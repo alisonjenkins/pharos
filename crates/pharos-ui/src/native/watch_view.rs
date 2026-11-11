@@ -1469,6 +1469,15 @@ fn SeekBar(
         let damaged = c.damage.as_ref().is_some_and(|d| in_span(&d.ranges, ms));
         (percent(ms, total), clock(ms), chapter, thumb, damaged)
     });
+    let preview_at = hover
+        .as_ref()
+        .map_or_else(String::new, |(at, _, _, thumb, _)| {
+            preview_left(
+                *at,
+                thumb.as_ref().map(|t| t.width),
+                class == "pharos-seek is-scrubbing",
+            )
+        });
     let damaged_spans = c
         .damage
         .as_ref()
@@ -1573,8 +1582,8 @@ fn SeekBar(
                 }
             }
             span { class: "pharos-seek-knob", style: "left: {played}%" }
-            if let Some((at, time, chapter, thumb, damaged)) = hover {
-                div { class: "pharos-seek-preview", style: "left: {at}%",
+            if let Some((_, time, chapter, thumb, damaged)) = hover {
+                div { class: "pharos-seek-preview", style: "{preview_at}",
                     if let Some(t) = thumb {
                         div {
                             class: "pharos-seek-thumb",
@@ -1593,6 +1602,29 @@ fn SeekBar(
         }
     }
 }
+
+/// B1277: where the seek preview's centre sits on the bar. It follows the
+/// target but stops half its own width short of either end, so a thumbnail
+/// near the start or the end of a film stays whole on screen instead of
+/// hanging off the edge. A remote scrub draws the thumbnail at full size
+/// (B907) and a pointer at half (`zoom: 0.5`), each with a 2px border; with
+/// no thumbnail the time label still needs [`PREVIEW_LABEL_HALF_PX`]. The
+/// half width also goes out as `--pharos-preview-half`, which caps a long
+/// chapter name to the clamped width.
+fn preview_left(at_percent: f64, thumb_width: Option<u32>, full_size: bool) -> String {
+    let zoom = if full_size { 1.0 } else { 0.5 };
+    let half = thumb_width
+        .map(|w| (f64::from(w) + 4.0) * zoom / 2.0)
+        .unwrap_or(0.0)
+        .max(PREVIEW_LABEL_HALF_PX);
+    format!(
+        "left: clamp({half}px, {at_percent}%, calc(100% - {half}px)); \
+         --pharos-preview-half: {half}px"
+    )
+}
+
+/// Half the width of the widest time label ("10:00:00" at 0.85rem).
+const PREVIEW_LABEL_HALF_PX: f64 = 32.0;
 
 /// What a pointer drag on the seek bar does when it ends: one seek to its
 /// target when the pointer lets go, nothing when the browser cancelled it.
@@ -2924,6 +2956,54 @@ mod tests {
             rule(".pharos-controls:has(.pharos-seek-preview)").contains("z-index: 2;"),
             "the seek preview must rise over the skip button"
         );
+    }
+
+    /// B1277 / V1240: the preview stops half its drawn width short of each
+    /// end of the bar, full size on a remote scrub and half size under a
+    /// pointer, and a bare time label still keeps clear of the edge.
+    #[test]
+    fn the_seek_preview_stays_inside_the_bar_at_either_end() {
+        assert_eq!(
+            preview_left(0.0, Some(316), true),
+            "left: clamp(160px, 0%, calc(100% - 160px)); --pharos-preview-half: 160px"
+        );
+        assert_eq!(
+            preview_left(99.5, Some(316), false),
+            "left: clamp(80px, 99.5%, calc(100% - 80px)); --pharos-preview-half: 80px"
+        );
+        assert_eq!(
+            preview_left(50.0, None, true),
+            "left: clamp(32px, 50%, calc(100% - 32px)); --pharos-preview-half: 32px"
+        );
+    }
+
+    /// B1277: on a TV the controls, and so the preview, keep to the
+    /// title-safe area the rest of the ten-foot layout uses.
+    #[test]
+    fn on_a_tv_the_controls_keep_to_the_title_safe_area() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = sheet
+            .split(":root[data-device=\"tv\"] .pharos-controls {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(rule.contains("padding-inline: 48px;"), "{rule}");
+        assert!(rule.contains("padding-bottom: 27px;"), "{rule}");
+        let chrome = sheet
+            .split(":root[data-device=\"tv\"] .pharos-up-next-pill {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(chrome.contains("right: 48px;"), "{chrome}");
+        assert!(
+            sheet.contains(":root[data-device=\"tv\"] .pharos-watch-top {\n  padding: 27px 48px")
+        );
+        let name = sheet
+            .split("\n.pharos-seek-chapter-name {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(name.contains("var(--pharos-preview-half"), "{name}");
     }
 
     /// B838: on a phone the wrapped control row would sit under a button
