@@ -5616,10 +5616,6 @@ body::before {
 }
 .pharos-album .pharos-overview {
   margin-top: 0.75rem;
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 .pharos-album .pharos-actions {
   align-items: center;
