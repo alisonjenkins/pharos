@@ -5214,11 +5214,10 @@ mod tests {
                 .map(|s| (dropped * s / 10, presented * s / 10))
                 .collect()
         };
-        let min = TIER_DROP_MIN_FRAMES;
-        assert!(run(Tier::Desktop, &window(10, min - 1)).is_empty());
-        assert_eq!(run(Tier::Desktop, &window(10, min)).len(), 1);
-        assert!(run(Tier::Desktop, &window(min - 1, 0)).is_empty());
-        assert_eq!(run(Tier::Desktop, &window(min, 0)).len(), 1);
+        assert!(run(Tier::Desktop, &window(10, 119)).is_empty());
+        assert_eq!(run(Tier::Desktop, &window(10, 120)).len(), 1);
+        assert!(run(Tier::Desktop, &window(119, 0)).is_empty());
+        assert_eq!(run(Tier::Desktop, &window(120, 0)).len(), 1);
     }
 
     #[test]
