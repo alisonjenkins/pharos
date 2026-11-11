@@ -357,7 +357,8 @@ try {{
     if (runs[run] && v.paused) await j.manualRender(frame(), true);
     return "ready paused_redraw=ok";
   }} catch (e) {{
-    return "ready paused_redraw=failed " + ((e && e.message) || e);
+    // A failed draw can leave JASSUB busy for good, so keep the plain cues.
+    return "failed: paused redraw " + ((e && e.message) || e);
   }}
 }} catch (e) {{
   return "failed: " + ((e && e.message) || e);
@@ -1065,6 +1066,7 @@ mod tests {
         assert!(js.contains("runs[run] = { j, own, ro }"));
         assert!(js.contains("j.manualRender(frame(), true)"));
         assert!(js.contains("paused_redraw=ok"));
+        assert!(js.contains(r#"return "failed: paused redraw ""#));
         assert!(styled_stop_js(3).contains("r.ro.disconnect()"));
         assert_eq!(
             parse_bridge(&serde_json::json!({"t": "styledresize", "run": 3})),
