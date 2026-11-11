@@ -143,6 +143,23 @@ pub const MEMBER_TTL_MS: u64 = 150_000;
 /// it is never quietly thinned. Sized far beyond any observed blackout.
 pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 
+/// Why a group with members in it was ended by the server rather than by its
+/// last member leaving: the `cause` label on
+/// `pharos_syncplay_group_dissolved_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DissolveCause {
+    /// Nobody held a socket and nothing was heard for [`GROUP_ABANDONED_MS`].
+    Abandoned,
+}
+
+impl DissolveCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
 /// How long a member's socket must have been gone before its reconnect
 /// forces a real `Seek` rather than trusting the ordinary catch-up `Play`
 /// alone to reposition it.
@@ -3462,10 +3479,14 @@ impl GroupHandle {
                                 members = state.members.len(),
                                 quiet_ms,
                                 threshold_ms = GROUP_ABANDONED_MS,
+                                cause = DissolveCause::Abandoned.label(),
                                 "syncplay: dissolving abandoned group (no sockets, no activity)"
                             );
-                            metrics::counter!("pharos_syncplay_group_dissolved_total")
-                                .increment(1);
+                            metrics::counter!(
+                                "pharos_syncplay_group_dissolved_total",
+                                "cause" => DissolveCause::Abandoned.label(),
+                            )
+                            .increment(1);
                             state.members.clear();
                         }
                         if pruned_any || abandoned {
@@ -5534,6 +5555,13 @@ mod tests {
             h.tx.is_closed(),
             "an abandoned group must dissolve, or orphans haunt the join picker"
         );
+    }
+
+    /// The `cause` label on `pharos_syncplay_group_dissolved_total` is a
+    /// dashboard contract: stable strings, distinct.
+    #[test]
+    fn dissolve_causes_are_distinct_and_stable() {
+        assert_eq!(DissolveCause::Abandoned.label(), "abandoned");
     }
 
     /// B30 — a group NOBODY ever joined (New whose caller's AddMember failed)
