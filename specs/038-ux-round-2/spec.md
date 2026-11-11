@@ -95,6 +95,8 @@ device.
   a separate info control for the title page (today both rails open the title
   page: `pharos-ui/src/native/views.rs:704`, `:1027-1052`). Continue Reading
   already opens the reader in one step. Not built until answered.
+  *Revised 2026-11-11 (Alison, B1340/V1311): the info control is gone; the
+  tile opens the title page on a press and plays on a hold.*
 
 ### Signal
 
