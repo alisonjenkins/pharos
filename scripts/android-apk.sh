@@ -95,6 +95,14 @@ fi
 
 # shellcheck disable=SC2016 # expanded by the dev shell, not here
 build_tools=$(nix develop .#android -c sh -c 'echo "$ANDROID_HOME/build-tools/35.0.0"')
+
+# B1329: refuse an APK missing the TV's label, icon, banner, dark theme or
+# config changes before it is signed (scripts/android-apk-check.sh).
+echo "android-apk: checking the APK's TV resources" >&2
+AAPT2=$build_tools/aapt2 bash "$root/scripts/android-apk-check.sh" "$built" || {
+  echo "android-apk: the built APK failed its checks; not signing it" >&2
+  exit 1
+}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$(dirname "$out")"
