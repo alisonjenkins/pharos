@@ -2985,7 +2985,9 @@ fn PaletteScreen() -> Element {
         }
     };
     let on_key = move |evt: KeyboardEvent| match evt.key() {
-        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
+        // A TV moves the real focus onto the results instead: OK on the
+        // input opens the remote's keyboard, never picks (B1331).
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) if !TV_SEARCH_BUTTON => {
             evt.prevent_default();
             let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), rows.peek().len(), down);
