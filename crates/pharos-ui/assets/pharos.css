@@ -719,6 +719,11 @@ input:focus-visible {
 .pharos-poster-play {
   display: none;
 }
+/* The box that takes a tile's hold, wrapping its art, name and lines so a
+   hold anywhere on the tile plays (B1341, V1312). It draws nothing. */
+.pharos-poster-press {
+  display: contents;
+}
 /* A held finger plays: no link callout or text selection under it. */
 .pharos-rail-items > li:has(> .pharos-poster-play) > .pharos-poster {
   -webkit-touch-callout: none;

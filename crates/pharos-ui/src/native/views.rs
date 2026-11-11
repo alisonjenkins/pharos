@@ -1313,14 +1313,11 @@ pub fn PosterTile(
     let rated = !ratings(item.kind, item.imdb_rating, item.critic_rating).is_empty();
     rsx! {
         Link { to, class: "pharos-poster",
-            div { class: "pharos-poster-art",
-                onpointermove: move |evt| depth::tilt(&evt),
-                onpointerleave: move |evt| {
-                    depth::untilt(&evt);
-                    if play {
-                        hold_release(hold);
-                    }
-                },
+            // The whole tile takes the hold, its name and lines as well as
+            // its art (B1341): the Link itself takes no handlers, so they
+            // sit on this box, which draws nothing of its own.
+            div { class: "pharos-poster-press",
+                onpointerleave: move |_| if play { hold_release(hold) },
                 onpointerdown: move |evt: PointerEvent| {
                     let touch = evt.pointer_type() != "mouse";
                     if play && hold.peek().touch != touch {
@@ -1347,40 +1344,44 @@ pub fn PosterTile(
                         evt.prevent_default();
                     }
                 },
-                match &item.image {
-                    Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
-                    None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
+                div { class: "pharos-poster-art",
+                    onpointermove: move |evt| depth::tilt(&evt),
+                    onpointerleave: move |evt| depth::untilt(&evt),
+                    match &item.image {
+                        Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
+                        None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
+                    }
+                    if item.played {
+                        span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
+                    }
+                    if item.stereo.is_some() {
+                        span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
+                    }
+                    if item.damaged {
+                        span { class: "pharos-badge pharos-badge-damaged", title: "The file is damaged", "Damaged" }
+                    }
+                    if let Some((short, long)) = new_children_label(&item) {
+                        span { class: "pharos-badge pharos-badge-new", title: "{long}", "aria-label": "{long}", "{short}" }
+                    }
+                    if let Some(p) = progress {
+                        div { class: "pharos-progress", style: "width: {p}%" }
+                    }
                 }
-                if item.played {
-                    span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
-                }
-                if item.stereo.is_some() {
-                    span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
-                }
-                if item.damaged {
-                    span { class: "pharos-badge pharos-badge-damaged", title: "The file is damaged", "Damaged" }
-                }
-                if let Some((short, long)) = new_children_label(&item) {
-                    span { class: "pharos-badge pharos-badge-new", title: "{long}", "aria-label": "{long}", "{short}" }
-                }
-                if let Some(p) = progress {
-                    div { class: "pharos-progress", style: "width: {p}%" }
-                }
-            }
-            span { class: "pharos-poster-name", title: "{name}", "{name}" }
-            // Scores sit on the year line, off the art, where most posters
-            // put their title (B1015, V974). Only films and series have them,
-            // and their tiles have one sub line.
-            if rated {
-                div { class: "pharos-poster-meta",
+                span { class: "pharos-poster-name", title: "{name}", "{name}" }
+                // Scores sit on the year line, off the art, where most posters
+                // put their title (B1015, V974). Only films and series have them,
+                // and their tiles have one sub line.
+                if rated {
+                    div { class: "pharos-poster-meta",
+                        for line in sub {
+                            span { class: "pharos-poster-sub", title: "{line}", "{line}" }
+                        }
+                        Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
+                    }
+                } else {
                     for line in sub {
                         span { class: "pharos-poster-sub", title: "{line}", "{line}" }
                     }
-                    Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
-                }
-            } else {
-                for line in sub {
-                    span { class: "pharos-poster-sub", title: "{line}", "{line}" }
                 }
             }
         }
@@ -3903,6 +3904,42 @@ mod tests {
             rule("\n.pharos-poster-play {").contains("display: none;"),
             "the play link is never drawn, so no arrow or Tab stops on it"
         );
+    }
+
+    /// B1341 (V1312): a hold anywhere on the tile plays, so the box that
+    /// takes the hold wraps the name and lines as well as the art.
+    #[test]
+    fn a_resume_tiles_hold_box_wraps_its_art_name_and_lines() {
+        let mut e = item(ItemKind::Episode);
+        e.name = "Pilot".into();
+        e.series_name = Some("Show AA".into());
+        e.season = Some(1);
+        e.episode = Some(1);
+        let html = render(move || rsx! { PosterTile { item: e.clone(), play: true } });
+        let Some(press) = html.find(r#"<div class="pharos-poster-press""#) else {
+            panic!("no hold box: {html}");
+        };
+        let (Some(art), Some(sub)) = (
+            html.find("pharos-poster-art"),
+            html.rfind("pharos-poster-sub"),
+        ) else {
+            panic!("no art or lines: {html}");
+        };
+        assert!(press < art, "{html}");
+        // The hold box is still open at the last line: more divs opened
+        // from it than closed.
+        let between = &html[press..sub];
+        assert!(
+            between.matches("<div").count() > between.matches("</div>").count(),
+            "the name and lines sit inside the hold box: {html}"
+        );
+        let css = include_str!("../../assets/pharos.css");
+        let rule = css
+            .split("\n.pharos-poster-press {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(rule.contains("display: contents;"), "it draws nothing");
     }
 
     #[test]
