@@ -2399,8 +2399,8 @@ pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
 
 /// Watches hls.js's forward ceiling (`maxMaxBufferLength`), which hls.js
 /// lowers on its own after buffer-full errors and evictions and never
-/// raises again. The first reading is the baseline; each drop below the
-/// last one is reported once, with both values.
+/// raises again. Each drop below the last reading is reported once, with
+/// both values.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BufferCeiling {
     last_s: Option<f64>,
@@ -2417,9 +2417,7 @@ impl BufferCeiling {
             .last_s
             .filter(|last| now_s < *last)
             .map(|from| (from, now_s));
-        if self.last_s.is_none() || cut.is_some() {
-            self.last_s = Some(now_s);
-        }
+        self.last_s = Some(now_s);
         cut
     }
 }
@@ -3084,6 +3082,11 @@ mod tests {
         assert_eq!(ceiling.observe(f64::NAN), None);
         assert_eq!(ceiling.observe(0.0), None);
         assert_eq!(ceiling.observe(30.0), None, "a rise is not a cut");
+        assert_eq!(
+            ceiling.observe(20.0),
+            Some((30.0, 20.0)),
+            "a cut after a rise is measured from the rise"
+        );
     }
 
     /// B1160: only hls.js media it could not parse or append counts as
