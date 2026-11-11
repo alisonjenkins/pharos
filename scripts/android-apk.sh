@@ -50,7 +50,10 @@ nix develop -c sh scripts/tv-visualiser.sh
 echo "android-apk: building ($profile)" >&2
 nix develop .#android -c dx build --platform android --package pharos-ui \
   --bin pharos-tv --features mobile --target armv7-linux-androideabi \
-  "${dx_flags[@]}"
+  "${dx_flags[@]}" || {
+  echo "android-apk: dx build failed (see its error above)" >&2
+  exit 1
+}
 
 # dx 0.7 has no setting for the launcher icon, TV banner or app_name: lay
 # crates/pharos-ui/android/res over the gradle project it generated, point
@@ -79,7 +82,10 @@ rm -rf "$apk_dir"
 # dx runs assembleRelease only when [bundle.android] signing is configured,
 # which it is not here (this script signs), so the APK is always under debug/.
 echo "android-apk: assembling with the Pharos icon and banner" >&2
-(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet assembleDebug)
+(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet assembleDebug) || {
+  echo "android-apk: gradle assembleDebug failed (see its error above)" >&2
+  exit 1
+}
 
 built=$(find "$apk_dir" -name '*.apk' | head -n 1)
 if [ -z "$built" ]; then
