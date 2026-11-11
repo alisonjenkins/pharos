@@ -329,8 +329,26 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     $NATIVE_BLOCK
     EOF
     PHAROS_CONFIG="$TMP/pharos.toml"
-    nix develop --command cargo build -q --bin pharos --bin transcode-worker
-    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # PHAROS_BIN_DIR (CI: `nix build .#pharosTestBins`) supplies prebuilt
+    # binaries, as for the crawl; otherwise build them here. On CI a cold
+    # `cargo build` of the workspace ran in every job that seeds a server.
+    # Copied out of the store: the host's auto-GC can delete a path this pod
+    # cannot root (B284). pharos spawns transcode-worker as its sibling, so
+    # both go in one directory.
+    bins_started=$SECONDS
+    if [[ -n "${PHAROS_BIN_DIR:-}" ]]; then
+      BIN="$TMP/bin"
+      mkdir -p "$BIN"
+      cp -L --no-preserve=mode "$PHAROS_BIN_DIR/pharos" "$PHAROS_BIN_DIR/transcode-worker" "$BIN/"
+      chmod +x "$BIN/pharos" "$BIN/transcode-worker"
+      bins_from="PHAROS_BIN_DIR $PHAROS_BIN_DIR"
+    else
+      nix develop --command cargo build -q --bin pharos --bin transcode-worker
+      BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug"
+      bins_from="cargo build"
+    fi
+    echo "compat-dioxus-full: binaries from $bins_from in $((SECONDS - bins_started))s"
+    nix develop --command "$BIN/pharos" --config "$PHAROS_CONFIG" admin seed-playwright-user
     # A film with a half side-by-side edition beside it, and a second copy of
     # a seeded episode in a "Season 1" folder beside "Season 01", for the 3D
     # badge, the 3D filter and the version picker (V721, V722).
@@ -348,7 +366,7 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     df -h /nix/store 2>&1 | tail -1 | sed 's/^/  df: /' || true
     if [[ -r /proc/self/mountinfo ]]; then grep -E ' /nix(/| )' /proc/self/mountinfo | sed 's/^/  mount: /' || true; fi
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
-    nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec '${CARGO_TARGET_DIR:-$PWD/target}/debug/pharos' --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
+    nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec '$BIN/pharos' --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
     SERVE_JOB=$!
     for _ in $(seq 1 120); do
       if curl -fsS -o /dev/null http://127.0.0.1:{{ port }}/ui/ 2>/dev/null; then ready=1; break; fi
