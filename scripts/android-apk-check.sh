@@ -45,8 +45,14 @@ badging=$("$AAPT2" dump badging "$apk" 2>&1) || {
   echo "android-apk-check: aapt2 could not read $apk: $badging" >&2
   exit 64
 }
-manifest=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" 2>&1)
-resources=$("$AAPT2" dump resources "$apk" 2>&1)
+manifest=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" 2>&1) || {
+  echo "android-apk-check: aapt2 could not dump the manifest of $apk: $manifest" >&2
+  exit 64
+}
+resources=$("$AAPT2" dump resources "$apk" 2>&1) || {
+  echo "android-apk-check: aapt2 could not dump the resources of $apk: $resources" >&2
+  exit 64
+}
 
 # The launcher shows the application label; dx's own is "PharosTv".
 label=$(printf '%s\n' "$badging" | sed -n "s/^application-label:'\(.*\)'$/\1/p" | head -n 1)
