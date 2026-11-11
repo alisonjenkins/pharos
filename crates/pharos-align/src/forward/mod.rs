@@ -201,10 +201,13 @@ impl Model for VulkanAligner {
 
     fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
         self.sample_pool();
-        let peak = self.song_peak.take()?;
+        let peak = self.song_peak.take();
+        // Released whether or not the pool could be read: a missing
+        // reading costs only the report, never the cleanup (B1352).
         self.model.release();
-        let after = self.model.pool()?;
-        Some(crate::service::GpuMemory { peak, after })
+        let after = self.model.pool();
+        peak.zip(after)
+            .map(|(peak, after)| crate::service::GpuMemory { peak, after })
     }
 
     fn device(&self) -> DeviceUsed {
