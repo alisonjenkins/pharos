@@ -118,14 +118,14 @@ impl Model for Fallback {
             self.pool_retired = true;
         }
         let gpu = &mut self.gpu;
-        let mem = match catch_unwind(AssertUnwindSafe(|| gpu.end_song())) {
-            Ok(mem) => mem,
+        let (mem, cleaned) = match catch_unwind(AssertUnwindSafe(|| gpu.end_song())) {
+            Ok(mem) => (mem, true),
             Err(panic) => {
                 tracing::warn!(error = %panic_message(&*panic), "GPU pool cleanup panicked");
-                None
+                (None, false)
             }
         };
-        if self.pool_retired {
+        if self.pool_retired && cleaned {
             tracing::info!(
                 kept_mib = mem.map(|m| m.after.reserved >> 20),
                 "GPU pool emptied after the latch; it is not asked again until restart"
@@ -271,6 +271,42 @@ mod tests {
                 after: pool,
             })
         }
+    }
+
+    /// A GPU whose every window fails and whose pool cleanup panics.
+    struct PanicsOnCleanup;
+
+    impl Model for PanicsOnCleanup {
+        fn align(&mut self, _: &[f32], _: &[String], _: bool) -> Result<LineSpans, ModelError> {
+            Err(ModelError::Device("device lost".into()))
+        }
+
+        fn device(&self) -> DeviceUsed {
+            DeviceUsed {
+                device: "vulkan",
+                reason: "test".into(),
+            }
+        }
+
+        fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
+            panic!("cleanup on a lost device")
+        }
+    }
+
+    #[test]
+    fn a_cleanup_that_panics_costs_only_the_reading() {
+        let cpu_calls = Arc::new(AtomicUsize::new(0));
+        let mut f = Fallback::new(
+            Box::new(PanicsOnCleanup),
+            Box::new(move || Ok(Box::new(Fake("cpu", Arc::clone(&cpu_calls))) as Box<dyn Model>)),
+        );
+        let t: Vec<String> = vec!["la".into()];
+        for _ in 1..=4 {
+            f.begin_song();
+            f.align(&[0.0], &t, false).unwrap();
+            assert_eq!(f.end_song(), None);
+        }
+        assert!(f.latch.latched());
     }
 
     #[test]
