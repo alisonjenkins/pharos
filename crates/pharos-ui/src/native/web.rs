@@ -3840,8 +3840,21 @@ impl PlaybackEngine for HlsJs {
         };
         let on_loaded = {
             let budget = Rc::clone(&budget);
+            let (player, url) = (player.clone(), url.to_owned());
+            let mut ceiling = super::playback::BufferCeiling::default();
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
                 budget.borrow_mut().progressed();
+                let now_s = js_number(&player, &["config", "maxMaxBufferLength"]);
+                if let Some((from_s, to_s)) = ceiling.observe(now_s) {
+                    warn(&format!(
+                        "pharos: hls.js cut its forward buffer ceiling engine=hlsjs from_s={from_s} to_s={to_s} url={url}"
+                    ));
+                    let mut event =
+                        hls_event(ClientLevel::Warn, "bufferCeiling", "reduced", "none", 0);
+                    event.fields.push(("from_s", from_s.to_string()));
+                    event.fields.push(("to_s", to_s.to_string()));
+                    report_event(event);
+                }
                 if let Some(load) = fragment_load(&data) {
                     on_fragment(load);
                 }

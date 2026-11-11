@@ -2370,6 +2370,33 @@ pub fn hls_start_position(start_ms: u64) -> f64 {
     start_ms as f64 / 1000.0
 }
 
+/// Watches hls.js's forward ceiling (`maxMaxBufferLength`), which hls.js
+/// lowers on its own after buffer-full errors and evictions and never
+/// raises again. The first reading is the baseline; each drop below the
+/// last one is reported once, with both values.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BufferCeiling {
+    last_s: Option<f64>,
+}
+
+impl BufferCeiling {
+    /// `Some((from_s, to_s))` when `now_s` is below the last value seen.
+    /// A missing or non-finite reading is ignored.
+    pub fn observe(&mut self, now_s: f64) -> Option<(f64, f64)> {
+        if !now_s.is_finite() || now_s <= 0.0 {
+            return None;
+        }
+        let cut = self
+            .last_s
+            .filter(|last| now_s < *last)
+            .map(|from| (from, now_s));
+        if self.last_s.is_none() || cut.is_some() {
+            self.last_s = Some(now_s);
+        }
+        cut
+    }
+}
+
 /// One trickplay thumbnail: the tile it is on and where in the tile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thumb {
@@ -3004,6 +3031,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn buffer_ceiling_reports_each_drop_once_with_both_values() {
+        let mut ceiling = BufferCeiling::default();
+        assert_eq!(ceiling.observe(120.0), None);
+        assert_eq!(ceiling.observe(60.0), Some((120.0, 60.0)));
+        assert_eq!(ceiling.observe(60.0), None);
+        assert_eq!(ceiling.observe(12.0), Some((60.0, 12.0)));
+        assert_eq!(ceiling.observe(f64::NAN), None);
+        assert_eq!(ceiling.observe(0.0), None);
+        assert_eq!(ceiling.observe(30.0), None, "a rise is not a cut");
+    }
 
     /// B1160: only hls.js media it could not parse or append counts as
     /// damage; a stall or a missing codec does not, nor does the network.
