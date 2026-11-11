@@ -3347,13 +3347,15 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
     radial-gradient(ellipse at 80% 90%, color-mix(in srgb, var(--px-color-accent) 14%, transparent), transparent 55%),
     var(--px-color-bg);
 }
-/* Three columns, the outer two equal, so the picker sits in the middle of
-   the screen whatever is either side of it. */
+/* The two sides grow from nothing alike, so the picker sits in the middle
+   while both fit; a side never gets less than its content, so a narrow
+   screen pushes the picker aside or wraps instead of overlapping
+   (B1360/V1331). */
 .pharos-listen-top {
   position: absolute;
   inset: 0 0 auto 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem 1rem;
   padding: 0.75rem 1rem 2.5rem;
@@ -3784,8 +3786,11 @@ button.pharos-lyrics-line:focus-visible {
 :root[data-device="tv"] .pharos-lyrics-words {
   filter: none;
 }
+.pharos-listen-top > .pharos-notice {
+  flex-basis: 100%;
+}
 .pharos-listen-note {
-  grid-column: 1 / -1;
+  flex-basis: 100%;
   margin: 0;
   text-align: right;
 }
@@ -3815,6 +3820,20 @@ button.pharos-lyrics-line:focus-visible {
   }
   .pharos-listen-top {
     gap: 0.5rem;
+  }
+  /* A phone held upright has no room for the toggles beside the picker:
+     they take their own row. */
+  .pharos-listen-top .pharos-listen-panels {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+  /* The picker sits at the edge there: its panel opens from that edge, the
+     translate undoing the centring the transform and its entry keep. */
+  .pharos-style-picker .pharos-style-panel {
+    left: auto;
+    right: 0;
+    translate: 50% 0;
+    box-sizing: border-box;
   }
   .pharos-style-trigger .pharos-style-name {
     display: none;
@@ -5144,15 +5163,23 @@ body::before {
    closed until asked for, so the visualiser keeps the screen. */
 .pharos-listen-nav {
   display: flex;
-  justify-self: start;
+  flex: 1 1 0;
+  min-width: max-content;
 }
 .pharos-listen-panels {
   display: flex;
-  justify-self: end;
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: max-content;
   gap: 0.35rem;
+}
+.pharos-listen-panels .pharos-chip {
+  white-space: nowrap;
 }
 .pharos-style-picker {
   position: relative;
+  flex: none;
 }
 .pharos-listen .pharos-style-trigger {
   display: inline-flex;
