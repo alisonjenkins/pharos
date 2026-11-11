@@ -414,10 +414,14 @@ jobs:
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       # The crawl's binaries, from the shared store: no cold `cargo build`
-      # in each shard.
+      # in each shard. Rooted in the host's gcroots drop box: the recipe
+      # builds the UI bundle and test media before it copies the binaries,
+      # and the host's auto-GC can delete an unrooted path meanwhile (B284).
+      # The `pharos-run-*` name is swept after 4 h by the test job.
       - name: Build pharos test binaries
         run: |
-          out="$(nix build .#pharosTestBins --no-link --print-out-paths)"
+          out="$(nix build .#pharosTestBins --out-link "/nix/var/nix/gcroots/gha/pharos-run-${GITHUB_RUN_ID}-bins-dioxus-on-${{ matrix.shard }}" --print-out-paths)" \
+            || { echo "::warning::could not root the test binaries"; out="$(nix build .#pharosTestBins --no-link --print-out-paths)"; }
           echo "PHAROS_BIN_DIR=$out/bin" >> "$GITHUB_ENV"
       - name: Run Dioxus UI suite (native on, shard ${{ matrix.shard }}/3)
         env:
@@ -452,7 +456,8 @@ jobs:
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       - name: Build pharos test binaries
         run: |
-          out="$(nix build .#pharosTestBins --no-link --print-out-paths)"
+          out="$(nix build .#pharosTestBins --out-link "/nix/var/nix/gcroots/gha/pharos-run-${GITHUB_RUN_ID}-bins-dioxus-off" --print-out-paths)" \
+            || { echo "::warning::could not root the test binaries"; out="$(nix build .#pharosTestBins --no-link --print-out-paths)"; }
           echo "PHAROS_BIN_DIR=$out/bin" >> "$GITHUB_ENV"
       - name: Run Dioxus UI suite (native off)
         id: native-off
