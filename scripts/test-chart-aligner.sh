@@ -69,9 +69,16 @@ server() {
   helm template p "$chart" --show-only templates/deployment.yaml \
     --set aligner.enabled=true --set aligner.image.tag=t "$@"
 }
+# Rendered first: a failed render is empty and would pass the absent check.
 shadow_url='value: "http://p-pharos-aligner-shadow:'
-if grep -qF "$shadow_url" <<<"$(server --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)" \
-  && ! grep -qF "PHAROS_LYRICS_ALIGNER_SHADOW_URL" <<<"$(server)"; then
+if ! with_shadow="$(server --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)"; then
+  echo "FAIL the server's render with the shadow on failed" >&2
+  failed=1
+elif ! without_shadow="$(server)"; then
+  echo "FAIL the server's default render failed" >&2
+  failed=1
+elif grep -qF "$shadow_url" <<<"$with_shadow" \
+  && ! grep -qF "PHAROS_LYRICS_ALIGNER_SHADOW_URL" <<<"$without_shadow"; then
   echo "ok   the server asks the shadow only when it is enabled"
 else
   echo "FAIL the server's shadow URL does not follow aligner.shadow.enabled" >&2
