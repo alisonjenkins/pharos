@@ -43,11 +43,11 @@ use super::playback::{
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
-    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
+    volume_setting, DeviceClass, EffectsDetail, EffectsLevel, Engine, EngineReason, FailureKind,
+    Fatal, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
     OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
-    TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
-    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
+    TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_DETAIL_KEY,
+    EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
     SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
@@ -913,6 +913,42 @@ fn store_speaker_colours(on: bool) -> Result<(), String> {
 }
 
 thread_local! {
+    /// The effects detail chosen on this page load; it outranks storage as
+    /// [`SESSION_EFFECTS_LEVEL`] does.
+    static SESSION_EFFECTS_DETAIL: Cell<Option<EffectsDetail>> = const { Cell::new(None) };
+}
+
+/// The viewer's effects detail: this page load's choice, else the stored
+/// one, else Auto.
+fn stored_effects_detail() -> EffectsDetail {
+    if let Some(detail) = SESSION_EFFECTS_DETAIL.with(Cell::get) {
+        return detail;
+    }
+    match platform::stored_theme(EFFECTS_DETAIL_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or(EffectsDetail::default(), EffectsDetail::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: effects_detail storage read failed error={e}"
+            ));
+            EffectsDetail::default()
+        }
+    }
+}
+
+/// Keep `detail` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_effects_detail(detail: EffectsDetail) -> Result<(), String> {
+    SESSION_EFFECTS_DETAIL.with(|s| s.set(Some(detail)));
+    platform::store_theme(EFFECTS_DETAIL_KEY, detail.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: effects_detail storage write failed error={e}"
+        ));
+    })
+}
+
+thread_local! {
     /// The tier this device dropped to on this page load; it outranks storage
     /// as [`SESSION_EFFECTS_LEVEL`] does.
     static SESSION_TIER_DROP: Cell<Option<Tier>> = const { Cell::new(None) };
@@ -969,12 +1005,14 @@ fn current_starting_tier() -> Tier {
     let device = this_device();
     let reduced_motion = platform::prefers(REDUCED_MOTION);
     let remembered = stored_tier_drop();
-    let tier = starting_tier(device, reduced_motion, remembered);
+    let detail = stored_effects_detail();
+    let tier = starting_tier(device, reduced_motion, remembered, detail);
     platform::info(&starting_tier_line(
         tier,
         device,
         reduced_motion,
         remembered,
+        detail,
     ));
     tier
 }
@@ -3606,6 +3644,7 @@ fn AppearanceScreen() -> Element {
     let mut overlay_effect = use_signal(stored_overlay_effect);
     let mut effects_level = use_signal(stored_effects_level);
     let mut speaker_colours = use_signal(stored_speaker_colours);
+    let mut effects_detail = use_signal(stored_effects_detail);
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -3629,6 +3668,7 @@ fn AppearanceScreen() -> Element {
     let overlay_effect_now = *overlay_effect.read();
     let effects_level_now = *effects_level.read();
     let speaker_colours_now = *speaker_colours.read();
+    let effects_detail_now = *effects_detail.read();
 
     rsx! {
         AppearanceView {
@@ -3669,6 +3709,14 @@ fn AppearanceScreen() -> Element {
                 }
                 speaker_colours.set(on);
                 platform::info(&format!("pharos: speaker_colours set={on}"));
+            },
+            effects_detail: effects_detail_now,
+            on_effects_detail: move |detail: EffectsDetail| {
+                if let Err(e) = store_effects_detail(detail) {
+                    show(notice, not_saved("the effects detail", &e, Lasts::UntilReload));
+                }
+                effects_detail.set(detail);
+                platform::info(&format!("pharos: effects_detail set={}", detail.as_str()));
             },
             on_pick: move |name: String| {
                 editing.set(None);
@@ -8190,6 +8238,13 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     fn the_host_starts_on_the_desktop_tier() {
         assert_eq!(current_starting_tier(), Tier::Desktop);
+    }
+
+    #[test]
+    fn a_chosen_effects_detail_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_effects_detail(), EffectsDetail::Auto);
+        store_effects_detail(EffectsDetail::Rich).unwrap();
+        assert_eq!(stored_effects_detail(), EffectsDetail::Rich);
     }
 
     #[test]

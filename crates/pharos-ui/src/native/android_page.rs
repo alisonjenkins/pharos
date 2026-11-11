@@ -578,7 +578,34 @@ pub async fn rust_subtitles(
     Err(super::subtitles::FallbackReason::NoWebgl2)
 }
 
-pub fn set_subtitle_controls_visible(_visible: bool) {}
+/// Whether the player's control bar shows, for the styled canvas's lift.
+static STYLED_CONTROLS_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Moves the styled canvas clear of the control bar while it shows (B634),
+/// by the web build's rule; signs are not held still on the TV yet.
+pub fn set_subtitle_controls_visible(visible: bool) {
+    STYLED_CONTROLS_VISIBLE.store(visible, Ordering::Relaxed);
+    lift_styled_subtitles();
+}
+
+fn lift_styled_subtitles() {
+    let measure = page_eval(tv_page::STYLED_LIFT_MEASURE_JS);
+    spawn_detached(async move {
+        let Ok(Some([canvas_bottom, player_bottom, bar_height])) =
+            measure.join::<Option<[f64; 3]>>().await
+        else {
+            return;
+        };
+        let lift = super::subtitles::styled_lift(
+            STYLED_CONTROLS_VISIBLE.load(Ordering::Relaxed),
+            false,
+            canvas_bottom,
+            player_bottom,
+            bar_height,
+        );
+        run(tv_page::styled_lift_set_js(lift));
+    });
+}
 
 pub fn refresh_subtitle_delay(_video_id: &str) {}
 pub fn set_subtitle_delay(_video_id: &str, _delay_ms: i64) {}
@@ -593,22 +620,81 @@ pub async fn video_metadata(video_id: &str) {
     }
 }
 
-pub struct StyledSubtitles;
+/// A styled-subtitle run JASSUB draws in the page (B1216).
+pub struct StyledSubtitles {
+    video_id: String,
+    run: u64,
+}
 
 impl StyledSubtitles {
-    /// The renderer's frame counters; the host draws nothing.
+    /// The renderer's own skipped and drawn frames, as the page's last media
+    /// message for the video carried them.
     pub fn frames(&self) -> Option<super::playback::RendererFrames> {
-        None
+        let (m, _) = media(&self.video_id)?;
+        Some(super::playback::RendererFrames {
+            skipped: m.sub_skipped?,
+            drawn: m.sub_drawn?,
+        })
     }
 }
 
+impl Drop for StyledSubtitles {
+    fn drop(&mut self) {
+        log::info!("pharos: styled subtitles run={} action=stop", self.run);
+        run(tv_page::styled_stop_js(self.run));
+    }
+}
+
+static NEXT_STYLED: AtomicU64 = AtomicU64::new(1);
+
+/// Starts JASSUB on `<video id=video_id>` for the styled script at `url`,
+/// as the web build does, and tells `report` once it is ready or why not.
 pub async fn styled_subtitles(
-    _video_id: &str,
-    _url: &str,
-    _fonts: &[String],
-    _report: std::rc::Rc<dyn Fn(Result<(), String>)>,
+    video_id: &str,
+    url: &str,
+    fonts: &[String],
+    report: std::rc::Rc<dyn Fn(Result<(), String>)>,
 ) -> Result<StyledSubtitles, String> {
-    Err("no renderer on the host".into())
+    let id = NEXT_STYLED.fetch_add(1, Ordering::Relaxed);
+    let script = tv_page::styled_start_js(
+        video_id,
+        url,
+        fonts,
+        &super::playback::SUBTITLE_FONT_PACK,
+        id,
+    );
+    log::info!(
+        "pharos: styled subtitles run={id} action=start fonts={}",
+        fonts.len()
+    );
+    let eval = page_eval(&script);
+    let at = now_ms();
+    spawn_detached(async move {
+        let answer = match eval.join::<String>().await {
+            Ok(answer) => answer,
+            Err(e) => format!("failed: eval {e}"),
+        };
+        let took_ms = now_ms() - at;
+        if answer == "ready" {
+            log::info!("pharos: styled subtitles run={id} outcome=ready took_ms={took_ms:.0}");
+            // The canvas is new: give it the lift the bar already has.
+            lift_styled_subtitles();
+            report(Ok(()));
+        } else {
+            let why = answer
+                .strip_prefix("failed: ")
+                .unwrap_or(&answer)
+                .to_owned();
+            log::warn!(
+                "pharos: styled subtitles run={id} outcome=failed took_ms={took_ms:.0} error={why}"
+            );
+            report(Err(why));
+        }
+    });
+    Ok(StyledSubtitles {
+        video_id: video_id.to_owned(),
+        run: id,
+    })
 }
 
 /// The video's dropped and total frame counts; the host has no video.
@@ -2127,6 +2213,7 @@ const media = (e) => {
     tick = true;
   }
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+  const d = window.__pharosJassub ? window.__pharosJassub.debug : null;
   send({
     t: "media", id: v.id, tick, pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
@@ -2134,6 +2221,7 @@ const media = (e) => {
     rate: v.playbackRate, vol: v.volume, muted: v.muted,
     w: v.videoWidth || 0, h: v.videoHeight || 0, src: !!v.currentSrc,
     dropped: q ? q.droppedVideoFrames : 0, frames: q ? q.totalVideoFrames : 0,
+    sub_skipped: d ? d.droppedFrames : null, sub_drawn: d ? d.presentedFrames : null,
   });
 };
 for (const name of ["timeupdate", "play", "playing", "pause", "waiting", "canplay",
