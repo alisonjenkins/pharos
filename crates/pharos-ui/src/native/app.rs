@@ -4594,13 +4594,23 @@ fn BrowseScreen(id: ItemRef) -> Element {
         .as_ref()
         .and_then(Option::as_ref)
         .is_some_and(|(asked, _)| *asked != id);
+    // Keyed by the parent it shows, so another parent's listing mounts
+    // afresh once it lands, while a reload of this one keeps its place and
+    // the last one stays mounted under the busy cue (B1324).
+    let shown = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map(|(asked, _)| *asked);
     rsx! {
         Busy { busy,
             {loaded_or_retry(
                 state.as_ref().and_then(Option::as_ref).map(|(_, result)| result),
                 EventHandler::new(move |()| listing.restart()),
                 |browse: &browse::Browse| {
-                    rsx! { SeenBrowse { browse: browse.clone() } }
+                    remount_on(
+                        &shown.map(|s| s.to_string()).unwrap_or_default(),
+                        rsx! { SeenBrowse { browse: browse.clone() } },
+                    )
                 },
             )}
         }
