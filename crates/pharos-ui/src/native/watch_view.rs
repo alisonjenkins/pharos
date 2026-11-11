@@ -52,6 +52,9 @@ pub const PLAYER_ID: &str = "pharos-player";
 /// takes the remote's focus as it appears (B1342).
 const SKIP_ID: &str = "pharos-skip";
 const UP_NEXT_PLAY_ID: &str = "pharos-up-next-play";
+/// Up Next's Cancel, the same id on the pill and the full card: the remote
+/// on the pill's Cancel stays on Cancel as the pill grows into the card.
+const UP_NEXT_CANCEL_ID: &str = "pharos-up-next-cancel";
 /// The seek bar, whose width turns a pointer offset into a position.
 pub const SEEK_ID: &str = "pharos-seek";
 
@@ -1338,7 +1341,7 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
     use_effect(use_reactive!(|span| {
         if REMOTE_FOCUS {
             if span.is_some() {
-                platform::focus_card(PLAYER_ID, SKIP_ID);
+                platform::focus_card(PLAYER_ID, SKIP_ID, "");
             } else {
                 platform::refocus_if_lost(PLAYER_ID);
             }
@@ -1406,6 +1409,7 @@ fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
                 "Play now"
             }
             button {
+                id: UP_NEXT_CANCEL_ID,
                 class: "pharos-up-next-pill-cancel",
                 r#type: "button",
                 aria_label: "Cancel up next",
@@ -1417,11 +1421,12 @@ fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
 }
 
 /// On a TV, Up Next's Play now takes the remote's focus as the card
-/// appears, and the picture takes it back when the card goes (B1342).
+/// appears (Cancel, if the remote was on the pill's Cancel), and the
+/// picture takes it back when the card goes (B1342).
 fn use_card_focus() {
     use_effect(|| {
         if REMOTE_FOCUS {
-            platform::focus_card(PLAYER_ID, UP_NEXT_PLAY_ID);
+            platform::focus_card(PLAYER_ID, UP_NEXT_PLAY_ID, UP_NEXT_CANCEL_ID);
         }
     });
     use_drop(|| {
@@ -1463,6 +1468,7 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
                         "Play now"
                     }
                     button {
+                        id: UP_NEXT_CANCEL_ID,
                         class: "pharos-up-next-cancel",
                         r#type: "button",
                         onclick: move |_| on_control.call(Control::CancelNext),
@@ -3906,6 +3912,9 @@ mod tests {
         assert!(!html.contains("Skip intro"), "{html}");
         // B1342: Play now carries the id a TV hands the remote's focus to.
         assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
+        // The pill's Cancel and the card's share an id, so the remote stays
+        // on Cancel as the pill grows into the card (B1342).
+        assert!(html.contains(r#"id="pharos-up-next-cancel""#), "{html}");
 
         // 038 FR-405, V1221: over a guessed ending the pill shows instead,
         // and the compact player leaves it to its stage bar (FR-406).
@@ -3923,6 +3932,9 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
+        // The pill's Cancel and the card's share an id, so the remote stays
+        // on Cancel as the pill grows into the card (B1342).
+        assert!(html.contains(r#"id="pharos-up-next-cancel""#), "{html}");
 
         let mut compact = controls();
         compact.up_next = Some(card);

@@ -326,7 +326,7 @@ pub fn focus_by_id(_id: &str) {}
 
 pub fn focus_first_in(_within: &str) {}
 
-pub fn focus_card(_within: &str, _to: &str) {}
+pub fn focus_card(_within: &str, _to: &str, _keep: &str) {}
 
 pub fn refocus_if_lost(_to: &str) {}
 
