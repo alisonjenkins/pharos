@@ -2872,13 +2872,21 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     } else {
         Vec::new()
     };
+    // Play opens the first song: an album folder can also hold a clip.
+    let first_song = tracks
+        .items
+        .iter()
+        .find(|t| t.kind == ItemKind::Audio)
+        .map(|t| t.id);
     let lead = (!tracks.items.is_empty()).then(|| {
         rsx! {
-            AlbumPlay {
-                album: detail.item.id,
-                name: detail.item.name.clone(),
-                first: first_track,
-                tracks: whole.clone(),
+            if let Some(first) = first_song {
+                AlbumPlay {
+                    album: detail.item.id,
+                    name: detail.item.name.clone(),
+                    first,
+                    tracks: whole.clone(),
+                }
             }
             QueueButtons {
                 name: detail.item.name.clone(),
@@ -2936,8 +2944,9 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 /// whole album, fetched when the page holds only part of it) and plays the
 /// first of them.
 #[component]
-fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<Item>) -> Element {
+fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) -> Element {
     let queue = try_use_context::<QueueCtx>().map(|q| q.0);
+    let mix = try_use_context::<MixCtx>();
     let nav = try_use_context::<Nav>();
     let ctx = try_use_context::<Ctx>();
     // A group picks what plays, so no shuffling the queue under it.
@@ -2945,11 +2954,18 @@ fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<I
         .as_ref()
         .is_some_and(|t| t.view.read().active);
     let mut note = use_signal(|| None::<String>);
+    // One shuffle at a time: a second press while a long album loads would
+    // otherwise reshuffle the queue and switch the song when it lands.
+    let mut busy = use_signal(|| false);
     let shuffle_label = format!("Shuffle {name}");
     let shuffle = move |_| {
         let (Some(mut queue), Some(nav)) = (queue, nav) else {
             return;
         };
+        if *busy.peek() {
+            return;
+        }
+        busy.set(true);
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
             let found = if tracks.is_empty() {
@@ -2976,6 +2992,11 @@ fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<I
                         .map(Track::from)
                         .collect();
                     let count = songs.len();
+                    // The album replaces a running mix, whose songs would
+                    // otherwise stay ahead of it and keep coming.
+                    if let (false, Some(MixCtx(mut mix))) = (songs.is_empty(), mix) {
+                        mixes::stop(&mut queue.write(), &mut mix.write());
+                    }
                     let start = queue.write().shuffle_album(songs, shuffle_seed());
                     platform::info(&format!(
                         "pharos: album shuffle album={album:?} count={count} started={}",
@@ -2993,17 +3014,16 @@ fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<I
                     note.set(Some(format!("Could not shuffle {name}.")));
                 }
             }
+            busy.set(false);
         });
     };
     rsx! {
-        if let Some(first) = first {
-            Link {
-                to: Route::Watch(first),
-                class: "pharos-button pharos-album-play",
-                key_action: "play",
-                Icon { path: ICON_PLAY }
-                span { "Play" }
-            }
+        Link {
+            to: Route::Watch(first),
+            class: "pharos-button pharos-album-play",
+            key_action: "play",
+            Icon { path: ICON_PLAY }
+            span { "Play" }
         }
         if queue.is_some() && nav.is_some() && !in_group {
             button {
@@ -3011,6 +3031,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<I
                 class: "pharos-button pharos-button-secondary pharos-album-shuffle",
                 "data-key-action": "shuffle",
                 aria_label: "{shuffle_label}",
+                aria_busy: if busy() { "true" } else { "false" },
                 title: "{shuffle_label}",
                 onclick: shuffle,
                 Icon { path: ICON_SHUFFLE }
@@ -5347,6 +5368,28 @@ mod tests {
         );
         // The track list follows, holding the songs.
         assert!(!side.contains("Opener"), "{side}");
+    }
+
+    /// An album folder can hold a clip: Play opens the first song, and an
+    /// album of clips alone offers neither Play nor Shuffle.
+    #[test]
+    fn an_albums_play_opens_its_first_song_not_a_clip() {
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let clip = item(ItemRef::Real(1), ItemKind::Movie, "Clip");
+        let song = item(ItemRef::Real(2), ItemKind::Audio, "Opener");
+        let html = with_queue({
+            let (album, items) = (album.clone(), vec![clip.clone(), song]);
+            move || rsx! { AlbumView { detail: album.clone(), tracks: page(items.clone()) } }
+        });
+        assert!(
+            html.contains(r#"href="/ui/watch/2" class="pharos-button pharos-album-play""#),
+            "{html}"
+        );
+        let html = with_queue(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(vec![clip.clone()]) } }
+        });
+        assert!(!html.contains("pharos-album-play"), "{html}");
+        assert!(!html.contains("pharos-album-shuffle"), "{html}");
     }
 
     #[test]
