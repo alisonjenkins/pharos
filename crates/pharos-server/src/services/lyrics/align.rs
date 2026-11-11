@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pharos_core::MediaItem;
 use reqwest::Client;
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
+use super::eta::Eta;
 use super::shadow::{Shadow, Source};
 use super::{Lyrics, WordStamp};
 
@@ -60,6 +61,39 @@ struct Job {
     path: String,
     lines: Vec<(u64, u64, String)>,
     key: String,
+    /// The song's length, which the time estimate is per second of.
+    duration_ms: u64,
+    queued_at: Instant,
+    /// The estimate given when the job was queued, if there was one.
+    predicted_ms: Option<u64>,
+}
+
+/// How far a job's queue-to-done time was from the estimate given when it was
+/// queued, in seconds, labelled `direction` (`late` or `early`, since a
+/// histogram cannot hold a negative) and `outcome` (`aligned` or `failed`).
+const ETA_ERROR_SECONDS: &str = "pharos_lyrics_align_eta_error_seconds";
+
+impl Job {
+    /// The estimate given at queueing and the time actually taken, for the
+    /// log line; the error between them goes to [`ETA_ERROR_SECONDS`] when
+    /// there was an estimate.
+    fn observe_eta(&self, outcome: &'static str) -> (Option<u64>, u64) {
+        let actual_ms = u64::try_from(self.queued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(predicted_ms) = self.predicted_ms {
+            let direction = if actual_ms > predicted_ms {
+                "late"
+            } else {
+                "early"
+            };
+            metrics::histogram!(ETA_ERROR_SECONDS, "direction" => direction, "outcome" => outcome)
+                .record(actual_ms.abs_diff(predicted_ms) as f64 / 1000.0);
+        }
+        (self.predicted_ms, actual_ms)
+    }
+}
+
+fn clamp_u32(ms: u64) -> u32 {
+    u32::try_from(ms).unwrap_or(u32::MAX)
 }
 
 /// The aligner's answer for a song: word stamps per line, and how far it
@@ -87,8 +121,9 @@ impl Aligned {
 pub enum Lookup {
     /// Word timestamps are ready for every line.
     Ready(Aligned),
-    /// Alignment is queued or currently in flight.
-    Pending,
+    /// Alignment is queued or currently in flight, with the milliseconds
+    /// the server expects it to take from now, when it can tell.
+    Pending(Option<u32>),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
 }
@@ -251,6 +286,10 @@ pub struct Aligner {
     media_root: PathBuf,
     cache: AlignCache,
     pending: Mutex<HashSet<u64>>,
+    /// What a queued song's wait is guessed from.
+    eta: Mutex<Eta>,
+    /// Zero for the `now_ms` the estimator is given.
+    epoch: Instant,
     /// Songs whose last alignment failed, and when to try them again.
     failed: Mutex<HashMap<u64, std::time::Instant>>,
     tx: mpsc::Sender<Job>,
@@ -269,6 +308,8 @@ impl Aligner {
             media_root,
             cache: AlignCache::new(None),
             pending: Mutex::new(HashSet::new()),
+            eta: Mutex::default(),
+            epoch: Instant::now(),
             failed: Mutex::default(),
             tx: mpsc::channel(1).0,
             shadow: None,
@@ -308,6 +349,8 @@ impl Aligner {
             media_root,
             cache,
             pending: Mutex::new(HashSet::new()),
+            eta: Mutex::default(),
+            epoch: Instant::now(),
             failed: Mutex::default(),
             tx,
         });
@@ -318,8 +361,23 @@ impl Aligner {
                 // The aligner joins this span's trace through `traceparent`.
                 let span =
                     tracing::info_span!("lyrics.align", media.id = job.id, lines = job.lines.len());
-                if let Err(e) = worker.process_job(&job).instrument(span).await {
-                    tracing::warn!(media.id = job.id, error = %e, "lyrics: alignment failed");
+                worker.eta_lock().start(job.id, worker.now_ms());
+                let outcome = worker.process_job(&job).instrument(span).await;
+                match &outcome {
+                    Ok(()) => worker
+                        .eta_lock()
+                        .finish(job.id, worker.now_ms(), job.duration_ms),
+                    Err(_) => worker.eta_lock().abort(job.id),
+                }
+                if let Err(e) = outcome {
+                    let (predicted_ms, actual_ms) = job.observe_eta("failed");
+                    tracing::warn!(
+                        media.id = job.id,
+                        error = %e,
+                        eta.predicted_ms = predicted_ms,
+                        eta.actual_ms = actual_ms,
+                        "lyrics: alignment failed"
+                    );
                     let retry = std::time::Instant::now() + RETRY_AFTER;
                     match worker.failed.lock() {
                         Ok(mut f) => f.insert(job.id, retry),
@@ -340,12 +398,23 @@ impl Aligner {
         aligner
     }
 
+    fn eta_lock(&self) -> std::sync::MutexGuard<'_, Eta> {
+        self.eta.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     async fn process_job(&self, job: &Job) -> Result<(), String> {
         let answered = self.request(&job.path, &job.lines, TIMEOUT).await?;
+        let (predicted_ms, actual_ms) = job.observe_eta("aligned");
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
             offset_ms = answered.aligned.offset_ms,
+            eta.predicted_ms = predicted_ms,
+            eta.actual_ms = actual_ms,
             "lyrics: aligned"
         );
         self.store(job.id, job.key.clone(), answered, Source::Song);
@@ -512,7 +581,8 @@ impl Aligner {
         };
 
         if pending.contains(&item.id) {
-            return Lookup::Pending;
+            let left = self.eta_lock().eta_ms(item.id, self.now_ms());
+            return Lookup::Pending(left.map(clamp_u32));
         }
         {
             let mut failed = match self.failed.lock() {
@@ -529,17 +599,27 @@ impl Aligner {
         }
 
         pending.insert(item.id);
+        let duration_ms = item.probe.duration_ms.unwrap_or(0);
+        let predicted_ms = {
+            let mut eta = self.eta_lock();
+            eta.enqueue(item.id, duration_ms);
+            eta.eta_ms(item.id, self.now_ms())
+        };
         let job = Job {
             id: item.id,
             path: rel_path,
             lines: job_lines,
             key,
+            duration_ms,
+            queued_at: Instant::now(),
+            predicted_ms,
         };
 
         match self.tx.try_send(job) {
-            Ok(()) => Lookup::Pending,
+            Ok(()) => Lookup::Pending(predicted_ms.map(clamp_u32)),
             Err(_) => {
                 pending.remove(&item.id);
+                self.eta_lock().forget(item.id);
                 Lookup::Unavailable
             }
         }
@@ -670,6 +750,8 @@ mod tests {
             media_root,
             cache,
             pending: Mutex::new(HashSet::new()),
+            eta: Mutex::default(),
+            epoch: Instant::now(),
             failed: Mutex::default(),
             tx,
             shadow: None,
@@ -722,6 +804,9 @@ mod tests {
             path: "a/song.flac".into(),
             lines: vec![(1000, 2000, "two words".into())],
             key: "k".into(),
+            duration_ms: 0,
+            queued_at: Instant::now(),
+            predicted_ms: None,
         };
 
         // The shadow holds its answer back, and the job still finishes.
@@ -1000,7 +1085,7 @@ mod tests {
         .unwrap();
 
         // 1. First call: Pending, job enqueued.
-        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending);
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
         let job = rx.try_recv().expect("job received");
         assert_eq!(job.id, item.id);
         assert_eq!(job.path, "song.mp3");
@@ -1009,7 +1094,7 @@ mod tests {
         assert_eq!(job.lines[1], (3000, 8000, "Second line".into()));
 
         // 2. Second call while pending: still Pending, no second job enqueued.
-        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending);
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
         assert!(rx.try_recv().is_err());
 
         // 3. Write cache entry for the key.
@@ -1039,10 +1124,140 @@ mod tests {
         // 5. Changed line text yields a different key, triggering Pending again.
         let mut changed_lyrics = lyrics;
         changed_lyrics.lines[0].text = "Changed line".into();
-        assert_eq!(aligner.words_for(&item, &changed_lyrics), Lookup::Pending);
+        assert_eq!(
+            aligner.words_for(&item, &changed_lyrics),
+            Lookup::Pending(None)
+        );
         let job2 = rx.try_recv().expect("second job received");
         assert_ne!(job.key, job2.key);
         assert_eq!(job2.lines[0].2, "Changed line");
+    }
+
+    #[test]
+    fn a_pending_song_is_told_how_long_the_queue_ahead_of_it_will_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        {
+            // Learned: 500 ms of work per second of audio.
+            let mut eta = aligner.eta_lock();
+            eta.enqueue(1, 10_000);
+            eta.start(1, 0);
+            eta.finish(1, 5_000, 10_000);
+        }
+        let mut item = sample_item(song_path);
+        item.probe.duration_ms = Some(20_000);
+        let lyrics = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1000),
+                text: "Line one".into(),
+                words: Vec::new(),
+            }],
+            Origin::SidecarLrc,
+        )
+        .unwrap();
+
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Pending(Some(10_000))
+        );
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Pending(Some(10_000)),
+            "asked again while queued"
+        );
+    }
+
+    fn eta_errors(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) -> Vec<(String, String, f64)> {
+        use metrics_util::debugging::DebugValue;
+        let label = |k: &metrics_util::CompositeKey, name: &str| {
+            k.key()
+                .labels()
+                .find(|l| l.key() == name)
+                .map(|l| l.value().to_owned())
+                .unwrap_or_default()
+        };
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == ETA_ERROR_SECONDS)
+            .flat_map(|(k, _, _, v)| match v {
+                DebugValue::Histogram(values) => values
+                    .into_iter()
+                    .map(|x| (label(&k, "direction"), label(&k, "outcome"), x.into_inner()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// ODD: the estimate's error is on /metrics. Disarm check: with the
+    /// `histogram!` call in `Job::observe_eta` commented out, this fails.
+    #[tokio::test]
+    async fn a_finished_job_reports_how_far_off_its_estimate_was() {
+        use crate::services::lyrics::shadow::tests::{body, fake};
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let answer = Aligned {
+            lines: vec![vec![WordStamp {
+                at: 0,
+                start_ms: 1000,
+            }]],
+            offset_ms: 0,
+            scores: vec![None],
+        };
+        let (base, _got) = fake(200, body(&answer, 2), None).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Aligner {
+            base,
+            ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
+        };
+        let job = Job {
+            id: 42,
+            path: "a/song.flac".into(),
+            lines: vec![(1000, 2000, "Line one".into())],
+            key: "k".into(),
+            duration_ms: 10_000,
+            // Queued 5 s ago with 2 s predicted: about 3 s late.
+            queued_at: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
+            predicted_ms: Some(2_000),
+        };
+        aligner.process_job(&job).await.unwrap();
+
+        let seen = eta_errors(&snapshotter);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (direction, outcome, seconds) = &seen[0];
+        assert_eq!((direction.as_str(), outcome.as_str()), ("late", "aligned"));
+        assert!((3.0..4.0).contains(seconds), "{seconds}");
+    }
+
+    #[test]
+    fn a_job_with_no_estimate_reports_no_error() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let job = Job {
+            id: 1,
+            path: "a/song.flac".into(),
+            lines: Vec::new(),
+            key: "k".into(),
+            duration_ms: 0,
+            queued_at: Instant::now(),
+            predicted_ms: None,
+        };
+        let (predicted, _) = metrics::with_local_recorder(&recorder, || job.observe_eta("failed"));
+        assert_eq!(predicted, None);
+        assert!(eta_errors(&snapshotter).is_empty());
     }
 
     #[test]
@@ -1070,7 +1285,7 @@ mod tests {
         // Once the time has passed it is asked again.
         let past = std::time::Instant::now();
         aligner.failed.lock().unwrap().insert(item.id, past);
-        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending);
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
         assert!(rx.try_recv().is_ok());
     }
 

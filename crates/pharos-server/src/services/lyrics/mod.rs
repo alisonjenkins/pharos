@@ -17,6 +17,7 @@
 pub mod align;
 pub mod cache;
 pub mod embedded;
+pub mod eta;
 pub mod lrc;
 pub mod lrclib;
 pub mod shadow;
@@ -424,6 +425,13 @@ fn local(path: &std::path::Path) -> Option<Lyrics> {
         .or_else(|| sidecar::text(path))
 }
 
+/// Word times are still being worked out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordsPending {
+    /// Milliseconds the server expects that to take from now, when it can tell.
+    pub eta_ms: Option<u32>,
+}
+
 /// A signed-in user's view of an item's lyrics. `Ok(None)` means the item has
 /// none, or is not a song. When `want_words` is true, word timestamps are
 /// filled in from an aligner when ready or flagged as pending.
@@ -432,7 +440,7 @@ pub async fn for_item(
     user: &User,
     id: u64,
     want_words: bool,
-) -> Result<Option<(Lyrics, bool)>, DetailError> {
+) -> Result<Option<(Lyrics, Option<WordsPending>)>, DetailError> {
     crate::services::access::check_item(state, user, id, "item")
         .await
         .map_err(DetailError::Hidden)?;
@@ -446,7 +454,7 @@ pub async fn for_item(
     let Some(mut lyrics) = state.lyrics.find(&item).await else {
         return Ok(None);
     };
-    let mut words_pending = false;
+    let mut words_pending = None;
     if want_words {
         if let Some(aligner) = state.lyrics.aligner.clone() {
             // words_for stats the file and reads the disk cache.
@@ -471,8 +479,8 @@ pub async fn for_item(
                     }
                     start_lines_at_their_first_word(&mut lyrics.lines);
                 }
-                align::Lookup::Pending => {
-                    words_pending = true;
+                align::Lookup::Pending(eta_ms) => {
+                    words_pending = Some(WordsPending { eta_ms });
                 }
                 align::Lookup::Unavailable => {}
             }
