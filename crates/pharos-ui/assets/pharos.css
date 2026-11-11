@@ -730,29 +730,52 @@ input:focus-visible {
   scroll-snap-align: start;
   position: relative;
 }
-/* A resume or Next Up tile plays at once (spec 038 FR-109); this opens its
-   title page. Top right: those rails never hold a watched item. */
-.pharos-poster-info {
-  position: absolute;
-  top: 0.4rem;
-  right: 0.4rem;
-  display: grid;
-  place-items: center;
-  width: 2rem;
-  height: 2rem;
-  border-radius: 9999px;
-  background: var(--px-color-bg);
-  color: var(--px-color-fg);
-  font-weight: 700;
-  font-style: italic;
-  text-decoration: none;
-  opacity: 0.9;
+/* A resume or Next Up tile opens its title page and plays on a hold
+   (spec 038 FR-109, B1340, V1311). Its play link is what a held OK presses
+   on the TV; never drawn, so no arrow or Tab stops on it. The hint shows
+   on the tile under a mouse (below) and on the TV's focused tile. */
+.pharos-poster-play {
+  display: none;
 }
-.pharos-poster-info:hover,
-.pharos-poster-info:focus-visible {
-  opacity: 1;
+.pharos-poster-hold {
+  display: none;
+  position: absolute;
+  left: 50%;
+  bottom: 0.5rem;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.2rem 0.5rem 0.2rem 0.3rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--px-color-bg) 85%, transparent);
+  color: var(--px-color-fg);
+  pointer-events: none;
+}
+.pharos-poster-hold .pharos-icon {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+.pharos-poster-hold-tv {
+  display: none;
+}
+@media (hover: hover) {
+  .pharos-poster:hover .pharos-poster-hold {
+    display: inline-flex;
+  }
+}
+.pharos-poster.is-held .pharos-poster-hold {
+  display: inline-flex;
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
+}
+/* A held finger plays: no link callout or text selection under it. */
+.pharos-rail-items .pharos-poster:has(.pharos-poster-hold) {
+  -webkit-touch-callout: none;
+  user-select: none;
 }
 
 .pharos-grid {
@@ -4903,6 +4926,15 @@ body::before {
 }
 :root[data-device="tv"] .pharos-poster-art::before,
 :root[data-device="tv"] .pharos-poster-art::after {
+  display: none;
+}
+:root[data-device="tv"] .pharos-poster:focus-visible .pharos-poster-hold {
+  display: inline-flex;
+}
+:root[data-device="tv"] .pharos-poster-hold-tv {
+  display: inline;
+}
+:root[data-device="tv"] .pharos-poster-hold-pointer {
   display: none;
 }
 :root[data-device="tv"] * {

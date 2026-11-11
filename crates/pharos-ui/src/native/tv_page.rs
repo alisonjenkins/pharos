@@ -457,6 +457,54 @@ addEventListener("keydown", (e) => {
 }, true);
 "#;
 
+/// How long OK is held on a tile that plays on a hold before it plays
+/// (B1340, V1311). A pointer's hold waits as long (views.rs).
+pub const TILE_HOLD_MS: u32 = 600;
+
+/// OK on a tile that plays on a hold (spec 038 FR-109, B1340, V1311): a
+/// press opens its title page, as the WebView's own click would, and a
+/// hold of [`TILE_HOLD_MS`] presses the tile's undrawn play link (Alison,
+/// 2026-11-11). The WebView's own click is held back on every Enter of the
+/// hold, its repeats included, so a hold never opens the page as well; the
+/// tile turns to its held look once the hold is plainly not a press.
+pub const TILE_HOLD_JS: &str = r#"
+let tileHold = null;
+const tilePlay = (t) => {
+  const tile = t && t.closest && t.closest("a.pharos-poster");
+  const li = tile && tile.parentElement;
+  const play = li && li.querySelector(":scope > a.pharos-poster-play");
+  return play ? { tile, play } : null;
+};
+addEventListener("keydown", (e) => {
+  if (!e.isTrusted || e.key !== "Enter") return;
+  const at = tileHold || tilePlay(e.target);
+  if (!at) return;
+  e.preventDefault();
+  if (tileHold) return;
+  at.started = performance.now();
+  tileHold = at;
+  at.lit = setTimeout(() => at.tile.classList.add("is-held"), 200);
+  at.timer = setTimeout(() => {
+    at.done = true;
+    at.tile.classList.remove("is-held");
+    at.play.click();
+    console.info("pharos: keys: tile ok verdict=play held_ms=" + Math.round(performance.now() - at.started));
+  }, __TILE_HOLD_MS__);
+}, true);
+addEventListener("keyup", (e) => {
+  if (e.key !== "Enter" || !tileHold) return;
+  const at = tileHold;
+  tileHold = null;
+  clearTimeout(at.lit);
+  clearTimeout(at.timer);
+  at.tile.classList.remove("is-held");
+  if (at.done) return;
+  e.preventDefault();
+  at.tile.click();
+  console.info("pharos: keys: tile ok verdict=open held_ms=" + Math.round(performance.now() - at.started));
+}, true);
+"#;
+
 /// The bridge script `template` with its tick intervals, player selectors
 /// and Info key filled in.
 /// What OK on the picture presses instead of pausing, while one shows:
@@ -471,6 +519,8 @@ pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"
 pub fn bridge_script(template: &str) -> String {
     template
         .replace("__BAR_KEYS__", BAR_KEY_JS)
+        .replace("__TILE_HOLD__", TILE_HOLD_JS)
+        .replace("__TILE_HOLD_MS__", &TILE_HOLD_MS.to_string())
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
         .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
         .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
@@ -1186,6 +1236,30 @@ mod tests {
             "{keys}"
         );
         assert!(!keys.contains("__PLAYER_HOME__"), "{keys}");
+    }
+
+    /// B1340, V1311: on the TV, OK on a tile that plays on a hold opens its
+    /// title page, and a hold presses its undrawn play link.
+    #[test]
+    fn ok_on_a_play_at_once_tile_opens_its_title_and_a_hold_plays() {
+        let hold = bridge_script("__TILE_HOLD__");
+        assert!(!hold.contains("__"), "{hold}");
+        assert!(hold.contains(&format!("}}, {TILE_HOLD_MS});")), "{hold}");
+        assert!(hold.contains("a.pharos-poster-play"), "{hold}");
+        let Some((held, press)) = hold.split_once(r#"addEventListener("keyup""#) else {
+            panic!("no keyup handler: {hold}");
+        };
+        assert!(
+            held.contains("at.play.click();") && !held.contains("at.tile.click();"),
+            "a hold plays: {held}"
+        );
+        assert!(
+            press.contains("at.tile.click();") && !press.contains("at.play.click();"),
+            "a press opens the title page: {press}"
+        );
+        for verdict in ["verdict=play", "verdict=open"] {
+            assert!(hold.contains(verdict), "{verdict} logged: {hold}");
+        }
     }
 
     #[test]
