@@ -733,9 +733,9 @@ pub fn focus_by_id(id: &str) {
 
 /// Give the focus to `to`, a card that just appeared over the video (Skip
 /// intro, Up Next), when the remote is on the picture or its control row,
-/// or the focus went with a card this one replaced: not while it scrubs, nor
-/// in the settings sheet, the queue or the invite panel (B1342). When `keep`
-/// was the last control focused (the pill's Cancel, as the pill grows into
+/// or the focus went with a card this one replaced: not while it scrubs or
+/// the settings sheet is open, nor from the queue or the invite panel
+/// (B1342). When `keep` was the last control focused (the pill's Cancel, as the pill grows into
 /// the full card), `keep` takes it instead, so OK still does what it did.
 /// The page applies a render's DOM edits on its own schedule, so the card
 /// may not be there yet: a few tries, a frame apart.
@@ -748,10 +748,10 @@ pub fn focus_card(within: &str, to: &str, keep: &str) {
            if (!t) {{ if (n > 0) setTimeout(() => go(n - 1), 50); return; }} \
            const a = document.activeElement; \
            const lost = !a || a === document.body; \
-           const scrubbing = !!document.querySelector('.pharos-seek.is-scrubbing'); \
+           const busy = !!document.querySelector('.pharos-seek.is-scrubbing, .pharos-control-menus.is-open'); \
            const row = a && a.closest && a.closest('.pharos-control-row') && \
              !a.closest('.pharos-control-menus'); \
-           if (w && !scrubbing && (lost || a === w || row)) {{ \
+           if (w && !busy && (lost || a === w || row)) {{ \
              t.focus({{preventScroll: true}}); \
              console.info('pharos: card focus to=' + t.id); \
            }} \
