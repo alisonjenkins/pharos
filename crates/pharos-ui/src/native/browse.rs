@@ -2958,6 +2958,9 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
     // One shuffle at a time: a second press while a long album loads would
     // otherwise reshuffle the queue and switch the song when it lands.
     let mut busy = use_signal(|| false);
+    // Bumped by every Play and Shuffle: a shuffle whose album lands after a
+    // later press leaves the queue to that press.
+    let mut pressed = use_signal(|| 0u64);
     let shuffle_label = format!("Shuffle {name}");
     let shuffle = move |_| {
         let (Some(mut queue), Some(nav)) = (queue, nav) else {
@@ -2967,6 +2970,8 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             return;
         }
         busy.set(true);
+        let ticket = *pressed.peek() + 1;
+        pressed.set(ticket);
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
             let found = if tracks.is_empty() {
@@ -2985,6 +2990,13 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             } else {
                 Ok(tracks)
             };
+            if *pressed.peek() != ticket {
+                platform::info(&format!(
+                    "pharos: album shuffle dropped album={album:?} reason=later press"
+                ));
+                busy.set(false);
+                return;
+            }
             match found {
                 Ok(items) => {
                     let songs: Vec<Track> = items
@@ -3027,6 +3039,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             return;
         }
         evt.prevent_default();
+        pressed += 1;
         if let (Some(mut queue), Some(MixCtx(mut mix))) = (queue, mix) {
             if mix.peek().is_some() {
                 mixes::stop(&mut queue.write(), &mut mix.write());
