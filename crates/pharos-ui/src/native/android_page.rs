@@ -675,7 +675,7 @@ pub async fn styled_subtitles(
             Err(e) => format!("failed: eval {e}"),
         };
         let took_ms = now_ms() - at;
-        // A paused video's answer adds ` paused_redraw=ok` or why it failed.
+        // A paused video's answer adds ` paused_redraw=ok`.
         if let Some(paused_redraw) = answer.strip_prefix("ready") {
             log::info!(
                 "pharos: styled subtitles run={id} outcome=ready took_ms={took_ms:.0}{paused_redraw}"
