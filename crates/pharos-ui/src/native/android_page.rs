@@ -2154,7 +2154,9 @@ addEventListener("keydown", (e) => {
 // panel follows the song, so a walk down its lines never left it.
 const inPanels = (el, player, r) => {
   for (let p = el.parentElement; p && p !== player; p = p.parentElement) {
-    if (getComputedStyle(p).overflowY === "visible") continue;
+    // The TV settings sheet scrolls under the remote (B1338): its clipped
+    // rows stay stops, and the focus scrolls them into view.
+    if (getComputedStyle(p).overflowY === "visible" || p.matches(".pharos-control-menus")) continue;
     const b = p.getBoundingClientRect();
     if (r.bottom <= b.top + 0.5 || r.top >= b.bottom - 0.5) return false;
   }
@@ -2205,6 +2207,7 @@ addEventListener("keydown", (e) => {
     if (!to && e.key === "ArrowUp") to = player;
   }
   if (to) to.focus({ preventScroll: true });
+  if (to && to !== player && to.closest(".pharos-control-menus")) to.scrollIntoView({ block: "nearest" });
 }, true);
 addEventListener("keydown", (e) => {
   // An arrow the focused field does not keep leaves it: it is no longer
