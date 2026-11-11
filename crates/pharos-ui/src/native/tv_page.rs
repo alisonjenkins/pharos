@@ -604,6 +604,23 @@ pub struct KeyContext {
     pub on_button: bool,
     /// The focus is on a field: text, a text area or a slider (FR-606).
     pub field: bool,
+    /// A held arrow's repeat, sent only from outside the player (B1337).
+    pub repeat: bool,
+}
+
+/// The most focus moves waiting behind the one running. Taps queue so none
+/// is lost to a slow move.
+pub const MOVES_WAITING: usize = 3;
+
+/// Whether a focus move asked for while one runs and `waiting` more wait
+/// joins them. A held key's repeat joins only an empty queue, so a hold
+/// never runs on after the key is let go (B1337).
+pub fn queues_move(waiting: usize, repeat: bool) -> bool {
+    if repeat {
+        waiting == 0
+    } else {
+        waiting < MOVES_WAITING
+    }
 }
 
 /// The neighbour a remote's next or previous key asks for (FR-609).
@@ -1450,6 +1467,36 @@ mod tests {
         };
         assert!(!forwards_to_player(" ", on_button));
         assert!(forwards_to_player("ArrowRight", on_button));
+    }
+
+    #[test]
+    fn a_held_arrow_says_it_repeats() {
+        let key = serde_json::json!({"t": "key", "key": "ArrowDown", "repeat": true});
+        let Some(Bridge::Key { at, .. }) = parse_bridge(&key) else {
+            panic!("not a key");
+        };
+        assert!(at.repeat);
+        let tap = serde_json::json!({"t": "key", "key": "ArrowDown"});
+        let Some(Bridge::Key { at, .. }) = parse_bridge(&tap) else {
+            panic!("not a key");
+        };
+        assert!(!at.repeat, "a press without the field is not a repeat");
+    }
+
+    #[test]
+    fn a_repeat_waits_behind_at_most_one_move_and_taps_queue() {
+        assert!(
+            queues_move(0, true),
+            "a repeat waits behind the running move"
+        );
+        assert!(
+            !queues_move(1, true),
+            "repeats never pile up behind a slow move"
+        );
+        for waiting in 0..MOVES_WAITING {
+            assert!(queues_move(waiting, false), "tap {waiting} is kept");
+        }
+        assert!(!queues_move(MOVES_WAITING, false));
     }
 
     #[test]

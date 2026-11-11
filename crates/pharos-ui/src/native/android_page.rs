@@ -838,13 +838,41 @@ pub fn on_mode_key(on_key: impl FnMut(&str) -> bool + 'static) -> KeyListener {
 /// focuses. True at once: the page's script already kept the arrow from
 /// the WebView's own navigation.
 pub fn move_focus(dir: super::keymap::Dir) -> bool {
+    let repeat = lock(&KEY_AT).repeat;
+    {
+        let mut moves = lock(&MOVES);
+        if moves.running {
+            if tv_page::queues_move(moves.waiting.len(), repeat) {
+                moves.waiting.push_back(dir);
+            }
+            return true;
+        }
+        moves.running = true;
+    }
+    // One move at a time: two at once both read the same focus and land on
+    // the same control.
     spawn_detached(async move {
-        if let Err(e) = move_focus_now(dir).await {
-            log::warn!("pharos: keys: move failed error={e}");
+        let mut next = Some(dir);
+        while let Some(dir) = next {
+            if let Err(e) = move_focus_now(dir).await {
+                log::warn!("pharos: keys: move failed error={e}");
+            }
+            let mut moves = lock(&MOVES);
+            next = moves.waiting.pop_front();
+            moves.running = next.is_some();
         }
     });
     true
 }
+
+/// The focus moves running and waiting (`move_focus`).
+#[derive(Default)]
+struct Moves {
+    running: bool,
+    waiting: std::collections::VecDeque<super::keymap::Dir>,
+}
+
+static MOVES: LazyLock<Mutex<Moves>> = LazyLock::new(Mutex::default);
 
 /// Enter on the focused control: the WebView clicks it itself, since the
 /// page's script leaves Enter alone.
@@ -1843,6 +1871,7 @@ static KEY_AT: Mutex<tv_page::KeyContext> = Mutex::new(tv_page::KeyContext {
     in_player: false,
     on_button: false,
     field: false,
+    repeat: false,
 });
 /// What `probe_capabilities` found.
 static CAPS: Mutex<Option<Capabilities>> = Mutex::new(None);
@@ -2123,14 +2152,18 @@ addEventListener("keydown", (e) => {
   // A held arrow repeats (the player's scrub speeds up on it): the WebView
   // must not move the focus on the repeats either. Rust hears the first.
   if (!text && takes.has(e.key)) e.preventDefault();
-  if (e.repeat) return;
   const player = document.querySelector(players);
   const at = document.activeElement;
+  const inPlayer = !!(player && at && player.contains(at));
+  // A held arrow outside the player keeps moving the focus (B1337): Rust
+  // hears its repeats and runs at most one behind the move in hand.
+  const moves = e.key.startsWith("Arrow") && !text && !prevented && !e.ctrlKey && !e.metaKey && !inPlayer;
+  if (e.repeat && !moves) return;
   send({
     t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text, prevented,
-    player: !!player, in_player: !!(player && at && player.contains(at)),
+    player: !!player, in_player: inPlayer,
     on_button: !!(at && at.matches && at.matches("a[href], button")),
-    field,
+    field, repeat: e.repeat,
   });
 });
 // The WebView takes the remote's Back only while it has a page to go back
@@ -2317,10 +2350,13 @@ fn on_bridge(message: Bridge) {
                 );
                 return;
             }
-            for f in &listeners {
-                if let Ok(mut f) = f.try_lock() {
-                    if let Listener::App(f) = &mut f.0 {
-                        taken |= f(&key, ctrl, meta);
+            // As on the web, a held key's repeats reach only the mode keys.
+            if !at.repeat {
+                for f in &listeners {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::App(f) = &mut f.0 {
+                            taken |= f(&key, ctrl, meta);
+                        }
                     }
                 }
             }
