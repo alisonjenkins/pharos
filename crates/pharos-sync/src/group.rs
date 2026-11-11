@@ -5578,6 +5578,9 @@ mod tests {
     /// dissolved WHOLE — never thinned member by member.
     #[tokio::test(start_paused = true)]
     async fn a_group_nobody_returns_to_is_dissolved_whole() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (h, sinks) = spawn_group();
         let a = MemberId::new();
         let b = MemberId::new();
@@ -5616,6 +5619,32 @@ mod tests {
             h.tx.is_closed(),
             "an abandoned group must dissolve, or orphans haunt the join picker"
         );
+        assert_eq!(dissolved_count(&snapshotter, DissolveCause::Abandoned), 1);
+        assert_eq!(dissolved_count(&snapshotter, DissolveCause::Idle), 0);
+    }
+
+    /// How many times `pharos_syncplay_group_dissolved_total{cause}` was
+    /// counted, as `snapshotter` saw it.
+    fn dissolved_count(
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+        cause: DissolveCause,
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let ours = k.name() == "pharos_syncplay_group_dissolved_total"
+                    && k.labels()
+                        .any(|l| l.key() == "cause" && l.value() == cause.label());
+                match (ours, v) {
+                    (true, DebugValue::Counter(n)) => Some(n),
+                    _ => None,
+                }
+            })
+            .sum()
     }
 
     /// Advance paused time one prune tick at a time for `ms`, pinging `ids`
@@ -5646,6 +5675,9 @@ mod tests {
     /// `GroupLeft` so its client stops rejoining. Before it, the group stays.
     #[tokio::test(start_paused = true)]
     async fn a_connected_group_nothing_plays_in_ends_after_the_idle_limit() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (h, sinks) = spawn_group();
         let a = MemberId::new();
         let b = MemberId::new();
@@ -5673,6 +5705,8 @@ mod tests {
             }
             assert!(told, "member {name} must be told its group ended");
         }
+        assert_eq!(dissolved_count(&snapshotter, DissolveCause::Idle), 1);
+        assert_eq!(dissolved_count(&snapshotter, DissolveCause::Abandoned), 0);
     }
 
     /// B1362 — playing is what keeps a group: one that plays through the idle
