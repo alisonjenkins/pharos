@@ -1045,7 +1045,7 @@ pub fn WatchView(
                 }
                 div { class: "pharos-watch-top",
                     button {
-                        class: "pharos-control",
+                        class: "pharos-control is-icon",
                         r#type: "button",
                         aria_label: "Back",
                         onclick: move |_| on_control.call(Control::Back),
@@ -1160,7 +1160,7 @@ pub fn WatchView(
                     }
                     div { class: "pharos-control-row",
                         button {
-                            class: "pharos-control",
+                            class: "pharos-control is-icon",
                             r#type: "button",
                             aria_label: if media.paused { "Play" } else { "Pause" },
                             onclick: move |_| on_control.call(Control::TogglePlay),
@@ -1168,7 +1168,7 @@ pub fn WatchView(
                         }
                         if let Some(id) = c.previous {
                             button {
-                                class: "pharos-control",
+                                class: "pharos-control is-icon",
                                 r#type: "button",
                                 aria_label: "Previous episode",
                                 onclick: move |_| on_control.call(Control::Play(id)),
@@ -1177,7 +1177,7 @@ pub fn WatchView(
                         }
                         if let Some(id) = c.next {
                             button {
-                                class: "pharos-control",
+                                class: "pharos-control is-icon",
                                 r#type: "button",
                                 aria_label: if next_queued { "Next in the queue" } else { "Next episode" },
                                 onclick: move |_| on_control.call(Control::Play(id)),
@@ -1218,6 +1218,7 @@ pub fn WatchView(
                             tracks: c.audio.clone(),
                             pick: c.audio_pick,
                             offer_off: false,
+                            caption: true,
                             on_pick: move |p: Option<u32>| {
                                 if let Some(i) = p {
                                     on_control.call(Control::Audio(i));
@@ -1229,6 +1230,7 @@ pub fn WatchView(
                             tracks: c.subtitles.clone(),
                             pick: c.subtitle_pick,
                             offer_off: true,
+                            caption: true,
                             on_pick: move |p| on_control.call(Control::Subtitle(p)),
                         }
                         SubtitleSizePicker {
@@ -1303,7 +1305,7 @@ pub fn WatchView(
                         }
                         if platform::pip_supported() {
                             button {
-                                class: "pharos-control",
+                                class: "pharos-control is-icon",
                                 r#type: "button",
                                 aria_label: "Picture in picture",
                                 title: "Picture in picture",
@@ -1316,7 +1318,7 @@ pub fn WatchView(
                         // The TV app always fills the screen (B1339).
                         if platform::fullscreen_supported() {
                             button {
-                                class: "pharos-control",
+                                class: "pharos-control is-icon",
                                 r#type: "button",
                                 aria_label: "Fullscreen",
                                 onclick: move |_| on_control.call(Control::Fullscreen),
@@ -1831,17 +1833,19 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
         return rsx! {};
     }
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-track-mode",
-            aria_label: "Tracks",
-            title: "Tracks",
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                on_change.call(evt.value() == "me");
-                after_pick();
-            },
-            option { value: "follow", selected: !own_tracks, "Follow group" }
-            option { value: "me", selected: own_tracks, "Just me" }
+        SheetRow { caption: "Tracks",
+            select {
+                class: "pharos-track-picker pharos-track-mode",
+                aria_label: "Tracks",
+                title: "Tracks",
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    on_change.call(evt.value() == "me");
+                    after_pick();
+                },
+                option { value: "follow", selected: !own_tracks, "Follow group" }
+                option { value: "me", selected: own_tracks, "Just me" }
+            }
         }
     }
 }
@@ -1945,6 +1949,9 @@ pub(super) fn TrackPicker(
     pick: Option<u32>,
     offer_off: bool,
     on_pick: EventHandler<Option<u32>>,
+    /// Captions the menu as a row of the player's settings sheet.
+    #[props(default)]
+    caption: bool,
 ) -> Element {
     let wake = try_use_context::<Wake>();
     let worth_showing = if offer_off {
@@ -1955,7 +1962,7 @@ pub(super) fn TrackPicker(
     if !worth_showing {
         return rsx! {};
     }
-    rsx! {
+    let menu = rsx! {
         select {
             class: "pharos-track-picker",
             aria_label: label,
@@ -1977,6 +1984,28 @@ pub(super) fn TrackPicker(
                 }
             }
         }
+    };
+    if caption {
+        rsx! { SheetRow { caption: label, {menu} } }
+    } else {
+        menu
+    }
+}
+
+/// One menu of the player's settings sheet, under its caption (B1358). In
+/// the wide bar the row draws no box of its own and the caption is hidden,
+/// unless `inline` keeps it beside the menu.
+#[component]
+fn SheetRow(caption: &'static str, #[props(default)] inline: bool, children: Element) -> Element {
+    rsx! {
+        div { class: "pharos-sheet-row",
+            span {
+                class: if inline { "pharos-sheet-caption is-inline" } else { "pharos-sheet-caption" },
+                aria_hidden: "true",
+                "{caption}"
+            }
+            {children}
+        }
     }
 }
 
@@ -1989,21 +2018,23 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
         return rsx! {};
     }
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-subtitle-size-picker",
-            aria_label: "Subtitle size",
-            title: "Subtitle size",
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                on_pick.call(Control::SubtitleSize(SubtitleSize::parse(&evt.value())));
-                after_pick();
-            },
-            for each in SubtitleSize::ALL {
-                option {
-                    key: "{each.as_str()}",
-                    value: "{each.as_str()}",
-                    selected: each == size,
-                    "Size: {each.label()}"
+        SheetRow { caption: "Size", inline: true,
+            select {
+                class: "pharos-track-picker pharos-subtitle-size-picker",
+                aria_label: "Subtitle size",
+                title: "Subtitle size",
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    on_pick.call(Control::SubtitleSize(SubtitleSize::parse(&evt.value())));
+                    after_pick();
+                },
+                for each in SubtitleSize::ALL {
+                    option {
+                        key: "{each.as_str()}",
+                        value: "{each.as_str()}",
+                        selected: each == size,
+                        "{each.label()}"
+                    }
                 }
             }
         }
@@ -2019,21 +2050,23 @@ fn ViewModePicker(show: bool, mode: ViewMode, on_pick: EventHandler<Control>) ->
         return rsx! {};
     }
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-view-mode-picker",
-            aria_label: "3D view",
-            title: "3D view",
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                on_pick.call(Control::ViewMode(ViewMode::parse(&evt.value())));
-                after_pick();
-            },
-            for each in ViewMode::ALL {
-                option {
-                    key: "{each.as_str()}",
-                    value: "{each.as_str()}",
-                    selected: each == mode,
-                    "{each.label()}"
+        SheetRow { caption: "3D",
+            select {
+                class: "pharos-track-picker pharos-view-mode-picker",
+                aria_label: "3D view",
+                title: "3D view",
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    on_pick.call(Control::ViewMode(ViewMode::parse(&evt.value())));
+                    after_pick();
+                },
+                for each in ViewMode::ALL {
+                    option {
+                        key: "{each.as_str()}",
+                        value: "{each.as_str()}",
+                        selected: each == mode,
+                        "{each.label()}"
+                    }
                 }
             }
         }
@@ -2079,33 +2112,35 @@ fn SubtitleDelay(show: bool, delay_ms: i64, on_pick: EventHandler<Control>) -> E
     }
     let label = delay_label(delay_ms);
     rsx! {
-        div {
-            class: "pharos-subtitle-delay",
-            role: "group",
-            aria_label: "Subtitle delay",
-            button {
-                class: "pharos-control",
-                r#type: "button",
-                aria_label: "Subtitles earlier",
-                title: "Subtitles 0.1 s earlier",
-                onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, -1))),
-                "−"
-            }
-            button {
-                class: "pharos-subtitle-delay-value",
-                r#type: "button",
-                title: "Reset the subtitle delay",
-                aria_label: "Subtitle delay {label}, reset",
-                onclick: move |_| on_pick.call(Control::SubtitleDelay(0)),
-                "Delay {label}"
-            }
-            button {
-                class: "pharos-control",
-                r#type: "button",
-                aria_label: "Subtitles later",
-                title: "Subtitles 0.1 s later",
-                onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, 1))),
-                "+"
+        SheetRow { caption: "Delay",
+            div {
+                class: "pharos-subtitle-delay",
+                role: "group",
+                aria_label: "Subtitle delay",
+                button {
+                    class: "pharos-control",
+                    r#type: "button",
+                    aria_label: "Subtitles earlier",
+                    title: "Subtitles 0.1 s earlier",
+                    onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, -1))),
+                    "−"
+                }
+                button {
+                    class: "pharos-subtitle-delay-value",
+                    r#type: "button",
+                    title: "Reset the subtitle delay",
+                    aria_label: "Subtitle delay {label}, reset",
+                    onclick: move |_| on_pick.call(Control::SubtitleDelay(0)),
+                    "{label}"
+                }
+                button {
+                    class: "pharos-control",
+                    r#type: "button",
+                    aria_label: "Subtitles later",
+                    title: "Subtitles 0.1 s later",
+                    onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, 1))),
+                    "+"
+                }
             }
         }
     }
@@ -2114,12 +2149,13 @@ fn SubtitleDelay(show: bool, delay_ms: i64, on_pick: EventHandler<Control>) -> E
 /// The speeds the speed menu offers.
 pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
-/// The speed menu's label for `speed`: "Speed: Normal", "Speed: 1.5×".
+/// The speed menu's label for `speed`, under its "Speed" caption:
+/// "Normal", "1.5×".
 pub fn speed_label(speed: f64) -> String {
     if speed == 1.0 {
-        "Speed: Normal".to_owned()
+        "Normal".to_owned()
     } else {
-        format!("Speed: {speed}×")
+        format!("{speed}×")
     }
 }
 
@@ -2130,24 +2166,26 @@ fn SpeedPicker(speed: f64, in_group: bool, on_pick: EventHandler<Control>) -> El
     let wake = try_use_context::<Wake>();
     let speed = if in_group || speed <= 0.0 { 1.0 } else { speed };
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-speed-picker",
-            aria_label: "Speed",
-            title: if in_group { "The group keeps everyone at normal speed" } else { "Speed" },
-            disabled: in_group,
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                if let Ok(rate) = evt.value().parse::<f64>() {
-                    on_pick.call(Control::Speed(rate));
-                }
-                after_pick();
-            },
-            for each in SPEEDS {
-                option {
-                    key: "{each}",
-                    value: "{each}",
-                    selected: each == speed,
-                    {speed_label(each)}
+        SheetRow { caption: "Speed",
+            select {
+                class: "pharos-track-picker pharos-speed-picker",
+                aria_label: "Speed",
+                title: if in_group { "The group keeps everyone at normal speed" } else { "Speed" },
+                disabled: in_group,
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    if let Ok(rate) = evt.value().parse::<f64>() {
+                        on_pick.call(Control::Speed(rate));
+                    }
+                    after_pick();
+                },
+                for each in SPEEDS {
+                    option {
+                        key: "{each}",
+                        value: "{each}",
+                        selected: each == speed,
+                        {speed_label(each)}
+                    }
                 }
             }
         }
@@ -2166,22 +2204,24 @@ fn VersionPicker(
         return rsx! {};
     }
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-version-picker",
-            aria_label: "Version",
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                if let Ok(i) = evt.value().parse::<usize>() {
-                    on_pick.call(Control::Version(i));
-                }
-                after_pick();
-            },
-            for (i, (id, label)) in versions.into_iter().enumerate() {
-                option {
-                    key: "{id}",
-                    value: "{i}",
-                    selected: id == version,
-                    "{label}"
+        SheetRow { caption: "Version",
+            select {
+                class: "pharos-track-picker pharos-version-picker",
+                aria_label: "Version",
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    if let Ok(i) = evt.value().parse::<usize>() {
+                        on_pick.call(Control::Version(i));
+                    }
+                    after_pick();
+                },
+                for (i, (id, label)) in versions.into_iter().enumerate() {
+                    option {
+                        key: "{id}",
+                        value: "{i}",
+                        selected: id == version,
+                        "{label}"
+                    }
                 }
             }
         }
@@ -2195,29 +2235,31 @@ fn QualityPicker(quality: QualityView, height: u32, on_pick: EventHandler<Contro
     let wake = try_use_context::<Wake>();
     let title = quality.title();
     rsx! {
-        select {
-            class: "pharos-track-picker pharos-quality-picker",
-            aria_label: "Quality",
-            title,
-            onkeydown: move |evt| menu_key(evt, wake),
-            onchange: move |evt: FormEvent| {
-                let value = evt.value();
-                let control = if value == quality::RESET_AUTO {
-                    Some(Control::ResetAutoQuality)
-                } else {
-                    value.parse::<u64>().ok().map(Control::Quality)
-                };
-                if let Some(control) = control {
-                    on_pick.call(control);
-                }
-                after_pick();
-            },
-            for (value, text) in quality.options(height) {
-                option {
-                    key: "{value}",
-                    value: "{value}",
-                    selected: value.parse::<u64>().is_ok_and(|bps| bps == quality.manual),
-                    "{text}"
+        SheetRow { caption: "Quality",
+            select {
+                class: "pharos-track-picker pharos-quality-picker",
+                aria_label: "Quality",
+                title,
+                onkeydown: move |evt| menu_key(evt, wake),
+                onchange: move |evt: FormEvent| {
+                    let value = evt.value();
+                    let control = if value == quality::RESET_AUTO {
+                        Some(Control::ResetAutoQuality)
+                    } else {
+                        value.parse::<u64>().ok().map(Control::Quality)
+                    };
+                    if let Some(control) = control {
+                        on_pick.call(control);
+                    }
+                    after_pick();
+                },
+                for (value, text) in quality.options(height) {
+                    option {
+                        key: "{value}",
+                        value: "{value}",
+                        selected: value.parse::<u64>().is_ok_and(|bps| bps == quality.manual),
+                        "{text}"
+                    }
                 }
             }
         }
@@ -2569,8 +2611,17 @@ mod tests {
         c.subtitle_size = SubtitleSize::Large;
         let html = render(c.clone());
         assert!(html.contains("pharos-subtitle-size-picker"), "{html}");
+        assert!(
+            html.contains(
+                r#"<span aria-hidden="true" class="pharos-sheet-caption is-inline">Size</span>"#
+            ),
+            "the menu keeps its caption beside it in the wide bar (B1358): {html}"
+        );
         for size in SubtitleSize::ALL {
-            assert!(html.contains(&format!("Size: {}", size.label())), "{html}");
+            assert!(
+                html.contains(&format!(">{}</option>", size.label())),
+                "{html}"
+            );
         }
         c.subtitles.clear();
         assert!(!render(c).contains("pharos-subtitle-size-picker"));
@@ -2874,11 +2925,15 @@ mod tests {
         c.speed = 1.5;
         let html = render(c.clone());
         assert!(
-            html.contains(r#"<option value="1.5" selected=true>Speed: 1.5×</option>"#),
+            html.contains(r#"<option value="1.5" selected=true>1.5×</option>"#),
             "{html}"
         );
         assert!(
-            html.contains("Speed: Normal") && html.contains("Speed: 2×"),
+            html.contains(">Normal</option>") && html.contains(">2×</option>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="pharos-sheet-caption">Speed</span>"#),
             "{html}"
         );
         let speed_menu = |html: &str| {
@@ -2897,7 +2952,7 @@ mod tests {
         let grouped = dioxus_ssr::render(&dom);
         assert!(grouped.contains("disabled=true"), "{grouped}");
         assert!(
-            grouped.contains(r#"<option value="1" selected=true>Speed: Normal</option>"#),
+            grouped.contains(r#"<option value="1" selected=true>Normal</option>"#),
             "the group plays at normal speed: {grouped}"
         );
     }
@@ -2921,7 +2976,11 @@ mod tests {
         let mut c = controls();
         c.subtitle_delay_ms = 300;
         let html = render(c.clone());
-        assert!(html.contains("Delay +0.3 s"), "{html}");
+        assert!(
+            html.contains(r#"class="pharos-sheet-caption">Delay</span>"#)
+                && html.contains(">+0.3 s</button>"),
+            "{html}"
+        );
         c.subtitle_pick = None;
         assert!(
             !render(c).contains("pharos-subtitle-delay"),
@@ -3108,6 +3167,72 @@ mod tests {
         assert!(label.contains("display: inline;"), "{label}");
         // The sheet is one of the overlays the remote's Back closes.
         assert!(super::super::tv_page::OVERLAYS.contains(".pharos-control-menus.is-open"));
+    }
+
+    /// B1358 / V1329: a touch screen keeps the menus in the settings sheet
+    /// at any width, so a phone on its side keeps one bar, and every menu in
+    /// the sheet is a captioned row. A TV keeps its own panel (B1338).
+    #[test]
+    fn on_a_touch_screen_the_menus_wait_in_the_sheet_at_any_width() {
+        let sheet = include_str!("../../assets/pharos.css");
+        // The block under `head` that holds `holding`: a media query can head
+        // several blocks.
+        let block = |head: &str, holding: &str| {
+            sheet
+                .split(&format!("\n{head} {{\n"))
+                .skip(1)
+                .filter_map(|r| r.split("\n}\n").next())
+                .find(|b| b.contains(holding))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let touch = block(
+            "@media (max-width: 40rem), (pointer: coarse)",
+            "pharos-control-menus",
+        );
+        let not_tv = r#":root:not([data-device="tv"])"#;
+        assert!(
+            touch.contains(&format!(
+                "{not_tv} .pharos-control-menus {{\n    display: none;"
+            )),
+            "{touch}"
+        );
+        assert!(
+            touch.contains(&format!(
+                "{not_tv} .pharos-control-menus.is-open {{\n    position: absolute;"
+            )),
+            "{touch}"
+        );
+        assert!(
+            touch.contains(&format!(
+                "{not_tv} .pharos-control-menus.is-open .pharos-sheet-caption {{\n    display: block;"
+            )),
+            "{touch}"
+        );
+        let volume = block("@media (pointer: coarse)", ".pharos-volume");
+        assert!(
+            volume.starts_with("  .pharos-volume {\n    display: none;"),
+            "a phone on its side drops the volume slider too: {volume}"
+        );
+        let side = block(
+            "@media (pointer: coarse) and (min-width: 40.0625rem) and (max-height: 32rem)",
+            "pharos-control-menus",
+        );
+        assert!(side.contains("grid-template-columns: 1fr 1fr;"), "{side}");
+        let html = render(controls());
+        let menus = html
+            .split(r#"id="pharos-player-settings""#)
+            .nth(1)
+            .unwrap_or_default();
+        for caption in ["Audio", "Subtitles", "Size", "Delay", "Speed", "Quality"] {
+            assert!(
+                menus.contains(&format!(r#"pharos-sheet-caption">{caption}</span>"#))
+                    || menus.contains(&format!(
+                        r#"pharos-sheet-caption is-inline">{caption}</span>"#
+                    )),
+                "{caption} has its caption: {menus}"
+            );
+        }
     }
 
     /// B838: on a phone the wrapped control row would sit under a button
