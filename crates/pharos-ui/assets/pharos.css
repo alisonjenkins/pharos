@@ -934,19 +934,8 @@ input:focus-visible {
 }
 .pharos-filter-pill,
 .pharos-sheet-pills .pharos-chip {
-  display: inline-flex;
   flex: none;
-  align-items: center;
-  gap: 0.4rem;
-  min-height: 2.25rem;
-  padding: 0 0.85rem;
-  font-size: 0.9rem;
   white-space: nowrap;
-}
-.pharos-filter-pill .pharos-icon {
-  width: 1.1rem;
-  height: 1.1rem;
-  flex: none;
 }
 .pharos-filter-pill[data-on],
 .pharos-filter-on {
@@ -1429,28 +1418,117 @@ input:focus-visible {
   margin: 0;
   overflow-wrap: anywhere;
 }
-.pharos-button {
-  display: inline-block;
-  padding: 0.6rem 1.25rem;
-  border-radius: 4px;
+/* B1343/V1314 (ADR 0120): one button family. Every button is a slim pill
+   (the library filter row's shape); a theme with square corners gets square
+   ones, since 0 * 999 is 0. The kind says how much the action matters:
+   primary (the accent, one per view), secondary (everything else, and
+   toggles via aria-pressed), quiet (Back, Cancel, icons), danger. `.pharos-chip`
+   is the secondary kind under its older name. The sizes are variables on
+   :root so a device (TV, touch) changes them in one place. */
+:root {
+  --pharos-button-h: 2.25rem;
+  --pharos-button-h-small: 1.75rem;
+  --pharos-button-font: 0.9rem;
+  --pharos-button-font-small: 0.8rem;
+}
+/* A 44px touch target on phones and tablets (WCAG 2.5.5). */
+@media (pointer: coarse) {
+  :root {
+    --pharos-button-h: 2.75rem;
+    --pharos-button-h-small: 2.25rem;
+  }
+}
+.pharos-button,
+.pharos-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  box-sizing: border-box;
+  min-height: var(--pharos-button-h);
+  padding: 0 0.95rem;
+  border: var(--px-border) solid var(--px-color-accent);
+  border-radius: calc(var(--px-radius) * 999);
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
+  font: inherit;
+  font-size: var(--pharos-button-font);
   font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
   text-decoration: none;
   cursor: pointer;
-  text-align: center;
-  transition: opacity 0.1s ease;
+  transition:
+    background var(--px-motion-duration) var(--px-motion-easing),
+    border-color var(--px-motion-duration) var(--px-motion-easing),
+    filter var(--px-motion-duration) var(--px-motion-easing);
 }
 .pharos-button:hover {
-  opacity: 0.9;
+  filter: brightness(1.1);
 }
-/* The quieter action beside the main one: Play from start, Mark watched. */
-.pharos-button-secondary {
+.pharos-button:disabled,
+.pharos-chip:disabled {
+  opacity: 0.45;
+  filter: none;
+  cursor: default;
+}
+.pharos-button .pharos-icon,
+.pharos-chip .pharos-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+.pharos-button-secondary,
+.pharos-chip {
+  border-color: var(--px-color-border);
   background: var(--px-color-surface);
   color: var(--px-color-fg);
-  border: 1px solid var(--px-color-border);
-  font: inherit;
-  font-weight: 600;
+  font-weight: 500;
+}
+.pharos-button-secondary:hover,
+.pharos-chip:hover {
+  filter: none;
+  background: var(--px-color-surface-raised);
+}
+.pharos-button-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--px-color-fg);
+  font-weight: 500;
+}
+.pharos-button-quiet:hover {
+  filter: none;
+  background: color-mix(in srgb, var(--px-color-fg) 9%, transparent);
+}
+.pharos-button-danger {
+  border-color: color-mix(in srgb, var(--px-color-danger) 60%, var(--px-color-border));
+  background: transparent;
+  color: var(--px-color-danger);
+}
+.pharos-button-danger:hover {
+  filter: none;
+  background: color-mix(in srgb, var(--px-color-danger) 14%, transparent);
+}
+.pharos-button-danger.is-strong {
+  border-color: var(--px-color-danger);
+  background: var(--px-color-danger);
+  color: var(--px-color-bg);
+}
+.pharos-button.is-small,
+.pharos-chip.is-small {
+  min-height: var(--pharos-button-h-small);
+  gap: 0.3rem;
+  padding: 0 0.7rem;
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-button.is-icon,
+.pharos-chip.is-icon {
+  width: var(--pharos-button-h);
+  padding: 0;
+}
+.pharos-button.is-small.is-icon,
+.pharos-chip.is-small.is-icon {
+  width: var(--pharos-button-h-small);
 }
 /* A favourite mark (B1082): the star takes the accent while it is one. */
 .pharos-favorite.on {
@@ -2068,11 +2146,6 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   align-items: center;
   flex-wrap: wrap;
   gap: 0.5rem;
-}
-.pharos-invite .pharos-button {
-  padding: 0.4rem 0.9rem;
-  font: inherit;
-  font-weight: 600;
 }
 .pharos-invite-note {
   font-size: var(--px-type-step--1);
@@ -3768,16 +3841,8 @@ button.pharos-lyrics-line:focus-visible {
     display: none;
   }
 }
-.pharos-chip {
-  padding: 0.35rem 0.8rem;
-  border: 1px solid var(--px-color-border);
-  border-radius: 999px;
-  background: var(--px-color-surface);
-  color: var(--px-color-fg);
-  font: inherit;
-  cursor: pointer;
-}
-.pharos-chip[aria-pressed="true"] {
+.pharos-chip[aria-pressed="true"],
+.pharos-button-secondary[aria-pressed="true"] {
   background: var(--px-color-accent);
   border-color: var(--px-color-accent);
   color: var(--px-color-accent-fg);
@@ -3786,7 +3851,11 @@ button.pharos-lyrics-line:focus-visible {
   outline: 2px solid var(--px-color-focus);
   outline-offset: 2px;
 }
+/* The listen view keeps its smaller, borderless chips. */
 .pharos-listen .pharos-chip {
+  min-height: 0;
+  padding: 0.35rem 0.8rem;
+  font-weight: inherit;
   border-color: transparent;
   background: transparent;
   color: var(--px-color-fg-muted);
@@ -7517,10 +7586,11 @@ body:has(.pharos-reader) {
 :root[data-device="tv"] .pharos-filters {
   margin-bottom: calc(0.5rem - 12px);
 }
-:root[data-device="tv"] .pharos-filter-pill,
-:root[data-device="tv"] .pharos-sheet-pills .pharos-chip {
-  min-height: 1.9rem;
-  font-size: 0.8rem;
+:root[data-device="tv"] {
+  --pharos-button-h: 1.9rem;
+  --pharos-button-h-small: 1.5rem;
+  --pharos-button-font: 0.8rem;
+  --pharos-button-font-small: 0.72rem;
 }
 /* B1334: the music tab row at the TV filter row's size. */
 :root[data-device="tv"] .pharos-music-bar {
