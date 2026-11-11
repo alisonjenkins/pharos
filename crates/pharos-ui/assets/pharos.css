@@ -4486,6 +4486,10 @@ body::before {
   right: 48px;
   bottom: calc(5.5rem + 19px);
 }
+:root[data-device="tv"] .pharos-up-next,
+:root[data-device="tv"] .pharos-up-next-pill {
+  max-width: calc(100% - 96px);
+}
 /* A TV's GPU is the weakest part of it (the G08 is a Mali on 2.4 GB). Each
    poster's translateZ(0) gave it its own compositor layer, hundreds on a
    home page, and the lift drew blurred shadows and 3D tilt; a backdrop

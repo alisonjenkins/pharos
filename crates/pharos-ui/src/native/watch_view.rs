@@ -2961,6 +2961,12 @@ mod tests {
             .unwrap_or_default();
         assert!(chrome.contains("right: 48px;"), "{chrome}");
         assert!(
+            sheet.contains(
+                ":root[data-device=\"tv\"] .pharos-up-next-pill {\n  max-width: calc(100% - 96px);"
+            ),
+            "a long next-episode name must stay inside the left inset too"
+        );
+        assert!(
             sheet.contains(":root[data-device=\"tv\"] .pharos-watch-top {\n  padding: 27px 48px")
         );
         let name = sheet
