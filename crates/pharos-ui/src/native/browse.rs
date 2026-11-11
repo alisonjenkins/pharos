@@ -2934,6 +2934,7 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 #[component]
 fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) -> Element {
     let queue = try_use_context::<QueueCtx>().map(|q| q.0);
+    let mix = try_use_context::<MixCtx>();
     let nav = try_use_context::<Nav>();
     let ctx = try_use_context::<Ctx>();
     // A group picks what plays, so no shuffling the queue under it.
@@ -2979,6 +2980,11 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
                         .map(Track::from)
                         .collect();
                     let count = songs.len();
+                    // The album replaces a running mix, whose songs would
+                    // otherwise stay ahead of it and keep coming.
+                    if let (false, Some(MixCtx(mut mix))) = (songs.is_empty(), mix) {
+                        mixes::stop(&mut queue.write(), &mut mix.write());
+                    }
                     let start = queue.write().shuffle_album(songs, shuffle_seed());
                     platform::info(&format!(
                         "pharos: album shuffle album={album:?} count={count} started={}",
