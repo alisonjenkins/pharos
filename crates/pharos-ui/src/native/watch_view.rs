@@ -994,7 +994,7 @@ pub fn WatchView(
                 }
                 if c.tap_to_start {
                     button {
-                        class: "pharos-tap-to-start",
+                        class: "pharos-tap-to-start pharos-button",
                         r#type: "button",
                         "data-tap-to-start": "true",
                         onclick: move |_| on_control.call(Control::TogglePlay),
@@ -1019,7 +1019,7 @@ pub fn WatchView(
                                         p { class: "pharos-seek-wait-reason", "{reason}" }
                                     }
                                     button {
-                                        class: "pharos-seek-wait-back",
+                                        class: "pharos-seek-wait-back pharos-button is-on-video",
                                         r#type: "button",
                                         onclick: move |_| on_control.call(Control::ReturnFromSeek(card.back_to_ms)),
                                         "{card.back}"
@@ -1358,7 +1358,7 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
     rsx! {
         button {
             id: SKIP_ID,
-            class: "pharos-skip",
+            class: "pharos-skip pharos-button is-on-video",
             r#type: "button",
             onclick: move |_| on_control.call(Control::Seek(seg.end_ms)),
             {skip_label(seg.kind)}
@@ -1403,14 +1403,14 @@ fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
             span { class: "pharos-up-next-pill-name", "Up next: {card.name}" }
             button {
                 id: UP_NEXT_PLAY_ID,
-                class: "pharos-up-next-pill-play",
+                class: "pharos-up-next-pill-play pharos-button",
                 r#type: "button",
                 onclick: move |_| on_control.call(Control::PlayNext),
                 "Play now"
             }
             button {
                 id: UP_NEXT_CANCEL_ID,
-                class: "pharos-up-next-pill-cancel",
+                class: "pharos-up-next-pill-cancel pharos-button is-on-video",
                 r#type: "button",
                 aria_label: "Cancel up next",
                 onclick: move |_| on_control.call(Control::CancelNext),
@@ -1462,14 +1462,14 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
                 div { class: "pharos-up-next-actions",
                     button {
                         id: UP_NEXT_PLAY_ID,
-                        class: "pharos-up-next-play",
+                        class: "pharos-up-next-play pharos-button",
                         r#type: "button",
                         onclick: move |_| on_control.call(Control::PlayNext),
                         "Play now"
                     }
                     button {
                         id: UP_NEXT_CANCEL_ID,
-                        class: "pharos-up-next-cancel",
+                        class: "pharos-up-next-cancel pharos-button is-on-video",
                         r#type: "button",
                         onclick: move |_| on_control.call(Control::CancelNext),
                         "Cancel"
@@ -3110,6 +3110,38 @@ mod tests {
         assert!(super::super::tv_page::OVERLAYS.contains(".pharos-control-menus.is-open"));
     }
 
+    /// B1363/V1334: the buttons drawn over the video take their look from
+    /// the family's on-video kind; their own rules only place them. Disarm
+    /// check: put `background: rgb(0 0 0 / 0.65);` back on `.pharos-skip`.
+    #[test]
+    fn on_video_buttons_take_their_look_from_the_family() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |selector: &str| {
+            sheet
+                .split(&format!("\n{selector} {{"))
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let on_video = rule(".pharos-button.is-on-video");
+        assert!(on_video.contains("color: #fff;"), "{on_video}");
+        for own in [
+            ".pharos-skip",
+            ".pharos-up-next-pill button",
+            ".pharos-seek-wait-back",
+            ".pharos-tap-to-start",
+        ] {
+            let body = rule(own);
+            assert!(!body.is_empty(), "{own} has a rule");
+            for look in ["background", "border", "color:", "cursor"] {
+                assert!(!body.contains(look), "{own} sets {look}: {body}");
+            }
+        }
+        assert!(!sheet.contains("\n.pharos-up-next-actions button {"));
+        assert!(!sheet.contains("\n.pharos-playback-failure-actions button {"));
+    }
+
     /// B838: on a phone the wrapped control row would sit under a button
     /// held at a fixed `bottom`, so the narrow layout moves it to the top.
     #[test]
@@ -3165,7 +3197,7 @@ mod tests {
     fn the_skip_button_is_a_focus_target_for_the_remote() {
         let html = render(controls());
         assert!(
-            html.contains(r#"<button class="pharos-skip" type="button" id="pharos-skip">"#),
+            html.contains(r#"<button class="pharos-skip pharos-button is-on-video" type="button" id="pharos-skip">"#),
             "{html}"
         );
         for id in [SKIP_ID, UP_NEXT_PLAY_ID] {
