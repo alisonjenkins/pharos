@@ -3796,6 +3796,10 @@ impl PlaybackEngine for HlsJs {
         let start = super::playback::hls_start_position(start_ms);
         js_sys::Reflect::set(&config, &"startPosition".into(), &start.into())
             .map_err(|e| format!("{e:?}"))?;
+        for (key, value) in super::playback::hls_buffer_config() {
+            js_sys::Reflect::set(&config, &key.into(), &value.into())
+                .map_err(|e| format!("hls.js config {key}={value}: {e:?}"))?;
+        }
         let player = HlsPlayer::new(&config);
         let budget = Rc::new(RefCell::new(RecoveryBudget::new()));
         let on_error = {
