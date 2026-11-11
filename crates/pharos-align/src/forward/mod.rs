@@ -169,12 +169,39 @@ pub struct VulkanAligner {
     pub model: vulkan::VulkanModel,
     pub reason: String,
     pub adapter: String,
+    /// The song's largest pool reading after any window so far: cubecl
+    /// frees pages as it reserves new ones, so a reading at the end alone
+    /// can miss the peak.
+    pub song_peak: Option<crate::service::GpuPool>,
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanAligner {
+    pub fn new(model: vulkan::VulkanModel, reason: String, adapter: String) -> Self {
+        Self {
+            model,
+            reason,
+            adapter,
+            song_peak: None,
+        }
+    }
+
+    fn sample_pool(&mut self) {
+        if let Some(now) = self.model.pool() {
+            self.song_peak = Some(self.song_peak.map_or(now, |p| p.max(now)));
+        }
+    }
 }
 
 #[cfg(feature = "vulkan")]
 impl Model for VulkanAligner {
+    fn begin_song(&mut self) {
+        self.song_peak = None;
+    }
+
     fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
-        let peak = self.model.pool()?;
+        self.sample_pool();
+        let peak = self.song_peak.take()?;
         self.model.release();
         let after = self.model.pool()?;
         Some(crate::service::GpuMemory { peak, after })
@@ -207,12 +234,14 @@ impl Model for VulkanAligner {
         )
         .in_scope(|| timed("vulkan", || self.model.logits(&wave)))
         .map_err(ModelError::Device)?;
+        self.sample_pool();
         spans(&logits, pcm.len(), tokens, lead_star)
     }
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

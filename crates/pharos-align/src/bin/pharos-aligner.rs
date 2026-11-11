@@ -214,11 +214,7 @@ fn loader(config: &Config, choice: device::Choice, warmed: Warmed) -> Loader {
                             .map_err(|e| e.to_string())?
                     }
                 };
-                let gpu = VulkanAligner {
-                    model,
-                    reason: reason.clone(),
-                    adapter: adapter.name.clone(),
-                };
+                let gpu = VulkanAligner::new(model, reason.clone(), adapter.name.clone());
                 let weights = gpu_weights.clone();
                 let cpu = Box::new(move || cpu_model(&weights, threads, batch, "gpu_fallback"));
                 Ok(Box::new(Fallback::new(Box::new(gpu), cpu)) as Box<dyn Model>)
