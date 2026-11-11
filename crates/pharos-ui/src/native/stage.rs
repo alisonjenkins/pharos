@@ -1276,10 +1276,35 @@ mod tests {
             "{root}"
         );
         let rail = rule("body:has(.pharos-stage.is-mini) .pharos-letters");
-        assert!(rail.contains("top: calc((100% - 3.5rem) / 2);"), "{rail}");
-        assert!(rail.contains("height: min(calc(100vh - 9.5rem), 36rem);"), "{rail}");
+        assert!(
+            rail.contains("top: calc((100% - var(--pharos-mini-h)) / 2);"),
+            "{rail}"
+        );
+        assert!(
+            rail.contains("height: min(calc(100vh - 6rem - var(--pharos-mini-h)), 36rem);"),
+            "{rail}"
+        );
+        // The bar's height, taller while it counts down to the next video.
+        assert!(
+            rule("body:has(.pharos-stage.is-mini)").contains("--pharos-mini-h: 4rem;"),
+            "{sheet}"
+        );
+        assert!(
+            rule("body:has(.pharos-stage.is-mini .pharos-stage-next)")
+                .contains("--pharos-mini-h: 4.75rem;"),
+            "the countdown's taller bar"
+        );
+        // A phone anchors the rail to the foot, so the centred `top` must go.
         let phone = rule("  body:has(.pharos-stage.is-mini) .pharos-letters");
-        assert!(phone.contains("bottom: 4.25rem;"), "{phone}");
+        assert!(phone.contains("top: auto;"), "{phone}");
+        assert!(
+            phone.contains("bottom: calc(var(--pharos-mini-h) + 0.75rem);"),
+            "{phone}"
+        );
+        assert!(
+            phone.contains("height: min(calc(100dvh - 15rem - var(--pharos-mini-h)), 36rem);"),
+            "{phone}"
+        );
     }
 
     /// B900/V852: music's mini bar has a queue button that counts what
