@@ -219,6 +219,10 @@ pub fn Shell(
     #[props(default)]
     libraries_failed: bool,
     trail: Vec<Item>,
+    /// This device is in a watch-together group: the Together link says so,
+    /// as that page is where it is left from outside the player (B1361).
+    #[props(default)]
+    in_group: bool,
     children: Element,
 ) -> Element {
     let current = trail
@@ -233,7 +237,17 @@ pub fn Shell(
                     nav { class: "pharos-shell-nav",
                         {search}
                         Link { to: Route::Favourites, "Favourites" }
-                        Link { to: Route::Together, "Together" }
+                        if in_group {
+                            Link {
+                                to: Route::Together,
+                                class: "pharos-together-link is-in-group",
+                                "Together"
+                                span { class: "pharos-in-group-dot", aria_hidden: "true" }
+                                span { class: "pharos-visually-hidden", " (you're in a group)" }
+                            }
+                        } else {
+                            Link { to: Route::Together, "Together" }
+                        }
                         {account}
                     }
                 }
@@ -2666,6 +2680,32 @@ mod tests {
         };
         assert!(shell(true).contains("load your libraries"));
         assert!(!shell(false).contains("load your libraries"));
+    }
+
+    /// B1361 / V1332 — in a group, the bar's Together link says so, as the
+    /// Together page is where the group is left from outside the player.
+    #[test]
+    fn the_shell_marks_together_while_in_a_group() {
+        let shell = |in_group: bool| {
+            render(move || {
+                rsx! {
+                    Shell {
+                        account: rsx! {},
+                        search: rsx! {},
+                        libraries: vec![],
+                        trail: vec![],
+                        in_group,
+                        p { "screen" }
+                    }
+                }
+            })
+        };
+        let inside = shell(true);
+        assert!(inside.contains("pharos-in-group-dot"), "{inside}");
+        assert!(inside.contains("re in a group)"), "{inside}");
+        let outside = shell(false);
+        assert!(!outside.contains("pharos-in-group-dot"), "{outside}");
+        assert!(outside.contains(">Together<"), "{outside}");
     }
 
     #[test]

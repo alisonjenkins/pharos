@@ -2584,6 +2584,29 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   font-size: var(--px-type-step--1);
   font-weight: 600;
 }
+/* The bar's Together link while in a group: a dot says so (B1361). */
+.pharos-together-link.is-in-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.pharos-in-group-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--px-color-accent);
+}
+.pharos-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .pharos-controls {
   position: absolute;
   inset: auto 0 0 0;

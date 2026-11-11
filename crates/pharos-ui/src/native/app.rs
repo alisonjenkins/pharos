@@ -1903,6 +1903,8 @@ fn NativeApp(route: Route) -> Element {
     let kept_group = use_hook(|| Rc::new(RefCell::new(super::group_app::kept_before_load())));
     let together = use_context::<Together>();
     let together_again = together.clone();
+    // Whether this device is in a group, for the bar's Together link (B1361).
+    let shell_group_view = together.view;
     use_effect(move || {
         let Some(api) = api.read().clone() else {
             return;
@@ -2220,6 +2222,7 @@ fn NativeApp(route: Route) -> Element {
         };
         return rsx! {
             Shell {
+                in_group: shell_group_view.read().active,
                 libraries: libraries(),
                 libraries_failed: libraries_failed(),
                 trail: trail.read().clone().unwrap_or_default(),
