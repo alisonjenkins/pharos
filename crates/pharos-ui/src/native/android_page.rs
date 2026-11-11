@@ -675,8 +675,11 @@ pub async fn styled_subtitles(
             Err(e) => format!("failed: eval {e}"),
         };
         let took_ms = now_ms() - at;
-        if answer == "ready" {
-            log::info!("pharos: styled subtitles run={id} outcome=ready took_ms={took_ms:.0}");
+        // A paused video's answer adds ` paused_redraw=ok`.
+        if let Some(paused_redraw) = answer.strip_prefix("ready") {
+            log::info!(
+                "pharos: styled subtitles run={id} outcome=ready took_ms={took_ms:.0}{paused_redraw}"
+            );
             // The canvas is new: give it the lift the bar already has.
             lift_styled_subtitles();
             report(Ok(()));
@@ -2338,7 +2341,9 @@ const media = (e) => {
     tick = true;
   }
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
-  const d = window.__pharosJassub ? window.__pharosJassub.debug : null;
+  // Only the video JASSUB draws over carries its counters.
+  const j = window.__pharosJassub;
+  const d = j && j._video === v ? j.debug : null;
   send({
     t: "media", id: v.id, tick, pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
@@ -2570,6 +2575,10 @@ fn on_bridge(message: Bridge) {
                     }
                 }
             }
+        }
+        Bridge::StyledResize { run } => {
+            log::debug!("pharos: styled subtitles run={run} canvas resized");
+            lift_styled_subtitles();
         }
         Bridge::Media(media) => {
             let at = now_ms();

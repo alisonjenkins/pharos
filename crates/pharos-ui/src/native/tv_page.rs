@@ -300,28 +300,39 @@ const blob = async (path, type) => {{
   return URL.createObjectURL(new Blob([await r.arrayBuffer()], {{ type }}));
 }};
 const assets = window.__pharosJassubAssets = window.__pharosJassubAssets || {{}};
+// The script's own font URLs, revoked if the start fails before a run owns
+// them, including any a fetch still finishes after the failure.
+const made = [];
+let owned = false, failed = false;
+const ownBlob = (f) => blob(f, "font/ttf").then((u) => {{ if (failed) URL.revokeObjectURL(u); else made.push(u); return u; }});
+// The deadline covers the asset fetches too, so a slow proxy cannot keep
+// plain cues up past it.
+const deadline = new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}));
+deadline.catch(() => {{}});
+const within = (p) => Promise.race([p, deadline]);
 try {{
   if (!window.JASSUB) {{
-    await new Promise((ok, no) => {{
+    await within(new Promise((ok, no) => {{
       const s = document.createElement("script");
       s.src = dir + "/jassub.js";
       s.onload = ok;
       s.onerror = () => no(new Error("jassub.js did not load"));
       document.head.append(s);
-    }});
+    }}));
   }}
   const at = (file) => new URL(dir + "/" + file, location.href).href;
-  if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2");
   assets.pack = assets.pack || {{}};
-  for (const [family, file] of pack) {{
-    if (!assets.pack[family]) assets.pack[family] = await blob("/ui/assets/fonts/" + file, "font/ttf").catch(() => null);
-  }}
-  const r = await fetch(sub);
-  if (!r.ok) throw new Error("the styled script answered " + r.status);
-  const subContent = await r.text();
-  const own = (await Promise.all(fonts.map((f) => blob(f, "font/ttf").catch(() => null)))).filter(Boolean);
+  const [subContent, own] = await within(Promise.all([
+    (async () => {{ if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2"); }})(),
+    ...pack.filter(([family]) => !assets.pack[family]).map(async ([family, file]) => {{
+      assets.pack[family] = await blob("/ui/assets/fonts/" + file, "font/ttf").catch(() => null);
+    }}),
+  ]).then(() => Promise.all([
+    fetch(sub).then((r) => {{ if (!r.ok) throw new Error("the styled script answered " + r.status); return r.text(); }}),
+    Promise.all(fonts.map((f) => ownBlob(f).catch(() => null))).then((l) => l.filter(Boolean)),
+  ])));
   const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
-  if (runs[run] === "gone") {{ delete runs[run]; own.forEach((u) => URL.revokeObjectURL(u)); return "failed: stopped before it started"; }}
+  if (runs[run] === "gone") {{ delete runs[run]; throw new Error("stopped before it started"); }}
   const v = document.getElementById(vid);
   if (!v) throw new Error("no <video id=" + vid + ">");
   const availableFonts = {{ "liberation sans": assets.font }};
@@ -331,11 +342,33 @@ try {{
     modernWasmUrl: at("jassub-worker-modern.wasm"),
     availableFonts, fonts: own, defaultFont: "liberation sans", queryFonts: false, debug: true,
   }});
-  runs[run] = {{ j, own }};
+  // Keep the counters, drop the console line the debug mode writes per frame.
+  if (j.debug) j.debug.onsubtitleFrameCallback = null;
+  // A resized canvas needs its lift measured again.
+  const ro = new ResizeObserver(() => window.__pharosSend && window.__pharosSend({{ t: "styledresize", run }}));
+  if (j._canvas) ro.observe(j._canvas);
+  runs[run] = {{ j, own, ro }};
+  owned = true;
   window.__pharosJassub = j;
-  await Promise.race([j.ready, new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}))]);
-  return runs[run] ? "ready" : "failed: stopped while starting";
+  await within(j.ready);
+  if (!runs[run]) return "failed: stopped while starting";
+  if (!v.paused) return "ready";
+  // A paused video sends no frame callbacks, so draw its frame now, and once
+  // more after JASSUB's own observer has resized and cleared the canvas.
+  const frame = () => ({{ mediaTime: v.currentTime, width: v.videoWidth, height: v.videoHeight }});
+  const tick = () => new Promise((ok) => requestAnimationFrame(() => ok()));
+  try {{
+    await j.manualRender(frame(), true);
+    await tick(); await tick();
+    if (runs[run] && v.paused) await j.manualRender(frame(), true);
+    return "ready paused_redraw=ok";
+  }} catch (e) {{
+    // A failed draw can leave JASSUB busy for good, so keep the plain cues.
+    return "failed: paused redraw " + ((e && e.message) || e);
+  }}
 }} catch (e) {{
+  failed = true;
+  if (!owned) made.forEach((u) => URL.revokeObjectURL(u));
   return "failed: " + ((e && e.message) || e);
 }}"#,
         ready_ms = STYLED_READY_MS,
@@ -349,6 +382,7 @@ pub fn styled_stop_js(run: u64) -> String {
         r#"const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
 const r = runs[{run}];
 if (r && r.j) {{
+  if (r.ro) r.ro.disconnect();
   try {{ r.j.destroy(); }} catch (e) {{}}
   r.own.forEach((u) => URL.revokeObjectURL(u));
   if (window.__pharosJassub === r.j) window.__pharosJassub = null;
@@ -621,6 +655,10 @@ pub enum Bridge {
         #[serde(default)]
         paused: u32,
     },
+    /// Styled-subtitle run `run`'s canvas changed size, so its lift is
+    /// measured again.
+    #[serde(rename = "styledresize")]
+    StyledResize { run: u64 },
     /// A media element's state, after any of its events.
     Media(Media),
     /// An hls.js event on the player for `id`.
@@ -1094,6 +1132,31 @@ mod tests {
         assert!(!js.contains("subUrl"), "{js}");
         assert!(js.contains("debug: true"));
         assert!(js.contains(&format!("not ready after {STYLED_READY_MS} ms")));
+    }
+
+    #[test]
+    fn the_styled_start_bounds_its_fetches_quiets_its_log_and_redraws_when_paused() {
+        let js = styled_start_js("v", "/s.ass", &[], &[("bangers", "B.ttf")], 3);
+        let at = |needle: &str| {
+            js.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {js}"))
+        };
+        // The deadline starts before the first fetch and covers each of them.
+        assert!(at("const deadline") < at("blob(dir"), "{js}");
+        assert!(js.contains("await within(j.ready)"), "{js}");
+        assert!(js.contains(".filter(([family]) => !assets.pack[family]).map(async"));
+        assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
+        assert!(js.contains(r#"t: "styledresize", run"#));
+        assert!(js.contains("runs[run] = { j, own, ro }"));
+        assert!(js.contains("j.manualRender(frame(), true)"));
+        assert!(js.contains("paused_redraw=ok"));
+        assert!(js.contains(r#"return "failed: paused redraw ""#));
+        assert!(js.contains("if (!owned) made.forEach((u) => URL.revokeObjectURL(u))"));
+        assert!(styled_stop_js(3).contains("r.ro.disconnect()"));
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "styledresize", "run": 3})),
+            Some(Bridge::StyledResize { run: 3 })
+        );
     }
 
     #[test]
