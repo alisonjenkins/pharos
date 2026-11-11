@@ -407,6 +407,10 @@ impl Queue {
             return None;
         }
         self.drop_source(Source::Album);
+        // The song it starts is a new start, even the one a reload left
+        // playing: the reload guard in `started` would otherwise keep it
+        // queued to play again.
+        self.restored = false;
         if !self.shuffled {
             self.shuffled = true;
             self.unshuffled = self.upcoming.iter().map(|e| e.key).collect();
@@ -837,6 +841,22 @@ mod tests {
         let mut want: Vec<u64> = vec![9];
         want.extend((10..20).filter(|&n| ItemRef::Real(n) != first));
         assert_eq!(ids(&q), want);
+    }
+
+    /// A shuffle right after a reload, of an album whose only song is the
+    /// one the reload left playing, starts it once: it leaves the queue as
+    /// it starts. Disarm check: without clearing `restored` in
+    /// `shuffle_album`, the song stays queued.
+    #[test]
+    fn shuffle_album_after_a_reload_starts_the_playing_song_once() {
+        let mut q = Queue::default();
+        q.claim("u1");
+        q.started(ItemRef::Real(10), Some(&album(&[])), 0);
+        let mut back = Queue::restore(&q.save()).unwrap();
+        let first = back.shuffle_album(vec![track(10)], 3).unwrap();
+        assert_eq!(first, ItemRef::Real(10));
+        back.started(first, None, 0);
+        assert!(back.upcoming().is_empty(), "{:?}", ids(&back));
     }
 
     #[test]
