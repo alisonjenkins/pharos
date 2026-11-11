@@ -395,6 +395,35 @@ impl Queue {
         }
     }
 
+    /// An album page's Shuffle (B1349/V1320): shuffle goes on and the
+    /// album's songs, in a fresh random order, become the album part of the
+    /// queue. The first of them goes to the front and is returned, so the
+    /// caller starts it and starting it takes it out, as Next would; the
+    /// rest follow what the listener added. Shuffle off brings back the
+    /// album's own order. `None` when `tracks` is empty, and then nothing
+    /// changes.
+    pub fn shuffle_album(&mut self, tracks: Vec<Track>, seed: u64) -> Option<ItemRef> {
+        if tracks.is_empty() {
+            return None;
+        }
+        self.drop_source(Source::Album);
+        if !self.shuffled {
+            self.shuffled = true;
+            self.unshuffled = self.upcoming.iter().map(|e| e.key).collect();
+        }
+        let mut album: Vec<Entry> = tracks
+            .into_iter()
+            .map(|t| self.entry(t, Source::Album))
+            .collect();
+        self.unshuffled.extend(album.iter().map(|e| e.key));
+        shuffle(&mut album, seed);
+        let first = album.remove(0);
+        let id = first.id;
+        self.upcoming.insert(0, first);
+        self.upcoming.extend(album);
+        Some(id)
+    }
+
     /// Take out every entry `source` put in.
     pub fn drop_source(&mut self, source: Source) {
         self.upcoming.retain(|e| e.source != source);
@@ -771,6 +800,52 @@ mod tests {
 
     fn album(ids: &[u64]) -> Vec<Item> {
         ids.iter().copied().map(item).collect()
+    }
+
+    /// B1349/V1320: an album page's Shuffle plays the whole album in a
+    /// random order after what the listener added, starting with the song
+    /// it returns, and shuffle off brings back the album's own order.
+    /// Disarm check: inserting the album in its own order fails the
+    /// "not in album order" assertion for this seed.
+    #[test]
+    fn shuffle_album_plays_every_song_in_a_random_order() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
+        q.add(vec![track(9)]);
+        let songs: Vec<Track> = (10..20).map(track).collect();
+        let first = q.shuffle_album(songs, 42).unwrap();
+        assert!(q.shuffled());
+        assert_eq!(q.next(), Some(first), "the returned song is first");
+        let order = ids(&q);
+        assert_eq!(order[1], 9, "what the listener added comes next");
+        let mut album_part: Vec<u64> = order.iter().copied().filter(|&n| n != 9).collect();
+        assert_ne!(
+            album_part,
+            (10..20).collect::<Vec<_>>(),
+            "not in album order"
+        );
+        album_part.sort_unstable();
+        assert_eq!(
+            album_part,
+            (10..20).collect::<Vec<_>>(),
+            "every song once, the old album part gone"
+        );
+        // Starting it takes it out, as Next would.
+        q.started(first, Some(&album(&[11])), 0);
+        assert_eq!(q.upcoming().len(), 10);
+        q.apply(QueueAction::Shuffle(false), 0);
+        let mut want: Vec<u64> = vec![9];
+        want.extend((10..20).filter(|&n| ItemRef::Real(n) != first));
+        assert_eq!(ids(&q), want);
+    }
+
+    #[test]
+    fn shuffle_album_of_nothing_changes_nothing() {
+        let mut q = Queue::default();
+        q.add(vec![track(9)]);
+        let before = q.clone();
+        assert_eq!(q.shuffle_album(Vec::new(), 1), None);
+        assert_eq!(q, before);
     }
 
     /// FR-704: a reload reads the queue back as the listener left it, and
