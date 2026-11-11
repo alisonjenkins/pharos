@@ -114,6 +114,9 @@ static TELEMETRY: LazyLock<Mutex<Owned>> =
 /// The state holds the connection, whose clients are `Rc`s, so it is not
 /// `Send`. Only Dioxus's own tasks and handlers touch it, which Dioxus runs
 /// one at a time even on different threads, and always under the mutex.
+/// The clones [`install`] and [`report`] hand out leave the mutex, so they
+/// rest on that one-at-a-time rule alone, the same rule android_page's own
+/// `Owned` statics rest on; nothing here spawns a thread of its own.
 struct Owned(Telemetry);
 
 // SAFETY: see `Owned`: never touched by two threads at once, since every
@@ -133,6 +136,7 @@ pub fn opted_in() -> bool {
     with(|t| t.opted_in)
 }
 
+#[cfg(test)]
 fn remember_opt_in(on: bool) {
     with(|t| t.opted_in = on);
 }
@@ -177,7 +181,7 @@ pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
 pub async fn load_opted_in_since(api: &NativeApi, begun: u64) -> Result<bool, String> {
     let ticket = Ticket {
         session: begun,
-        saves: saves(),
+        saves: with(|t| t.saves),
     };
     match api.pref(&prefs_call("opt_in_read"), OPT_IN_PREF).await {
         Ok(raw) => remember_if_current(ticket, opt_in_from(raw.as_deref())),
@@ -197,25 +201,25 @@ struct Ticket {
     saves: u64,
 }
 
-fn saves() -> u64 {
-    with(|t| t.saves)
+/// Remembers `on` if `ticket` is still the latest: no sign-out and no save
+/// begun since. The check and the write hold one lock, so a sign-out or a
+/// save cannot land between them.
+fn remember_if_current(ticket: Ticket, on: bool) -> Result<bool, String> {
+    with(|t| {
+        if t.session != ticket.session {
+            return Err("signed out while the opt-in was read".to_owned());
+        }
+        if t.saves != ticket.saves {
+            return Err("the opt-in was saved while it was read".to_owned());
+        }
+        t.opted_in = on;
+        Ok(on)
+    })
 }
 
-/// Remembers `on` if `ticket` is still the latest: no sign-out and no save
-/// begun since.
-fn remember_if_current(ticket: Ticket, on: bool) -> Result<bool, String> {
-    let now = Ticket {
-        session: session(),
-        saves: saves(),
-    };
-    if now.session != ticket.session {
-        return Err("signed out while the opt-in was read".to_owned());
-    }
-    if now.saves != ticket.saves {
-        return Err("the opt-in was saved while it was read".to_owned());
-    }
-    remember_opt_in(on);
-    Ok(on)
+#[cfg(test)]
+fn saves() -> u64 {
+    with(|t| t.saves)
 }
 
 /// Writes the user's opt-in to `Prefs`; remembered only once the server
@@ -256,8 +260,10 @@ pub fn install(api: NativeApi, opted_in: bool, begun: u64) -> Vec<ClientEvent> {
 
 /// The submit to make now for `event`, if any (see [`Sink::report`]).
 pub fn report(event: ClientEvent) -> Option<(NativeApi, ClientEvent)> {
-    let opted = opted_in();
-    with(|t| t.sink.report(opted, event))
+    with(|t| {
+        let opted = t.opted_in;
+        t.sink.report(opted, event)
+    })
 }
 
 /// Submits `events`, unless the opt-in was turned off since they were
