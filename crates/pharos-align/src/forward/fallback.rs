@@ -103,6 +103,18 @@ impl Fallback {
 }
 
 impl Model for Fallback {
+    /// The GPU's pool, unless the GPU has failed: a lost device is not
+    /// asked again, as the CPU path promises.
+    fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
+        if self.latch.latched() {
+            return None;
+        }
+        let gpu = &mut self.gpu;
+        catch_unwind(AssertUnwindSafe(|| gpu.end_song()))
+            .ok()
+            .flatten()
+    }
+
     fn begin_song(&mut self) {
         self.song_on_cpu = if self.latch.latched() {
             metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => LATCHED).increment(1);
