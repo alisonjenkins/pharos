@@ -3225,6 +3225,8 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 }
 .pharos-up-next-pill button {
   flex: none;
+  min-width: 44px;
+  min-height: 44px; /* a touch target (WCAG 2.5.5) */
 }
 @media (max-width: 30rem) {
   .pharos-up-next-art {
