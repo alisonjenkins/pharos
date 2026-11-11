@@ -2370,6 +2370,37 @@ pub fn hls_start_position(start_ms: u64) -> f64 {
     start_ms as f64 / 1000.0
 }
 
+/// Seconds hls.js aims to hold ahead of the play head. Above its 30 s
+/// default so a long-latency viewer rides out a slow segment, and short
+/// enough that a 12 Mbps stream (~67 MB) plus the back buffer stays under
+/// the ~80 MiB video quota Chromium gives low-memory devices (B1325).
+pub const HLS_FORWARD_S: f64 = 45.0;
+
+/// Ceiling on the forward target, which hls.js raises above
+/// `HLS_FORWARD_S` for a stream whose `HLS_FORWARD_BYTES` lasts longer.
+pub const HLS_FORWARD_CEILING_S: f64 = 120.0;
+
+/// Seconds kept behind the play head. hls.js keeps everything by default,
+/// which fills the browser's SourceBuffer quota a few minutes in; each
+/// eviction then halves the forward ceiling, down to about two segments
+/// (B1325, V1296). Matches the TV page's hls.js.
+pub const HLS_BACK_S: f64 = 10.0;
+
+/// Bytes whose play time hls.js takes as the forward target when that is
+/// longer than `HLS_FORWARD_S`: 60 MB is 120 s of a 4 Mbps transcode. It
+/// lengthens the look-ahead of a low-bitrate stream and never caps it.
+pub const HLS_FORWARD_BYTES: f64 = 60_000_000.0;
+
+/// The buffer settings handed to hls.js, as `(config key, value)`.
+pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
+    [
+        ("maxBufferLength", HLS_FORWARD_S),
+        ("maxMaxBufferLength", HLS_FORWARD_CEILING_S),
+        ("backBufferLength", HLS_BACK_S),
+        ("maxBufferSize", HLS_FORWARD_BYTES),
+    ]
+}
+
 /// Watches hls.js's forward ceiling (`maxMaxBufferLength`), which hls.js
 /// lowers on its own after buffer-full errors and evictions and never
 /// raises again. Each drop below the last reading is reported once, with
@@ -3029,6 +3060,21 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn hls_buffer_config_bounds_the_back_buffer_and_lengthens_the_forward_one() {
+        let config: std::collections::HashMap<_, _> = hls_buffer_config().into_iter().collect();
+        assert_eq!(config.get("backBufferLength"), Some(&10.0));
+        assert_eq!(config.get("maxBufferLength"), Some(&45.0));
+        assert_eq!(config.get("maxMaxBufferLength"), Some(&120.0));
+        assert_eq!(config.get("maxBufferSize"), Some(&60_000_000.0));
+        let forward = config.get("maxBufferLength").copied().unwrap_or_default();
+        let ceiling = config
+            .get("maxMaxBufferLength")
+            .copied()
+            .unwrap_or_default();
+        assert!(forward <= ceiling, "hls.js caps the target at the ceiling");
+    }
 
     #[test]
     fn buffer_ceiling_reports_each_drop_once_with_both_values() {
