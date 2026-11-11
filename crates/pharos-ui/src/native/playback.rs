@@ -1511,6 +1511,9 @@ const TIER_DROP_WINDOW_MS: u64 = 10_000;
 const TIER_DROP_COOLDOWN_MS: u64 = 30_000;
 /// Dropped frames over presented frames, in percent, past which a window is over budget.
 const TIER_DROP_BUDGET_PERCENT: u128 = 5;
+/// The fewest video frames a window needs before its drops count: half a
+/// 24 fps window, so a stall or restart's few frames cannot trip a drop.
+const TIER_DROP_MIN_FRAMES: u64 = 120;
 
 /// One tier lower and why: the measured window behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1660,7 +1663,9 @@ impl TierDrop {
             }),
             _ => None,
         };
-        let video_over = window_ms >= TIER_DROP_WINDOW_MS && over_budget(dropped, presented);
+        let video_over = window_ms >= TIER_DROP_WINDOW_MS
+            && presented.max(dropped) >= TIER_DROP_MIN_FRAMES
+            && over_budget(dropped, presented);
         let cooled = self.last_drop_ms.map_or(true, |at| {
             now_ms.saturating_sub(at) >= TIER_DROP_COOLDOWN_MS
         });
@@ -5194,6 +5199,15 @@ mod tests {
     }
 
     #[test]
+    fn a_window_with_too_few_frames_cannot_drop_the_tier() {
+        // 3 of 55 frames over 10 s is over budget, but too few frames to judge.
+        let thin: Vec<_> = (0..=10).map(|s| (s * 3 / 10, s * 55 / 10)).collect();
+        assert!(run(Tier::Desktop, &thin).is_empty());
+        let full: Vec<_> = (0..=10).map(|s| (s * 30 / 10, s * 550 / 10)).collect();
+        assert!(!run(Tier::Desktop, &full).is_empty());
+    }
+
+    #[test]
     fn exactly_five_percent_is_within_budget() {
         let totals: Vec<_> = (0..=30).map(|s| (s * 3, s * 60)).collect();
         assert!(run(Tier::Desktop, &totals).is_empty());
@@ -5240,7 +5254,7 @@ mod tests {
 
     #[test]
     fn dropped_frames_with_none_presented_are_over_budget() {
-        let totals: Vec<_> = (0..=10).map(|s| (s, 0)).collect();
+        let totals: Vec<_> = (0..=10).map(|s| (s * 24, 0)).collect();
         assert_eq!(run(Tier::Desktop, &totals).len(), 1);
         let totals: Vec<_> = (0..=10).map(|_| (0, 0)).collect();
         assert!(run(Tier::Desktop, &totals).is_empty());
