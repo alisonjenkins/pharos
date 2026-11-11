@@ -328,7 +328,7 @@ pub fn focus_first_in(_within: &str) {}
 
 pub fn focus_card(_within: &str, _to: &str, _keep: &str) {}
 
-pub fn refocus_if_lost(_to: &str) {}
+pub fn refocus_if_lost(_to: &str, _up_next_gone: bool) {}
 
 pub fn focus_out_of(_within: &str, _to: &str) {}
 
