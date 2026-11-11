@@ -91,12 +91,13 @@ device.
   untouched rather than clearing it.
 - **FR-108** A failed read or write on the stop path is logged with its cause,
   counted, and returned to the client as a denial it can retry.
-- **FR-109 [ALISON]** A Continue Watching or Next Up tile plays at once, with
-  a separate info control for the title page (today both rails open the title
-  page: `pharos-ui/src/native/views.rs:704`, `:1027-1052`). Continue Reading
-  already opens the reader in one step. Not built until answered.
-  *Revised 2026-11-11 (Alison, B1340/V1311): the info control is gone; the
-  tile opens the title page on a press and plays on a hold.*
+- **FR-109 [ALISON]** A Continue Watching or Next Up tile opens its title
+  page on a press (OK, a click or a tap) and plays on a hold of 600 ms
+  anywhere on the tile, with no info control and no hint drawn on it.
+  Continue Reading opens the reader in one step.
+  *Revised 2026-11-11 (Alison, B1340/V1311, B1341/V1312). As first written
+  the tile played at once, with a separate info control for the title page;
+  that control could not be reached by the TV remote and was removed.*
 
 ### Signal
 
