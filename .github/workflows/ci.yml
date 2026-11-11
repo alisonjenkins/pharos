@@ -339,13 +339,56 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Dioxus UI suite, once per native-API mode. Each mode seeds its own pharos
-  # (see `just compat-dioxus-full`), so the two runs share nothing. They run
-  # one after the other in ONE job: every job waits for a home runner on its
-  # own, so a matrix leg was a second trip through the queue for a ~3 min
-  # suite. The `off` step runs even when `on` failed, so both results show.
-  dioxus-ui:
-    name: dioxus UI
+  # Dioxus UI suite. The native-on run is most of it and took ~25 min on one
+  # worker, the longest step of a batch's CI, while the other runners sat
+  # idle once test and the crawl were done. It is split into shards, each a
+  # job with its own seeded pharos (`PLAYWRIGHT_SHARD`, see
+  # `just compat-dioxus-full`), so the shards share no state. The native-off
+  # run and the TV type-check share a job. `dioxus UI` below gathers them
+  # under the one check name the PRs have always reported.
+  dioxus-ui-on:
+    name: dioxus UI (native on ${{ matrix.shard }}/3)
+    runs-on: pharos-nix-builder-amd64
+    timeout-minutes: 120
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
+        with:
+          max-jobs: 2
+          cores: 16
+      - name: Pin compiled deps against auto-GC
+        run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
+      - name: npm install
+        run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
+      # The crawl's binaries, from the shared store: no cold `cargo build`
+      # in each shard.
+      - name: Build pharos test binaries
+        run: |
+          out="$(nix build .#pharosTestBins --no-link --print-out-paths)"
+          echo "PHAROS_BIN_DIR=$out/bin" >> "$GITHUB_ENV"
+      - name: Run Dioxus UI suite (native on, shard ${{ matrix.shard }}/3)
+        env:
+          PLAYWRIGHT_SHARD: ${{ matrix.shard }}/3
+        run: nix develop --command bash -c 'just compat-dioxus-full on'
+      - name: Upload Dioxus UI artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dioxus-ui-native-on-${{ matrix.shard }}-${{ github.sha }}
+          path: |
+            compat-playwright/test-results
+            compat-playwright/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dioxus-ui-off:
+    name: dioxus UI (native off + TV type-check)
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
@@ -360,22 +403,12 @@ jobs:
         run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
-      - name: Run Dioxus UI suite (native on)
-        id: native-on
-        run: nix develop --command bash -c 'just compat-dioxus-full on'
-      - name: Upload Dioxus UI artifacts (native on) on failure
-        if: failure() && steps.native-on.outcome == 'failure'
-        uses: actions/upload-artifact@v7
-        with:
-          name: dioxus-ui-native-on-${{ github.sha }}
-          path: |
-            compat-playwright/test-results
-            compat-playwright/playwright-report
-          if-no-files-found: ignore
-          retention-days: 7
+      - name: Build pharos test binaries
+        run: |
+          out="$(nix build .#pharosTestBins --no-link --print-out-paths)"
+          echo "PHAROS_BIN_DIR=$out/bin" >> "$GITHUB_ENV"
       - name: Run Dioxus UI suite (native off)
         id: native-off
-        if: ${{ !cancelled() && steps.native-on.conclusion != 'skipped' }}
         run: nix develop --command bash -c 'just compat-dioxus-full off'
       - name: Upload Dioxus UI artifacts (native off) on failure
         if: ${{ !cancelled() && steps.native-off.outcome == 'failure' }}
@@ -389,8 +422,34 @@ jobs:
           retention-days: 7
       # B1333/V1304: the TV app's Android-only modules compile under no
       # other build, so a shared signature change broke the TV line with
-      # every other check green. Last, and whatever the suites did, so their
+      # every other check green. Last, and whatever the suite did, so both
       # results show either way.
       - name: Type-check the TV app (mobile feature, armv7 Android)
         if: ${{ !cancelled() }}
         run: nix develop --command just tv-check
+
+  # The single `dioxus UI` check, as before the split, so a required-check
+  # rule or a reader keyed on that name still sees one result. It passes when
+  # every part passed, or when the parts were skipped because this run needs
+  # no heavy jobs (a skipped job reports success, as before; `merge via
+  # batch` is what stops a feature PR merging).
+  dioxus-ui:
+    name: dioxus UI
+    runs-on: ubuntu-latest
+    needs: [changes, dioxus-ui-on, dioxus-ui-off]
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Require every Dioxus UI part to pass
+        env:
+          CODE: ${{ needs.changes.outputs.code }}
+          ON: ${{ needs.dioxus-ui-on.result }}
+          OFF: ${{ needs.dioxus-ui-off.result }}
+        run: |
+          echo "code=$CODE native-on=$ON native-off+tv=$OFF"
+          for part in "native-on=$ON" "native-off+tv=$OFF"; do
+            result="${part#*=}"
+            if [[ "$result" == success ]]; then continue; fi
+            if [[ "$result" == skipped && "$CODE" == false ]]; then continue; fi
+            echo "::error::dioxus UI part ${part%%=*} ended ${result}"
+            exit 1
+          done
