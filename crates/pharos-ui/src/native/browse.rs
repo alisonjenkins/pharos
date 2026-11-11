@@ -2972,6 +2972,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
         busy.set(true);
         let ticket = *pressed.peek() + 1;
         pressed.set(ticket);
+        let mix_at = mix_generation(mix);
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
             let found = if tracks.is_empty() {
@@ -2990,9 +2991,11 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             } else {
                 Ok(tracks)
             };
-            if *pressed.peek() != ticket {
+            if let Some(reason) =
+                shuffle_overtaken(ticket, *pressed.peek(), mix_at, mix_generation(mix))
+            {
                 platform::info(&format!(
-                    "pharos: album shuffle dropped album={album:?} reason=later press"
+                    "pharos: album shuffle dropped album={album:?} reason={reason}"
                 ));
                 busy.set(false);
                 return;
@@ -3073,6 +3076,29 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             span { class: "pharos-queue-note", role: "status", "{text}" }
         }
     }
+}
+
+/// Why a Shuffle whose album has landed must leave the queue alone: a
+/// Play or Shuffle pressed after it, or a mix started since it was pressed
+/// (a mix running then is one it replaces). `None` when it may go on.
+fn shuffle_overtaken(
+    ticket: u64,
+    pressed: u64,
+    mix_at: Option<u64>,
+    mix_now: Option<u64>,
+) -> Option<&'static str> {
+    if pressed != ticket {
+        Some("later press")
+    } else if mix_now.is_some() && mix_now != mix_at {
+        Some("mix started")
+    } else {
+        None
+    }
+}
+
+/// The running mix's generation: a new one marks a mix started since.
+fn mix_generation(mix: Option<MixCtx>) -> Option<u64> {
+    mix.and_then(|MixCtx(m)| m.peek().as_ref().map(|m| m.generation))
 }
 
 /// A shuffle seed: a play order needs no more randomness than the clock.
@@ -5488,6 +5514,21 @@ mod tests {
         );
         // The track list follows, holding the songs.
         assert!(!side.contains("Opener"), "{side}");
+    }
+
+    /// A Shuffle that lands late gives way to what came after it, and names
+    /// why in its log line; a mix it was pressed over is one it replaces.
+    #[test]
+    fn a_late_album_shuffle_gives_way_to_a_later_press_or_mix() {
+        assert_eq!(shuffle_overtaken(1, 1, None, None), None);
+        assert_eq!(shuffle_overtaken(1, 1, Some(4), Some(4)), None);
+        assert_eq!(shuffle_overtaken(1, 1, Some(4), None), None);
+        assert_eq!(shuffle_overtaken(1, 2, None, None), Some("later press"));
+        assert_eq!(shuffle_overtaken(1, 1, None, Some(5)), Some("mix started"));
+        assert_eq!(
+            shuffle_overtaken(1, 1, Some(4), Some(5)),
+            Some("mix started")
+        );
     }
 
     /// An album folder can hold a clip: Play opens the first song, and an
