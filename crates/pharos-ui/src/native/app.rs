@@ -1030,6 +1030,10 @@ fn current_starting_tier() -> Tier {
 /// How often the player reads the video's dropped frames while a generated
 /// styled track shows; one second is a fine-enough grain for a 10 s window.
 const QUALITY_SAMPLE_MS: u32 = 1_000;
+/// Samples in a row without renderer counters before warning: the TV page
+/// posts them at most once a second, so the first sample after ready can
+/// come before any message has carried them.
+const UNCOUNTED_WARN_SAMPLES: u32 = 3;
 
 /// Feed the video's frame counters, and the renderer's own when it counts
 /// them, to `watch`; a drop is remembered for the device, logged and
@@ -6791,7 +6795,7 @@ fn Player(
                 Rc::clone(&styled),
             );
             spawn(async move {
-                let mut warned_uncounted = false;
+                let mut uncounted_samples = 0_u32;
                 while sampling.get() == run {
                     platform::sleep_ms(QUALITY_SAMPLE_MS).await;
                     if sampling.get() != run {
@@ -6808,10 +6812,14 @@ fn Player(
                         .borrow()
                         .as_ref()
                         .map_or((false, None), |s| (true, s.frames()));
-                    if live && frames.is_none() && !warned_uncounted {
+                    uncounted_samples = if live && frames.is_none() {
+                        uncounted_samples.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if uncounted_samples == UNCOUNTED_WARN_SAMPLES {
                         // Without the counters every video drop is charged to
                         // the effects again (B667), so say so once.
-                        warned_uncounted = true;
                         platform::warn(
                             "pharos: subtitle renderer frames uncounted renderer=jassub",
                         );
