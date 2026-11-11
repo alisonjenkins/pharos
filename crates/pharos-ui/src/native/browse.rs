@@ -2953,11 +2953,18 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
         .as_ref()
         .is_some_and(|t| t.view.read().active);
     let mut note = use_signal(|| None::<String>);
+    // One shuffle at a time: a second press while a long album loads would
+    // otherwise reshuffle the queue and switch the song when it lands.
+    let mut busy = use_signal(|| false);
     let shuffle_label = format!("Shuffle {name}");
     let shuffle = move |_| {
         let (Some(mut queue), Some(nav)) = (queue, nav) else {
             return;
         };
+        if *busy.peek() {
+            return;
+        }
+        busy.set(true);
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
             let found = if tracks.is_empty() {
@@ -3001,6 +3008,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
                     note.set(Some(format!("Could not shuffle {name}.")));
                 }
             }
+            busy.set(false);
         });
     };
     rsx! {
@@ -3017,6 +3025,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
                 class: "pharos-button pharos-button-secondary pharos-album-shuffle",
                 "data-key-action": "shuffle",
                 aria_label: "{shuffle_label}",
+                aria_busy: if busy() { "true" } else { "false" },
                 title: "{shuffle_label}",
                 onclick: shuffle,
                 Icon { path: ICON_SHUFFLE }
