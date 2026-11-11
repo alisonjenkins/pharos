@@ -5585,6 +5585,106 @@ body::before {
   display: none;
 }
 
+/* B1347/V1318: an album page in two columns. The cover, facts and every
+   album button (Play, Shuffle, then round icon pills for Play next, Add to
+   queue and Favourite) sit in a column beside the track list, so the list
+   starts at the top of the page; it held three rows above the TV's mini
+   player when they were stacked. A phone stacks them, the cover small
+   beside the title. Buttons are the slim pills of the library filter row
+   (B1311), drawn by the shared button family (B1343). */
+.pharos-album {
+  display: grid;
+  gap: 1.25rem;
+}
+.pharos-album .pharos-hero {
+  flex-direction: column;
+  gap: 0.75rem;
+  margin: 0;
+}
+.pharos-album .pharos-hero-art {
+  flex: none;
+  width: 100%;
+}
+.pharos-album .pharos-hero-body h2 {
+  margin: 0 0 0.15rem;
+  font-size: 1.4rem;
+  line-height: 1.2;
+}
+.pharos-album .pharos-hero-body > p {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.pharos-album .pharos-overview {
+  margin-top: 0.75rem;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pharos-album .pharos-actions {
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.75rem 0 0;
+}
+.pharos-album .pharos-actions .pharos-queue-buttons {
+  display: contents;
+}
+.pharos-album .pharos-actions .pharos-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+.pharos-album .is-icon .pharos-button-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+.pharos-album .pharos-track {
+  grid-template-columns: 1.75rem 1fr auto;
+  gap: 0.75rem;
+  padding: 0.4rem 0.5rem;
+}
+@media (min-width: 40rem) {
+  .pharos-album {
+    grid-template-columns: minmax(12rem, 21rem) minmax(0, 1fr);
+    gap: 2rem;
+    align-items: start;
+  }
+  .pharos-album-tracks {
+    max-width: 60rem;
+  }
+  /* A long album scrolls past its cover and buttons, which stay put. */
+  .pharos-album-side {
+    position: sticky;
+    top: 1rem;
+  }
+}
+@media (max-width: 40rem) {
+  .pharos-album .pharos-hero {
+    flex-direction: row;
+    gap: 1rem;
+  }
+  .pharos-album .pharos-hero-art {
+    width: 7rem;
+  }
+}
+:root[data-device="tv"] .pharos-album {
+  grid-template-columns: 13rem minmax(0, 1fr);
+  gap: 1.75rem;
+}
+/* Play and Shuffle share the column's first line on the TV; the icon
+   pills take the next. */
+:root[data-device="tv"] .pharos-album :is(.pharos-album-play, .pharos-album-shuffle) {
+  flex: 1 1 40%;
+}
+:root[data-device="tv"] .pharos-album .pharos-track {
+  padding-block: 0.3rem;
+}
+
 /* Dynamic mixes (spec 024, B441): the mix line in the queue panel, its
    picker, the rule editor, and why a mix picked a song. */
 .pharos-mix-bar {
