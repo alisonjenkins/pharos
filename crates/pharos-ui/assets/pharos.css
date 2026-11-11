@@ -3092,7 +3092,7 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   display: none;
 }
 @media (max-width: 40rem) and (pointer: coarse) {
-  .pharos-control-row .pharos-mute {
+  :root:not([data-device="tv"]) .pharos-control-row .pharos-mute {
     display: none;
   }
   :root:not([data-device="tv"]) .pharos-control-menus.is-open > .pharos-sheet-mute {
