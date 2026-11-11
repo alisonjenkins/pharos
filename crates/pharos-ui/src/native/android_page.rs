@@ -697,7 +697,14 @@ pub fn enter_vr(
 
 pub fn exit_vr() {}
 
-pub fn select_field(_id: &str) {}
+/// Focuses the text field `id` and selects all of it; on a TV that brings
+/// up the remote's keyboard (FR-602).
+pub fn select_field(id: &str) {
+    run(format!(
+        "const el = document.getElementById({}); if (el) {{ el.focus(); if (el.select) el.select(); }}",
+        js_str(id)
+    ));
+}
 
 /// Move the focus to `to` when it is inside `within` (B1031): the compact
 /// player's picture hands it to the stage bar.
@@ -835,12 +842,22 @@ impl ModalHold {
     pub fn engage(&mut self, _root: &str) {}
 }
 
-pub struct TrackSkips;
+/// The remote's next and previous keys' listener, removed on drop.
+pub struct TrackSkips(u64);
 
+impl Drop for TrackSkips {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_skip` for the remote's next and previous keys (FR-609), from
+/// anywhere in the app, for whichever player is on show; its answer is
+/// whether it took the press.
 pub fn on_track_skip(
-    _on_skip: impl FnMut(super::watch_view::Skip, &'static str) -> bool + 'static,
+    on_skip: impl FnMut(super::watch_view::Skip, &'static str) -> bool + 'static,
 ) -> TrackSkips {
-    TrackSkips
+    TrackSkips(listen(Listener::Skip(Box::new(on_skip))))
 }
 
 pub fn offer_track_skips(_previous: bool, _next: bool) {}
@@ -855,8 +872,10 @@ pub fn android_shell() -> bool {
     cfg!(target_os = "android")
 }
 
+/// No keyboard shortcut opens the palette on a TV: the banner's Search
+/// button does (FR-602).
 pub fn palette_keys() -> &'static str {
-    "Ctrl+K"
+    ""
 }
 
 pub fn now_ms() -> f64 {
@@ -948,8 +967,16 @@ pub fn rail_gestures() -> RailGestures {
     RailGestures
 }
 
+/// Where the browse grid on the page shown stands, as the bridge last said
+/// (FR-603): the tile with the focus, else the first in view. The page's
+/// layout cannot be read synchronously here, so the bridge sends it as the
+/// scroll or focus settles.
 pub fn first_visible_tile() -> Option<u32> {
-    None
+    let here = current_path();
+    lock(&GRID_PLACE)
+        .as_ref()
+        .filter(|(path, _, _)| *path == here)
+        .map(|(_, tile, _)| *tile)
 }
 
 pub fn tile_in_view(_at: u32) -> bool {
@@ -991,14 +1018,31 @@ pub fn scroll_to_top() {
     run(tv_page::SCROLL_TO_TOP_JS.to_owned());
 }
 
-pub fn tile_top(_at: u32) -> Option<f64> {
-    None
+pub fn tile_top(at: u32) -> Option<f64> {
+    let here = current_path();
+    lock(&GRID_PLACE)
+        .as_ref()
+        .filter(|(path, tile, _)| *path == here && *tile == at)
+        .map(|(_, _, top)| *top)
 }
 
 pub fn stage_arrival(_again: bool) {}
 
-pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
-    false
+/// Puts the grid's tile `at` back where it was and focuses it (FR-603).
+/// The page answers later: true means asked, and a tile not in the page
+/// logs `placed=false`.
+pub fn scroll_tile_to(at: u32, top: f64) -> bool {
+    let script = tv_page::scroll_tile_to_js(at, top);
+    spawn_detached(async move {
+        match page_eval(&script).join::<bool>().await {
+            Ok(placed) => log::info!(
+                "pharos: grid place restored tile={at} top={top:.0} placed={placed} path={}",
+                current_path()
+            ),
+            Err(e) => log::warn!("pharos: grid place restored tile={at} placed=false error={e}"),
+        }
+    });
+    true
 }
 
 /// The page's query, `?` included, as `location.search` on the web.
@@ -1008,10 +1052,19 @@ pub fn current_search() -> String {
         .to_owned()
 }
 
-pub struct ScrollWatch;
+/// A listener for the grid's place settling, removed on drop.
+pub struct ScrollWatch(u64);
 
-pub fn on_scroll_settled(_on_settled: impl FnMut() + 'static) -> ScrollWatch {
-    ScrollWatch
+impl Drop for ScrollWatch {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_settled` each time the bridge reports where the browse grid
+/// stands, after its scroll or focus settles (FR-603).
+pub fn on_scroll_settled(on_settled: impl FnMut() + 'static) -> ScrollWatch {
+    ScrollWatch(listen(Listener::Settled(Box::new(on_settled))))
 }
 
 /// Scrolls the panel `id` so its child `at` sits in the middle (the lyrics'
@@ -1037,13 +1090,23 @@ pub fn turn_open(_item: &str) {}
 pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
 pub fn turn_cancel(_item: &str, _reason: &str) {}
 
-pub struct PageLifecycle;
+/// A listener for the page going hidden, removed on drop.
+pub struct PageLifecycle(u64);
 
+impl Drop for PageLifecycle {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_hidden` when the app leaves the screen, which hides the
+/// WebView's page (FR-605); the bridge pauses a playing video first. The
+/// WebView has no back/forward cache, so `on_restored` never runs.
 pub fn on_page_lifecycle(
-    _on_hidden: impl FnMut() + 'static,
+    on_hidden: impl FnMut() + 'static,
     _on_restored: impl FnMut() + 'static,
 ) -> PageLifecycle {
-    PageLifecycle
+    PageLifecycle(listen(Listener::Hidden(Box::new(on_hidden))))
 }
 
 /// hls.js for every HLS stream; the Rust engine (spec 031) is the web
@@ -1441,26 +1504,48 @@ pub fn info(message: &str) {
     log::info!("{message}");
 }
 
-/// No server to submit to on the host: client events are dropped.
-pub fn install_telemetry(_api: &NativeApi) {}
+pub use super::diagnostics::{forget_opt_in, load_opted_in, opted_in, set_opted_in};
 
+/// Reads the user's opt-in, then sends the session's client events from
+/// now on, and the held ones. An unreadable opt-in counts as off. As in the
+/// browser, nothing leaves the TV unless the user opted in (FR-608).
+pub fn install_telemetry(api: &NativeApi) {
+    let api = api.clone();
+    let begun = super::diagnostics::session();
+    spawn_forever(async move {
+        let opted = super::diagnostics::load_opted_in_since(&api, begun)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("pharos: diagnostics opt-in unreadable: {e}");
+                false
+            });
+        let held = super::diagnostics::install(api.clone(), opted, begun);
+        log::info!(
+            "pharos: telemetry installed opted_in={opted} held={}",
+            held.len()
+        );
+        if !held.is_empty() {
+            send(api, held);
+        }
+    });
+}
+
+/// Submits one client event without waiting for it, if opted in. Opted out,
+/// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    // Kept locally whatever the opt-in: it leaves only inside a pressed report.
     super::report::record_event(&event);
+    if let Some((api, event)) = super::diagnostics::report(tv_page::tagged(event)) {
+        send(api, vec![event]);
+    }
 }
 
-/// The host sends no client events, so diagnostics are never opted in.
-pub fn opted_in() -> bool {
-    false
-}
-
-pub fn forget_opt_in() {}
-
-pub async fn load_opted_in(_api: &NativeApi) -> Result<bool, String> {
-    Ok(false)
-}
-
-pub async fn set_opted_in(_api: &NativeApi, _on: bool) -> Result<(), String> {
-    Err("no server to store the choice on".to_owned())
+fn send(api: NativeApi, events: Vec<ClientEvent>) {
+    spawn_forever(async move {
+        if let Some(e) = super::diagnostics::submit(&api, &events).await {
+            log::warn!("pharos: client event submit failed: {e}");
+        }
+    });
 }
 
 /// `localStorage`'s twin: a file in the app's private directory.
@@ -1647,6 +1732,9 @@ static BRIDGED: AtomicBool = AtomicBool::new(false);
 /// Per page path, where the arrow keys last left the focus: a selector
 /// and which match it was (B712's rule, as on the web).
 static LEFT_AT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::new(Mutex::default);
+/// Where the browse grid last stood: its page path, the tile with the
+/// focus (else the first in view) and that tile's top in CSS px (FR-603).
+static GRID_PLACE: Mutex<Option<(String, u32, f64)>> = Mutex::new(None);
 /// Each media element's last pushed state and when it came (`now_ms`).
 static MEDIA: LazyLock<Mutex<HashMap<String, (tv_page::Media, f64)>>> =
     LazyLock::new(Mutex::default);
@@ -1656,6 +1744,7 @@ static KEY_AT: Mutex<tv_page::KeyContext> = Mutex::new(tv_page::KeyContext {
     player: false,
     in_player: false,
     on_button: false,
+    field: false,
 });
 /// What `probe_capabilities` found.
 static CAPS: Mutex<Option<Capabilities>> = Mutex::new(None);
@@ -1678,8 +1767,10 @@ unsafe impl<T> Send for Owned<T> {}
 
 /// The controls the arrow keys move between: the web's, and the player's
 /// track pickers too, which a remote has no other way to reach.
-const KEY_TARGETS: &str =
-    "a[href], button:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])";
+/// The D-pad's stops. Fields too (FR-606): a join code, a switch, a slider.
+const KEY_TARGETS: &str = "a[href], button:not([disabled]), select:not([disabled]), \
+     input:not([disabled]):not([type='hidden']), textarea:not([disabled]), \
+     [tabindex]:not([tabindex='-1'])";
 
 /// An app-wide key listener: key, ctrl, meta; true takes the key.
 type AppKeys = Box<dyn FnMut(&str, bool, bool) -> bool>;
@@ -1701,6 +1792,12 @@ enum Listener {
     MediaError(String, Box<dyn FnMut(u16, String)>),
     /// Page visualiser run `id` could not draw: the fallback's label.
     Visualiser(u64, Box<dyn FnMut(String)>),
+    /// The page went hidden: the app left the screen.
+    Hidden(Box<dyn FnMut()>),
+    /// The browse grid's place settled (`GRID_PLACE`).
+    Settled(Box<dyn FnMut()>),
+    /// The remote's next or previous key; true when a player took it.
+    Skip(Box<dyn FnMut(super::watch_view::Skip, &'static str) -> bool>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1771,7 +1868,62 @@ const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
 __BAR_KEYS__
 // Not a <select>: OK opens its list, and the arrows have to move off it.
-const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName));
+// A field typed into; a checkbox, switch or slider is not (FR-606).
+const notTyped = /^(checkbox|radio|range|button|submit|reset|color|file|image)$/;
+const inText = (t) => !!t && (t.isContentEditable || t.tagName === "TEXTAREA" ||
+  (t.tagName === "INPUT" && !notTyped.test(t.type)));
+const isRange = (t) => !!t && t.tagName === "INPUT" && t.type === "range";
+// Whether the focused field keeps an arrow for itself rather than let the
+// D-pad leave it (FR-606): a slider keeps left and right; a text field
+// keeps left and right until its caret is at that end, and a text area
+// keeps up and down too.
+const fieldKeeps = (t, key) => {
+  if (isRange(t)) return key === "ArrowLeft" || key === "ArrowRight";
+  if (!inText(t)) return false;
+  if (key === "ArrowUp" || key === "ArrowDown") return t.tagName === "TEXTAREA";
+  if (t.isContentEditable || t.selectionStart == null) return false;
+  const n = (t.value || "").length;
+  if (key === "ArrowLeft") return !(t.selectionStart === 0 && t.selectionEnd === 0);
+  if (key === "ArrowRight") return !(t.selectionStart === n && t.selectionEnd === n);
+  return false;
+};
+// A remote has no Space: OK toggles a checkbox or switch, as Space does.
+addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (e.key !== "Enter" || e.repeat || !t || t.tagName !== "INPUT" || !/^(checkbox|radio)$/.test(t.type)) return;
+  e.preventDefault();
+  t.click();
+}, true);
+// B1324: OK in a search box with a match highlighted opens that match. The
+// focus stays in the box while Down moves the highlight, and a TV's OK on a
+// focused text field brings its keyboard back up instead of reaching the
+// page as Enter. So while a match is highlighted the box asks for no
+// keyboard (`inputmode="none"`), and OK clicks the match's link or the
+// match itself, before the box's own Enter handler can run.
+const matchOf = (t) => {
+  if (!inText(t)) return null;
+  const id = t.getAttribute("aria-activedescendant");
+  return (id && document.getElementById(id)) || null;
+};
+const keyboardFor = (t) => {
+  if (!inText(t) || !t.hasAttribute("aria-activedescendant") && t.inputMode !== "none") return;
+  const want = matchOf(t) ? "none" : "";
+  if (t.inputMode !== want) t.inputMode = want;
+};
+addEventListener("keyup", (e) => keyboardFor(e.target), true);
+addEventListener("input", (e) => keyboardFor(e.target), true);
+addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (e.key !== "Enter" || e.repeat) return;
+  const match = matchOf(t);
+  if (!match) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const link = match.querySelector("a[href], button");
+  (link || match).click();
+  t.inputMode = "";
+  send({ t: "okpick", id: match.id, link: !!link });
+}, true);
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
@@ -1797,7 +1949,29 @@ addEventListener("keydown", (e) => {
   const onPlayer = !at || at === document.body || at === player;
   const v = player.querySelector("video, audio");
   const paused = !v || v.paused;
+  // Stop (FR-609): a song pauses; a video pauses and leaves the player, as
+  // Back does.
+  if (e.key === "MediaStop") {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (v && !v.paused) v.pause();
+    if (v instanceof HTMLVideoElement) history.back();
+    send({ t: "stop", video: v instanceof HTMLVideoElement });
+    return;
+  }
   const scrubbing = !!document.querySelector(".pharos-seek.is-scrubbing");
+  // OK on the picture presses Skip or Up Next while one shows (FR-604):
+  // the button is what the viewer is looking at.
+  if (e.key === "Enter" && onPlayer && !scrubbing) {
+    const press = player.querySelector('__OK_PRESSES__');
+    if (press && press.getClientRects().length > 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      press.click();
+      send({ t: "okpress", target: press.className });
+      return;
+    }
+  }
   const toggle = (e.key === "Enter" && onPlayer && !scrubbing) || e.key === "MediaPlayPause" ||
     (e.key === "MediaPlay" && paused) || (e.key === "MediaPause" && !paused);
   if (!toggle) return;
@@ -1869,7 +2043,10 @@ addEventListener("keydown", (e) => {
   if (to) to.focus({ preventScroll: true });
 }, true);
 addEventListener("keydown", (e) => {
-  const text = inText(e.target);
+  // An arrow the focused field does not keep leaves it: it is no longer
+  // a key "in the field", so the D-pad moves on (FR-606).
+  const field = inText(e.target) || isRange(e.target);
+  const text = field && (!e.key.startsWith("Arrow") || fieldKeeps(e.target, e.key));
   const prevented = e.defaultPrevented;
   if (!text && !e.ctrlKey && !e.metaKey && !document.querySelector('.pharos-invite') && seekKeys.has(e.key) && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
   if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing") || performance.now() - lastSeekKey < 900;
@@ -1884,6 +2061,7 @@ addEventListener("keydown", (e) => {
     t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text, prevented,
     player: !!player, in_player: !!(player && at && player.contains(at)),
     on_button: !!(at && at.matches && at.matches("a[href], button")),
+    field,
   });
 });
 // The WebView takes the remote's Back only while it has a page to go back
@@ -1895,10 +2073,53 @@ if (!window.__pharosGuard) {
   history.replaceState("pharos-guard", "", location.href);
   history.pushState("pharos", "", location.href);
 }
+// Where the browse grid stands, for coming back to it (FR-603): the tile
+// with the focus, else the first in view, and how far below the top it
+// sits, sent once the scroll or the focus has settled.
+let placeTimer = 0;
+const gridPlace = () => {
+  clearTimeout(placeTimer);
+  placeTimer = setTimeout(() => {
+    const grid = document.querySelector('__GRID__');
+    if (!grid) return;
+    const tiles = [...grid.children];
+    const at = document.activeElement;
+    let i = at && grid.contains(at) ? tiles.findIndex((t) => t.contains(at)) : -1;
+    if (i < 0) i = tiles.findIndex((t) => t.getBoundingClientRect().bottom > 0);
+    if (i < 0) return;
+    send({ t: "place", path: location.pathname + location.search, tile: i,
+      top: tiles[i].getBoundingClientRect().top });
+  }, 150);
+};
+addEventListener("scroll", gridPlace, { passive: true });
+addEventListener("focusin", gridPlace);
+// Back closes an open dialog or menu before it goes back a page (FR-607),
+// with the Escape each of them already closes on. One that is still open
+// at the next Back, with no key pressed between, does not close on Escape:
+// that Back goes on as usual.
+let backClosed = null;
+addEventListener("keydown", () => { backClosed = null; }, true);
+const closeOverlay = () => {
+  let el = null;
+  for (const o of document.querySelectorAll('__OVERLAYS__')) {
+    if (o.getClientRects().length > 0) { el = o; break; }
+  }
+  if (!el || el === backClosed) return null;
+  const at = document.activeElement;
+  const target = at && el.contains(at) ? at : el;
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  backClosed = el;
+  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
+};
 addEventListener("popstate", (e) => {
+  const closed = closeOverlay();
   if (e.state === "pharos-guard") {
     history.pushState("pharos", "", location.href);
-    send({ t: "root" });
+    send(closed ? { t: "backclose", what: closed, restore: false } : { t: "root" });
+    return;
+  }
+  if (closed) {
+    send({ t: "backclose", what: closed, restore: true });
     return;
   }
   send({ t: "pop", path: location.pathname + location.search });
@@ -1937,6 +2158,19 @@ for (const name of ["timeupdate", "play", "playing", "pause", "waiting", "canpla
   "ratechange", "emptied"]) {
   document.addEventListener(name, media, true);
 }
+// Leaving the app (Home, another app, the TV's input switch) hides the
+// page. A video pauses here, before Rust hears of it, so it never plays on
+// behind the launcher (FR-605); a song plays on, as music does elsewhere.
+document.addEventListener("visibilitychange", () => {
+  const hidden = document.hidden;
+  let paused = 0;
+  if (hidden) {
+    for (const v of document.querySelectorAll("video")) {
+      if (!v.paused) { v.pause(); paused++; }
+    }
+  }
+  send({ t: "visibility", hidden, paused });
+});
 const size = () => send({ t: "size", w: innerWidth, h: innerHeight });
 addEventListener("resize", size);
 size();
@@ -1994,7 +2228,24 @@ fn on_bridge(message: Bridge) {
             at,
         } => {
             *lock(&KEY_AT) = at;
+            if at.field && !text && key.starts_with("Arrow") {
+                log::info!("pharos: keys: field left via={key} path={}", current_path());
+            }
             let mut taken = false;
+            if let Some(skip) = tv_page::track_skip(&key) {
+                for f in &listeners {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::Skip(f) = &mut f.0 {
+                            taken |= f(skip, "remote");
+                        }
+                    }
+                }
+                log::info!(
+                    "pharos: remote key key={key} skip={} taken={taken}",
+                    skip.label()
+                );
+                return;
+            }
             for f in &listeners {
                 if let Ok(mut f) = f.try_lock() {
                     if let Listener::App(f) = &mut f.0 {
@@ -2071,6 +2322,62 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Place { path, tile, top } => {
+            if path != current_path() {
+                return;
+            }
+            log::debug!("pharos: grid place tile={tile} top={top:.0} path={path}");
+            *lock(&GRID_PLACE) = Some((path, tile, top));
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Settled(f) = &mut f.0 {
+                        f();
+                    }
+                }
+            }
+        }
+        Bridge::BackClose { what, restore } => {
+            let here = current_path();
+            log::info!("pharos: back closed overlay what={what} path={here}");
+            if restore {
+                // The WebView went back an entry; the page stays.
+                run(format!(
+                    "history.pushState('pharos', '', {});",
+                    js_str(&here)
+                ));
+            }
+        }
+        Bridge::OkPick { id, link } => {
+            log::info!(
+                "pharos: remote ok opened match id={id} link={link} path={}",
+                current_path()
+            );
+        }
+        Bridge::OkPress { target } => {
+            log::info!("pharos: remote ok pressed target={target}");
+        }
+        Bridge::Stop { video } => {
+            log::info!(
+                "pharos: remote key key=MediaStop video={video} path={}",
+                current_path()
+            );
+        }
+        Bridge::Visibility { hidden, paused } => {
+            log::info!(
+                "pharos: page visibility hidden={hidden} paused_videos={paused} path={}",
+                current_path()
+            );
+            if !hidden {
+                return;
+            }
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Hidden(f) = &mut f.0 {
+                        f();
+                    }
+                }
+            }
+        }
         Bridge::Media(media) => {
             let at = now_ms();
             let (id, tick) = (media.id.clone(), media.tick);

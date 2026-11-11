@@ -17,6 +17,27 @@ pub const DEFAULT_SERVER: &str = match option_env!("PHAROS_TV_SERVER") {
 /// a TV, so the ten-foot layout applies.
 pub const USER_AGENT: &str = "Pharos Android TV";
 
+/// The field the TV adds to each client event it submits, so the server's
+/// log tells its events from a browser's (FR-608).
+pub const EVENT_CLIENT: (&str, &str) = ("client", "android-tv");
+
+/// `event` as the TV submits it: tagged with [`EVENT_CLIENT`], once.
+pub fn tagged(mut event: pharos_client::api::ClientEvent) -> pharos_client::api::ClientEvent {
+    if !event.fields.iter().any(|(k, _)| *k == EVENT_CLIENT.0) {
+        event
+            .fields
+            .push((EVENT_CLIENT.0, EVENT_CLIENT.1.to_owned()));
+    }
+    event
+}
+
+/// The query of `path`, `?` and all, without any fragment; empty when it
+/// has none, as `location.search` reads (B1276).
+pub fn search_of(path: &str) -> &str {
+    let path = path.split('#').next().unwrap_or_default();
+    path.find('?').map_or("", |at| &path[at..])
+}
+
 /// The first page the app opens on.
 pub const START_PATH: &str = "/ui/";
 
@@ -313,6 +334,15 @@ addEventListener("keydown", (e) => {
 
 /// The bridge script `template` with its tick intervals, player selectors
 /// and Info key filled in.
+/// What OK on the picture presses instead of pausing, while one shows:
+/// Up Next's Play now, or the skip intro/credits button (FR-604).
+pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .pharos-skip";
+
+/// What the remote's Back closes, with an Escape, before it goes back a page
+/// (FR-607): dialogs, menus, an open search list, the player's settings
+/// sheet and its queue.
+pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue"#;
+
 pub fn bridge_script(template: &str) -> String {
     template
         .replace("__BAR_KEYS__", BAR_KEY_JS)
@@ -321,6 +351,9 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
         .replace("__PLAYER_HOME__", PLAYER_HOME)
         .replace("__REMOTE_SKIPS__", REMOTE_SKIPS)
+        .replace("__OK_PRESSES__", OK_PRESSES)
+        .replace("__OVERLAYS__", OVERLAYS)
+        .replace("__GRID__", GRID)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -368,6 +401,50 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// Where the browse grid on `path` stands once its scroll or focus has
+    /// settled: the tile with the focus, else the first in view, and how far
+    /// below the viewport's top it sits (FR-603).
+    Place { path: String, tile: u32, top: f64 },
+    /// The remote's Back closed an open dialog or menu (`what`, its class
+    /// or role) instead of going back a page (FR-607). With `restore` the
+    /// WebView already went back an entry, which Rust puts back.
+    #[serde(rename = "backclose")]
+    BackClose {
+        #[serde(default)]
+        what: String,
+        #[serde(default)]
+        restore: bool,
+    },
+    /// OK in a search box opened its highlighted match (B1324): `id` is
+    /// the match's element, `link` whether a link inside it took the click.
+    #[serde(rename = "okpick")]
+    OkPick {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        link: bool,
+    },
+    /// OK on the picture pressed the shown Skip or Up Next button (FR-604);
+    /// `target` is its class.
+    #[serde(rename = "okpress")]
+    OkPress {
+        #[serde(default)]
+        target: String,
+    },
+    /// The remote's Stop key, which the page's script handled: it paused
+    /// the player, and left it when it was a video (FR-609).
+    Stop {
+        #[serde(default)]
+        video: bool,
+    },
+    /// The page was hidden (the app left the screen: Home, another app, the
+    /// TV's input switch) or shown again. `paused` counts the videos the
+    /// page's script paused as it hid (FR-605).
+    Visibility {
+        hidden: bool,
+        #[serde(default)]
+        paused: u32,
+    },
     /// A media element's state, after any of its events.
     Media(Media),
     /// An hls.js event on the player for `id`.
@@ -408,6 +485,17 @@ pub struct KeyContext {
     pub in_player: bool,
     /// The focus is on a button or link.
     pub on_button: bool,
+    /// The focus is on a field: text, a text area or a slider (FR-606).
+    pub field: bool,
+}
+
+/// The neighbour a remote's next or previous key asks for (FR-609).
+pub fn track_skip(key: &str) -> Option<super::watch_view::Skip> {
+    match key {
+        "MediaTrackNext" => Some(super::watch_view::Skip::Next),
+        "MediaTrackPrevious" => Some(super::watch_view::Skip::Previous),
+        _ => None,
+    }
 }
 
 /// Whether a transport key goes on to the player (B618): there is one, the
@@ -550,6 +638,24 @@ return true;
     )
 }
 
+/// Script: put the browse tile at `at` back `top` CSS px below the top of
+/// the viewport, where it was when the grid was left, and focus it (FR-603).
+pub fn scroll_tile_to_js(at: u32, top: f64) -> String {
+    let top = if top.is_finite() { top } else { 0.0 };
+    format!(
+        r#"
+const grid = document.querySelector({grid});
+const tile = grid ? grid.children[{at}] : null;
+if (!tile) return false;
+window.scrollBy(0, tile.getBoundingClientRect().top - ({top}));
+const link = tile.querySelector("a[href], button, [tabindex]") || tile;
+if (link.focus) link.focus({{ preventScroll: true }});
+return true;
+"#,
+        grid = serde_json::Value::String(GRID.to_owned()),
+    )
+}
+
 /// Script: scroll the page back to its top.
 pub const SCROLL_TO_TOP_JS: &str = "window.scrollTo(0, 0);";
 
@@ -591,6 +697,68 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paths_search_is_its_query() {
+        assert_eq!(
+            search_of("/ui/browse/s7?genre=animation"),
+            "?genre=animation"
+        );
+        assert_eq!(search_of("/ui/browse/s7"), "");
+        assert_eq!(search_of("/ui/title/s7?a=1#x"), "?a=1");
+    }
+
+    #[test]
+    fn a_tv_event_names_its_client_once() {
+        use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+        let event = ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: ClientLevel::Error,
+            route: "/watch/1".to_owned(),
+            fields: vec![("engine", "hlsjs".to_owned())],
+        };
+        let once = tagged(event);
+        assert_eq!(
+            once.fields,
+            vec![
+                ("engine", "hlsjs".to_owned()),
+                ("client", "android-tv".to_owned())
+            ]
+        );
+        let twice = tagged(once.clone());
+        assert_eq!(twice.fields, once.fields, "tagged twice");
+    }
+
+    #[test]
+    fn ok_presses_the_buttons_the_player_draws() {
+        let view = include_str!("watch_view.rs");
+        for class in OK_PRESSES.split(", ") {
+            let name = class.trim_start_matches('.');
+            assert!(
+                view.contains(&format!("class: \"{name}\"")),
+                "the player draws no {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_remotes_next_and_previous_keys_skip() {
+        use super::super::watch_view::Skip;
+        assert_eq!(track_skip("MediaTrackNext"), Some(Skip::Next));
+        assert_eq!(track_skip("MediaTrackPrevious"), Some(Skip::Previous));
+        assert_eq!(track_skip("ArrowRight"), None);
+        assert_eq!(track_skip("MediaFastForward"), None);
+    }
+
+    #[test]
+    fn a_kept_place_puts_the_tile_back_where_it_was_and_focuses_it() {
+        let js = scroll_tile_to_js(40, 212.5);
+        assert!(js.contains("grid.children[40]"), "{js}");
+        assert!(js.contains("getBoundingClientRect().top - (212.5)"), "{js}");
+        assert!(js.contains("link.focus({ preventScroll: true })"), "{js}");
+        assert!(scroll_tile_to_js(1, f64::NAN).contains("- (0)"));
+        assert_eq!(bridge_script("__GRID__"), GRID);
+    }
 
     #[test]
     fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
@@ -687,6 +855,8 @@ mod tests {
         );
         assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
         assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
+        assert_eq!(bridge_script("__OK_PRESSES__"), OK_PRESSES);
+        assert_eq!(bridge_script("__OVERLAYS__"), OVERLAYS);
         // B1222/V1182: the Info key's script is in the bridge, filled in.
         let keys = bridge_script("__BAR_KEYS__");
         assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
@@ -878,6 +1048,49 @@ mod tests {
                 path: "/ui/".into()
             })
         );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "visibility", "hidden": true, "paused": 1})),
+            Some(Bridge::Visibility {
+                hidden: true,
+                paused: 1
+            })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "stop", "video": true})),
+            Some(Bridge::Stop { video: true })
+        );
+        assert_eq!(
+            parse_bridge(
+                &serde_json::json!({"t": "okpick", "id": "palette-option-2", "link": false})
+            ),
+            Some(Bridge::OkPick {
+                id: "palette-option-2".to_owned(),
+                link: false
+            })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "okpress", "target": "pharos-skip"})),
+            Some(Bridge::OkPress {
+                target: "pharos-skip".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "backclose", "what": "menu", "restore": true})),
+            Some(Bridge::BackClose {
+                what: "menu".to_owned(),
+                restore: true
+            })
+        );
+        assert_eq!(
+            parse_bridge(
+                &serde_json::json!({"t": "place", "path": "/ui/browse/1", "tile": 40, "top": 212.5})
+            ),
+            Some(Bridge::Place {
+                path: "/ui/browse/1".to_owned(),
+                tile: 40,
+                top: 212.5
+            })
+        );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
         assert_eq!(parse_bridge(&serde_json::json!(3)), None);
     }
@@ -914,6 +1127,16 @@ mod tests {
         assert!(!waiting.has_data());
         let live = Media { dur: None, ..m };
         assert_eq!(live.duration_ms(), 0);
+    }
+
+    #[test]
+    fn a_key_says_when_the_focus_is_on_a_field() {
+        let key = serde_json::json!({"t": "key", "key": "ArrowDown", "field": true});
+        let Some(Bridge::Key { at, text, .. }) = parse_bridge(&key) else {
+            panic!("not a key");
+        };
+        assert!(at.field);
+        assert!(!text, "an arrow leaving a field is not a key in it");
     }
 
     #[test]

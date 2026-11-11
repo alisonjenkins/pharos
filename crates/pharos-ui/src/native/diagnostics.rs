@@ -1,12 +1,17 @@
 //! The gate on client diagnostics: whether this user has opted in to
 //! sending them, and the bounded hold for events raised before the session
-//! opens. Platform-neutral so the gate runs under host tests; the browser
-//! platform keeps the choice in the server's `Prefs` and does the submit.
+//! opens. Platform-neutral so the gate runs under host tests. The session's
+//! state (the opt-in as read from the server's `Prefs`, and the gate) lives
+//! here too, so the browser and the TV app share one gate; each platform
+//! spawns the submit on its own executor.
 
-// Only the browser platform submits; the host build compiles this for tests.
+// Only the browser and the TV app submit; the host build compiles this for tests.
 #![allow(dead_code)]
 
-use pharos_client::api::ClientEvent;
+use std::cell::RefCell;
+
+use pharos_client::api::{ClientEvent, NativeApi};
+use pharos_client::CallInfo;
 
 /// The `Prefs` key holding this user's diagnostics opt-in.
 pub const OPT_IN_PREF: &str = "diagnostics.opt_in";
@@ -84,6 +89,135 @@ impl<A: Clone> Sink<A> {
     }
 }
 
+/// The signed-in session's diagnostics: the gate, and the user's opt-in as
+/// last read from or written to `Prefs`. Off until read, and again after
+/// sign-out.
+#[derive(Default)]
+struct Telemetry {
+    sink: Sink<NativeApi>,
+    failure_logged: bool,
+    opted_in: bool,
+    /// Bumped by each [`forget_opt_in`]: a read or an install begun under an
+    /// earlier session must not land in this one.
+    session: u64,
+}
+
+thread_local! {
+    static TELEMETRY: RefCell<Telemetry> = RefCell::new(Telemetry::default());
+}
+
+/// Whether the signed-in user has opted in to sending diagnostics, as
+/// last read from the server. Off before sign-in and until the read lands.
+pub fn opted_in() -> bool {
+    TELEMETRY.with(|t| t.borrow().opted_in)
+}
+
+fn remember_opt_in(on: bool) {
+    TELEMETRY.with(|t| t.borrow_mut().opted_in = on);
+}
+
+/// Forgets the session: the opt-in, the connection events went through
+/// and any events held for it, so nothing is sent after sign-out until the
+/// next user's choice is read, and nothing raised before reaches that user's
+/// session. A read or an install still under way is discarded when it lands.
+pub fn forget_opt_in() {
+    TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        let session = t.session.wrapping_add(1);
+        *t = Telemetry {
+            session,
+            ..Telemetry::default()
+        };
+    });
+}
+
+/// The session a read or an install is begun under; see [`forget_opt_in`].
+pub fn session() -> u64 {
+    TELEMETRY.with(|t| t.borrow().session)
+}
+
+fn prefs_call(action: &str) -> CallInfo {
+    CallInfo {
+        ui_route: "telemetry".into(),
+        ui_action: action.into(),
+        ..Default::default()
+    }
+}
+
+/// Reads the user's opt-in from `Prefs` and remembers it.
+pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
+    load_opted_in_since(api, session()).await
+}
+
+/// [`load_opted_in`] for a read begun under session `begun` (from
+/// [`session`]), taken where `api` was: a task that only starts after a
+/// sign-out must not remember the previous user's opt-in for the next.
+pub async fn load_opted_in_since(api: &NativeApi, begun: u64) -> Result<bool, String> {
+    let raw = api
+        .pref(&prefs_call("opt_in_read"), OPT_IN_PREF)
+        .await
+        .map_err(|e| e.to_string())?;
+    remember_if_current(begun, opt_in_from(raw.as_deref()))
+}
+
+/// Remembers `on` if no sign-out came since session `begun`.
+fn remember_if_current(begun: u64, on: bool) -> Result<bool, String> {
+    if session() != begun {
+        return Err("signed out while the opt-in was read".to_owned());
+    }
+    remember_opt_in(on);
+    Ok(on)
+}
+
+/// Writes the user's opt-in to `Prefs`; remembered only once the server
+/// has stored it.
+pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
+    let begun = session();
+    let value: &[u8] = if on { b"true" } else { b"false" };
+    api.set_pref(&prefs_call("opt_in_write"), OPT_IN_PREF, value)
+        .await
+        .map_err(|e| e.to_string())?;
+    if session() != begun {
+        return Err("signed out while the opt-in was saved".to_owned());
+    }
+    remember_opt_in(on);
+    Ok(())
+}
+
+/// Starts submitting through `api`: the held events to send now, none when
+/// opted out. An install begun under an earlier session (`begun`, from
+/// [`session`]) does nothing.
+pub fn install(api: NativeApi, opted_in: bool, begun: u64) -> Vec<ClientEvent> {
+    TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.session != begun {
+            return Vec::new();
+        }
+        t.sink.install(api, opted_in)
+    })
+}
+
+/// The submit to make now for `event`, if any (see [`Sink::report`]).
+pub fn report(event: ClientEvent) -> Option<(NativeApi, ClientEvent)> {
+    let opted = opted_in();
+    TELEMETRY.with(|t| t.borrow_mut().sink.report(opted, event))
+}
+
+/// Submits `events`, unless the opt-in was turned off since they were
+/// raised. A failure is returned once per session: a dead socket fails
+/// every later batch the same way.
+pub async fn submit(api: &NativeApi, events: &[ClientEvent]) -> Option<String> {
+    if !opted_in() {
+        return None;
+    }
+    let e = api
+        .submit_events(&prefs_call("submit"), events)
+        .await
+        .err()?;
+    let first = TELEMETRY.with(|t| !std::mem::replace(&mut t.borrow_mut().failure_logged, true));
+    first.then(|| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +230,23 @@ mod tests {
             route: "/player".to_owned(),
             fields: Vec::new(),
         }
+    }
+
+    #[test]
+    fn sign_out_forgets_the_opt_in_and_the_held_events_and_starts_a_new_session() {
+        remember_opt_in(true);
+        assert!(report(event()).is_none(), "no connection yet: held");
+        let held = || TELEMETRY.with(|t| t.borrow().sink.pending_len());
+        assert_eq!(held(), 1);
+        let before = session();
+        forget_opt_in();
+        assert!(!opted_in());
+        assert_eq!(held(), 0, "a held event survived sign-out");
+        assert_ne!(
+            session(),
+            before,
+            "a read begun before sign-out would still land"
+        );
     }
 
     #[test]
@@ -159,6 +310,20 @@ mod tests {
             matches!(submitted, Some((7, _))),
             "expected one submit through api 7"
         );
+    }
+
+    /// An opt-in read begun before a sign-out, even one whose task only
+    /// starts after it, is not remembered for the next user.
+    #[test]
+    fn an_opt_in_read_from_before_sign_out_is_not_remembered() {
+        forget_opt_in();
+        let begun = session();
+        forget_opt_in();
+        assert!(remember_if_current(begun, true).is_err());
+        assert!(!opted_in());
+        assert_eq!(remember_if_current(session(), true), Ok(true));
+        assert!(opted_in());
+        forget_opt_in();
     }
 
     #[test]

@@ -1855,7 +1855,8 @@ fn NativeApp(route: Route) -> Element {
     let mut slow_connect = use_signal(|| false);
     // A page loaded before a deploy reconnects to the newer server, which may
     // send values this build cannot read: it asks to be reloaded.
-    let outdated = use_signal(|| false);
+    // The newer server's schema, when it is newer than this build's.
+    let outdated = use_signal(|| None::<u32>);
     // Dismissed for the rest of this run; a restart shows it again.
     let mut update_dismissed = use_signal(|| false);
     let marks = use_signal(|| 0u32);
@@ -2244,7 +2245,7 @@ fn NativeApp(route: Route) -> Element {
                     }
                 },
                 search: rsx! { TopSearch {} },
-                if outdated() && !on_player && !update_dismissed() {
+                if let Some(server) = outdated().filter(|_| !on_player && !update_dismissed()) {
                     if platform::can_reload() {
                         p { class: "pharos-error", role: "alert",
                             "Pharos has been updated. Reload to keep using it. "
@@ -2256,7 +2257,8 @@ fn NativeApp(route: Route) -> Element {
                         // An installed app has nothing to reload: the
                         // update is a new build.
                         p { class: "pharos-error", role: "alert",
-                            "The Pharos server has been updated. Some things may not work until this app is updated too. "
+                            {app_outdated_line(pharos_client::SCHEMA_VERSION, server)}
+                            " "
                             button { class: "pharos-button", onclick: move |_| update_dismissed.set(true), "Dismiss" }
                         }
                     }
@@ -2380,22 +2382,22 @@ fn QuickConnectSignIn(on_signed_in: EventHandler<SignInReply>) -> Element {
 async fn connect(
     mut machine: Signal<Machine>,
     mut api: Signal<Option<NativeApi>>,
-    mut outdated: Signal<bool>,
+    mut outdated: Signal<Option<u32>>,
     epoch: u32,
     delay_ms: u32,
 ) {
     platform::sleep_ms(delay_ms).await;
     let event = match platform::open(&call("connect", "resume")).await {
         Ok(mut open) => {
-            if open
+            if let Some(server) = open
                 .server_schema
-                .is_some_and(pharos_client::is_outdated_by)
+                .filter(|&v| pharos_client::is_outdated_by(v))
             {
                 platform::warn(&format!(
-                    "pharos: server schema {:?} is newer than this page's",
-                    open.server_schema
+                    "pharos: server schema {server} is newer than this page's {}",
+                    pharos_client::SCHEMA_VERSION
                 ));
-                outdated.set(true);
+                outdated.set(Some(server));
             }
             api.set(Some(open.api.clone()));
             platform::install_telemetry(&open.api);
@@ -2997,6 +2999,20 @@ fn PaletteScreen() -> Element {
     }
 }
 
+/// What an installed app (the TV's) says when the server is newer than
+/// it: both versions, and how to update (FR-610). There is nothing to
+/// reload: the update is a new build.
+fn app_outdated_line(app: u32, server: u32) -> String {
+    format!(
+        "The Pharos server has been updated (version {server}); this app is version {app}. \
+         Some things may not work until you install the latest Pharos TV app."
+    )
+}
+
+/// Whether the top bar offers a Search button in place of the search box:
+/// on the Android TV app (FR-602).
+const TV_SEARCH_BUTTON: bool = cfg!(target_os = "android");
+
 /// The top bar's search box: the shared search's first matches in a list
 /// under it, walked with the arrow keys. Enter opens the match the arrows
 /// are on, or the palette with all of them.
@@ -3016,6 +3032,22 @@ fn TopSearch() -> Element {
             .collect(),
         _ => Vec::new(),
     };
+    // A TV has no keyboard to type into the box from and no Ctrl+K: the bar
+    // holds a Search button that opens the palette, its input focused, where
+    // the remote's keyboard comes up (FR-602).
+    if TV_SEARCH_BUTTON {
+        return rsx! {
+            button {
+                class: "pharos-search-open",
+                r#type: "button",
+                onclick: move |_| {
+                    platform::info("pharos: palette opened via=banner");
+                    palette.0.set(true);
+                },
+                "Search"
+            }
+        };
+    }
     let on_key = move |evt: KeyboardEvent| match evt.key() {
         Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
@@ -7999,6 +8031,14 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn the_apps_outdated_notice_names_both_versions_and_the_update() {
+        let line = app_outdated_line(41, 43);
+        assert!(line.contains("version 43"), "{line}");
+        assert!(line.contains("this app is version 41"), "{line}");
+        assert!(line.contains("install the latest Pharos TV app"), "{line}");
+    }
 
     #[test]
     fn a_remount_keeps_a_paused_video_paused() {
