@@ -1266,7 +1266,7 @@ pub fn PosterTile(
 ) -> Element {
     let play = play && item.kind.playable();
     let nav = use_context::<Nav>();
-    let hold = use_signal(TileHold::default);
+    let mut hold = use_signal(TileHold::default);
     let to = if read {
         Route::Read(item.id)
     } else {
@@ -1299,6 +1299,10 @@ pub fn PosterTile(
                     }
                 },
                 onpointerdown: move |evt: PointerEvent| {
+                    let touch = evt.pointer_type() != "mouse";
+                    if play && hold.peek().touch != touch {
+                        hold.write().touch = touch;
+                    }
                     if play && evt.is_primary() && evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
                         hold_start(hold, nav, watch.clone(), evt.pointer_type());
                     }
@@ -1313,8 +1317,13 @@ pub fn PosterTile(
                         hold_clear(hold);
                     }
                 },
-                // A held finger plays rather than opening the link's menu.
-                oncontextmenu: move |evt: MouseEvent| if play { evt.prevent_default() },
+                // A held finger plays rather than opening the link's menu; a
+                // mouse's right click keeps the menu.
+                oncontextmenu: move |evt: MouseEvent| {
+                    if play && hold.peek().touch {
+                        evt.prevent_default();
+                    }
+                },
                 match &item.image {
                     Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
                     None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
@@ -1387,17 +1396,22 @@ struct TileHold {
     down: bool,
     lit: bool,
     fired: bool,
+    /// The last press on the tile was a finger or pen, whose long press
+    /// opens the link's menu; a mouse's right click keeps it (B1340).
+    touch: bool,
 }
 
 /// A press on a tile that plays on a hold: lit once it is plainly not a
 /// click, and played if it is still down at [`TILE_HOLD_MS`].
 fn hold_start(mut hold: Signal<TileHold>, nav: Nav, watch: Route, via: String) {
     let press = hold.peek().press.wrapping_add(1);
+    let touch = hold.peek().touch;
     hold.set(TileHold {
         press,
         down: true,
         lit: false,
         fired: false,
+        touch,
     });
     spawn(async move {
         platform::sleep_ms(200).await;
