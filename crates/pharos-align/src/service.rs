@@ -51,8 +51,20 @@ pub struct GpuPool {
     pub reserved: u64,
 }
 
-/// The GPU pool at the end of a song (B1352, V1323): `peak` before its empty
-/// pages were handed back, the most the song held, and `after` what it keeps.
+impl GpuPool {
+    /// Each count's larger value of two readings: a high-water mark.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            in_use: self.in_use.max(other.in_use),
+            reserved: self.reserved.max(other.reserved),
+        }
+    }
+}
+
+/// The GPU pool at the end of a song (B1352, V1323): `peak`, the most the
+/// song held as read after each window and before the cleanup, and `after`
+/// what it keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuMemory {
     pub peak: GpuPool,
@@ -458,6 +470,16 @@ fn run_song(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pool_high_water_mark_keeps_each_counts_largest_reading() {
+        use super::GpuPool;
+        let p = |in_use, reserved| GpuPool { in_use, reserved };
+        // A later reading after cubecl freed pages does not lower the peak.
+        assert_eq!(p(4, 9).max(p(2, 6)), p(4, 9));
+        assert_eq!(p(4, 6).max(p(2, 9)), p(4, 9));
+        assert_eq!(p(1, 5).max(p(1, 5)), p(1, 5));
+    }
+
     #[test]
     fn a_score_is_rounded_to_three_places_within_0_to_1_and_null_when_not_finite() {
         use super::round_score;

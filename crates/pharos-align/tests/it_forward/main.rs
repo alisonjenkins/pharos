@@ -207,27 +207,32 @@ fn the_gpu_pool_gives_back_what_a_song_grew() {
         eprintln!("SKIPPED: no discrete Vulkan adapter (wgpu panicked creating it)");
         return;
     };
-    let mut gpu = VulkanAligner {
-        model: model.unwrap(),
-        reason: "forced_vulkan".into(),
-        adapter: "test".into(),
-    };
+    let mut gpu = VulkanAligner::new(model.unwrap(), "forced_vulkan".into(), "test".into());
     let tokens: Vec<String> = ["la", "da", "na"].iter().map(|s| (*s).to_owned()).collect();
-    // Each song's windows take new shapes, which grow the pool.
+    // Each song's windows take new shapes, which grow the pool; a long one
+    // early lets cubecl free its pages before the song ends.
     for (song, lens) in [
-        [4u64, 12, 30, 60],
-        [3, 9, 22, 45],
-        [6, 17, 40, 55],
-        [5, 11, 26, 50],
+        [60u64, 4, 12, 30, 3, 5, 2, 4, 3, 6, 2, 5],
+        [3, 9, 22, 45, 2, 3, 4, 2, 5, 3, 2, 4],
+        [55, 6, 17, 40, 3, 2, 4, 5, 2, 3, 6, 2],
+        [5, 50, 11, 26, 2, 4, 3, 5, 2, 6, 3, 2],
     ]
     .iter()
     .enumerate()
     {
+        gpu.begin_song();
+        let mut seen = 0;
         for &secs in lens {
             let line = wave(usize::try_from(secs * 16_000).unwrap(), secs + song as u64);
             gpu.align(&line, &tokens, false).unwrap();
+            seen = seen.max(gpu.model.pool().unwrap().reserved);
         }
         let mem = gpu.end_song().expect("the Vulkan pass reports its pool");
+        // The peak is the song's high-water mark, not its last reading.
+        assert!(
+            mem.peak.reserved >= seen,
+            "song {song}: {mem:?}, saw {seen}"
+        );
         eprintln!("song {song}: {mem:?}");
         assert!(
             mem.peak.reserved <= MAX_GPU_POOL_BYTES,
