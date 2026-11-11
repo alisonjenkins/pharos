@@ -1787,6 +1787,15 @@ pub(super) fn slider_key(evt: KeyboardEvent, wake: Option<Wake>) {
 }
 
 /// Whether a track menu keeps `key`: the keys that open it and move along it.
+/// Once a menu is picked, the keys that move it go to the player again. On
+/// a TV the menu sits in the open settings sheet, so the remote stays on it
+/// (B1342): the picture would take OK while the sheet is still open.
+fn after_pick() {
+    if !REMOTE_FOCUS {
+        platform::focus_by_id(PLAYER_ID);
+    }
+}
+
 fn menu_takes(key: &Key) -> bool {
     moves_a_control(key) || matches!(key, Key::Named(NamedKey::Enter)) || key.to_string() == " "
 }
@@ -1829,7 +1838,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
             onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_change.call(evt.value() == "me");
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             option { value: "follow", selected: !own_tracks, "Follow group" }
             option { value: "me", selected: own_tracks, "Just me" }
@@ -1954,8 +1963,7 @@ pub(super) fn TrackPicker(
             onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_pick.call(evt.value().parse::<u32>().ok());
-                // Once picked, the keys that move the picker go to the player again.
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             if offer_off {
                 option { value: "off", selected: pick.is_none(), "{label} off" }
@@ -1988,7 +1996,7 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
             onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_pick.call(Control::SubtitleSize(SubtitleSize::parse(&evt.value())));
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             for each in SubtitleSize::ALL {
                 option {
@@ -2018,7 +2026,7 @@ fn ViewModePicker(show: bool, mode: ViewMode, on_pick: EventHandler<Control>) ->
             onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_pick.call(Control::ViewMode(ViewMode::parse(&evt.value())));
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             for each in ViewMode::ALL {
                 option {
@@ -2132,7 +2140,7 @@ fn SpeedPicker(speed: f64, in_group: bool, on_pick: EventHandler<Control>) -> El
                 if let Ok(rate) = evt.value().parse::<f64>() {
                     on_pick.call(Control::Speed(rate));
                 }
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             for each in SPEEDS {
                 option {
@@ -2166,7 +2174,7 @@ fn VersionPicker(
                 if let Ok(i) = evt.value().parse::<usize>() {
                     on_pick.call(Control::Version(i));
                 }
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             for (i, (id, label)) in versions.into_iter().enumerate() {
                 option {
