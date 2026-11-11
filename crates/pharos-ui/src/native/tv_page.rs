@@ -264,6 +264,10 @@ pub const JASSUB_DIR: &str = "/ui/assets/vendor/jassub";
 /// keeps the plain cues; the web build's wait.
 pub const STYLED_READY_MS: u32 = 45_000;
 
+/// How long a paused redraw waits for an animation frame before a timer
+/// stands in: about six frames at 60 Hz, well inside the ready deadline.
+const STYLED_TICK_FALLBACK_MS: u32 = 100;
+
 /// The script that starts styled-subtitle run `run` on `<video id=video_id>`:
 /// JASSUB drawing the script at `url` with the script's own `fonts` and the
 /// subtitle font `pack` (family, file under `/ui/assets/fonts/`). It answers
@@ -356,7 +360,9 @@ try {{
   // A paused video sends no frame callbacks, so draw its frame now, and once
   // more after JASSUB's own observer has resized and cleared the canvas.
   const frame = () => ({{ mediaTime: v.currentTime, width: v.videoWidth, height: v.videoHeight }});
-  const tick = () => new Promise((ok) => requestAnimationFrame(() => ok()));
+  // A hidden page runs no animation frames, so a timer stands in for one
+  // rather than letting the deadline fail a healthy start.
+  const tick = () => new Promise((ok) => {{ requestAnimationFrame(() => ok()); setTimeout(ok, {TICK_FALLBACK_MS}); }});
   try {{
     await within(j.manualRender(frame(), true));
     await within(tick()); await within(tick());
@@ -372,6 +378,7 @@ try {{
   return "failed: " + ((e && e.message) || e);
 }}"#,
         ready_ms = STYLED_READY_MS,
+        TICK_FALLBACK_MS = STYLED_TICK_FALLBACK_MS,
     )
 }
 
@@ -1151,6 +1158,11 @@ mod tests {
         );
         assert_eq!(js.matches("tick()").count(), 2, "{js}");
         assert_eq!(js.matches("await within(tick())").count(), 2, "{js}");
+        // A hidden page runs no animation frames; a timer must still end a tick.
+        assert!(
+            js.contains(&format!("setTimeout(ok, {STYLED_TICK_FALLBACK_MS})")),
+            "{js}"
+        );
         assert!(js.contains("paused_redraw=ok"));
         assert!(js.contains(r#"return "failed: paused redraw ""#));
         assert!(js.contains("if (!owned) made.forEach((u) => URL.revokeObjectURL(u))"));
