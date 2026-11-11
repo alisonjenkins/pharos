@@ -4026,7 +4026,8 @@ button.pharos-lyrics-line:focus-visible {
 .pharos-settings-page button {
   padding: 0.55rem 1.1rem;
   border: var(--px-border) solid var(--px-color-border);
-  border-radius: var(--px-radius);
+  /* The button family's pill (B1345/V1316). */
+  border-radius: calc(var(--px-radius) * 999);
   background: var(--px-color-surface-raised);
   cursor: pointer;
   transition:
@@ -4035,6 +4036,11 @@ button.pharos-lyrics-line:focus-visible {
 }
 .pharos-settings-page button:hover {
   background: var(--px-color-border);
+}
+/* Nav rows and tiles are not buttons to the eye: they keep the theme's
+   corner. */
+.pharos-settings-page :is(.pharos-settings-link, .pharos-style-tile, .pharos-admin-integrity-deep) {
+  border-radius: var(--px-radius);
 }
 .pharos-settings-page button:disabled {
   opacity: 0.55;
