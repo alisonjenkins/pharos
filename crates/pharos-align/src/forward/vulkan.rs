@@ -293,6 +293,13 @@ impl VulkanModel {
             })
     }
 
+    /// Hands the pool's empty pages back to the driver (B1352): the pool
+    /// otherwise keeps every page a longer window grew it to, and on a GPU
+    /// shared with other models that pushes their memory out to system RAM.
+    pub fn release(&self) {
+        self.device.memory_cleanup();
+    }
+
     /// Runs one window at every bucket up to [`WARM_UP_TO`], so their
     /// kernels are compiled and tuned before the first song. Each window
     /// falls short of its bucket, as nearly every real one does, so the
