@@ -367,7 +367,7 @@ pub fn SignInView(
                 if let Some(error) = error {
                     p { class: "pharos-error", role: "alert", "{error}" }
                 }
-                button { r#type: "submit", disabled: busy,
+                button { class: "pharos-button", r#type: "submit", disabled: busy,
                     if busy { "Signing in…" } else { "Sign in" }
                 }
             }
@@ -391,7 +391,7 @@ pub fn StatusView(
                 h2 { "{title}" }
                 p { "{detail}" }
                 if let Some((label, on_click)) = action {
-                    button { onclick: move |_| on_click.call(()), "{label}" }
+                    button { class: "pharos-button", onclick: move |_| on_click.call(()), "{label}" }
                 }
             }
         }
