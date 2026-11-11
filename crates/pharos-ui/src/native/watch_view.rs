@@ -1343,13 +1343,13 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
             if span.is_some() {
                 platform::focus_card(PLAYER_ID, SKIP_ID, "");
             } else {
-                platform::refocus_if_lost(PLAYER_ID);
+                platform::refocus_if_lost(PLAYER_ID, false);
             }
         }
     }));
     use_drop(|| {
         if REMOTE_FOCUS {
-            platform::refocus_if_lost(PLAYER_ID);
+            platform::refocus_if_lost(PLAYER_ID, false);
         }
     });
     let Some(seg) = seg else {
@@ -1431,7 +1431,7 @@ fn use_card_focus() {
     });
     use_drop(|| {
         if REMOTE_FOCUS {
-            platform::refocus_if_lost(PLAYER_ID);
+            platform::refocus_if_lost(PLAYER_ID, true);
         }
     });
 }
