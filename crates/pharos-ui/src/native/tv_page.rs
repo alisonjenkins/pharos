@@ -1069,7 +1069,8 @@ mod tests {
         for class in OK_PRESSES.split(", ") {
             let name = class.trim_start_matches('.');
             assert!(
-                view.contains(&format!("class: \"{name}\"")),
+                view.contains(&format!("class: \"{name}\""))
+                    || view.contains(&format!("class: \"{name} ")),
                 "the player draws no {name}"
             );
         }

@@ -2264,14 +2264,7 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   gap: 0.6rem;
   align-items: center;
   padding: 0.9rem 1.6rem;
-  border: 0;
-  border-radius: 999px;
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-  font: inherit;
   font-size: 1.15rem;
-  font-weight: 600;
-  cursor: pointer;
 }
 .pharos-tap-to-start:focus-visible {
   outline: 3px solid #fff; /* not themed: controls sit on the video, whose colours no theme sets */
@@ -2348,18 +2341,6 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 }
 .pharos-seek-wait-back {
   margin-top: 0.4rem;
-  padding: 0.45rem 0.9rem;
-  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font-size: 0.95rem;
-  cursor: pointer;
-}
-.pharos-seek-wait-back:hover,
-.pharos-seek-wait-back:focus-visible {
-  outline: 2px solid var(--px-color-accent);
-  outline-offset: 2px;
 }
 .pharos-stage.is-mini .pharos-seek-wait {
   display: none;
@@ -3281,13 +3262,6 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   right: 1rem;
   bottom: 5.5rem;
   z-index: 1;
-  padding: 0.6rem 1.2rem;
-  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
-  border-radius: 6px;
-  background: rgb(0 0 0 / 0.65); /* not themed: controls sit on the video, whose colours no theme sets */
-  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
-  font-size: 1rem;
-  cursor: pointer;
 }
 .pharos-controls:has(.pharos-seek-preview) {
   z-index: 2;
@@ -3308,11 +3282,6 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
     top: calc(env(safe-area-inset-top, 0px) + 4.5rem);
     bottom: auto;
   }
-}
-.pharos-skip:hover,
-.pharos-skip:focus-visible {
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
 }
 
 /* "Up next": the next episode and a countdown to it, over the credits.
@@ -3375,25 +3344,6 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   display: flex;
   gap: 0.5rem;
 }
-.pharos-up-next-actions button {
-  padding: 0.45rem 0.9rem;
-  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font-size: 0.95rem;
-  cursor: pointer;
-}
-.pharos-up-next-actions .pharos-up-next-play {
-  border-color: var(--px-color-accent);
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-}
-.pharos-up-next-actions button:hover,
-.pharos-up-next-actions button:focus-visible {
-  outline: 2px solid var(--px-color-accent);
-  outline-offset: 2px;
-}
 /* "Up next" over a guessed ending: a small pill in the corner that leaves
    the last scene in view, until the last 15 s (038 FR-405). */
 .pharos-up-next-pill {
@@ -3419,25 +3369,6 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 }
 .pharos-up-next-pill button {
   flex: none;
-  min-width: 44px;
-  min-height: 44px; /* a touch target (WCAG 2.5.5) */
-  padding: 0.3rem 0.75rem;
-  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
-  border-radius: 999px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}
-.pharos-up-next-pill .pharos-up-next-pill-play {
-  border-color: var(--px-color-accent);
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-}
-.pharos-up-next-pill button:hover,
-.pharos-up-next-pill button:focus-visible {
-  outline: 2px solid var(--px-color-accent);
-  outline-offset: 2px;
 }
 @media (max-width: 30rem) {
   .pharos-up-next-art {
