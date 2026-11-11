@@ -6253,13 +6253,20 @@ fn Player(
     // ask; the lyrics shown meanwhile keep their estimate. Kept with the
     // song they are for, so they never outlive it on screen.
     let mut aligned = use_signal(|| None::<(ItemRef, pharos_client::api::Lyrics)>);
+    // When the server expects them by, set on each answer that says so.
+    let mut words_eta_at = use_signal(|| None::<(ItemRef, f64)>);
     use_effect({
         let id = p.detail.item.id;
         move || {
-            let pending = matches!(&*lyrics.read(), Some(Ok(Some(l))) if l.words_pending);
-            if !pending {
+            let pending = match &*lyrics.read() {
+                Some(Ok(Some(l))) if l.words_pending => Some(l.words_eta_ms),
+                _ => None,
+            };
+            let Some(first_eta) = pending else {
                 return;
-            }
+            };
+            words_eta_at
+                .set(super::lyrics::eta_deadline(first_eta, platform::now_ms()).map(|at| (id, at)));
             let Some(api) = ctx.api.peek().clone() else {
                 return;
             };
@@ -6267,7 +6274,12 @@ fn Player(
                 loop {
                     platform::sleep_ms(ALIGN_ASK_MS).await;
                     match api.lyrics(&call("watch", "lyrics"), id, true).await {
-                        Ok(next) if next.words_pending => {}
+                        Ok(next) if next.words_pending => {
+                            words_eta_at.set(
+                                super::lyrics::eta_deadline(next.words_eta_ms, platform::now_ms())
+                                    .map(|at| (id, at)),
+                            );
+                        }
                         // The aligner failed or found no words: keep the
                         // estimate already on screen.
                         Ok(next) if next.lines.iter().all(|l| l.words.is_empty()) => {
@@ -8026,6 +8038,9 @@ fn Player(
                     .or_else(|| lyrics.read().clone().and_then(Result::ok).flatten()),
                 lyrics_loading: lyrics.read().is_none(),
                 lyrics_failed: matches!(*lyrics.read(), Some(Err(()))),
+                words_eta_at: words_eta_at()
+                    .filter(|(for_id, _)| *for_id == p.detail.item.id)
+                    .map(|(_, at)| at),
                 playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),
