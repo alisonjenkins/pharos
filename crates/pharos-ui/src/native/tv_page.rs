@@ -532,7 +532,8 @@ addEventListener("keydown", (e) => {
   if (!at) return;
   e.preventDefault();
   if (tileHold) return;
-  at.started = performance.now();
+  // Input times, not handler times: a busy page can run a handler late.
+  at.started = e.timeStamp;
   tileHold = at;
   at.timer = setTimeout(() => {
     if (tileHold !== at || at.done) return;
@@ -547,8 +548,9 @@ addEventListener("keyup", (e) => {
   if (at.done) return;
   e.preventDefault();
   // A busy page can run the hold's timer late, after the release: an OK
-  // held as long as a hold still plays.
-  const held = performance.now() - at.started;
+  // held as long as a hold still plays. Measured between the key events'
+  // own times, so a late keyup after a short press still opens.
+  const held = e.timeStamp - at.started;
   if (held >= __TILE_HOLD_MS__) { holdPlay(at, "release"); return; }
   at.tile.click();
   console.info("pharos: keys: tile ok verdict=open held_ms=" + Math.round(held));
@@ -1328,6 +1330,10 @@ mod tests {
             "{press}"
         );
         assert!(held.contains(r#"holdPlay(at, "timer");"#), "{held}");
+        // The press is timed from the key events' own times, not from when
+        // a busy page ran their handlers.
+        assert!(held.contains("at.started = e.timeStamp;"), "{held}");
+        assert!(press.contains("const held = e.timeStamp - at.started;"), "{press}");
         // A hold dropped by a focus or page change neither plays nor opens.
         for drop in [
             r#"addEventListener("focusout""#,
