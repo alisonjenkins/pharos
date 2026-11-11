@@ -4865,6 +4865,122 @@ label.pharos-setting {
   }
 }
 
+/* B1353/V1324: a film's or an episode's page, as compact as the album page
+   (B1347). The art keeps a narrow column; beside it the name, one facts line
+   carrying the ratings, one row of pills (Play, Watch together, then round
+   icon pills), one row of pill pickers (version, audio, subtitles), the
+   overview and the file facts. On a TV everything up to the overview fits
+   above the mini player. */
+.pharos-title {
+  gap: 1.75rem;
+}
+.pharos-title-art {
+  flex: 0 0 13rem;
+}
+.pharos-title[data-kind="episode"] .pharos-title-art {
+  flex-basis: 20rem;
+}
+.pharos-title-body h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.9rem;
+  line-height: 1.15;
+}
+.pharos-title-up {
+  display: inline-block;
+  margin-bottom: 0.15rem;
+  color: var(--px-color-accent);
+  font-size: 0.95rem;
+  text-decoration: none;
+}
+.pharos-title-up:hover {
+  text-decoration: underline;
+}
+.pharos-title-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  margin-bottom: 0.9rem;
+}
+.pharos-title-facts p,
+.pharos-title-facts .pharos-ratings {
+  margin: 0;
+}
+.pharos-title .pharos-actions {
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+.pharos-title-picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.9rem;
+}
+.pharos-title-picks .pharos-title-tracks {
+  display: contents;
+}
+/* The pickers as pills the height of a small button: the version's word
+   rides inside its pill, as the library filter pills carry theirs. */
+.pharos-version-pick {
+  flex-direction: row;
+  align-items: center;
+  gap: 0;
+  min-height: var(--pharos-button-h-small);
+  padding-left: 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 999);
+  background: var(--px-color-surface);
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-title-picks .pharos-version-pick select,
+.pharos-title-picks .pharos-track-picker {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 20rem;
+  min-height: var(--pharos-button-h-small);
+  padding: 0 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 999);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  font: inherit;
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-title-picks .pharos-version-pick select {
+  border: 0;
+  background: transparent;
+  padding-left: 0.4rem;
+}
+.pharos-title .pharos-overview {
+  margin: 0 0 0.5rem;
+  max-width: 70ch;
+}
+.pharos-title-body > .pharos-muted {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+}
+.pharos-title .pharos-version-facts {
+  gap: 0.1rem 0.75rem;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-title .pharos-cast {
+  margin-top: 1.25rem;
+}
+/* A round icon pill keeps its words for screen readers and its tooltip. */
+.pharos-button.is-icon .pharos-button-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
 /* Rails (012): no scrollbar; a sideways swipe or Shift+wheel, a mouse
    drag, touch, keyboard focus and the controller still move them. A plain
    vertical wheel turn scrolls the page, never the rail. */
@@ -7903,4 +8019,32 @@ body:has(.pharos-reader) {
 :root[data-device="tv"] .pharos-sheet-body,
 :root[data-device="tv"] .pharos-sheet-foot {
   padding-inline: 1.25rem 48px;
+}
+
+/* B1353/V1324 on a TV: narrower art, and a focused round icon pill grows
+   to show its words, so the remote never lands on a bare icon. */
+:root[data-device="tv"] .pharos-title-art {
+  flex-basis: 11rem;
+}
+:root[data-device="tv"] .pharos-title[data-kind="episode"] .pharos-title-art {
+  flex-basis: 16rem;
+}
+:root[data-device="tv"] .pharos-title-body h2 {
+  font-size: 1.6rem;
+}
+:root[data-device="tv"] .pharos-title .pharos-overview {
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+:root[data-device="tv"] .pharos-actions .pharos-button.is-icon:focus {
+  width: auto;
+  padding: 0 0.8rem;
+}
+:root[data-device="tv"] .pharos-actions .pharos-button.is-icon:focus .pharos-button-label {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 0;
+  clip: auto;
+  overflow: visible;
 }

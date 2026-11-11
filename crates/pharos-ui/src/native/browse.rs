@@ -3231,11 +3231,12 @@ impl QueueTarget {
     /// bare icons.
     pub fn button_class(self) -> &'static str {
         match self {
-            // Round icon pills beside Play and Shuffle (B1347/V1318).
-            QueueTarget::AlbumPage => {
+            // Round icon pills beside Play and Shuffle (B1347/V1318), and in
+            // a title page's one row of actions (B1353/V1324); the words
+            // stay for screen readers and the tooltip.
+            QueueTarget::AlbumPage | QueueTarget::VideoPage => {
                 "pharos-queue-button pharos-button pharos-button-secondary is-icon"
             }
-            QueueTarget::VideoPage => "pharos-queue-button pharos-button pharos-button-secondary",
             QueueTarget::Song | QueueTarget::AlbumCard | QueueTarget::EpisodeRow => {
                 "pharos-queue-button"
             }
@@ -3391,7 +3392,7 @@ pub fn QueueButtons(
                     put(Place::Next);
                 },
                 Icon { path: ICON_QUEUE_NEXT }
-                if labelled { span { "Play next" } }
+                if labelled { span { class: "pharos-button-label", "Play next" } }
             }
             button {
                 class: "{button_class}",
@@ -3406,7 +3407,7 @@ pub fn QueueButtons(
                     put_end(Place::End);
                 },
                 Icon { path: ICON_QUEUE_ADD }
-                if labelled { span { "Add to queue" } }
+                if labelled { span { class: "pharos-button-label", "Add to queue" } }
             }
             if let (Some(song), Some(MixCtx(mut mix))) = (mix_song, mix) {
                 button {
@@ -5433,7 +5434,7 @@ mod tests {
         // Both are icon pills now, named by their labels (B1347/V1318).
         assert!(html.contains(r#"data-target="album_page""#), "{html}");
         assert!(html.contains(r#"data-target="song""#), "{html}");
-        assert!(!html.contains("<span>Play next</span>"), "{html}");
+        assert!(!html.contains(">Play next</span>"), "{html}");
         // Buttons are not inside the row's link.
         let link = html
             .split_once(r#"class="pharos-track""#)
