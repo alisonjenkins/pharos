@@ -5733,9 +5733,12 @@ body::before {
 body:has(.pharos-stage.is-mini) .pharos-main {
   padding-bottom: calc(var(--px-gutter) + 4rem);
 }
-/* And a control scrolled into view (the TV's arrow keys) stops above it. */
+/* And a control scrolled into view (the TV's arrow keys) stops above it.
+   `--px-gutter` is set on `.pharos-main`, not here, so it needs a fallback:
+   without one the calc() was invalid, the padding computed to `auto`, and
+   a tile the remote moved to scrolled in under the bar (B1346/V1317). */
 html:has(.pharos-stage.is-mini) {
-  scroll-padding-bottom: calc(var(--px-gutter) + 4rem);
+  scroll-padding-bottom: calc(var(--px-gutter, 1.5rem) + 4rem);
 }
 .pharos-stage.is-mini .pharos-watch {
   order: -1;
