@@ -3319,9 +3319,10 @@ mod tests {
         );
         assert!(
             sheet.contains(
-                "@media (max-width: 40rem) and (pointer: coarse) {\n  .pharos-control-row .pharos-mute {\n    display: none;"
+                "@media (max-width: 40rem) and (pointer: coarse) {\n  :root:not([data-device=\"tv\"]) .pharos-control-row .pharos-mute {\n    display: none;"
             ),
-            "an upright phone moves mute out of the bar, so the time fits"
+            "an upright phone moves mute out of the bar, so the time fits; a TV keeps it, \
+             as its sheet has no mute row"
         );
         let menus = html
             .split(r#"id="pharos-player-settings""#)
