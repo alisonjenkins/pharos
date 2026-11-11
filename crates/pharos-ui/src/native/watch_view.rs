@@ -1295,12 +1295,15 @@ pub fn WatchView(
                             }
                         }
                         }
-                        button {
-                            class: "pharos-control",
-                            r#type: "button",
-                            aria_label: "Fullscreen",
-                            onclick: move |_| on_control.call(Control::Fullscreen),
-                            Icon { path: ICON_FULL }
+                        // The TV app always fills the screen (B1339).
+                        if platform::fullscreen_supported() {
+                            button {
+                                class: "pharos-control",
+                                r#type: "button",
+                                aria_label: "Fullscreen",
+                                onclick: move |_| on_control.call(Control::Fullscreen),
+                                Icon { path: ICON_FULL }
+                            }
                         }
                     }
                 }

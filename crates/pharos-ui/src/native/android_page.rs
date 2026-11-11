@@ -658,6 +658,12 @@ pub fn session_set(key: &str, value: &str) -> Result<(), String> {
 
 pub fn toggle_fullscreen() {}
 
+/// The TV app always fills the screen: it has no fullscreen to toggle, so
+/// the player offers no button for it (B1339).
+pub fn fullscreen_supported() -> bool {
+    false
+}
+
 pub fn page_origin() -> String {
     String::new()
 }
