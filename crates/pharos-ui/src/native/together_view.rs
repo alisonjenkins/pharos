@@ -90,7 +90,7 @@ pub fn TogetherView(
 fn LeaveGroup(on_leave: EventHandler<()>) -> Element {
     rsx! {
         button {
-            class: "pharos-button-secondary pharos-group-leave",
+            class: "pharos-button pharos-button-secondary pharos-group-leave",
             r#type: "button",
             onclick: move |_| on_leave.call(()),
             "Leave group"
@@ -499,7 +499,10 @@ mod tests {
         assert_eq!(html.matches(">Leave group<").count(), 1, "{html}");
         assert_eq!(html.matches(">Join<").count(), 1, "{html}");
         assert!(html.contains("re in this group"), "{html}");
-        assert!(html.contains("pharos-button-secondary"), "{html}");
+        assert!(
+            html.contains(r#"class="pharos-button pharos-button-secondary pharos-group-leave""#),
+            "Leave group takes the family's base class and its secondary kind: {html}"
+        );
     }
 
     /// B1361 — in a group the list does not show, the page still says so and
