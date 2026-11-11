@@ -342,7 +342,20 @@ try {{
   runs[run] = {{ j, own }};
   window.__pharosJassub = j;
   await within(j.ready);
-  return runs[run] ? "ready" : "failed: stopped while starting";
+  if (!runs[run]) return "failed: stopped while starting";
+  if (!v.paused) return "ready";
+  // A paused video sends no frame callbacks, so draw its frame now, and once
+  // more after JASSUB's own observer has resized and cleared the canvas.
+  const frame = () => ({{ mediaTime: v.currentTime, width: v.videoWidth, height: v.videoHeight }});
+  const tick = () => new Promise((ok) => requestAnimationFrame(() => ok()));
+  try {{
+    await j.manualRender(frame(), true);
+    await tick(); await tick();
+    if (runs[run] && v.paused) await j.manualRender(frame(), true);
+    return "ready paused_redraw=ok";
+  }} catch (e) {{
+    return "ready paused_redraw=failed " + ((e && e.message) || e);
+  }}
 }} catch (e) {{
   return "failed: " + ((e && e.message) || e);
 }}"#,
@@ -1099,6 +1112,8 @@ mod tests {
         assert!(js.contains("await within(j.ready)"), "{js}");
         assert!(js.contains(".filter(([family]) => !assets.pack[family]).map(async"));
         assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
+        assert!(js.contains("j.manualRender(frame(), true)"));
+        assert!(js.contains("paused_redraw=ok"));
     }
 
     #[test]
