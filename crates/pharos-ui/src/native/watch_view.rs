@@ -2210,7 +2210,7 @@ fn QualityPicker(quality: QualityView, height: u32, on_pick: EventHandler<Contro
                 if let Some(control) = control {
                     on_pick.call(control);
                 }
-                platform::focus_by_id(PLAYER_ID);
+                after_pick();
             },
             for (value, text) in quality.options(height) {
                 option {
