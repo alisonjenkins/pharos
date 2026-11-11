@@ -255,12 +255,12 @@ pub fn Shell(
 pub fn LibraryNav(libraries: Vec<Item>, current: Option<ItemRef>) -> Element {
     // The lit tab can sit past the edge of a phone's row, and a library's
     // grid has no heading of its own to say where it is (B1313).
-    // The libraries can arrive after the trail, and a refresh can reorder
-    // or rename them, so the row's ids and names count as well as a new
-    // current library.
-    let listed: Vec<(ItemRef, String)> = libraries
+    // The libraries can arrive after the trail, and a refresh can reorder,
+    // rename or re-kind them (the kind sets a tab's place), so the row's
+    // ids, names and kinds count as well as a new current library.
+    let listed: Vec<_> = libraries
         .iter()
-        .map(|library| (library.id, library.name.clone()))
+        .map(|library| (library.id, library.name.clone(), library.library_kind))
         .collect();
     use_effect(use_reactive!(|current, listed| {
         if current.is_some() && !listed.is_empty() {
