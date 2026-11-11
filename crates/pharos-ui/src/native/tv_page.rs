@@ -1333,7 +1333,10 @@ mod tests {
         // The press is timed from the key events' own times, not from when
         // a busy page ran their handlers.
         assert!(held.contains("at.started = e.timeStamp;"), "{held}");
-        assert!(press.contains("const held = e.timeStamp - at.started;"), "{press}");
+        assert!(
+            press.contains("const held = e.timeStamp - at.started;"),
+            "{press}"
+        );
         // A hold dropped by a focus or page change neither plays nor opens.
         for drop in [
             r#"addEventListener("focusout""#,
