@@ -1555,6 +1555,11 @@ pub async fn copy_text(text: &str) -> bool {
     }
 }
 
+/// A browser can put the page in fullscreen.
+pub fn fullscreen_supported() -> bool {
+    true
+}
+
 /// Whether the browser can hand a video to its own picture-in-picture
 /// window (`document.pictureInPictureEnabled`; missing in Firefox).
 pub fn pip_supported() -> bool {
