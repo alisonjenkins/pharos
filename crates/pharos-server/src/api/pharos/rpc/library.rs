@@ -349,7 +349,10 @@ impl server::library::Handler for Library {
         };
         out.set_synced(found.synced());
         out.set_source(found.origin.label());
-        out.set_words_pending(words_pending);
+        out.set_words_pending(words_pending.is_some());
+        if let Some(eta_ms) = words_pending.and_then(|w| w.eta_ms) {
+            out.reborrow().init_words_eta_ms().set_some(eta_ms);
+        }
         let mut lines = out.init_lines(len_u32(&found.lines));
         for (i, line) in (0..).zip(&found.lines) {
             let mut w = lines.reborrow().get(i);
