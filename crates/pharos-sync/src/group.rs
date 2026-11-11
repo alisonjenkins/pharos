@@ -143,6 +143,18 @@ pub const MEMBER_TTL_MS: u64 = 150_000;
 /// it is never quietly thinned. Sized far beyond any observed blackout.
 pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 
+/// B1362 — how long a group may sit without playing before it ends, whoever
+/// is still connected to it.
+///
+/// [`GROUP_ABANDONED_MS`] only reaps a group nobody holds a socket in. A tab
+/// left open on a phone keeps its socket, and rejoins after every prune and
+/// every reload (B665, B893), so a group started one evening was still holding
+/// that phone the next morning with nothing playing and no way out outside
+/// the player (B1361). Silence from the members cannot decide this: they ping.
+/// Playback can. A group that has not played for three hours is over; a paused
+/// break shorter than that is kept.
+pub const GROUP_IDLE_MS: u64 = 10_800_000;
+
 /// Why a group with members in it was ended by the server rather than by its
 /// last member leaving: the `cause` label on
 /// `pharos_syncplay_group_dissolved_total`.
@@ -150,12 +162,15 @@ pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 pub enum DissolveCause {
     /// Nobody held a socket and nothing was heard for [`GROUP_ABANDONED_MS`].
     Abandoned,
+    /// Nothing played for [`GROUP_IDLE_MS`], members connected or not.
+    Idle,
 }
 
 impl DissolveCause {
     pub fn label(self) -> &'static str {
         match self {
             Self::Abandoned => "abandoned",
+            Self::Idle => "idle",
         }
     }
 }
@@ -1686,6 +1701,10 @@ struct GroupState {
     /// by every one of those other transitions. Not persisted, like
     /// `item_started_at`.
     next_item_advanced_at: Option<tokio::time::Instant>,
+    /// B1362 — since when the group has not been playing, as the prune tick
+    /// last saw it; `None` while it plays. Monotonic and NOT persisted: a
+    /// takeover starts the count again, which only ever keeps a group longer.
+    idle_since: Option<tokio::time::Instant>,
     playback: PlaybackState,
     queue: PlayQueue,
     /// B183 — whether the current queue has ever been BROADCAST, as opposed to
@@ -1745,6 +1764,7 @@ impl GroupState {
             buffering_resume_playing: false,
             item_started_at: None,
             next_item_advanced_at: None,
+            idle_since: None,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             // A fresh group has no queue at all; the first real broadcast sets this.
@@ -1811,6 +1831,19 @@ impl GroupState {
             .items
             .get(self.queue.playing_index)
             .and_then(|e| e.runtime_ms)
+    }
+
+    /// B1362 — how long the group has gone without playing as of `now`,
+    /// starting the count on the first tick that finds it not playing and
+    /// clearing it on any tick that finds it playing. Counted from the tick,
+    /// not from the pause itself, so it can only ever run late by one tick.
+    fn idle_ms(&mut self, now: tokio::time::Instant) -> u64 {
+        if matches!(self.playback, PlaybackState::Playing { .. }) {
+            self.idle_since = None;
+            return 0;
+        }
+        let since = *self.idle_since.get_or_insert(now);
+        now.saturating_duration_since(since).as_millis() as u64
     }
 
     /// Settle a group whose model has run past the end of its item.
@@ -3489,7 +3522,35 @@ impl GroupHandle {
                             .increment(1);
                             state.members.clear();
                         }
-                        if pruned_any || abandoned {
+                        // B1362 — a group nothing has played in for
+                        // GROUP_IDLE_MS ends, connected members and all. They
+                        // are told, so their clients stop rejoining it.
+                        let idle_ms = state.idle_ms(now);
+                        let idle = !abandoned
+                            && !state.members.is_empty()
+                            && idle_ms > GROUP_IDLE_MS;
+                        if idle {
+                            let connected =
+                                state.members.values().filter(|m| m.connected).count();
+                            tracing::info!(
+                                group = %state.id,
+                                members = state.members.len(),
+                                connected,
+                                idle_ms,
+                                threshold_ms = GROUP_IDLE_MS,
+                                playback = ?state.play_state(),
+                                cause = DissolveCause::Idle.label(),
+                                "syncplay: ending idle group (nothing played)"
+                            );
+                            metrics::counter!(
+                                "pharos_syncplay_group_dissolved_total",
+                                "cause" => DissolveCause::Idle.label(),
+                            )
+                            .increment(1);
+                            state.broadcast(ServerMsg::GroupLeft);
+                            state.members.clear();
+                        }
+                        if pruned_any || abandoned || idle {
                             relist = true;
                             state.persist();
                         }
@@ -5557,11 +5618,104 @@ mod tests {
         );
     }
 
+    /// Advance paused time one prune tick at a time for `ms`, pinging `ids`
+    /// before each tick so the silence prune never touches them: only the
+    /// idle rule can end the group.
+    async fn tick_with_pings(h: &GroupHandle, ids: &[MemberId], ms: u64) {
+        for _ in 0..(ms / MEMBER_PRUNE_TICK_MS) {
+            for id in ids {
+                let _ = h.tx.send(GroupMsg::MemberPing { member_id: *id }).await;
+            }
+            tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_closed(h: &GroupHandle) -> bool {
+        for _ in 0..200 {
+            if h.tx.is_closed() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.tx.is_closed()
+    }
+
+    /// B1362 / V1333 — a group nothing has played in for GROUP_IDLE_MS ends,
+    /// even while its members hold sockets and ping, and each member is told
+    /// `GroupLeft` so its client stops rejoining. Before it, the group stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_group_nothing_plays_in_ends_after_the_idle_limit() {
+        let (h, sinks) = spawn_group();
+        let a = MemberId::new();
+        let b = MemberId::new();
+        let mut rx_a = join(&h, &sinks, a, "a").await;
+        let mut rx_b = join(&h, &sinks, b, "b").await;
+
+        tick_with_pings(&h, &[a, b], GROUP_IDLE_MS - 2 * MEMBER_PRUNE_TICK_MS).await;
+        assert_eq!(
+            snapshot_of(&h).await.participants.len(),
+            2,
+            "a group must not end before the idle limit"
+        );
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        tick_with_pings(&h, &[a, b], 4 * MEMBER_PRUNE_TICK_MS).await;
+        assert!(
+            wait_closed(&h).await,
+            "a group idle past the limit must end, connected members or not"
+        );
+        for (name, rx) in [("a", &mut rx_a), ("b", &mut rx_b)] {
+            let mut told = false;
+            while let Ok(msg) = rx.try_recv() {
+                told |= matches!(msg, ServerMsg::GroupLeft);
+            }
+            assert!(told, "member {name} must be told its group ended");
+        }
+    }
+
+    /// B1362 — playing is what keeps a group: one that plays through the idle
+    /// limit stays, and the count starts again once it stops.
+    #[tokio::test(start_paused = true)]
+    async fn a_playing_group_is_not_ended_for_idleness() {
+        let (h, sinks) = spawn_group();
+        let a = MemberId::new();
+        let _rx_a = join(&h, &sinks, a, "a").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: a,
+            position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        tick_with_pings(&h, &[a], GROUP_IDLE_MS + 4 * MEMBER_PRUNE_TICK_MS).await;
+        assert_eq!(
+            snapshot_of(&h).await.participants.len(),
+            1,
+            "a group that is playing is never idle"
+        );
+
+        h.tx.send(GroupMsg::LeaderPause { sender: a })
+            .await
+            .unwrap();
+        tick_with_pings(&h, &[a], GROUP_IDLE_MS - 2 * MEMBER_PRUNE_TICK_MS).await;
+        assert_eq!(
+            snapshot_of(&h).await.participants.len(),
+            1,
+            "the idle count starts when playing stops, not when the group began"
+        );
+        tick_with_pings(&h, &[a], 4 * MEMBER_PRUNE_TICK_MS).await;
+        assert!(wait_closed(&h).await, "paused past the limit, it ends");
+    }
+
     /// The `cause` label on `pharos_syncplay_group_dissolved_total` is a
     /// dashboard contract: stable strings, distinct.
     #[test]
     fn dissolve_causes_are_distinct_and_stable() {
         assert_eq!(DissolveCause::Abandoned.label(), "abandoned");
+        assert_eq!(DissolveCause::Idle.label(), "idle");
     }
 
     /// B30 — a group NOBODY ever joined (New whose caller's AddMember failed)
