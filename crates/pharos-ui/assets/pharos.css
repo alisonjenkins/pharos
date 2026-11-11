@@ -1507,6 +1507,24 @@ input:focus-visible {
 .pharos-chip.is-small.is-icon {
   width: var(--pharos-button-h-small);
 }
+/* B1363/V1334: on the video no theme owns the colours behind a button, so
+   an on-video one is light on a dark glass; the main action on the video is
+   a plain primary. A remote's or keyboard's focus fills it with the accent. */
+.pharos-button.is-on-video {
+  border-color: rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
+  background: rgb(0 0 0 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  font-weight: 500;
+}
+.pharos-button.is-on-video:hover {
+  filter: none;
+  background: rgb(0 0 0 / 0.8); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-button.is-on-video:focus-visible {
+  border-color: var(--px-color-accent);
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
 /* A favourite mark (B1082): the star takes the accent while it is one. */
 .pharos-favorite.on {
   border-color: var(--px-color-accent);
