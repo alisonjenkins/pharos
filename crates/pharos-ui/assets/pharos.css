@@ -95,15 +95,6 @@ body {
   background: var(--px-color-overlay);
   color: var(--px-color-fg);
 }
-.pharos-login button {
-  padding: 0.6rem;
-  border: 0;
-  border-radius: 4px;
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-  font-weight: 600;
-  cursor: pointer;
-}
 /* A line over the screen for an action that failed away from its button
    (B824). */
 .pharos-flash {
@@ -687,15 +678,6 @@ input:focus-visible {
 .pharos-status p {
   color: var(--px-color-fg-muted);
   margin: 0 0 1.5rem;
-}
-.pharos-status button {
-  padding: 0.6rem 1.25rem;
-  border: 0;
-  border-radius: 4px;
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-  font-weight: 600;
-  cursor: pointer;
 }
 
 .pharos-loading,
