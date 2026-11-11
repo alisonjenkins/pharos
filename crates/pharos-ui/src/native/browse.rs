@@ -3006,6 +3006,20 @@ impl QueueTarget {
         }
     }
 
+    /// B1344/V1315: on a page, the queue buttons are secondary family
+    /// buttons like Shuffle and Mark watched beside them; in a row they stay
+    /// bare icons.
+    pub fn button_class(self) -> &'static str {
+        match self {
+            QueueTarget::AlbumPage | QueueTarget::VideoPage => {
+                "pharos-queue-button pharos-button pharos-button-secondary"
+            }
+            QueueTarget::Song | QueueTarget::AlbumCard | QueueTarget::EpisodeRow => {
+                "pharos-queue-button"
+            }
+        }
+    }
+
     /// Whether it queues on the video queue rather than the music one.
     pub fn video(self) -> bool {
         matches!(self, QueueTarget::VideoPage | QueueTarget::EpisodeRow)
@@ -3137,10 +3151,11 @@ pub fn QueueButtons(
     };
     let put_end = put.clone();
     let labelled = matches!(kind, QueueTarget::AlbumPage | QueueTarget::VideoPage);
+    let button_class = kind.button_class();
     rsx! {
         div { class: "pharos-queue-buttons", "data-target": kind.label(),
             button {
-                class: "pharos-queue-button",
+                class: "{button_class}",
                 r#type: "button",
                 title: "{next_label}",
                 "data-key-action": "queue-next",
@@ -3155,7 +3170,7 @@ pub fn QueueButtons(
                 if labelled { span { "Play next" } }
             }
             button {
-                class: "pharos-queue-button",
+                class: "{button_class}",
                 r#type: "button",
                 title: "{end_label}",
                 "data-key-action": "queue-end",
@@ -5179,6 +5194,31 @@ mod tests {
         assert!(grid.contains(r#"data-target="album_card""#), "{grid}");
         assert!(grid.contains(r#"aria-label="Play Record next""#), "{grid}");
         assert!(!grid.contains("Play Band next"), "{grid}");
+    }
+
+    /// B1344/V1315: the page's queue buttons are secondary family buttons,
+    /// the same shape on an album and a film; a row's stay bare icons.
+    /// Disarm check: return "pharos-queue-button" for every target.
+    #[test]
+    fn page_queue_buttons_are_family_buttons_and_row_ones_are_not() {
+        let family = "pharos-button pharos-button-secondary";
+        for page in [QueueTarget::AlbumPage, QueueTarget::VideoPage] {
+            assert!(page.button_class().contains(family), "{}", page.label());
+        }
+        for row in [
+            QueueTarget::Song,
+            QueueTarget::AlbumCard,
+            QueueTarget::EpisodeRow,
+        ] {
+            assert_eq!(row.button_class(), "pharos-queue-button", "{}", row.label());
+        }
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let tracks = page(vec![item(ItemRef::Real(1), ItemKind::Audio, "Opener")]);
+        let html = with_queue(
+            move || rsx! { AlbumView { detail: album.clone(), tracks: tracks.clone() } },
+        );
+        let classed = format!(r#"class="pharos-queue-button {family}""#);
+        assert_eq!(html.matches(&classed).count(), 2, "{html}");
     }
 
     #[test]
