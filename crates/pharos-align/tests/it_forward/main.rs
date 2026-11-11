@@ -182,6 +182,65 @@ fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
         .is_empty());
 }
 
+/// GPU pool a song may hold at its peak (B1352, V1323).
+#[cfg(feature = "vulkan")]
+const MAX_GPU_POOL_BYTES: u64 = 4 << 30;
+/// Empty pool pages a song may leave behind; held, they were 1.4 GiB here.
+#[cfg(feature = "vulkan")]
+const MAX_GPU_SPARE_BYTES: u64 = 256 << 20;
+
+#[cfg(feature = "vulkan")]
+#[test]
+#[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run alone (--exact): the pool is per device"]
+fn the_gpu_pool_gives_back_what_a_song_grew() {
+    use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
+    use pharos_align::forward::vulkan::VulkanModel;
+    use pharos_align::forward::VulkanAligner;
+    use pharos_align::service::Model;
+    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
+    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
+    let loaded = std::panic::catch_unwind(|| {
+        let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0)).on(WgpuBackend::Vulkan);
+        VulkanModel::load(&weights, device.into())
+    });
+    let Ok(model) = loaded else {
+        eprintln!("SKIPPED: no discrete Vulkan adapter (wgpu panicked creating it)");
+        return;
+    };
+    let mut gpu = VulkanAligner {
+        model: model.unwrap(),
+        reason: "forced_vulkan".into(),
+        adapter: "test".into(),
+    };
+    let tokens: Vec<String> = ["la", "da", "na"].iter().map(|s| (*s).to_owned()).collect();
+    // Each song's windows take new shapes, which grow the pool.
+    for (song, lens) in [
+        [4u64, 12, 30, 60],
+        [3, 9, 22, 45],
+        [6, 17, 40, 55],
+        [5, 11, 26, 50],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for &secs in lens {
+            let line = wave(usize::try_from(secs * 16_000).unwrap(), secs + song as u64);
+            gpu.align(&line, &tokens, false).unwrap();
+        }
+        let mem = gpu.end_song().expect("the Vulkan pass reports its pool");
+        eprintln!("song {song}: {mem:?}");
+        assert!(
+            mem.peak.reserved <= MAX_GPU_POOL_BYTES,
+            "song {song}: {mem:?}"
+        );
+        // What stays reserved is the weights, not the song's empty pages.
+        assert!(
+            mem.after.reserved - mem.after.in_use <= MAX_GPU_SPARE_BYTES,
+            "song {song}: {mem:?}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs PHAROS_ALIGNER_WEIGHTS"]
 fn a_window_under_one_frame_gives_no_frames() {

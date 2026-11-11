@@ -174,11 +174,10 @@ pub struct VulkanAligner {
 #[cfg(feature = "vulkan")]
 impl Model for VulkanAligner {
     fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
-        let pool = self.model.pool()?;
-        Some(crate::service::GpuMemory {
-            peak: pool,
-            after: pool,
-        })
+        let peak = self.model.pool()?;
+        self.model.release();
+        let after = self.model.pool()?;
+        Some(crate::service::GpuMemory { peak, after })
     }
 
     fn device(&self) -> DeviceUsed {

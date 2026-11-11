@@ -51,8 +51,8 @@ pub struct GpuPool {
     pub reserved: u64,
 }
 
-/// The GPU pool at the end of a song (B1352, V1323): `peak`, the most the
-/// song held, and `after` what it keeps.
+/// The GPU pool at the end of a song (B1352, V1323): `peak` before its empty
+/// pages were handed back, the most the song held, and `after` what it keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuMemory {
     pub peak: GpuPool,
@@ -73,7 +73,7 @@ pub trait Model: Send {
     fn begin_song(&mut self) {}
 
     /// Called after each song's last window, whatever its outcome: a GPU
-    /// model says what its pool held.
+    /// model hands back its pool's empty pages and says what it held.
     fn end_song(&mut self) -> Option<GpuMemory> {
         None
     }
