@@ -3874,7 +3874,10 @@ mod tests {
         let watch = format!(r#"href="{}""#, Route::Watch(id).path());
         let title = format!(r#"href="{}""#, Route::Title(id).path());
         assert!(
-            html.find(&title) < html.find(&watch) && html.contains(&watch),
+            matches!(
+                (html.find(&title), html.find(&watch)),
+                (Some(t), Some(w)) if t < w
+            ),
             "the tile opens the title, and the play link follows it: {html}"
         );
         assert!(
