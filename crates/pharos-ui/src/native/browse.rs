@@ -1221,6 +1221,22 @@ fn FilterBar(
     let on = active_filters(&now);
     let count = on.len();
     let mut open = use_signal(|| None::<Opened>);
+    // As the sheet closes the focus goes back to the pill that opened it.
+    // The browser's modal hold does this too; the TV's does not (V1283).
+    let mut was_open = use_signal(|| None::<Opened>);
+    use_effect(move || {
+        let now = *open.read();
+        if let (None, Some(opener)) = (now, *was_open.peek()) {
+            super::focus_after_render(
+                match opener {
+                    Opened::Sort => SORT_BUTTON_ID,
+                    Opened::Filters => FILTERS_BUTTON_ID,
+                }
+                .to_owned(),
+            );
+        }
+        was_open.set(now);
+    });
     let mut narrow = narrow;
     let expanded = open.read().is_some();
     rsx! {
