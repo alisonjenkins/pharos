@@ -11,7 +11,7 @@ is installed on the TV, and record the build's result in its thread.
 |---|---|---|
 | The TV build type-checks | `just tv-check` | Android-only code (B1333, V1304) |
 | Manifest and launcher resources | `cargo nextest run -p pharos-ui -E 'test(the_tv_)'` | label, icon, banner, dark theme, config changes (V1302, V1294) |
-| The remote, off the TV | `just compat-dioxus-full on` (runs `tv-remote.spec.ts`) | seek bar stop, seek preview, album tiles, search OK (V1303) |
+| The remote, off the TV | `just compat-dioxus-full on` (runs `tv-remote.spec.ts`) | seek bar stop, seek preview, album tiles (V1303) |
 | The APK itself | `just tv-apk-check <apk>` | the built APK has the overlay, versionCode and config changes (V1302) |
 
 Build only with `nix run .#android-apk`. A `dx build` run by hand skips

@@ -8,7 +8,8 @@ import { tvBridgeInitScript } from "../lib/tv-bridge";
 // the keys a remote has: the arrows, OK (Enter) and Back.
 //
 // What this cannot reach: code behind `cfg!(target_os = "android")` (the
-// remote scrub's own steps, the banner's Search button) and the WebView
+// remote scrub's own steps, the banner's Search button, the palette handing
+// Down and Up to the D-pad so OK picks a result, B1331) and the WebView
 // itself (its on-screen keyboard, config changes). Those are on the on-TV
 // checklist, docs/tv-smoke-checklist.md. Nor does a case belong here when
 // the web build passes it with the fix reverted: Back to a filtered library
@@ -226,46 +227,5 @@ test.describe("Android TV remote (B1332)", () => {
     await expect(page.locator("section.pharos-album h2"), "OK opened the album").toBeVisible({
       timeout: 15_000,
     });
-  });
-
-  // B1324 / V1295 (and B1331 / V1301): OK on a highlighted search match
-  // opens it. On the TV a focused text field takes OK as "raise the
-  // keyboard", so with a match highlighted the remote's focus must not be
-  // left in a box that would raise it.
-  test("OK on a highlighted search match opens it without raising a keyboard (B1324)", async ({
-    page,
-    request,
-  }) => {
-    test.setTimeout(90_000);
-    await signIn(page, request);
-    const palette = page.getByRole("dialog", { name: "Go to or search" });
-    await page.keyboard.press("Control+k");
-    await expect(palette).toBeVisible();
-    await palette.getByRole("combobox").fill("playwright show");
-    const titles = palette.getByRole("group", { name: "Titles" }).getByRole("option");
-    await expect(titles.first()).toContainText("Playwright Show", { timeout: 15_000 });
-
-    await page.keyboard.press("ArrowDown");
-    const keyboard = await page.evaluate(() => {
-      const at = document.activeElement as HTMLInputElement | null;
-      const typed = !!at && (at.tagName === "TEXTAREA" || (at.tagName === "INPUT" && !/^(checkbox|radio|range|button)$/.test(at.type)));
-      const id = at?.getAttribute("aria-activedescendant") ?? "";
-      // The highlighted match: the one the box points at, else the focus.
-      const match = (id && document.getElementById(id)) || at;
-      const link = match?.matches("a[href]") ? match : match?.querySelector("a[href]");
-      return { typed, inputMode: at?.inputMode ?? "", id, href: link?.getAttribute("href") ?? "" };
-    });
-    // Either the focus left the box for the match (B1331), or the box still
-    // has it with a match highlighted and asks for no keyboard (B1324).
-    if (keyboard.typed) {
-      expect(keyboard.id, "Down highlights a match").not.toBe("");
-      expect(keyboard.inputMode, "a box holding a highlighted match asks for no keyboard").toBe("none");
-    }
-    expect(keyboard.href, "the highlighted match links somewhere").toMatch(/^\/ui\//);
-    await page.keyboard.press("Enter");
-    await expect(page, "OK opened the highlighted match").toHaveURL(
-      (u) => u.pathname === keyboard.href,
-      { timeout: 15_000 },
-    );
   });
 });
