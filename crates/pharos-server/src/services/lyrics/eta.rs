@@ -17,7 +17,8 @@ const ALPHA: f64 = 0.3;
 struct Running {
     id: u64,
     started_ms: u64,
-    expected_ms: f64,
+    /// The song's length; 0 when unknown.
+    duration_ms: u64,
 }
 
 /// The queue, the running job and the learned cost of alignment.
@@ -53,11 +54,10 @@ impl Eta {
             .position(|(queued, _)| *queued == id)
             .and_then(|at| self.queue.remove(at))
             .map_or(0, |(_, d)| d);
-        let expected_ms = self.rate.map_or(0.0, |r| Self::cost_ms(r, duration_ms));
         self.running = Some(Running {
             id,
             started_ms: now_ms,
-            expected_ms,
+            duration_ms,
         });
     }
 
@@ -84,21 +84,32 @@ impl Eta {
     }
 
     /// Milliseconds until `id` is done, or `None` with no history yet, an
-    /// unknown song length, or an `id` neither queued nor running.
+    /// unknown length for the song or for any job ahead of it, or an `id`
+    /// neither queued nor running.
+    ///
+    /// The running job's cost is priced at the current rate, so a job begun
+    /// before the first rate was learned is still estimated once one is.
     pub fn eta_ms(&self, id: u64, now_ms: u64) -> Option<u64> {
         let rate = self.rate?;
         let mut total = 0.0;
         if let Some(run) = &self.running {
-            let left = (run.expected_ms - now_ms.saturating_sub(run.started_ms) as f64).max(0.0);
+            if run.duration_ms == 0 {
+                return None;
+            }
+            let expected = Self::cost_ms(rate, run.duration_ms);
+            let left = (expected - now_ms.saturating_sub(run.started_ms) as f64).max(0.0);
             if run.id == id {
                 return Some(left as u64);
             }
             total += left;
         }
         for (queued, duration_ms) in &self.queue {
+            if *duration_ms == 0 {
+                return None;
+            }
             total += Self::cost_ms(rate, *duration_ms);
             if *queued == id {
-                return (*duration_ms > 0).then_some(total as u64);
+                return Some(total as u64);
             }
         }
         None
@@ -188,6 +199,37 @@ mod tests {
         let mut eta = learned();
         eta.enqueue(2, 0);
         assert_eq!(eta.eta_ms(2, 6_000), None);
+    }
+
+    #[test]
+    fn a_running_song_of_unknown_length_has_no_estimate() {
+        let mut eta = learned();
+        eta.enqueue(2, 0);
+        eta.start(2, 6_000);
+        assert_eq!(eta.eta_ms(2, 7_000), None);
+    }
+
+    #[test]
+    fn a_song_behind_one_of_unknown_length_has_no_estimate() {
+        let mut eta = learned();
+        eta.enqueue(2, 0);
+        eta.enqueue(3, 10_000);
+        assert_eq!(eta.eta_ms(3, 6_000), None);
+        eta.start(2, 6_000);
+        assert_eq!(eta.eta_ms(3, 7_000), None);
+    }
+
+    #[test]
+    fn a_job_begun_before_any_rate_is_estimated_once_one_is_learned() {
+        let mut eta = Eta::default();
+        eta.enqueue(1, 10_000);
+        eta.enqueue(2, 20_000);
+        eta.start(1, 0);
+        // Pretend another worker's answer taught the rate; the running
+        // job is then priced at it, not stuck at "almost done".
+        eta.rate = Some(500.0);
+        assert_eq!(eta.eta_ms(1, 1_000), Some(4_000));
+        assert_eq!(eta.eta_ms(2, 1_000), Some(14_000));
     }
 
     #[test]
