@@ -5680,6 +5680,14 @@ mod tests {
         let show = at(":root[data-device=\"tv\"] .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,");
         let hover = at("  .pharos-show-main .pharos-episode:hover .pharos-episode-play,");
         assert!(hover < hide && hide < show);
+        // B1355: only the buttons fade; the row's "Added" note stays readable
+        // after focus leaves the row.
+        assert!(sheet.contains(
+            ":root[data-device=\"tv\"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target=\"episode_row\"] > button {"
+        ));
+        assert!(sheet.contains(
+            "  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target=\"episode_row\"] > button {"
+        ));
     }
 
     #[test]
