@@ -169,9 +169,9 @@ pub struct VulkanAligner {
     pub model: vulkan::VulkanModel,
     pub reason: String,
     pub adapter: String,
-    /// The song's largest pool reading after any window so far: cubecl
-    /// frees pages as it reserves new ones, so a reading at the end alone
-    /// can miss the peak.
+    /// The song's largest pool reading so far, taken after each window and
+    /// once more at the song's end: cubecl frees pages as it reserves new
+    /// ones, so a reading at the end alone can miss the peak.
     pub song_peak: Option<crate::service::GpuPool>,
 }
 
