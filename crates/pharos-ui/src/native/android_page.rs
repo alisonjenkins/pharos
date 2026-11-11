@@ -1868,36 +1868,6 @@ addEventListener("keydown", (e) => {
   e.preventDefault();
   t.click();
 }, true);
-// B1324: OK in a search box with a match highlighted opens that match. The
-// focus stays in the box while Down moves the highlight, and a TV's OK on a
-// focused text field brings its keyboard back up instead of reaching the
-// page as Enter. So while a match is highlighted the box asks for no
-// keyboard (`inputmode="none"`), and OK clicks the match's link or the
-// match itself, before the box's own Enter handler can run.
-const matchOf = (t) => {
-  if (!inText(t)) return null;
-  const id = t.getAttribute("aria-activedescendant");
-  return (id && document.getElementById(id)) || null;
-};
-const keyboardFor = (t) => {
-  if (!inText(t) || !t.hasAttribute("aria-activedescendant") && t.inputMode !== "none") return;
-  const want = matchOf(t) ? "none" : "";
-  if (t.inputMode !== want) t.inputMode = want;
-};
-addEventListener("keyup", (e) => keyboardFor(e.target), true);
-addEventListener("input", (e) => keyboardFor(e.target), true);
-addEventListener("keydown", (e) => {
-  const t = e.target;
-  if (e.key !== "Enter" || e.repeat) return;
-  const match = matchOf(t);
-  if (!match) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const link = match.querySelector("a[href], button");
-  (link || match).click();
-  t.inputMode = "";
-  send({ t: "okpick", id: match.id, link: !!link });
-}, true);
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
@@ -2318,12 +2288,6 @@ fn on_bridge(message: Bridge) {
                     js_str(&here)
                 ));
             }
-        }
-        Bridge::OkPick { id, link } => {
-            log::info!(
-                "pharos: remote ok opened match id={id} link={link} path={}",
-                current_path()
-            );
         }
         Bridge::OkPress { target } => {
             log::info!("pharos: remote ok pressed target={target}");

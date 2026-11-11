@@ -415,15 +415,6 @@ pub enum Bridge {
         #[serde(default)]
         restore: bool,
     },
-    /// OK in a search box opened its highlighted match (B1324): `id` is
-    /// the match's element, `link` whether a link inside it took the click.
-    #[serde(rename = "okpick")]
-    OkPick {
-        #[serde(default)]
-        id: String,
-        #[serde(default)]
-        link: bool,
-    },
     /// OK on the picture pressed the shown Skip or Up Next button (FR-604);
     /// `target` is its class.
     #[serde(rename = "okpress")]
@@ -1058,15 +1049,6 @@ mod tests {
         assert_eq!(
             parse_bridge(&serde_json::json!({"t": "stop", "video": true})),
             Some(Bridge::Stop { video: true })
-        );
-        assert_eq!(
-            parse_bridge(
-                &serde_json::json!({"t": "okpick", "id": "palette-option-2", "link": false})
-            ),
-            Some(Bridge::OkPick {
-                id: "palette-option-2".to_owned(),
-                link: false
-            })
         );
         assert_eq!(
             parse_bridge(&serde_json::json!({"t": "okpress", "target": "pharos-skip"})),
