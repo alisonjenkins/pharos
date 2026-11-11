@@ -108,6 +108,7 @@ async fn native_lyrics_serve_sidecars_and_answer_nothing_without_them() {
                 ],
             }],
             words_pending: false,
+            words_eta_ms: None,
         }
     );
     let (synced, source, lines) = wire_lyrics(&session, 401).await;

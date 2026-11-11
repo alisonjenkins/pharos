@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
-    item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
+    item_id, item_query, item_summary, items_result, library, lyrics, lyrics_result, me_result,
     media_token_result, my_devices_result, negotiate_result, opt_u16, opt_u32, playback,
     playback_grant, pref_result, prefs, report_document_result, report_list_result, report_result,
     session, start_tracks_result, stream_choice, telemetry, track, user_data, user_state_result,
@@ -458,6 +458,8 @@ pub struct Lyrics {
     pub synced: bool,
     pub lines: Vec<LyricLine>,
     pub words_pending: bool,
+    /// Milliseconds left to time the words, as of when the server answered.
+    pub words_eta_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1697,31 +1699,7 @@ impl PharosApi for NativeApi {
             .which()
             .map_err(capnp::Error::from)?
         {
-            lyrics_result::Lyrics(l) => {
-                let l = l?;
-                Ok(Lyrics {
-                    synced: l.get_synced(),
-                    lines: l
-                        .get_lines()?
-                        .iter()
-                        .map(|line| {
-                            Ok(LyricLine {
-                                start_ms: line.get_start_ms(),
-                                text: text(line.get_text())?,
-                                words: line
-                                    .get_words()?
-                                    .iter()
-                                    .map(|w| LyricWord {
-                                        at: w.get_at(),
-                                        start_ms: w.get_start_ms(),
-                                    })
-                                    .collect(),
-                            })
-                        })
-                        .collect::<Result<_, capnp::Error>>()?,
-                    words_pending: l.get_words_pending(),
-                })
-            }
+            lyrics_result::Lyrics(l) => Ok(read_lyrics(l?)?),
             lyrics_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
@@ -2077,6 +2055,32 @@ fn read_opt_u16(o: opt_u16::Reader<'_>) -> Result<Option<u16>, capnp::Error> {
     })
 }
 
+fn read_lyrics(l: lyrics::Reader<'_>) -> Result<Lyrics, capnp::Error> {
+    Ok(Lyrics {
+        synced: l.get_synced(),
+        lines: l
+            .get_lines()?
+            .iter()
+            .map(|line| {
+                Ok(LyricLine {
+                    start_ms: line.get_start_ms(),
+                    text: text(line.get_text())?,
+                    words: line
+                        .get_words()?
+                        .iter()
+                        .map(|w| LyricWord {
+                            at: w.get_at(),
+                            start_ms: w.get_start_ms(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, capnp::Error>>()?,
+        words_pending: l.get_words_pending(),
+        words_eta_ms: read_opt_u32(l.get_words_eta_ms()?)?,
+    })
+}
+
 fn read_opt_u32(o: opt_u32::Reader<'_>) -> Result<Option<u32>, capnp::Error> {
     Ok(match o.which()? {
         opt_u32::Some(n) => Some(n),
@@ -2274,6 +2278,33 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn lyrics_carry_the_words_eta_when_the_server_gave_one() {
+        for eta in [Some(4_500), Some(0), None] {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut l = message.init_root::<lyrics::Builder<'_>>();
+                l.set_words_pending(true);
+                if let Some(ms) = eta {
+                    l.init_words_eta_ms().set_some(ms);
+                }
+            }
+            let read = read_lyrics(message.get_root_as_reader().unwrap()).unwrap();
+            assert!(read.words_pending);
+            assert_eq!(read.words_eta_ms, eta);
+        }
+    }
+
+    /// An older server never writes field 4, so its pointer reads null.
+    #[test]
+    fn lyrics_without_the_eta_field_read_it_as_none() {
+        let mut message = capnp::message::Builder::new_default();
+        message.init_root::<lyrics::Builder<'_>>().set_synced(true);
+        let read = read_lyrics(message.get_root_as_reader().unwrap()).unwrap();
+        assert!(read.synced);
+        assert_eq!(read.words_eta_ms, None);
+    }
 
     #[test]
     fn item_refs_round_trip_through_urls() {

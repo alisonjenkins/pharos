@@ -361,7 +361,10 @@ struct LyricWord { at @0 :UInt32; startMs @1 :UInt64; }
 # `words` is empty unless the source timed words.
 struct LyricLine { startMs @0 :UInt64; text @1 :Text; words @2 :List(LyricWord); }
 # wordsPending: word times are being worked out; ask again in a little while.
-struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; wordsPending @3 :Bool; }
+# wordsEtaMs: with wordsPending, the server's guess of the milliseconds left,
+# counted from when it answered (relative, so client and server clocks need
+# not agree); none when it has no basis for a guess.
+struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; wordsPending @3 :Bool; wordsEtaMs @4 :OptU32; }
 struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
 
 # A dynamic mix (spec 024): rules the next songs must, should or should not
