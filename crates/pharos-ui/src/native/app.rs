@@ -3203,8 +3203,11 @@ fn join_group(ctx: Ctx, together: Together, nav: Nav, id: String) {
 /// Leave the group this device is in, from outside the player (B1361). The
 /// leave outlives the page, like a join.
 fn leave_group(together: Together) {
-    let Some(session) = together.current().filter(|s| s.active()) else {
-        platform::info("pharos: group leave skipped from=together cause=not_in_group");
+    // Not filtered on `active`: mid-rejoin the session is briefly inactive
+    // while the page still shows the group, and `leave` is what cancels that
+    // rejoin. A click there must not be dropped.
+    let Some(session) = together.current() else {
+        platform::info("pharos: group leave skipped from=together cause=no_session");
         return;
     };
     let mut error = together.error;
