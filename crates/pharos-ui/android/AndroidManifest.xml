@@ -15,7 +15,11 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:networkSecurityConfig="@xml/network_security_config">
-        <activity android:configChanges="orientation|screenLayout|screenSize|keyboardHidden" android:exported="true"
+        <!-- B1323: every change a TV can make while the app runs (a keyboard
+             or remote attached, the panel's mode or density) is handled in
+             place; a recreated NativeActivity came back with a dark window
+             and no page. -->
+        <activity android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" android:exported="true"
             android:label="Pharos" android:name="dev.dioxus.main.MainActivity">
             <meta-data android:name="android.app.lib_name" android:value="main" />
             <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
