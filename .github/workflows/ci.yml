@@ -28,8 +28,14 @@ jobs:
   changes:
     name: classify changes
     runs-on: ubuntu-latest
+    # Read-only: the main-push check below reads the merged PR and its runs.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      tested: ${{ steps.tested.outputs.tested }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,6 +77,42 @@ jobs:
             echo "$path -> code=$code"
           done < <(git diff --name-only "$BASE_SHA"...HEAD)
           echo "code=$code" >> "$GITHUB_OUTPUT"
+      # A push to main that a batch rebase-merge made carries the exact tree
+      # the batch PR's CI already passed, yet it ran every heavy job again:
+      # 40 to 50 min on all four home runners, just as the queue started the
+      # next batch (FO's dioxus job waited 15 min, FP's 9). When the pushed
+      # tree equals a merged batch/ PR head whose ci run passed, the tests are
+      # skipped and only oci + publish run. Anything else (a direct push, a
+      # release-please merge, main moved under the batch, any lookup error)
+      # leaves tested empty and runs everything, as before (fail open).
+      - name: Was this tree already tested as a batch?
+        id: tested
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          verdict() { echo "main tree check: $1"; }
+          tree="$(git rev-parse "${GITHUB_SHA}^{tree}")" || { verdict "no tree for $GITHUB_SHA, running tests"; exit 0; }
+          prs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '.[] | select(.merged_at != null and (.head.ref | startswith("batch/"))) | "\(.number) \(.head.sha) \(.head.ref)"')" \
+            || { verdict "PR lookup failed, running tests"; exit 0; }
+          if [[ -z "$prs" ]]; then verdict "$GITHUB_SHA is not from a merged batch PR, running tests"; exit 0; fi
+          while read -r number head ref; do
+            head_tree="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$head" --jq .tree.sha)" || continue
+            if [[ "$head_tree" != "$tree" ]]; then
+              verdict "#$number ($ref) head $head has tree $head_tree, main has $tree, running tests"
+              continue
+            fi
+            green="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$head&event=pull_request&status=success" \
+              --jq '[.workflow_runs[] | select(.head_branch | startswith("batch/"))] | length')" || continue
+            if [[ "$green" -gt 0 ]]; then
+              verdict "#$number ($ref) head $head passed ci on tree $tree, skipping tests"
+              echo "tested=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            verdict "#$number ($ref) head $head has the same tree but no passed ci run, running tests"
+          done <<< "$prs"
 
   # Feature PRs skip the heavy jobs, and a skipped job reports success, so
   # without this a feature PR would show every required check green and
@@ -118,7 +160,7 @@ jobs:
     # Never run fork-PR code on the self-hosted runner (the enforcer's fork-PR
     # approval gate is the primary control; this is a backstop).
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' && github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
 
@@ -204,11 +246,16 @@ jobs:
     name: publish images (ghcr)
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
-    needs: [test, oci]
+    needs: [changes, test, oci]
     # Only on a push that landed on main — PRs build the images (oci job)
     # but must not publish. Consumes the tarballs the `oci` job already built
     # (build-once): no second `nix build`, just download + push.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # `test` is skipped on a main push whose tree a batch already passed
+    # (`changes` above), and a skipped need would skip this job too.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.oci.result == 'success'
+      && (needs.test.result == 'success' || (needs.test.result == 'skipped' && needs.changes.outputs.tested == 'true')) }}
     permissions:
       contents: read
       packages: write
@@ -300,7 +347,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' && github.event.pull_request.head.repo.fork != true }}
     # NO `needs: [test]`. This job builds what it needs through `just`, so
     # nothing it does depends on the flake check having passed — waiting for
     # it only serialised ~2m45s onto the end of every PR run (measured: the
@@ -351,7 +398,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' && github.event.pull_request.head.repo.fork != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -392,7 +439,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' && github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
@@ -431,7 +478,7 @@ jobs:
   # The single `dioxus UI` check, as before the split, so a required-check
   # rule or a reader keyed on that name still sees one result. It passes when
   # every part passed, or when the parts were skipped because this run needs
-  # no heavy jobs (a skipped job reports success, as before; `merge via
+  # no heavy jobs or its tree already passed as a batch (a skipped job reports success, as before; `merge via
   # batch` is what stops a feature PR merging).
   dioxus-ui:
     name: dioxus UI
@@ -442,14 +489,15 @@ jobs:
       - name: Require every Dioxus UI part to pass
         env:
           CODE: ${{ needs.changes.outputs.code }}
+          TESTED: ${{ needs.changes.outputs.tested }}
           ON: ${{ needs.dioxus-ui-on.result }}
           OFF: ${{ needs.dioxus-ui-off.result }}
         run: |
-          echo "code=$CODE native-on=$ON native-off+tv=$OFF"
+          echo "code=$CODE tested=$TESTED native-on=$ON native-off+tv=$OFF"
           for part in "native-on=$ON" "native-off+tv=$OFF"; do
             result="${part#*=}"
             if [[ "$result" == success ]]; then continue; fi
-            if [[ "$result" == skipped && "$CODE" == false ]]; then continue; fi
+            if [[ "$result" == skipped && ( "$CODE" == false || "$TESTED" == true ) ]]; then continue; fi
             echo "::error::dioxus UI part ${part%%=*} ended ${result}"
             exit 1
           done
