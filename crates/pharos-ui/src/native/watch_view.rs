@@ -1045,7 +1045,7 @@ pub fn WatchView(
                 }
                 div { class: "pharos-watch-top",
                     button {
-                        class: "pharos-control is-icon",
+                        class: "pharos-button pharos-button-quiet is-icon",
                         r#type: "button",
                         aria_label: "Back",
                         onclick: move |_| on_control.call(Control::Back),
@@ -1059,7 +1059,7 @@ pub fn WatchView(
                     }
                     if can_start_together && !in_group {
                         button {
-                            class: "pharos-control pharos-together-start",
+                            class: "pharos-button pharos-button-quiet pharos-together-start",
                             r#type: "button",
                             title: "Start a group here so others can join",
                             onclick: move |_| on_control.call(Control::StartTogether),
@@ -1073,7 +1073,7 @@ pub fn WatchView(
                             rsx! {
                                 button {
                                     id: QUEUE_TOGGLE_ID,
-                                    class: "pharos-control pharos-queue-toggle",
+                                    class: "pharos-button pharos-button-quiet is-icon pharos-queue-toggle",
                                     r#type: "button",
                                     "data-key-action": "queue",
                                     title: "Show or hide what plays next",
@@ -1094,7 +1094,7 @@ pub fn WatchView(
                     }
                     if in_group && invite.is_some() {
                         button {
-                            class: "pharos-control pharos-invite-toggle",
+                            class: "pharos-button pharos-button-quiet pharos-invite-toggle",
                             r#type: "button",
                             aria_expanded: if invite_open { "true" } else { "false" },
                             onclick: move |_| on_control.call(Control::ShowInvite(!invite_open)),
@@ -1160,7 +1160,7 @@ pub fn WatchView(
                     }
                     div { class: "pharos-control-row",
                         button {
-                            class: "pharos-control is-icon",
+                            class: "pharos-button pharos-button-quiet is-icon",
                             r#type: "button",
                             aria_label: if media.paused { "Play" } else { "Pause" },
                             onclick: move |_| on_control.call(Control::TogglePlay),
@@ -1168,7 +1168,7 @@ pub fn WatchView(
                         }
                         if let Some(id) = c.previous {
                             button {
-                                class: "pharos-control is-icon",
+                                class: "pharos-button pharos-button-quiet is-icon",
                                 r#type: "button",
                                 aria_label: "Previous episode",
                                 onclick: move |_| on_control.call(Control::Play(id)),
@@ -1177,7 +1177,7 @@ pub fn WatchView(
                         }
                         if let Some(id) = c.next {
                             button {
-                                class: "pharos-control is-icon",
+                                class: "pharos-button pharos-button-quiet is-icon",
                                 r#type: "button",
                                 aria_label: if next_queued { "Next in the queue" } else { "Next episode" },
                                 onclick: move |_| on_control.call(Control::Play(id)),
@@ -1185,14 +1185,14 @@ pub fn WatchView(
                             }
                         }
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
-                        Volume { media, on_control }
+                        Volume { media, on_control, button_class: "pharos-button pharos-button-quiet is-icon" }
                         span { class: "pharos-control-spacer" }
                         // Speed and subtitle delay wait behind it; on a narrow
                         // screen or a TV the menus and window-size buttons do
                         // too (B1338).
                         button {
                             id: SETTINGS_TOGGLE_ID,
-                            class: "pharos-control pharos-settings-toggle",
+                            class: "pharos-button pharos-button-quiet is-icon pharos-settings-toggle",
                             r#type: "button",
                             aria_label: "Settings",
                             title: "Speed, subtitle delay and more",
@@ -1245,7 +1245,7 @@ pub fn WatchView(
                         }
                         if let Some((packing, screen)) = vr {
                             button {
-                                class: "pharos-control pharos-watch-vr",
+                                class: "pharos-button pharos-button-quiet pharos-watch-vr",
                                 r#type: "button",
                                 title: "Watch in VR",
                                 // Called in the click itself: a VR session
@@ -1294,7 +1294,7 @@ pub fn WatchView(
                         // the row, smallest to largest: a small window, picture
                         // in picture, then fullscreen (B904).
                         button {
-                            class: "pharos-control pharos-shrink",
+                            class: "pharos-button pharos-button-quiet is-icon pharos-shrink",
                             r#type: "button",
                             "data-key-action": "shrink",
                             aria_label: "Small window",
@@ -1305,7 +1305,7 @@ pub fn WatchView(
                         }
                         if platform::pip_supported() {
                             button {
-                                class: "pharos-control is-icon",
+                                class: "pharos-button pharos-button-quiet is-icon",
                                 r#type: "button",
                                 aria_label: "Picture in picture",
                                 title: "Picture in picture",
@@ -1318,7 +1318,7 @@ pub fn WatchView(
                         // The TV app always fills the screen (B1339).
                         if platform::fullscreen_supported() {
                             button {
-                                class: "pharos-control is-icon",
+                                class: "pharos-button pharos-button-quiet is-icon",
                                 r#type: "button",
                                 aria_label: "Fullscreen",
                                 onclick: move |_| on_control.call(Control::Fullscreen),
@@ -3233,6 +3233,52 @@ mod tests {
                 "{caption} has its caption: {menus}"
             );
         }
+    }
+
+    /// B1359 / V1330: the player's buttons are the family's quiet pills
+    /// (ADR 0120), round where they hold an icon, kept white on the video.
+    /// Only the subtitle delay's text steps stay plain controls.
+    #[test]
+    fn the_player_buttons_are_the_family_pills() {
+        let html = render(controls());
+        let delay = html
+            .split(r#"class="pharos-subtitle-delay""#)
+            .nth(1)
+            .and_then(|r| r.split("</div>").next())
+            .unwrap_or_default();
+        let rest = html.replacen(delay, "", 1);
+        assert!(
+            !rest.contains(r#"class="pharos-control""#)
+                && !rest.contains(r#"class="pharos-control "#),
+            "{rest}"
+        );
+        for label in [
+            "Back",
+            "Play",
+            "Mute",
+            "Settings",
+            "Small window",
+            "Fullscreen",
+        ] {
+            assert!(
+                rest.contains(&format!(
+                    r#"class="pharos-button pharos-button-quiet is-icon" type="button" aria-label="{label}""#
+                )) || rest.contains(&format!(r#"aria-label="{label}""#))
+                    && rest
+                        .split(&format!(r#"aria-label="{label}""#))
+                        .next()
+                        .and_then(|before| before.rsplit("<button").next())
+                        .is_some_and(|tag| tag.contains("pharos-button pharos-button-quiet is-icon")),
+                "{label} is a round quiet pill: {rest}"
+            );
+        }
+        let sheet = include_str!("../../assets/pharos.css");
+        let on_video = sheet
+            .split("\n.pharos-player .pharos-button-quiet {\n")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(on_video.contains("color: inherit;"), "{on_video}");
     }
 
     /// B838: on a phone the wrapped control row would sit under a button

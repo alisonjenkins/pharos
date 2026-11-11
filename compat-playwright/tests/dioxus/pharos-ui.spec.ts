@@ -2848,7 +2848,7 @@ test.describe("pharos Dioxus UI", () => {
           () => getComputedStyle(document.querySelector(".pharos-controls")!).opacity,
         );
       if ((await media()).paused) {
-        await page.locator(".pharos-control-row .pharos-control").first().click();
+        await page.locator(".pharos-control-row > button").first().click();
       }
       await expect.poll(async () => (await media()).paused).toBe(false);
       await page.mouse.move(20, 20);
@@ -2879,7 +2879,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect.poll(async () => (await media()).muted).toBe(false);
 
       // Play/pause through the control, not the element.
-      const toggle = page.locator(".pharos-control-row .pharos-control").first();
+      const toggle = page.locator(".pharos-control-row > button").first();
       if (!(await media()).paused) {
         await toggle.click();
       }
