@@ -62,6 +62,8 @@ pub struct Fallback {
     latch: Latch,
     /// Why this song left the GPU, once it has.
     song_on_cpu: Option<&'static str>,
+    /// The GPU's pool was emptied once after the latch tripped.
+    pool_retired: bool,
 }
 
 impl Fallback {
@@ -72,6 +74,7 @@ impl Fallback {
             load_cpu,
             latch: Latch::default(),
             song_on_cpu: None,
+            pool_retired: false,
         }
     }
 
@@ -103,16 +106,32 @@ impl Fallback {
 }
 
 impl Model for Fallback {
-    /// The GPU's pool, unless the GPU has failed: a lost device is not
-    /// asked again, as the CPU path promises.
+    /// The GPU's pool after each song it ran. The song that trips the latch
+    /// still hands the GPU's empty pages back, once, so the CPU songs after
+    /// it do not hold them (B1352); later songs never ask the GPU again. A
+    /// lost device that panics on the cleanup costs nothing but the reading.
     fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
         if self.latch.latched() {
-            return None;
+            if self.pool_retired {
+                return None;
+            }
+            self.pool_retired = true;
         }
         let gpu = &mut self.gpu;
-        catch_unwind(AssertUnwindSafe(|| gpu.end_song()))
-            .ok()
-            .flatten()
+        let mem = match catch_unwind(AssertUnwindSafe(|| gpu.end_song())) {
+            Ok(mem) => mem,
+            Err(panic) => {
+                tracing::warn!(error = %panic_message(&*panic), "GPU pool cleanup panicked");
+                None
+            }
+        };
+        if self.pool_retired {
+            tracing::info!(
+                kept_mib = mem.map(|m| m.after.reserved >> 20),
+                "GPU pool emptied after the latch; it is not asked again until restart"
+            );
+        }
+        mem
     }
 
     fn begin_song(&mut self) {
@@ -230,6 +249,55 @@ mod tests {
                 _ => Ok(vec![(2, 2)].into()),
             }
         }
+    }
+
+    /// A GPU whose every window fails, counting its pool cleanups.
+    struct Failing(Arc<AtomicUsize>);
+
+    impl Model for Failing {
+        fn align(&mut self, _: &[f32], _: &[String], _: bool) -> Result<LineSpans, ModelError> {
+            Err(ModelError::Device("device lost".into()))
+        }
+
+        fn end_song(&mut self) -> Option<crate::service::GpuMemory> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let pool = crate::service::GpuPool {
+                in_use: 1,
+                reserved: 2,
+            };
+            Some(crate::service::GpuMemory {
+                peak: pool,
+                after: pool,
+            })
+        }
+    }
+
+    #[test]
+    fn the_song_that_latches_still_empties_the_gpu_pool_once() {
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cpu_calls = Arc::new(AtomicUsize::new(0));
+        let mut f = Fallback::new(
+            Box::new(Failing(Arc::clone(&cleanups))),
+            Box::new(move || Ok(Box::new(Fake("cpu", Arc::clone(&cpu_calls))) as Box<dyn Model>)),
+        );
+        let t: Vec<String> = vec!["la".into()];
+        for song in 1..=3 {
+            f.begin_song();
+            f.align(&[0.0], &t, false).unwrap();
+            assert!(f.end_song().is_some(), "song {song} reports its pool");
+            assert_eq!(cleanups.load(Ordering::SeqCst), song);
+        }
+        assert!(f.latch.latched(), "the third error latches");
+        for _ in 0..2 {
+            f.begin_song();
+            f.align(&[0.0], &t, false).unwrap();
+            assert_eq!(f.end_song(), None);
+        }
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            3,
+            "after the latch the GPU is never asked again"
+        );
     }
 
     #[test]
