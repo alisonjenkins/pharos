@@ -3051,6 +3051,13 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* An upright phone leaves its volume to its own buttons, so with the
+   episode buttons the time still has room. */
+@media (max-width: 40rem) and (pointer: coarse) {
+  .pharos-control-row .pharos-mute {
+    display: none;
+  }
+}
 .pharos-player :is(.pharos-watch-top, .pharos-controls) .pharos-button .pharos-icon {
   width: 1.5rem;
   height: 1.5rem;

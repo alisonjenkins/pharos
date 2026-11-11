@@ -1188,7 +1188,7 @@ pub fn WatchView(
                             }
                         }
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
-                        Volume { media, on_control, button_class: "pharos-button pharos-button-quiet is-icon" }
+                        Volume { media, on_control, button_class: "pharos-button pharos-button-quiet is-icon pharos-mute" }
                         span { class: "pharos-control-spacer" }
                         // Speed and subtitle delay wait behind it; on a narrow
                         // screen or a TV the menus and window-size buttons do
@@ -3285,6 +3285,12 @@ mod tests {
         assert!(
             sheet.contains(".pharos-player .pharos-button.is-icon {\n  flex-shrink: 0;"),
             "an icon button keeps its touch size on a narrow phone"
+        );
+        assert!(
+            sheet.contains(
+                "@media (max-width: 40rem) and (pointer: coarse) {\n  .pharos-control-row .pharos-mute {\n    display: none;"
+            ),
+            "an upright phone leaves its volume to its own buttons, so the time fits"
         );
     }
 
