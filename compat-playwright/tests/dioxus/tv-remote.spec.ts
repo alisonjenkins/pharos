@@ -272,9 +272,9 @@ test.describe("Android TV remote (B1332)", () => {
     await expect(page, "OK opened the title page").toHaveURL(new RegExp(`/ui/title/${film}$`), { timeout: 15_000 });
 
     await home();
+    // Hold OK until the hold plays, then let go: no fixed wait.
     await page.keyboard.down("Enter");
-    await page.waitForTimeout(900);
-    await page.keyboard.up("Enter");
     await expect(page, "a held OK played").toHaveURL(new RegExp(`/ui/watch/${film}$`), { timeout: 15_000 });
+    await page.keyboard.up("Enter");
   });
 });
