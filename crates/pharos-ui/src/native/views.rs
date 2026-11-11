@@ -3885,6 +3885,21 @@ mod tests {
             .and_then(|r| r.split('}').next())
             .unwrap_or_default();
         assert!(rule.contains("display: contents;"), "it draws nothing");
+        // The box draws nothing, so a gap made of margin between the art
+        // and the name would belong to the link alone: a hold there would
+        // open the title page. The gap is the name's own padding instead.
+        for head in [
+            "\n.pharos-poster-name {",
+            "\n:root[data-device=\"tv\"] .pharos-poster-name {",
+        ] {
+            let Some(rule) = css.split(head).nth(1).and_then(|r| r.split('}').next()) else {
+                panic!("no rule {head}");
+            };
+            assert!(
+                !rule.contains("margin-top") && !rule.contains("margin:"),
+                "{head} {rule}"
+            );
+        }
     }
 
     #[test]
