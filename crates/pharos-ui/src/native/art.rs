@@ -14,7 +14,16 @@ const OFFER_AVIF: bool = !cfg!(target_os = "android");
 /// The width a grid poster is shown at. Grid columns are `minmax(9rem, 1fr)`,
 /// so with three or more columns a tile stays under 13rem; a phone shows two
 /// columns of about half the screen. Erring wide keeps HiDPI tiles sharp.
-pub const POSTER_SIZES: &str = "(max-width: 40rem) 50vw, 13rem";
+///
+/// The TV lays out at 960x540 CSS px with 5.5rem posters (pharos.css), about
+/// 6rem with the focus scale; at its 2x pixel ratio that is the 240 px rung.
+/// 13rem there fetched 480 px posters, 2.5x the bytes and 4x the decoded
+/// pixels, a hundred at a time as a grid page lands.
+pub const POSTER_SIZES: &str = if cfg!(target_os = "android") {
+    "6rem"
+} else {
+    "(max-width: 40rem) 50vw, 13rem"
+};
 
 /// `src` asked for at `width` px, as AVIF when `avif`.
 fn sized(src: &str, width: u32, avif: bool) -> String {
