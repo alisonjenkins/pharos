@@ -3165,6 +3165,8 @@ mod tests {
         assert!(open.contains("right: 48px;"), "{open}");
         assert!(open.contains("bottom: 100%;"), "{open}");
         assert!(open.contains("flex-direction: column;"), "{open}");
+        assert!(open.contains("overflow-y: auto;"), "{open}");
+        assert!(open.contains("max-height:"), "{open}");
         let label =
             rule(r#":root[data-device="tv"] .pharos-control-menus.is-open .pharos-sheet-label"#);
         assert!(label.contains("display: inline;"), "{label}");
