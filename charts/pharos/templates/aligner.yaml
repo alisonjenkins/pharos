@@ -65,9 +65,10 @@ spec:
             - name: PHAROS_ALIGNER_DEVICE
               value: {{ . | quote }}
             {{- end }}
-            {{- with $cfg.idleUnloadSecs }}
+            {{- /* 0 means never unload, so only nil and "" are left out. */}}
+            {{- if not (or (kindIs "invalid" $cfg.idleUnloadSecs) (eq (toString $cfg.idleUnloadSecs) "")) }}
             - name: PHAROS_ALIGNER_IDLE_UNLOAD_SECS
-              value: {{ . | quote }}
+              value: {{ $cfg.idleUnloadSecs | toString | quote }}
             {{- end }}
             {{- if $root.Values.config.obs.otlpEndpoint }}
             # ADR-0105: the aligner's spans join the server's trace in Tempo.
