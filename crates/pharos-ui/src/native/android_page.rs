@@ -863,16 +863,20 @@ pub fn focus_card(within: &str, to: &str, keep: &str) {
 /// Remembers the id of the last focused element, so a card that replaces
 /// another can tell which of its buttons the remote was on (B1342).
 const CARD_WATCH: &str = "if (!window.__pharosFocusWatch) { window.__pharosFocusWatch = true; \
-  document.addEventListener('focusin', (e) => { window.__pharosLastFocus = (e.target && e.target.id) || ''; }, true); }";
+  document.addEventListener('focusin', (e) => { if (!window.__pharosRefocusing) \
+  window.__pharosLastFocus = (e.target && e.target.id) || ''; }, true); }";
 
 /// Put the focus on `to` when it was lost with a removed element (a card
 /// that closed under it), so the remote keeps a place (B1342). The card's
 /// node may go after this runs, so it looks again a frame or two later.
+/// That focus is not the viewer's choice, so it leaves the remembered id
+/// alone: a pill's Cancel survives into the card that replaces it.
 pub fn refocus_if_lost(to: &str) {
     run(format!(
         "const back = () => {{ const a = document.activeElement; \
            const t = document.getElementById({}); \
-           if (t && (!a || a === document.body)) t.focus({{preventScroll: true}}); }}; \
+           if (t && (!a || a === document.body)) {{ window.__pharosRefocusing = true; \
+             try {{ t.focus({{preventScroll: true}}); }} finally {{ window.__pharosRefocusing = false; }} }} }}; \
          back(); setTimeout(back, 50); setTimeout(back, 200);",
         js_str(to)
     ));
