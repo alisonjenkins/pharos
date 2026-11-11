@@ -6255,6 +6255,9 @@ fn Player(
     let mut aligned = use_signal(|| None::<(ItemRef, pharos_client::api::Lyrics)>);
     // When the server expects them by, set on each answer that says so.
     let mut words_eta_at = use_signal(|| None::<(ItemRef, f64)>);
+    // The one word-times poll; a refreshed lookup (a reconnect) replaces it,
+    // so a late answer to the old one never overwrites the newer deadline.
+    let mut align_poll = use_signal(|| None::<dioxus::core::Task>);
     use_effect({
         let id = p.detail.item.id;
         move || {
@@ -6262,6 +6265,9 @@ fn Player(
                 Some(Ok(Some(l))) if l.words_pending => Some(l.words_eta_ms),
                 _ => None,
             };
+            if let Some(old) = align_poll.write().take() {
+                old.cancel();
+            }
             let Some(first_eta) = pending else {
                 return;
             };
@@ -6270,7 +6276,7 @@ fn Player(
             let Some(api) = ctx.api.peek().clone() else {
                 return;
             };
-            spawn(async move {
+            align_poll.set(Some(spawn(async move {
                 loop {
                     platform::sleep_ms(ALIGN_ASK_MS).await;
                     match api.lyrics(&call("watch", "lyrics"), id, true).await {
@@ -6297,7 +6303,7 @@ fn Player(
                         }
                     }
                 }
-            });
+            })));
         }
     });
 
