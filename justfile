@@ -76,6 +76,27 @@ test-changed-plan from="":
 lint:
     nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
+# B1333/V1304: type-check and lint the TV app (`--features mobile`) for the
+# TV's own target. The Android-only modules (android.rs, android_page.rs)
+# compile under no other build, so a change to a shared signature broke the
+# TV line with every other check green. The visualiser bundle is built only
+# for an APK; an empty one stands in for the check.
+tv-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gen=crates/pharos-ui/assets/generated
+    mkdir -p "$gen"
+    for f in tv-visualiser.js tv-visualiser.wasm.b64; do
+      [ -e "$gen/$f" ] || : > "$gen/$f"
+    done
+    nix develop .#android --command cargo clippy -p pharos-ui --bin pharos-tv \
+      --features mobile --target armv7-linux-androideabi -- -D warnings
+
+# B1329/V1302: check a built TV APK has the Pharos label, icon, banner, dark
+# launch theme and config changes before it goes near the TV.
+tv-apk-check apk:
+    bash scripts/android-apk-check.sh {{ apk }}
+
 # P53 — regenerate the workspace-hack contents after a dep change.
 # Run this whenever a Cargo.toml in any crate gains / drops a dep
 # or feature flag. hakari diffs the unified feature set and emits a
