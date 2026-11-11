@@ -5208,6 +5208,20 @@ mod tests {
     }
 
     #[test]
+    fn a_window_needs_exactly_the_minimum_frames_to_drop_the_tier() {
+        let window = |dropped: u64, presented: u64| -> Vec<(u64, u64)> {
+            (0..=10)
+                .map(|s| (dropped * s / 10, presented * s / 10))
+                .collect()
+        };
+        let min = TIER_DROP_MIN_FRAMES;
+        assert!(run(Tier::Desktop, &window(10, min - 1)).is_empty());
+        assert_eq!(run(Tier::Desktop, &window(10, min)).len(), 1);
+        assert!(run(Tier::Desktop, &window(min - 1, 0)).is_empty());
+        assert_eq!(run(Tier::Desktop, &window(min, 0)).len(), 1);
+    }
+
+    #[test]
     fn exactly_five_percent_is_within_budget() {
         let totals: Vec<_> = (0..=30).map(|s| (s * 3, s * 60)).collect();
         assert!(run(Tier::Desktop, &totals).is_empty());
