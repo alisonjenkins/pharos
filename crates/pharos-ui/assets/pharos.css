@@ -5820,6 +5820,12 @@ body::before {
     margin: -0.5rem;
   }
 }
+/* The dense rows still give a finger 44px (WCAG 2.5.5). */
+@media (pointer: coarse) {
+  :root:not([data-device="tv"]) .pharos-album .pharos-track {
+    min-height: 2.75rem;
+  }
+}
 @media (max-width: 40rem) {
   .pharos-album .pharos-hero {
     flex-direction: row;
