@@ -3074,6 +3074,17 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 .pharos-player .pharos-button-quiet:focus-visible {
   background: rgb(255 255 255 / 0.15); /* not themed: controls sit on the video, whose colours no theme sets */
 }
+/* An icon button never shrinks under its touch size; on a very narrow
+   phone the time gives way instead. */
+.pharos-player .pharos-button.is-icon {
+  flex-shrink: 0;
+}
+.pharos-control-row .pharos-time {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 .pharos-player :is(.pharos-watch-top, .pharos-controls) .pharos-button .pharos-icon {
   width: 1.5rem;
   height: 1.5rem;
