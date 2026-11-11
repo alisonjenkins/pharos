@@ -451,14 +451,19 @@ pub fn FirstLoad(on_back: EventHandler<()>) -> Element {
 
 /// The last screen's content under a cue that the next one is loading
 /// (B822): dimmed, not clickable, `aria-busy`, and a "Loading…" status above
-/// it. Not busy, `children` stand alone, with no wrapper.
+/// it. Not busy, the same wrapper lays nothing out (`display: contents`).
+/// `children` keep their place in the tree either way (B1324/V1295): moving
+/// them into a wrapper only while busy remounted the last screen, so a
+/// library left for another replayed its arrival under the next one.
 #[component]
 pub fn Busy(busy: bool, children: Element) -> Element {
     rsx! {
         if busy {
             Loading {}
-            div { class: "pharos-busy", aria_busy: "true", {children} }
-        } else {
+        }
+        div {
+            class: if busy { "pharos-screen-frame pharos-busy" } else { "pharos-screen-frame" },
+            aria_busy: if busy { "true" },
             {children}
         }
     }
@@ -2350,10 +2355,61 @@ mod tests {
         );
         let idle = render(|| rsx! { Busy { busy: false, p { "old" } } });
         assert!(
-            !idle.contains("busy") && !idle.contains("Loading"),
+            !idle.contains("pharos-busy")
+                && !idle.contains("aria-busy")
+                && !idle.contains("Loading"),
             "{idle}"
         );
         assert!(idle.contains("old"), "{idle}");
+    }
+
+    /// B1324/V1295: the screen under the busy cue is the same one, not a
+    /// new mount: a library grid remounted there replayed its arrival.
+    /// Disarm check: with the children moved into a wrapper only while
+    /// busy, this counts three mounts.
+    #[test]
+    fn going_busy_and_back_keeps_the_screen_mounted() {
+        use dioxus::dioxus_core::NoOpMutations;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        #[derive(Clone)]
+        struct Mounts(Rc<Cell<u32>>);
+        impl PartialEq for Mounts {
+            fn eq(&self, other: &Self) -> bool {
+                Rc::ptr_eq(&self.0, &other.0)
+            }
+        }
+        #[component]
+        fn Counted(mounts: Mounts) -> Element {
+            use_hook(|| mounts.0.set(mounts.0.get() + 1));
+            rsx! { p { "old" } }
+        }
+        #[component]
+        fn Harness(mounts: Mounts, busy: Rc<Cell<bool>>) -> Element {
+            rsx! {
+                Busy { busy: busy.get(),
+                    Counted { mounts: mounts.clone() }
+                }
+            }
+        }
+        let mounts = Mounts(Rc::new(Cell::new(0)));
+        let busy = Rc::new(Cell::new(false));
+        let mut dom = VirtualDom::new_with_props(
+            Harness,
+            HarnessProps {
+                mounts: mounts.clone(),
+                busy: busy.clone(),
+            },
+        );
+        dom.rebuild_in_place();
+        for now in [true, false] {
+            busy.set(now);
+            dom.mark_dirty(ScopeId::APP);
+            dom.render_immediate(&mut NoOpMutations);
+            let html = dioxus_ssr::render(&dom);
+            assert_eq!(html.contains("aria-busy"), now, "{html}");
+        }
+        assert_eq!(mounts.0.get(), 1);
     }
 
     fn api_error(kind: &'static str, trace: &str) -> ClientError {
