@@ -1,4 +1,9 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(gh api -X PUT repos/alisonjenkins/pharos/pulls/*/merge -f merge_method=rebase *)"
+    ]
+  },
   "hooks": {
     "WorktreeCreate": [
       {
