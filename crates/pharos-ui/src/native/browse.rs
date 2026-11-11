@@ -338,6 +338,19 @@ pub enum Browse {
 }
 
 impl Browse {
+    /// What the page is mounted per (B1324): the parent `asked` for, so
+    /// another parent's page of the same kind starts afresh; a show's
+    /// series, so a season tab keeps the page, its scroll and its focus.
+    pub fn mount_key(&self, asked: ItemRef) -> String {
+        match self {
+            Browse::Show(Show {
+                series: Some(series),
+                ..
+            }) => format!("series {}", series.item.id),
+            _ => asked.to_string(),
+        }
+    }
+
     /// The parent this page lists, for the tab title. `asked` is the item
     /// the route names: a season route reads "<season> · <show>", so each
     /// season's tab has its own title, while the series route (whose shown
@@ -4700,6 +4713,38 @@ mod tests {
         });
         assert_eq!(show.name(S2), "Season 2 · Show");
         assert_eq!(show.name(SERIES), "Show");
+    }
+
+    /// B1324: a season tab keeps the show page mounted (its scroll and
+    /// focus); another parent's page mounts afresh.
+    #[test]
+    fn a_show_is_mounted_per_series_and_other_pages_per_parent() {
+        let show = |selected| {
+            Browse::Show(Show {
+                title: "Show".into(),
+                series: Some(detail(item(SERIES, ItemKind::Series, "Show"))),
+                seasons: vec![
+                    item(S1, ItemKind::Season, "Season 1"),
+                    item(S2, ItemKind::Season, "Season 2"),
+                ],
+                selected: Some(selected),
+                episodes: page(Vec::new()),
+                season_played: None,
+                pick: SeasonPick::Asked,
+                next_up: None,
+            })
+        };
+        assert_eq!(show(S1).mount_key(S1), show(S2).mount_key(S2));
+        assert_eq!(show(S1).mount_key(S1), show(S1).mount_key(SERIES));
+        let grid = |_: ItemRef| Browse::Grid {
+            title: "Films".into(),
+            page: page(Vec::new()),
+            more: None,
+            library: true,
+            sets: false,
+        };
+        assert_ne!(grid(S1).mount_key(S1), grid(S2).mount_key(S2));
+        assert_ne!(show(S1).mount_key(S1), grid(SERIES).mount_key(SERIES));
     }
 
     #[test]
