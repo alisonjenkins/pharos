@@ -16,6 +16,7 @@ use super::depth;
 use super::find::{self, SUGGEST_LIMIT};
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
+use super::listen::Icon;
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, FailureKind, Left};
@@ -110,6 +111,11 @@ pub fn WatchedToggle(
     what: Option<String>,
     #[props(default)] listen: bool,
     #[props(default)] name: String,
+    /// A tick alone, its words kept for screen readers and as its tooltip:
+    /// a round icon pill in a title page's row of pills (B1353/V1324). A
+    /// watched item's tick takes the accent, and `aria-pressed` says so.
+    #[props(default)]
+    icon: bool,
 ) -> Element {
     let mark = use_context::<MarkPlayed>();
     let state = match (listen, played) {
@@ -122,6 +128,20 @@ pub fn WatchedToggle(
         Some(what) => format!("Mark {what} {state}"),
         None => format!("Mark {state}"),
     };
+    if icon {
+        return rsx! {
+            button {
+                r#type: "button",
+                class: if played { "pharos-button pharos-button-secondary pharos-watched is-icon on" } else { "pharos-button pharos-button-secondary pharos-watched is-icon" },
+                "data-key-action": "watched",
+                aria_pressed: if played { "true" } else { "false" },
+                title: "{text}",
+                onclick: move |_| mark.0.call((id, !played, name.clone())),
+                Icon { path: ICON_TICK }
+                span { class: "pharos-button-label", "{text}" }
+            }
+        };
+    }
     rsx! {
         button {
             r#type: "button",
@@ -132,6 +152,14 @@ pub fn WatchedToggle(
         }
     }
 }
+
+/// A tick, for an icon-only watched mark.
+pub const ICON_TICK: &str = "M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z";
+/// A play triangle, for a title page's Play and an episode row's.
+pub const ICON_PLAY: &str =
+    "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z";
+/// Two people, for Watch together.
+pub const ICON_TOGETHER: &str = "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7 0a3 3 0 1 0 0-6v6Zm-7 2c-4 0-7 2-7 4.5V20h14v-2.5C16 15 13 13 9 13Zm8 0c1.8.8 3 2.4 3 4.5V20h2v-2.5c0-2.2-2.2-4-5-4.5Z";
 
 /// An `<a>` to a route. A plain click navigates in place; a modified click
 /// (new tab, new window) is left to the browser. `current` marks the link to
@@ -382,7 +410,7 @@ pub fn SignInView(
                 if let Some(error) = error {
                     p { class: "pharos-error", role: "alert", "{error}" }
                 }
-                button { r#type: "submit", disabled: busy,
+                button { class: "pharos-button", r#type: "submit", disabled: busy,
                     if busy { "Signing in…" } else { "Sign in" }
                 }
             }
@@ -406,7 +434,7 @@ pub fn StatusView(
                 h2 { "{title}" }
                 p { "{detail}" }
                 if let Some((label, on_click)) = action {
-                    button { onclick: move |_| on_click.call(()), "{label}" }
+                    button { class: "pharos-button", onclick: move |_| on_click.call(()), "{label}" }
                 }
             }
         }
@@ -1523,51 +1551,61 @@ pub fn TitleView(
         .find(|v| v.id == version)
         .or(detail.versions.first());
     let version_facts = chosen.map(versions::version_facts).unwrap_or_default();
+    // B1353/V1324: an episode's file facts sit under its still, where a
+    // wide picture leaves room; a film's follow its overview.
+    let facts_beside_art = item.kind == ItemKind::Episode;
+    let version_list = (!version_facts.is_empty()).then(|| {
+        rsx! {
+            dl { class: "pharos-version-facts",
+                for (label, value) in version_facts.iter() {
+                    div {
+                        dt { "{label}" }
+                        dd { "{value}" }
+                    }
+                }
+            }
+        }
+    });
+    let pick_version = item.kind.playable() && detail.versions.len() > 1;
     rsx! {
-        article { class: "pharos-title",
+        article { class: "pharos-title", "data-kind": title_kind(item.kind),
             div { class: "pharos-title-art",
                 match &item.image {
                     Some(src) => rsx! { Art { src: src.clone(), sizes: "16rem", lazy: false } },
                     None if item.kind == ItemKind::Audio => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                     None => rsx! {},
                 }
+                if facts_beside_art {
+                    {version_list.clone()}
+                }
             }
             div { class: "pharos-title-body",
                 if let Some(series) = &item.series_name {
-                    p { class: "pharos-muted", "{series}" }
+                    match (item.kind == ItemKind::Episode).then_some(item.parent).flatten() {
+                        Some(season) => rsx! {
+                            Link { to: Route::Browse(season), class: "pharos-title-up", "{series}" }
+                        },
+                        None => rsx! { p { class: "pharos-muted", "{series}" } },
+                    }
                 }
                 h2 { {display_name(item)} }
-                if !facts.is_empty() {
-                    p { class: "pharos-muted", "{facts}" }
+                div { class: "pharos-title-facts",
+                    if !facts.is_empty() {
+                        p { class: "pharos-muted", "{facts}" }
+                    }
+                    Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 }
-                Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 if let Some(damage) = detail.damage.clone() {
                     super::damage::DamageLine { damage }
                 }
                 div { class: "pharos-actions",
-                    if item.kind.playable() && detail.versions.len() > 1 {
-                        label { class: "pharos-filter",
-                            span { aria_hidden: "true", "Version" }
-                            select {
-                                aria_label: "Version",
-                                value: "{version}",
-                                onchange: move |e| {
-                                    if let Some(h) = on_version {
-                                        h.call(e.value());
-                                    }
-                                },
-                                for v in detail.versions.iter() {
-                                    option { value: "{v.id}", selected: v.id == version, {versions::version_label(v)} }
-                                }
-                            }
-                        }
-                    }
                     if item.kind.playable() {
                         Link {
                             to: Route::Watch(item.id),
                             class: "pharos-button",
                             id: MAIN_ACTION,
                             key_action: "play",
+                            Icon { path: ICON_PLAY }
                             if resume { "Resume" } else { "Play" }
                         }
                     }
@@ -1620,6 +1658,7 @@ pub fn TitleView(
                                         r#type: "button",
                                         "data-key-action": key_action,
                                         onclick: move |_| on_watch_together.call((id, from)),
+                                        Icon { path: ICON_TOGETHER }
                                         "{label}"
                                     }
                                 }
@@ -1638,31 +1677,51 @@ pub fn TitleView(
                         }
                     }
                     if item.kind.playable() {
-                        WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio, name: display_name(item) }
+                        WatchedToggle {
+                            id: item.id,
+                            played: item.played,
+                            listen: item.kind == ItemKind::Audio,
+                            name: display_name(item),
+                            icon: video_kind(item.kind),
+                        }
                     }
                     if item.kind.playable() {
-                        FavoriteToggle { id: item.id, favorite: item.favorite, name: display_name(item) }
+                        FavoriteToggle { id: item.id, favorite: item.favorite, name: display_name(item), icon: video_kind(item.kind) }
                     }
                 }
-                if let Some(tracks) = tracks {
-                    {tracks}
-                }
-                InThisGroup { rows: group_rows }
-                if !version_facts.is_empty() {
-                    dl { class: "pharos-version-facts",
-                        for (label, value) in version_facts {
-                            div {
-                                dt { "{label}" }
-                                dd { "{value}" }
+                if pick_version || tracks.is_some() {
+                    div { class: "pharos-title-picks",
+                        if pick_version {
+                            label { class: "pharos-filter pharos-version-pick",
+                                span { aria_hidden: "true", "Version" }
+                                select {
+                                    aria_label: "Version",
+                                    value: "{version}",
+                                    onchange: move |e| {
+                                        if let Some(h) = on_version {
+                                            h.call(e.value());
+                                        }
+                                    },
+                                    for v in detail.versions.iter() {
+                                        option { value: "{v.id}", selected: v.id == version, {versions::version_label(v)} }
+                                    }
+                                }
                             }
+                        }
+                        if let Some(tracks) = tracks {
+                            {tracks}
                         }
                     }
                 }
+                InThisGroup { rows: group_rows }
                 if !detail.overview.is_empty() {
                     p { class: "pharos-overview", "{detail.overview}" }
                 }
                 if !detail.genres.is_empty() {
                     p { class: "pharos-muted", "{detail.genres.join(\", \")}" }
+                }
+                if !facts_beside_art {
+                    {version_list}
                 }
             }
         }
@@ -1672,6 +1731,18 @@ pub fn TitleView(
         if !guests.is_empty() {
             CastRail { title: "Guest stars".to_string(), cast: guests }
         }
+    }
+}
+
+/// A title page's kind, for its layout: an episode's wide still takes a
+/// wider art column than a poster (B1353).
+fn title_kind(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Episode => "episode",
+        ItemKind::Movie => "movie",
+        ItemKind::Book => "book",
+        ItemKind::Audio => "audio",
+        _ => "other",
     }
 }
 
@@ -1955,7 +2026,7 @@ fn together_starts(
             (
                 resume,
                 start_ms(item.position_ms, item.played),
-                "pharos-button",
+                "pharos-button pharos-button-secondary",
                 "together",
             ),
             (
@@ -1966,7 +2037,12 @@ fn together_starts(
             ),
         ]
     } else {
-        vec![(fresh, 0, "pharos-button", "together")]
+        vec![(
+            fresh,
+            0,
+            "pharos-button pharos-button-secondary",
+            "together",
+        )]
     }
 }
 
@@ -3093,6 +3169,145 @@ mod tests {
         assert!(html.contains(">720p</option>"), "{html}");
     }
 
+    /// A detail with two copies of the item, the second one an admin sees
+    /// the path of, for the B1353/B1356 layout tests.
+    fn two_copies(kind: ItemKind) -> Detail {
+        use pharos_client::api::Version;
+        let copy = |id: &str, height: u32, path: &str| Version {
+            id: id.into(),
+            primary: id.is_empty(),
+            width: height * 16 / 9,
+            height,
+            video_codec: "h264".into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let mut item = item(kind);
+        item.critic_rating = Some(80);
+        Detail {
+            book: None,
+            read_position: None,
+            item,
+            overview: "An overview.".into(),
+            genres: vec!["Drama".into()],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: Vec::new(),
+            versions: vec![
+                copy("", 1080, "/media/a.mkv"),
+                copy("b", 2160, "/media/b.mkv"),
+            ],
+            damage: None,
+        }
+    }
+
+    /// The text of `html` from `from` up to the next `to` after it.
+    fn between<'a>(html: &'a str, from: &str, to: &str) -> &'a str {
+        let rest = html.split_once(from).map_or("", |(_, r)| r);
+        rest.split_once(to).map_or(rest, |(inner, _)| inner)
+    }
+
+    /// B1353/V1324: a film's page has one row of actions, Play first, then
+    /// Watch together and round icon pills for Play next, Add to queue,
+    /// Watched and Favourite, each keeping its words for screen readers;
+    /// the version picker shares one row with the track pickers, after the
+    /// actions; the ratings ride on the facts line. Disarm check: drawing
+    /// WatchedToggle without `icon` fails the watched pill lookup.
+    #[test]
+    fn a_films_actions_are_one_row_of_pills_with_the_pickers_under_it() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            rsx! { TitleView { detail: detail.clone(), tracks: rsx! { div { class: "pharos-title-tracks", "tracks" } } } }
+        });
+        let actions = between(&html, r#"class="pharos-actions""#, "pharos-title-picks");
+        let play = actions.find(">Play<").expect("Play in the actions");
+        let together = actions.find("Watch together").expect("Watch together");
+        assert!(play < together, "{actions}");
+        for label in ["Play Name next", "Add Name to the queue"] {
+            assert!(
+                actions.contains(&format!(r#"aria-label="{label}""#)),
+                "{actions}"
+            );
+        }
+        assert_eq!(
+            actions
+                .matches("pharos-queue-button pharos-button pharos-button-secondary is-icon")
+                .count(),
+            2,
+            "{actions}"
+        );
+        assert!(
+            actions.contains("pharos-watched is-icon")
+                && actions.contains(r#"<span class="pharos-button-label">Mark watched</span>"#),
+            "{actions}"
+        );
+        assert!(
+            actions.contains("pharos-favorite is-icon")
+                && actions.contains(r#"<span class="pharos-button-label">Favourite</span>"#),
+            "{actions}"
+        );
+        let picks = between(&html, r#"class="pharos-title-picks""#, "pharos-overview");
+        assert!(picks.contains(r#"aria-label="Version""#), "{picks}");
+        assert!(picks.contains("tracks"), "{picks}");
+        let facts = between(&html, r#"class="pharos-title-facts""#, "pharos-actions");
+        assert!(facts.contains("pharos-ratings"), "{facts}");
+    }
+
+    /// B1356/V1327: an episode's file facts, its path among them, sit under
+    /// its still; a film's follow its overview. The show's name above an
+    /// episode links to its season on the show's page. Disarm check: with
+    /// `facts_beside_art` always false, the episode's lookup fails.
+    #[test]
+    fn an_episodes_file_facts_sit_under_its_still_and_a_films_after_its_overview() {
+        let mut episode = two_copies(ItemKind::Episode);
+        episode.item.series_name = Some("Show".into());
+        episode.item.parent = Some(ItemRef::Synth(9));
+        let html = render(move || rsx! { TitleView { detail: episode.clone() } });
+        let art = between(&html, r#"class="pharos-title-art""#, "pharos-title-body");
+        assert!(art.contains("<dt>Path</dt><dd>/media/a.mkv</dd>"), "{art}");
+        assert!(
+            html.contains(r#"class="pharos-title-up""#) && html.contains(r#"href="/ui/browse/s9""#),
+            "{html}"
+        );
+        let film = two_copies(ItemKind::Movie);
+        let html = render(move || rsx! { TitleView { detail: film.clone() } });
+        let art = between(&html, r#"class="pharos-title-art""#, "pharos-title-body");
+        assert!(!art.contains("pharos-version-facts"), "{art}");
+        let overview = html.find("pharos-overview").expect("overview");
+        let facts = html.find("pharos-version-facts").expect("facts");
+        assert!(overview < facts, "{html}");
+    }
+
+    /// B1353/V1324: on a TV a focused round icon pill grows to show its
+    /// words, so the remote never lands on a bare icon. Disarm check:
+    /// deleting the TV focus rule fails the lookup.
+    #[test]
+    fn a_focused_icon_pill_on_the_tv_shows_its_words() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let hide = sheet
+            .find(".pharos-button.is-icon .pharos-button-label {\n  position: absolute;")
+            .expect("the hidden label");
+        let show = sheet
+            .find(":root[data-device=\"tv\"] .pharos-actions .pharos-button.is-icon:focus .pharos-button-label {\n  position: static;")
+            .expect("the TV focus rule");
+        assert!(hide < show);
+    }
+
+    fn with_video_queue(body: impl Fn() -> Element + 'static) -> String {
+        render(move || {
+            let queue = use_signal(super::super::queue::Queue::default);
+            let shown = use_signal(|| false);
+            use_context_provider(|| super::super::queue::VideoQueueCtx(queue, shown));
+            body()
+        })
+    }
+
     /// Two copies of an episode: the picker names each by its file, and the
     /// chosen one's facts are listed, its path only when the server sent it.
     #[test]
@@ -3362,6 +3577,22 @@ mod tests {
                 ("Watch together from start", 0)
             ]
         );
+    }
+
+    /// B1343/V1314: Play is a title page's one primary button; every
+    /// together start beside it is secondary, in a group or not.
+    #[test]
+    fn together_starts_are_secondary_beside_play() {
+        let mut film = item(ItemKind::Movie);
+        film.runtime_ms = 100 * 60_000;
+        for position_ms in [0, 60_000] {
+            film.position_ms = position_ms;
+            for in_group in [false, true] {
+                for (label, _, class, _) in together_starts(&film, in_group) {
+                    assert_eq!(class, "pharos-button pharos-button-secondary", "{label}");
+                }
+            }
+        }
     }
 
     /// 014 US10: in a group, the together buttons move the group to this

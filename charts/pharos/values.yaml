@@ -353,6 +353,11 @@ aligner:
     enabled: false
     size: 1Gi
     storageClass: ""
+  # Seconds unused before the model is dropped and its memory freed
+  # (PHAROS_ALIGNER_IDLE_UNLOAD_SECS); empty keeps the image's 600, 0 never
+  # unloads. On a GPU shared with other models a shorter idle hands VRAM
+  # back sooner; a reload costs about 2 s (B1352).
+  idleUnloadSecs: ""
   # A second aligner for the shadow comparison (R21), e.g. the Rust image
   # beside the Python one. The server calls it once
   # [lyrics].aligner_shadow_url is wired (T039-24).

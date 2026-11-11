@@ -95,15 +95,6 @@ body {
   background: var(--px-color-overlay);
   color: var(--px-color-fg);
 }
-.pharos-login button {
-  padding: 0.6rem;
-  border: 0;
-  border-radius: 4px;
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-  font-weight: 600;
-  cursor: pointer;
-}
 /* A line over the screen for an action that failed away from its button
    (B824). */
 .pharos-flash {
@@ -688,15 +679,6 @@ input:focus-visible {
   color: var(--px-color-fg-muted);
   margin: 0 0 1.5rem;
 }
-.pharos-status button {
-  padding: 0.6rem 1.25rem;
-  border: 0;
-  border-radius: 4px;
-  background: var(--px-color-accent);
-  color: var(--px-color-accent-fg);
-  font-weight: 600;
-  cursor: pointer;
-}
 
 .pharos-loading,
 .pharos-muted {
@@ -922,19 +904,8 @@ input:focus-visible {
 }
 .pharos-filter-pill,
 .pharos-sheet-pills .pharos-chip {
-  display: inline-flex;
   flex: none;
-  align-items: center;
-  gap: 0.4rem;
-  min-height: 2.25rem;
-  padding: 0 0.85rem;
-  font-size: 0.9rem;
   white-space: nowrap;
-}
-.pharos-filter-pill .pharos-icon {
-  width: 1.1rem;
-  height: 1.1rem;
-  flex: none;
 }
 .pharos-filter-pill[data-on],
 .pharos-filter-on {
@@ -1417,35 +1388,126 @@ input:focus-visible {
   margin: 0;
   overflow-wrap: anywhere;
 }
-.pharos-button {
-  display: inline-block;
-  padding: 0.6rem 1.25rem;
-  border-radius: 4px;
+/* B1343/V1314 (ADR 0120): one button family. Every button is a slim pill
+   (the library filter row's shape); a theme with square corners gets square
+   ones, since 0 * 999 is 0. The kind says how much the action matters:
+   primary (the accent, one per view), secondary (everything else, and
+   toggles via aria-pressed), quiet (Back, Cancel, icons), danger. `.pharos-chip`
+   is the secondary kind under its older name. The sizes are variables on
+   :root so a device (TV, touch) changes them in one place. */
+:root {
+  --pharos-button-h: 2.25rem;
+  --pharos-button-h-small: 1.75rem;
+  --pharos-button-font: 0.9rem;
+  --pharos-button-font-small: 0.8rem;
+}
+/* A 44px touch target on phones and tablets (WCAG 2.5.5). */
+@media (pointer: coarse) {
+  :root {
+    --pharos-button-h: 2.75rem;
+    --pharos-button-h-small: 2.25rem;
+  }
+}
+.pharos-button,
+.pharos-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  box-sizing: border-box;
+  min-height: var(--pharos-button-h);
+  padding: 0 0.95rem;
+  border: var(--px-border) solid var(--px-color-accent);
+  border-radius: calc(var(--px-radius) * 999);
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
+  font: inherit;
+  font-size: var(--pharos-button-font);
   font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
   text-decoration: none;
   cursor: pointer;
-  text-align: center;
-  transition: opacity 0.1s ease;
+  transition:
+    background var(--px-motion-duration) var(--px-motion-easing),
+    border-color var(--px-motion-duration) var(--px-motion-easing),
+    filter var(--px-motion-duration) var(--px-motion-easing);
 }
 .pharos-button:hover {
-  opacity: 0.9;
+  filter: brightness(1.1);
 }
-/* The quieter action beside the main one: Play from start, Mark watched. */
-.pharos-button-secondary {
+.pharos-button:disabled,
+.pharos-chip:disabled {
+  opacity: 0.45;
+  filter: none;
+  cursor: default;
+}
+.pharos-button .pharos-icon,
+.pharos-chip .pharos-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+.pharos-button-secondary,
+.pharos-chip {
+  border-color: var(--px-color-border);
   background: var(--px-color-surface);
   color: var(--px-color-fg);
-  border: 1px solid var(--px-color-border);
-  font: inherit;
-  font-weight: 600;
+  font-weight: 500;
+}
+.pharos-button-secondary:hover,
+.pharos-chip:hover {
+  filter: none;
+  background: var(--px-color-surface-raised);
+}
+.pharos-button-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--px-color-fg);
+  font-weight: 500;
+}
+.pharos-button-quiet:hover {
+  filter: none;
+  background: color-mix(in srgb, var(--px-color-fg) 9%, transparent);
+}
+.pharos-button-danger {
+  border-color: color-mix(in srgb, var(--px-color-danger) 60%, var(--px-color-border));
+  background: transparent;
+  color: var(--px-color-danger);
+}
+.pharos-button-danger:hover {
+  filter: none;
+  background: color-mix(in srgb, var(--px-color-danger) 14%, transparent);
+}
+.pharos-button-danger.is-strong {
+  border-color: var(--px-color-danger);
+  background: var(--px-color-danger);
+  color: var(--px-color-bg);
+}
+.pharos-button.is-small,
+.pharos-chip.is-small {
+  min-height: var(--pharos-button-h-small);
+  gap: 0.3rem;
+  padding: 0 0.7rem;
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-button.is-icon,
+.pharos-chip.is-icon {
+  width: var(--pharos-button-h);
+  padding: 0;
+}
+.pharos-button.is-small.is-icon,
+.pharos-chip.is-small.is-icon {
+  width: var(--pharos-button-h-small);
 }
 /* A favourite mark (B1082): the star takes the accent while it is one. */
 .pharos-favorite.on {
   border-color: var(--px-color-accent);
 }
+/* The pressed pill is filled with the accent (B1343), so its star takes the
+   accent's foreground, or it vanishes into the fill (B1353). */
 .pharos-favorite.on span {
-  color: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
 }
 .pharos-overview {
   max-width: 60ch;
@@ -2056,11 +2118,6 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   align-items: center;
   flex-wrap: wrap;
   gap: 0.5rem;
-}
-.pharos-invite .pharos-button {
-  padding: 0.4rem 0.9rem;
-  font: inherit;
-  font-weight: 600;
 }
 .pharos-invite-note {
   font-size: var(--px-type-step--1);
@@ -3756,16 +3813,8 @@ button.pharos-lyrics-line:focus-visible {
     display: none;
   }
 }
-.pharos-chip {
-  padding: 0.35rem 0.8rem;
-  border: 1px solid var(--px-color-border);
-  border-radius: 999px;
-  background: var(--px-color-surface);
-  color: var(--px-color-fg);
-  font: inherit;
-  cursor: pointer;
-}
-.pharos-chip[aria-pressed="true"] {
+.pharos-chip[aria-pressed="true"],
+.pharos-button-secondary[aria-pressed="true"] {
   background: var(--px-color-accent);
   border-color: var(--px-color-accent);
   color: var(--px-color-accent-fg);
@@ -3774,7 +3823,11 @@ button.pharos-lyrics-line:focus-visible {
   outline: 2px solid var(--px-color-focus);
   outline-offset: 2px;
 }
+/* The listen view keeps its smaller, borderless chips. */
 .pharos-listen .pharos-chip {
+  min-height: 0;
+  padding: 0.35rem 0.8rem;
+  font-weight: inherit;
   border-color: transparent;
   background: transparent;
   color: var(--px-color-fg-muted);
@@ -3963,7 +4016,8 @@ button.pharos-lyrics-line:focus-visible {
 .pharos-settings-page button {
   padding: 0.55rem 1.1rem;
   border: var(--px-border) solid var(--px-color-border);
-  border-radius: var(--px-radius);
+  /* The button family's pill (B1345/V1316). */
+  border-radius: calc(var(--px-radius) * 999);
   background: var(--px-color-surface-raised);
   cursor: pointer;
   transition:
@@ -3972,6 +4026,11 @@ button.pharos-lyrics-line:focus-visible {
 }
 .pharos-settings-page button:hover {
   background: var(--px-color-border);
+}
+/* Nav rows and tiles are not buttons to the eye: they keep the theme's
+   corner. */
+.pharos-settings-page :is(.pharos-settings-link, .pharos-style-tile, .pharos-admin-integrity-deep) {
+  border-radius: var(--px-radius);
 }
 .pharos-settings-page button:disabled {
   opacity: 0.55;
@@ -4676,6 +4735,290 @@ label.pharos-setting {
   }
   .pharos-episode:not(.is-more-open) .pharos-queue-buttons[data-target="episode_row"] {
     display: none;
+  }
+}
+
+/* B1353/V1324: a film's or an episode's page, as compact as the album page
+   (B1347). The art keeps a narrow column; beside it the name, one facts line
+   carrying the ratings, one row of pills (Play, Watch together, then round
+   icon pills), one row of pill pickers (version, audio, subtitles), the
+   overview and the file facts. On a TV everything up to the overview fits
+   above the mini player. */
+.pharos-title {
+  gap: 1.75rem;
+}
+.pharos-title-art {
+  flex: 0 0 13rem;
+}
+.pharos-title[data-kind="episode"] .pharos-title-art {
+  flex-basis: 20rem;
+}
+.pharos-title-body h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.9rem;
+  line-height: 1.15;
+}
+.pharos-title-up {
+  display: inline-block;
+  margin-bottom: 0.15rem;
+  color: var(--px-color-accent);
+  font-size: 0.95rem;
+  text-decoration: none;
+}
+.pharos-title-up:hover {
+  text-decoration: underline;
+}
+.pharos-title-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  margin-bottom: 0.9rem;
+}
+.pharos-title-facts p,
+.pharos-title-facts .pharos-ratings {
+  margin: 0;
+}
+.pharos-title .pharos-actions {
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+.pharos-title-picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.9rem;
+}
+.pharos-title-picks .pharos-title-tracks {
+  display: contents;
+}
+/* The pickers as pills the height of a small button: the version's word
+   rides inside its pill, as the library filter pills carry theirs. */
+.pharos-version-pick {
+  flex-direction: row;
+  align-items: center;
+  gap: 0;
+  min-height: var(--pharos-button-h-small);
+  padding-left: 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 999);
+  background: var(--px-color-surface);
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-title-picks .pharos-version-pick select,
+.pharos-title-picks .pharos-track-picker {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 20rem;
+  min-height: var(--pharos-button-h-small);
+  padding: 0 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 999);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  font: inherit;
+  font-size: var(--pharos-button-font-small);
+}
+.pharos-title-picks .pharos-version-pick select {
+  border: 0;
+  background: transparent;
+  padding-left: 0.4rem;
+}
+.pharos-title .pharos-overview {
+  margin: 0 0 0.5rem;
+  max-width: 70ch;
+}
+.pharos-title-body > .pharos-muted {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+}
+.pharos-title .pharos-version-facts {
+  gap: 0.1rem 0.75rem;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-title .pharos-cast {
+  margin-top: 1.25rem;
+}
+/* A round icon pill keeps its words for screen readers and its tooltip. */
+.pharos-button.is-icon .pharos-button-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+/* B1354/V1325: a show's page in the album page's two columns: art, name,
+   Resume, marks and overview on the left; the seasons and the episodes
+   start at the top on the right. */
+.pharos-show {
+  display: grid;
+  grid-template-columns: 17rem minmax(0, 1fr);
+  gap: 2.25rem;
+  align-items: start;
+  max-width: 80rem;
+}
+.pharos-show-side .pharos-hero {
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.pharos-show-side .pharos-hero-art {
+  flex: none;
+  width: 11rem;
+}
+.pharos-show-side .pharos-hero-body h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+  line-height: 1.2;
+}
+.pharos-show-side .pharos-hero-body > .pharos-muted {
+  margin: 0 0 0.25rem;
+  font-size: 0.9rem;
+}
+.pharos-show-side .pharos-actions {
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+}
+.pharos-show-side .pharos-overview {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.pharos-show-main > .pharos-section-title {
+  margin-top: 0;
+}
+/* The season tabs: the music bar's segmented row of pills (B1334), with the
+   season's watched mark beside it. */
+.pharos-show-main .pharos-season-bar {
+  justify-content: flex-start;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--px-color-border);
+}
+.pharos-season-bar .pharos-tabs {
+  flex: 0 1 auto;
+  gap: 0.15rem;
+  margin: 0;
+  padding: 0.15rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: 999px;
+  background: var(--px-color-surface);
+}
+.pharos-season-bar .pharos-tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.85rem;
+  padding: 0 0.85rem;
+  border: 0;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.pharos-season-bar .pharos-tab-active {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-show-main .pharos-season-bar .pharos-button {
+  margin-left: 0;
+}
+/* B1355/V1326: dense episode rows. A smaller still; the row's Play and queue
+   buttons show on the hovered or focused row only, where a pointer or the
+   remote is, so the list reads as names. Faded, not hidden, so they stay
+   focusable and clickable (B1348 does the same for song rows). */
+.pharos-show-main .pharos-episode {
+  gap: 0.75rem;
+  padding: 0.3rem 0.4rem;
+  border-bottom: 0;
+  border-radius: 6px;
+}
+.pharos-show-main .pharos-episode:hover,
+.pharos-show-main .pharos-episode:focus-within {
+  background: var(--px-color-surface);
+}
+.pharos-show-main .pharos-episode-link {
+  gap: 0.75rem;
+}
+.pharos-show-main .pharos-episode-still {
+  flex-basis: 7.5rem;
+  border-radius: 4px;
+}
+.pharos-show-main .pharos-episode-text {
+  gap: 0.1rem;
+}
+.pharos-show-main .pharos-episode-text .pharos-muted {
+  font-size: 0.8rem;
+}
+.pharos-show-main .pharos-episode-mark {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+.pharos-show-main .pharos-episode-mark svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+/* A touch screen keeps the 44px target (WCAG 2.5.5); the tick stays small. */
+@media (pointer: coarse) {
+  .pharos-show-main .pharos-episode-mark {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+}
+/* A laptop with a touch screen as well keeps them shown: a finger cannot
+   hover to find them. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
+  .pharos-show-main .pharos-episode .pharos-episode-play,
+  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+    opacity: 0;
+  }
+  .pharos-show-main .pharos-episode:hover .pharos-episode-play,
+  .pharos-show-main .pharos-episode:hover .pharos-queue-buttons[data-target="episode_row"],
+  .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
+  .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+    opacity: 1;
+  }
+}
+@media (max-width: 40rem) {
+  .pharos-title-art,
+  .pharos-title[data-kind="episode"] .pharos-title-art {
+    flex-basis: auto;
+  }
+  .pharos-title[data-kind="movie"] .pharos-title-art {
+    max-width: 10rem;
+  }
+  /* One line an episode: still, name, tick, the "more" control and Play;
+     the queue buttons wrap under it only while "more" is open. */
+  .pharos-show-main .pharos-episode:not(.is-more-open) {
+    flex-wrap: nowrap;
+  }
+  .pharos-show-main .pharos-episode-link {
+    flex: 1 1 auto;
+  }
+  .pharos-show-main .pharos-episode.is-more-open .pharos-episode-link {
+    flex-basis: 100%;
+  }
+  .pharos-show {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+  .pharos-show-side .pharos-hero {
+    flex-direction: row;
+  }
+  .pharos-show-side .pharos-hero-art {
+    width: 6.5rem;
+  }
+  .pharos-show-main .pharos-season-bar {
+    overflow-x: auto;
+  }
+  .pharos-show-main .pharos-episode-still {
+    flex-basis: 5rem;
   }
 }
 
@@ -5409,13 +5752,14 @@ body::before {
   align-items: center;
   gap: 0.25rem;
 }
-.pharos-queue-button {
+/* A row's queue icons; on a page they are family buttons (B1344). */
+.pharos-queue-button:where(:not(.pharos-button)) {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
   padding: 0.35rem;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: calc(var(--px-radius) * 999);
   background: none;
   color: var(--px-color-fg);
   font: inherit;
@@ -5425,8 +5769,8 @@ body::before {
   width: 1.15rem;
   height: 1.15rem;
 }
-.pharos-queue-button:hover,
-.pharos-queue-button:focus-visible {
+.pharos-queue-button:where(:not(.pharos-button)):hover,
+.pharos-queue-button:where(:not(.pharos-button)):focus-visible {
   background: color-mix(in srgb, var(--px-color-fg) 12%, transparent);
 }
 .pharos-queue-button:focus-visible {
@@ -5452,18 +5796,6 @@ body::before {
 .pharos-watch .pharos-queue-total {
   color: var(--px-color-fg);
   opacity: 0.85;
-}
-.pharos-queue-buttons[data-target="album_page"] .pharos-queue-button,
-.pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
-  padding: 0.45rem 0.9rem;
-  border-color: var(--px-color-border);
-  background: var(--px-color-surface);
-}
-/* Shaped like the Play and Mark watched buttons beside them. */
-.pharos-actions .pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
-  padding: 0.6rem 1.25rem;
-  border-radius: 4px;
-  font-weight: 600;
 }
 .pharos-track-item {
   display: flex;
@@ -5545,7 +5877,7 @@ body::before {
    starts at the top of the page; it held three rows above the TV's mini
    player when they were stacked. A phone stacks them, the cover small
    beside the title. Buttons are the slim pills of the library filter row
-   (B1311). */
+   (B1311), drawn by the shared button family (B1343). */
 .pharos-album {
   display: grid;
   gap: 1.25rem;
@@ -5579,36 +5911,10 @@ body::before {
 .pharos-album .pharos-actions .pharos-queue-buttons {
   display: contents;
 }
-.pharos-album .pharos-actions .pharos-button,
-.pharos-album .pharos-actions .pharos-queue-button {
-  box-sizing: border-box;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.4rem;
-  min-height: 2.25rem;
-  padding: 0 0.9rem;
-  border: 1px solid transparent;
-  border-radius: calc(var(--px-radius) * 999);
-  font-size: 0.9rem;
-}
-.pharos-album .pharos-actions .pharos-button-secondary,
-.pharos-album .pharos-actions .pharos-queue-button {
-  border-color: var(--px-color-border);
-  background: var(--px-color-surface);
-  color: var(--px-color-fg);
-}
-.pharos-album .pharos-actions .pharos-favorite.on {
-  border-color: var(--px-color-accent);
-}
 .pharos-album .pharos-actions .pharos-icon {
   width: 1.1rem;
   height: 1.1rem;
   flex: none;
-}
-.pharos-album .pharos-actions :is(.is-icon, .pharos-queue-button) {
-  width: 2.25rem;
-  padding: 0;
 }
 .pharos-album .is-icon .pharos-button-label {
   position: absolute;
@@ -5618,10 +5924,6 @@ body::before {
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
-}
-.pharos-album .is-icon span[aria-hidden] {
-  font-size: 1.05rem;
-  line-height: 1;
 }
 .pharos-album .pharos-track {
   grid-template-columns: 1.75rem 1fr auto;
@@ -5655,13 +5957,6 @@ body::before {
 :root[data-device="tv"] .pharos-album {
   grid-template-columns: 13rem minmax(0, 1fr);
   gap: 1.75rem;
-}
-:root[data-device="tv"] .pharos-album .pharos-actions :is(.pharos-button, .pharos-queue-button) {
-  min-height: 1.9rem;
-  font-size: 0.85rem;
-}
-:root[data-device="tv"] .pharos-album .pharos-actions :is(.is-icon, .pharos-queue-button) {
-  width: 1.9rem;
 }
 /* Play and Shuffle share the column's first line on the TV; the icon
    pills take the next. */
@@ -7691,10 +7986,11 @@ body:has(.pharos-reader) {
 :root[data-device="tv"] .pharos-filters {
   margin-bottom: calc(0.5rem - 12px);
 }
-:root[data-device="tv"] .pharos-filter-pill,
-:root[data-device="tv"] .pharos-sheet-pills .pharos-chip {
-  min-height: 1.9rem;
-  font-size: 0.8rem;
+:root[data-device="tv"] {
+  --pharos-button-h: 1.9rem;
+  --pharos-button-h-small: 1.5rem;
+  --pharos-button-font: 0.8rem;
+  --pharos-button-font-small: 0.72rem;
 }
 /* B1334: the music tab row at the TV filter row's size. */
 :root[data-device="tv"] .pharos-music-bar {
@@ -7712,4 +8008,67 @@ body:has(.pharos-reader) {
 :root[data-device="tv"] .pharos-sheet-body,
 :root[data-device="tv"] .pharos-sheet-foot {
   padding-inline: 1.25rem 48px;
+}
+
+/* B1353/V1324 on a TV: narrower art, and a focused round icon pill grows
+   to show its words, so the remote never lands on a bare icon. */
+:root[data-device="tv"] .pharos-title-art {
+  flex-basis: 11rem;
+}
+:root[data-device="tv"] .pharos-title[data-kind="episode"] .pharos-title-art {
+  flex-basis: 16rem;
+}
+:root[data-device="tv"] .pharos-title-body h2 {
+  font-size: 1.6rem;
+}
+:root[data-device="tv"] .pharos-title .pharos-overview {
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+:root[data-device="tv"] .pharos-actions .pharos-button.is-icon:focus {
+  width: auto;
+  padding: 0 0.8rem;
+}
+:root[data-device="tv"] .pharos-actions .pharos-button.is-icon:focus .pharos-button-label {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 0;
+  clip: auto;
+  overflow: visible;
+}
+
+/* B1354-B1355 on a TV: a narrower side column, and an episode row's buttons
+   only on the row holding the remote's focus (the TV reports no hover, like
+   the album page's song rows, B1348). */
+:root[data-device="tv"] .pharos-show {
+  grid-template-columns: 14.5rem minmax(0, 1fr);
+  gap: 1.75rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-hero-art {
+  width: 7.5rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-hero-body h2 {
+  font-size: 1.2rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-overview {
+  font-size: 0.78rem;
+}
+:root[data-device="tv"] .pharos-season-bar .pharos-tab {
+  min-height: 1.65rem;
+  font-size: 0.8rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode-still {
+  flex-basis: 5rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode-name {
+  font-size: 0.9rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-episode-play,
+:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+  opacity: 0;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
+:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+  opacity: 1;
 }

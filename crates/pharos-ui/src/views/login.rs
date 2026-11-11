@@ -49,7 +49,7 @@ pub fn LoginForm(on_submit: EventHandler<LoginAttempt>, error: Option<String>) -
                     oninput: move |ev| password.set(ev.value()),
                 }
             }
-            button { r#type: "submit", "Sign in" }
+            button { class: "pharos-button", r#type: "submit", "Sign in" }
         }
     }
 }
