@@ -16,6 +16,7 @@ use super::depth;
 use super::find::{self, SUGGEST_LIMIT};
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
+use super::listen::Icon;
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, FailureKind, Left};
@@ -110,6 +111,11 @@ pub fn WatchedToggle(
     what: Option<String>,
     #[props(default)] listen: bool,
     #[props(default)] name: String,
+    /// A tick alone, its words kept for screen readers and as its tooltip:
+    /// a round icon pill in a title page's row of pills (B1353/V1324). A
+    /// watched item's tick takes the accent, and `aria-pressed` says so.
+    #[props(default)]
+    icon: bool,
 ) -> Element {
     let mark = use_context::<MarkPlayed>();
     let state = match (listen, played) {
@@ -122,6 +128,20 @@ pub fn WatchedToggle(
         Some(what) => format!("Mark {what} {state}"),
         None => format!("Mark {state}"),
     };
+    if icon {
+        return rsx! {
+            button {
+                r#type: "button",
+                class: if played { "pharos-button pharos-button-secondary pharos-watched is-icon on" } else { "pharos-button pharos-button-secondary pharos-watched is-icon" },
+                "data-key-action": "watched",
+                aria_pressed: if played { "true" } else { "false" },
+                title: "{text}",
+                onclick: move |_| mark.0.call((id, !played, name.clone())),
+                Icon { path: ICON_TICK }
+                span { class: "pharos-button-label", "{text}" }
+            }
+        };
+    }
     rsx! {
         button {
             r#type: "button",
@@ -132,6 +152,14 @@ pub fn WatchedToggle(
         }
     }
 }
+
+/// A tick, for an icon-only watched mark.
+pub const ICON_TICK: &str = "M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z";
+/// A play triangle, for a title page's Play and an episode row's.
+pub const ICON_PLAY: &str =
+    "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z";
+/// Two people, for Watch together.
+pub const ICON_TOGETHER: &str = "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7 0a3 3 0 1 0 0-6v6Zm-7 2c-4 0-7 2-7 4.5V20h14v-2.5C16 15 13 13 9 13Zm8 0c1.8.8 3 2.4 3 4.5V20h2v-2.5c0-2.2-2.2-4-5-4.5Z";
 
 /// An `<a>` to a route. A plain click navigates in place; a modified click
 /// (new tab, new window) is left to the browser. `current` marks the link to
