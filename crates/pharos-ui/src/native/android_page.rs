@@ -732,29 +732,41 @@ pub fn focus_by_id(id: &str) {
 }
 
 /// Give the focus to `to`, a card that just appeared over the video (Skip
-/// intro, Up Next), when the remote is on the picture or its control row,
-/// or the focus went with a card this one replaced: not while it scrubs or
-/// the settings sheet is open, nor from the queue or the invite panel
-/// (B1342). When `keep` was the last control focused (the pill's Cancel, as the pill grows into
-/// the full card), `keep` takes it instead, so OK still does what it did.
-/// The page applies a render's DOM edits on its own schedule, so the card
-/// may not be there yet: a few tries, a frame apart.
+/// intro, Up Next), when the remote is on the picture, the seek bar or the
+/// control row, or the focus went with a card this one replaced: not while
+/// it scrubs or the settings sheet is open, nor from the queue or the
+/// invite panel (B1342). When `keep` was the last control focused (the
+/// pill's Cancel, as the pill grows into the full card), `keep` takes it
+/// instead, so OK still does what it did. The page applies a render's DOM
+/// edits on its own schedule, so the card may not be there yet: a few
+/// tries, a frame apart. Every outcome is logged, a skip with its reason
+/// and where the focus was.
 pub fn focus_card(within: &str, to: &str, keep: &str) {
     run(format!(
         "{CARD_WATCH} \
          const w = document.getElementById({}); const to = {}; const keep = {}; \
+         const what = (a) => !a ? 'none' : (a.tagName + (a.id ? '#' + a.id : '') + \
+           (a.className && a.className.baseVal === undefined ? '.' + String(a.className).split(' ')[0] : '')); \
          const go = (n) => {{ \
            const t = document.getElementById(keep && window.__pharosLastFocus === keep ? keep : to); \
-           if (!t) {{ if (n > 0) setTimeout(() => go(n - 1), 50); return; }} \
+           if (!t) {{ \
+             if (n > 0) {{ setTimeout(() => go(n - 1), 50); return; }} \
+             console.info('pharos: card focus skipped to=' + to + ' reason=missing'); return; \
+           }} \
            const a = document.activeElement; \
            const lost = !a || a === document.body; \
-           const busy = !!document.querySelector('.pharos-seek.is-scrubbing, .pharos-control-menus.is-open'); \
-           const row = a && a.closest && a.closest('.pharos-control-row') && \
+           const scrubbing = !!document.querySelector('.pharos-seek.is-scrubbing'); \
+           const sheet = !!document.querySelector('.pharos-control-menus.is-open'); \
+           const bar = a && a.closest && (a.closest('.pharos-control-row') || a.closest('.pharos-seek')) && \
              !a.closest('.pharos-control-menus'); \
-           if (w && !busy && (lost || a === w || row)) {{ \
-             t.focus({{preventScroll: true}}); \
-             console.info('pharos: card focus to=' + t.id); \
+           const reason = !w ? 'no_player' : scrubbing ? 'scrubbing' : sheet ? 'sheet_open' : \
+             (lost || a === w || bar) ? '' : 'focus_elsewhere'; \
+           if (reason) {{ \
+             console.info('pharos: card focus skipped to=' + t.id + ' reason=' + reason + ' from=' + what(a)); \
+             return; \
            }} \
+           t.focus({{preventScroll: true}}); \
+           console.info('pharos: card focus to=' + t.id + ' from=' + what(a)); \
          }}; go(4);",
         js_str(within),
         js_str(to),
