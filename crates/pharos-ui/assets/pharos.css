@@ -5104,13 +5104,13 @@ label.pharos-setting {
    hover to find them. */
 @media (hover: hover) and (not (any-pointer: coarse)) {
   .pharos-show-main .pharos-episode .pharos-episode-play,
-  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] > button {
     opacity: 0;
   }
   .pharos-show-main .pharos-episode:hover .pharos-episode-play,
-  .pharos-show-main .pharos-episode:hover .pharos-queue-buttons[data-target="episode_row"],
+  .pharos-show-main .pharos-episode:hover .pharos-queue-buttons[data-target="episode_row"] > button,
   .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
-  .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+  .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] > button {
     opacity: 1;
   }
 }
@@ -8257,10 +8257,10 @@ body:has(.pharos-reader) {
   font-size: 0.9rem;
 }
 :root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-episode-play,
-:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] > button {
   opacity: 0;
 }
 :root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
-:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] > button {
   opacity: 1;
 }
