@@ -100,6 +100,9 @@ struct Telemetry {
     /// Bumped by each [`forget_opt_in`]: a read or an install begun under an
     /// earlier session must not land in this one.
     session: u64,
+    /// Bumped as each save of the opt-in starts: a read or an earlier save
+    /// that lands after a later save began must not undo it.
+    saves: u64,
 }
 
 thread_local! {
@@ -152,18 +155,47 @@ pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
 /// [`load_opted_in`] for a read begun under session `begun` (from
 /// [`session`]), taken where `api` was: a task that only starts after a
 /// sign-out must not remember the previous user's opt-in for the next.
+/// An unreadable opt-in counts as off from then on, not only for the held
+/// events: a reconnect keeps the last session's choice otherwise.
 pub async fn load_opted_in_since(api: &NativeApi, begun: u64) -> Result<bool, String> {
-    let raw = api
-        .pref(&prefs_call("opt_in_read"), OPT_IN_PREF)
-        .await
-        .map_err(|e| e.to_string())?;
-    remember_if_current(begun, opt_in_from(raw.as_deref()))
+    let ticket = Ticket {
+        session: begun,
+        saves: saves(),
+    };
+    match api.pref(&prefs_call("opt_in_read"), OPT_IN_PREF).await {
+        Ok(raw) => remember_if_current(ticket, opt_in_from(raw.as_deref())),
+        Err(e) => {
+            // Off whatever happened since: a failed read never turns it on.
+            let _ = remember_if_current(ticket, false);
+            Err(e.to_string())
+        }
+    }
 }
 
-/// Remembers `on` if no sign-out came since session `begun`.
-fn remember_if_current(begun: u64, on: bool) -> Result<bool, String> {
-    if session() != begun {
+/// When a read or a save of the opt-in began: its result is remembered only
+/// if no sign-out and no later save came since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ticket {
+    session: u64,
+    saves: u64,
+}
+
+fn saves() -> u64 {
+    TELEMETRY.with(|t| t.borrow().saves)
+}
+
+/// Remembers `on` if `ticket` is still the latest: no sign-out and no save
+/// begun since.
+fn remember_if_current(ticket: Ticket, on: bool) -> Result<bool, String> {
+    let now = Ticket {
+        session: session(),
+        saves: saves(),
+    };
+    if now.session != ticket.session {
         return Err("signed out while the opt-in was read".to_owned());
+    }
+    if now.saves != ticket.saves {
+        return Err("the opt-in was saved while it was read".to_owned());
     }
     remember_opt_in(on);
     Ok(on)
@@ -172,16 +204,26 @@ fn remember_if_current(begun: u64, on: bool) -> Result<bool, String> {
 /// Writes the user's opt-in to `Prefs`; remembered only once the server
 /// has stored it.
 pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
-    let begun = session();
+    let ticket = begin_save();
     let value: &[u8] = if on { b"true" } else { b"false" };
     api.set_pref(&prefs_call("opt_in_write"), OPT_IN_PREF, value)
         .await
         .map_err(|e| e.to_string())?;
-    if session() != begun {
-        return Err("signed out while the opt-in was saved".to_owned());
-    }
-    remember_opt_in(on);
-    Ok(())
+    remember_if_current(ticket, on)
+        .map(|_| ())
+        .map_err(|_| "signed out or saved again while the opt-in was saved".to_owned())
+}
+
+/// Starts a save: reads and saves begun before it no longer land.
+fn begin_save() -> Ticket {
+    TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        t.saves = t.saves.wrapping_add(1);
+        Ticket {
+            session: t.session,
+            saves: t.saves,
+        }
+    })
 }
 
 /// Starts submitting through `api`: the held events to send now, none when
@@ -317,12 +359,38 @@ mod tests {
     #[test]
     fn an_opt_in_read_from_before_sign_out_is_not_remembered() {
         forget_opt_in();
-        let begun = session();
+        let begun = Ticket {
+            session: session(),
+            saves: saves(),
+        };
         forget_opt_in();
         assert!(remember_if_current(begun, true).is_err());
         assert!(!opted_in());
-        assert_eq!(remember_if_current(session(), true), Ok(true));
+        let now = Ticket {
+            session: session(),
+            saves: saves(),
+        };
+        assert_eq!(remember_if_current(now, true), Ok(true));
         assert!(opted_in());
+        forget_opt_in();
+    }
+
+    /// A read begun before a save of the opt-out lands after it and is
+    /// dropped, so the saved choice stands; so is an earlier save landing
+    /// after a later one.
+    #[test]
+    fn a_read_or_save_from_before_a_later_save_does_not_undo_it() {
+        forget_opt_in();
+        let read = Ticket {
+            session: session(),
+            saves: saves(),
+        };
+        let first = begin_save();
+        let second = begin_save();
+        assert_eq!(remember_if_current(second, false), Ok(false));
+        assert!(remember_if_current(read, true).is_err());
+        assert!(remember_if_current(first, true).is_err());
+        assert!(!opted_in());
         forget_opt_in();
     }
 
