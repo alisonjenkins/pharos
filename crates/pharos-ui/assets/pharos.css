@@ -5064,6 +5064,11 @@ body::before {
   gap: 0.5rem;
   width: 20rem;
   max-width: calc(100% - 96px);
+  /* Above the bar and inside the 27px title-safe top: a long list of
+     tracks scrolls instead of running off the screen. */
+  max-height: calc(100vh - 12rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 0.75rem;
   border-radius: 12px;
   background: rgb(16 20 28 / 0.94); /* not themed: controls sit on the video, whose colours no theme sets */
