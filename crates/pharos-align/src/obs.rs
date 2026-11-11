@@ -14,9 +14,9 @@ pub const SONG_SECONDS: &str = "pharos_aligner_song_seconds";
 /// Wall time of one forward pass, by `device` (`cpu`, `vulkan`).
 pub const FORWARD_SECONDS: &str = "pharos_aligner_forward_seconds";
 /// Bytes the GPU pool held in the last song (B1352, V1323): `state="peak"`
-/// is the largest reading taken after each window (allocations inside one
-/// forward pass are not sampled), `state="kept"` what stayed reserved after
-/// its empty pages were handed back.
+/// is the largest reading taken after each window and once more at the
+/// song's end (allocations inside one forward pass are not sampled),
+/// `state="kept"` what stayed reserved after its empty pages were handed back.
 pub const GPU_POOL_BYTES: &str = "pharos_aligner_gpu_pool_bytes";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
@@ -155,7 +155,7 @@ impl Metrics {
         metrics::describe_gauge!(
             GPU_POOL_BYTES,
             metrics::Unit::Bytes,
-            "GPU pool bytes in the last song: peak = largest reading sampled after each window, kept = reserved after release"
+            "GPU pool bytes in the last song: peak = largest reading sampled after each window and at song end, kept = reserved after release"
         );
         Ok(Self { handle, process })
     }
