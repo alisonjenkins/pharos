@@ -843,12 +843,29 @@ pub enum HlsEvent {
         details: String,
         fatal: bool,
     },
-    /// `Hls.Events.FRAG_LOADED` for a main fragment.
+    /// `Hls.Events.FRAG_LOADED` for a main or audio fragment.
     Frag {
         bytes: u64,
         load_ms: u64,
         media_ms: u64,
+        /// The fragment's sequence number.
+        #[serde(default)]
+        sn: u64,
+        /// Request start to first byte, ms.
+        #[serde(default)]
+        ttfb_ms: u64,
+        #[serde(default)]
+        track: FragTrack,
     },
+}
+
+/// Which rendition a loaded fragment belongs to (hls.js's `frag.type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FragTrack {
+    #[default]
+    Main,
+    Audio,
 }
 
 /// Read one bridge message; `None` for anything unknown.
@@ -1710,13 +1727,44 @@ mod tests {
         );
         let f = serde_json::json!({"t": "hls", "id": "v", "ev": "frag",
             "bytes": 10, "load_ms": 2, "media_ms": 4000});
-        assert!(matches!(
+        assert_eq!(
             parse_bridge(&f),
             Some(Bridge::Hls {
-                event: HlsEvent::Frag { bytes: 10, .. },
-                ..
+                id: "v".into(),
+                event: HlsEvent::Frag {
+                    bytes: 10,
+                    load_ms: 2,
+                    media_ms: 4000,
+                    sn: 0,
+                    ttfb_ms: 0,
+                    track: FragTrack::Main,
+                }
+            }),
+            "an old message is a main fragment with no number"
+        );
+    }
+
+    /// B1367: a fragment says which rendition it is, its number and its
+    /// time to first byte.
+    #[test]
+    fn a_fragment_names_its_track_number_and_first_byte() {
+        let f = serde_json::json!({"t": "hls", "id": "v", "ev": "frag",
+            "bytes": 10, "load_ms": 2, "media_ms": 4000,
+            "sn": 7, "ttfb_ms": 35, "track": "audio"});
+        assert_eq!(
+            parse_bridge(&f),
+            Some(Bridge::Hls {
+                id: "v".into(),
+                event: HlsEvent::Frag {
+                    bytes: 10,
+                    load_ms: 2,
+                    media_ms: 4000,
+                    sn: 7,
+                    ttfb_ms: 35,
+                    track: FragTrack::Audio,
+                }
             })
-        ));
+        );
     }
 
     #[test]
