@@ -1507,46 +1507,14 @@ async fn deliver_vtt_inner(
         }
     }
 
-    // Embedded stream: ffmpeg -map 0:<idx> -f webvtt.
-    let input = item
-        .path
-        .to_str()
-        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
-
-    // P5 — cache lookup before ffmpeg. Key includes mtime so a
-    // mid-flight source edit invalidates the cached bytes.
-    let mtime = mtime_secs(&item.path).await;
-    if let Some(cache) = state.subtitles.as_ref() {
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await
-        {
-            return Ok(vtt_response((*bytes).clone(), style_lossy, &style));
-        }
-        // Per-key fetch lock dedupes concurrent first-fetchers so
-        // they share one ffmpeg spawn.
-        let lock = cache
-            .lock(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await;
-        let _guard = lock.lock().await;
-        // Re-check — peer may have stored while we waited.
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await
-        {
-            return Ok(vtt_response((*bytes).clone(), style_lossy, &style));
-        }
-        let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
-        let stored = cache
-            .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
-            .await;
-        return Ok(vtt_response((*stored).clone(), style_lossy, &style));
-    }
-
-    // No cache configured — fall back to the original spawn-per-fetch
-    // path. (Default config keeps the cache on; this branch only
-    // fires for tests / minimal deployments.)
-    let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
+    // Embedded stream: ffmpeg -map 0:<idx> -f webvtt, cached.
+    let out = embedded_vtt(
+        state.subtitles.as_ref(),
+        &item,
+        stream_index,
+        &BgPermit::playback_priority(),
+    )
+    .await?;
     Ok(vtt_response(out, style_lossy, &style))
 }
 
@@ -1668,6 +1636,56 @@ async fn resolve_vtt_bytes(
     .await
 }
 
+/// How an embedded-subtitle request was answered, the `temp` label of
+/// `pharos_subtitle_extract_total`: `warm` read the cache, `coalesced` waited on
+/// a peer's extraction, `cold` ran ffmpeg on this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExtractTemp {
+    Warm,
+    Coalesced,
+    Cold,
+}
+
+impl ExtractTemp {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Coalesced => "coalesced",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// Count one embedded-subtitle request as `pharos_subtitle_extract_total` and
+/// `pharos_subtitle_extract_seconds` (`kind`, `temp`, `outcome`). A cold fetch
+/// demuxes the whole source and was only visible as a log line.
+fn record_extract(
+    kind: &'static str,
+    temp: ExtractTemp,
+    ok: bool,
+    stream_index: u32,
+    started: std::time::Instant,
+) {
+    let outcome = if ok { "ok" } else { "error" };
+    metrics::counter!(
+        "pharos_subtitle_extract_total",
+        "kind" => kind, "temp" => temp.label(), "outcome" => outcome
+    )
+    .increment(1);
+    metrics::histogram!(
+        "pharos_subtitle_extract_seconds",
+        "kind" => kind, "temp" => temp.label(), "outcome" => outcome
+    )
+    .record(started.elapsed().as_secs_f64());
+    tracing::debug!(
+        idx = stream_index,
+        kind,
+        temp = temp.label(),
+        outcome,
+        "embedded subtitle served"
+    );
+}
+
 /// The WebVTT form of the embedded text stream `stream_index`, extracted once
 /// and cached when a cache is given, under the caller's `permit`.
 pub(crate) async fn embedded_vtt(
@@ -1676,43 +1694,63 @@ pub(crate) async fn embedded_vtt(
     stream_index: u32,
     permit: &BgPermit,
 ) -> Result<Vec<u8>, actix_web::Error> {
-    let input = item
-        .path
-        .to_str()
-        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
-    let mtime = mtime_secs(&item.path).await;
-    if let Some(cache) = cache {
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await
-        {
-            tracing::debug!(idx = stream_index, "subtitle cache hit (warm)");
-            return Ok((*bytes).clone());
-        }
-        let lock = cache
-            .lock(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await;
-        let _guard = lock.lock().await;
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
-            .await
-        {
-            tracing::debug!(idx = stream_index, "subtitle cache hit (after lock)");
-            return Ok((*bytes).clone());
-        }
-        // Cold: not pre-warmed by the backfill yet → extract now (blocks this
-        // fetch). A slow one here is the "subtitles take too long" symptom.
-        tracing::info!(
-            idx = stream_index,
-            "subtitle cache MISS — extracting on the request path"
+    let started = std::time::Instant::now();
+    let (temp, result) = embedded_vtt_inner(cache, item, stream_index, permit).await;
+    record_extract("vtt", temp, result.is_ok(), stream_index, started);
+    result
+}
+
+async fn embedded_vtt_inner(
+    cache: Option<&pharos_cache::SubtitleCache>,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+    permit: &BgPermit,
+) -> (ExtractTemp, Result<Vec<u8>, actix_web::Error>) {
+    let Some(input) = item.path.to_str() else {
+        return (
+            ExtractTemp::Cold,
+            Err(error::ErrorInternalServerError("non-utf8 path")),
         );
-        let out = run_ffmpeg_embedded(input, stream_index, permit).await?;
-        let stored = cache
-            .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
-            .await;
-        return Ok((*stored).clone());
+    };
+    let mtime = mtime_secs(&item.path).await;
+    let Some(cache) = cache else {
+        return (
+            ExtractTemp::Cold,
+            run_ffmpeg_embedded(input, stream_index, permit).await,
+        );
+    };
+    if let Some(bytes) = cache
+        .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+        .await
+    {
+        return (ExtractTemp::Warm, Ok((*bytes).clone()));
     }
-    run_ffmpeg_embedded(input, stream_index, permit).await
+    // Per-key fetch lock dedupes concurrent first-fetchers so they share one
+    // ffmpeg spawn.
+    let lock = cache
+        .lock(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+        .await;
+    let _guard = lock.lock().await;
+    if let Some(bytes) = cache
+        .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
+        .await
+    {
+        return (ExtractTemp::Coalesced, Ok((*bytes).clone()));
+    }
+    // Cold: not pre-warmed by the backfill yet → extract now (blocks this
+    // fetch). A slow one here is the "subtitles take too long" symptom.
+    tracing::info!(
+        idx = stream_index,
+        "subtitle cache MISS — extracting on the request path"
+    );
+    let out = match run_ffmpeg_embedded(input, stream_index, permit).await {
+        Ok(out) => out,
+        Err(e) => return (ExtractTemp::Cold, Err(e)),
+    };
+    let stored = cache
+        .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
+        .await;
+    (ExtractTemp::Cold, Ok((*stored).clone()))
 }
 
 /// Parse a WebVTT document into jellyfin's `{ "TrackEvents": [...] }` JSON.
@@ -2568,6 +2606,80 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// V1366 — an embedded subtitle request says whether it paid the demux.
+    #[test]
+    fn an_embedded_subtitle_is_counted_warm_or_cold() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let td = TempDir::new().unwrap();
+                let path = td.path().join("Film.mkv");
+                tokio::fs::write(&path, b"x").await.unwrap();
+                let item = pharos_core::MediaItem {
+                    path: path.clone(),
+                    ..Default::default()
+                };
+                let cache = pharos_cache::SubtitleCache::new(1 << 20, 16);
+                let permit = BgPermit::playback_priority();
+                let mtime = mtime_secs(&path).await;
+                cache
+                    .store(
+                        &path,
+                        mtime,
+                        3,
+                        SubtitleKind::Embedded,
+                        b"WEBVTT\n".to_vec(),
+                    )
+                    .await;
+                let warm = embedded_vtt(Some(&cache), &item, 3, &permit).await.unwrap();
+                assert_eq!(warm, b"WEBVTT\n");
+                // Not stored, and the stub source is no media file: ffmpeg runs
+                // and fails. The outcome is not the point, the temperature is.
+                let _ = embedded_vtt(Some(&cache), &item, 4, &permit).await;
+            })
+        });
+        let count = |temp: &str| -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(ck, _, _, v)| {
+                    let k = ck.key();
+                    let has = |l: &str| {
+                        k.labels()
+                            .any(|x| format!("{}={}", x.key(), x.value()) == l)
+                    };
+                    match v {
+                        DebugValue::Counter(n)
+                            if k.name() == "pharos_subtitle_extract_total"
+                                && has("kind=vtt")
+                                && has(&format!("temp={temp}")) =>
+                        {
+                            Some(n)
+                        }
+                        _ => None,
+                    }
+                })
+                .sum()
+        };
+        assert_eq!(
+            count("warm"),
+            1,
+            "pharos_subtitle_extract_total{{temp=warm}}"
+        );
+        assert_eq!(
+            count("cold"),
+            1,
+            "pharos_subtitle_extract_total{{temp=cold}}"
+        );
+    }
 
     /// B600: `pharos_subtitle_delivery_total` labels are a dashboard
     /// contract, distinct within each label.
