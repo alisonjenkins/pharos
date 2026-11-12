@@ -5374,7 +5374,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         platform::hls_engine_used,
                     );
                     let engine = verdict.engine;
-                    if verdict.picked.reports_fragments() {
+                    if engine.reports_fragments() {
                         platform::info(&verdict.line());
                         platform::report_event(verdict.report());
                     }
