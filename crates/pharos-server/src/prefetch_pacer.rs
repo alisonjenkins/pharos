@@ -224,13 +224,17 @@ impl Walker {
                 (base, jobs)
             }
             // The deep scan awaits I/O before it sends, so a seek may have
-            // retargeted meanwhile; its jobs behind the client are stale.
+            // retargeted meanwhile; its jobs outside the retained range of the
+            // newest playhead are stale.
             Msg::Extend { base, jobs } => (base, jobs),
         };
         let now = Instant::now();
         let floor = self.latest_base.unwrap_or(0);
+        let ceiling = self
+            .latest_base
+            .map_or(u32::MAX, |b| b.saturating_add(self.retain_ahead));
         for (seg, job) in jobs {
-            if seg < floor {
+            if seg < floor || seg > ceiling {
                 self.superseded(1);
                 continue;
             }
@@ -426,6 +430,25 @@ mod tests {
             *probe.started.lock().unwrap(),
             vec![1, 41, 45],
             "6 is behind 40"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_late_extend_beyond_the_retained_range_is_skipped() {
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
+        let probe = Arc::new(Probe::default());
+        pacer.retarget(100, vec![job(&probe, 101, 5)]);
+        // A backward seek retargets to 10 while the deep scan, started at
+        // base 100, is still reading; its far-ahead result arrives afterwards.
+        pacer.retarget(10, vec![job(&probe, 11, 5)]);
+        let beyond = 10 + TEST_RETAIN + 1;
+        pacer.extend(100, vec![job(&probe, 12, 5), job(&probe, beyond, 5)]);
+        idle(&pacer).await;
+        let started = probe.started.lock().unwrap().clone();
+        assert!(started.contains(&12), "{started:?}");
+        assert!(
+            !started.contains(&beyond),
+            "{beyond} is past the retained range: {started:?}"
         );
     }
 
