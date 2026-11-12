@@ -1566,7 +1566,7 @@ const h = new Hls({{
   maxBufferLength: 30,
   maxMaxBufferLength: 60,
   maxBufferSize: 40 * 1000 * 1000,
-  xhrSetup: (xhr) => {{ if (token) xhr.setRequestHeader('X-Emby-Token', token); }},
+  xhrSetup: {xhr_setup},
 }});
 h.__pharosGen = {generation};
 window.__pharosHls[id] = h;
@@ -1600,6 +1600,7 @@ h.attachMedia(v);
             url = js_str(&direct_url(&server(), url)),
             token = android::token().map_or_else(|| "null".to_owned(), |t| js_str(&t)),
             generation = self.generation,
+            xhr_setup = super::playback::HLS_XHR_SETUP,
         ));
         Ok(())
     }
