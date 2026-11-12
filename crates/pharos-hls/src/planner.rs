@@ -594,8 +594,9 @@ fn resolve_playhead(
     if let Some(target_ms) = state.seek_target_ms {
         let target_idx = clamped_segment_at(&state.segments, target_ms)?;
         let target_seg = state.segments.get(target_idx)?;
-        let covered = is_segment_covered(target_seg, track_buffered)
-            && (state.seek_refetched || point_buffered(track_buffered, target_ms));
+        let covered = state.given_up.contains(&target_idx)
+            || (is_segment_covered(target_seg, track_buffered)
+                && (state.seek_refetched || point_buffered(track_buffered, target_ms)));
         if covered && play_ms != 0 && play_ms != target_ms {
             state.seek_target_ms = None;
         } else {
@@ -882,6 +883,23 @@ mod tests {
             }),
             "{fetched:?}"
         );
+    }
+
+    // B1393: giving up on the seek-target segment left the seek target set, so
+    // the planning anchor stayed at the target while the play head moved on and
+    // fetching stopped one forward window past the target.
+    #[test]
+    fn giving_up_the_seek_target_segment_releases_the_anchor() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        let (fetches, _, _) = drive(&mut planner, &segs, 10_000, 50, |_, i| {
+            if i == 0 {
+                0
+            } else {
+                6_000
+            }
+        });
+        assert!(fetches.contains(&(Track::Video, 6)), "{fetches:?}");
     }
 
     // B1394: a segment appended on two successive rounds that was covered in
