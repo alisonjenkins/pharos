@@ -66,6 +66,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
   - `segmented`: some probes fit at one offset and others at another (two or more probes each, offsets more than 2 s apart). Reported only; no correction in this version. Reason lists the offsets.
   - `unknown`: FR-002, FR-003, FR-004, an aligner error or timeout, or a stage-2 best that is neither fitting nor decoy-level.
 - FR-011. A `wrong_video` track of an episode is checked once more against the audio of the previous and next episodes of the same season (stage 1 only). When it fits one of them, the reason adds `fits_sibling=<item id>`, and the admin list says the video file looks like that episode's. No file or metadata is changed.
+- FR-011a. Flagged tracks (`wrong_video`, `segmented`) are listed on a Manage tab, "Subtitle check", with the item, track, verdict, reason and a link to the item; an entry leaves the list when a re-check after a file change no longer flags it. Each finished backfill pass that flagged anything adds one Activity entry with the counts (for example "Subtitle check: 3 possible swapped files, 5 tracks that don't fit"), never one entry per track (Alison, 2026-11-12T19:19Z).
 
 ### Serving the correction
 
@@ -108,4 +109,4 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 
 ## Open questions
 
-1. Should `wrong_video` with `fits_sibling` notify the admin (activity log entry) rather than only show in the admin list?
+None open. Decided 2026-11-12: films first (FR-016a); flagged tracks go to the admin list, with one Activity entry per pass (FR-011a).
