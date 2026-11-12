@@ -3905,7 +3905,7 @@ async fn spawn_segment_prefetch(
                     )
                 })
                 .collect();
-            handles.extend(pacer.retarget(base_seg, jobs));
+            pacer.retarget(base_seg, jobs);
         }
         None => handles.extend(
             near.iter()
@@ -3923,7 +3923,9 @@ async fn spawn_segment_prefetch(
         let item_c = item.clone();
         let opts_c = opts.clone();
         let psid_owned = psid.map(str::to_string);
-        let pacer_c = pacer.clone();
+        // Weak: if the session swapped media or stopped while the scan ran, the
+        // registry has dropped the pacer and the late jobs must not revive it.
+        let pacer_c = pacer.as_ref().map(std::sync::Arc::downgrade);
         let media_id = item.id;
         let deep = actix_web::rt::spawn(async move {
             let mtime = pharos_cache::subtitle_cache::mtime_secs(&item_c.path).await;
@@ -3945,7 +3947,10 @@ async fn spawn_segment_prefetch(
                 PREFETCH_BURN_MAX,
             );
             let inner: Vec<tokio::task::JoinHandle<()>> = match &pacer_c {
-                Some(pacer) => {
+                Some(weak) => {
+                    let Some(pacer) = weak.upgrade() else {
+                        return;
+                    };
                     let jobs = targets
                         .iter()
                         .map(|seg| {
@@ -3960,7 +3965,8 @@ async fn spawn_segment_prefetch(
                             (*seg, job)
                         })
                         .collect();
-                    pacer.extend(base_seg, jobs).into_iter().collect()
+                    pacer.extend(base_seg, jobs);
+                    Vec::new()
                 }
                 None => targets
                     .iter()
