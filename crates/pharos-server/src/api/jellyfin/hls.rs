@@ -1383,7 +1383,9 @@ async fn serve_segment(
             .await
         {
             Ok(Some(s)) => Some(s),
-            Ok(None) => return Err(error::ErrorGone("play session expired")),
+            Ok(None) => {
+                return Err(play_session_gone(GoneRoute::TsSegment, psid, Some(seg)));
+            }
             Err(e) => {
                 return Err(error::ErrorInternalServerError(format!(
                     "transcode session lookup: {e}"
@@ -2718,7 +2720,13 @@ async fn vp9_init(
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
-    check_session(&state, q.play_session_id.as_deref()).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::Vp9Init,
+        None,
+    )
+    .await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
         q.play_session_id.as_deref(),
@@ -2771,7 +2779,13 @@ async fn vp9_segment(
     // Active playback → background backfill yields (see serve_segment).
     state.note_playback_activity();
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
-    check_session(&state, q.play_session_id.as_deref()).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::Vp9Segment,
+        Some(seg),
+    )
+    .await?;
     // Bounds-check against the VOD grid the playlist enumerated. An over-index
     // used to reach the encoder, produce no frames past EOF, and surface as a
     // NoMoof/NoMoov → 500; make it a clean 404 (only when duration is known).
@@ -2986,7 +3000,13 @@ async fn h264cmaf_init_for(
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
-    check_session(&state, q.play_session_id.as_deref()).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::CmafInit,
+        None,
+    )
+    .await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
         q.play_session_id.as_deref(),
@@ -3068,7 +3088,13 @@ async fn h264cmaf_segment_for(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     state.note_playback_activity();
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
-    check_session(&state, q.play_session_id.as_deref()).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::CmafSegment,
+        Some(seg),
+    )
+    .await?;
     let surface = rung.map_or("h264cmaf", Variant::cmaf_surface);
     let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
@@ -4218,9 +4244,50 @@ async fn fetch_req_item(
     .await
 }
 
+/// The routes that answer 410 for a play session the registry no longer holds.
+/// The label set is the `pharos_play_session_gone_total` dashboard contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GoneRoute {
+    TsSegment,
+    Vp9Init,
+    Vp9Segment,
+    CmafInit,
+    CmafSegment,
+}
+
+impl GoneRoute {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TsSegment => "ts_segment",
+            Self::Vp9Init => "vp9_init",
+            Self::Vp9Segment => "vp9_segment",
+            Self::CmafInit => "cmaf_init",
+            Self::CmafSegment => "cmaf_segment",
+        }
+    }
+}
+
+/// Records and builds the 410 for a stream request whose play session is gone.
+/// Only the id's prefix is logged: the id is a stream credential (B256).
+fn play_session_gone(route: GoneRoute, psid: &str, seg: Option<u32>) -> actix_web::Error {
+    metrics::counter!("pharos_play_session_gone_total", "route" => route.label()).increment(1);
+    tracing::warn!(
+        route = route.label(),
+        seg = ?seg,
+        play_session_id = %pharos_core::secret_prefix(psid),
+        "play session gone: answering 410 for a stream request"
+    );
+    error::ErrorGone("play session expired")
+}
+
 /// W4 — enforce the PlaySessionId (if supplied) is still live, matching the
 /// `.ts` segment handler: a GC'd/stopped session must not keep serving bytes.
-async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix_web::Error> {
+async fn check_session(
+    state: &AppState,
+    psid: Option<&str>,
+    route: GoneRoute,
+    seg: Option<u32>,
+) -> Result<(), actix_web::Error> {
     if let Some(psid) = psid {
         match state
             .transcode_sessions
@@ -4228,7 +4295,7 @@ async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix
             .await
         {
             Ok(Some(_)) => {}
-            Ok(None) => return Err(error::ErrorGone("play session expired")),
+            Ok(None) => return Err(play_session_gone(route, psid, seg)),
             Err(e) => {
                 return Err(error::ErrorInternalServerError(format!(
                     "transcode session lookup: {e}"

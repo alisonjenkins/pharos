@@ -30,7 +30,7 @@ use pharos_server::{
 const DURATION_MS: u64 = 60_000;
 const LAST_SEG: u32 = 9;
 
-async fn seed() -> (web::Data<AppState>, String) {
+pub(super) async fn seed() -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:")
         .await
         .expect("open store");
