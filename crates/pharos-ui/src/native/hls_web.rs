@@ -1258,6 +1258,11 @@ fn execute_actions(session: &Rc<RefCell<Session>>, actions: Vec<Action>) {
                 session.borrow_mut().eos_pending = true;
                 maybe_end_of_stream(session);
             }
+            Action::Skip { to_ms } => {
+                let video = session.borrow().video.clone();
+                #[allow(clippy::cast_precision_loss)]
+                video.set_current_time(to_ms as f64 / 1000.0);
+            }
         }
     }
 }
