@@ -1524,11 +1524,25 @@ pub struct GrantRequest<'a> {
     pub client_is_remote: bool,
     /// A version's id (`AlternateMediaSource::id`); empty plays the primary.
     pub version: &'a str,
+    /// The device the session's token was issued to. With it, a negotiate may
+    /// adopt a grant that device released without a stop (B1397).
+    pub device: Option<&'a pharos_core::ClientDeviceId>,
 }
 
 /// A playback a native player may start: the stream capability and the
 /// decision behind it.
 pub struct Grant {
+    /// The numeric item id and the version as named: with the device, what a
+    /// released grant is matched on.
+    pub item_id: u64,
+    pub version: String,
+    /// What makes this stream the same stream as another negotiation's.
+    pub shape: crate::pending_release::StreamShape,
+    /// Adopted from a released grant: the session, its transcode and its
+    /// `/Sessions` entry already exist, and nothing was prewarmed.
+    pub adopted: bool,
+    /// The position of the last report on an adopted grant.
+    pub reported_ms: Option<u64>,
     pub play_session_id: String,
     /// The item as the player names it in progress reports.
     pub item_wire_id: String,
@@ -1753,6 +1767,28 @@ pub async fn grant(
             is_web_client: false,
         },
     );
+    let shape = crate::pending_release::StreamShape {
+        decision: negotiated.decision.clone(),
+        burn_subtitle_indices: negotiated.burn_text_indices.clone(),
+        audio: audio.index,
+        subtitle: styled_pick.or(subtitle),
+    };
+    if let Some(adopted) = adopt_released(state, user, id, r, &shape).await {
+        return Ok(Grant {
+            play_session_id: adopted.play_session_id,
+            item_wire_id: adopted.item_wire_id,
+            negotiated,
+            stream_url: adopted.stream_url,
+            audio_stream_index: shape.audio,
+            subtitle_stream_index: shape.subtitle,
+            remembers_tracks: adopted.remembers_tracks,
+            item_id: id,
+            version: r.version.to_owned(),
+            shape,
+            adopted: true,
+            reported_ms: adopted.reported_ms,
+        });
+    }
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
     let resume_ticks = if user_data.played {
         0
@@ -1857,10 +1893,64 @@ pub async fn grant(
         item_wire_id,
         negotiated,
         stream_url,
-        audio_stream_index: audio.index,
-        subtitle_stream_index: styled_pick.or(subtitle),
+        audio_stream_index: shape.audio,
+        subtitle_stream_index: shape.subtitle,
         remembers_tracks: item.edition.is_none(),
+        item_id: id,
+        version: r.version.to_owned(),
+        shape,
+        adopted: false,
+        reported_ms: None,
     })
+}
+
+/// Takes over the grant `r`'s device released without a stop for the same
+/// item and version, when the stream negotiated is the same one: the player
+/// is still pulling segments under its session id, and a new id would 410
+/// them (B1397). A held grant that is not that stream ends at once.
+async fn adopt_released(
+    state: &AppState,
+    user: &pharos_core::User,
+    item: u64,
+    r: &GrantRequest<'_>,
+    shape: &crate::pending_release::StreamShape,
+) -> Option<crate::pending_release::Released> {
+    let key = crate::pending_release::ReleaseKey {
+        user: user.id,
+        device: r.device?.clone(),
+        item,
+        version: r.version.to_owned(),
+    };
+    let claim = state.pending_releases.claim(&key)?;
+    if let Some(why) = claim.mismatch(shape) {
+        claim.reject(why);
+        return None;
+    }
+    let psid = claim.released()?.play_session_id.clone();
+    // The transcode session is the stream's capability: adopt only a live one
+    // this user holds for this item.
+    let live = state
+        .transcode_sessions
+        .get(pharos_core::PlaySessionId::from(psid.as_str()))
+        .await;
+    match live {
+        Ok(Some(s)) if s.holder.user_id == user.id && s.media_id == item => claim.adopt(),
+        Ok(other) => {
+            claim.reject(format!(
+                "session: the transcode session is {}",
+                if other.is_some() {
+                    "held by another user or item"
+                } else {
+                    "gone"
+                }
+            ));
+            None
+        }
+        Err(e) => {
+            claim.reject(format!("session: transcode session lookup failed: {e}"));
+            None
+        }
+    }
 }
 
 /// Convert the boot-resolved server encode capabilities into the negotiator's

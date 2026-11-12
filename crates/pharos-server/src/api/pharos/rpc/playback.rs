@@ -14,6 +14,7 @@ use pharos_jellyfin_api::dto::WireId;
 
 use super::library::{item_denial, read_item_id, IMAGE_DELIVERY_SCHEMA_VERSION};
 use super::session::Session;
+use crate::pending_release::{ReleaseKey, ReleaseOutcome, Released, Verdict, MAX_PENDING_RELEASES};
 use crate::services::access::ItemHidden;
 use crate::services::play_state::{self, Report};
 use crate::services::playback::{self, Capabilities, GrantError, GrantRequest};
@@ -66,6 +67,7 @@ impl server::playback::Handler for Playback {
             .unwrap_or_default();
         let version = params.get_version()?.to_str()?.trim().to_owned();
         let session = &self.session;
+        let device = session.device_id().await;
         let granted = match (session.current_user().await, id, audio_stream_index) {
             (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
             (Ok(user), WireId::Real(id), Ok(audio_stream_index)) => {
@@ -76,10 +78,15 @@ impl server::playback::Handler for Playback {
                     token: &session.token,
                     client_is_remote: session.client_is_remote(),
                     version: &version,
+                    device: device.as_ref(),
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
                     Ok(grant) => {
-                        start_session(session, &user, &grant, client_version).await;
+                        // An adopted grant's entry in `/Sessions` never left.
+                        if !grant.adopted {
+                            start_session(session, &user, &grant, device.clone(), client_version)
+                                .await;
+                        }
                         Ok(grant)
                     }
                     Err(GrantError::Item(e)) => Err(item_denial(id, &e, "negotiate")),
@@ -105,8 +112,12 @@ impl server::playback::Handler for Playback {
                     audio: grant.audio_stream_index,
                     subtitle: grant.subtitle_stream_index,
                     remembers_tracks: grant.remembers_tracks,
-                    reported_ms: Cell::new(None),
+                    reported_ms: Cell::new(grant.reported_ms),
                     stopped: Cell::new(false),
+                    item_id: grant.item_id,
+                    version,
+                    device,
+                    shape: grant.shape,
                 };
                 let conn = self.session.conn();
                 out.set_grant(server::playback_grant::client(grant, &conn));
@@ -174,9 +185,10 @@ async fn start_session(
     session: &Session,
     user: &pharos_core::User,
     grant: &playback::Grant,
+    device_id: Option<pharos_core::ClientDeviceId>,
     client_version: String,
 ) {
-    let Some(device_id) = session.device_id().await else {
+    let Some(device_id) = device_id else {
         tracing::warn!(
             play_session_id = %pharos_core::secret_prefix(&grant.play_session_id),
             "native playback: session not listed, device unknown"
@@ -229,6 +241,12 @@ struct Grant {
     reported_ms: Cell<Option<u64>>,
     /// Set by `stop`: the playback has ended and a release has nothing to do.
     stopped: Cell<bool>,
+    /// What a released grant is matched on when its player negotiates again:
+    /// the item and version named, the device, and the stream's shape.
+    item_id: u64,
+    version: String,
+    device: Option<pharos_core::ClientDeviceId>,
+    shape: crate::pending_release::StreamShape,
 }
 
 /// The tracks a report names: `None` says nothing about that track.
@@ -378,12 +396,23 @@ fn write_queue_hint(
 
 impl Drop for Grant {
     /// A grant released without a stop, which is how a closed tab or a lost
-    /// connection looks from here, ends its playback as `stop` would: the
+    /// connection looks from here, is held for the release grace (B1397): the
+    /// player's stream outlives its connection and its next negotiate adopts
+    /// the playback. A release nobody adopts ends as `stop` would: the
     /// transcode and the session's now-playing go, and the last reported
     /// position is saved. With no report there is no position to save, so
     /// the stored one is left alone.
     fn drop(&mut self) {
-        if self.stopped.get() || crate::state::is_shutting_down() {
+        if self.stopped.get() {
+            return;
+        }
+        if crate::state::is_shutting_down() {
+            tracing::info!(
+                play_session_id = %pharos_core::secret_prefix(&self.play_session_id),
+                outcome = ReleaseOutcome::EndedShutdown.label(),
+                "playback: grant released as the server shuts down, left as it is"
+            );
+            ReleaseOutcome::EndedShutdown.record();
             return;
         }
         // The grant can be dropped as the runtime goes down.
@@ -391,52 +420,139 @@ impl Drop for Grant {
             return;
         }
         let session = Rc::clone(&self.session);
-        let play_session_id = std::mem::take(&mut self.play_session_id);
-        let psid = pharos_core::PlaySessionId::from(play_session_id.as_str());
-        let item_wire_id = std::mem::take(&mut self.item_wire_id);
-        let reported_ms = self.reported_ms.get();
+        let released = Released {
+            play_session_id: std::mem::take(&mut self.play_session_id),
+            item_wire_id: std::mem::take(&mut self.item_wire_id),
+            stream_url: std::mem::take(&mut self.stream_url),
+            remembers_tracks: self.remembers_tracks,
+            shape: self.shape.clone(),
+            reported_ms: self.reported_ms.get(),
+        };
+        let key = self.device.take().map(|device| ReleaseKey {
+            user: session.owner(),
+            device,
+            item: self.item_id,
+            version: std::mem::take(&mut self.version),
+        });
+        let Some(key) = key else {
+            end_at_once(
+                session,
+                released,
+                ReleaseOutcome::EndedNoDevice,
+                "the session names no device, so no negotiate can adopt it".into(),
+            );
+            return;
+        };
+        let held = match session
+            .state
+            .pending_releases
+            .hold(key.clone(), released.clone())
+        {
+            Ok(held) => held,
+            Err(_) => {
+                end_at_once(
+                    session,
+                    released,
+                    ReleaseOutcome::EndedOverflow,
+                    format!(
+                        "{MAX_PENDING_RELEASES} released grants are already held, so this one ends now"
+                    ),
+                );
+                return;
+            }
+        };
+        let grace = session.state.pending_releases.grace();
+        tracing::info!(
+            play_session_id = %pharos_core::secret_prefix(&released.play_session_id),
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            "playback: grant released without a stop, held for its player to return"
+        );
         actix_web::rt::spawn(async move {
-            let report = Report {
-                play_session_id: Some(&play_session_id),
-                item_wire_id: reported_ms.map(|_| item_wire_id.as_str()),
-                position_ticks: reported_ms.unwrap_or(0).saturating_mul(TICKS_PER_MS),
-                is_paused: false,
-                audio_stream_index: None,
-                subtitle_stream_index: None,
-            };
-            // A revoked session saves no position but still ends the
-            // stream and the now-playing it owns.
-            let (ended, saved) = match session.current_user().await {
-                Ok(user) => match play_state::stop(&session.state, &user, report).await {
-                    // The item was hidden from the user since the last
-                    // report: `stop` wrote nothing and ended nothing, so
-                    // end the playback without saving a position.
-                    Err(play_state::ReportError::Withheld(hidden)) => {
-                        tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
-                        (play_state::end(&session.state, user.id, &psid).await, false)
+            let id = held.id;
+            let mut verdict = held.verdict;
+            // Whoever takes the slot out of the table decides it; the other
+            // side finds it gone and only reads the verdict.
+            let verdict = tokio::select! {
+                v = &mut verdict => v.ok(),
+                () = actix_web::rt::time::sleep(grace) => {
+                    if session.state.pending_releases.expire(&key, id) {
+                        Some(Verdict::Ended {
+                            outcome: ReleaseOutcome::EndedAfterGrace,
+                            reason: "no negotiate adopted it within the grace".into(),
+                        })
+                    } else {
+                        verdict.await.ok()
                     }
-                    // The playback ended; only its position was lost.
-                    Err(e @ play_state::ReportError::Store { .. }) => {
-                        tracing::warn!(%play_session_id, error = %e, "playback: released grant's position not stored");
-                        (Ok(()), false)
-                    }
-                    other => (other, reported_ms.is_some()),
-                },
-                Err(_) => (
-                    play_state::end(&session.state, session.owner(), &psid).await,
-                    false,
-                ),
+                }
             };
-            let ended = ended.map_err(|e| e.to_string());
-            match ended {
-                Ok(()) => {
-                    tracing::info!(%play_session_id, saved, "playback: grant released without a stop, playback ended")
-                }
-                Err(error) => {
-                    tracing::warn!(%play_session_id, %error, "playback: grant released without a stop, ending it failed")
-                }
+            if let Some(Verdict::Ended { outcome, reason }) = verdict {
+                end_released(&session, &released, outcome, &reason).await;
             }
         });
+    }
+}
+
+fn end_at_once(session: Rc<Session>, released: Released, outcome: ReleaseOutcome, reason: String) {
+    actix_web::rt::spawn(async move {
+        end_released(&session, &released, outcome, &reason).await;
+    });
+}
+
+/// Ends the playback of a released grant nobody adopted, as `stop` would.
+async fn end_released(
+    session: &Session,
+    released: &Released,
+    outcome: ReleaseOutcome,
+    reason: &str,
+) {
+    let play_session_id = pharos_core::secret_prefix(&released.play_session_id);
+    if crate::state::is_shutting_down() {
+        tracing::info!(%play_session_id, "playback: released grant left as it is, the server is shutting down");
+        ReleaseOutcome::EndedShutdown.record();
+        return;
+    }
+    let psid = pharos_core::PlaySessionId::from(released.play_session_id.as_str());
+    let reported_ms = released.reported_ms;
+    let report = Report {
+        play_session_id: Some(&released.play_session_id),
+        item_wire_id: reported_ms.map(|_| released.item_wire_id.as_str()),
+        position_ticks: reported_ms.unwrap_or(0).saturating_mul(TICKS_PER_MS),
+        is_paused: false,
+        audio_stream_index: None,
+        subtitle_stream_index: None,
+    };
+    // A revoked session saves no position but still ends the
+    // stream and the now-playing it owns.
+    let (ended, saved) = match session.current_user().await {
+        Ok(user) => match play_state::stop(&session.state, &user, report).await {
+            // The item was hidden from the user since the last
+            // report: `stop` wrote nothing and ended nothing, so
+            // end the playback without saving a position.
+            Err(play_state::ReportError::Withheld(hidden)) => {
+                tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
+                (play_state::end(&session.state, user.id, &psid).await, false)
+            }
+            // The playback ended; only its position was lost.
+            Err(e @ play_state::ReportError::Store { .. }) => {
+                tracing::warn!(%play_session_id, error = %e, "playback: released grant's position not stored");
+                (Ok(()), false)
+            }
+            other => (other, reported_ms.is_some()),
+        },
+        Err(_) => (
+            play_state::end(&session.state, session.owner(), &psid).await,
+            false,
+        ),
+    };
+    let ended = ended.map_err(|e| e.to_string());
+    outcome.record();
+    match ended {
+        Ok(()) => {
+            tracing::info!(%play_session_id, saved, outcome = outcome.label(), %reason, "playback: grant released without a stop, playback ended")
+        }
+        Err(error) => {
+            tracing::warn!(%play_session_id, %error, outcome = outcome.label(), %reason, "playback: grant released without a stop, ending it failed")
+        }
     }
 }
 
