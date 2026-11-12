@@ -35,7 +35,7 @@ The align queue in `services::lyrics::align` exposes whether a job is queued or 
 
 ## Slices
 
-0. `pharos_lyrics_align_wait_seconds` in the align queue, with a test that fails without it (FR-022).
+0. `pharos_lyrics_align_wait_seconds` in the align queue, on the long-running bucket ladder (up to 1 h, so a wait past 30 s is not capped), with a test that fails without it (FR-022).
 1. Probe picker, language gate and verdict as pure code in `pharos-subs`, with the spike's numbers as test vectors (generic names).
 2. Table, migration and the job with `apply = false`: checks run and log, nothing is served differently. Calibration (FR-014) reads these logs.
 3. Coarse search and stage 2.
@@ -46,5 +46,5 @@ The align queue in `services::lyrics::align` exposes whether a job is queued or 
 ## Signals to name before building (ODD)
 
 - Verdict mix: `sum by (verdict, reason_class) (increase(pharos_subtitle_check_total[1d]))`.
-- Karaoke contention: `histogram_quantile(0.95, sum by (le) (rate(pharos_lyrics_align_wait_seconds_bucket[1h])))` while the backfill runs, against the week before. This metric is new (FR-022) and is slice 0, shipped before anything else. It only covers the server queue, so the comparison also reads the wait inside the aligner: `quantile_over_time(0.95, {namespace="pharos"} |= "lyrics: aligned" | logfmt | unwrap first_line_ms [1d])`. Both must hold for SC-003.
+- Karaoke contention: `histogram_quantile(0.95, sum by (le) (rate(pharos_lyrics_align_wait_seconds_bucket[1h])))` while the backfill runs, against the week before. This metric is new (FR-022) and is slice 0, shipped before anything else. It only covers the server queue, so the comparison also reads the wait inside the aligner: `quantile_over_time(0.95, {namespace="pharos"} |= "lyrics: aligned" | json | unwrap fields_first_line_ms [1d])` (the server logs JSON, fields under `fields`). Both must hold for SC-003.
 - A track's reasoning: `{namespace="pharos"} |= "subtitle check" | json | item_id="<id>"`.
