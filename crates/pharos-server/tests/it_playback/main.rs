@@ -22,6 +22,7 @@ mod jellyfin_subtitle_defaults;
 mod jellyfin_track_selection;
 mod jellyfin_video_remux;
 mod media_source_selection;
+mod play_session_gone;
 mod playback_stopped_audit;
 mod playing_progress_coalescing;
 mod playing_progress_db_calls;
