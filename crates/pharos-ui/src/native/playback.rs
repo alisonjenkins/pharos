@@ -331,6 +331,21 @@ impl EngineVerdict {
     }
 }
 
+/// The verdict for a stream: the device's pick, the Rust engine's own
+/// fallback, then the platform's substitution (`used` reports what the
+/// platform plays for the pick). The play path and the quality-adapts query
+/// both go through here so they cannot disagree (B1367, V1337).
+pub fn resolve_engine(
+    is_hls: bool,
+    native_hls: bool,
+    mse: bool,
+    (mse_engine, reason): (MseEngine, EngineReason),
+    used: impl FnOnce(Engine) -> Option<(Engine, &'static str)>,
+) -> EngineVerdict {
+    let picked = choose_engine(is_hls, native_hls, mse, mse_engine);
+    engine_verdict(picked, reason).on_platform(used(picked))
+}
+
 /// Stable fallback cause when [`Engine::RustHls`] hands a stream to `hls.js`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HlsFallbackCause {
@@ -4798,6 +4813,20 @@ mod tests {
         let built = engine_verdict(Engine::RustHls, EngineReason::Override);
         assert_eq!((built.engine, built.fallback), (Engine::RustHls, None));
         assert_eq!(built.line(), "pharos: playback engine=rust reason=override");
+    }
+
+    /// B1367, V1337: a stored `rust` setting on a platform that plays hls.js
+    /// instead does not adapt quality; the verdict, not the pick, decides.
+    #[test]
+    fn resolved_engine_follows_the_platform_substitution() {
+        let rust = (MseEngine::Rust, EngineReason::Setting);
+        let android = |_| Some((Engine::HlsJs, "android"));
+        let v = resolve_engine(true, false, true, rust, android);
+        assert_eq!((v.engine, v.picked), (Engine::HlsJs, Engine::RustHls));
+        assert!(!v.engine.adapts_quality());
+        let v = resolve_engine(true, false, true, rust, |_| None);
+        assert_eq!(v.engine, Engine::RustHls);
+        assert!(v.engine.adapts_quality());
     }
 
     /// B1366, V1336: a platform that plays another engine than the one asked
