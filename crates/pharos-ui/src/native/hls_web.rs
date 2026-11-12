@@ -963,11 +963,11 @@ fn finish_trace(session: &Rc<RefCell<Session>>, flush: super::hls_trace::Flush) 
 fn emit_trace(reports: Vec<super::hls_trace::Report>) {
     for report in reports {
         if report.is_warn() {
-            warn(&report.line());
+            warn(&report.line(super::hls_trace::ENGINE_RUST));
         } else {
-            info(&report.line());
+            info(&report.line(super::hls_trace::ENGINE_RUST));
         }
-        report_event(report.event(current_path()));
+        report_event(report.event(current_path(), super::hls_trace::ENGINE_RUST));
     }
 }
 

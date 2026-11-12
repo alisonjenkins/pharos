@@ -37,14 +37,14 @@ use super::palette::{self, Row};
 use super::person::PersonView;
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, crossfade_ms, device_class, engine_verdict, fade_volume, format_tier_drop,
-    max_bitrate_label, offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop,
-    parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
-    rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
-    starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
-    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
-    volume_setting, DeviceClass, EffectsDetail, EffectsLevel, Engine, EngineReason, FailureKind,
-    Fatal, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
+    crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
+    offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting,
+    pick_mse_engine, position_at, preview_set, resolve_engine, restart_styled, rust_subtitle_url,
+    shown_font_urls, source_of_styled, start_ms, starting_tier, starting_tier_line,
+    styled_subtitle_signals, styled_subtitle_url, styled_track_url, subtitle_switch,
+    tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill, volume_setting,
+    DeviceClass, EffectsDetail, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
+    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
     OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
     TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_DETAIL_KEY,
     EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
@@ -1113,12 +1113,14 @@ pub(super) fn crossfade_seconds() -> u32 {
 /// Whether an HLS stream on this device plays through an engine that adapts
 /// its own quality.
 fn hls_engine_adapts() -> bool {
-    choose_engine(
+    resolve_engine(
         true,
         platform::plays_hls(),
         platform::has_mse(),
-        mse_engine_choice().0,
+        mse_engine_choice(),
+        platform::hls_engine_used,
     )
+    .engine
     .adapts_quality()
 }
 
@@ -5364,17 +5366,15 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             .await;
             Some(
                 settle_start(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
-                    let (mse_engine, engine_reason) = mse_engine_choice();
-                    let picked = choose_engine(
+                    let verdict = resolve_engine(
                         decision.is_hls(),
                         platform::plays_hls(),
                         platform::has_mse(),
-                        mse_engine,
+                        mse_engine_choice(),
+                        platform::hls_engine_used,
                     );
-                    let verdict = engine_verdict(picked, engine_reason)
-                        .on_platform(platform::hls_engine_used(picked));
                     let engine = verdict.engine;
-                    if picked.reports_fragments() {
+                    if verdict.picked.reports_fragments() {
                         platform::info(&verdict.line());
                         platform::report_event(verdict.report());
                     }
