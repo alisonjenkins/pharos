@@ -1385,9 +1385,14 @@ impl PlaybackEngine for HlsJs {
             let id = id.clone();
             move |event: tv_page::HlsEvent| match event {
                 tv_page::HlsEvent::Frag {
+                    track: tv_page::FragTrack::Audio,
+                    ..
+                } => {}
+                tv_page::HlsEvent::Frag {
                     bytes,
                     load_ms,
                     media_ms,
+                    ..
                 } => {
                     budget.borrow_mut().progressed();
                     if bytes > 0 && load_ms > 0 && media_ms > 0 {
@@ -1463,11 +1468,13 @@ window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
 h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
 h.on(Hls.Events.FRAG_LOADED, (_, d) => {{
-  if (!d.frag || d.frag.type !== "main") return;
+  if (!d.frag || (d.frag.type !== "main" && d.frag.type !== "audio")) return;
   const st = d.frag.stats || d.stats || {{}};
   const l = st.loading || {{}};
   const from = l.first > 0 ? l.first : l.start;
-  send({{ ev: "frag", bytes: Math.max(0, Math.round(st.loaded || 0)),
+  send({{ ev: "frag", track: d.frag.type, sn: typeof d.frag.sn === "number" ? d.frag.sn : 0,
+         ttfb_ms: Math.max(0, Math.round((l.first || 0) - (l.start || 0))),
+         bytes: Math.max(0, Math.round(st.loaded || 0)),
          load_ms: Math.max(0, Math.round((l.end || 0) - (from || 0))),
          media_ms: Math.max(0, Math.round((d.frag.duration || 0) * 1000)) }});
 }});
