@@ -4,7 +4,10 @@
 //! a login answer reads as the sign-in form's status, and the messages the
 //! page's script sends into Rust.
 
+use pharos_hls::planner::Track;
 use serde::Deserialize;
+
+use super::hls_trace::{Appended, Clip, Signal};
 
 /// The server a build points at when nothing is stored: `PHAROS_TV_SERVER`
 /// at build time, else Alison's prototype server (spec 025 slice 0).
@@ -775,6 +778,20 @@ pub struct Media {
     /// A throttled `timeupdate`, which Rust hears only this way.
     #[serde(default)]
     pub tick: bool,
+    /// The event's type (`playing`, `waiting`, ...), which the play's trace
+    /// reads (B1367).
+    #[serde(default)]
+    pub ev: String,
+    /// `networkState`.
+    #[serde(default)]
+    pub ns: u16,
+    /// Media buffered ahead of the play head, ms; 0 in a gap.
+    #[serde(default)]
+    pub fwd: u64,
+    /// The buffered ranges, `start-end` in ms, comma separated: only a
+    /// `waiting` carries them.
+    #[serde(default)]
+    pub buffered: String,
 }
 
 fn one() -> f64 {
@@ -829,12 +846,71 @@ pub enum HlsEvent {
         details: String,
         fatal: bool,
     },
-    /// `Hls.Events.FRAG_LOADED` for a main fragment.
+    /// `Hls.Events.FRAG_LOADED` for a main or audio fragment.
     Frag {
         bytes: u64,
         load_ms: u64,
         media_ms: u64,
+        /// The fragment's sequence number.
+        #[serde(default)]
+        sn: u64,
+        /// Request start to first byte, ms.
+        #[serde(default)]
+        ttfb_ms: u64,
+        #[serde(default)]
+        track: FragTrack,
     },
+}
+
+/// Which rendition a loaded fragment belongs to (hls.js's `frag.type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FragTrack {
+    #[default]
+    Main,
+    Audio,
+}
+
+/// The play trace's signal for a media event, `None` for an event the
+/// trace does not read (B1367, V1337). A `timeupdate` reaches Rust only as a
+/// tick.
+pub fn signal_of(ev: &str, tick: bool) -> Option<Signal> {
+    match ev {
+        "playing" => Some(Signal::Playing),
+        "waiting" => Some(Signal::Waiting),
+        "seeking" => Some(Signal::Seeking),
+        "seeked" => Some(Signal::Seeked),
+        "pause" => Some(Signal::Pause),
+        "timeupdate" if tick => Some(Signal::TimeUpdate),
+        _ => None,
+    }
+}
+
+/// The `<video>` as the trace reads it at `now_ms`.
+pub fn clip_of(media: &Media, now_ms: u64) -> Clip {
+    Clip {
+        now_ms,
+        position_ms: secs_to_ms(media.pos),
+        paused: media.paused,
+        ready_state: media.ready,
+        network_state: media.ns,
+        forward_ms: media.fwd,
+        buffered: media.buffered.clone(),
+    }
+}
+
+/// The trace's appended segment for a loaded fragment.
+pub fn appended_of(sn: u64, bytes: u64, ttfb_ms: u64, load_ms: u64, track: FragTrack) -> Appended {
+    Appended {
+        track: match track {
+            FragTrack::Main => Track::Video,
+            FragTrack::Audio => Track::Audio,
+        },
+        index: usize::try_from(sn).unwrap_or_default(),
+        bytes,
+        ttfb_ms,
+        load_ms,
+    }
 }
 
 /// Read one bridge message; `None` for anything unknown.
@@ -1610,6 +1686,11 @@ mod tests {
             parse_bridge(&ticked),
             Some(Bridge::Media(Media { tick: true, .. }))
         ));
+        assert_eq!(
+            (m.ev.as_str(), m.ns, m.fwd, m.buffered.as_str()),
+            ("", 0, 0, ""),
+            "an old message names none of the trace's fields"
+        );
         let paused = Media {
             paused: true,
             ..m.clone()
@@ -1623,6 +1704,80 @@ mod tests {
         assert!(!waiting.has_data());
         let live = Media { dur: None, ..m };
         assert_eq!(live.duration_ms(), 0);
+    }
+
+    /// B1367: the page sends the event type, network state and forward
+    /// buffer the play's trace needs.
+    #[test]
+    fn a_media_event_carries_what_the_play_trace_reads() {
+        let v = serde_json::json!({"t": "media", "id": "v", "pos": 10.0, "dur": 20.0,
+            "paused": false, "ended": false, "seeking": false, "ready": 2, "vol": 1.0,
+            "muted": false, "ev": "waiting", "ns": 2, "fwd": 0,
+            "buffered": "0-9000,12000-15000"});
+        let Some(Bridge::Media(m)) = parse_bridge(&v) else {
+            panic!("not media");
+        };
+        assert_eq!(
+            (m.ev.as_str(), m.ns, m.fwd, m.buffered.as_str()),
+            ("waiting", 2, 0, "0-9000,12000-15000")
+        );
+    }
+
+    /// B1367, V1337: the media events the trace reads, and only those.
+    #[test]
+    fn the_trace_reads_playing_waiting_seeks_pause_and_ticks() {
+        assert_eq!(signal_of("playing", false), Some(Signal::Playing));
+        assert_eq!(signal_of("waiting", false), Some(Signal::Waiting));
+        assert_eq!(signal_of("seeking", false), Some(Signal::Seeking));
+        assert_eq!(signal_of("seeked", false), Some(Signal::Seeked));
+        assert_eq!(signal_of("pause", false), Some(Signal::Pause));
+        assert_eq!(signal_of("timeupdate", true), Some(Signal::TimeUpdate));
+        for ignored in ["play", "canplay", "volumechange", "ended", "emptied", ""] {
+            assert_eq!(signal_of(ignored, false), None, "{ignored}");
+        }
+        assert_eq!(signal_of("timeupdate", false), None, "a throttled-out one");
+        assert_eq!(signal_of("", true), None, "a tick with no event type");
+    }
+
+    #[test]
+    fn a_clip_carries_the_media_state_the_trace_reads() {
+        let v = serde_json::json!({"t": "media", "id": "v", "pos": 12.3456, "dur": 20.0,
+            "paused": true, "ended": false, "seeking": false, "ready": 2, "vol": 1.0,
+            "muted": false, "ev": "waiting", "ns": 2, "fwd": 40, "buffered": "0-12400"});
+        let Some(Bridge::Media(m)) = parse_bridge(&v) else {
+            panic!("not media");
+        };
+        assert_eq!(
+            clip_of(&m, 9_000),
+            Clip {
+                now_ms: 9_000,
+                position_ms: 12_346,
+                paused: true,
+                ready_state: 2,
+                network_state: 2,
+                forward_ms: 40,
+                buffered: "0-12400".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_an_appended_segment_on_its_own_track() {
+        let video = appended_of(7, 1_000, 30, 200, FragTrack::Main);
+        assert_eq!(
+            (
+                video.track,
+                video.index,
+                video.bytes,
+                video.ttfb_ms,
+                video.load_ms
+            ),
+            (Track::Video, 7, 1_000, 30, 200)
+        );
+        assert_eq!(
+            appended_of(7, 1, 1, 1, FragTrack::Audio).track,
+            Track::Audio
+        );
     }
 
     #[test]
@@ -1674,13 +1829,44 @@ mod tests {
         );
         let f = serde_json::json!({"t": "hls", "id": "v", "ev": "frag",
             "bytes": 10, "load_ms": 2, "media_ms": 4000});
-        assert!(matches!(
+        assert_eq!(
             parse_bridge(&f),
             Some(Bridge::Hls {
-                event: HlsEvent::Frag { bytes: 10, .. },
-                ..
+                id: "v".into(),
+                event: HlsEvent::Frag {
+                    bytes: 10,
+                    load_ms: 2,
+                    media_ms: 4000,
+                    sn: 0,
+                    ttfb_ms: 0,
+                    track: FragTrack::Main,
+                }
+            }),
+            "an old message is a main fragment with no number"
+        );
+    }
+
+    /// B1367: a fragment says which rendition it is, its number and its
+    /// time to first byte.
+    #[test]
+    fn a_fragment_names_its_track_number_and_first_byte() {
+        let f = serde_json::json!({"t": "hls", "id": "v", "ev": "frag",
+            "bytes": 10, "load_ms": 2, "media_ms": 4000,
+            "sn": 7, "ttfb_ms": 35, "track": "audio"});
+        assert_eq!(
+            parse_bridge(&f),
+            Some(Bridge::Hls {
+                id: "v".into(),
+                event: HlsEvent::Frag {
+                    bytes: 10,
+                    load_ms: 2,
+                    media_ms: 4000,
+                    sn: 7,
+                    ttfb_ms: 35,
+                    track: FragTrack::Audio,
+                }
             })
-        ));
+        );
     }
 
     #[test]

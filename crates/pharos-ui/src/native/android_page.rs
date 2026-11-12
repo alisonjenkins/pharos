@@ -34,6 +34,7 @@ use super::tv_page::{self, Bridge, Paths};
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
+use super::hls_trace::{Flush, PlayTrace, Report};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     Engine, FailureKind, Fatal, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine,
@@ -366,6 +367,12 @@ pub fn plays_hls() -> bool {
 
 pub fn has_mse() -> bool {
     true
+}
+
+/// hls.js plays every HLS stream here, whichever engine was asked for
+/// (B1366, V1336).
+pub fn hls_engine_used(picked: Engine) -> Option<(Engine, &'static str)> {
+    matches!(picked, Engine::NativeHls | Engine::RustHls).then_some((Engine::HlsJs, "android"))
 }
 
 /// What the WebView decodes, as `open` probed it, with no container the
@@ -1315,12 +1322,6 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
             Ok(Box::new(engine))
         }
         Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
-            if kind != Engine::HlsJs {
-                log::info!(
-                    "pharos: engine picked={} using=hlsjs reason=android",
-                    super::playback::engine_label(kind)
-                );
-            }
             load_hlsjs().await?;
             Ok(Box::new(HlsJs::default()))
         }
@@ -1364,6 +1365,41 @@ struct HlsJs {
     /// Which attach made the page's player, so a late `Drop` eval cannot
     /// destroy the one a later attach put at the same id.
     generation: u64,
+    /// The play's start, seeks, stalls and summaries (V1337); ended once,
+    /// when the play fails, is replaced or dropped.
+    trace: Option<Rc<RefCell<PlayTrace>>>,
+    media_listener: Option<u64>,
+}
+
+impl HlsJs {
+    /// Ends the current play's trace and stops listening to its element.
+    fn end_trace(&mut self, flush: Flush) {
+        if let Some(listener) = self.media_listener.take() {
+            unlisten(listener);
+        }
+        if let Some(trace) = self.trace.take() {
+            let reports = trace.borrow_mut().finish(flush, trace_now());
+            emit_trace(reports);
+        }
+    }
+}
+
+/// Sends what a play's trace reports: the log line, then the client event.
+fn emit_trace(reports: Vec<Report>) {
+    for report in reports {
+        if report.is_warn() {
+            warn(&report.line());
+        } else {
+            info(&report.line());
+        }
+        report_event(report.event(current_path()));
+    }
+}
+
+/// The trace's clock: ms since the app started.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn trace_now() -> u64 {
+    now_ms().max(0.0) as u64
 }
 
 /// Attach generations, shared by hls.js and direct players.
@@ -1381,14 +1417,27 @@ impl PlaybackEngine for HlsJs {
         let id = video_id.to_owned();
         let budget = RefCell::new(super::playback::RecoveryBudget::new());
         let log_url = url.split('?').next().unwrap_or_default().to_owned();
+        // A re-attach ends the old play's trace before the new one starts.
+        self.end_trace(Flush::Closed);
+        let trace = Rc::new(RefCell::new(PlayTrace::new(trace_now(), start_ms)));
         let on_event = {
             let id = id.clone();
+            let trace = Rc::clone(&trace);
             move |event: tv_page::HlsEvent| match event {
                 tv_page::HlsEvent::Frag {
                     bytes,
                     load_ms,
                     media_ms,
+                    sn,
+                    ttfb_ms,
+                    track,
                 } => {
+                    let appended = tv_page::appended_of(sn, bytes, ttfb_ms, load_ms, track);
+                    let summary = trace.borrow_mut().appended(appended, trace_now());
+                    emit_trace(summary.into_iter().collect());
+                    if track == tv_page::FragTrack::Audio {
+                        return;
+                    }
                     budget.borrow_mut().progressed();
                     if bytes > 0 && load_ms > 0 && media_ms > 0 {
                         on_fragment(super::playback::FragmentLoad {
@@ -1424,6 +1473,8 @@ impl PlaybackEngine for HlsJs {
                             run(format!("const p = {p}; if (p) p.recoverMediaError();"));
                         }
                         super::playback::Recovery::Fail => {
+                            let reports = trace.borrow_mut().finish(Flush::Fatal, trace_now());
+                            emit_trace(reports);
                             on_fatal(Fatal::from_hls(&kind, &details));
                         }
                     }
@@ -1434,6 +1485,19 @@ impl PlaybackEngine for HlsJs {
             unlisten(old);
         }
         self.listener = Some(listen(Listener::Hls(id.clone(), Box::new(on_event))));
+        let on_media = {
+            let trace = Rc::clone(&trace);
+            move |media: &tv_page::Media| {
+                let Some(signal) = tv_page::signal_of(&media.ev, media.tick) else {
+                    return;
+                };
+                let clip = tv_page::clip_of(media, trace_now());
+                let reports = trace.borrow_mut().observe(signal, &clip);
+                emit_trace(reports);
+            }
+        };
+        self.media_listener = Some(listen(Listener::Media(id.clone(), Box::new(on_media))));
+        self.trace = Some(trace);
         self.video_id = id.clone();
         self.generation = NEXT_HLS.fetch_add(1, Ordering::Relaxed);
         // The previous source's state must not answer for this one:
@@ -1463,11 +1527,13 @@ window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
 h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
 h.on(Hls.Events.FRAG_LOADED, (_, d) => {{
-  if (!d.frag || d.frag.type !== "main") return;
+  if (!d.frag || (d.frag.type !== "main" && d.frag.type !== "audio")) return;
   const st = d.frag.stats || d.stats || {{}};
   const l = st.loading || {{}};
   const from = l.first > 0 ? l.first : l.start;
-  send({{ ev: "frag", bytes: Math.max(0, Math.round(st.loaded || 0)),
+  send({{ ev: "frag", track: d.frag.type, sn: typeof d.frag.sn === "number" ? d.frag.sn : 0,
+         ttfb_ms: Math.max(0, Math.round((l.first || 0) - (l.start || 0))),
+         bytes: Math.max(0, Math.round(st.loaded || 0)),
          load_ms: Math.max(0, Math.round((l.end || 0) - (from || 0))),
          media_ms: Math.max(0, Math.round((d.frag.duration || 0) * 1000)) }});
 }});
@@ -1671,6 +1737,7 @@ fn direct_url(base: &str, url: &str) -> String {
 
 impl Drop for HlsJs {
     fn drop(&mut self) {
+        self.end_trace(Flush::Closed);
         if let Some(listener) = self.listener.take() {
             unlisten(listener);
         }
@@ -1978,6 +2045,8 @@ enum Listener {
     Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
+    /// Every event of the media element `id`, as its state arrived.
+    Media(String, Box<dyn FnMut(&tv_page::Media)>),
     /// A media element's `timeupdate`, with its id.
     Tick(Box<dyn FnMut(&str)>),
     /// A directly played media element's `error`, for the element `id`.
@@ -2298,6 +2367,14 @@ window.__pharosSend = send;
 // a second for a video, four times for a song, whose karaoke wipe and line
 // changes need them (B1030).
 const ticked = {};
+// The element's buffered ranges in whole ms.
+const rangesOf = (v) => {
+  const out = [];
+  for (let i = 0; i < v.buffered.length; i++) {
+    out.push([Math.round(v.buffered.start(i) * 1000), Math.round(v.buffered.end(i) * 1000)]);
+  }
+  return out;
+};
 const media = (e) => {
   const v = e.target;
   if (!(v instanceof HTMLMediaElement) || !v.id) return;
@@ -2310,12 +2387,19 @@ const media = (e) => {
     ticked[v.id] = now;
     tick = true;
   }
+  // Media buffered ahead of the play head; a stall also names where it ends.
+  const here = Math.round(v.currentTime * 1000);
+  const ranges = rangesOf(v);
+  const range = ranges.find((r) => r[0] <= here && here < r[1]);
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
   // Only the video JASSUB draws over carries its counters.
   const j = window.__pharosJassub;
   const d = j && j._video === v ? j.debug : null;
   send({
-    t: "media", id: v.id, tick, pos: v.currentTime,
+    t: "media", id: v.id, tick, ev: e.type, ns: v.networkState,
+    fwd: range ? range[1] - here : 0,
+    buffered: e.type === 'waiting' ? ranges.map((r) => r[0] + "-" + r[1]).join(",") : "",
+    pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
     paused: v.paused, ended: v.ended, seeking: v.seeking, ready: v.readyState,
     rate: v.playbackRate, vol: v.volume, muted: v.muted,
@@ -2549,6 +2633,15 @@ fn on_bridge(message: Bridge) {
         }
         Bridge::Media(media) => {
             let at = now_ms();
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Media(on, f) = &mut f.0 {
+                        if *on == media.id {
+                            f(&media);
+                        }
+                    }
+                }
+            }
             let (id, tick) = (media.id.clone(), media.tick);
             lock(&MEDIA).insert(id.clone(), (media, at));
             if tick {

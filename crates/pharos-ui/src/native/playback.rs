@@ -309,6 +309,28 @@ pub fn engine_verdict_with(
     }
 }
 
+impl EngineVerdict {
+    /// The verdict once the platform plays `picked` with `engine` instead,
+    /// for `cause` (B1366, V1336): `engine` is what plays, `picked` stays as
+    /// asked.
+    pub fn handed_to(self, engine: Engine, cause: &'static str) -> EngineVerdict {
+        EngineVerdict {
+            engine,
+            fallback: Some(cause),
+            ..self
+        }
+    }
+
+    /// This verdict with the platform's own substitution applied, when it
+    /// makes one.
+    pub fn on_platform(self, used: Option<(Engine, &'static str)>) -> EngineVerdict {
+        match used {
+            Some((engine, cause)) => self.handed_to(engine, cause),
+            None => self,
+        }
+    }
+}
+
 /// Stable fallback cause when [`Engine::RustHls`] hands a stream to `hls.js`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HlsFallbackCause {
@@ -4776,6 +4798,34 @@ mod tests {
         let built = engine_verdict(Engine::RustHls, EngineReason::Override);
         assert_eq!((built.engine, built.fallback), (Engine::RustHls, None));
         assert_eq!(built.line(), "pharos: playback engine=rust reason=override");
+    }
+
+    /// B1366, V1336: a platform that plays another engine than the one asked
+    /// reports the one that plays, with the platform as the cause.
+    #[test]
+    fn a_platform_handover_names_the_engine_that_plays() {
+        let asked = engine_verdict(Engine::RustHls, EngineReason::Setting);
+        let v = asked.on_platform(Some((Engine::HlsJs, "android")));
+        assert_eq!(
+            (v.engine, v.picked, v.fallback),
+            (Engine::HlsJs, Engine::RustHls, Some("android"))
+        );
+        assert_eq!(
+            v.line(),
+            "pharos: playback engine=hlsjs reason=fallback cause=android asked=rust asked_by=setting"
+        );
+        for field in [
+            ("mode", "hlsjs"),
+            ("asked", "rust"),
+            ("reason", "fallback"),
+            ("cause", "android"),
+        ] {
+            assert!(
+                v.report().fields.contains(&(field.0, field.1.to_owned())),
+                "{field:?}"
+            );
+        }
+        assert_eq!(asked.on_platform(None), asked);
     }
 
     #[test]
