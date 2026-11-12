@@ -147,6 +147,27 @@ pub fn round_score(score: f64) -> Option<f64> {
         .then(|| (score.clamp(0.0, 1.0) * 1000.0).round() / 1000.0)
 }
 
+/// What a song can show before it is done (ADR-0121), in the order it
+/// happens: its offset once found, then each line as it is timed. A line's
+/// words never change after it is reported; only the next line reads where
+/// it ended.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Progress<'a> {
+    /// The song's lyric stamps are this far off the singing; every line moves by it.
+    Offset {
+        offset_ms: i64,
+        aligner_version: u32,
+        lines: usize,
+    },
+    /// Line `index` is timed, as it will be in the final answer.
+    Line {
+        index: usize,
+        #[serde(flatten)]
+        words: &'a LineWords,
+    },
+}
+
 /// The `/align` answer, fields in the Python service's order.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Answer {
@@ -264,16 +285,19 @@ impl Engine {
         full_path: &Path,
         lines: Vec<Line>,
     ) -> Result<Aligned, SongError> {
-        self.align_song_on(rel_path, full_path, lines).0
+        self.align_song_on(rel_path, full_path, lines, &mut |_| {})
+            .0
     }
 
     /// [`Engine::align_song`], plus where it ran: known on failure too, so
     /// the failure's log line names the device as the success's does.
+    /// `on` hears the song's [`Progress`] as it happens, on this thread.
     pub fn align_song_on(
         &self,
         rel_path: &str,
         full_path: &Path,
         lines: Vec<Line>,
+        on: &mut dyn FnMut(Progress<'_>),
     ) -> (
         Result<Aligned, SongError>,
         Option<DeviceUsed>,
@@ -304,7 +328,7 @@ impl Engine {
         let result = match slot.model.as_deref_mut() {
             Some(model) => {
                 model.begin_song();
-                let r = run_song(model, &self.decoder, rel_path, full_path, lines);
+                let r = run_song(model, &self.decoder, rel_path, full_path, lines, on);
                 let used = model.device();
                 (r, Some(used), model.end_song())
             }
@@ -334,6 +358,7 @@ fn run_song(
     rel_path: &str,
     full_path: &Path,
     lines: Vec<Line>,
+    on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Aligned, SongError> {
     let mut phases = Phases::default();
     let path: PathBuf = full_path.to_owned();
@@ -402,13 +427,23 @@ fn run_song(
     );
 
     let lines = shift(lines, found.offset_ms);
+    on(Progress::Offset {
+        offset_ms: found.offset_ms,
+        aligner_version: ALIGNER_VERSION,
+        lines: lines.len(),
+    });
     let mut out = Vec::with_capacity(lines.len());
     let mut words_aligned = 0;
     let mut prev_end_ms = 0;
     for (index, line) in lines.iter().enumerate() {
         let w_list = words(&line.text);
         if w_list.is_empty() {
-            out.push(LineWords::empty());
+            let done = LineWords::empty();
+            on(Progress::Line {
+                index,
+                words: &done,
+            });
+            out.push(done);
             continue;
         }
         let (w_start, w_end) = window(line, w_list.len(), prev_end_ms);
@@ -438,7 +473,12 @@ fn run_song(
             // A window too short for its text: only that line goes without word times.
             Err(ModelError::Line(e)) => {
                 tracing::warn!(path = %rel_path, line = index, error = %e, "alignment failed");
-                out.push(LineWords::empty());
+                let done = LineWords::empty();
+                on(Progress::Line {
+                    index,
+                    words: &done,
+                });
+                out.push(done);
                 continue;
             }
             Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
@@ -450,10 +490,15 @@ fn run_song(
             words_aligned += w_list.len();
             prev_end_ms = last.start_ms;
         }
-        out.push(LineWords {
+        let done = LineWords {
             words: line_stamps,
             score: spans.score.and_then(round_score),
+        };
+        on(Progress::Line {
+            index,
+            words: &done,
         });
+        out.push(done);
     }
     Ok(Aligned {
         answer: Answer {
