@@ -4779,6 +4779,17 @@ pub trait TranscodeSessionStore: Send + Sync {
         now_unix_secs: i64,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
+    /// Makes `holder` the session's holder, stamping `updated_at`, but only
+    /// when the row exists: `false` = no such row, and none is created. A
+    /// session another replica stopped must not come back through a stale
+    /// local cache (B256), which an upsert would allow.
+    fn update_transcode_session_holder(
+        &self,
+        play_session_id: &str,
+        holder: &SessionHolder,
+        now_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
     /// Fetch a session by PlaySessionId. `None` = no such row, or one last
     /// written before `updated_since_unix_secs`: an expired session must not
     /// authorize anything while it waits for the pruner.

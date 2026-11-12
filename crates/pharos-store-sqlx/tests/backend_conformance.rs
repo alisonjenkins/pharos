@@ -1794,6 +1794,44 @@ where
             .is_none()
     );
 
+    // Holder update touches an existing row only (B1397 + B256): a session
+    // another replica stopped must not be recreated by a late rebind.
+    let rebound = pharos_core::SessionHolder {
+        user_id: pharos_core::UserId::new(),
+        token_id: "rebound-token-id".into(),
+    };
+    assert!(
+        !TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 500)
+            .await
+            .unwrap(),
+        "no row: the update reports false"
+    );
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "no row: the update must not create one"
+    );
+    TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 600)
+        .await
+        .unwrap();
+    assert!(
+        TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 700)
+            .await
+            .unwrap(),
+        "existing row: the update reports true"
+    );
+    let got = TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+        .await
+        .unwrap()
+        .expect("row survives the holder update");
+    assert_eq!(got.holder, Some(rebound.clone()));
+    assert_eq!(got.decision_json, sess.decision_json, "payload untouched");
+    TranscodeSessionStore::remove_transcode_session(&store, psid)
+        .await
+        .unwrap();
+
     // -----------------------------------------------------------------
     // 10b. TranscodeSessionStore::trim_transcode_sessions_for_holder (B279)
     // A holder's live rows are bounded in the durable store, not only in

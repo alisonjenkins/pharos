@@ -1516,6 +1516,24 @@ impl TranscodeSessionStore for AnyStore {
         }
     }
 
+    async fn update_transcode_session_holder(
+        &self,
+        play_session_id: &str,
+        holder: &pharos_core::SessionHolder,
+        now_unix_secs: i64,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                    .await
+            }
+        }
+    }
+
     async fn get_transcode_session(
         &self,
         play_session_id: &str,
