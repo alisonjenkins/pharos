@@ -37,6 +37,8 @@ pub enum TranscodeSessionError {
     ActorDown,
     #[error("reply dropped")]
     ReplyDropped,
+    #[error("session store: {0}")]
+    Store(String),
 }
 
 /// What `playback_info` recorded about a session we'll later need to
@@ -502,10 +504,13 @@ where
         }
     }
 
-    /// Makes `holder` the one the session's stream checks, in memory and in
-    /// the store: the playback was taken over by another token (B1397), so
-    /// that token's revocation ends it and the old one's no longer does.
-    /// `false` when the session is gone.
+    /// Makes `holder` the one the session's stream checks, in the store and
+    /// then in memory: the playback was taken over by another token (B1397),
+    /// so that token's revocation ends it and the old one's no longer does.
+    /// The store goes first and only touches an existing row, so a session
+    /// another replica stopped is not brought back by this replica's stale
+    /// cache (B256); a store failure is returned, never swallowed, so the old
+    /// token is not silently left as holder. `false` when the session is gone.
     pub async fn rebind_holder(
         &self,
         session_id: &PlaySessionId,
@@ -514,27 +519,22 @@ where
         let Some(mut session) = self.get(session_id.clone()).await? else {
             return Ok(false);
         };
-        session.holder = holder;
-        match Self::to_persisted(&session) {
-            Ok(persisted) => {
-                if let Err(e) = self
-                    .store
-                    .upsert_transcode_session(session_id.as_str(), &persisted, now_unix_secs())
-                    .await
-                {
-                    tracing::warn!(
-                        psid = %pharos_core::secret_prefix(session_id.as_str()),
-                        error = %e,
-                        "transcode session holder write-through failed; failover keeps the old holder"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                psid = %pharos_core::secret_prefix(session_id.as_str()),
-                error = %e,
-                "transcode session serialize failed; holder not persisted"
-            ),
+        let updated = self
+            .store
+            .update_transcode_session_holder(session_id.as_str(), &holder, now_unix_secs())
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
+        if !updated {
+            // Stopped elsewhere: drop the stale local copy too.
+            let _ = self
+                .tx
+                .send(Msg::Remove {
+                    session_id: session_id.clone(),
+                })
+                .await;
+            return Ok(false);
         }
+        session.holder = holder;
         self.tx
             .send(Msg::Recache(Box::new(InsertPayload {
                 session_id: session_id.clone(),
@@ -841,6 +841,80 @@ mod tests {
         );
     }
 
+    fn holder_of(token: &str, user: pharos_core::UserId) -> SessionHolder {
+        SessionHolder {
+            user_id: user,
+            token_id: token.into(),
+        }
+    }
+
+    /// B1397: rebinding moves the holder in memory and in the store.
+    #[tokio::test]
+    async fn rebind_holder_moves_the_holder_everywhere() {
+        let store = store().await;
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(store.clone());
+        r.insert("s".into(), session_for(alice)).await.unwrap();
+        let new = holder_of("new-token", alice);
+        assert!(r.rebind_holder(&"s".into(), new.clone()).await.unwrap());
+        assert_eq!(r.get("s".into()).await.unwrap().unwrap().holder, new);
+        let row = store.get_transcode_session("s", 0).await.unwrap().unwrap();
+        assert_eq!(row.holder, Some(new));
+    }
+
+    /// B256: a session another replica stopped (row deleted) is not revived by
+    /// a rebind through this replica's stale cache.
+    /// Disarm check: with the holder written by upsert, the row is recreated
+    /// and the session authorizes again.
+    #[tokio::test]
+    async fn rebind_holder_does_not_revive_a_stopped_session() {
+        let store = store().await;
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(store.clone());
+        r.insert("s".into(), session_for(alice)).await.unwrap();
+        // Another replica stops it: the row goes, this cache keeps its copy.
+        store.remove_transcode_session("s").await.unwrap();
+        let rebound = r
+            .rebind_holder(&"s".into(), holder_of("new-token", alice))
+            .await
+            .unwrap();
+        assert!(!rebound, "a stopped session is gone, not rebound");
+        assert!(
+            store.get_transcode_session("s", 0).await.unwrap().is_none(),
+            "the row must not be recreated"
+        );
+        assert!(r.get("s".into()).await.unwrap().is_none());
+    }
+
+    /// B1397: a store failure is reported and leaves the old holder in place,
+    /// so adoption is refused rather than leaving the old token as holder.
+    /// Disarm check: with the error swallowed, this returns Ok(true).
+    #[tokio::test]
+    async fn rebind_holder_reports_a_store_failure_and_keeps_the_old_holder() {
+        let gated = GatedStore {
+            inner: store().await,
+            armed: Default::default(),
+            never: Default::default(),
+            fail_holder: Default::default(),
+        };
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(gated.clone());
+        let original = session_for(alice);
+        let old = original.holder.clone();
+        r.insert("s".into(), original).await.unwrap();
+        gated
+            .fail_holder
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = r
+            .rebind_holder(&"s".into(), holder_of("new-token", alice))
+            .await;
+        assert!(
+            matches!(out, Err(TranscodeSessionError::Store(_))),
+            "{out:?}"
+        );
+        assert_eq!(r.get("s".into()).await.unwrap().unwrap().holder, old);
+    }
+
     /// A store that parks on a gate that is never opened, to show a hung store
     /// cannot stall the registry actor (and so every `get` on the replica).
     #[derive(Clone)]
@@ -848,6 +922,7 @@ mod tests {
         inner: SqliteStore,
         armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         never: std::sync::Arc<tokio::sync::Notify>,
+        fail_holder: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl GatedStore {
@@ -875,6 +950,11 @@ mod tests {
             holder: &SessionHolder,
             now_unix_secs: i64,
         ) -> pharos_core::DomainResult<bool> {
+            if self.fail_holder.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(pharos_core::DomainError::Backend(
+                    "holder update down".into(),
+                ));
+            }
             self.inner
                 .update_transcode_session_holder(play_session_id, holder, now_unix_secs)
                 .await
@@ -928,6 +1008,7 @@ mod tests {
             inner: store().await,
             armed: Default::default(),
             never: Default::default(),
+            fail_holder: Default::default(),
         };
         let r = TranscodeSessionRegistry::spawn(gated.clone());
         let alice = pharos_core::UserId::new();
