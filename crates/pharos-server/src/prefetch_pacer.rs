@@ -51,6 +51,13 @@ use tokio::task::JoinHandle;
 /// interactive job outside this cap, sharing the device with at most two.
 pub const MAX_PREFETCH_IN_FLIGHT: usize = 2;
 
+/// How far past the client's segment a queued prefetch survives a retarget.
+/// It must cover the deep subtitle-burn scan's reach (hls
+/// `PREFETCH_BURN_HORIZON_SEGS`), else every request would discard the burn
+/// jobs it front-loaded; it also bounds how long far-ahead work from before a
+/// backward seek can linger.
+pub const RETAIN_AHEAD_SEGS: u32 = 24;
+
 /// How a queued prefetch left the pacer. Labels are a dashboard contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacingOutcome {
@@ -109,11 +116,12 @@ impl Drop for PrefetchPacer {
 impl PrefetchPacer {
     /// Create a pacer and spawn its walker on the calling actix worker, so it
     /// must be called from inside the actix runtime.
-    pub fn new(max_in_flight: usize) -> Arc<Self> {
+    pub fn new(max_in_flight: usize, retain_ahead: u32) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let outstanding = Arc::new(AtomicUsize::new(0));
         let walker = Walker {
             max_in_flight: max_in_flight.max(1),
+            retain_ahead,
             pending: BTreeMap::new(),
             in_flight: BTreeSet::new(),
             outstanding: Arc::clone(&outstanding),
@@ -125,10 +133,12 @@ impl PrefetchPacer {
         })
     }
 
-    /// Replace the wanted set with `jobs` (segment, future), `base` being the
-    /// segment the client asked for. Segments already running or already queued
-    /// keep their place; queued ones absent from `jobs` are dropped, since the
-    /// client moved on. Never blocks: it only hands the walker a message.
+    /// Retarget the queue at `jobs` (segment, future), `base` being the segment
+    /// the client asked for. Segments already running or already queued keep
+    /// their place. Queued ones are dropped only when the client moved past
+    /// them (behind `base`) or they lie more than the retain horizon ahead of
+    /// it; anything between, such as a queued burn front-load, stays even when
+    /// `jobs` omits it. Never blocks: it only hands the walker a message.
     pub fn retarget(&self, base: u32, jobs: Vec<(u32, PrefetchJob)>) {
         self.send(Msg::Retarget { base, jobs });
     }
@@ -159,6 +169,7 @@ impl PrefetchPacer {
 /// The state only the walker task touches.
 struct Walker {
     max_in_flight: usize,
+    retain_ahead: u32,
     pending: BTreeMap<u32, Queued>,
     in_flight: BTreeSet<u32>,
     outstanding: Arc<AtomicUsize>,
@@ -202,9 +213,9 @@ impl Walker {
     fn apply(&mut self, msg: Msg) {
         let (base, jobs) = match msg {
             Msg::Retarget { base, jobs } => {
-                let keep: BTreeSet<u32> = jobs.iter().map(|(s, _)| *s).collect();
+                let last = base.saturating_add(self.retain_ahead);
                 let before = self.pending.len();
-                self.pending.retain(|seg, _| keep.contains(seg));
+                self.pending.retain(|seg, _| (base..=last).contains(seg));
                 self.superseded(before - self.pending.len());
                 (base, jobs)
             }
@@ -272,6 +283,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    const TEST_RETAIN: u32 = 24;
+
     /// Shared probe: start order, current and peak concurrency.
     #[derive(Default)]
     struct Probe {
@@ -309,7 +322,7 @@ mod tests {
 
     #[actix_web::test]
     async fn runs_at_most_the_cap_at_once_nearest_first() {
-        let pacer = PrefetchPacer::new(2);
+        let pacer = PrefetchPacer::new(2, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         // Handed over out of order: the pacer, not the caller, orders them.
         let jobs = [5, 3, 1, 4, 2, 6]
@@ -325,7 +338,7 @@ mod tests {
     /// Disarm check: with no cap all six run together.
     #[actix_web::test]
     async fn an_uncapped_pacer_would_run_them_all_together() {
-        let pacer = PrefetchPacer::new(usize::MAX);
+        let pacer = PrefetchPacer::new(usize::MAX, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, (1..=6).map(|s| job(&probe, s, 30)).collect());
         idle(&pacer).await;
@@ -334,7 +347,7 @@ mod tests {
 
     #[actix_web::test]
     async fn a_later_request_dedupes_and_keeps_nearest_first() {
-        let pacer = PrefetchPacer::new(2);
+        let pacer = PrefetchPacer::new(2, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, (1..=4).map(|s| job(&probe, s, 40)).collect());
         // Client advanced one segment while 1 and 2 run, 3 and 4 wait.
@@ -348,7 +361,7 @@ mod tests {
 
     #[actix_web::test]
     async fn retarget_drops_queued_segments_the_client_moved_past() {
-        let pacer = PrefetchPacer::new(1);
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, (1..=4).map(|s| job(&probe, s, 40)).collect());
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -358,9 +371,38 @@ mod tests {
         assert_eq!(*probe.started.lock().unwrap(), vec![1, 51, 52]);
     }
 
+    /// Disarm: make retarget keep only the segments in its own set.
+    #[actix_web::test]
+    async fn a_queued_burn_job_ahead_of_the_client_survives_a_retarget() {
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
+        let probe = Arc::new(Probe::default());
+        pacer.retarget(0, vec![job(&probe, 1, 40)]);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The deep burn scan queues 10 behind the running 1...
+        pacer.extend(0, vec![job(&probe, 10, 5)]);
+        // ...and the next request's near window does not name it.
+        pacer.retarget(1, vec![job(&probe, 2, 5)]);
+        idle(&pacer).await;
+        assert_eq!(*probe.started.lock().unwrap(), vec![1, 2, 10]);
+    }
+
+    /// Disarm: drop the `<= base + retain_ahead` bound from retarget.
+    #[actix_web::test]
+    async fn retarget_drops_a_queued_job_beyond_the_retain_horizon() {
+        let pacer = PrefetchPacer::new(1, 5);
+        let probe = Arc::new(Probe::default());
+        pacer.retarget(0, vec![job(&probe, 1, 40)]);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 4 is within base + 5 = 6, 20 is far ahead of where the client is.
+        pacer.extend(0, vec![job(&probe, 4, 5), job(&probe, 20, 5)]);
+        pacer.retarget(1, vec![job(&probe, 2, 5)]);
+        idle(&pacer).await;
+        assert_eq!(*probe.started.lock().unwrap(), vec![1, 2, 4]);
+    }
+
     #[actix_web::test]
     async fn enqueueing_never_waits_on_the_cap() {
-        let pacer = PrefetchPacer::new(1);
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, vec![job(&probe, 1, 100)]);
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -381,7 +423,7 @@ mod tests {
 
     #[actix_web::test]
     async fn dropping_the_pacer_aborts_running_and_pending_work() {
-        let pacer = PrefetchPacer::new(1);
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         let dropped = Arc::new(AtomicUsize::new(0));
         let jobs = (1..=3)
@@ -416,7 +458,7 @@ mod tests {
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let pacer = PrefetchPacer::new(1);
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, (1..=3).map(|s| job(&probe, s, 20)).collect());
         tokio::time::sleep(Duration::from_millis(5)).await;

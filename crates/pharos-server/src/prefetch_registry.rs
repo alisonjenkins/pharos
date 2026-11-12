@@ -39,7 +39,7 @@
 //! the old episode, not the encodes already on the GPU: the depth of the ladder
 //! bounds what is in flight, and V125's allowance bounds the rest.
 
-use crate::prefetch_pacer::{PrefetchPacer, MAX_PREFETCH_IN_FLIGHT};
+use crate::prefetch_pacer::{PrefetchPacer, MAX_PREFETCH_IN_FLIGHT, RETAIN_AHEAD_SEGS};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -68,7 +68,7 @@ impl Entry {
         Self {
             media_id,
             handles,
-            pacer: PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT),
+            pacer: PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT, RETAIN_AHEAD_SEGS),
         }
     }
 }
@@ -111,7 +111,7 @@ impl PrefetchRegistry {
                 }
                 entry.media_id = media_id;
                 entry.handles = handles;
-                entry.pacer = PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT);
+                entry.pacer = PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT, RETAIN_AHEAD_SEGS);
             }
             None => {
                 map.insert(psid.to_string(), Entry::new(media_id, handles));

@@ -3920,6 +3920,8 @@ fn prewarm_cold_start(
 /// segment as the horizon rolls forward.
 const PREFETCH_BURN_HORIZON_SEGS: u32 = 24;
 const PREFETCH_BURN_MAX: usize = 4;
+// A retarget must not discard the burn jobs this horizon front-loads.
+const _: () = assert!(PREFETCH_BURN_HORIZON_SEGS <= crate::prefetch_pacer::RETAIN_AHEAD_SEGS);
 
 /// Prefetch one segment into the HLS cache with the client's REAL subtitle
 /// selection (`wanted_burn`, pre-gate), then gate it per THIS segment's
