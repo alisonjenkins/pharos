@@ -86,34 +86,41 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     })?;
     let connected = now_ms();
     spawn_forever(system);
-    if lock(&CAPS).is_none() {
-        probe_capabilities().await;
-    }
-    let probed = now_ms();
-    let server_schema = pharos_client::server_schema_version(&client, call)
-        .await
-        .inspect_err(|e| log::warn!("pharos: serverInfo failed: {e}"))
-        .ok();
-    let informed = now_ms();
-    let timing = |resumed: f64| {
-        format!(
-            "connect_ms={:.0} probe_ms={:.0} server_info_ms={:.0} resume_ms={:.0} total_ms={:.0}",
-            connected - started,
-            probed - connected,
-            informed - probed,
-            resumed - informed,
-            resumed - started,
-        )
+    // None of the three needs another's answer, so they share one wait: the
+    // capability probe is a WebView round trip and the other two are RPCs.
+    let token = android::load_token();
+    let probe = async {
+        if lock(&CAPS).is_none() {
+            probe_capabilities().await;
+        }
+        now_ms() - connected
     };
-    let Some(token) = android::load_token() else {
-        log::info!(
-            "pharos: open server={base} signed_in=false reason=no_token {}",
-            timing(now_ms())
-        );
+    let info = async {
+        let schema = pharos_client::server_schema_version(&client, call)
+            .await
+            .inspect_err(|e| log::warn!("pharos: serverInfo failed: {e}"))
+            .ok();
+        (schema, now_ms() - connected)
+    };
+    let resume = async {
+        let resumed = match &token {
+            Some(token) => Some(android::resume(&client, &closed, call, token).await),
+            None => None,
+        };
+        (resumed, now_ms() - connected)
+    };
+    let (probe_ms, (server_schema, server_info_ms), (resumed, resume_ms)) =
+        futures_util::join!(probe, info, resume);
+    let timing = format!(
+        "connect_ms={:.0} probe_ms={probe_ms:.0} server_info_ms={server_info_ms:.0} \
+         resume_ms={resume_ms:.0} total_ms={:.0}",
+        connected - started,
+        now_ms() - started,
+    );
+    let Some(resumed) = resumed else {
+        log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
         return Err(OpenError::NotSignedIn);
     };
-    let resumed = android::resume(&client, &closed, call, &token).await;
-    let timing = timing(now_ms());
     match resumed {
         Ok(session) => {
             log::info!("pharos: open server={base} signed_in=true {timing}");
