@@ -80,25 +80,44 @@ pub fn art_src(src: &str) -> String {
 pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     install_bridge();
     let base = server();
+    let started = now_ms();
     let (client, system, closed) = android::connect(&base).await.map_err(|e| {
         log::warn!("pharos: open failed server={base} error={e}");
         OpenError::NotOpened(Probe::Failed(e))
     })?;
+    let connected = now_ms();
     spawn_forever(system);
     if lock(&CAPS).is_none() {
         probe_capabilities().await;
     }
+    let probed = now_ms();
     let server_schema = pharos_client::server_schema_version(&client, call)
         .await
         .inspect_err(|e| log::warn!("pharos: serverInfo failed: {e}"))
         .ok();
+    let informed = now_ms();
+    let timing = |resumed: f64| {
+        format!(
+            "connect_ms={:.0} probe_ms={:.0} server_info_ms={:.0} resume_ms={:.0} total_ms={:.0}",
+            connected - started,
+            probed - connected,
+            informed - probed,
+            resumed - informed,
+            resumed - started,
+        )
+    };
     let Some(token) = android::load_token() else {
-        log::info!("pharos: open server={base} signed_in=false reason=no_token");
+        log::info!(
+            "pharos: open server={base} signed_in=false reason=no_token {}",
+            timing(now_ms())
+        );
         return Err(OpenError::NotSignedIn);
     };
-    match android::resume(&client, &closed, call, &token).await {
+    let resumed = android::resume(&client, &closed, call, &token).await;
+    let timing = timing(now_ms());
+    match resumed {
         Ok(session) => {
-            log::info!("pharos: open server={base} signed_in=true");
+            log::info!("pharos: open server={base} signed_in=true {timing}");
             let api = NativeApi::new(&session);
             spawn_forever(keep_media_token(api.clone()));
             Ok(Open {
@@ -108,11 +127,14 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             })
         }
         Err(NetError::Client(e)) if e.needs_sign_in() => {
-            log::info!("pharos: open server={base} signed_in=false reason=token_refused");
+            log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
             android::forget_token();
             Err(OpenError::NotSignedIn)
         }
-        Err(e) => Err(OpenError::Resume(e.to_string())),
+        Err(e) => {
+            log::warn!("pharos: open resume failed server={base} error={e} {timing}");
+            Err(OpenError::Resume(e.to_string()))
+        }
     }
 }
 
