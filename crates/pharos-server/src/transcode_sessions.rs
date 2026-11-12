@@ -869,6 +869,16 @@ mod tests {
                 .upsert_transcode_session(play_session_id, session, now_unix_secs)
                 .await
         }
+        async fn update_transcode_session_holder(
+            &self,
+            play_session_id: &str,
+            holder: &SessionHolder,
+            now_unix_secs: i64,
+        ) -> pharos_core::DomainResult<bool> {
+            self.inner
+                .update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                .await
+        }
         async fn get_transcode_session(
             &self,
             play_session_id: &str,
