@@ -34,6 +34,7 @@ use super::tv_page::{self, Bridge, Paths};
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
+use super::hls_trace::{Flush, PlayTrace, Report};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     Engine, FailureKind, Fatal, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine,
@@ -1364,6 +1365,41 @@ struct HlsJs {
     /// Which attach made the page's player, so a late `Drop` eval cannot
     /// destroy the one a later attach put at the same id.
     generation: u64,
+    /// The play's start, seeks, stalls and summaries (V1337); ended once,
+    /// when the play fails, is replaced or dropped.
+    trace: Option<Rc<RefCell<PlayTrace>>>,
+    media_listener: Option<u64>,
+}
+
+impl HlsJs {
+    /// Ends the current play's trace and stops listening to its element.
+    fn end_trace(&mut self, flush: Flush) {
+        if let Some(listener) = self.media_listener.take() {
+            unlisten(listener);
+        }
+        if let Some(trace) = self.trace.take() {
+            let reports = trace.borrow_mut().finish(flush, trace_now());
+            emit_trace(reports);
+        }
+    }
+}
+
+/// Sends what a play's trace reports: the log line, then the client event.
+fn emit_trace(reports: Vec<Report>) {
+    for report in reports {
+        if report.is_warn() {
+            warn(&report.line());
+        } else {
+            info(&report.line());
+        }
+        report_event(report.event(current_path()));
+    }
+}
+
+/// The trace's clock: ms since the app started.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn trace_now() -> u64 {
+    now_ms().max(0.0) as u64
 }
 
 /// Attach generations, shared by hls.js and direct players.
@@ -1381,19 +1417,27 @@ impl PlaybackEngine for HlsJs {
         let id = video_id.to_owned();
         let budget = RefCell::new(super::playback::RecoveryBudget::new());
         let log_url = url.split('?').next().unwrap_or_default().to_owned();
+        // A re-attach ends the old play's trace before the new one starts.
+        self.end_trace(Flush::Closed);
+        let trace = Rc::new(RefCell::new(PlayTrace::new(trace_now(), start_ms)));
         let on_event = {
             let id = id.clone();
+            let trace = Rc::clone(&trace);
             move |event: tv_page::HlsEvent| match event {
-                tv_page::HlsEvent::Frag {
-                    track: tv_page::FragTrack::Audio,
-                    ..
-                } => {}
                 tv_page::HlsEvent::Frag {
                     bytes,
                     load_ms,
                     media_ms,
-                    ..
+                    sn,
+                    ttfb_ms,
+                    track,
                 } => {
+                    let appended = tv_page::appended_of(sn, bytes, ttfb_ms, load_ms, track);
+                    let summary = trace.borrow_mut().appended(appended, trace_now());
+                    emit_trace(summary.into_iter().collect());
+                    if track == tv_page::FragTrack::Audio {
+                        return;
+                    }
                     budget.borrow_mut().progressed();
                     if bytes > 0 && load_ms > 0 && media_ms > 0 {
                         on_fragment(super::playback::FragmentLoad {
@@ -1429,6 +1473,8 @@ impl PlaybackEngine for HlsJs {
                             run(format!("const p = {p}; if (p) p.recoverMediaError();"));
                         }
                         super::playback::Recovery::Fail => {
+                            let reports = trace.borrow_mut().finish(Flush::Fatal, trace_now());
+                            emit_trace(reports);
                             on_fatal(Fatal::from_hls(&kind, &details));
                         }
                     }
@@ -1439,6 +1485,19 @@ impl PlaybackEngine for HlsJs {
             unlisten(old);
         }
         self.listener = Some(listen(Listener::Hls(id.clone(), Box::new(on_event))));
+        let on_media = {
+            let trace = Rc::clone(&trace);
+            move |media: &tv_page::Media| {
+                let Some(signal) = tv_page::signal_of(&media.ev, media.tick) else {
+                    return;
+                };
+                let clip = tv_page::clip_of(media, trace_now());
+                let reports = trace.borrow_mut().observe(signal, &clip);
+                emit_trace(reports);
+            }
+        };
+        self.media_listener = Some(listen(Listener::Media(id.clone(), Box::new(on_media))));
+        self.trace = Some(trace);
         self.video_id = id.clone();
         self.generation = NEXT_HLS.fetch_add(1, Ordering::Relaxed);
         // The previous source's state must not answer for this one:
@@ -1678,6 +1737,7 @@ fn direct_url(base: &str, url: &str) -> String {
 
 impl Drop for HlsJs {
     fn drop(&mut self) {
+        self.end_trace(Flush::Closed);
         if let Some(listener) = self.listener.take() {
             unlisten(listener);
         }
@@ -1985,6 +2045,8 @@ enum Listener {
     Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
+    /// Every event of the media element `id`, as its state arrived.
+    Media(String, Box<dyn FnMut(&tv_page::Media)>),
     /// A media element's `timeupdate`, with its id.
     Tick(Box<dyn FnMut(&str)>),
     /// A directly played media element's `error`, for the element `id`.
@@ -2571,6 +2633,15 @@ fn on_bridge(message: Bridge) {
         }
         Bridge::Media(media) => {
             let at = now_ms();
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Media(on, f) = &mut f.0 {
+                        if *on == media.id {
+                            f(&media);
+                        }
+                    }
+                }
+            }
             let (id, tick) = (media.id.clone(), media.tick);
             lock(&MEDIA).insert(id.clone(), (media, at));
             if tick {
