@@ -1804,7 +1804,14 @@ pub async fn grant(
             negotiated,
             stream_url: adopted.stream_url,
             audio_stream_index: adopted.audio,
-            subtitle_stream_index: adopted.subtitle,
+            // A subtitle the reconnect names (one the player draws itself,
+            // since a burned one is part of the shape) is the one reported;
+            // the held stream's pick stands only when it named none.
+            subtitle_stream_index: if r.subtitle_stream_index.is_some() {
+                styled_pick.or(subtitle)
+            } else {
+                adopted.subtitle
+            },
             remembers_tracks: adopted.remembers_tracks,
             item_id: id,
             version: r.version.to_owned(),
