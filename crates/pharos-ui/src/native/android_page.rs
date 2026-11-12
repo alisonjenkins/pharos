@@ -2426,6 +2426,9 @@ const ticked = {};
 // The last `progress` sent for each element: download progress feeds only
 // the seek bar's buffered range, so once a second is plenty (B1386).
 const progressed = {};
+// A `progress` held back by that limit, sent once the second is up so the
+// last range of a download is never lost.
+const trailing = {};
 // The element's buffered ranges in whole ms.
 const rangesOf = (v) => {
   const out = [];
@@ -2449,9 +2452,17 @@ const media = (e) => {
   if (e.type === 'progress') {
     // Never a Dioxus event, which would hold the WebView until Rust answers.
     e.stopPropagation();
-    const now = performance.now();
-    if (now - (progressed[v.id] || 0) < 1000) return;
-    progressed[v.id] = now;
+    const wait = 1000 - (performance.now() - (progressed[v.id] || 0));
+    if (wait > 0) {
+      if (!trailing[v.id]) {
+        trailing[v.id] = setTimeout(() => {
+          trailing[v.id] = 0;
+          media({ type: 'progress', target: v, stopPropagation() {} });
+        }, wait);
+      }
+      return;
+    }
+    progressed[v.id] = performance.now();
   }
   // Media buffered ahead of the play head; a stall also names where it ends.
   const here = Math.round(v.currentTime * 1000);
