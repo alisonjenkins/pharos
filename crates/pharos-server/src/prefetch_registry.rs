@@ -39,8 +39,9 @@
 //! the old episode, not the encodes already on the GPU: the depth of the ladder
 //! bounds what is in flight, and V125's allowance bounds the rest.
 
+use crate::prefetch_pacer::{PrefetchPacer, MAX_PREFETCH_IN_FLIGHT};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 /// Above this many tracked sessions, drop entries whose prefetch has all
@@ -51,6 +52,18 @@ const MAX_TRACKED_SESSIONS: usize = 256;
 struct Entry {
     media_id: u64,
     handles: Vec<JoinHandle<()>>,
+    /// The session's prefetch queue; replaced with the entry on a media swap.
+    pacer: Arc<PrefetchPacer>,
+}
+
+impl Entry {
+    fn new(media_id: u64, handles: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            media_id,
+            handles,
+            pacer: PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT),
+        }
+    }
 }
 
 /// Cancellable registry of in-flight prefetch tasks, keyed by `PlaySessionId`.
@@ -92,9 +105,37 @@ impl PrefetchRegistry {
                 }
                 entry.media_id = media_id;
                 entry.handles = handles;
+                entry.pacer = PrefetchPacer::new(MAX_PREFETCH_IN_FLIGHT);
             }
             None => {
-                map.insert(psid.to_string(), Entry { media_id, handles });
+                map.insert(psid.to_string(), Entry::new(media_id, handles));
+            }
+        }
+    }
+
+    /// The prefetch pacer for `psid` on `media_id`, created on first use. A
+    /// different media aborts the stale session's tasks first, exactly as
+    /// [`register`](Self::register) does, so a pacer never carries one
+    /// episode's queue into the next.
+    pub fn pacer(&self, psid: &str, media_id: u64) -> Arc<PrefetchPacer> {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_TRACKED_SESSIONS && !map.contains_key(psid) {
+            map.retain(|_, e| e.handles.iter().any(|h| !h.is_finished()));
+        }
+        match map.get_mut(psid) {
+            Some(entry) if entry.media_id == media_id => Arc::clone(&entry.pacer),
+            Some(entry) => {
+                for h in entry.handles.drain(..) {
+                    h.abort();
+                }
+                *entry = Entry::new(media_id, Vec::new());
+                Arc::clone(&entry.pacer)
+            }
+            None => {
+                let entry = Entry::new(media_id, Vec::new());
+                let pacer = Arc::clone(&entry.pacer);
+                map.insert(psid.to_string(), entry);
+                pacer
             }
         }
     }
@@ -260,5 +301,72 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// V1340 — through the registry's pacer, one session never has more than
+    /// MAX_PREFETCH_IN_FLIGHT prefetch encodes running, and they start nearest
+    /// segment first. Disarm: raise the cap to usize::MAX and this goes red.
+    #[actix_web::test]
+    async fn a_sessions_prefetch_is_paced_nearest_first() {
+        use futures_util::FutureExt;
+        let reg = PrefetchRegistry::new();
+        let running = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let jobs = [4u32, 2, 1, 3]
+            .into_iter()
+            .map(|seg| {
+                let (running, peak, started) = (running.clone(), peak.clone(), started.clone());
+                (
+                    seg,
+                    Box::new(move || {
+                        async move {
+                            started.lock().unwrap().push(seg);
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            running.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        .boxed_local()
+                    }) as crate::prefetch_pacer::PrefetchJob,
+                )
+            })
+            .collect();
+        let handle = reg.pacer("sess-p", 1).retarget(0, jobs);
+        reg.register(Some("sess-p"), 1, handle.into_iter().collect());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "the session's prefetch must run at the cap, no more"
+        );
+        assert_eq!(*started.lock().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[actix_web::test]
+    async fn a_media_swap_aborts_the_pacers_running_work_and_gives_a_fresh_pacer() {
+        use futures_util::FutureExt;
+        let reg = PrefetchRegistry::new();
+        let ran = Arc::new(AtomicU32::new(0));
+        let r = ran.clone();
+        let old = reg.pacer("sess-s", 1);
+        let h = old.retarget(
+            0,
+            vec![(
+                1,
+                Box::new(move || {
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        r.fetch_add(1, Ordering::SeqCst);
+                    }
+                    .boxed_local()
+                }),
+            )],
+        );
+        reg.register(Some("sess-s"), 1, h.into_iter().collect());
+        let new = reg.pacer("sess-s", 2);
+        assert!(!Arc::ptr_eq(&old, &new));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "old episode's job aborted");
     }
 }
