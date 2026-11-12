@@ -1035,29 +1035,31 @@ pub(crate) async fn pre_extract_subtitles(
 
 /// Start extracting the subtitle track a negotiation selected, so the player's
 /// first `Stream.vtt` / `stream.ass` fetch reads the cache instead of demuxing
-/// the whole source (p95 ~13 s cold). One track, one source open, through the
-/// same per-key lock and cache as the request path, so a request arriving
-/// meanwhile waits on this extraction rather than starting its own. Nothing
-/// new is held in memory: the result lands in the bounded subtitle cache.
-/// Sidecars, image tracks and generated styled tracks have nothing to extract.
+/// the whole source (p95 ~13 s cold). One track through the same per-key lock
+/// and cache as the request path, so a request arriving meanwhile waits on this
+/// extraction rather than starting its own. Nothing new is held in memory: the
+/// result lands in the bounded subtitle cache. An ASS/SSA track is warmed in
+/// both forms the player fetches (the WebVTT `<track>` it shows until the styled
+/// renderer starts, and `stream.ass`). Sidecars, image tracks and generated
+/// styled tracks have nothing to extract. The returned handle is the spawned
+/// task, for a caller that wants to wait for the verdict.
 pub(crate) fn warm_selected_subtitle(
     state: &actix_web::web::Data<AppState>,
     media_id: u64,
     media_source_id: Option<String>,
     stream_index: u32,
-) {
-    if state.subtitles.is_none() {
-        return;
-    }
+) -> Option<tokio::task::JoinHandle<()>> {
+    state.subtitles.as_ref()?;
     let state = state.clone();
-    actix_web::rt::spawn(async move {
+    Some(actix_web::rt::spawn(async move {
         let started = std::time::Instant::now();
         let (kind, temp, outcome) =
             match warm_selected_subtitle_inner(&state, media_id, media_source_id, stream_index)
                 .await
             {
-                Ok((kind, temp)) => (kind, temp, "ok"),
-                Err(skip) => ("none", "skipped", skip),
+                SubtitleWarm::Done { kind, temp } => (kind, temp.label(), "ok"),
+                SubtitleWarm::Failed { kind } => (kind, ExtractTemp::Cold.label(), "error"),
+                SubtitleWarm::Skipped(reason) => ("none", "skipped", reason),
             };
         metrics::counter!(
             "pharos_subtitle_prewarm_total",
@@ -1073,68 +1075,85 @@ pub(crate) fn warm_selected_subtitle(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "subtitle prewarm"
         );
-    });
+    }))
 }
 
-/// `Ok((kind, temp))` when the track is now cached (`temp` says whether this
-/// call extracted it), `Err(reason)` when there was nothing to do or it failed.
+/// What one subtitle prewarm did. `Skipped` is only for tracks that need no
+/// extraction; an extraction that failed is `Failed`, with the kind it tried.
+enum SubtitleWarm {
+    Skipped(&'static str),
+    Done {
+        kind: &'static str,
+        temp: ExtractTemp,
+    },
+    Failed {
+        kind: &'static str,
+    },
+}
+
 async fn warm_selected_subtitle_inner(
     state: &AppState,
     media_id: u64,
     media_source_id: Option<String>,
     stream_index: u32,
-) -> Result<(&'static str, &'static str), &'static str> {
-    let item = super::media_source::load_named(
+) -> SubtitleWarm {
+    let Ok(item) = super::media_source::load_named(
         state,
         super::media_source::Route::Prewarm,
         media_id,
         media_source_id.as_deref(),
     )
     .await
-    .map_err(|_| "item_unloadable")?;
+    else {
+        return SubtitleWarm::Skipped("item_unloadable");
+    };
     if stream_index >= sidecar_base_index(&item.probe) {
-        return Err("not_embedded");
+        return SubtitleWarm::Skipped("not_embedded");
     }
     let Some(cache) = state.subtitles.as_ref() else {
-        return Err("no_cache");
+        return SubtitleWarm::Skipped("no_cache");
     };
-    let codec = item
+    let Some(codec) = item
         .probe
         .subtitle_tracks
         .iter()
         .find(|t| t.stream_index == stream_index)
         .and_then(|t| t.codec.as_deref())
-        .ok_or("unknown_track")?;
-    if is_image_subtitle_codec(codec) {
-        return Err("image_track");
-    }
-    let styled = is_styled_text_subtitle_codec(codec);
-    let (kind, store_kind) = if styled {
-        ("ass", SubtitleKind::EmbeddedAss)
-    } else {
-        ("vtt", SubtitleKind::Embedded)
+    else {
+        return SubtitleWarm::Skipped("unknown_track");
     };
-    let mtime = mtime_secs(&item.path).await;
-    if cache
-        .get(&item.path, mtime, stream_index, store_kind)
-        .await
-        .is_some()
-    {
-        return Ok((kind, "warm"));
+    if is_image_subtitle_codec(codec) {
+        return SubtitleWarm::Skipped("image_track");
     }
     let permit = BgPermit::playback_priority();
-    let extracted = if styled {
-        embedded_ass_script(Some(cache), &item, stream_index, &permit)
-            .await
-            .map(drop)
-    } else {
-        embedded_vtt_inner(Some(cache), &item, stream_index, &permit)
-            .await
-            .1
-            .map(drop)
-    };
-    extracted.map_err(|_| "extract_failed")?;
-    Ok((kind, "cold"))
+    let (vtt_temp, vtt) = embedded_vtt_inner(Some(cache), &item, stream_index, &permit).await;
+    if !is_styled_text_subtitle_codec(codec) {
+        return match vtt {
+            Ok(_) => SubtitleWarm::Done {
+                kind: "vtt",
+                temp: vtt_temp,
+            },
+            Err(_) => SubtitleWarm::Failed { kind: "vtt" },
+        };
+    }
+    // `embedded_ass_script` does not say whether it read the cache.
+    let mtime = mtime_secs(&item.path).await;
+    let ass_cached = cache
+        .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+        .await
+        .is_some();
+    let ass = embedded_ass_script(Some(cache), &item, stream_index, &permit).await;
+    match (vtt, ass) {
+        (Ok(_), Ok(_)) => SubtitleWarm::Done {
+            kind: "styled",
+            temp: vtt_temp.max(if ass_cached {
+                ExtractTemp::Warm
+            } else {
+                ExtractTemp::Cold
+            }),
+        },
+        _ => SubtitleWarm::Failed { kind: "styled" },
+    }
 }
 
 /// Whether a track that produced no output should be remembered as EMPTY.
@@ -1743,7 +1762,7 @@ async fn resolve_vtt_bytes(
 /// How an embedded-subtitle request was answered, the `temp` label of
 /// `pharos_subtitle_extract_total`: `warm` read the cache, `coalesced` waited on
 /// a peer's extraction, `cold` ran ffmpeg on this request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ExtractTemp {
     Warm,
     Coalesced,
@@ -2712,19 +2731,26 @@ mod tests {
     use tempfile::TempDir;
 
     /// V1366 — the selected track is extracted at negotiate time, so the
-    /// player's first fetch is a cache read; image tracks and unknown indices
-    /// are skipped with their reason, and every verdict is counted.
+    /// player's first fetch is a cache read; an ASS track is warmed in the
+    /// WebVTT form too, a failed extraction keeps its kind and says `error`,
+    /// image tracks are skipped with their reason, and every verdict is counted.
     #[test]
     fn a_negotiated_subtitle_is_prewarmed_and_counted() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         use pharos_core::{MediaItem, MediaProbe, MediaStore, SubtitleTrack};
+        const ASS: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n\
+            [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, \
+            OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, \
+            Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, \
+            Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,\
+            100,100,0,0,1,2,2,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, \
+            MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,\
+            0,0,0,,Hello\n";
         let recorder = DebuggingRecorder::new();
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         metrics::with_local_recorder(&recorder, || {
             actix_web::rt::System::new().block_on(async {
                 let td = TempDir::new().unwrap();
-                let path = td.path().join("Film.mkv");
-                tokio::fs::write(&path, b"x").await.unwrap();
                 let track = |i, codec: &str| SubtitleTrack {
                     stream_index: i,
                     codec: Some(codec.into()),
@@ -2733,26 +2759,59 @@ mod tests {
                 let stores = crate::state::Stores::connect("sqlite::memory:")
                     .await
                     .unwrap();
-                stores
-                    .put(MediaItem {
-                        id: 7,
-                        path: path.clone(),
+                let put = |id: u64, path: std::path::PathBuf, tracks: Vec<SubtitleTrack>| {
+                    stores.put(MediaItem {
+                        id,
+                        path,
                         probe: MediaProbe {
-                            subtitle_tracks: vec![
-                                track(2, "subrip"),
-                                track(3, "hdmv_pgs_subtitle"),
-                            ],
+                            subtitle_tracks: tracks,
                             ..Default::default()
                         },
                         ..Default::default()
                     })
-                    .await
+                };
+                // 7: a text track already cached, and an image track.
+                let cached = td.path().join("Cached.mkv");
+                tokio::fs::write(&cached, b"x").await.unwrap();
+                put(
+                    7,
+                    cached.clone(),
+                    vec![track(2, "subrip"), track(3, "hdmv_pgs_subtitle")],
+                )
+                .await
+                .unwrap();
+                // 8: a real source with an ASS track, nothing cached.
+                let real = td.path().join("Real.mkv");
+                let ass = td.path().join("t.ass");
+                tokio::fs::write(&ass, ASS).await.unwrap();
+                let made = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=c=black:s=64x64:d=3",
+                    ])
+                    .arg("-i")
+                    .arg(&ass)
+                    .args(["-map", "0", "-map", "1", "-c:v", "mpeg4", "-c:s", "ass"])
+                    .arg(&real)
+                    .status()
                     .unwrap();
+                assert!(made.success(), "ffmpeg builds the fixture");
+                put(8, real.clone(), vec![track(1, "ass")]).await.unwrap();
+                // 9: an ASS track in a file ffmpeg cannot read.
+                let junk = td.path().join("Junk.mkv");
+                tokio::fs::write(&junk, b"not media").await.unwrap();
+                put(9, junk, vec![track(1, "ass")]).await.unwrap();
+
                 let cache = pharos_cache::SubtitleCache::new(1 << 20, 16);
-                let mtime = mtime_secs(&path).await;
+                let mtime = mtime_secs(&cached).await;
                 cache
                     .store(
-                        &path,
+                        &cached,
                         mtime,
                         2,
                         SubtitleKind::Embedded,
@@ -2761,12 +2820,43 @@ mod tests {
                     .await;
                 let state =
                     web::Data::new(AppState::new(stores, "t".into()).with_subtitle_cache(cache));
-                warm_selected_subtitle(&state, 7, None, 2);
-                warm_selected_subtitle(&state, 7, None, 3);
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                for (id, idx) in [(7, 2), (7, 3), (8, 1), (9, 1)] {
+                    warm_selected_subtitle(&state, id, None, idx)
+                        .unwrap()
+                        .await
+                        .unwrap();
+                }
+
+                // The ASS track's WebVTT form, fetched as Stream.vtt would, is
+                // already cached by the prewarm.
+                let cache = state.subtitles.as_ref().unwrap();
+                let (temp, vtt) = embedded_vtt_inner(
+                    Some(cache),
+                    &MediaItem {
+                        path: real.clone(),
+                        ..Default::default()
+                    },
+                    1,
+                    &BgPermit::playback_priority(),
+                )
+                .await;
+                assert!(vtt.unwrap().starts_with(b"WEBVTT"));
+                assert_eq!(
+                    temp,
+                    ExtractTemp::Warm,
+                    "Stream.vtt of an ASS track hits the prewarm"
+                );
+                let real_mtime = mtime_secs(&real).await;
+                assert!(
+                    cache
+                        .get(&real, real_mtime, 1, SubtitleKind::EmbeddedAss)
+                        .await
+                        .is_some(),
+                    "stream.ass is cached by the same prewarm"
+                );
             })
         });
-        let count = |temp: &str, outcome: &str| -> u64 {
+        let count = |kind: &str, temp: &str, outcome: &str| -> u64 {
             snapshotter
                 .snapshot()
                 .into_vec()
@@ -2780,6 +2870,7 @@ mod tests {
                     match v {
                         DebugValue::Counter(n)
                             if k.name() == "pharos_subtitle_prewarm_total"
+                                && has(&format!("kind={kind}"))
                                 && has(&format!("temp={temp}"))
                                 && has(&format!("outcome={outcome}")) =>
                         {
@@ -2790,15 +2881,21 @@ mod tests {
                 })
                 .sum()
         };
+        assert_eq!(count("vtt", "warm", "ok"), 1, "the cached text track");
         assert_eq!(
-            count("warm", "ok"),
-            1,
-            "the cached text track is a warm prewarm"
-        );
-        assert_eq!(
-            count("skipped", "image_track"),
+            count("none", "skipped", "image_track"),
             1,
             "an image track has nothing to extract, and says so"
+        );
+        assert_eq!(
+            count("styled", "cold", "ok"),
+            1,
+            "the ASS track was extracted"
+        );
+        assert_eq!(
+            count("styled", "cold", "error"),
+            1,
+            "a failed extraction keeps its kind and is an error, not a skip"
         );
     }
 
