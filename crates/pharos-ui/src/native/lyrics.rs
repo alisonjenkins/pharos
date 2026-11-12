@@ -500,6 +500,34 @@ mod tests {
         assert!((line_progress(&l, 0, 5_000) - 100.0).abs() < f64::EPSILON);
     }
 
+    /// ADR-0121, V1298: while a song is still being timed, a line the
+    /// aligner has finished follows its word times and a line it has not
+    /// keeps the guessed fill.
+    #[test]
+    fn a_partly_timed_song_fills_timed_lines_by_their_words_and_the_rest_by_guess() {
+        let guessed = synced_lines(&[(0, "one two"), (4_000, "one two"), (20_000, "next")]);
+        let mut partly = guessed.clone();
+        partly.words_pending = true;
+        partly.lines[0].words = vec![
+            LyricWord { at: 0, start_ms: 0 },
+            LyricWord {
+                at: 4,
+                start_ms: 2_000,
+            },
+        ];
+        // The timed line: 1000 ms is halfway from "one" to "two", 2/7 of the
+        // way in, not the guess's "one" finished at 700 ms.
+        assert!((line_progress(&partly, 0, 1_000) - 2.0 / 7.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&guessed, 0, 1_000) - 2.0 / 7.0 * 100.0).abs() > 1.0);
+        // The line still to be timed fills exactly as the guess does.
+        for at in [4_000, 4_700, 5_400] {
+            assert!(
+                (line_progress(&partly, 1, at) - line_progress(&guessed, 1, at)).abs()
+                    < f64::EPSILON
+            );
+        }
+    }
+
     #[test]
     fn stamped_words_fill_at_their_times() {
         let l = Lyrics {
