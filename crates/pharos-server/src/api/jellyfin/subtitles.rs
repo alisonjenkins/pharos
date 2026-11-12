@@ -1048,10 +1048,9 @@ pub(crate) fn warm_selected_subtitle(
     media_id: u64,
     media_source_id: Option<String>,
     stream_index: u32,
-) -> Option<tokio::task::JoinHandle<()>> {
-    state.subtitles.as_ref()?;
+) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
-    Some(actix_web::rt::spawn(async move {
+    actix_web::rt::spawn(async move {
         let started = std::time::Instant::now();
         let (kind, temp, outcome) =
             match warm_selected_subtitle_inner(&state, media_id, media_source_id, stream_index)
@@ -1075,7 +1074,7 @@ pub(crate) fn warm_selected_subtitle(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "subtitle prewarm"
         );
-    }))
+    })
 }
 
 /// What one subtitle prewarm did. `Skipped` is only for tracks that need no
@@ -2730,6 +2729,64 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// V1366 — a deployment with no subtitle cache still counts its verdict.
+    #[test]
+    fn a_prewarm_without_a_subtitle_cache_is_counted_as_no_cache() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_core::{MediaItem, MediaProbe, MediaStore, SubtitleTrack};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            actix_web::rt::System::new().block_on(async {
+                let td = TempDir::new().unwrap();
+                let path = td.path().join("Item.mkv");
+                tokio::fs::write(&path, b"x").await.unwrap();
+                let stores = crate::state::Stores::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                stores
+                    .put(MediaItem {
+                        id: 7,
+                        path,
+                        probe: MediaProbe {
+                            subtitle_tracks: vec![SubtitleTrack {
+                                stream_index: 2,
+                                codec: Some("subrip".into()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let state = web::Data::new(AppState::new(stores, "t".into()));
+                assert!(state.subtitles.is_none());
+                warm_selected_subtitle(&state, 7, None, 2).await.unwrap();
+            })
+        });
+        let counted: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let outcome = k
+                    .labels()
+                    .any(|l| l.key() == "outcome" && l.value() == "no_cache");
+                match v {
+                    DebugValue::Counter(n)
+                        if k.name() == "pharos_subtitle_prewarm_total" && outcome =>
+                    {
+                        Some(n)
+                    }
+                    _ => None,
+                }
+            })
+            .sum();
+        assert_eq!(counted, 1, "the no-cache verdict is counted");
+    }
+
     /// V1366 — the selected track is extracted at negotiate time, so the
     /// player's first fetch is a cache read; an ASS track is warmed in the
     /// WebVTT form too, a failed extraction keeps its kind and says `error`,
@@ -2821,10 +2878,7 @@ mod tests {
                 let state =
                     web::Data::new(AppState::new(stores, "t".into()).with_subtitle_cache(cache));
                 for (id, idx) in [(7, 2), (7, 3), (8, 1), (9, 1)] {
-                    warm_selected_subtitle(&state, id, None, idx)
-                        .unwrap()
-                        .await
-                        .unwrap();
+                    warm_selected_subtitle(&state, id, None, idx).await.unwrap();
                 }
 
                 // The ASS track's WebVTT form, fetched as Stream.vtt would, is
