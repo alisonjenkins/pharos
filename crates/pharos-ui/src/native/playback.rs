@@ -3107,9 +3107,15 @@ mod tests {
 
     #[test]
     fn hls_xhr_setup_sends_the_token_only_without_a_play_session() {
-        assert!(HLS_XHR_SETUP.contains("[?&]PlaySessionId="));
-        assert!(HLS_XHR_SETUP.contains("setRequestHeader('X-Emby-Token', token)"));
-        assert!(HLS_XHR_SETUP.starts_with("(xhr, url) =>"));
+        // No JS engine runs here, so the callback is pinned whole: dropping the
+        // negation or the case-insensitive flag changes the text and fails.
+        // Its behaviour was checked in node against `?PlaySessionId=`,
+        // `&playSessionId=` (no header) and a URL without one (header).
+        assert_eq!(
+            HLS_XHR_SETUP,
+            "(xhr, url) => { if (token && !/[?&]PlaySessionId=/i.test(url)) \
+             xhr.setRequestHeader('X-Emby-Token', token); }"
+        );
     }
 
     #[test]
