@@ -2,8 +2,8 @@
 //! can be cancelled when a session moves to a different media (episode swap) or
 //! stops.
 //!
-//! Segment prefetch is deliberately fire-and-forget (`spawn_one_prefetch` spawns
-//! a detached task): it must OUTLIVE the request that triggered it so the next
+//! Segment prefetch is deliberately fire-and-forget (`spawn_segment_prefetch` spawns
+//! a detached walker task, see `prefetch_pacer`): it must OUTLIVE the request that triggered it so the next
 //! few segments warm while the client keeps playing. But the transcode
 //! scheduler only skips a queued job when its caller future was dropped
 //! (`scheduler.rs` `ctx.reply.is_closed()`), and a detached prefetch task keeps
