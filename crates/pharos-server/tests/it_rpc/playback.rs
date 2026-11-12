@@ -1872,3 +1872,156 @@ async fn play_on(
     )
     .await
 }
+
+/// `MOVIE` with two audio tracks and one text subtitle the player draws
+/// itself, so a track switch does not change what the server streams.
+async fn seed_tracks(fx: &Fixture) {
+    use pharos_core::{AudioTrack, SubtitleTrack};
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    item.probe.audio_tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("aac".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.subtitle_tracks = vec![SubtitleTrack {
+        stream_index: 3,
+        codec: Some("subrip".into()),
+        ..SubtitleTrack::default()
+    }];
+    fx.state.stores.put(item).await.unwrap();
+}
+
+async fn report_tracks(grant: &playback_grant::Client, audio: Choice, subtitle: Choice) {
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(10_000);
+    set_choice(req.get().init_audio(), audio);
+    set_choice(req.get().init_subtitle(), subtitle);
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+}
+
+/// B1397: a subtitle the player draws itself, switched mid-playback and so
+/// remembered, is not a different stream: the reconnect still adopts.
+/// Disarm check: with the subtitle compared as picked, the negotiate resolves
+/// the remembered track, the shapes differ and a new session id is minted.
+#[actix_web::test]
+async fn a_remembered_unburned_subtitle_does_not_block_adoption() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_tracks(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.subtitle, None);
+    report_tracks(&grant, Choice::Default, Choice::Index(3)).await;
+    drop(grant);
+    let (_grant, again) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.psid, first.psid, "{again:?}");
+    assert_eq!(again.url, first.url);
+}
+
+/// B1397: an audio track switched mid-playback and so remembered does not
+/// make the reconnect a different stream: the player is still pulling the one
+/// it holds, and the grant names the tracks that stream carries.
+/// Disarm check: with the held tracks not used for a default pick, the
+/// negotiate resolves the remembered track, the decision differs and a new
+/// session id is minted.
+#[actix_web::test]
+async fn a_remembered_audio_switch_does_not_block_adoption() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_tracks(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.method, "direct_play", "{first:?}");
+    report_tracks(&grant, Choice::Index(2), Choice::Off).await;
+    drop(grant);
+    let (_grant, again) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.psid, first.psid, "{again:?}");
+    assert_eq!(again.audio, first.audio, "the tracks the stream carries");
+}
+
+/// B1397: naming a different audio track on the reconnect is a different
+/// stream, so the held one ends and a new session is minted.
+/// Disarm check: with audio left out of the shape, the new track is adopted
+/// onto the old stream.
+#[actix_web::test]
+async fn an_explicit_other_audio_track_is_not_adopted() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_tracks(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Index(1),
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    drop(grant);
+    let (_grant, second) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Index(2),
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_ne!(second.psid, first.psid, "{second:?}");
+    assert_eq!(second.audio, Some(2));
+    assert!(settles_gone(&fx, &first.psid).await);
+}

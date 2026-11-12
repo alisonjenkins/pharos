@@ -427,6 +427,8 @@ impl Drop for Grant {
             remembers_tracks: self.remembers_tracks,
             shape: self.shape.clone(),
             reported_ms: self.reported_ms.get(),
+            audio: self.audio,
+            subtitle: self.subtitle,
         };
         let key = self.device.take().map(|device| ReleaseKey {
             user: session.owner(),

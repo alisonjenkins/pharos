@@ -1733,6 +1733,19 @@ pub async fn grant(
         .profile(crate::services::watch::extracts_image_subtitles(state));
     profile.denied_audio_codecs = denied_audio_codecs_for_token(state, r.token).await;
     let streams = crate::services::watch::streams(&item).await;
+    let release_key = r.device.map(|device| crate::pending_release::ReleaseKey {
+        user: user.id,
+        device: device.clone(),
+        item: id,
+        version: r.version.to_owned(),
+    });
+    // A player that reconnects under a live stream names no tracks, and would
+    // resolve to a pick it switched to mid-playback (which is remembered): the
+    // stream it is still pulling is on the tracks it was negotiated on, so a
+    // default pick follows the held release.
+    let held = release_key
+        .as_ref()
+        .and_then(|key| state.pending_releases.held_picks(key));
     let TrackPick {
         audio,
         requested_subtitle,
@@ -1744,8 +1757,9 @@ pub async fn grant(
         &item,
         &streams,
         &profile.subtitle_profiles,
-        r.audio_stream_index,
-        r.subtitle_stream_index,
+        r.audio_stream_index.or(held.and_then(|(audio, _)| audio)),
+        r.subtitle_stream_index
+            .or(held.and_then(|(_, subtitle)| subtitle.map(i64::from))),
     )
     .await;
     // The decision names these tracks, so the stream must carry them: the
@@ -1771,16 +1785,26 @@ pub async fn grant(
         decision: negotiated.decision.clone(),
         burn_subtitle_indices: negotiated.burn_text_indices.clone(),
         audio: audio.index,
-        subtitle: styled_pick.or(subtitle),
+        burned_subtitle: negotiated
+            .selected_subtitle
+            .as_ref()
+            .filter(|t| {
+                is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
+                    || negotiated.burn_text_indices.contains(&t.stream_index)
+            })
+            .map(|t| t.stream_index),
     };
-    if let Some(adopted) = adopt_released(state, user, id, r, &shape).await {
+    if let Some(adopted) = match &release_key {
+        Some(key) => adopt_released(state, user, id, key, &shape).await,
+        None => None,
+    } {
         return Ok(Grant {
             play_session_id: adopted.play_session_id,
             item_wire_id: adopted.item_wire_id,
             negotiated,
             stream_url: adopted.stream_url,
-            audio_stream_index: shape.audio,
-            subtitle_stream_index: shape.subtitle,
+            audio_stream_index: adopted.audio,
+            subtitle_stream_index: adopted.subtitle,
             remembers_tracks: adopted.remembers_tracks,
             item_id: id,
             version: r.version.to_owned(),
@@ -1893,8 +1917,8 @@ pub async fn grant(
         item_wire_id,
         negotiated,
         stream_url,
-        audio_stream_index: shape.audio,
-        subtitle_stream_index: shape.subtitle,
+        audio_stream_index: audio.index,
+        subtitle_stream_index: styled_pick.or(subtitle),
         remembers_tracks: item.edition.is_none(),
         item_id: id,
         version: r.version.to_owned(),
@@ -1912,16 +1936,10 @@ async fn adopt_released(
     state: &AppState,
     user: &pharos_core::User,
     item: u64,
-    r: &GrantRequest<'_>,
+    key: &crate::pending_release::ReleaseKey,
     shape: &crate::pending_release::StreamShape,
 ) -> Option<crate::pending_release::Released> {
-    let key = crate::pending_release::ReleaseKey {
-        user: user.id,
-        device: r.device?.clone(),
-        item,
-        version: r.version.to_owned(),
-    };
-    let claim = state.pending_releases.claim(&key)?;
+    let claim = state.pending_releases.claim(key)?;
     if let Some(why) = claim.mismatch(shape) {
         claim.reject(why);
         return None;
