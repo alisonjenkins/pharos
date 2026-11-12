@@ -467,6 +467,16 @@ fn plan_track(
     let refetch_target = state.seek_target_ms.is_some()
         && !state.seek_refetched
         && !point_buffered(track_buffered, anchor_ms);
+    // Appends only count against a segment that stays unbuffered.
+    if let Some((idx, _)) = state.appends {
+        if state
+            .segments
+            .get(idx)
+            .is_some_and(|seg| is_segment_covered(seg, track_buffered))
+        {
+            state.appends = None;
+        }
+    }
     let mut found = None;
     for idx in start_idx..state.segments.len() {
         let Some(seg) = state.segments.get(idx) else {
@@ -871,6 +881,37 @@ mod tests {
                 index: 1
             }),
             "{fetched:?}"
+        );
+    }
+
+    // B1394: a segment appended on two successive rounds that was covered in
+    // between (then evicted) is fetched again, not given up without a request.
+    #[test]
+    fn appends_are_forgotten_once_the_segment_is_seen_covered() {
+        let segs = make_segments(&[6_000]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let empty = Buffered::default();
+        let covered = Buffered {
+            video: vec![(0, 6_000)],
+            audio: Vec::new(),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                planner.tick(1_000, &empty),
+                vec![Action::Fetch {
+                    track: Track::Video,
+                    index: 0
+                }]
+            );
+            planner.appended(Track::Video);
+            planner.tick(1_000, &covered);
+        }
+        assert_eq!(
+            planner.tick(1_000, &empty),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 0
+            }]
         );
     }
 
