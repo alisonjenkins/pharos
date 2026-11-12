@@ -825,6 +825,16 @@ impl Media {
     pub fn has_data(&self) -> bool {
         !self.seeking && self.ready >= HAVE_FUTURE_DATA
     }
+
+    /// Where the media had data up to from the play head when this state
+    /// arrived, for the seek bar's buffered range (B1386); 0 in a gap, as
+    /// the browser's [`buffered_to_ms`](super::platform) answers.
+    pub fn buffered_to_ms(&self) -> u64 {
+        if self.fwd == 0 {
+            return 0;
+        }
+        secs_to_ms(self.pos).saturating_add(self.fwd)
+    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1719,6 +1729,30 @@ mod tests {
         assert!(!waiting.has_data());
         let live = Media { dur: None, ..m };
         assert_eq!(live.duration_ms(), 0);
+    }
+
+    /// B1386 (V1356): the TV's seek bar draws the buffered range from the
+    /// play head the page reported, and none in a gap.
+    #[test]
+    fn the_buffered_range_ends_where_the_page_said_data_runs_out() {
+        let v = serde_json::json!({"t": "media", "id": "v", "pos": 10.0, "dur": 20.0,
+            "paused": true, "ended": false, "seeking": false, "ready": 4, "vol": 1.0,
+            "muted": false, "ev": "progress", "fwd": 6500});
+        let Some(Bridge::Media(m)) = parse_bridge(&v) else {
+            panic!("not media");
+        };
+        assert_eq!(m.buffered_to_ms(), 16_500);
+        let gap = Media { fwd: 0, ..m };
+        assert_eq!(
+            gap.buffered_to_ms(),
+            0,
+            "a gap at the play head draws no range"
+        );
+        assert_eq!(
+            signal_of("progress", false),
+            None,
+            "a progress is not a trace signal"
+        );
     }
 
     /// B1367: the page sends the event type, network state and forward

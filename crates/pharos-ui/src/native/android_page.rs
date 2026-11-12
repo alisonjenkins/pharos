@@ -755,8 +755,10 @@ pub fn page_visible() -> bool {
     true
 }
 
-pub fn buffered_to_ms(_id: &str) -> u64 {
-    0
+/// Where the media `id` has data up to from its play head, as the page's
+/// last event for it said (B1386); 0 when none does or it is gone.
+pub fn buffered_to_ms(id: &str) -> u64 {
+    media(id).map_or(0, |(m, _)| m.buffered_to_ms())
 }
 
 pub fn element_width(_id: &str) -> f64 {
@@ -2421,6 +2423,9 @@ window.__pharosSend = send;
 // a second for a video, four times for a song, whose karaoke wipe and line
 // changes need them (B1030).
 const ticked = {};
+// The last `progress` sent for each element: download progress feeds only
+// the seek bar's buffered range, so once a second is plenty (B1386).
+const progressed = {};
 // The element's buffered ranges in whole ms.
 const rangesOf = (v) => {
   const out = [];
@@ -2440,6 +2445,13 @@ const media = (e) => {
     if (now - (ticked[v.id] || 0) < every) return;
     ticked[v.id] = now;
     tick = true;
+  }
+  if (e.type === 'progress') {
+    // Never a Dioxus event, which would hold the WebView until Rust answers.
+    e.stopPropagation();
+    const now = performance.now();
+    if (now - (progressed[v.id] || 0) < 1000) return;
+    progressed[v.id] = now;
   }
   // Media buffered ahead of the play head; a stall also names where it ends.
   const here = Math.round(v.currentTime * 1000);
@@ -2464,7 +2476,7 @@ const media = (e) => {
 };
 for (const name of ["timeupdate", "play", "playing", "pause", "waiting", "canplay",
   "loadedmetadata", "durationchange", "seeking", "seeked", "ended", "volumechange",
-  "ratechange", "emptied"]) {
+  "ratechange", "emptied", "progress"]) {
   document.addEventListener(name, media, true);
 }
 // Leaving the app (Home, another app, the TV's input switch) hides the
