@@ -3911,6 +3911,7 @@ fn prewarm_cold_start(
             resume_secs = resume_ticks as f64 / 1e7,
             prewarm.base = base,
             prewarm.count = COLD_START_PREWARM_SEGS,
+            prewarm.init_seg = demuxed_cmaf && base > 0,
             prewarm.total_segs = total_segs,
             resumed = resume_ticks > 0,
             demuxed_cmaf,
@@ -3936,7 +3937,18 @@ fn prewarm_cold_start(
             }
         };
         let session_cap = decision_video_cap(&session.decision);
-        for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
+        // V1365 — the demuxed rungs' init is the moov of segment 0, so a resume
+        // that warms only `base..` leaves the init's encode as the first thing
+        // the player waits on. Segment 0 goes in after the base, never as a
+        // statement of where the stream begins.
+        let init_seg = (demuxed_cmaf && base > 0).then_some(0);
+        let segs = (base..(base + COLD_START_PREWARM_SEGS).min(total_segs)).chain(init_seg);
+        for seg in segs {
+            let seeds_playhead = if init_seg == Some(seg) {
+                PlayheadSeed::Observes
+            } else {
+                PlayheadSeed::StatesTheStart
+            };
             let state = state.clone();
             let item = item.clone();
             let session = session.clone();
@@ -4008,7 +4020,7 @@ fn prewarm_cold_start(
                         // This is the one caller that KNOWS where this stream
                         // begins: `base` came from the resume position, and no
                         // interactive request has touched the stream yet.
-                        PlayheadSeed::StatesTheStart,
+                        seeds_playhead,
                     )
                     .await
                 {
@@ -7181,9 +7193,15 @@ mod prewarm_edition_tests {
         let (state, root, _edition) = seed(td.path()).await;
         let resume = 300_000_000_u64; // 30 s
         let grant = native_grant(&state, resume).await;
-        let want = COLD_START_PREWARM_SEGS as usize;
+        // The three segments from the resume point, plus segment 0 because the
+        // CMAF init is its moov (V1365).
+        let want = COLD_START_PREWARM_SEGS as usize + 1;
         let names = warmed(&root, want).await;
         assert_eq!(names.len(), want, "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("0-")),
+            "a resume warms segment 0, which the init request is served from: {names:?}"
+        );
 
         // The client's first request: the segment containing the resume point,
         // on the h264 CMAF route, with the query the master URL carries.
