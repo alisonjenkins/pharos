@@ -12,6 +12,7 @@
 //! server, abandoned segments don't leak processes.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::prefetch_pacer::PrefetchJob;
 use crate::{
     api::jellyfin::auth_extractor::{extract_token, AuthUser},
     api::jellyfin::fmp4,
@@ -19,6 +20,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
+use futures_util::FutureExt;
 use pharos_cache::HlsSegmentCache;
 use pharos_core::{PlaySessionId, Prober};
 use pharos_scanner::FfmpegProber;
@@ -3922,15 +3924,17 @@ const PREFETCH_BURN_MAX: usize = 4;
 /// Prefetch one segment into the HLS cache with the client's REAL subtitle
 /// selection (`wanted_burn`, pre-gate), then gate it per THIS segment's
 /// window — so the cached bytes match the exact key the client will request.
-/// Spawned fire-and-forget.
-fn spawn_one_prefetch(
+/// Returned as a job for the session's [`PrefetchPacer`], which decides when
+/// it runs; [`spawn_one_prefetch`] runs one straight away for a request with
+/// no play session (nothing to pace it under).
+fn prefetch_job(
     state: &web::Data<AppState>,
     item: &pharos_core::MediaItem,
     seg: u32,
     opts: &SegmentOpts,
     wanted_burn: Option<u32>,
     psid: Option<&str>,
-) -> tokio::task::JoinHandle<()> {
+) -> PrefetchJob {
     let state = state.clone();
     let item = item.clone();
     let mut o = opts.clone();
@@ -3952,46 +3956,59 @@ fn spawn_one_prefetch(
     // missed and encoded live, hanging exactly when the subtitle appeared.
     o.burn_subtitle_stream_index = wanted_burn;
     o.burn_intent = wanted_burn.is_some();
-    // actix arbiter spawn: the future awaits I/O + the scheduler channel
-    // (the encode runs in the transcode worker pool, not here), so it
-    // yields the worker immediately and never blocks request handling.
+    // The future awaits I/O + the scheduler channel (the encode runs in the
+    // transcode worker pool, not here), so it yields the worker immediately and
+    // never blocks request handling.
     //
-    // The handle is returned so the caller can register it for session-scoped
-    // cancellation (episode swap / stop) — see PrefetchRegistry. Aborting it
-    // drops this task's `segment_bytes_keyed` future, and so the only receiver
+    // Its task handle is registered for session-scoped cancellation (episode
+    // swap / stop) — see PrefetchRegistry. Aborting it drops this `segment_bytes_keyed` future, and so the only receiver
     // it holds on the segment's shared-result registration; the segment cache
     // stops the ENCODE when the last such receiver goes
     // (`await_last_requester_gone`), which is what closes the scheduler job's
     // `oneshot` and gets it collected as `QueueOutcome::Abandoned` (V58). The
     // encode survives an abort while any OTHER requester is still waiting on
     // the same segment, which is the point of the shared result.
-    actix_web::rt::spawn(async move {
-        // Gate for THIS segment's window (sparse tracks flip burn on/off
-        // between segments; the cache key follows the burn index).
-        gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
-        let Some(cache) = state.hls.as_ref() else {
-            return;
-        };
-        if let Err(e) = cache
-            .segment_bytes_keyed(
-                item.id,
-                seg,
-                o.audio_source_stream_index,
-                o.burn_subtitle_stream_index,
-                &item.path,
-                item.edition.as_deref(),
-                &o,
-                JobClass::Background,
-                stream,
-                // An ordinary guess, relative to a playhead somebody else
-                // established. It may not state one of its own.
-                PlayheadSeed::Observes,
-            )
-            .await
-        {
-            tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
+    Box::new(move || {
+        async move {
+            // Gate for THIS segment's window (sparse tracks flip burn on/off
+            // between segments; the cache key follows the burn index).
+            gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
+            let Some(cache) = state.hls.as_ref() else {
+                return;
+            };
+            if let Err(e) = cache
+                .segment_bytes_keyed(
+                    item.id,
+                    seg,
+                    o.audio_source_stream_index,
+                    o.burn_subtitle_stream_index,
+                    &item.path,
+                    item.edition.as_deref(),
+                    &o,
+                    JobClass::Background,
+                    stream,
+                    // An ordinary guess, relative to a playhead somebody else
+                    // established. It may not state one of its own.
+                    PlayheadSeed::Observes,
+                )
+                .await
+            {
+                tracing::debug!(media.id = item.id, seg, error = %e, "segment prefetch failed");
+            }
         }
+        .boxed_local()
     })
+}
+
+/// A prefetch with no play session: spawned at once, unpaced and untracked.
+fn spawn_one_prefetch(
+    state: &web::Data<AppState>,
+    item: &pharos_core::MediaItem,
+    seg: u32,
+    opts: &SegmentOpts,
+    wanted_burn: Option<u32>,
+) -> tokio::task::JoinHandle<()> {
+    actix_web::rt::spawn(prefetch_job(state, item, seg, opts, wanted_burn, None)())
 }
 
 async fn spawn_segment_prefetch(
@@ -4041,10 +4058,29 @@ async fn spawn_segment_prefetch(
     // Near shallow prefetch: the next few segments, all of them (fast).
     let near = prefetch_target_segments(base_seg, total_segs, ahead);
     let near_end = base_seg + ahead;
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = near
-        .iter()
-        .map(|seg| spawn_one_prefetch(state, item, *seg, opts, wanted_burn, psid))
-        .collect();
+    // A session's prefetch goes through its pacer: at most
+    // MAX_PREFETCH_IN_FLIGHT encodes at once, nearest first, so the segment
+    // the client needs next never shares the GPU with the ones farther ahead.
+    let pacer = psid.map(|p| state.prefetch_tasks.pacer(p, item.id));
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    match &pacer {
+        Some(pacer) => {
+            let jobs = near
+                .iter()
+                .map(|seg| {
+                    (
+                        *seg,
+                        prefetch_job(state, item, *seg, opts, wanted_burn, psid),
+                    )
+                })
+                .collect();
+            handles.extend(pacer.retarget(base_seg, jobs));
+        }
+        None => handles.extend(
+            near.iter()
+                .map(|seg| spawn_one_prefetch(state, item, *seg, opts, wanted_burn)),
+        ),
+    }
 
     // B51 — window-aware deep prefetch: when a subtitle is selected, look
     // past the near window for the upcoming SLOW burn segments and front-
@@ -4056,6 +4092,7 @@ async fn spawn_segment_prefetch(
         let item_c = item.clone();
         let opts_c = opts.clone();
         let psid_owned = psid.map(str::to_string);
+        let pacer_c = pacer.clone();
         let media_id = item.id;
         let deep = actix_web::rt::spawn(async move {
             let mtime = pharos_cache::subtitle_cache::mtime_secs(&item_c.path).await;
@@ -4076,19 +4113,29 @@ async fn spawn_segment_prefetch(
                 item_c.probe.frame_rate_mille,
                 PREFETCH_BURN_MAX,
             );
-            let inner: Vec<tokio::task::JoinHandle<()>> = targets
-                .iter()
-                .map(|seg| {
-                    spawn_one_prefetch(
-                        &state_c,
-                        &item_c,
-                        *seg,
-                        &opts_c,
-                        wanted_burn,
-                        psid_owned.as_deref(),
-                    )
-                })
-                .collect();
+            let inner: Vec<tokio::task::JoinHandle<()>> = match &pacer_c {
+                Some(pacer) => {
+                    let jobs = targets
+                        .iter()
+                        .map(|seg| {
+                            let job = prefetch_job(
+                                &state_c,
+                                &item_c,
+                                *seg,
+                                &opts_c,
+                                wanted_burn,
+                                psid_owned.as_deref(),
+                            );
+                            (*seg, job)
+                        })
+                        .collect();
+                    pacer.extend(base_seg, jobs).into_iter().collect()
+                }
+                None => targets
+                    .iter()
+                    .map(|seg| spawn_one_prefetch(&state_c, &item_c, *seg, &opts_c, wanted_burn))
+                    .collect(),
+            };
             // Append only if the session is STILL on this media — the scan above
             // is async, so it may have swapped episodes meanwhile; then these
             // late tasks are aborted instead of resurrecting abandoned work.
