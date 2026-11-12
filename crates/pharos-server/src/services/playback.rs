@@ -1698,7 +1698,7 @@ pub async fn start_tracks(
 /// authorizes its stream, as `/Items/{id}/PlaybackInfo` does for a
 /// Jellyfin client: the same access check, decision, metric and session.
 pub async fn grant(
-    state: &AppState,
+    state: &actix_web::web::Data<AppState>,
     user: &pharos_core::User,
     id: u64,
     r: &GrantRequest<'_>,
@@ -1759,6 +1759,7 @@ pub async fn grant(
     } else {
         user_data.last_played_position_ticks
     };
+    let mut delivery_renditions: Vec<String> = Vec::new();
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
             "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}{source_param}",
@@ -1768,25 +1769,28 @@ pub async fn grant(
                 "audio"
             },
         ),
-        _ => delivery(
-            &negotiated,
-            &DeliveryRequest {
-                profile: &profile,
-                probe: &item.probe,
-                item_wire_id: &item_wire_id,
-                source_param: &source_param,
-                play_session_id: &play_session_id,
-                audio_stream_index: audio.index.map(|i| i.to_string()),
-                explicit_subtitle_index: requested_subtitle,
-                is_web_client: false,
-                resume_ticks,
-                transcoding: true,
-                size_limits: pharos_transcode::SizeLimits::default(),
-            },
-        )
-        .transcoding_url
-        .and_then(|url| ensure_audio_index_param(Some(url), audio.index))
-        .unwrap_or_default(),
+        _ => {
+            let d = delivery(
+                &negotiated,
+                &DeliveryRequest {
+                    profile: &profile,
+                    probe: &item.probe,
+                    item_wire_id: &item_wire_id,
+                    source_param: &source_param,
+                    play_session_id: &play_session_id,
+                    audio_stream_index: audio.index.map(|i| i.to_string()),
+                    explicit_subtitle_index: requested_subtitle,
+                    is_web_client: false,
+                    resume_ticks,
+                    transcoding: true,
+                    size_limits: pharos_transcode::SizeLimits::default(),
+                },
+            );
+            delivery_renditions = d.renditions;
+            d.transcoding_url
+                .and_then(|url| ensure_audio_index_param(Some(url), audio.index))
+                .unwrap_or_default()
+        }
     };
     let holder = pharos_core::SessionHolder {
         user_id: user.id,
@@ -1798,9 +1802,41 @@ pub async fn grant(
         id,
         &negotiated,
         &item.probe,
-        holder,
+        holder.clone(),
     )
     .await;
+    // The client will not ask for segment 0 until its player has loaded the
+    // master, so warm the opening segments now, off its critical path. The
+    // URL is the one handed back, so the prewarm derives the keys the same
+    // way the client's requests will.
+    let transcoding_url =
+        (!matches!(negotiated.decision, Decision::DirectPlay)).then_some(stream_url.as_str());
+    let renditions = delivery_renditions;
+    crate::api::jellyfin::hls::prewarm_negotiated(
+        state,
+        crate::api::jellyfin::hls::NegotiatedPrewarm {
+            route: crate::api::jellyfin::hls::PrewarmRoute::Native,
+            media_id: id,
+            negotiated: &negotiated,
+            transcoding_url,
+            renditions: &renditions,
+            probe: &item.probe,
+            holder,
+            play_session_id: &play_session_id,
+            resume_ticks,
+            // Native clients play through hls.js in a browser engine, so their
+            // media requests send a Mozilla user agent and `master_playlist`
+            // serves them the demuxed h264 CMAF master.
+            fetches_as_browser: true,
+            is_audio: !negotiated.is_video,
+            media_source_id: item.edition.is_some().then(|| {
+                format!(
+                    "{item_wire_id}-{}",
+                    item.edition.as_deref().unwrap_or_default()
+                )
+            }),
+        },
+    );
     negotiated.record();
     tracing::info!(
         media.id = id,
