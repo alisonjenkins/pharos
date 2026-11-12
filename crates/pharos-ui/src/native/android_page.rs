@@ -2457,7 +2457,8 @@ const media = (e) => {
       if (!trailing[v.id]) {
         trailing[v.id] = setTimeout(() => {
           trailing[v.id] = 0;
-          media({ type: 'progress', target: v, stopPropagation() {} });
+          // A replaced element must not overwrite its successor's state.
+          if (v.isConnected) media({ type: 'progress', target: v, stopPropagation() {} });
         }, wait);
       }
       return;
