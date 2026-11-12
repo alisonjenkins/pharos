@@ -1033,6 +1033,110 @@ pub(crate) async fn pre_extract_subtitles(
     );
 }
 
+/// Start extracting the subtitle track a negotiation selected, so the player's
+/// first `Stream.vtt` / `stream.ass` fetch reads the cache instead of demuxing
+/// the whole source (p95 ~13 s cold). One track, one source open, through the
+/// same per-key lock and cache as the request path, so a request arriving
+/// meanwhile waits on this extraction rather than starting its own. Nothing
+/// new is held in memory: the result lands in the bounded subtitle cache.
+/// Sidecars, image tracks and generated styled tracks have nothing to extract.
+pub(crate) fn warm_selected_subtitle(
+    state: &actix_web::web::Data<AppState>,
+    media_id: u64,
+    media_source_id: Option<String>,
+    stream_index: u32,
+) {
+    if state.subtitles.is_none() {
+        return;
+    }
+    let state = state.clone();
+    actix_web::rt::spawn(async move {
+        let started = std::time::Instant::now();
+        let (kind, temp, outcome) =
+            match warm_selected_subtitle_inner(&state, media_id, media_source_id, stream_index)
+                .await
+            {
+                Ok((kind, temp)) => (kind, temp, "ok"),
+                Err(skip) => ("none", "skipped", skip),
+            };
+        metrics::counter!(
+            "pharos_subtitle_prewarm_total",
+            "kind" => kind, "temp" => temp, "outcome" => outcome
+        )
+        .increment(1);
+        tracing::info!(
+            media.id = media_id,
+            idx = stream_index,
+            kind,
+            temp,
+            outcome,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "subtitle prewarm"
+        );
+    });
+}
+
+/// `Ok((kind, temp))` when the track is now cached (`temp` says whether this
+/// call extracted it), `Err(reason)` when there was nothing to do or it failed.
+async fn warm_selected_subtitle_inner(
+    state: &AppState,
+    media_id: u64,
+    media_source_id: Option<String>,
+    stream_index: u32,
+) -> Result<(&'static str, &'static str), &'static str> {
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Prewarm,
+        media_id,
+        media_source_id.as_deref(),
+    )
+    .await
+    .map_err(|_| "item_unloadable")?;
+    if stream_index >= sidecar_base_index(&item.probe) {
+        return Err("not_embedded");
+    }
+    let Some(cache) = state.subtitles.as_ref() else {
+        return Err("no_cache");
+    };
+    let codec = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.stream_index == stream_index)
+        .and_then(|t| t.codec.as_deref())
+        .ok_or("unknown_track")?;
+    if is_image_subtitle_codec(codec) {
+        return Err("image_track");
+    }
+    let styled = is_styled_text_subtitle_codec(codec);
+    let (kind, store_kind) = if styled {
+        ("ass", SubtitleKind::EmbeddedAss)
+    } else {
+        ("vtt", SubtitleKind::Embedded)
+    };
+    let mtime = mtime_secs(&item.path).await;
+    if cache
+        .get(&item.path, mtime, stream_index, store_kind)
+        .await
+        .is_some()
+    {
+        return Ok((kind, "warm"));
+    }
+    let permit = BgPermit::playback_priority();
+    let extracted = if styled {
+        embedded_ass_script(Some(cache), &item, stream_index, &permit)
+            .await
+            .map(drop)
+    } else {
+        embedded_vtt_inner(Some(cache), &item, stream_index, &permit)
+            .await
+            .1
+            .map(drop)
+    };
+    extracted.map_err(|_| "extract_failed")?;
+    Ok((kind, "cold"))
+}
+
 /// Whether a track that produced no output should be remembered as EMPTY.
 /// Only when ffmpeg finished cleanly: then the source was read end to end and
 /// the track genuinely has nothing. A non-zero exit (a source that would not
@@ -2606,6 +2710,97 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// V1366 — the selected track is extracted at negotiate time, so the
+    /// player's first fetch is a cache read; image tracks and unknown indices
+    /// are skipped with their reason, and every verdict is counted.
+    #[test]
+    fn a_negotiated_subtitle_is_prewarmed_and_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_core::{MediaItem, MediaProbe, MediaStore, SubtitleTrack};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            actix_web::rt::System::new().block_on(async {
+                let td = TempDir::new().unwrap();
+                let path = td.path().join("Film.mkv");
+                tokio::fs::write(&path, b"x").await.unwrap();
+                let track = |i, codec: &str| SubtitleTrack {
+                    stream_index: i,
+                    codec: Some(codec.into()),
+                    ..Default::default()
+                };
+                let stores = crate::state::Stores::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                stores
+                    .put(MediaItem {
+                        id: 7,
+                        path: path.clone(),
+                        probe: MediaProbe {
+                            subtitle_tracks: vec![
+                                track(2, "subrip"),
+                                track(3, "hdmv_pgs_subtitle"),
+                            ],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let cache = pharos_cache::SubtitleCache::new(1 << 20, 16);
+                let mtime = mtime_secs(&path).await;
+                cache
+                    .store(
+                        &path,
+                        mtime,
+                        2,
+                        SubtitleKind::Embedded,
+                        b"WEBVTT\n".to_vec(),
+                    )
+                    .await;
+                let state =
+                    web::Data::new(AppState::new(stores, "t".into()).with_subtitle_cache(cache));
+                warm_selected_subtitle(&state, 7, None, 2);
+                warm_selected_subtitle(&state, 7, None, 3);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            })
+        });
+        let count = |temp: &str, outcome: &str| -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(ck, _, _, v)| {
+                    let k = ck.key();
+                    let has = |l: &str| {
+                        k.labels()
+                            .any(|x| format!("{}={}", x.key(), x.value()) == l)
+                    };
+                    match v {
+                        DebugValue::Counter(n)
+                            if k.name() == "pharos_subtitle_prewarm_total"
+                                && has(&format!("temp={temp}"))
+                                && has(&format!("outcome={outcome}")) =>
+                        {
+                            Some(n)
+                        }
+                        _ => None,
+                    }
+                })
+                .sum()
+        };
+        assert_eq!(
+            count("warm", "ok"),
+            1,
+            "the cached text track is a warm prewarm"
+        );
+        assert_eq!(
+            count("skipped", "image_track"),
+            1,
+            "an image track has nothing to extract, and says so"
+        );
+    }
 
     /// V1366 — an embedded subtitle request says whether it paid the demux.
     #[test]
