@@ -568,8 +568,13 @@ fn first_fields(first: Option<FirstSegment>) -> [(&'static str, String); 4] {
     ]
 }
 
-fn line_of(prefix: &str, fields: &[(&'static str, String)]) -> String {
-    let mut line = format!("pharos: playback {prefix} engine=rust");
+/// The `engine` field of reports from the Rust HLS engine (`hls_web`).
+pub const ENGINE_RUST: &str = "rust";
+/// The `engine` field of reports from the Android hls.js engine.
+pub const ENGINE_HLSJS: &str = "hlsjs";
+
+fn line_of(prefix: &str, engine: &str, fields: &[(&'static str, String)]) -> String {
+    let mut line = format!("pharos: playback {prefix} engine={engine}");
     for (k, v) in fields {
         line.push(' ');
         line.push_str(k);
@@ -675,10 +680,10 @@ impl Report {
         }
     }
 
-    /// The console line (V690).
-    pub fn line(&self) -> String {
+    /// The console line (V690), tagged with the engine that produced it.
+    pub fn line(&self, engine: &str) -> String {
         let (prefix, _, _, fields) = self.parts();
-        line_of(prefix, &fields)
+        line_of(prefix, engine, &fields)
     }
 
     /// Info lines go to `console.info`, the rest to `console.warn`.
@@ -687,10 +692,10 @@ impl Report {
     }
 
     /// The client event, with the same fields as the line (V690).
-    pub fn event(&self, route: String) -> ClientEvent {
+    pub fn event(&self, route: String, engine: &str) -> ClientEvent {
         let (_, kind, level, fields) = self.parts();
         let mut all = Vec::with_capacity(fields.len() + 1);
-        all.push(("engine", "rust".to_owned()));
+        all.push(("engine", engine.to_owned()));
         all.extend(fields);
         ClientEvent {
             kind,
@@ -1025,7 +1030,10 @@ mod tests {
         let mut t = started(0);
         t.observe(Signal::Waiting, &clip(1_000, 900));
         let out = t.finish(Flush::Fatal, 2_000);
-        let kinds: Vec<_> = out.iter().map(|r| r.event(String::new()).kind).collect();
+        let kinds: Vec<_> = out
+            .iter()
+            .map(|r| r.event(String::new(), ENGINE_RUST).kind)
+            .collect();
         assert_eq!(
             kinds,
             [
@@ -1034,9 +1042,9 @@ mod tests {
             ]
         );
         for report in &out {
-            let event = report.event("/watch/x".to_owned());
+            let event = report.event("/watch/x".to_owned(), ENGINE_RUST);
             assert_eq!(field(&event, "engine"), "rust");
-            let line = report.line();
+            let line = report.line(ENGINE_RUST);
             assert!(line.contains("engine=rust"), "{line}");
             for (k, v) in &event.fields {
                 assert!(
@@ -1045,9 +1053,25 @@ mod tests {
                 );
             }
         }
-        let start = PlayTrace::new(0, 0).finish(Flush::Closed, 1)[0].event(String::new());
+        let start =
+            PlayTrace::new(0, 0).finish(Flush::Closed, 1)[0].event(String::new(), ENGINE_RUST);
         assert_eq!(start.kind, ClientEventKind::PlaybackStart);
         assert_eq!(field(&start, "end"), "abandoned");
+    }
+
+    /// V1337: a report labelled for the hls.js engine says so in both the
+    /// event and the line, never `rust`.
+    #[test]
+    fn an_hlsjs_report_carries_its_engine_label() {
+        let out = PlayTrace::new(0, 0).finish(Flush::Closed, 1);
+        assert!(!out.is_empty());
+        for report in &out {
+            let event = report.event(String::new(), ENGINE_HLSJS);
+            assert_eq!(field(&event, "engine"), "hlsjs");
+            let line = report.line(ENGINE_HLSJS);
+            assert!(line.contains(" engine=hlsjs "), "{line}");
+            assert!(!line.contains("engine=rust"), "{line}");
+        }
     }
 
     #[test]

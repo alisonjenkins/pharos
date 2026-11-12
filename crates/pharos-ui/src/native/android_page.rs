@@ -34,7 +34,7 @@ use super::tv_page::{self, Bridge, Paths};
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
-use super::hls_trace::{Flush, PlayTrace, Report};
+use super::hls_trace::{Flush, PlayTrace, Report, ENGINE_HLSJS};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     Engine, FailureKind, Fatal, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine,
@@ -1388,11 +1388,11 @@ impl HlsJs {
 fn emit_trace(reports: Vec<Report>) {
     for report in reports {
         if report.is_warn() {
-            warn(&report.line());
+            warn(&report.line(ENGINE_HLSJS));
         } else {
-            info(&report.line());
+            info(&report.line(ENGINE_HLSJS));
         }
-        report_event(report.event(current_path()));
+        report_event(report.event(current_path(), ENGINE_HLSJS));
     }
 }
 
