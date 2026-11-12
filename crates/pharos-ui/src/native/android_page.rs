@@ -82,7 +82,10 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     let base = server();
     let started = now_ms();
     let (client, system, closed) = android::connect(&base).await.map_err(|e| {
-        log::warn!("pharos: open failed server={base} error={e}");
+        log::warn!(
+            "pharos: open failed server={base} error={e} connect_ms={:.0}",
+            now_ms() - started
+        );
         OpenError::NotOpened(Probe::Failed(e))
     })?;
     let connected = now_ms();
@@ -91,10 +94,11 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     // capability probe is a WebView round trip and the other two are RPCs.
     let token = android::load_token();
     let probe = async {
-        if lock(&CAPS).is_none() {
-            probe_capabilities().await;
+        if lock(&CAPS).is_some() {
+            return None;
         }
-        now_ms() - connected
+        probe_capabilities().await;
+        Some(now_ms() - connected)
     };
     let info = async {
         let schema = pharos_client::server_schema_version(&client, call)
@@ -104,21 +108,27 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         (schema, now_ms() - connected)
     };
     let resume = async {
-        let resumed = match &token {
-            Some(token) => Some(android::resume(&client, &closed, call, token).await),
+        match &token {
+            Some(token) => {
+                let resumed = android::resume(&client, &closed, call, token).await;
+                Some((resumed, now_ms() - connected))
+            }
             None => None,
-        };
-        (resumed, now_ms() - connected)
+        }
     };
-    let (probe_ms, (server_schema, server_info_ms), (resumed, resume_ms)) =
+    let (probe_ms, (server_schema, server_info_ms), resumed) =
         futures_util::join!(probe, info, resume);
+    // A step that did not run says so instead of carrying a duration.
+    let ms =
+        |d: Option<f64>, skipped: &str| d.map_or_else(|| skipped.to_owned(), |d| format!("{d:.0}"));
     let timing = format!(
-        "connect_ms={:.0} probe_ms={probe_ms:.0} server_info_ms={server_info_ms:.0} \
-         resume_ms={resume_ms:.0} total_ms={:.0}",
+        "connect_ms={:.0} probe_ms={} server_info_ms={server_info_ms:.0} resume_ms={} total_ms={:.0}",
         connected - started,
+        ms(probe_ms, "cached"),
+        ms(resumed.as_ref().map(|(_, d)| *d), "no_token"),
         now_ms() - started,
     );
-    let Some(resumed) = resumed else {
+    let Some((resumed, _)) = resumed else {
         log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
         return Err(OpenError::NotSignedIn);
     };
