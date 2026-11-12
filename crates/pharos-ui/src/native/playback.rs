@@ -2428,6 +2428,13 @@ pub const HLS_BACK_S: f64 = 10.0;
 /// lengthens the look-ahead of a low-bitrate stream and never caps it.
 pub const HLS_FORWARD_BYTES: f64 = 60_000_000.0;
 
+/// hls.js's `xhrSetup` for a cross-origin page (the TV app), given a `token`
+/// binding. A URL carrying `PlaySessionId` is authorized by that capability
+/// (B1090, V1050), so it goes without the token header: a custom header makes
+/// every new segment URL a CORS-preflighted request, and the preflight cache is
+/// keyed per URL (B1399, V1369).
+pub const HLS_XHR_SETUP: &str = "(xhr, url) => { if (token && !/[?&]PlaySessionId=/i.test(url)) xhr.setRequestHeader('X-Emby-Token', token); }";
+
 /// The buffer settings handed to hls.js, as `(config key, value)`.
 pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
     [
@@ -3097,6 +3104,13 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn hls_xhr_setup_sends_the_token_only_without_a_play_session() {
+        assert!(HLS_XHR_SETUP.contains("[?&]PlaySessionId="));
+        assert!(HLS_XHR_SETUP.contains("setRequestHeader('X-Emby-Token', token)"));
+        assert!(HLS_XHR_SETUP.starts_with("(xhr, url) =>"));
+    }
 
     #[test]
     fn hls_buffer_config_bounds_the_back_buffer_and_lengthens_the_forward_one() {
