@@ -47,7 +47,10 @@ impl MediaRoute {
     /// The media route a registered route pattern (`match_pattern`) belongs
     /// to; `None` for everything that is not HLS or a direct stream.
     pub fn from_pattern(pattern: &str) -> Option<Self> {
-        if pattern.contains("/audio/{id}/stream") || pattern.contains("/videos/{id}/stream") {
+        if pattern.contains("/audio/{id}/stream")
+            || pattern.contains("/audio/{id}/universal")
+            || pattern.contains("/videos/{id}/stream")
+        {
             return Some(Self::Stream);
         }
         if !pattern.contains("/videos/{id}/") {
@@ -206,6 +209,7 @@ mod tests {
             ("/videos/{id}/stream", MediaRoute::Stream),
             ("/videos/{id}/stream.{ext}", MediaRoute::Stream),
             ("/audio/{id}/stream", MediaRoute::Stream),
+            ("/audio/{id}/universal", MediaRoute::Stream),
         ];
         for (pattern, want) in cases {
             assert_eq!(MediaRoute::from_pattern(pattern), Some(want), "{pattern}");
