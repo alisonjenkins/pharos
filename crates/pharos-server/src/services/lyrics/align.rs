@@ -73,6 +73,11 @@ struct Job {
 /// histogram cannot hold a negative) and `outcome` (`aligned` or `failed`).
 const ETA_ERROR_SECONDS: &str = "pharos_lyrics_align_eta_error_seconds";
 
+/// How long a karaoke job waited between queueing and being sent to the
+/// aligner, so other users of the aligner can be shown not to delay karaoke
+/// (spec 040 FR-022).
+const WAIT_SECONDS: &str = "pharos_lyrics_align_wait_seconds";
+
 impl Job {
     /// The estimate given at queueing and the time actually taken, for the
     /// log line; the error between them goes to [`ETA_ERROR_SECONDS`] when
@@ -560,6 +565,7 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
+        metrics::histogram!(WAIT_SECONDS).record(job.queued_at.elapsed().as_secs_f64());
         let answered = self
             .request(&job.path, &job.lines, TIMEOUT, Some((job.id, &job.key)))
             .await?;
@@ -1478,6 +1484,56 @@ mod tests {
         assert_eq!((direction.as_str(), outcome.as_str()), ("late", "aligned"));
         assert!((3.0..4.0).contains(seconds), "{seconds}");
         eta_line(&logs, "lyrics: aligned");
+    }
+
+    /// ODD (spec 040 FR-022): the time a job waited before it was sent is on
+    /// /metrics. Disarm check: with the `histogram!` call at the top of
+    /// `process_job` commented out, this fails.
+    #[tokio::test]
+    async fn a_sent_job_reports_how_long_it_waited() {
+        use crate::services::lyrics::shadow::tests::{body, fake};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let answer = Aligned {
+            lines: vec![vec![WordStamp {
+                at: 0,
+                start_ms: 1000,
+            }]],
+            offset_ms: 0,
+            scores: vec![None],
+        };
+        let (base, _got) = fake(200, body(&answer, 2), None).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Aligner {
+            base,
+            ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
+        };
+        let job = Job {
+            id: 7,
+            path: "a/song.flac".into(),
+            lines: vec![(1000, 2000, "Line one".into())],
+            key: "k".into(),
+            duration_ms: 10_000,
+            queued_at: Instant::now().checked_sub(Duration::from_secs(3)).unwrap(),
+            predicted_ms: None,
+        };
+        aligner.process_job(&job).await.unwrap();
+
+        let waits: Vec<f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == WAIT_SECONDS)
+            .flat_map(|(.., v)| match v {
+                DebugValue::Histogram(h) => h.into_iter().map(|x| x.into_inner()).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert!((3.0..4.0).contains(&waits[0]), "{waits:?}");
     }
 
     /// ODD symmetry: a failed job reports its estimate's error under
