@@ -6393,10 +6393,13 @@ fn Player(
                                 aligned.set(Some((id, next)));
                             }
                         }
-                        // The aligner failed or found no words: keep the
-                        // estimate already on screen.
+                        // The aligner failed or found no words: the guessed
+                        // fill stays, and lines a failed job had already
+                        // timed and its "Timing the words" banner go.
                         Ok(next) if next.lines.iter().all(|l| l.words.is_empty()) => {
                             platform::info("pharos: lyrics word times not found");
+                            words_eta_at.set(None);
+                            aligned.set(Some((id, next)));
                             return;
                         }
                         Ok(next) => {
