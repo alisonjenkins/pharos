@@ -462,13 +462,32 @@ fn skip_given_up(
     if point_buffered(track_buffered, play_ms) {
         return;
     }
-    // Only to the end of this segment, and only when something plays there:
+    // Only to the next segment's data, and only when something plays there:
     // anything fetched in between would be skipped, and the seek aborts it.
-    let next_given_up = state.given_up.contains(&index.saturating_add(1));
-    if !point_buffered(track_buffered, seg_end) && !next_given_up {
+    let next = index.saturating_add(1);
+    let next_given_up = state.given_up.contains(&next);
+    let base_ms = if next_given_up || point_buffered(track_buffered, seg_end) {
+        seg_end
+    } else if let Some(start) = range_of_slice(&state.segments, next)
+        .filter(|_| is_settled(state, next, track_buffered))
+        .and_then(|(_, next_end)| {
+            track_buffered
+                .iter()
+                .map(|&(start, _)| start)
+                .filter(|&start| seg_end <= start && start < next_end)
+                .min()
+        })
+    {
+        start
+    } else {
         return;
-    }
-    let to_ms = seg_end.saturating_add(SKIP_PADDING_MS);
+    };
+    let padded_ms = base_ms.saturating_add(SKIP_PADDING_MS);
+    let to_ms = if point_buffered(track_buffered, padded_ms) {
+        padded_ms
+    } else {
+        base_ms
+    };
     state.seek_target_ms = None;
     actions.push(Action::Skip { to_ms });
     notes.push(Note::Skipped {
