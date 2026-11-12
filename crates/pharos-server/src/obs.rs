@@ -218,11 +218,17 @@ const LONG_RUNNING_SECONDS: &[&str] = &[
     "pharos_scan_duration_seconds",
     "pharos_media_integrity_seconds",
     "pharos_subtitle_styling_seconds",
-    "pharos_lyrics_align_wait_seconds",
 ];
 
 const LONG_SECONDS_BUCKETS: &[f64] = &[
     0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
+
+/// A karaoke job's queue wait: usually milliseconds, minutes behind a long
+/// backlog, so both ends of the ladder matter for comparing p95s.
+const ALIGN_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    120.0, 300.0, 600.0, 1800.0, 3600.0,
 ];
 
 /// Encoded frames per wall second: a software 4K encode manages a handful, a
@@ -301,6 +307,12 @@ pub fn init_with_sampling(
                     .set_buckets_for_metric(Matcher::Full((*name).into()), LONG_SECONDS_BUCKETS)
                     .map_err(|e| ObsError::Prom(e.to_string()))?;
             }
+            builder = builder
+                .set_buckets_for_metric(
+                    Matcher::Full("pharos_lyrics_align_wait_seconds".into()),
+                    ALIGN_WAIT_BUCKETS,
+                )
+                .map_err(|e| ObsError::Prom(e.to_string()))?;
             // Neither name ends in `_seconds`, so without these they would
             // fall through to a summary, which cannot be aggregated across pods.
             builder = builder
@@ -732,6 +744,10 @@ mod tests {
             );
         }
         assert!(bucket_bounds(&body, "pharos_store_query_seconds").contains(&"0.0001".to_string()));
+        assert!(
+            bucket_bounds(&body, "pharos_lyrics_align_wait_seconds").contains(&"0.001".to_string()),
+            "a karaoke wait of a few ms must not share one bucket"
+        );
         let http = bucket_bounds(&body, "http_request_duration_seconds");
         assert!(http.contains(&"30".to_string()) && !http.contains(&"3600".to_string()));
     }
