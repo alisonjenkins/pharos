@@ -2549,6 +2549,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 pharos_server::middleware::sign_image_tags,
             ))
             .wrap(pharos_server::middleware::nosniff())
+            .wrap(pharos_server::middleware::timing_allow_origin())
             .wrap(pharos_server::middleware::CookieBackfill)
             .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
             .wrap(RedMetrics)
