@@ -213,6 +213,7 @@ const LONG_RUNNING_SECONDS: &[&str] = &[
     "pharos_segment_transcode_seconds",
     "pharos_transcode_encode_seconds",
     "pharos_transcode_queue_wait_seconds",
+    "pharos_prefetch_slot_wait_seconds",
     "pharos_transcode_stage_seconds",
     "pharos_scan_duration_seconds",
     "pharos_media_integrity_seconds",
