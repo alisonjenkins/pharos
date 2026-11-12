@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -199,4 +200,115 @@ fn healthz_answers_while_a_song_holds_the_lock_and_songs_queue() {
     open.send(()).unwrap();
     assert_eq!(first.join().unwrap().0, 200);
     assert_eq!(second.join().unwrap().0, 200);
+}
+
+#[test]
+fn a_streamed_song_sends_its_offset_then_each_line_then_the_whole_answer() {
+    let s = serve("stream", silent(), None);
+    let lines = json!({"path": "song.mp3", "lines": [
+        {"start_ms": 1000, "end_ms": 2000, "text": "Hello world"},
+        {"start_ms": 3000, "end_ms": 4000, "text": "..."},
+    ]});
+    let (_, plain) = post(s.addr, &lines);
+    let (status, events) = post_events(s.addr, &lines);
+    assert_eq!(status, 200, "{events:?}");
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["offset", "line", "line", "done"], "{events:?}");
+    assert_eq!(
+        events[0],
+        json!({"event": "offset", "offset_ms": 0, "aligner_version": 5, "lines": 2})
+    );
+    // Each line as it was sent is the line the whole answer ends with.
+    for (i, event) in events[1..3].iter().enumerate() {
+        assert_eq!(event["index"], json!(i));
+        assert_eq!(event["words"], plain["lines"][i]["words"], "{event}");
+        assert_eq!(event["score"], plain["lines"][i]["score"], "{event}");
+    }
+    let mut done = events[3].clone();
+    done.as_object_mut().unwrap().remove("event");
+    assert_eq!(done, plain);
+}
+
+#[test]
+fn a_streamed_song_that_fails_ends_with_the_status_it_would_have_had() {
+    let failing: Decoder = Box::new(|_: &Path, s, e| {
+        Err(DecodeError::Failed {
+            status: std::os::unix::process::ExitStatusExt::from_raw(256),
+            start_ms: s,
+            end_ms: e,
+            stderr: "Invalid data found when processing input".into(),
+        })
+    });
+    let s = serve("stream-ffmpeg", failing, None);
+    let (status, events) = post_events(s.addr, &one_line());
+    assert_eq!(status, 200);
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "error", "{events:?}");
+    assert_eq!(last["status"], 422, "{last}");
+    assert!(
+        last["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ffmpeg failed: "),
+        "{last}"
+    );
+    assert!(events.iter().all(|e| e["event"] != "done"), "{events:?}");
+}
+
+#[test]
+fn a_bad_body_is_still_a_plain_400_when_events_are_asked_for() {
+    let s = serve("stream-bad", silent(), None);
+    let bytes = serde_json::to_vec(&json!({"bad": "data"})).unwrap();
+    let head = format!(
+        "POST /align HTTP/1.1\r\nHost: t\r\nAccept: application/x-ndjson\r\nContent-Length: {}",
+        bytes.len()
+    );
+    assert_eq!(
+        raw(s.addr, &head, &bytes),
+        (400, json!({"error": "path is required"}))
+    );
+}
+
+/// `body` to `/align` asking for the streamed answer (ADR-0121): the status
+/// and each NDJSON event, de-chunked.
+pub fn post_events(addr: SocketAddr, body: &Value) -> (u16, Vec<Value>) {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let head = format!(
+        "POST /align HTTP/1.1\r\nHost: t\r\nAccept: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(&bytes).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let status = text.split(' ').nth(1).unwrap().parse().unwrap();
+    let (headers, mut rest) = text.split_once("\r\n\r\n").unwrap();
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: application/x-ndjson"),
+        "{headers}"
+    );
+    let mut body = String::new();
+    loop {
+        let (size, after) = rest.split_once("\r\n").unwrap();
+        let size = usize::from_str_radix(size.trim(), 16).unwrap();
+        if size == 0 {
+            break;
+        }
+        body.push_str(&after[..size]);
+        rest = &after[size + 2..];
+    }
+    assert!(body.ends_with('\n'), "{body:?}");
+    let events = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (status, events)
 }
