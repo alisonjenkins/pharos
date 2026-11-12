@@ -14,6 +14,7 @@ pub mod cast_sessions;
 #[cfg(target_os = "linux")]
 pub mod child_memory;
 pub mod cli;
+pub mod client_class;
 pub mod client_ip;
 pub mod client_reports;
 pub mod client_spans;
