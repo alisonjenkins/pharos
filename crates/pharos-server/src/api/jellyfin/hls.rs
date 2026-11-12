@@ -3753,6 +3753,18 @@ fn prewarm_skip_reason(
 /// its reason, so a playback that paid the cold encode says why.
 pub(crate) fn prewarm_negotiated(state: &web::Data<AppState>, p: NegotiatedPrewarm<'_>) {
     use crate::api::jellyfin::device_profile::Decision;
+    // The selected text subtitle is fetched by the player right after it
+    // starts; extracting it now, whatever the video rung, takes the whole-source
+    // demux off that first fetch. A track the client cannot render is burned
+    // into the video instead and never fetched.
+    if let Some(idx) = p
+        .transcoding_url
+        .and_then(|u| super::items::query_param(u, "SubtitleStreamIndex"))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|i| !p.negotiated.burn_text_indices.contains(i))
+    {
+        super::subtitles::warm_selected_subtitle(state, p.media_id, p.media_source_id.clone(), idx);
+    }
     if let Some(reason) = prewarm_skip_reason(p.transcoding_url, p.renditions) {
         tracing::info!(
             media.id = p.media_id,
