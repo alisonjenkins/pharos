@@ -90,7 +90,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 - FR-019. `pharos_subtitle_check_total{verdict,reason_class,stage}` counts every finished check. `reason_class` is a bounded `label()` (`fits`, `offset`, `ratio`, `decoy_level`, `segmented`, `language_mismatch`, `script`, `language_untagged`, `too_few_lines`, `aligner_error`, `inconclusive`).
 - FR-020. One log line per track, `subtitle check`, with the item id, track source and index, languages, verdict, the full reason, every probe and decoy score, the offset and ratio tried at each stage, aligner time and coarse-search time. Success and failure carry the same fields (ODD symmetry).
 - FR-021. `pharos_subtitle_check_aligner_seconds` (histogram) records aligner time per check.
-- FR-022. Karaoke contention needs a signal that does not exist today: `pharos_lyrics_align_wait_seconds` (histogram, label `outcome`) records each karaoke job's time from queued to sent to the aligner. It ships first, on its own, so SC-003 has a baseline from before the job runs.
+- FR-022. Karaoke contention needs a signal that does not exist today: `pharos_lyrics_align_wait_seconds` (histogram, no labels) records each karaoke job's time from queued to sent to the aligner. It ships first, on its own, so SC-003 has a baseline from before the job runs.
 
 ## Non-goals
 
