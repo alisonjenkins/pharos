@@ -3586,12 +3586,14 @@ fn prewarm_base_segment(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrewarmRoute {
     Jellyfin,
+    Native,
 }
 
 impl PrewarmRoute {
     pub(crate) fn label(self) -> &'static str {
         match self {
             PrewarmRoute::Jellyfin => "jellyfin",
+            PrewarmRoute::Native => "native",
         }
     }
 }
@@ -6828,5 +6830,139 @@ mod prewarm_edition_tests {
             "every warmed segment must be keyed by the edition's file ({gen}), \
              not the primary's: {names:?}"
         );
+    }
+
+    /// A native client's `grant` must warm the segments its own first request
+    /// reads. Native clients play through hls.js in a browser engine, so they
+    /// are served the demuxed CMAF master; warming mpegts would be wasted
+    /// encoder time and leave the cold encode on the first request.
+    async fn native_grant(
+        state: &web::Data<AppState>,
+        resume_ticks: u64,
+    ) -> crate::services::playback::Grant {
+        use pharos_core::{UserDataStore as _, UserStore as _};
+        let user = pharos_core::User {
+            id: pharos_core::UserId::new(),
+            name: "native".into(),
+            policy: Default::default(),
+            has_password: true,
+        };
+        state
+            .stores
+            .create(pharos_core::UserRecord {
+                id: user.id,
+                name: user.name.clone(),
+                password_hash: pharos_core::SecretString::new("pw"),
+                policy: Default::default(),
+            })
+            .await
+            .unwrap();
+        state
+            .stores
+            .set_user_data(
+                user.id,
+                7,
+                pharos_core::UserItemData {
+                    last_played_position_ticks: resume_ticks,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let caps = crate::services::playback::Capabilities {
+            video_codecs: vec!["h264".into()],
+            audio_codecs: vec!["aac".into()],
+            containers: vec!["mp4".into()],
+            max_bitrate: 0,
+            hdr: true,
+            image_subtitles: Vec::new(),
+        };
+        crate::services::playback::grant(
+            state,
+            &user,
+            7,
+            &crate::services::playback::GrantRequest {
+                capabilities: &caps,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                token: "native-token",
+                client_is_remote: false,
+                version: "",
+            },
+        )
+        .await
+        .ok()
+        .unwrap()
+    }
+
+    #[actix_web::test]
+    async fn a_native_grant_warms_the_cmaf_name_its_first_request_reads() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, _edition) = seed(td.path()).await;
+        let resume = 300_000_000_u64; // 30 s
+        let grant = native_grant(&state, resume).await;
+        let want = COLD_START_PREWARM_SEGS as usize;
+        let names = warmed(&root, want).await;
+        assert_eq!(names.len(), want, "{names:?}");
+
+        // The client's first request: the segment containing the resume point,
+        // on the h264 CMAF route, with the query the master URL carries.
+        let base = prewarm_base_segment(resume, Some(60_000), None).unwrap();
+        assert!(base > 0, "a resume starts past segment 0");
+        assert!(
+            names.iter().any(|n| n.starts_with(&format!("{base}-"))),
+            "the resume segment {base} is warmed: {names:?}"
+        );
+        let qs = grant.stream_url.split_once('?').unwrap().1;
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = actix_web::test::TestRequest::get()
+            .uri(&format!("/videos/7/h264cmaf/main/{base}.m4s?{qs}"))
+            .to_http_request();
+        let opts =
+            fmp4_segment_opts(&state, &req, &item, base, SegmentVideo::H264, None, None).await;
+        state
+            .hls
+            .as_ref()
+            .unwrap()
+            .segment_bytes_keyed(
+                item.id,
+                base,
+                opts.audio_source_stream_index,
+                opts.burn_subtitle_stream_index,
+                &item.path,
+                item.edition.as_deref(),
+                &opts,
+                JobClass::Interactive,
+                StreamKey::of(&grant.play_session_id),
+                PlayheadSeed::StatesTheStart,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            warmed(&root, want + 1).await.len(),
+            want,
+            "the first request read a prewarmed file instead of encoding its own"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_prewarm_skips_what_the_master_will_not_serve_h264_first() {
+        let h264 = vec!["h264".to_string()];
+        let vp9 = vec!["vp9".to_string()];
+        let master = Some("/videos/7/master.m3u8?renditions=h264");
+        assert_eq!(prewarm_skip_reason(master, &h264), None);
+        assert_eq!(prewarm_skip_reason(None, &h264), Some("no_transcoding_url"));
+        assert_eq!(
+            prewarm_skip_reason(Some("/audio/7/universal?PlaySessionId=p"), &h264),
+            Some("not_hls_master")
+        );
+        assert_eq!(prewarm_skip_reason(master, &vp9), Some("not_h264_first"));
     }
 }
