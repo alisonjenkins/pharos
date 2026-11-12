@@ -2025,3 +2025,51 @@ async fn an_explicit_other_audio_track_is_not_adopted() {
     assert_eq!(second.audio, Some(2));
     assert!(settles_gone(&fx, &first.psid).await);
 }
+
+/// B1397: the token that adopts a released grant becomes the stream's holder:
+/// revoking the old connection's token no longer touches the stream, and
+/// revoking the adopting token ends it.
+/// Disarm check: with the holder left as first negotiated, revoking the old
+/// token closes the stream and revoking the new one does not.
+#[actix_web::test]
+async fn the_adopting_token_holds_the_stream() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let old = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let new_token = fx.state.stores.issue(fx.user_id, "test").await.unwrap();
+    let new_token = new_token.0.expose().to_string();
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let new = crate::revocation::signed_in(&client2, &new_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = play_on(&old, &direct).await.unwrap();
+    drop(grant);
+    let (_grant, adopted) = play_on(&new, &direct).await.unwrap();
+    assert_eq!(adopted.psid, first.psid, "the control: it was adopted");
+
+    let status = || async {
+        test::call_service(&app, test::TestRequest::get().uri(&first.url).to_request())
+            .await
+            .status()
+    };
+    let unauthorized = actix_web::http::StatusCode::UNAUTHORIZED;
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the control: the stream is open"
+    );
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the old token's revocation leaves the adopted stream open"
+    );
+    fx.state.stores.revoke(&new_token).await.unwrap();
+    assert_eq!(
+        status().await,
+        unauthorized,
+        "the adopting token's revocation ends it"
+    );
+}
