@@ -2298,6 +2298,14 @@ window.__pharosSend = send;
 // a second for a video, four times for a song, whose karaoke wipe and line
 // changes need them (B1030).
 const ticked = {};
+// The element's buffered ranges in whole ms.
+const rangesOf = (v) => {
+  const out = [];
+  for (let i = 0; i < v.buffered.length; i++) {
+    out.push([Math.round(v.buffered.start(i) * 1000), Math.round(v.buffered.end(i) * 1000)]);
+  }
+  return out;
+};
 const media = (e) => {
   const v = e.target;
   if (!(v instanceof HTMLMediaElement) || !v.id) return;
@@ -2310,12 +2318,19 @@ const media = (e) => {
     ticked[v.id] = now;
     tick = true;
   }
+  // Media buffered ahead of the play head; a stall also names where it ends.
+  const here = Math.round(v.currentTime * 1000);
+  const ranges = rangesOf(v);
+  const range = ranges.find((r) => r[0] <= here && here < r[1]);
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
   // Only the video JASSUB draws over carries its counters.
   const j = window.__pharosJassub;
   const d = j && j._video === v ? j.debug : null;
   send({
-    t: "media", id: v.id, tick, pos: v.currentTime,
+    t: "media", id: v.id, tick, ev: e.type, ns: v.networkState,
+    fwd: range ? range[1] - here : 0,
+    buffered: e.type === 'waiting' ? ranges.map((r) => r[0] + "-" + r[1]).join(",") : "",
+    pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
     paused: v.paused, ended: v.ended, seeking: v.seeking, ready: v.readyState,
     rate: v.playbackRate, vol: v.volume, muted: v.muted,
