@@ -5340,6 +5340,28 @@ impl TranscodeSessionStore for PostgresStore {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, play_session_id, holder), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
+    async fn update_transcode_session_holder(
+        &self,
+        play_session_id: &str,
+        holder: &pharos_core::SessionHolder,
+        now_unix_secs: i64,
+    ) -> DomainResult<bool> {
+        let done = sqlx::query(
+            "UPDATE transcode_sessions \
+             SET holder_user_id = $1, holder_token_id = $2, updated_at = $3 \
+             WHERE play_session_id = $4",
+        )
+        .bind(holder.user_id.0.simple().to_string())
+        .bind(holder.token_id.as_str())
+        .bind(now_unix_secs)
+        .bind(play_session_id)
+        .execute(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(done.rows_affected() > 0)
+    }
+
     #[tracing::instrument(skip(self, play_session_id), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn get_transcode_session(
         &self,
