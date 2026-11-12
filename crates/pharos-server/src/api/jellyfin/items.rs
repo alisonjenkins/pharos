@@ -2338,7 +2338,6 @@ async fn playback_info(
         ref decision,
         ref direct_play_block,
         downgrade,
-        remote_ceiling,
         ref burn_text_indices,
         explicit_mono,
         profile_rejected_3d,
@@ -2550,61 +2549,23 @@ async fn playback_info(
     // the opening `fragLoadTimeOut` stall (cold ffmpeg spawn on segment 0) is
     // gone. Only when h264 is the rung the client actually starts on (every
     // real browser); a vp9-first client never touches /hls1/main, so skip it.
-    if route == "hls-master" && renditions.first().is_some_and(|c| c == "h264") {
-        // The master URL carries the track picks the segments will ask for.
-        let url = transcoding_url.as_deref().unwrap_or_default();
-        let audio_idx = query_param(url, "AudioStreamIndex").and_then(|v| v.parse::<u32>().ok());
-        let sub_idx = query_param(url, "SubtitleStreamIndex")
-            .and_then(|v| v.parse::<i32>().ok())
-            .filter(|&i| i >= 0)
-            .map(|i| i as u32);
-        let video_bitrate_cap = match &decision {
-            Decision::Transcode {
-                max_video_bitrate_bps,
-                ..
-            } => *max_video_bitrate_bps,
-            _ => remote_ceiling,
-        };
-        crate::api::jellyfin::hls::prewarm_cold_start(
-            &state,
-            crate::transcode_sessions::TranscodeSession {
-                media_id: id,
-                decision: decision.clone(),
-                source_probe: probe.clone(),
-                // The ONLY request on which this client's SubtitleProfiles are
-                // visible. Every segment URL it fetches later carries a bare
-                // SubtitleStreamIndex, so without carrying the verdict forward
-                // the segment handler must assume each one needs burning.
-                burn_subtitle_indices: burn_text_indices.clone(),
-                holder: holder.clone(),
-            },
-            &play_session_id,
-            audio_idx,
-            sub_idx,
-            video_bitrate_cap,
-            // The bounds the URL carries, so the prewarmed segments are keyed
-            // by the size the client's own requests will plan.
-            super::output_size::qs_size_limits(url),
-            // B136 — warm the segments playback will actually START on. This is
-            // the same value that rides `start_position_ticks` in the response
-            // (and, for native players, `StartTimeTicks` on the transcoding
-            // URL), so the prewarm covers the client's first request on a
-            // resume instead of warming the opening it will never fetch.
+    crate::api::jellyfin::hls::prewarm_negotiated(
+        &state,
+        crate::api::jellyfin::hls::NegotiatedPrewarm {
+            route: crate::api::jellyfin::hls::PrewarmRoute::Jellyfin,
+            media_id: id,
+            negotiated: &negotiated,
+            transcoding_url: transcoding_url.as_deref(),
+            renditions: &renditions,
+            probe,
+            holder: holder.clone(),
+            play_session_id: &play_session_id,
             resume_ticks,
-            // B139 — and warm the CONTAINER it will fetch. This mirrors
-            // `master_playlist`'s `demuxed_h264` exactly: a web client whose
-            // first ranked rendition is h264 gets the demuxed all-fMP4 master
-            // and never requests an mpegts segment. `renditions.first()` is
-            // what `select_master_video` reads off the URL this same response
-            // hands back, so the two cannot disagree.
-            is_web_client
-                && !matches!(item.kind, pharos_core::MediaKind::Audio)
-                && renditions.first().is_some_and(|c| c == "h264"),
-            // The edition this response negotiated, or the prewarm reloads the
-            // item's own file and warms segments under the primary's key.
-            item.edition.is_some().then(|| source_id.clone()),
-        );
-    }
+            fetches_as_browser: is_web_client,
+            is_audio: matches!(item.kind, pharos_core::MediaKind::Audio),
+            media_source_id: item.edition.is_some().then(|| source_id.clone()),
+        },
+    );
 
     let sidecars = discover_sidecars(&item.path).await;
     let sidecar_langs: Vec<Option<String>> = sidecars
