@@ -3745,15 +3745,25 @@ fn prewarm_cold_start(
     let stream = StreamKey::of(play_session_id);
     let state = state.clone();
     actix_web::rt::spawn(async move {
-        let Ok(item) = super::media_source::load_named(
+        let item = match super::media_source::load_named(
             &state,
             super::media_source::Route::Prewarm,
             media_id,
             media_source_id.as_deref(),
         )
         .await
-        else {
-            return;
+        {
+            Ok(item) => item,
+            Err(e) => {
+                tracing::info!(
+                    media.id = media_id,
+                    prewarm.route = route.label(),
+                    prewarm.skip_reason = "item_unloadable",
+                    error = %e,
+                    "cold-start prewarm: skipped"
+                );
+                return;
+            }
         };
         let total_segs = item
             .probe
@@ -3787,13 +3797,38 @@ fn prewarm_cold_start(
             "cold-start prewarm: warming from the resume position"
         );
         let Some(base) = base else {
+            tracing::info!(
+                media.id = media_id,
+                prewarm.route = route.label(),
+                prewarm.skip_reason = "resume_off_grid",
+                resume_ticks,
+                duration_ms = item.probe.duration_ms,
+                "cold-start prewarm: skipped"
+            );
             return;
+        };
+        // The same locator serve_segment keys on: a URL-backed item's stored
+        // path is an identity, so warming under it would fill a key no client
+        // request reads and hand ffmpeg a path it cannot open.
+        let source = match transcode_source(&state, &item.path, true).await {
+            Ok(source) => source,
+            Err(e) => {
+                tracing::info!(
+                    media.id = media_id,
+                    prewarm.route = route.label(),
+                    prewarm.skip_reason = "source_unresolved",
+                    error = %e,
+                    "cold-start prewarm: skipped"
+                );
+                return;
+            }
         };
         let session_cap = decision_video_cap(&session.decision);
         for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
             let state = state.clone();
             let item = item.clone();
             let session = session.clone();
+            let source = source.clone();
             actix_web::rt::spawn(async move {
                 let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
                 // B139 — warm the rendition THIS client will actually fetch. A
@@ -3853,7 +3888,7 @@ fn prewarm_cold_start(
                         seg,
                         opts.audio_source_stream_index,
                         opts.burn_subtitle_stream_index,
-                        &item.path,
+                        &source,
                         item.edition.as_deref(),
                         &opts,
                         JobClass::Background,
