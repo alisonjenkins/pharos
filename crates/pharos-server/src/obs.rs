@@ -218,6 +218,7 @@ const LONG_RUNNING_SECONDS: &[&str] = &[
     "pharos_scan_duration_seconds",
     "pharos_media_integrity_seconds",
     "pharos_subtitle_styling_seconds",
+    "pharos_lyrics_align_wait_seconds",
 ];
 
 const LONG_SECONDS_BUCKETS: &[f64] = &[
@@ -718,10 +719,12 @@ mod tests {
         metrics::histogram!("pharos_store_query_seconds", "method" => "m").record(0.0002);
         metrics::histogram!("http_request_duration_seconds", "method" => "GET", "path" => "/x")
             .record(0.2);
+        metrics::histogram!("pharos_lyrics_align_wait_seconds").record(300.0);
         let body = render();
         for long in [
             "pharos_syncplay_hydrate_anchor_age_seconds",
             "pharos_segment_transcode_seconds",
+            "pharos_lyrics_align_wait_seconds",
         ] {
             assert!(
                 bucket_bounds(&body, long).contains(&"3600".to_string()),
