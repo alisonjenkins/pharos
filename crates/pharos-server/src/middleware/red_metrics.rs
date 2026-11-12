@@ -143,6 +143,8 @@ where
         let path = req
             .match_pattern()
             .unwrap_or_else(|| UNMATCHED_PATH.to_string());
+        let media_route = crate::media_telemetry::MediaRoute::from_pattern(&path);
+        let client = crate::client_class::ClientClass::of(req.request());
         let inner = self.inner.clone();
         let start = Instant::now();
         Box::pin(async move {
@@ -162,6 +164,16 @@ where
                 Ok(r) => r.status().as_u16(),
                 Err(_) => 500,
             };
+            if let (Some(route), Ok(r)) = (media_route, &res) {
+                if r.status().as_u16() < 400 {
+                    crate::media_telemetry::record_request(
+                        route,
+                        client,
+                        crate::media_telemetry::cache_outcome(r.request()),
+                        elapsed,
+                    );
+                }
+            }
             metrics::counter!(
                 "http_requests_total",
                 "method" => method.clone(),

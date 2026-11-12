@@ -34,6 +34,7 @@ pub mod item_list_cache;
 pub mod library_watch;
 pub mod local_text;
 pub mod local_time;
+pub mod media_telemetry;
 pub mod metadata_backfill;
 pub mod metadata_language;
 pub mod middleware;
