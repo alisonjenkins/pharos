@@ -12,6 +12,10 @@ const DEFAULT_BACK_MS: u64 = 15_000;
 /// Minimum forward buffer target in milliseconds after quota reductions.
 const DEFAULT_MIN_FORWARD_MS: u64 = 8_000;
 
+/// Appends of one segment that leave it unbuffered before it is given up on: a
+/// refetch can repair a partial remove, a third cannot change the answer.
+const MAX_APPENDS_PER_SEGMENT: u32 = 2;
+
 /// Media track managed by [`Planner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Track {
@@ -76,6 +80,32 @@ pub enum Action {
     EndOfStream,
 }
 
+/// A decision the planner took that its actions do not show, drained with
+/// [`Planner::take_notes`] for the adapter to log and report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// `EndOfStream` was emitted with the play head at `play_ms` and the
+    /// furthest buffered end at `buffered_end_ms`.
+    EndOfStream { play_ms: u64, buffered_end_ms: u64 },
+    /// A segment still unbuffered after `appends` appends is no longer fetched
+    /// (its data is shorter than the playlist says, or the append is a no-op).
+    GaveUp {
+        track: Track,
+        index: usize,
+        appends: u32,
+    },
+}
+
+impl Note {
+    /// Stable log and telemetry token.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EndOfStream { .. } => "end_of_stream",
+            Self::GaveUp { .. } => "gave_up",
+        }
+    }
+}
+
 /// Buffered `[start_ms, end_ms)` ranges reported by each track's `SourceBuffer`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Buffered {
@@ -93,6 +123,10 @@ struct TrackState {
     /// was not buffered, though most of its segment was; once per seek.
     seek_refetched: bool,
     last_appended: bool,
+    /// The segment most recently appended and how many times in a row.
+    appends: Option<(usize, u32)>,
+    /// Segments left unbuffered after [`MAX_APPENDS_PER_SEGMENT`] appends.
+    given_up: Vec<usize>,
 }
 
 impl TrackState {
@@ -104,6 +138,8 @@ impl TrackState {
             in_flight: None,
             seek_target_ms: Some(start_ms),
             seek_refetched: false,
+            appends: None,
+            given_up: Vec::new(),
         }
     }
 }
@@ -116,6 +152,7 @@ pub struct Planner {
     config: Config,
     forward_target_ms: u64,
     eos_emitted: bool,
+    notes: Vec<Note>,
 }
 
 impl Planner {
@@ -136,7 +173,13 @@ impl Planner {
             config,
             forward_target_ms,
             eos_emitted: false,
+            notes: Vec::new(),
         }
+    }
+
+    /// The decisions taken since the last call, oldest first.
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Called on every timeupdate / progress tick and after each append, with
@@ -152,32 +195,57 @@ impl Planner {
         let video_finished = !self.video.needs_init
             && is_track_covered_from_playhead(&self.video, play_ms, &buffered.video);
 
-        plan_track(
-            Track::Video,
-            &mut self.video,
-            play_ms,
-            &buffered.video,
-            has_audio.then_some((&buffered.audio[..], audio_finished)),
-            self.config.back_ms,
-            self.forward_target_ms,
-            &mut actions,
-        );
+        let video_view = gate_view(&self.video, &buffered.video);
+        let audio_view = self
+            .audio
+            .as_ref()
+            .map_or_else(Vec::new, |a| gate_view(a, &buffered.audio));
 
-        if let Some(audio) = &mut self.audio {
+        let order = [Track::Video, Track::Audio];
+        for track in order {
+            let (state, own, other, other_finished) = match track {
+                Track::Video => (
+                    Some(&mut self.video),
+                    &buffered.video[..],
+                    &audio_view[..],
+                    audio_finished,
+                ),
+                Track::Audio => (
+                    self.audio.as_mut(),
+                    &buffered.audio[..],
+                    &video_view[..],
+                    video_finished,
+                ),
+            };
+            let Some(state) = state else {
+                continue;
+            };
             plan_track(
-                Track::Audio,
-                audio,
+                track,
+                state,
                 play_ms,
-                &buffered.audio,
-                Some((&buffered.video[..], video_finished)),
+                own,
+                has_audio.then_some((other, other_finished)),
                 self.config.back_ms,
                 self.forward_target_ms,
                 &mut actions,
+                &mut self.notes,
             );
         }
 
         if !self.eos_emitted && self.ready_for_eos(play_ms, buffered) {
             self.eos_emitted = true;
+            let buffered_end_ms = buffered
+                .video
+                .iter()
+                .chain(&buffered.audio)
+                .map(|&(_, end)| end)
+                .max()
+                .unwrap_or(0);
+            self.notes.push(Note::EndOfStream {
+                play_ms,
+                buffered_end_ms,
+            });
             actions.push(Action::EndOfStream);
         }
 
@@ -225,10 +293,16 @@ impl Planner {
                     state.last_appended = true;
                 }
             }
-            Some(Request::Media(idx)) if idx.saturating_add(1) >= state.segments.len() => {
-                state.last_appended = true;
+            Some(Request::Media(idx)) => {
+                let n = match state.appends {
+                    Some((prev, n)) if prev == idx => n.saturating_add(1),
+                    _ => 1,
+                };
+                state.appends = Some((idx, n));
+                if idx.saturating_add(1) >= state.segments.len() {
+                    state.last_appended = true;
+                }
             }
-            Some(Request::Media(_)) => {}
             None => {}
         }
     }
@@ -312,6 +386,8 @@ fn seek_track(
     }
     state.seek_target_ms = Some(to_ms);
     state.seek_refetched = false;
+    state.appends = None;
+    state.given_up.clear();
     let end_ms = segments_duration_ms(&state.segments);
     if to_ms < end_ms {
         state.last_appended = state
@@ -331,6 +407,7 @@ fn plan_track(
     back_ms: u64,
     forward_target_ms: u64,
     actions: &mut Vec<Action>,
+    notes: &mut Vec<Note>,
 ) {
     if state.in_flight.is_some() {
         return;
@@ -366,15 +443,34 @@ fn plan_track(
     let refetch_target = state.seek_target_ms.is_some()
         && !state.seek_refetched
         && !point_buffered(track_buffered, anchor_ms);
-    let Some((candidate_idx, candidate_seg)) = state
-        .segments
-        .iter()
-        .enumerate()
-        .skip(start_idx)
-        .find(|&(idx, seg)| {
-            (idx == start_idx && refetch_target) || !is_segment_covered(seg, track_buffered)
-        })
-    else {
+    let mut found = None;
+    for idx in start_idx..state.segments.len() {
+        let Some(seg) = state.segments.get(idx) else {
+            break;
+        };
+        if idx == start_idx && refetch_target {
+            found = Some((idx, seg.clone()));
+            break;
+        }
+        if is_settled(state, idx, track_buffered) {
+            continue;
+        }
+        match state.appends {
+            Some((last, appends)) if last == idx && appends >= MAX_APPENDS_PER_SEGMENT => {
+                state.given_up.push(idx);
+                notes.push(Note::GaveUp {
+                    track,
+                    index: idx,
+                    appends,
+                });
+            }
+            _ => {
+                found = Some((idx, seg.clone()));
+                break;
+            }
+        }
+    }
+    let Some((candidate_idx, candidate_seg)) = found else {
         return;
     };
 
@@ -407,6 +503,21 @@ fn segment_floor(segments: &[Segment], at_ms: u64) -> u64 {
     segment_at_slice(segments, at_ms)
         .and_then(|idx| segments.get(idx))
         .map_or(at_ms, |seg| seg.start_ms)
+}
+
+/// What the other track's lead is measured against: its buffered ranges plus
+/// the segments given up on, which will never buffer, so the track waiting on
+/// it does not wait for them forever.
+fn gate_view(state: &TrackState, buffered: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut view = buffered.to_vec();
+    view.extend(
+        state
+            .given_up
+            .iter()
+            .filter_map(|&idx| range_of_slice(&state.segments, idx)),
+    );
+    view.sort_unstable();
+    view
 }
 
 fn point_buffered(buffered: &[(u64, u64)], at_ms: u64) -> bool {
@@ -476,6 +587,23 @@ fn segment_at_or_after(segments: &[Segment], at_ms: u64) -> Option<usize> {
         .position(|seg| at_ms < seg.start_ms.saturating_add(seg.duration_ms))
 }
 
+/// Nothing is left to fetch for segment `idx`: it is buffered, given up on, or
+/// the final segment, appended, with data that stops short of its midpoint.
+fn is_settled(state: &TrackState, idx: usize, buffered: &[(u64, u64)]) -> bool {
+    let Some(seg) = state.segments.get(idx) else {
+        return true;
+    };
+    if is_segment_covered(seg, buffered) || state.given_up.contains(&idx) {
+        return true;
+    }
+    let seg_end = seg.start_ms.saturating_add(seg.duration_ms);
+    state.last_appended
+        && idx.saturating_add(1) == state.segments.len()
+        && buffered
+            .iter()
+            .any(|&(start, end)| start < seg_end && end > seg.start_ms)
+}
+
 fn is_segment_covered(seg: &Segment, buffered: &[(u64, u64)]) -> bool {
     let mid_ms = seg.start_ms.saturating_add(seg.duration_ms / 2);
     buffered.iter().any(|&(start, end)| {
@@ -506,16 +634,13 @@ fn is_track_covered_from_playhead(
         None => segment_at_or_after(&state.segments, play_ms),
     };
     let Some(idx) = start_idx else {
-        return state
-            .segments
-            .last()
-            .is_some_and(|last| is_segment_covered(last, track_buffered));
+        return is_settled(
+            state,
+            state.segments.len().saturating_sub(1),
+            track_buffered,
+        );
     };
-    state
-        .segments
-        .iter()
-        .skip(idx)
-        .all(|seg| is_segment_covered(seg, track_buffered))
+    (idx..state.segments.len()).all(|i| is_settled(state, i, track_buffered))
 }
 
 fn track_ready_for_eos(state: &TrackState, play_ms: u64, track_buffered: &[(u64, u64)]) -> bool {
@@ -532,7 +657,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{Action, Buffered, Config, Planner, Request, Track};
+    use super::{Action, Buffered, Config, Note, Planner, Request, Track};
     use crate::playlist::Segment;
     use crate::timeline::segments_duration_ms;
 
@@ -587,6 +712,133 @@ mod tests {
             }
         }
         *ranges = out;
+    }
+
+    /// Drives a planner like the adapter: every fetch is appended at once and
+    /// buffers `real_ms(track, index)` of the segment. Returns the fetches made
+    /// and whether `EndOfStream` came, over `ticks` ticks at `play_ms`.
+    fn drive(
+        planner: &mut Planner,
+        segs: &[Segment],
+        play_ms: u64,
+        ticks: usize,
+        real_ms: impl Fn(Track, usize) -> u64,
+    ) -> (Vec<(Track, usize)>, bool, Buffered) {
+        let mut buffered = Buffered::default();
+        let mut fetches = Vec::new();
+        let mut eos = false;
+        for _ in 0..ticks {
+            for action in planner.tick(play_ms, &buffered) {
+                match action {
+                    Action::Fetch { track, index } => {
+                        fetches.push((track, index));
+                        let seg = &segs[index];
+                        let end = seg.start_ms + real_ms(track, index).min(seg.duration_ms);
+                        let ranges = match track {
+                            Track::Video => &mut buffered.video,
+                            Track::Audio => &mut buffered.audio,
+                        };
+                        merge_range(ranges, seg.start_ms, end);
+                        planner.appended(track);
+                    }
+                    Action::FetchInit { track } => planner.appended(track),
+                    Action::EndOfStream => eos = true,
+                    _ => {}
+                }
+            }
+        }
+        (fetches, eos, buffered)
+    }
+
+    // B1392: a last segment that buffers less than its playlist duration (a
+    // short final GOP) never reached its midpoint, so the track never counted
+    // as covered and EndOfStream was never emitted: playback hung at the end.
+    #[test]
+    fn a_last_segment_that_buffers_short_still_ends_the_stream() {
+        let segs = make_segments(&[6_000, 6_000, 6_000]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        let (fetches, eos, _) = drive(&mut planner, &segs, 1_000, 20, |_, i| {
+            if i == 2 {
+                1_000
+            } else {
+                6_000
+            }
+        });
+        assert!(eos, "EndOfStream never emitted; fetches={fetches:?}");
+        assert_eq!(fetches.len(), 3, "{fetches:?}");
+    }
+
+    // B1393: a segment whose append never covers its midpoint was fetched on
+    // every tick, forever (a storm of requests for one index).
+    #[test]
+    fn a_segment_that_never_buffers_is_given_up_after_two_appends() {
+        let segs = make_segments(&[6_000; 6]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs.clone(), false)),
+            Config::default(),
+            0,
+        );
+        let (fetches, eos, _) = drive(&mut planner, &segs, 10_000, 200, |t, i| {
+            if t == Track::Audio && i == 2 {
+                0
+            } else {
+                6_000
+            }
+        });
+        let of_it = fetches.iter().filter(|&&f| f == (Track::Audio, 2)).count();
+        assert!(of_it <= 2, "audio segment 2 fetched {of_it} times");
+        assert!(fetches.contains(&(Track::Audio, 5)), "{fetches:?}");
+        assert!(eos);
+    }
+
+    // Each decision the planner takes silently is a note the adapter logs.
+    #[test]
+    fn end_of_stream_is_noted_with_the_play_head_and_buffered_end() {
+        let segs = make_segments(&[6_000, 6_000, 6_000]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        drive(&mut planner, &segs, 1_000, 20, |_, i| {
+            if i == 2 {
+                1_000
+            } else {
+                6_000
+            }
+        });
+        assert_eq!(
+            planner.take_notes(),
+            vec![Note::EndOfStream {
+                play_ms: 1_000,
+                buffered_end_ms: 13_000
+            }]
+        );
+        assert_eq!(planner.take_notes(), Vec::new());
+    }
+
+    #[test]
+    fn giving_up_on_a_segment_is_noted_once() {
+        let segs = make_segments(&[6_000; 6]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        drive(&mut planner, &segs, 10_000, 50, |_, i| {
+            if i == 2 {
+                0
+            } else {
+                6_000
+            }
+        });
+        let gave_up: Vec<Note> = planner
+            .take_notes()
+            .into_iter()
+            .filter(|n| n.label() == "gave_up")
+            .collect();
+        assert_eq!(
+            gave_up,
+            vec![Note::GaveUp {
+                track: Track::Video,
+                index: 2,
+                appends: 2
+            }]
+        );
     }
 
     // B733: eviction leaves the audio track partly holding a segment; a seek
