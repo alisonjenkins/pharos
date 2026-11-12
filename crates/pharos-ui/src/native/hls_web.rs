@@ -23,7 +23,7 @@ use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
     rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
     HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
-    PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
+    PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -1179,6 +1179,7 @@ fn on_seek(session: &Rc<RefCell<Session>>) {
             .map_or_else(Vec::new, |p| p.seek(current_ms, &buffered))
     };
     execute_actions(session, actions);
+    report_planner_notes(session);
     pump(session);
 }
 
@@ -1208,6 +1209,25 @@ fn pump(session: &Rc<RefCell<Session>>) {
         report_event(report.event(current_path()));
     }
     execute_actions(session, actions);
+    report_planner_notes(session);
+}
+
+/// Logs and reports what the planner decided that its actions do not show.
+fn report_planner_notes(session: &Rc<RefCell<Session>>) {
+    let notes = session
+        .borrow_mut()
+        .planner
+        .as_mut()
+        .map_or_else(Vec::new, Planner::take_notes);
+    for note in notes {
+        let report = PlannerNoteReport(note);
+        if report.is_warn() {
+            warn(&report.line());
+        } else {
+            info(&report.line());
+        }
+        report_event(report.event(current_path()));
+    }
 }
 
 fn execute_actions(session: &Rc<RefCell<Session>>, actions: Vec<Action>) {
@@ -1786,7 +1806,12 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
         s.eos_pending = false;
         s.media_source.clone()
     };
-    let _ = media_source.end_of_stream();
+    if let Err(err) = media_source.end_of_stream() {
+        warn(&format!(
+            "pharos: playback engine=rust end_of_stream refused reason={}",
+            js_message(&err)
+        ));
+    }
 }
 
 fn fail_manifest(

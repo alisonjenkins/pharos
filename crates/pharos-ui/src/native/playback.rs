@@ -884,6 +884,96 @@ impl SegmentFailureReport {
     }
 }
 
+/// A buffering decision of the Rust engine's planner (V1362-V1364): the end of
+/// stream, a segment given up on, a track held back for the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerNoteReport(pub pharos_hls::planner::Note);
+
+impl PlannerNoteReport {
+    fn detail(&self) -> String {
+        use pharos_hls::planner::Note;
+        match &self.0 {
+            Note::EndOfStream {
+                play_ms,
+                buffered_end_ms,
+            } => format!("play_ms={play_ms} buffered_end_ms={buffered_end_ms}"),
+            Note::GaveUp {
+                track,
+                index,
+                appends,
+            } => format!("track={} index={index} appends={appends}", track.label()),
+            Note::Held {
+                track,
+                lead_ms,
+                limit_ms,
+            } => format!(
+                "track={} lead_ms={lead_ms} limit_ms={limit_ms}",
+                track.label()
+            ),
+        }
+    }
+
+    /// A giving up is the one note that means the stream is off nominal.
+    pub fn is_warn(&self) -> bool {
+        matches!(self.0, pharos_hls::planner::Note::GaveUp { .. })
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "pharos: playback engine=rust planner={} {}",
+            self.0.label(),
+            self.detail()
+        )
+    }
+
+    pub fn event(&self, route: String) -> ClientEvent {
+        use pharos_hls::planner::Note;
+        let fields = match &self.0 {
+            Note::EndOfStream {
+                play_ms,
+                buffered_end_ms,
+            } => vec![
+                ("play_ms", play_ms.to_string()),
+                ("buffered_end_ms", buffered_end_ms.to_string()),
+            ],
+            Note::GaveUp {
+                track,
+                index,
+                appends,
+            } => vec![
+                ("track", track.label().to_owned()),
+                ("index", index.to_string()),
+                ("appends", appends.to_string()),
+            ],
+            Note::Held {
+                track,
+                lead_ms,
+                limit_ms,
+            } => vec![
+                ("track", track.label().to_owned()),
+                ("lead_ms", lead_ms.to_string()),
+                ("limit_ms", limit_ms.to_string()),
+            ],
+        };
+        let mut all = vec![
+            ("engine", "rust".to_owned()),
+            ("type", "planner".to_owned()),
+            ("planner", self.0.label().to_owned()),
+        ];
+        all.extend(fields);
+        ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: if self.is_warn() {
+                ClientLevel::Warn
+            } else {
+                ClientLevel::Info
+            },
+            route,
+            fields: all,
+        }
+    }
+}
+
 impl EngineVerdict {
     /// The watch page's log line for this verdict (V630).
     pub fn line(&self) -> String {
@@ -4675,6 +4765,45 @@ mod tests {
         assert!(refused.line().contains("est_kbps=none"));
         assert!(refused.line().ends_with("applied=false"));
         assert_eq!(refused.event(String::new()).level, ClientLevel::Warn);
+    }
+
+    // V1362-V1364: each planner decision is logged and reported with the
+    // values it was taken on.
+    #[test]
+    fn a_planner_note_is_logged_and_reported_with_its_values() {
+        use pharos_hls::planner::{Note, Track};
+        let eos = PlannerNoteReport(Note::EndOfStream {
+            play_ms: 12_000,
+            buffered_end_ms: 13_000,
+        });
+        assert_eq!(
+            eos.line(),
+            "pharos: playback engine=rust planner=end_of_stream play_ms=12000 buffered_end_ms=13000"
+        );
+        assert!(!eos.is_warn());
+        let gave_up = PlannerNoteReport(Note::GaveUp {
+            track: Track::Audio,
+            index: 4,
+            appends: 2,
+        });
+        assert_eq!(
+            gave_up.line(),
+            "pharos: playback engine=rust planner=gave_up track=audio index=4 appends=2"
+        );
+        let e = gave_up.event("/ui/watch/9".to_owned());
+        assert_eq!(e.level, ClientLevel::Warn);
+        assert!(e.fields.contains(&("planner", "gave_up".to_owned())));
+        assert!(e.fields.contains(&("index", "4".to_owned())));
+        let held = PlannerNoteReport(Note::Held {
+            track: Track::Audio,
+            lead_ms: 6_000,
+            limit_ms: 2_000,
+        });
+        assert_eq!(
+            held.line(),
+            "pharos: playback engine=rust planner=held track=audio lead_ms=6000 limit_ms=2000"
+        );
+        assert_eq!(held.event(String::new()).level, ClientLevel::Info);
     }
 
     // V637: every failed segment request logs and reports its cause, the
