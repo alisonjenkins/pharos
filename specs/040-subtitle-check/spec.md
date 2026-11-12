@@ -64,7 +64,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
   - `retimed`: a stage-1 offset of 400 ms or more, or any stage-2 candidate, fits. Reason adds `offset_ms=<o> ratio=<r>`.
   - `wrong_video`: neither stage fits, and the stage-2 best candidate's median is within `T_margin` of its decoys. Reason as `fits`, from the best candidate.
   - `segmented`: some probes fit at one offset and others at another (two or more probes each, offsets more than 2 s apart). Reported only; no correction in this version. Reason lists the offsets.
-  - `unknown`: FR-002, FR-003, FR-004, an aligner error or timeout, or a stage-2 best that is neither fitting nor decoy-level.
+  - `unknown`: FR-002, FR-003, FR-004, an aligner error or timeout that has used up its retries (FR-015a), or a stage-2 best that is neither fitting nor decoy-level.
 - FR-011. A `wrong_video` track of an episode is checked once more against the audio of the previous and next episodes of the same season (stage 1 only). When it fits one of them, the reason adds `fits_sibling=<item id>`, and the admin list says the video file looks like that episode's. No file or metadata is changed.
 - FR-011a. Flagged tracks (`wrong_video`, `segmented`) are listed on a Manage tab, "Subtitle check", with the item, track, verdict, reason and a link to the item; an entry leaves the list when a re-check after a file change no longer flags it. Each finished backfill pass that flagged anything adds one Activity entry with the counts (for example "Subtitle check: 3 possible swapped files, 5 tracks that don't fit"), never one entry per track (Alison, 2026-11-12T19:19Z).
 
@@ -80,6 +80,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 ### Scheduling and cost
 
 - FR-015. The job runs in the mould of the styling job: after a warm-up and the background leader, passes over the library, one track at a time; a row per item and track source keyed by the video's and sidecar's mtime and size and a `CHECK_VERSION`, so each track is checked once and again only when a file or the check changes.
+- FR-015a. An aligner error or timeout is not a result about the file. That check stores no verdict row, only an attempt count and a retry time: it is tried again on a later pass at least 1 h later (as the karaoke queue's `RETRY_AFTER`), up to 3 attempts, and only then stored as `unknown`, reason `aligner_error:<last error>`, until a file or `CHECK_VERSION` changes. While the aligner's `/healthz` fails, the job pauses instead of spending attempts. The FR-002, FR-003 and FR-004 outcomes depend only on the files and are stored as final at once.
 - FR-016. Karaoke first: the job sends no request while a karaoke alignment is queued or running in the server's align queue, and never more than one at a time. It also starts no item while the transcode scheduler has jobs queued (as the styling job does, V34).
 - FR-016a. The backfill orders film libraries before TV libraries (Alison, 2026-11-12T19:15Z), and other video libraries last.
 - FR-017. An item a viewer opens is put ahead of the backfill (a small deduped FIFO, as the styling job's on-demand queue).
@@ -90,7 +91,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 - FR-019. `pharos_subtitle_check_total{verdict,reason_class,stage}` counts every finished check. `reason_class` is a bounded `label()` (`fits`, `offset`, `ratio`, `decoy_level`, `segmented`, `language_mismatch`, `script`, `language_untagged`, `too_few_lines`, `aligner_error`, `inconclusive`).
 - FR-020. One log line per track, `subtitle check`, with the item id, track source and index, languages, verdict, the full reason, every probe and decoy score, the offset and ratio tried at each stage, aligner time and coarse-search time. Success and failure carry the same fields (ODD symmetry).
 - FR-021. `pharos_subtitle_check_aligner_seconds` (histogram) records aligner time per check.
-- FR-022. Karaoke contention needs a signal that does not exist today: `pharos_lyrics_align_wait_seconds` (histogram, no labels) records each karaoke job's time from queued to sent to the aligner. It ships first, on its own, so SC-003 has a baseline from before the job runs.
+- FR-022. Karaoke contention needs a signal that does not exist today: `pharos_lyrics_align_wait_seconds` (histogram, no labels) records each karaoke job's time from queued to sent to the aligner. It ships first, on its own, so SC-003 has a baseline from before the job runs. It cannot see a karaoke request that is sent at once but then waits inside the aligner behind a check request (039 R5), so SC-003 also reads the existing `first_line_ms` field of the `lyrics: aligned` log line (queue to first timed line, which includes that wait).
 
 ## Non-goals
 
@@ -104,7 +105,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 
 - SC-001. On a calibration set of at least 50 tracks with known answers, no right track gets `wrong_video`, and every known swapped or wrong track gets `wrong_video` or `unknown`.
 - SC-002. A track shifted by any offset within ±120 s, or timed at 25 fps for a 23.976 fps video, gets `retimed` and plays within 100 ms of the right times (median over its probes).
-- SC-003. Karaoke alignment wait time (p95 of the align queue wait) does not rise while the backfill runs.
+- SC-003. Karaoke waits do not rise while the backfill runs: neither the p95 of `pharos_lyrics_align_wait_seconds` (server queue) nor the p95 of `first_line_ms` from `lyrics: aligned` (queue to first timed line, including any wait inside the aligner) against the week before the job ran.
 - SC-004. Aligner time per checked track is at most 12 s at p95 on the GPU; server RSS rises by no more than 20 MB while the job runs.
 
 ## Open questions

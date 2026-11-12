@@ -46,5 +46,5 @@ The align queue in `services::lyrics::align` exposes whether a job is queued or 
 ## Signals to name before building (ODD)
 
 - Verdict mix: `sum by (verdict, reason_class) (increase(pharos_subtitle_check_total[1d]))`.
-- Karaoke contention: `histogram_quantile(0.95, sum by (le) (rate(pharos_lyrics_align_wait_seconds_bucket[1h])))` while the backfill runs, against the week before. This metric is new (FR-022) and is slice 0, shipped before anything else.
+- Karaoke contention: `histogram_quantile(0.95, sum by (le) (rate(pharos_lyrics_align_wait_seconds_bucket[1h])))` while the backfill runs, against the week before. This metric is new (FR-022) and is slice 0, shipped before anything else. It only covers the server queue, so the comparison also reads the wait inside the aligner: `quantile_over_time(0.95, {namespace="pharos"} |= "lyrics: aligned" | logfmt | unwrap first_line_ms [1d])`. Both must hold for SC-003.
 - A track's reasoning: `{namespace="pharos"} |= "subtitle check" | json | item_id="<id>"`.
