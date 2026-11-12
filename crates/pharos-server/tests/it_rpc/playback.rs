@@ -2073,3 +2073,40 @@ async fn the_adopting_token_holds_the_stream() {
         "the adopting token's revocation ends it"
     );
 }
+
+/// B1397: a reconnect that names an external subtitle the stream does not
+/// burn still adopts, and the grant reports the subtitle it named, not the
+/// held stream's none.
+/// Disarm check: with the held subtitle always reported, this reads None.
+#[actix_web::test]
+async fn an_adopting_reconnect_reports_the_subtitle_it_named() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_tracks(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.subtitle, None);
+    drop(grant);
+    let (_grant, again) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Index(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.psid, first.psid, "the control: it was adopted");
+    assert_eq!(again.subtitle, Some(3), "{again:?}");
+}
