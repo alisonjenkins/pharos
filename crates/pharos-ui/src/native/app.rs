@@ -5982,6 +5982,11 @@ const UP_NEXT_RESET_SETTLE_MS: f64 = 2_000.0;
 /// pause and seek, every 10 s while playing, and one stop when the video
 /// ends, the player unmounts or the page is hidden. A track change the
 /// `<video>` cannot make itself asks the screen for a new playback.
+/// How often the player reads the buffered range between media events.
+const BUFFER_POLL_MS: u32 = 1_000;
+/// Whether it does: a browser or the TV's WebView has a range to read.
+const BUFFER_POLLS: bool = cfg!(any(target_arch = "wasm32", target_os = "android"));
+
 #[component]
 fn Player(
     playing: PlayingRef,
@@ -6118,6 +6123,22 @@ fn Player(
     // it, so a tick does not rebuild the player (B815).
     let mut position = use_signal(|| 0u64);
     let mut buffered = use_signal(|| 0u64);
+    // The download runs on between media events, and a paused video has
+    // none: read the buffered range once a second too, so the seek bar shows
+    // it filling (B1386). Only the bar reads the signal, and only a change
+    // sets it. The host's `sleep_ms` does not wait, so it never loops there.
+    use_future(move || async move {
+        if !BUFFER_POLLS {
+            return;
+        }
+        loop {
+            platform::sleep_ms(BUFFER_POLL_MS).await;
+            let to = platform::buffered_to_ms(VIDEO_ID);
+            if *buffered.peek() != to {
+                buffered.set(to);
+            }
+        }
+    });
     // The viewer's playback speed (T038-305), 1.0 being normal. It lasts
     // the session, so the next episode plays at the speed the viewer chose.
     let mut speed = use_signal(|| LAST_SPEED.with(Cell::get));
