@@ -80,6 +80,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 
 - FR-015. The job runs in the mould of the styling job: after a warm-up and the background leader, passes over the library, one track at a time; a row per item and track source keyed by the video's and sidecar's mtime and size and a `CHECK_VERSION`, so each track is checked once and again only when a file or the check changes.
 - FR-016. Karaoke first: the job sends no request while a karaoke alignment is queued or running in the server's align queue, and never more than one at a time. It also starts no item while the transcode scheduler has jobs queued (as the styling job does, V34).
+- FR-016a. The backfill orders film libraries before TV libraries (Alison, 2026-11-12T19:15Z), and other video libraries last.
 - FR-017. An item a viewer opens is put ahead of the backfill (a small deduped FIFO, as the styling job's on-demand queue).
 - FR-018. Without `[lyrics].aligner_url` the job does not run; tracks have no row and are served as today.
 
@@ -108,4 +109,3 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 ## Open questions
 
 1. Should `wrong_video` with `fits_sibling` notify the admin (activity log entry) rather than only show in the admin list?
-2. Scope of the backfill at first: all libraries, or the TV libraries before films?
