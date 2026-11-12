@@ -42,13 +42,16 @@ pub struct ReleaseKey {
 
 /// What makes two negotiations the same stream: the decision (delivery method
 /// and transcode targets, bitrate cap included), the subtitles burned in, and
-/// the tracks the playback starts on.
+/// the audio track the stream carries. A subtitle the player draws itself is
+/// not part of it: it does not change a byte of the stream, and a track
+/// switched mid-playback is remembered, so the next negotiate names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamShape {
     pub decision: Decision,
     pub burn_subtitle_indices: BTreeSet<u32>,
     pub audio: Option<u32>,
-    pub subtitle: Option<u32>,
+    /// The subtitle picked, only when it is burned into the video.
+    pub burned_subtitle: Option<u32>,
 }
 
 impl StreamShape {
@@ -72,10 +75,10 @@ impl StreamShape {
                 self.audio, other.audio
             ));
         }
-        if self.subtitle != other.subtitle {
+        if self.burned_subtitle != other.burned_subtitle {
             return Some(format!(
-                "subtitle: held {:?}, asked {:?}",
-                self.subtitle, other.subtitle
+                "burned_subtitle: held {:?}, asked {:?}",
+                self.burned_subtitle, other.burned_subtitle
             ));
         }
         None
@@ -91,6 +94,11 @@ pub struct Released {
     pub remembers_tracks: bool,
     pub shape: StreamShape,
     pub reported_ms: Option<u64>,
+    /// The tracks the held stream was negotiated on, as the grant names them:
+    /// what an adopting grant reports, and what a default pick on its
+    /// negotiate resolves to rather than a remembered switch.
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
 }
 
 /// How a released grant ended up; the `outcome` of
@@ -194,6 +202,13 @@ impl PendingReleases {
             });
         }
         Ok(Held { id, verdict: rx })
+    }
+
+    /// The tracks of the release held under `key`, without taking it.
+    pub fn held_picks(&self, key: &ReleaseKey) -> Option<(Option<u32>, Option<u32>)> {
+        self.lock()
+            .get(key)
+            .map(|s| (s.released.audio, s.released.subtitle))
     }
 
     /// Takes slot `id` out when its grace is up. `false` means it was already
@@ -303,9 +318,11 @@ mod tests {
                 decision: Decision::DirectPlay,
                 burn_subtitle_indices: BTreeSet::new(),
                 audio: Some(1),
-                subtitle: None,
+                burned_subtitle: None,
             },
             reported_ms: None,
+            audio: Some(1),
+            subtitle: None,
         }
     }
 
