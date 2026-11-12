@@ -327,6 +327,9 @@ pub struct AppState {
     pub dlna_enabled: bool,
     /// Which progress reports reach the database now and which are held.
     pub progress_writes: Arc<crate::progress_writes::ProgressCoalescer>,
+    /// Native grants released without a stop, waiting for their player to
+    /// negotiate again (B1397).
+    pub pending_releases: Arc<crate::pending_release::PendingReleases>,
     /// Track preferences a newly created user starts with (`[user_defaults]`).
     /// Stock by default, in which case creation writes no preferences row.
     pub user_defaults: crate::config::UserDefaultsConfig,
@@ -815,6 +818,9 @@ impl AppState {
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
             )),
+            pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
+                crate::pending_release::DEFAULT_RELEASE_GRACE,
+            )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
@@ -958,6 +964,9 @@ impl AppState {
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
             )),
+            pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
+                crate::pending_release::DEFAULT_RELEASE_GRACE,
+            )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
@@ -1035,6 +1044,12 @@ impl AppState {
 
     pub fn with_progress_persist_interval(mut self, interval: std::time::Duration) -> Self {
         self.progress_writes = Arc::new(crate::progress_writes::ProgressCoalescer::new(interval));
+        self
+    }
+
+    /// How long a released native grant waits for its player to come back.
+    pub fn with_release_grace(mut self, grace: std::time::Duration) -> Self {
+        self.pending_releases = Arc::new(crate::pending_release::PendingReleases::new(grace));
         self
     }
 
