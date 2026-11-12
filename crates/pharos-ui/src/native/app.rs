@@ -5371,7 +5371,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         platform::has_mse(),
                         mse_engine,
                     );
-                    let verdict = engine_verdict(picked, engine_reason);
+                    let verdict = engine_verdict(picked, engine_reason)
+                        .on_platform(platform::hls_engine_used(picked));
                     let engine = verdict.engine;
                     if picked.reports_fragments() {
                         platform::info(&verdict.line());
