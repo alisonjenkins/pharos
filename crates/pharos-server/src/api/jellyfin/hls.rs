@@ -2571,8 +2571,10 @@ async fn vp9_audio_file(
         InitTemp::Cold
     };
     let file = cache.audio_hls_file(&dir, &name).await;
-    if is_init {
-        record_init_served("vp9-audio-init", init_temp, file.is_ok(), media_id, started);
+    // A failed read ends the request here; a successful one is recorded after
+    // the edit-list rewrite below, the last step that can still fail it.
+    if is_init && file.is_err() {
+        record_init_served("vp9-audio-init", init_temp, false, media_id, started);
     }
     let file = file
         // Carry the cache's give-up reason into the response body. A bare
@@ -2607,7 +2609,15 @@ async fn vp9_audio_file(
         // audio ahead of the picture for the whole title (B188).
         let session_offset_secs =
             f64::from(file.session_start_seg) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
-        fmp4::shrink_empty_edits(&mut bytes, session_offset_secs)
+        let shrunk = fmp4::shrink_empty_edits(&mut bytes, session_offset_secs);
+        record_init_served(
+            "vp9-audio-init",
+            init_temp,
+            shrunk.is_ok(),
+            media_id,
+            started,
+        );
+        shrunk
             .map_err(|e| error::ErrorInternalServerError(format!("audio init edit list: {e}")))?;
     } else if name.ends_with(".m4s") {
         // B189-shaped gap (2026-09-07): the init above was watched for
@@ -2783,7 +2793,13 @@ async fn init_from_first_segment(
     surface: &'static str,
 ) -> Result<Vec<u8>, actix_web::Error> {
     let started = std::time::Instant::now();
-    let source = transcode_source(state, &item.path, opts.video.is_some()).await?;
+    let source = match transcode_source(state, &item.path, opts.video.is_some()).await {
+        Ok(source) => source,
+        Err(e) => {
+            record_init_served(surface, InitTemp::Cold, false, item.id, started);
+            return Err(e);
+        }
+    };
     let temp = match state.hls.as_ref() {
         Some(cache)
             if cache
@@ -7280,6 +7296,67 @@ mod prewarm_edition_tests {
             count("warm"),
             1,
             "the second init request reads the same segment: pharos_init_segment_total{{temp=warm}}"
+        );
+    }
+
+    /// An init whose source cannot be resolved fails before any segment is
+    /// asked for, and is still counted: the failure path records what the
+    /// success path does.
+    #[::core::prelude::v1::test]
+    fn an_init_with_an_unresolvable_source_is_counted_as_an_error() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let td = tempfile::TempDir::new().unwrap();
+                let (state, _root, _edition) = seed(td.path()).await;
+                let mut item = super::super::media_source::load_named(
+                    &state,
+                    super::super::media_source::Route::Hls,
+                    7,
+                    None,
+                )
+                .await
+                .unwrap();
+                // URL-backed, and this server has no [remote] resolver.
+                item.path = "ytdlp://youtube/dQw4w9WgXcQ".into();
+                let opts =
+                    fmp4_segment_opts_resolved(&item, 0, SegmentVideo::H264, None, None, None);
+                let req = actix_web::test::TestRequest::default().to_http_request();
+                let r = init_from_first_segment(&state, &req, &item, &opts, None, "vp9-init").await;
+                assert!(r.is_err());
+            })
+        });
+        let errors: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let has = |l: &str| {
+                    k.labels()
+                        .any(|x| format!("{}={}", x.key(), x.value()) == l)
+                };
+                match v {
+                    DebugValue::Counter(n)
+                        if k.name() == "pharos_init_segment_total"
+                            && has("surface=vp9-init")
+                            && has("outcome=error") =>
+                    {
+                        Some(n)
+                    }
+                    _ => None,
+                }
+            })
+            .sum();
+        assert_eq!(
+            errors, 1,
+            "pharos_init_segment_total{{outcome=error}} for a source that did not resolve"
         );
     }
 
