@@ -1795,7 +1795,7 @@ pub async fn grant(
             .map(|t| t.stream_index),
     };
     if let Some(adopted) = match &release_key {
-        Some(key) => adopt_released(state, user, id, key, &shape).await,
+        Some(key) => adopt_released(state, user, id, r, key, &shape).await,
         None => None,
     } {
         return Ok(Grant {
@@ -1936,6 +1936,7 @@ async fn adopt_released(
     state: &AppState,
     user: &pharos_core::User,
     item: u64,
+    r: &GrantRequest<'_>,
     key: &crate::pending_release::ReleaseKey,
     shape: &crate::pending_release::StreamShape,
 ) -> Option<crate::pending_release::Released> {
@@ -1952,7 +1953,29 @@ async fn adopt_released(
         .get(pharos_core::PlaySessionId::from(psid.as_str()))
         .await;
     match live {
-        Ok(Some(s)) if s.holder.user_id == user.id && s.media_id == item => claim.adopt(),
+        Ok(Some(s)) if s.holder.user_id == user.id && s.media_id == item => {
+            // The stream now answers to the adopting token: revoking it ends
+            // the playback, and revoking the old connection's does not.
+            let holder = pharos_core::SessionHolder {
+                user_id: user.id,
+                token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
+            };
+            match state
+                .transcode_sessions
+                .rebind_holder(&pharos_core::PlaySessionId::from(psid.as_str()), holder)
+                .await
+            {
+                Ok(true) => claim.adopt(),
+                Ok(false) => {
+                    claim.reject("session: the transcode session is gone".into());
+                    None
+                }
+                Err(e) => {
+                    claim.reject(format!("session: rebinding its holder failed: {e}"));
+                    None
+                }
+            }
+        }
         Ok(other) => {
             claim.reject(format!(
                 "session: the transcode session is {}",

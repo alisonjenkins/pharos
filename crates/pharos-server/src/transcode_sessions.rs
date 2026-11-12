@@ -502,6 +502,49 @@ where
         }
     }
 
+    /// Makes `holder` the one the session's stream checks, in memory and in
+    /// the store: the playback was taken over by another token (B1397), so
+    /// that token's revocation ends it and the old one's no longer does.
+    /// `false` when the session is gone.
+    pub async fn rebind_holder(
+        &self,
+        session_id: &PlaySessionId,
+        holder: SessionHolder,
+    ) -> Result<bool, TranscodeSessionError> {
+        let Some(mut session) = self.get(session_id.clone()).await? else {
+            return Ok(false);
+        };
+        session.holder = holder;
+        match Self::to_persisted(&session) {
+            Ok(persisted) => {
+                if let Err(e) = self
+                    .store
+                    .upsert_transcode_session(session_id.as_str(), &persisted, now_unix_secs())
+                    .await
+                {
+                    tracing::warn!(
+                        psid = %pharos_core::secret_prefix(session_id.as_str()),
+                        error = %e,
+                        "transcode session holder write-through failed; failover keeps the old holder"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                psid = %pharos_core::secret_prefix(session_id.as_str()),
+                error = %e,
+                "transcode session serialize failed; holder not persisted"
+            ),
+        }
+        self.tx
+            .send(Msg::Recache(Box::new(InsertPayload {
+                session_id: session_id.clone(),
+                session,
+            })))
+            .await
+            .map_err(|_| TranscodeSessionError::ActorDown)?;
+        Ok(true)
+    }
+
     /// Drop durable rows idle past `DB_RETENTION_SECS`. Idempotent + cheap;
     /// safe to run on every replica. Returns rows removed.
     pub async fn prune_store(&self) -> u64 {
