@@ -669,20 +669,22 @@ impl Aligner {
             .is_some_and(|v| v.starts_with(NDJSON));
         let aligned = match stream.filter(|_| streamed) {
             Some(job) => {
+                let too_long = || format!("aligner event over {MAX_EVENT_BYTES} bytes");
                 let mut buf = Vec::new();
                 let mut done = None;
                 while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
                     buf.extend_from_slice(&chunk);
                     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                        if nl > MAX_EVENT_BYTES {
+                            return Err(too_long());
+                        }
                         let event: Vec<u8> = buf.drain(..=nl).collect();
                         if let Some(answer) = self.event(job, &event, lines.len())? {
                             done = Some(answer);
                         }
                     }
                     if buf.len() > MAX_EVENT_BYTES {
-                        return Err(format!(
-                            "aligner event over {MAX_EVENT_BYTES} bytes without a newline"
-                        ));
+                        return Err(too_long());
                     }
                 }
                 done.ok_or_else(|| "aligner stream ended before its answer".to_owned())?
@@ -2099,20 +2101,24 @@ mod tests {
         );
     }
 
-    /// An aligner that streams an event longer than `MAX_EVENT_BYTES`
-    /// without a newline fails the job instead of growing the buffer.
+    /// An aligner that streams an event longer than `MAX_EVENT_BYTES` fails
+    /// the job, whether or not the event ends in a newline: without one the
+    /// buffer would grow, and with one in the chunk that crosses the limit
+    /// the event would otherwise be read whole.
     #[tokio::test]
     async fn an_event_too_long_for_one_line_fails_the_job() {
-        let events = vec!["x".repeat(MAX_EVENT_BYTES + 1)];
-        let (open, gate) = tokio::sync::oneshot::channel();
-        open.send(()).unwrap();
-        let base = fake_stream(events, 0, gate, false).await;
-        let (tx, _rx) = mpsc::channel(1);
-        let aligner = Aligner {
-            base,
-            ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
-        };
-        let err = aligner.process_job(&two_line_job()).await.unwrap_err();
-        assert!(err.contains("without a newline"), "{err}");
+        for newline in [false, true] {
+            let events = vec!["x".repeat(MAX_EVENT_BYTES + 1)];
+            let (open, gate) = tokio::sync::oneshot::channel();
+            open.send(()).unwrap();
+            let base = fake_stream(events, 0, gate, newline).await;
+            let (tx, _rx) = mpsc::channel(1);
+            let aligner = Aligner {
+                base,
+                ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
+            };
+            let err = aligner.process_job(&two_line_job()).await.unwrap_err();
+            assert!(err.contains("event over"), "newline {newline}: {err}");
+        }
     }
 }
