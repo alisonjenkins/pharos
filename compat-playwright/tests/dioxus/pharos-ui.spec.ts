@@ -3386,6 +3386,23 @@ test.describe("pharos Dioxus UI", () => {
           { timeout: 30_000 },
         )
         .toBeGreaterThan(3);
+      // Earlier tests on this fixture leave a resume point, which can sit past
+      // the 80% target (B1372, V1342): set the start here instead.
+      await page.evaluate(() => {
+        document.querySelector("video")!.currentTime = 5;
+      });
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const v = document.querySelector("video");
+              return v && !v.paused && !v.seeking ? v.currentTime : -1;
+            }),
+          { timeout: 15_000 },
+        )
+        .toBeGreaterThanOrEqual(5);
+      const settled = await page.evaluate(() => document.querySelector("video")!.currentTime);
+      expect(settled, "playback restarted near 5 s").toBeLessThan(30);
       await page.evaluate(() => {
         (window as unknown as { slowSeek: { armed: boolean } }).slowSeek.armed = true;
       });
