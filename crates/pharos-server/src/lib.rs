@@ -42,6 +42,7 @@ pub mod omdb;
 pub mod online_enrich;
 pub mod opensubtitles;
 pub mod parental;
+pub mod pending_release;
 pub mod person_details;
 pub mod person_image_backfill;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
