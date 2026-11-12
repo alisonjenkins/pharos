@@ -52,11 +52,18 @@ const MAX_TRACKED_SESSIONS: usize = 256;
 struct Entry {
     media_id: u64,
     handles: Vec<JoinHandle<()>>,
-    /// The session's prefetch queue; replaced with the entry on a media swap.
+    /// The session's prefetch queue. Dropping it (media swap, stop, or the
+    /// entry being reclaimed) aborts its walker and so all its prefetch.
     pacer: Arc<PrefetchPacer>,
 }
 
 impl Entry {
+    /// Still has deep-scan work or queued/running prefetch; an entry that does
+    /// not is a leaked slot (a session that never sent a stop).
+    fn is_live(&self) -> bool {
+        self.handles.iter().any(|h| !h.is_finished()) || !self.pacer.is_idle()
+    }
+
     fn new(media_id: u64, handles: Vec<JoinHandle<()>>) -> Self {
         Self {
             media_id,
@@ -77,7 +84,7 @@ impl PrefetchRegistry {
         Self::default()
     }
 
-    /// Record freshly-spawned prefetch `handles` for `psid` + `media_id`.
+    /// Record freshly-spawned deep-scan `handles` for `psid` + `media_id`.
     ///
     /// If the session was prefetching a DIFFERENT media, abort those stale tasks
     /// first (episode swap). For the same media, finished handles are pruned and
@@ -90,9 +97,8 @@ impl PrefetchRegistry {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_TRACKED_SESSIONS && !map.contains_key(psid) {
             // Reclaim slots leaked by sessions that never sent a stop: an entry
-            // whose prefetch has all finished is safe to forget (aborting a
-            // finished task is a no-op anyway).
-            map.retain(|_, e| e.handles.iter().any(|h| !h.is_finished()));
+            // whose prefetch has all finished is safe to forget.
+            map.retain(|_, e| e.is_live());
         }
         match map.get_mut(psid) {
             Some(entry) if entry.media_id == media_id => {
@@ -120,7 +126,7 @@ impl PrefetchRegistry {
     pub fn pacer(&self, psid: &str, media_id: u64) -> Arc<PrefetchPacer> {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_TRACKED_SESSIONS && !map.contains_key(psid) {
-            map.retain(|_, e| e.handles.iter().any(|h| !h.is_finished()));
+            map.retain(|_, e| e.is_live());
         }
         match map.get_mut(psid) {
             Some(entry) if entry.media_id == media_id => Arc::clone(&entry.pacer),
@@ -205,7 +211,7 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[actix_web::test]
     async fn switching_media_aborts_the_previous_episodes_prefetch() {
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
@@ -231,7 +237,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[actix_web::test]
     async fn cancel_aborts_all_outstanding_for_the_session() {
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
@@ -251,7 +257,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[actix_web::test]
     async fn same_media_appends_and_prunes_finished() {
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
@@ -267,7 +273,7 @@ mod tests {
         assert_eq!(reg.live_count("s"), 1);
     }
 
-    #[tokio::test]
+    #[actix_web::test]
     async fn append_if_current_drops_late_work_after_a_switch() {
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
@@ -289,7 +295,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[actix_web::test]
     async fn none_psid_is_untracked() {
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
@@ -332,8 +338,7 @@ mod tests {
                 )
             })
             .collect();
-        let handle = reg.pacer("sess-p", 1).retarget(0, jobs);
-        reg.register(Some("sess-p"), 1, handle.into_iter().collect());
+        reg.pacer("sess-p", 1).retarget(0, jobs);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             peak.load(Ordering::SeqCst),
@@ -343,30 +348,51 @@ mod tests {
         assert_eq!(*started.lock().unwrap(), vec![1, 2, 3, 4]);
     }
 
+    /// A job that bumps `ran` after 100 ms, unless its pacer is dropped first.
+    fn slow_job(ran: &Arc<AtomicU32>) -> Vec<(u32, crate::prefetch_pacer::PrefetchJob)> {
+        use futures_util::FutureExt;
+        let r = ran.clone();
+        vec![(
+            1,
+            Box::new(move || {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    r.fetch_add(1, Ordering::SeqCst);
+                }
+                .boxed_local()
+            }),
+        )]
+    }
+
     #[actix_web::test]
     async fn a_media_swap_aborts_the_pacers_running_work_and_gives_a_fresh_pacer() {
-        use futures_util::FutureExt;
         let reg = PrefetchRegistry::new();
         let ran = Arc::new(AtomicU32::new(0));
-        let r = ran.clone();
-        let old = reg.pacer("sess-s", 1);
-        let h = old.retarget(
-            0,
-            vec![(
-                1,
-                Box::new(move || {
-                    async move {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        r.fetch_add(1, Ordering::SeqCst);
-                    }
-                    .boxed_local()
-                }),
-            )],
-        );
-        reg.register(Some("sess-s"), 1, h.into_iter().collect());
-        let new = reg.pacer("sess-s", 2);
-        assert!(!Arc::ptr_eq(&old, &new));
+        // The handler drops its Arc once it has queued; the registry's is the
+        // only one left, so replacing the entry drops the pacer.
+        reg.pacer("sess-s", 1).retarget(0, slow_job(&ran));
+        let fresh = reg.pacer("sess-s", 2);
+        assert!(fresh.is_idle(), "the new media starts with an empty queue");
+        fresh.retarget(0, slow_job(&ran));
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "old episode's job aborted");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "old episode's job aborted; only the new episode's ran"
+        );
+    }
+
+    #[actix_web::test]
+    async fn cancel_aborts_the_pacers_running_work() {
+        let reg = PrefetchRegistry::new();
+        let ran = Arc::new(AtomicU32::new(0));
+        reg.pacer("sess-c", 1).retarget(0, slow_job(&ran));
+        reg.cancel("sess-c");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "stopped session's job aborted"
+        );
     }
 }

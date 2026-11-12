@@ -14,14 +14,19 @@
 //! client's own segment goes straight to the segment cache, and the pacer only
 //! ever sees speculative work.
 //!
-//! One walker task per pacer runs the in-flight set as a `FuturesUnordered`, so
-//! aborting the walker drops every pending AND running prefetch future with it
-//! (the registry's session-scoped cancellation, see `prefetch_registry`).
+//! The pending map and the in-flight set belong to one walker task, spawned
+//! when the pacer is created (V18: mutable runtime state is owned by exactly
+//! one task and mutated by message passing). [`PrefetchPacer::retarget`] and
+//! [`PrefetchPacer::extend`] only send it a message over an unbounded channel,
+//! so the request handler that calls them never locks, waits or blocks. The
+//! walker runs the in-flight set as a `FuturesUnordered`, and the pacer aborts
+//! the walker when it is dropped, so every pending AND running prefetch future
+//! dies with the registry entry that owns the pacer (the session-scoped
+//! cancellation, see `prefetch_registry`).
 //!
 //! State per session is the pending map (at most the near window plus the burn
 //! front-load, about 10 boxed futures) and an in-flight set of at most
-//! [`MAX_PREFETCH_IN_FLIGHT`] segment numbers; it is dropped with the
-//! registry entry when the session stops or swaps media.
+//! [`MAX_PREFETCH_IN_FLIGHT`] segment numbers.
 
 use futures_util::future::LocalBoxFuture;
 
@@ -33,9 +38,10 @@ pub type PrefetchJob = Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send>;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Prefetch encodes one play session may have running at once. Measured on the
@@ -74,97 +80,143 @@ struct Queued {
     deferred: bool,
 }
 
-#[derive(Default)]
-struct State {
-    pending: BTreeMap<u32, Queued>,
-    in_flight: BTreeSet<u32>,
-    walking: bool,
+enum Msg {
+    Retarget {
+        base: u32,
+        jobs: Vec<(u32, PrefetchJob)>,
+    },
+    Extend {
+        base: u32,
+        jobs: Vec<(u32, PrefetchJob)>,
+    },
 }
 
-/// One play session's prefetch queue; see the module docs.
+/// One play session's prefetch queue; see the module docs. Dropping it aborts
+/// the walker, and with it every pending and running prefetch.
 pub struct PrefetchPacer {
-    max_in_flight: usize,
-    state: Mutex<State>,
-    wake: Notify,
+    tx: mpsc::UnboundedSender<Msg>,
+    walker: JoinHandle<()>,
+    /// Jobs sent and not yet run to completion or dropped by the walker.
+    outstanding: Arc<AtomicUsize>,
 }
 
-/// Clears `walking` if the walker task ends any way but a clean exit (an abort
-/// or a panicking job), so a later request can start a fresh walker.
-struct WalkGuard<'a> {
-    pacer: &'a PrefetchPacer,
-    clean: bool,
-}
-
-impl Drop for WalkGuard<'_> {
+impl Drop for PrefetchPacer {
     fn drop(&mut self) {
-        if !self.clean {
-            self.pacer.lock().walking = false;
-        }
+        self.walker.abort();
     }
 }
 
 impl PrefetchPacer {
+    /// Create a pacer and spawn its walker on the calling actix worker, so it
+    /// must be called from inside the actix runtime.
     pub fn new(max_in_flight: usize) -> Arc<Self> {
-        Arc::new(Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let walker = Walker {
             max_in_flight: max_in_flight.max(1),
-            state: Mutex::new(State::default()),
-            wake: Notify::new(),
+            pending: BTreeMap::new(),
+            in_flight: BTreeSet::new(),
+            outstanding: Arc::clone(&outstanding),
+        };
+        Arc::new(Self {
+            tx,
+            walker: actix_web::rt::spawn(walker.run(rx)),
+            outstanding,
         })
-    }
-
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Replace the wanted set with `jobs` (segment, future), `base` being the
     /// segment the client asked for. Segments already running or already queued
     /// keep their place; queued ones absent from `jobs` are dropped, since the
-    /// client moved on. Returns the walker's handle when this call started one,
-    /// for the caller to register for cancellation.
-    pub fn retarget(
-        self: &Arc<Self>,
-        base: u32,
-        jobs: Vec<(u32, PrefetchJob)>,
-    ) -> Option<JoinHandle<()>> {
-        self.enqueue(base, jobs, true)
+    /// client moved on. Never blocks: it only hands the walker a message.
+    pub fn retarget(&self, base: u32, jobs: Vec<(u32, PrefetchJob)>) {
+        self.send(Msg::Retarget { base, jobs });
     }
 
     /// Add `jobs` to the wanted set without dropping anything (the deep
     /// subtitle-burn front-load, which arrives after the near window).
-    pub fn extend(
-        self: &Arc<Self>,
-        base: u32,
-        jobs: Vec<(u32, PrefetchJob)>,
-    ) -> Option<JoinHandle<()>> {
-        self.enqueue(base, jobs, false)
+    pub fn extend(&self, base: u32, jobs: Vec<(u32, PrefetchJob)>) {
+        self.send(Msg::Extend { base, jobs });
     }
 
-    fn enqueue(
-        self: &Arc<Self>,
-        base: u32,
-        jobs: Vec<(u32, PrefetchJob)>,
-        replace: bool,
-    ) -> Option<JoinHandle<()>> {
-        let mut st = self.lock();
-        if replace {
-            let keep: BTreeSet<u32> = jobs.iter().map(|(s, _)| *s).collect();
-            let before = st.pending.len();
-            st.pending.retain(|seg, _| keep.contains(seg));
-            let dropped = before - st.pending.len();
-            if dropped > 0 {
-                metrics::counter!(
-                    "pharos_prefetch_paced_total",
-                    "outcome" => PacingOutcome::Superseded.label()
-                )
-                .increment(dropped as u64);
+    /// True once every job handed over has run or been dropped.
+    pub fn is_idle(&self) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
+    }
+
+    fn send(&self, msg: Msg) {
+        let n = match &msg {
+            Msg::Retarget { jobs, .. } | Msg::Extend { jobs, .. } => jobs.len(),
+        };
+        self.outstanding.fetch_add(n, Ordering::AcqRel);
+        if self.tx.send(msg).is_err() {
+            self.outstanding.fetch_sub(n, Ordering::AcqRel);
+            tracing::warn!(jobs = n, "prefetch walker is gone; jobs dropped");
+        }
+    }
+}
+
+/// The state only the walker task touches.
+struct Walker {
+    max_in_flight: usize,
+    pending: BTreeMap<u32, Queued>,
+    in_flight: BTreeSet<u32>,
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl Walker {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
+        let mut running: FuturesUnordered<LocalBoxFuture<'static, u32>> = FuturesUnordered::new();
+        loop {
+            self.start_ready(&mut running);
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => self.apply(msg),
+                    None => return,
+                },
+                Some(seg) = running.next() => {
+                    self.in_flight.remove(&seg);
+                    self.retire(1);
+                }
             }
         }
+    }
+
+    fn retire(&self, n: usize) {
+        if n > 0 {
+            self.outstanding.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
+
+    fn superseded(&self, n: usize) {
+        if n > 0 {
+            metrics::counter!(
+                "pharos_prefetch_paced_total",
+                "outcome" => PacingOutcome::Superseded.label()
+            )
+            .increment(n as u64);
+            self.retire(n);
+        }
+    }
+
+    fn apply(&mut self, msg: Msg) {
+        let (base, jobs) = match msg {
+            Msg::Retarget { base, jobs } => {
+                let keep: BTreeSet<u32> = jobs.iter().map(|(s, _)| *s).collect();
+                let before = self.pending.len();
+                self.pending.retain(|seg, _| keep.contains(seg));
+                self.superseded(before - self.pending.len());
+                (base, jobs)
+            }
+            Msg::Extend { base, jobs } => (base, jobs),
+        };
         let now = Instant::now();
         for (seg, job) in jobs {
-            if st.in_flight.contains(&seg) || st.pending.contains_key(&seg) {
+            if self.in_flight.contains(&seg) || self.pending.contains_key(&seg) {
+                self.retire(1);
                 continue;
             }
-            st.pending.insert(
+            self.pending.insert(
                 seg,
                 Queued {
                     job,
@@ -174,69 +226,39 @@ impl PrefetchPacer {
                 },
             );
         }
-        if st.walking {
-            drop(st);
-            self.wake.notify_one();
-            return None;
-        }
-        st.walking = true;
-        drop(st);
-        Some(actix_web::rt::spawn(Arc::clone(self).walk()))
     }
 
-    async fn walk(self: Arc<Self>) {
-        let mut guard = WalkGuard {
-            pacer: &self,
-            clean: false,
-        };
-        let mut running: FuturesUnordered<LocalBoxFuture<'static, u32>> = FuturesUnordered::new();
-        loop {
-            {
-                let mut st = self.lock();
-                while running.len() < self.max_in_flight {
-                    let Some((seg, q)) = st.pending.pop_first() else {
-                        break;
-                    };
-                    let outcome = if q.deferred {
-                        PacingOutcome::Deferred
-                    } else {
-                        PacingOutcome::Started
-                    };
-                    let wait = q.queued_at.elapsed();
-                    metrics::counter!("pharos_prefetch_paced_total", "outcome" => outcome.label())
-                        .increment(1);
-                    metrics::histogram!("pharos_prefetch_slot_wait_seconds")
-                        .record(wait.as_secs_f64());
-                    tracing::debug!(
-                        seg,
-                        distance_ahead = seg.saturating_sub(q.base),
-                        wait_ms = wait.as_millis() as u64,
-                        outcome = outcome.label(),
-                        in_flight = running.len(),
-                        "prefetch took a session slot"
-                    );
-                    st.in_flight.insert(seg);
-                    let job = (q.job)();
-                    running.push(Box::pin(async move {
-                        job.await;
-                        seg
-                    }));
-                }
-                if running.is_empty() {
-                    st.walking = false;
-                    guard.clean = true;
-                    return;
-                }
-                for q in st.pending.values_mut() {
-                    q.deferred = true;
-                }
-            }
-            tokio::select! {
-                Some(seg) = running.next() => {
-                    self.lock().in_flight.remove(&seg);
-                }
-                () = self.wake.notified() => {}
-            }
+    fn start_ready(&mut self, running: &mut FuturesUnordered<LocalBoxFuture<'static, u32>>) {
+        while running.len() < self.max_in_flight {
+            let Some((seg, q)) = self.pending.pop_first() else {
+                return;
+            };
+            let outcome = if q.deferred {
+                PacingOutcome::Deferred
+            } else {
+                PacingOutcome::Started
+            };
+            let wait = q.queued_at.elapsed();
+            metrics::counter!("pharos_prefetch_paced_total", "outcome" => outcome.label())
+                .increment(1);
+            metrics::histogram!("pharos_prefetch_slot_wait_seconds").record(wait.as_secs_f64());
+            tracing::debug!(
+                seg,
+                distance_ahead = seg.saturating_sub(q.base),
+                wait_ms = wait.as_millis() as u64,
+                outcome = outcome.label(),
+                in_flight = running.len(),
+                "prefetch took a session slot"
+            );
+            self.in_flight.insert(seg);
+            let job = (q.job)();
+            running.push(Box::pin(async move {
+                job.await;
+                seg
+            }));
+        }
+        for q in self.pending.values_mut() {
+            q.deferred = true;
         }
     }
 }
@@ -247,6 +269,7 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     /// Shared probe: start order, current and peak concurrency.
@@ -276,7 +299,7 @@ mod tests {
 
     async fn idle(pacer: &PrefetchPacer) {
         for _ in 0..200 {
-            if !pacer.lock().walking {
+            if pacer.is_idle() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -348,20 +371,42 @@ mod tests {
         assert!(t.elapsed() < Duration::from_millis(20));
     }
 
+    /// Counts how many futures were dropped, finished or not.
+    struct DropCount(Arc<AtomicUsize>);
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[actix_web::test]
-    async fn aborting_the_walker_drops_running_and_pending_work() {
+    async fn dropping_the_pacer_aborts_running_and_pending_work() {
         let pacer = PrefetchPacer::new(1);
         let probe = Arc::new(Probe::default());
-        let h = pacer
-            .retarget(0, (1..=3).map(|s| job(&probe, s, 200)).collect())
-            .unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let jobs = (1..=3)
+            .map(|seg| {
+                let (probe, dropped) = (Arc::clone(&probe), Arc::clone(&dropped));
+                let (_, inner) = job(&probe, seg, 200);
+                let job: PrefetchJob = Box::new(move || {
+                    let guard = DropCount(dropped);
+                    let fut = inner();
+                    async move {
+                        fut.await;
+                        drop(guard);
+                    }
+                    .boxed_local()
+                });
+                (seg, job)
+            })
+            .collect();
+        pacer.retarget(0, jobs);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        h.abort();
+        drop(pacer);
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(probe.running.load(Ordering::SeqCst), 1, "1 never finished");
         assert_eq!(*probe.started.lock().unwrap(), vec![1], "2 and 3 never ran");
-        // A later request starts a fresh walker.
-        assert!(pacer.extend(0, vec![job(&probe, 7, 1)]).is_some());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "1's future was dropped");
     }
 
     #[actix_web::test]
@@ -375,7 +420,8 @@ mod tests {
         let probe = Arc::new(Probe::default());
         pacer.retarget(0, (1..=3).map(|s| job(&probe, s, 20)).collect());
         tokio::time::sleep(Duration::from_millis(5)).await;
-        pacer.retarget(0, vec![job(&probe, 1, 1), job(&probe, 2, 1)]);
+        // Client moved to 3: 2 is behind it and never runs.
+        pacer.retarget(3, vec![job(&probe, 3, 1)]);
         idle(&pacer).await;
 
         let rows = snapshotter.snapshot().into_vec();
