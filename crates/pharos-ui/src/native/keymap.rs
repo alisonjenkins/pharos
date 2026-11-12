@@ -746,8 +746,32 @@ pub type Rect = (f64, f64, f64, f64);
 /// (the focused one may be among them). Up and Down take the nearest
 /// control wholly above or below, keeping the column; Left and Right the
 /// nearest on the same line. First and Last are the first and last in
-/// page order.
+/// page order. With nothing below, Down takes the next control in page
+/// order that is not on the focused one's line, so the foot of a side
+/// column (a show's or an album's) leads into the column beside it (B1354).
 pub fn pick(dir: Dir, from: Rect, controls: &[Rect]) -> Option<usize> {
+    let found = pick_spatial(dir, from, controls);
+    match (dir, found) {
+        (Dir::Down, None) => next_column(from, controls),
+        _ => found,
+    }
+}
+
+/// The first control after `from` in page order that is not on its line;
+/// None when `from` is not among `controls`.
+fn next_column(from: Rect, controls: &[Rect]) -> Option<usize> {
+    const SLACK: f64 = 0.5;
+    let at = controls.iter().position(|r| *r == from)?;
+    let (_, fy, _, fh) = from;
+    controls
+        .iter()
+        .enumerate()
+        .skip(at + 1)
+        .find(|(_, r)| !(r.1 < fy + fh - SLACK && r.1 + r.3 > fy + SLACK))
+        .map(|(i, _)| i)
+}
+
+fn pick_spatial(dir: Dir, from: Rect, controls: &[Rect]) -> Option<usize> {
     let (fx, fy, fw, fh) = from;
     let centre = |r: &Rect| (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
     let (fcx, fcy) = centre(&from);
@@ -1285,6 +1309,26 @@ mod tests {
         assert_eq!(pick(Dir::First, GRID[3], &GRID), Some(0));
         assert_eq!(pick(Dir::Last, GRID[0], &GRID), Some(5));
         assert_eq!(pick(Dir::Last, GRID[0], &[]), None);
+    }
+
+    #[test]
+    fn down_from_the_foot_of_a_side_column_enters_the_column_beside_it() {
+        // B1354: a show's page. The side column (Resume, then a mark) comes
+        // first in page order; the season tab and episodes sit beside it,
+        // all of them above the mark's foot.
+        let page = [
+            (0.0, 200.0, 200.0, 40.0),   // Resume
+            (0.0, 260.0, 40.0, 40.0),    // the show's mark
+            (240.0, 0.0, 120.0, 32.0),   // season tab
+            (240.0, 50.0, 600.0, 60.0),  // episode 1
+            (240.0, 120.0, 600.0, 60.0), // episode 2
+        ];
+        assert_eq!(pick(Dir::Down, page[0], &page), Some(1));
+        assert_eq!(pick(Dir::Down, page[1], &page), Some(2));
+        assert_eq!(pick(Dir::Down, page[3], &page), Some(4));
+        // A grid's last line still ends the walk: its neighbour on the line
+        // is no step down.
+        assert_eq!(pick(Dir::Down, GRID[4], &GRID), None);
     }
 
     #[test]
