@@ -1822,10 +1822,10 @@ where
             .unwrap(),
         "existing row: the update reports true"
     );
-    let got = TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+    let got = TranscodeSessionStore::get_transcode_session(&store, psid, 700)
         .await
         .unwrap()
-        .expect("row survives the holder update");
+        .expect("row survives the holder update with updated_at stamped");
     assert_eq!(got.holder, Some(rebound.clone()));
     assert_eq!(got.decision_json, sess.decision_json, "payload untouched");
     TranscodeSessionStore::remove_transcode_session(&store, psid)
