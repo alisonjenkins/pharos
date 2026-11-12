@@ -122,6 +122,7 @@ impl PrefetchPacer {
         let walker = Walker {
             max_in_flight: max_in_flight.max(1),
             retain_ahead,
+            latest_base: None,
             pending: BTreeMap::new(),
             in_flight: BTreeSet::new(),
             outstanding: Arc::clone(&outstanding),
@@ -170,6 +171,8 @@ impl PrefetchPacer {
 struct Walker {
     max_in_flight: usize,
     retain_ahead: u32,
+    /// The base of the newest retarget: where the client is.
+    latest_base: Option<u32>,
     pending: BTreeMap<u32, Queued>,
     in_flight: BTreeSet<u32>,
     outstanding: Arc<AtomicUsize>,
@@ -213,16 +216,24 @@ impl Walker {
     fn apply(&mut self, msg: Msg) {
         let (base, jobs) = match msg {
             Msg::Retarget { base, jobs } => {
+                self.latest_base = Some(base);
                 let last = base.saturating_add(self.retain_ahead);
                 let before = self.pending.len();
                 self.pending.retain(|seg, _| (base..=last).contains(seg));
                 self.superseded(before - self.pending.len());
                 (base, jobs)
             }
+            // The deep scan awaits I/O before it sends, so a seek may have
+            // retargeted meanwhile; its jobs behind the client are stale.
             Msg::Extend { base, jobs } => (base, jobs),
         };
         let now = Instant::now();
+        let floor = self.latest_base.unwrap_or(0);
         for (seg, job) in jobs {
+            if seg < floor {
+                self.superseded(1);
+                continue;
+            }
             if self.in_flight.contains(&seg) || self.pending.contains_key(&seg) {
                 self.retire(1);
                 continue;
@@ -398,6 +409,24 @@ mod tests {
         pacer.retarget(1, vec![job(&probe, 2, 5)]);
         idle(&pacer).await;
         assert_eq!(*probe.started.lock().unwrap(), vec![1, 2, 4]);
+    }
+
+    /// Disarm: drop the `seg < floor` skip in `apply`.
+    #[actix_web::test]
+    async fn a_stale_extend_behind_the_latest_base_is_skipped() {
+        let pacer = PrefetchPacer::new(1, TEST_RETAIN);
+        let probe = Arc::new(Probe::default());
+        pacer.retarget(0, vec![job(&probe, 1, 30)]);
+        // A seek retargets to 40 while the deep scan, started at base 0, is
+        // still reading; its result arrives afterwards.
+        pacer.retarget(40, vec![job(&probe, 41, 5)]);
+        pacer.extend(0, vec![job(&probe, 6, 5), job(&probe, 45, 5)]);
+        idle(&pacer).await;
+        assert_eq!(
+            *probe.started.lock().unwrap(),
+            vec![1, 41, 45],
+            "6 is behind 40"
+        );
     }
 
     #[actix_web::test]
