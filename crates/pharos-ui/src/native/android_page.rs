@@ -2424,11 +2424,12 @@ window.__pharosSend = send;
 // changes need them (B1030).
 const ticked = {};
 // The last `progress` sent for each element: download progress feeds only
-// the seek bar's buffered range, so once a second is plenty (B1386).
-const progressed = {};
+// the seek bar's buffered range, so once a second is plenty (B1386). Keyed
+// by element, not id: a replacement element with the same id starts fresh.
+const progressed = new WeakMap();
 // A `progress` held back by that limit, sent once the second is up so the
 // last range of a download is never lost.
-const trailing = {};
+const trailing = new WeakMap();
 // The element's buffered ranges in whole ms.
 const rangesOf = (v) => {
   const out = [];
@@ -2452,18 +2453,18 @@ const media = (e) => {
   if (e.type === 'progress') {
     // Never a Dioxus event, which would hold the WebView until Rust answers.
     e.stopPropagation();
-    const wait = 1000 - (performance.now() - (progressed[v.id] || 0));
+    const wait = 1000 - (performance.now() - (progressed.get(v) || 0));
     if (wait > 0) {
-      if (!trailing[v.id]) {
-        trailing[v.id] = setTimeout(() => {
-          trailing[v.id] = 0;
+      if (!trailing.get(v)) {
+        trailing.set(v, setTimeout(() => {
+          trailing.delete(v);
           // A replaced element must not overwrite its successor's state.
           if (v.isConnected) media({ type: 'progress', target: v, stopPropagation() {} });
-        }, wait);
+        }, wait));
       }
       return;
     }
-    progressed[v.id] = performance.now();
+    progressed.set(v, performance.now());
   }
   // Media buffered ahead of the play head; a stall also names where it ends.
   const here = Math.round(v.currentTime * 1000);
