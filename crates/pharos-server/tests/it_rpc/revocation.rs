@@ -27,6 +27,14 @@ pub(crate) async fn start() -> (actix_test::TestServer, Fixture) {
     start_with(NonZeroU32::MIN).await
 }
 
+/// A server that holds a released playback grant for `grace` before ending it.
+pub(crate) async fn start_with_release_grace(
+    grace: std::time::Duration,
+) -> (actix_test::TestServer, Fixture) {
+    let fx = crate::common::seed_rich_with(|s| s.with_release_grace(grace)).await;
+    serve(fx, NonZeroU32::MIN)
+}
+
 /// A server whose timer re-checks every `revalidate_secs`.
 async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fixture) {
     serve(seed_rich().await, revalidate_secs)
