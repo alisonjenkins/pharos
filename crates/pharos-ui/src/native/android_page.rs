@@ -368,6 +368,12 @@ pub fn has_mse() -> bool {
     true
 }
 
+/// hls.js plays every HLS stream here, whichever engine was asked for
+/// (B1366, V1336).
+pub fn hls_engine_used(picked: Engine) -> Option<(Engine, &'static str)> {
+    matches!(picked, Engine::NativeHls | Engine::RustHls).then_some((Engine::HlsJs, "android"))
+}
+
 /// What the WebView decodes, as `open` probed it, with no container the
 /// server can play directly (`tv_page::NO_DIRECT_PLAY`).
 ///
@@ -1315,12 +1321,6 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
             Ok(Box::new(engine))
         }
         Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
-            if kind != Engine::HlsJs {
-                log::info!(
-                    "pharos: engine picked={} using=hlsjs reason=android",
-                    super::playback::engine_label(kind)
-                );
-            }
             load_hlsjs().await?;
             Ok(Box::new(HlsJs::default()))
         }
