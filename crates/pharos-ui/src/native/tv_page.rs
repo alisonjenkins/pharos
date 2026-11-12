@@ -775,6 +775,20 @@ pub struct Media {
     /// A throttled `timeupdate`, which Rust hears only this way.
     #[serde(default)]
     pub tick: bool,
+    /// The event's type (`playing`, `waiting`, ...), which the play's trace
+    /// reads (B1367).
+    #[serde(default)]
+    pub ev: String,
+    /// `networkState`.
+    #[serde(default)]
+    pub ns: u16,
+    /// Media buffered ahead of the play head, ms; 0 in a gap.
+    #[serde(default)]
+    pub fwd: u64,
+    /// The buffered ranges, `start-end` in ms, comma separated: only a
+    /// `waiting` carries them.
+    #[serde(default)]
+    pub buffered: String,
 }
 
 fn one() -> f64 {
@@ -1610,6 +1624,11 @@ mod tests {
             parse_bridge(&ticked),
             Some(Bridge::Media(Media { tick: true, .. }))
         ));
+        assert_eq!(
+            (m.ev.as_str(), m.ns, m.fwd, m.buffered.as_str()),
+            ("", 0, 0, ""),
+            "an old message names none of the trace's fields"
+        );
         let paused = Media {
             paused: true,
             ..m.clone()
@@ -1623,6 +1642,23 @@ mod tests {
         assert!(!waiting.has_data());
         let live = Media { dur: None, ..m };
         assert_eq!(live.duration_ms(), 0);
+    }
+
+    /// B1367: the page sends the event type, network state and forward
+    /// buffer the play's trace needs.
+    #[test]
+    fn a_media_event_carries_what_the_play_trace_reads() {
+        let v = serde_json::json!({"t": "media", "id": "v", "pos": 10.0, "dur": 20.0,
+            "paused": false, "ended": false, "seeking": false, "ready": 2, "vol": 1.0,
+            "muted": false, "ev": "waiting", "ns": 2, "fwd": 0,
+            "buffered": "0-9000,12000-15000"});
+        let Some(Bridge::Media(m)) = parse_bridge(&v) else {
+            panic!("not media");
+        };
+        assert_eq!(
+            (m.ev.as_str(), m.ns, m.fwd, m.buffered.as_str()),
+            ("waiting", 2, 0, "0-9000,12000-15000")
+        );
     }
 
     #[test]
