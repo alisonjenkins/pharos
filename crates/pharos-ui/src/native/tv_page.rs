@@ -860,6 +860,21 @@ pub enum HlsEvent {
         #[serde(default)]
         track: FragTrack,
     },
+    /// `Hls.Events.FRAG_BUFFERED`: a main or audio fragment parsed and
+    /// appended to the source buffer. Its numbers are the download's, as in
+    /// [`HlsEvent::Frag`].
+    Buffered {
+        #[serde(default)]
+        bytes: u64,
+        #[serde(default)]
+        load_ms: u64,
+        #[serde(default)]
+        sn: u64,
+        #[serde(default)]
+        ttfb_ms: u64,
+        #[serde(default)]
+        track: FragTrack,
+    },
 }
 
 /// Which rendition a loaded fragment belongs to (hls.js's `frag.type`).
@@ -1864,6 +1879,41 @@ mod tests {
                     sn: 7,
                     ttfb_ms: 35,
                     track: FragTrack::Audio,
+                }
+            })
+        );
+    }
+
+    /// B1367: the play trace counts a segment once it is appended, which
+    /// hls.js says with `FRAG_BUFFERED`, not when the download ends.
+    #[test]
+    fn a_buffered_fragment_parses_with_defaults() {
+        let b = serde_json::json!({"t": "hls", "id": "v", "ev": "buffered",
+            "bytes": 10, "load_ms": 2, "sn": 7, "ttfb_ms": 35, "track": "audio"});
+        assert_eq!(
+            parse_bridge(&b),
+            Some(Bridge::Hls {
+                id: "v".into(),
+                event: HlsEvent::Buffered {
+                    bytes: 10,
+                    load_ms: 2,
+                    sn: 7,
+                    ttfb_ms: 35,
+                    track: FragTrack::Audio,
+                }
+            })
+        );
+        let bare = serde_json::json!({"t": "hls", "id": "v", "ev": "buffered"});
+        assert_eq!(
+            parse_bridge(&bare),
+            Some(Bridge::Hls {
+                id: "v".into(),
+                event: HlsEvent::Buffered {
+                    bytes: 0,
+                    load_ms: 0,
+                    sn: 0,
+                    ttfb_ms: 0,
+                    track: FragTrack::Main,
                 }
             })
         );

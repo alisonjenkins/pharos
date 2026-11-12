@@ -1428,13 +1428,9 @@ impl PlaybackEngine for HlsJs {
                     bytes,
                     load_ms,
                     media_ms,
-                    sn,
-                    ttfb_ms,
                     track,
+                    ..
                 } => {
-                    let appended = tv_page::appended_of(sn, bytes, ttfb_ms, load_ms, track);
-                    let summary = trace.borrow_mut().appended(appended, trace_now());
-                    emit_trace(summary.into_iter().collect());
                     if track == tv_page::FragTrack::Audio {
                         return;
                     }
@@ -1446,6 +1442,17 @@ impl PlaybackEngine for HlsJs {
                             media_ms,
                         });
                     }
+                }
+                tv_page::HlsEvent::Buffered {
+                    bytes,
+                    load_ms,
+                    sn,
+                    ttfb_ms,
+                    track,
+                } => {
+                    let appended = tv_page::appended_of(sn, bytes, ttfb_ms, load_ms, track);
+                    let summary = trace.borrow_mut().appended(appended, trace_now());
+                    emit_trace(summary.into_iter().collect());
                 }
                 tv_page::HlsEvent::Error {
                     kind,
@@ -1526,16 +1533,24 @@ h.__pharosGen = {generation};
 window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
 h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
-h.on(Hls.Events.FRAG_LOADED, (_, d) => {{
-  if (!d.frag || (d.frag.type !== "main" && d.frag.type !== "audio")) return;
+const fragStats = (ev, d) => {{
+  if (!d.frag || (d.frag.type !== "main" && d.frag.type !== "audio")) return null;
   const st = d.frag.stats || d.stats || {{}};
   const l = st.loading || {{}};
   const from = l.first > 0 ? l.first : l.start;
-  send({{ ev: "frag", track: d.frag.type, sn: typeof d.frag.sn === "number" ? d.frag.sn : 0,
+  return {{ ev, track: d.frag.type, sn: typeof d.frag.sn === "number" ? d.frag.sn : 0,
          ttfb_ms: Math.max(0, Math.round((l.first || 0) - (l.start || 0))),
          bytes: Math.max(0, Math.round(st.loaded || 0)),
          load_ms: Math.max(0, Math.round((l.end || 0) - (from || 0))),
-         media_ms: Math.max(0, Math.round((d.frag.duration || 0) * 1000)) }});
+         media_ms: Math.max(0, Math.round((d.frag.duration || 0) * 1000)) }};
+}};
+h.on(Hls.Events.FRAG_LOADED, (_, d) => {{
+  const m = fragStats("frag", d);
+  if (m) send(m);
+}});
+h.on(Hls.Events.FRAG_BUFFERED, (_, d) => {{
+  const m = fragStats("buffered", d);
+  if (m) send(m);
 }});
 v.setAttribute({mark}, "hlsjs");
 h.loadSource({url});
