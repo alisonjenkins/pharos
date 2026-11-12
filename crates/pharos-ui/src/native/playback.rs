@@ -2371,21 +2371,25 @@ pub fn hls_start_position(start_ms: u64) -> f64 {
 }
 
 /// Seconds hls.js aims to hold ahead of the play head. Above its 30 s
-/// default so a long-latency viewer rides out a slow segment (B1325).
-pub const HLS_FORWARD_S: f64 = 60.0;
+/// default so a long-latency viewer rides out a slow segment, and short
+/// enough that a 12 Mbps stream (~67 MB) plus the back buffer stays under
+/// the ~80 MiB video quota Chromium gives low-memory devices (B1325).
+pub const HLS_FORWARD_S: f64 = 45.0;
 
-/// Ceiling hls.js may raise the forward target to for a low-bitrate stream.
+/// Ceiling on the forward target, which hls.js raises above
+/// `HLS_FORWARD_S` for a stream whose `HLS_FORWARD_BYTES` lasts longer.
 pub const HLS_FORWARD_CEILING_S: f64 = 120.0;
 
 /// Seconds kept behind the play head. hls.js keeps everything by default,
 /// which fills the browser's SourceBuffer quota a few minutes in; each
 /// eviction then halves the forward ceiling, down to about two segments
-/// (B1325, V1296).
-pub const HLS_BACK_S: f64 = 30.0;
+/// (B1325, V1296). Matches the TV page's hls.js.
+pub const HLS_BACK_S: f64 = 10.0;
 
-/// Bytes hls.js may hold ahead: 120 s of a ~6 Mbps stream, below Chrome's
-/// ~150 MB video quota so the forward target never pushes it over.
-pub const HLS_FORWARD_BYTES: f64 = 90_000_000.0;
+/// Bytes whose play time hls.js takes as the forward target when that is
+/// longer than `HLS_FORWARD_S`: 60 MB is 120 s of a 4 Mbps transcode. It
+/// lengthens the look-ahead of a low-bitrate stream and never caps it.
+pub const HLS_FORWARD_BYTES: f64 = 60_000_000.0;
 
 /// The buffer settings handed to hls.js, as `(config key, value)`.
 pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
@@ -2399,8 +2403,8 @@ pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
 
 /// Watches hls.js's forward ceiling (`maxMaxBufferLength`), which hls.js
 /// lowers on its own after buffer-full errors and evictions and never
-/// raises again. The first reading is the baseline; each drop below the
-/// last one is reported once, with both values.
+/// raises again. Each drop below the last reading is reported once, with
+/// both values.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BufferCeiling {
     last_s: Option<f64>,
@@ -2417,9 +2421,7 @@ impl BufferCeiling {
             .last_s
             .filter(|last| now_s < *last)
             .map(|from| (from, now_s));
-        if self.last_s.is_none() || cut.is_some() {
-            self.last_s = Some(now_s);
-        }
+        self.last_s = Some(now_s);
         cut
     }
 }
@@ -3062,10 +3064,10 @@ mod tests {
     #[test]
     fn hls_buffer_config_bounds_the_back_buffer_and_lengthens_the_forward_one() {
         let config: std::collections::HashMap<_, _> = hls_buffer_config().into_iter().collect();
-        assert_eq!(config.get("backBufferLength"), Some(&30.0));
-        assert_eq!(config.get("maxBufferLength"), Some(&60.0));
+        assert_eq!(config.get("backBufferLength"), Some(&10.0));
+        assert_eq!(config.get("maxBufferLength"), Some(&45.0));
         assert_eq!(config.get("maxMaxBufferLength"), Some(&120.0));
-        assert_eq!(config.get("maxBufferSize"), Some(&90_000_000.0));
+        assert_eq!(config.get("maxBufferSize"), Some(&60_000_000.0));
         let forward = config.get("maxBufferLength").copied().unwrap_or_default();
         let ceiling = config
             .get("maxMaxBufferLength")
@@ -3084,6 +3086,11 @@ mod tests {
         assert_eq!(ceiling.observe(f64::NAN), None);
         assert_eq!(ceiling.observe(0.0), None);
         assert_eq!(ceiling.observe(30.0), None, "a rise is not a cut");
+        assert_eq!(
+            ceiling.observe(20.0),
+            Some((30.0, 20.0)),
+            "a cut after a rise is measured from the rise"
+        );
     }
 
     /// B1160: only hls.js media it could not parse or append counts as

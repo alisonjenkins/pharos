@@ -283,8 +283,9 @@ fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
 /// words are pending: a song can wait behind others in the aligner's queue
 /// and then take minutes, and giving up after a fixed count left the fill a
 /// guess for the whole song (B1163). Leaving the song drops the task and
-/// stops the asks.
-const ALIGN_ASK_MS: u32 = 5_000;
+/// stops the asks. Each answer can carry more lines already timed
+/// (ADR-0121), so a shorter wait shows each one sooner (B1326).
+const ALIGN_ASK_MS: u32 = 2_000;
 
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
 const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
@@ -6386,11 +6387,19 @@ fn Player(
                                 super::lyrics::eta_deadline(next.words_eta_ms, platform::now_ms())
                                     .map(|at| (id, at)),
                             );
+                            // The lines timed so far replace their guesses
+                            // now; the rest stay guessed until a later answer.
+                            if next.lines.iter().any(|l| !l.words.is_empty()) {
+                                aligned.set(Some((id, next)));
+                            }
                         }
-                        // The aligner failed or found no words: keep the
-                        // estimate already on screen.
+                        // The aligner failed or found no words: the guessed
+                        // fill stays, and lines a failed job had already
+                        // timed and its "Timing the words" banner go.
                         Ok(next) if next.lines.iter().all(|l| l.words.is_empty()) => {
                             platform::info("pharos: lyrics word times not found");
+                            words_eta_at.set(None);
+                            aligned.set(Some((id, next)));
                             return;
                         }
                         Ok(next) => {

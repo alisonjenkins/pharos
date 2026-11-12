@@ -2,17 +2,119 @@
 //! service's statuses and error bodies.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
-use actix_web::http::header::CONTENT_LENGTH;
+use actix_web::body::{BodySize, MessageBody};
+use actix_web::http::header::{ACCEPT, CONTENT_LENGTH};
 use actix_web::http::StatusCode;
+use actix_web::web::Bytes;
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, SONGS_TOTAL, SONG_SECONDS};
 use crate::plan::{parse_request, resolve, Line};
-use crate::service::{Aligned, Engine, SongError};
+use crate::service::{Aligned, Answer, Engine, Progress, SongError};
+
+/// The streamed `/align` answer's type (ADR-0121): one JSON event per line,
+/// sent when a caller's `Accept` names it.
+pub const NDJSON: &str = "application/x-ndjson";
+
+/// The last event of a streamed song: the whole answer, as the plain reply
+/// carries it, so the caller keeps nothing it pieced together itself.
+#[derive(Serialize)]
+struct Done<'a> {
+    event: &'static str,
+    #[serde(flatten)]
+    answer: &'a Answer,
+}
+
+/// A streamed song that failed after its 200 went out: the status and body
+/// the plain reply would have had.
+#[derive(Serialize)]
+struct Failed {
+    event: &'static str,
+    status: u16,
+    error: String,
+}
+
+/// A response body fed event by event from the song's blocking thread; it
+/// ends when the song's last sender is dropped.
+struct Events(UnboundedReceiver<Bytes>);
+
+impl MessageBody for Events {
+    type Error = std::convert::Infallible;
+
+    fn size(&self) -> BodySize {
+        BodySize::Stream
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        self.0.poll_recv(cx).map(|line| line.map(Ok))
+    }
+}
+
+/// `event` as one NDJSON line; `None`, logged, if it does not serialise.
+fn event_line(event: &impl Serialize) -> Option<Bytes> {
+    match serde_json::to_vec(event) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            Some(Bytes::from(bytes))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "event did not serialise");
+            None
+        }
+    }
+}
+
+/// Whether the caller's `Accept` names the streamed answer with a quality
+/// above zero (RFC 9110: `q=0` is "not acceptable").
+fn wants_events(req: &HttpRequest) -> bool {
+    req.headers()
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(accepts_events)
+}
+
+fn accepts_events(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';');
+        let kind = parts.next().unwrap_or("").trim();
+        let q = parts
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+            .map_or(Some(1.0), |(_, v)| v.trim().parse::<f32>().ok());
+        kind.eq_ignore_ascii_case(NDJSON) && q.is_some_and(|q| q > 0.0)
+    })
+}
+
+/// The status and error body a failed song answers with.
+fn failure(
+    done: Result<Result<Aligned, SongError>, actix_web::error::BlockingError>,
+) -> Result<Aligned, (StatusCode, String)> {
+    match done {
+        Ok(Ok(aligned)) => Ok(aligned),
+        Ok(Err(e @ SongError::Ffmpeg(_))) => Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
+        Ok(Err(SongError::Internal(_))) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_owned(),
+        )),
+        Err(e) => {
+            tracing::error!(error = %e, "alignment thread failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_owned(),
+            ))
+        }
+    }
+}
 
 /// Largest `/align` body read; larger ones answer 413 without being read.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -137,20 +239,50 @@ async fn align(
     }
 
     let engine = Arc::clone(&state.engine);
+    if wants_events(&req) {
+        // Streamed (ADR-0121): the 200 goes out now, each line follows as it
+        // is timed, and the last event is the whole answer or the failure.
+        let (tx, rx) = unbounded_channel();
+        actix_web::rt::spawn(async move {
+            let progress = tx.clone();
+            let done = web::block(move || {
+                span.in_scope(|| {
+                    let mut on = |p: Progress<'_>| {
+                        // A caller that went away costs only its events.
+                        if let Some(line) = event_line(&p) {
+                            let _ = progress.send(line);
+                        }
+                    };
+                    run_song(&engine, &rel_path, &full_path, lines, &mut on)
+                })
+            })
+            .await;
+            let last = match failure(done) {
+                Ok(aligned) => event_line(&Done {
+                    event: "done",
+                    answer: &aligned.answer,
+                }),
+                Err((status, error)) => event_line(&Failed {
+                    event: "error",
+                    status: status.as_u16(),
+                    error,
+                }),
+            };
+            if let Some(last) = last {
+                let _ = tx.send(last);
+            }
+        });
+        return HttpResponse::Ok().content_type(NDJSON).body(Events(rx));
+    }
     // The song runs on a blocking thread so /healthz answers meanwhile; it
     // finishes and logs even if the caller stops waiting.
-    let done =
-        web::block(move || span.in_scope(|| run_song(&engine, &rel_path, &full_path, lines))).await;
-    match done {
-        Ok(Ok(aligned)) => json(StatusCode::OK, &aligned.answer),
-        Ok(Err(e @ SongError::Ffmpeg(_))) => error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-        Ok(Err(SongError::Internal(_))) => {
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "alignment thread failed");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
+    let done = web::block(move || {
+        span.in_scope(|| run_song(&engine, &rel_path, &full_path, lines, &mut |_| {}))
+    })
+    .await;
+    match failure(done) {
+        Ok(aligned) => json(StatusCode::OK, &aligned.answer),
+        Err((status, message)) => error(status, message),
     }
 }
 
@@ -161,10 +293,11 @@ fn run_song(
     rel_path: &str,
     full_path: &Path,
     lines: Vec<Line>,
+    on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Aligned, SongError> {
     let started = Instant::now();
     let n_lines = lines.len();
-    let (result, used, gpu) = engine.align_song_on(rel_path, full_path, lines);
+    let (result, used, gpu) = engine.align_song_on(rel_path, full_path, lines, on);
     let (device, device_reason) = used.map_or(("none", String::new()), |u| (u.device, u.reason));
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -276,7 +409,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-    use super::record_gpu;
+    use super::{accepts_events, record_gpu};
     use crate::obs::GPU_POOL_BYTES;
     use crate::service::{GpuMemory, GpuPool};
 
@@ -322,6 +455,22 @@ mod tests {
                 ("peak".into(), 3.0 * f64::from(1u32 << 30))
             ]
         );
+    }
+
+    #[test]
+    fn only_an_accept_that_names_the_stream_above_zero_quality_gets_it() {
+        assert!(accepts_events("application/x-ndjson"));
+        assert!(accepts_events("application/x-ndjson, application/json"));
+        assert!(accepts_events(
+            "application/json;q=0.5, Application/X-NDJSON; q=0.9"
+        ));
+        assert!(!accepts_events("application/json"));
+        assert!(!accepts_events(
+            "application/json, application/x-ndjson;q=0"
+        ));
+        assert!(!accepts_events("application/x-ndjson; q=0.0"));
+        assert!(!accepts_events("application/x-ndjson;q=nope"));
+        assert!(!accepts_events("application/x-ndjsonish"));
     }
 
     #[test]
