@@ -334,6 +334,25 @@ mod tests {
         assert_eq!(histogram_samples(&snapshotter, &[]), 0);
     }
 
+    /// A 304 never reaches the segment cache, so timing it would add a fast
+    /// `cache="none"` sample to the segment latency.
+    #[actix_web::test]
+    async fn a_not_modified_media_response_is_not_timed() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = test::init_service(App::new().wrap(RedMetrics).route(
+            "/videos/{id}/hls1/main/{seg}.ts",
+            web::get().to(|| async { HttpResponse::NotModified().finish() }),
+        ))
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/videos/7/hls1/main/3.ts")
+            .to_request();
+        test::call_service(&app, req).await;
+        assert_eq!(histogram_samples(&snapshotter, &[]), 0);
+    }
+
     /// The per-serve INFO line carries the client, route, segment, cache
     /// outcome and wait, from the request handler.
     // The lock only orders tests; the runtime is single-threaded, so holding

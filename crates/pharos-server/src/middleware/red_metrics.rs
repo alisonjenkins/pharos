@@ -259,7 +259,7 @@ where
                 Err(_) => 500,
             };
             if let (Some(route), Ok(r)) = (media_route, &res) {
-                if r.status().as_u16() < 400 {
+                if r.status().is_success() {
                     crate::media_telemetry::record_request(
                         route,
                         client,
