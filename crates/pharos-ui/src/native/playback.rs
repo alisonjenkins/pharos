@@ -910,12 +910,24 @@ impl PlannerNoteReport {
                 "track={} lead_ms={lead_ms} limit_ms={limit_ms}",
                 track.label()
             ),
+            Note::Skipped {
+                track,
+                index,
+                from_ms,
+                to_ms,
+            } => format!(
+                "track={} index={index} from_ms={from_ms} to_ms={to_ms}",
+                track.label()
+            ),
         }
     }
 
     /// A giving up is the one note that means the stream is off nominal.
     pub fn is_warn(&self) -> bool {
-        matches!(self.0, pharos_hls::planner::Note::GaveUp { .. })
+        matches!(
+            self.0,
+            pharos_hls::planner::Note::GaveUp { .. } | pharos_hls::planner::Note::Skipped { .. }
+        )
     }
 
     pub fn line(&self) -> String {
@@ -953,6 +965,17 @@ impl PlannerNoteReport {
                 ("track", track.label().to_owned()),
                 ("lead_ms", lead_ms.to_string()),
                 ("limit_ms", limit_ms.to_string()),
+            ],
+            Note::Skipped {
+                track,
+                index,
+                from_ms,
+                to_ms,
+            } => vec![
+                ("track", track.label().to_owned()),
+                ("index", index.to_string()),
+                ("from_ms", from_ms.to_string()),
+                ("to_ms", to_ms.to_string()),
             ],
         };
         let mut all = vec![
@@ -4804,6 +4827,17 @@ mod tests {
             "pharos: playback engine=rust planner=held track=audio lead_ms=6000 limit_ms=2000"
         );
         assert_eq!(held.event(String::new()).level, ClientLevel::Info);
+        let skipped = PlannerNoteReport(Note::Skipped {
+            track: Track::Video,
+            index: 0,
+            from_ms: 0,
+            to_ms: 6_100,
+        });
+        assert_eq!(
+            skipped.line(),
+            "pharos: playback engine=rust planner=skipped track=video index=0 from_ms=0 to_ms=6100"
+        );
+        assert_eq!(skipped.event(String::new()).level, ClientLevel::Warn);
     }
 
     // V637: every failed segment request logs and reports its cause, the
