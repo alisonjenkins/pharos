@@ -2163,15 +2163,19 @@ fn Hero(
                                 class: "pharos-button",
                                 id: MAIN_ACTION,
                                 key_action: "play",
+                                Icon { path: ICON_PLAY }
                                 {next_label(ep)}
                             }
                         }
+                        // B1354/V1325: a show's marks are round icon pills
+                        // beside its Resume, in the narrow side column.
                         if let Some(d) = detail.as_ref().filter(|_| mark) {
                             WatchedToggle {
                                 id: d.item.id,
                                 played: d.item.played,
                                 what: "show",
                                 name: d.item.name.clone(),
+                                icon: true,
                             }
                         }
                         if let Some(d) = detail.as_ref().filter(|_| mark || favourite) {
@@ -2179,7 +2183,7 @@ fn Hero(
                                 id: d.item.id,
                                 favorite: d.item.favorite,
                                 name: d.item.name.clone(),
-                                icon: lead.is_some(),
+                                icon: mark || lead.is_some(),
                             }
                         }
                     }
@@ -2225,55 +2229,65 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
     .collect();
     let marked_season = show.selected.filter(|_| !show.episodes.items.is_empty());
     rsx! {
+        // B1354/V1325: the album page's two columns. The show's art, name,
+        // Resume and marks keep a side column; the seasons and their
+        // episodes start at the top beside it, so the remote lands on a list
+        // instead of a poster.
         section { class: "pharos-show", "data-season-pick": show.pick.label(),
-            Hero {
-                title: show.title.clone(),
-                detail: show.series.clone(),
-                facts,
-                square: false,
-                mark: true,
-                next: play_target(&show).cloned(),
-            }
-            if let Some(series) = series {
-                super::check_match::CheckMatchBadge { series }
-            }
-            if show.seasons.len() > 1 {
-                nav { class: "pharos-tabs", aria_label: "Seasons", "data-key-tabs": "seasons",
-                    for season in show.seasons.iter() {
-                        Link {
-                            key: "{season.id}",
-                            to: Route::Browse(season.id),
-                            current: Some(season.id) == show.selected,
-                            class: if Some(season.id) == show.selected { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
-                            "{season.name}"
-                        }
-                    }
+            div { class: "pharos-show-side",
+                Hero {
+                    title: show.title.clone(),
+                    detail: show.series.clone(),
+                    facts,
+                    square: false,
+                    mark: true,
+                    next: play_target(&show).cloned(),
+                }
+                if let Some(series) = series {
+                    super::check_match::CheckMatchBadge { series }
                 }
             }
-            if show.seasons.len() == 1 || marked_season.is_some() {
-                div { class: "pharos-season-bar",
-                    if show.seasons.len() == 1 {
-                        h3 { class: "pharos-section-title", "{show.seasons[0].name}" }
-                    }
-                    if let Some(season) = marked_season {
-                        WatchedToggle {
-                            id: season,
-                            played: all_played(&show.episodes, show.season_played),
-                            what: "season",
-                            name: show
-                                .seasons
-                                .iter()
-                                .find(|s| s.id == season)
-                                .map_or_else(String::new, |s| s.name.clone()),
+            div { class: "pharos-show-main",
+                if show.seasons.len() > 1 || marked_season.is_some() {
+                    div { class: "pharos-season-bar",
+                        if show.seasons.len() > 1 {
+                            nav { class: "pharos-tabs", aria_label: "Seasons", "data-key-tabs": "seasons",
+                                for season in show.seasons.iter() {
+                                    Link {
+                                        key: "{season.id}",
+                                        to: Route::Browse(season.id),
+                                        current: Some(season.id) == show.selected,
+                                        class: if Some(season.id) == show.selected { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                                        "{season.name}"
+                                    }
+                                }
+                            }
+                        } else if show.seasons.len() == 1 {
+                            h3 { class: "pharos-section-title", "{show.seasons[0].name}" }
+                        }
+                        if let Some(season) = marked_season {
+                            WatchedToggle {
+                                id: season,
+                                played: all_played(&show.episodes, show.season_played),
+                                what: "season",
+                                name: show
+                                    .seasons
+                                    .iter()
+                                    .find(|s| s.id == season)
+                                    .map_or_else(String::new, |s| s.name.clone()),
+                                icon: true,
+                            }
                         }
                     }
+                } else if show.seasons.len() == 1 {
+                    h3 { class: "pharos-section-title", "{show.seasons[0].name}" }
                 }
+                InThisGroup { rows: in_group }
+                {remount_on(
+                    &show.selected.map_or_else(String::new, |s| s.to_string()),
+                    rsx! { EpisodeList { page: show.episodes.clone(), seen, source: episode_source(&show) } },
+                )}
             }
-            InThisGroup { rows: in_group }
-            {remount_on(
-                &show.selected.map_or_else(String::new, |s| s.to_string()),
-                rsx! { EpisodeList { page: show.episodes.clone(), seen, source: episode_source(&show) } },
-            )}
         }
     }
 }
@@ -2547,11 +2561,15 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 kind: QueueTarget::EpisodeRow,
             }
             super::check_match::RematchEpisode { id: episode.id }
+            // B1355/V1326: a round play pill, shown with the row's queue
+            // buttons on the focused or hovered row only.
             Link {
                 to: Route::Watch(episode.id),
-                class: "pharos-button pharos-episode-play",
+                class: "pharos-button pharos-button-secondary is-icon pharos-episode-play",
                 key_action: "play",
-                if progress.is_some() { "Resume" } else { "Play" }
+                label: format!("{} {label}", if progress.is_some() { "Resume" } else { "Play" }),
+                Icon { path: ICON_PLAY }
+                span { class: "pharos-button-label", if progress.is_some() { "Resume" } else { "Play" } }
             }
         }
     }
@@ -3231,11 +3249,12 @@ impl QueueTarget {
     /// bare icons.
     pub fn button_class(self) -> &'static str {
         match self {
-            // Round icon pills beside Play and Shuffle (B1347/V1318).
-            QueueTarget::AlbumPage => {
+            // Round icon pills beside Play and Shuffle (B1347/V1318), and in
+            // a title page's one row of actions (B1353/V1324); the words
+            // stay for screen readers and the tooltip.
+            QueueTarget::AlbumPage | QueueTarget::VideoPage => {
                 "pharos-queue-button pharos-button pharos-button-secondary is-icon"
             }
-            QueueTarget::VideoPage => "pharos-queue-button pharos-button pharos-button-secondary",
             QueueTarget::Song | QueueTarget::AlbumCard | QueueTarget::EpisodeRow => {
                 "pharos-queue-button"
             }
@@ -3391,7 +3410,7 @@ pub fn QueueButtons(
                     put(Place::Next);
                 },
                 Icon { path: ICON_QUEUE_NEXT }
-                if labelled { span { "Play next" } }
+                if labelled { span { class: "pharos-button-label", "Play next" } }
             }
             button {
                 class: "{button_class}",
@@ -3406,7 +3425,7 @@ pub fn QueueButtons(
                     put_end(Place::End);
                 },
                 Icon { path: ICON_QUEUE_ADD }
-                if labelled { span { "Add to queue" } }
+                if labelled { span { class: "pharos-button-label", "Add to queue" } }
             }
             if let (Some(song), Some(MixCtx(mut mix))) = (mix_song, mix) {
                 button {
@@ -5433,7 +5452,7 @@ mod tests {
         // Both are icon pills now, named by their labels (B1347/V1318).
         assert!(html.contains(r#"data-target="album_page""#), "{html}");
         assert!(html.contains(r#"data-target="song""#), "{html}");
-        assert!(!html.contains("<span>Play next</span>"), "{html}");
+        assert!(!html.contains(">Play next</span>"), "{html}");
         // Buttons are not inside the row's link.
         let link = html
             .split_once(r#"class="pharos-track""#)
@@ -5628,6 +5647,104 @@ mod tests {
         let show = at(":root[data-device=\"tv\"] .pharos-track-item:focus-within .pharos-queue-button {\n  opacity: 1;");
         let touch = at("@media (hover: none) {\n  .pharos-queue-buttons[data-target=\"song\"] .pharos-queue-button,");
         assert!(touch < hide && hide < show);
+    }
+
+    /// A show of two seasons, the first shown, with two episodes.
+    fn two_season_show() -> Show {
+        let mut pilot = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
+        pilot.episode = Some(1);
+        let mut second = item(ItemRef::Real(2), ItemKind::Episode, "Second");
+        second.episode = Some(2);
+        let mut series = detail(item(ItemRef::Synth(9), ItemKind::Series, "Show"));
+        series.overview = "An overview.".into();
+        Show {
+            title: "Show".into(),
+            series: Some(series),
+            seasons: vec![
+                item(S1, ItemKind::Season, "Season 1"),
+                item(ItemRef::Synth(14), ItemKind::Season, "Season 2"),
+            ],
+            selected: Some(S1),
+            episodes: page(vec![pilot, second]),
+            season_played: None,
+            pick: SeasonPick::Asked,
+            next_up: None,
+        }
+    }
+
+    /// B1354/V1325: a show's page is two columns. The side column holds
+    /// the art, name, Resume and the show's marks as round icon pills (their
+    /// words kept for screen readers); the main column starts with the
+    /// season tabs and the season's mark, then the episodes. Disarm check:
+    /// moving the season bar into the side column fails the order check.
+    #[test]
+    fn a_show_page_keeps_its_art_and_marks_beside_the_seasons_and_episodes() {
+        let show = two_season_show();
+        let html = render(move || rsx! { ShowView { show: show.clone() } });
+        let side = html
+            .split_once(r#"class="pharos-show-side""#)
+            .and_then(|(_, rest)| rest.split_once(r#"class="pharos-show-main""#))
+            .map(|(inner, _)| inner)
+            .expect("a side column before the main one");
+        assert!(side.contains("pharos-hero"), "{side}");
+        assert!(side.contains(">Play E1<"), "{side}");
+        assert!(
+            side.contains(r#"<span class="pharos-button-label">Mark show watched</span>"#)
+                && side.contains("pharos-watched is-icon"),
+            "{side}"
+        );
+        assert!(side.contains("pharos-favorite is-icon"), "{side}");
+        let main = html
+            .split_once(r#"class="pharos-show-main""#)
+            .map(|(_, rest)| rest)
+            .expect("a main column");
+        let tabs = main.find(r#"aria-label="Seasons""#).expect("season tabs");
+        let mark = main.find("Mark season watched").expect("the season's mark");
+        let episodes = main.find("pharos-episodes").expect("episodes");
+        assert!(tabs < mark && mark < episodes, "{main}");
+    }
+
+    /// B1355/V1326: an episode row's Play is a round icon pill naming the
+    /// episode, and its Play and queue buttons show on the hovered or
+    /// focused row only, on a TV by focus alone (a TV reports no hover).
+    /// Disarm check: deleting the TV rules fails the stylesheet lookup;
+    /// a labelled Play fails the first.
+    #[test]
+    fn an_episode_rows_play_and_queue_buttons_wait_for_its_focus() {
+        let show = two_season_show();
+        let html = render(move || rsx! { ShowView { show: show.clone() } });
+        assert!(
+            html.contains("pharos-button pharos-button-secondary is-icon pharos-episode-play")
+                && html.contains(r#"aria-label="Play 1. Pilot""#),
+            "{html}"
+        );
+        let sheet = include_str!("../../assets/pharos.css");
+        let at = |needle: &str| sheet.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let hide =
+            at(":root[data-device=\"tv\"] .pharos-show-main .pharos-episode .pharos-episode-play,");
+        let show = at(":root[data-device=\"tv\"] .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,");
+        let hover = at("  .pharos-show-main .pharos-episode:hover .pharos-episode-play,");
+        assert!(hover < hide && hide < show);
+        // B1355: only the buttons fade; the row's "Added" note stays readable
+        // after focus leaves the row.
+        assert!(sheet.contains(
+            ":root[data-device=\"tv\"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target=\"episode_row\"] > button {"
+        ));
+        assert!(sheet.contains(
+            "  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target=\"episode_row\"] > button {"
+        ));
+    }
+
+    #[test]
+    fn on_the_narrowest_phones_an_episodes_name_gets_a_line_of_its_own() {
+        // B1355: the one-line phone row left a 320px screen a few letters
+        // of the name; the narrow rule must come after the one-line rule.
+        let sheet = include_str!("../../assets/pharos.css");
+        let at = |needle: &str| sheet.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let one_line =
+            at("  .pharos-show-main .pharos-episode:not(.is-more-open) {\n    flex-wrap: nowrap;");
+        let narrow = at("@media (max-width: 22.5rem) {\n  .pharos-show-main .pharos-episode:not(.is-more-open) {\n    flex-wrap: wrap;\n  }\n  .pharos-show-main .pharos-episode-link {\n    flex-basis: 100%;");
+        assert!(one_line < narrow);
     }
 
     #[test]
