@@ -3161,11 +3161,12 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   bottom: 0;
 }
 /* What the media has data for ahead of the play head (T038-301), under
-   the played fill. */
+   the played fill. Bright enough to read against the groove's own light
+   (B1386): at 0.28 it matched the groove and could not be seen. */
 .pharos-seek-buffered {
   left: 0;
   border-radius: 3px;
-  background: rgb(255 255 255 / 0.28); /* not themed: controls sit on the video, whose colours no theme sets */
+  background: rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
 }
 .pharos-seek-played {
   left: 0;

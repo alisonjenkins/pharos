@@ -4379,6 +4379,28 @@ mod tests {
         );
     }
 
+    /// B1386 (V1357): the buffered range reads against the groove. The
+    /// groove's own light runs to 0.32 white, and a range at 0.28 sat inside
+    /// it; only transform and opacity animate on the bar, so its width
+    /// steps rather than transitions.
+    #[test]
+    fn the_buffered_range_stands_out_from_the_groove() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = sheet
+            .split("\n.pharos-seek-buffered {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        let alpha = rule
+            .split("background: rgb(255 255 255 / ")
+            .nth(1)
+            .and_then(|r| r.split(')').next())
+            .and_then(|a| a.parse::<f64>().ok())
+            .unwrap_or_default();
+        assert!(alpha >= 0.5, "buffered alpha {alpha} in: {rule}");
+        assert!(!rule.contains("transition"), "{rule}");
+    }
+
     #[test]
     fn a_scrub_shows_its_target_in_the_time_label() {
         let mut dom = VirtualDom::new(|| {
