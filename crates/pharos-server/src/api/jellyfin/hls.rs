@@ -3777,6 +3777,17 @@ fn prewarm_cold_start(
             item.probe.duration_ms,
             item.probe.frame_rate_mille,
         );
+        let Some(base) = base else {
+            tracing::info!(
+                media.id = media_id,
+                prewarm.route = route.label(),
+                prewarm.skip_reason = "resume_off_grid",
+                resume_ticks,
+                duration_ms = item.probe.duration_ms,
+                "cold-start prewarm: skipped"
+            );
+            return;
+        };
         // The prewarm's whole value is that it covers the segment the client
         // asks for first, so which segments it chose — and why — is the thing
         // worth being able to query. Silent before: a prewarm warming the wrong
@@ -3796,17 +3807,6 @@ fn prewarm_cold_start(
             prewarm.edition = item.edition.as_deref().unwrap_or_default(),
             "cold-start prewarm: warming from the resume position"
         );
-        let Some(base) = base else {
-            tracing::info!(
-                media.id = media_id,
-                prewarm.route = route.label(),
-                prewarm.skip_reason = "resume_off_grid",
-                resume_ticks,
-                duration_ms = item.probe.duration_ms,
-                "cold-start prewarm: skipped"
-            );
-            return;
-        };
         // The same locator serve_segment keys on: a URL-backed item's stored
         // path is an identity, so warming under it would fill a key no client
         // request reads and hand ffmpeg a path it cannot open.
