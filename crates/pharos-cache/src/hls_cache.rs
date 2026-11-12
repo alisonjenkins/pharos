@@ -754,6 +754,32 @@ impl CacheHitPath {
     }
 }
 
+/// How a segment request was satisfied, as the caller sees it. Bounded label
+/// (three values) for per-client latency: unlike [`CacheHitPath`] it also names
+/// the miss, so a client's slow segments can be split into "waited on an
+/// encode" and "read a file".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SegmentServed {
+    /// The file was already cached.
+    Hit,
+    /// Joined an encode another request (usually prefetch) had in flight.
+    Coalesced,
+    /// This request drove the encode itself.
+    Miss,
+}
+
+impl SegmentServed {
+    pub const ALL: [Self; 3] = [Self::Hit, Self::Coalesced, Self::Miss];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Coalesced => "coalesced",
+            Self::Miss => "miss",
+        }
+    }
+}
+
 /// Record one segment served from cache.
 ///
 /// V91 — symmetry with the `cache miss` line beside it. The miss path recorded
@@ -3107,11 +3133,6 @@ impl HlsSegmentCache {
     // makes this the single mint entry point on purpose — collapsing the
     // dimensions into a struct would hide which of them key the cache.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(
-        name = "segment_cache",
-        skip_all,
-        fields(media.id = media_id, seg = seg_index, class = class.label())
-    )]
     pub async fn segment_bytes_keyed(
         &self,
         media_id: u64,
@@ -3125,6 +3146,44 @@ impl HlsSegmentCache {
         stream: StreamKey,
         seeds_playhead: PlayheadSeed,
     ) -> Result<Vec<u8>, HlsCacheError> {
+        self.segment_bytes_keyed_served(
+            media_id,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            source,
+            edition,
+            opts,
+            class,
+            stream,
+            seeds_playhead,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    /// [`Self::segment_bytes_keyed`] that also says how the segment was
+    /// satisfied, so an HTTP handler can label its latency hit / coalesced /
+    /// miss without re-deriving it from the cache's logs.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "segment_cache",
+        skip_all,
+        fields(media.id = media_id, seg = seg_index, class = class.label())
+    )]
+    pub async fn segment_bytes_keyed_served(
+        &self,
+        media_id: u64,
+        seg_index: u32,
+        audio_index: Option<u32>,
+        subtitle_index: Option<u32>,
+        source: &Path,
+        edition: Option<&str>,
+        opts: &SegmentOpts,
+        class: JobClass,
+        stream: StreamKey,
+        seeds_playhead: PlayheadSeed,
+    ) -> Result<(Vec<u8>, SegmentServed), HlsCacheError> {
         let hint = JobHint {
             stream,
             segment: Some(seg_index),
@@ -3170,7 +3229,7 @@ impl HlsSegmentCache {
                             cached_age_secs(&meta),
                         );
                         self.note_client_playhead(class, stream, seg_index);
-                        return Ok(b);
+                        return Ok((b, SegmentServed::Hit));
                     }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
@@ -3299,7 +3358,12 @@ impl HlsSegmentCache {
             // a hit, and its own `Submit` already moved its reading.
             self.note_client_playhead(class, stream, seg_index);
         }
-        Ok(bytes.as_ref().clone())
+        let served = if driving {
+            SegmentServed::Miss
+        } else {
+            SegmentServed::Coalesced
+        };
+        Ok((bytes.as_ref().clone(), served))
     }
 
     /// Tell the scheduler where this viewer has reached, for a segment the
@@ -9361,6 +9425,61 @@ mod tests {
              never asked for this segment, and declaring them to be standing on \
              it makes everything they have queued in between stale"
         );
+    }
+
+    /// The caller is told how its segment was satisfied: the request that
+    /// drives the encode is a `Miss`, one that joins it is `Coalesced`, and a
+    /// later one that finds the file is a `Hit`. Per-client latency is labelled
+    /// from this, so a wrong answer here mislabels every dashboard split.
+    #[tokio::test]
+    async fn the_caller_is_told_whether_its_segment_was_a_hit_a_join_or_a_miss() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(5));
+        let sched = writes_each_segment(std::time::Duration::from_millis(150));
+        let cache = Arc::new(cache.with_scheduler(sched));
+        let opts = slow_opts();
+        let ask = |c: Arc<HlsSegmentCache>, o: SegmentOpts| async move {
+            c.segment_bytes_keyed_served(
+                83,
+                7,
+                None,
+                None,
+                Path::new("/no/source"),
+                None,
+                &o,
+                JobClass::Interactive,
+                StreamKey::NONE,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .map(|(_, served)| served)
+        };
+
+        let driver = tokio::spawn(ask(cache.clone(), opts.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let joiner = tokio::spawn(ask(cache.clone(), opts.clone()));
+        assert_eq!(
+            driver.await.unwrap().expect("driver"),
+            SegmentServed::Miss,
+            "the request that ran the encode"
+        );
+        assert_eq!(
+            joiner.await.unwrap().expect("joiner"),
+            SegmentServed::Coalesced,
+            "the request that waited on someone else's encode"
+        );
+        assert_eq!(
+            ask(cache.clone(), opts.clone()).await.expect("later"),
+            SegmentServed::Hit,
+            "the request that found the file"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn segment_served_labels_are_distinct() {
+        let labels: std::collections::BTreeSet<_> =
+            SegmentServed::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), SegmentServed::ALL.len());
     }
 
     /// The simplest thing the scheduler will place on the CPU: no video
