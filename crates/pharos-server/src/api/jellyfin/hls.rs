@@ -1586,8 +1586,9 @@ async fn serve_segment(
             .as_deref()
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
-        let bytes = cache
-            .segment_bytes_keyed(
+        let waited = std::time::Instant::now();
+        let (bytes, served) = cache
+            .segment_bytes_keyed_served(
                 id_num,
                 seg,
                 opts.audio_source_stream_index,
@@ -1601,6 +1602,7 @@ async fn serve_segment(
             )
             .await
             .map_err(segment_cache_error)?;
+        crate::media_telemetry::note_segment_served(&req, seg, served, waited.elapsed());
         return Ok(HttpResponse::Ok()
             .content_type(opts.container.content_type())
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
@@ -2742,7 +2744,7 @@ async fn vp9_init(
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let raw = vp9_segment_raw(&state, &item, 0, &opts, q.play_session_id.as_deref()).await?;
+    let raw = vp9_segment_raw(&state, &req, &item, 0, &opts, q.play_session_id.as_deref()).await?;
     // The init IS the rendition's clock. Judge it too: an init on the wrong
     // timescale mis-reads every segment that follows it, not just itself.
     fmp4::record_track_timescale(&raw, item.id, 0);
@@ -2837,7 +2839,15 @@ async fn vp9_segment(
         q.play_session_id.as_deref(),
     )
     .await;
-    let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
+    let raw = vp9_segment_raw(
+        &state,
+        &req,
+        &item,
+        seg,
+        &opts,
+        q.play_session_id.as_deref(),
+    )
+    .await?;
     // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
     // duration mismatch — the mechanism behind the reported drift + clicks.
@@ -3014,7 +3024,7 @@ async fn h264cmaf_init_for(
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let raw = vp9_segment_raw(&state, &item, 0, &opts, q.play_session_id.as_deref()).await?;
+    let raw = vp9_segment_raw(&state, &req, &item, 0, &opts, q.play_session_id.as_deref()).await?;
     // The init IS the rendition's clock. Judge it too: an init on the wrong
     // timescale mis-reads every segment that follows it, not just itself.
     fmp4::record_track_timescale(&raw, item.id, 0);
@@ -3126,7 +3136,15 @@ async fn h264cmaf_segment_for(
         q.play_session_id.as_deref(),
     )
     .await;
-    let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
+    let raw = vp9_segment_raw(
+        &state,
+        &req,
+        &item,
+        seg,
+        &opts,
+        q.play_session_id.as_deref(),
+    )
+    .await?;
     fmp4::record_track_timescale(&raw, item.id, seg);
     let processed = fmp4::process_segment(&raw)
         .map_err(|e| error::ErrorInternalServerError(format!("fmp4 seg {seg}: {e}")))?;
@@ -4450,6 +4468,7 @@ fn codec_relative_index(abs_indices: impl Iterator<Item = u32>, abs: u32) -> Opt
 /// tiers are collected to a `Vec`.
 async fn vp9_segment_raw(
     state: &AppState,
+    req: &HttpRequest,
     item: &pharos_core::MediaItem,
     seg: u32,
     opts: &SegmentOpts,
@@ -4461,8 +4480,9 @@ async fn vp9_segment_raw(
         let stream = play_session_id
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
-        return cache
-            .segment_bytes_keyed(
+        let waited = std::time::Instant::now();
+        let (bytes, served) = cache
+            .segment_bytes_keyed_served(
                 item.id,
                 seg,
                 opts.audio_source_stream_index,
@@ -4475,7 +4495,9 @@ async fn vp9_segment_raw(
                 PlayheadSeed::Observes,
             )
             .await
-            .map_err(segment_cache_error);
+            .map_err(segment_cache_error)?;
+        crate::media_telemetry::note_segment_served(req, seg, served, waited.elapsed());
+        return Ok(bytes);
     }
     // Same as the h264 live fallback: no cache means no continuous audio
     // encode, so a muxed rung cannot be served here. (VP9 rungs are
