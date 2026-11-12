@@ -3580,6 +3580,130 @@ fn prewarm_base_segment(
     grid.resolve(resume_ticks as f64 / 1e7).map(|i| i.get())
 }
 
+/// Which negotiation asked for a cold-start prewarm. The label is a stable
+/// log value (`prewarm.route`), so a query can tell the Jellyfin
+/// `PlaybackInfo` prewarm from the native RPC grant's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrewarmRoute {
+    Jellyfin,
+}
+
+impl PrewarmRoute {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PrewarmRoute::Jellyfin => "jellyfin",
+        }
+    }
+}
+
+/// One negotiation's facts a cold-start prewarm is derived from.
+pub(crate) struct NegotiatedPrewarm<'a> {
+    pub route: PrewarmRoute,
+    pub media_id: u64,
+    pub negotiated: &'a crate::services::playback::Negotiated,
+    /// The URL the client was handed, `None` for a direct playback.
+    pub transcoding_url: Option<&'a str>,
+    /// The codecs that URL's master advertises, best first.
+    pub renditions: &'a [String],
+    pub probe: &'a pharos_core::MediaProbe,
+    pub holder: pharos_core::SessionHolder,
+    pub play_session_id: &'a str,
+    pub resume_ticks: u64,
+    /// Whether the client fetches the master as a browser (a `Mozilla` user
+    /// agent), which decides between the demuxed CMAF and the mpegts master.
+    pub fetches_as_browser: bool,
+    pub is_audio: bool,
+    /// The edition negotiated, `None` for the primary file.
+    pub media_source_id: Option<String>,
+}
+
+/// Why a negotiation did not start a cold-start prewarm, for the skip log.
+fn prewarm_skip_reason(
+    transcoding_url: Option<&str>,
+    renditions: &[String],
+) -> Option<&'static str> {
+    match transcoding_url {
+        None => Some("no_transcoding_url"),
+        Some(u) if !u.contains("/master.m3u8") => Some("not_hls_master"),
+        Some(_) if !renditions.first().is_some_and(|c| c == "h264") => Some("not_h264_first"),
+        Some(_) => None,
+    }
+}
+
+/// Cold-start prewarm for a negotiated playback, shared by the Jellyfin
+/// `PlaybackInfo` route and the native RPC grant so both derive the warmed
+/// keys from the URL the client is handed, the way its requests will.
+///
+/// Only when h264 is the rung the client actually starts on (a vp9-first
+/// client never touches `/hls1/main`). Every decision to skip is logged with
+/// its reason, so a playback that paid the cold encode says why.
+pub(crate) fn prewarm_negotiated(state: &web::Data<AppState>, p: NegotiatedPrewarm<'_>) {
+    use crate::api::jellyfin::device_profile::Decision;
+    if let Some(reason) = prewarm_skip_reason(p.transcoding_url, p.renditions) {
+        tracing::info!(
+            media.id = p.media_id,
+            prewarm.route = p.route.label(),
+            prewarm.skip_reason = reason,
+            first_rendition = p.renditions.first().map_or("none", String::as_str),
+            "cold-start prewarm: skipped"
+        );
+        return;
+    }
+    // The master URL carries the track picks the segments will ask for.
+    let url = p.transcoding_url.unwrap_or_default();
+    let audio_idx =
+        super::items::query_param(url, "AudioStreamIndex").and_then(|v| v.parse::<u32>().ok());
+    let sub_idx = super::items::query_param(url, "SubtitleStreamIndex")
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&i| i >= 0)
+        .map(|i| i as u32);
+    let video_bitrate_cap = match &p.negotiated.decision {
+        Decision::Transcode {
+            max_video_bitrate_bps,
+            ..
+        } => *max_video_bitrate_bps,
+        _ => p.negotiated.remote_ceiling,
+    };
+    prewarm_cold_start(
+        state,
+        p.route,
+        crate::transcode_sessions::TranscodeSession {
+            media_id: p.media_id,
+            decision: p.negotiated.decision.clone(),
+            source_probe: p.probe.clone(),
+            // The ONLY request on which this client's SubtitleProfiles are
+            // visible. Every segment URL it fetches later carries a bare
+            // SubtitleStreamIndex, so without carrying the verdict forward
+            // the segment handler must assume each one needs burning.
+            burn_subtitle_indices: p.negotiated.burn_text_indices.clone(),
+            holder: p.holder,
+        },
+        p.play_session_id,
+        audio_idx,
+        sub_idx,
+        video_bitrate_cap,
+        // The bounds the URL carries, so the prewarmed segments are keyed
+        // by the size the client's own requests will plan.
+        super::output_size::qs_size_limits(url),
+        // B136 — warm the segments playback will actually START on. This is
+        // the same value that rides `start_position_ticks` in the response
+        // (and, for native players, `StartTimeTicks` on the transcoding
+        // URL), so the prewarm covers the client's first request on a
+        // resume instead of warming the opening it will never fetch.
+        p.resume_ticks,
+        // B139 — and warm the CONTAINER it will fetch. This mirrors
+        // `master_playlist`'s `demuxed_h264` exactly: a browser whose first
+        // ranked rendition is h264 gets the demuxed all-fMP4 master and
+        // never requests an mpegts segment. `renditions.first()` is what
+        // `select_master_video` reads off the URL the client is handed, so
+        // the two cannot disagree.
+        p.fetches_as_browser && !p.is_audio,
+        // The edition this response negotiated, or the prewarm reloads the
+        // item's own file and warms segments under the primary's key.
+        p.media_source_id,
+    );
+}
+
 /// Cold-start prewarm: transcode the first [`COLD_START_PREWARM_SEGS`] h264/
 /// mpegts `main`-rung segments into the HLS cache the moment PlaybackInfo
 /// negotiates a transcode — seconds before the client (which first runs a
@@ -3593,8 +3717,9 @@ fn prewarm_base_segment(
 /// session's negotiated ceiling, so the two agree and the prewarmed bytes hit
 /// the exact cache key the client's request keys on. No-op without a cache.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prewarm_cold_start(
+fn prewarm_cold_start(
     state: &web::Data<AppState>,
+    route: PrewarmRoute,
     session: crate::transcode_sessions::TranscodeSession,
     play_session_id: &str,
     audio_stream_index: Option<u32>,
@@ -3606,6 +3731,12 @@ pub(super) fn prewarm_cold_start(
     media_source_id: Option<String>,
 ) {
     if state.hls.is_none() {
+        tracing::info!(
+            media.id = session.media_id,
+            prewarm.route = route.label(),
+            prewarm.skip_reason = "no_segment_cache",
+            "cold-start prewarm: skipped"
+        );
         return;
     }
     let media_id = session.media_id;
@@ -3640,6 +3771,7 @@ pub(super) fn prewarm_cold_start(
         // end of the film looked exactly like one warming the right end.
         tracing::info!(
             media.id = media_id,
+            prewarm.route = route.label(),
             resume_ticks,
             resume_secs = resume_ticks as f64 / 1e7,
             prewarm.base = base,
@@ -6584,6 +6716,7 @@ mod prewarm_edition_tests {
         let url = "/videos/7/master.m3u8?PlaySessionId=ps-bound&renditions=h264&MaxWidth=1280";
         prewarm_cold_start(
             &state,
+            PrewarmRoute::Jellyfin,
             session,
             "ps-bound",
             None,
@@ -6669,6 +6802,7 @@ mod prewarm_edition_tests {
         // encoder needs no continuous audio behind it.
         prewarm_cold_start(
             &state,
+            PrewarmRoute::Jellyfin,
             session,
             "ps-cold",
             None,
