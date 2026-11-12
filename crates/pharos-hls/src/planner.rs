@@ -21,6 +21,10 @@ const MAX_TRACK_LEAD_MS: u64 = 2_000;
 /// refetch can repair a partial remove, a third cannot change the answer.
 const MAX_APPENDS_PER_SEGMENT: u32 = 2;
 
+/// A skip lands this far past the start of the data it jumps to, as the stall
+/// watchdog's jumps do (hls.js `skipBufferHolePadding`).
+const SKIP_PADDING_MS: u64 = 100;
+
 /// Media track managed by [`Planner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Track {
@@ -83,6 +87,9 @@ pub enum Action {
     },
     /// Every segment of every track is appended: call endOfStream.
     EndOfStream,
+    /// The play head sits in a segment that was given up on: set `currentTime`
+    /// to `to_ms`, the start of the data after it.
+    Skip { to_ms: u64 },
 }
 
 /// A decision the planner took that its actions do not show, drained with
@@ -98,6 +105,14 @@ pub enum Note {
         track: Track,
         index: usize,
         appends: u32,
+    },
+    /// The play head moved from `from_ms` to `to_ms` past the given-up segment
+    /// `index` of `track`.
+    Skipped {
+        track: Track,
+        index: usize,
+        from_ms: u64,
+        to_ms: u64,
     },
     /// `track` waits for the other: it would buffer `lead_ms` ahead of it,
     /// over `limit_ms`. Noted once per wait.
@@ -115,6 +130,7 @@ impl Note {
             Self::EndOfStream { .. } => "end_of_stream",
             Self::GaveUp { .. } => "gave_up",
             Self::Held { .. } => "held",
+            Self::Skipped { .. } => "skipped",
         }
     }
 }
@@ -244,6 +260,7 @@ impl Planner {
             let Some(state) = state else {
                 continue;
             };
+            skip_given_up(track, state, play_ms, own, &mut actions, &mut self.notes);
             plan_track(
                 track,
                 state,
@@ -419,6 +436,47 @@ fn seek_track(
             .last()
             .is_some_and(|last| is_segment_covered(last, track_buffered));
     }
+}
+
+/// The play head sits in a segment given up on, with no data under it and
+/// data further on: the stall watchdog only jumps ordinary gaps, so the planner
+/// moves the play head to that data and lets go of the seek anchor.
+fn skip_given_up(
+    track: Track,
+    state: &mut TrackState,
+    play_ms: u64,
+    track_buffered: &[(u64, u64)],
+    actions: &mut Vec<Action>,
+    notes: &mut Vec<Note>,
+) {
+    if actions.iter().any(|a| matches!(a, Action::Skip { .. })) {
+        return;
+    }
+    let Some(index) = state.given_up.iter().copied().find(|&idx| {
+        range_of_slice(&state.segments, idx).is_some_and(|(s, e)| s <= play_ms && play_ms < e)
+    }) else {
+        return;
+    };
+    if point_buffered(track_buffered, play_ms) {
+        return;
+    }
+    let Some(next_start) = track_buffered
+        .iter()
+        .map(|&(start, _)| start)
+        .filter(|&start| start > play_ms)
+        .min()
+    else {
+        return;
+    };
+    let to_ms = next_start.saturating_add(SKIP_PADDING_MS);
+    state.seek_target_ms = None;
+    actions.push(Action::Skip { to_ms });
+    notes.push(Note::Skipped {
+        track,
+        index,
+        from_ms: play_ms,
+        to_ms,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,6 +958,50 @@ mod tests {
             }
         });
         assert!(fetches.contains(&(Track::Video, 6)), "{fetches:?}");
+    }
+
+    // B1393: a given-up segment leaves a gap wider than the stall watchdog
+    // jumps, and at play head 0 the seek anchor was never released: the
+    // planner now skips the play head to the data after it.
+    #[test]
+    fn a_given_up_start_segment_is_skipped_and_fetching_goes_on() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        let mut buffered = Buffered::default();
+        let mut play_ms = 0;
+        let mut fetches = Vec::new();
+        let mut skipped_to = None;
+        for _ in 0..40 {
+            for action in planner.tick(play_ms, &buffered) {
+                match action {
+                    Action::Fetch { track, index } => {
+                        fetches.push(index);
+                        if index != 0 {
+                            let seg = &segs[index];
+                            merge_range(
+                                &mut buffered.video,
+                                seg.start_ms,
+                                seg.start_ms + seg.duration_ms,
+                            );
+                        }
+                        planner.appended(track);
+                    }
+                    Action::Skip { to_ms } => {
+                        skipped_to = Some(to_ms);
+                        play_ms = to_ms;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(skipped_to, Some(6_100), "{fetches:?}");
+        assert!(fetches.iter().any(|&i| i >= 6), "{fetches:?}");
+        assert!(planner.take_notes().contains(&Note::Skipped {
+            track: Track::Video,
+            index: 0,
+            from_ms: 0,
+            to_ms: 6_100
+        }));
     }
 
     // B1394: a segment appended on two successive rounds that was covered in
@@ -1723,6 +1825,9 @@ mod tests {
                                 Action::EndOfStream => {
                                     prop_assert!(shadow_video.is_none());
                                     prop_assert!(shadow_audio.is_none());
+                                }
+                                Action::Skip { .. } => {
+                                    prop_assert!(false, "no segment is given up in this model");
                                 }
                             }
                         }
