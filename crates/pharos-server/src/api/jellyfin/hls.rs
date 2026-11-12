@@ -7067,6 +7067,7 @@ mod prewarm_edition_tests {
                 token: "native-token",
                 client_is_remote: false,
                 version: "",
+                device: None,
             },
         )
         .await

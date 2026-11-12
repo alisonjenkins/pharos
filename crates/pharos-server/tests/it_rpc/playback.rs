@@ -19,6 +19,8 @@ use crate::common::Fixture;
 pub(crate) const MOVIE: u64 = 300;
 const BOOK: u64 = 301;
 const NATIVE_UA: &str = "pharos-native-test/1.0";
+/// The release grace the tests that wait out a released grant run with.
+const TEST_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(crate) async fn seed_playable(fx: &Fixture) {
     let stores = &fx.state.stores;
@@ -526,7 +528,7 @@ async fn a_native_grant_is_listed_in_sessions_until_it_stops() {
 /// early, the entry stays.
 #[actix_web::test]
 async fn a_released_native_grant_leaves_sessions() {
-    let (server, fx) = crate::revocation::start().await;
+    let (server, fx) = crate::revocation::start_with_release_grace(TEST_GRACE).await;
     seed_playable(&fx).await;
     let (client, _closed) = crate::revocation::connect(&server).await;
     let session = crate::revocation::signed_in(&client, &fx.user_token).await;
@@ -574,7 +576,7 @@ async fn a_released_native_grant_leaves_sessions() {
 /// with it skipping `play_state::end` for a revoked session, the last one does.
 #[actix_web::test]
 async fn a_released_grant_ends_its_playback_at_the_last_report() {
-    let (server, fx) = crate::revocation::start().await;
+    let (server, fx) = crate::revocation::start_with_release_grace(TEST_GRACE).await;
     seed_playable(&fx).await;
     let (client, _closed) = crate::revocation::connect(&server).await;
     let session = crate::revocation::signed_in(&client, &fx.user_token).await;
@@ -1629,4 +1631,244 @@ async fn a_grant_answers_what_its_playback_waits_behind() {
     .await
     .unwrap();
     assert_eq!(queue_hint(&grant).await, Ok((0, 0, 0, false)));
+}
+
+/// What `pharos_grant_release_total{outcome}` has counted so far. The
+/// registry is process-global, so tests compare before and after.
+fn released_count(outcome: &str) -> u64 {
+    let _ = pharos_server::obs::init("info", None);
+    pharos_server::obs::render()
+        .lines()
+        .filter(|l| {
+            l.starts_with("pharos_grant_release_total{")
+                && l.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+async fn stream_is_live(fx: &Fixture, psid: &str) -> bool {
+    fx.state
+        .transcode_sessions
+        .get(pharos_core::PlaySessionId::from(psid))
+        .await
+        .unwrap()
+        .is_some()
+}
+
+async fn settles_gone(fx: &Fixture, psid: &str) -> bool {
+    for _ in 0..150 {
+        if !stream_is_live(fx, psid).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// B1397: a player whose connection dropped under a live stream negotiates
+/// again, and the playback it was on continues under the same session id: the
+/// segment URLs it already holds would 410 under a new one.
+/// Disarm check: with `adopt_released` returning `None`, the second negotiate
+/// mints a new id and the first stream is ended.
+#[actix_web::test]
+async fn a_negotiate_after_a_release_adopts_the_same_stream() {
+    let adopted_before = released_count("adopted");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let sessions_listed = || async {
+        let req = test::TestRequest::get()
+            .uri("/Sessions")
+            .insert_header(("X-Emby-Token", fx.admin_token.as_str()))
+            .to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        body.as_array().unwrap().len()
+    };
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let play = || {
+        negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            &direct,
+            Choice::Default,
+            Choice::Default,
+        )
+    };
+
+    let (grant, first) = play().await.unwrap();
+    report(&grant, 30_000, false).await.unwrap();
+    drop(grant);
+    let (grant, second) = play().await.unwrap();
+
+    assert_eq!(second.psid, first.psid, "the playback keeps its session id");
+    assert_eq!(second.url, first.url, "and its stream url");
+    assert!(
+        stream_is_live(&fx, &first.psid).await,
+        "the stream stays open"
+    );
+    assert_eq!(sessions_listed().await, 1, "one entry, not two");
+    assert!(
+        released_count("adopted") > adopted_before,
+        "the adoption is counted"
+    );
+
+    // The adopted grant is a grant like any other: its stop ends the playback.
+    stop(&grant, 45_000).await.unwrap();
+    assert!(
+        settles_gone(&fx, &first.psid).await,
+        "its stop ends the stream"
+    );
+    assert_eq!(sessions_listed().await, 0);
+}
+
+/// B1397: a negotiate for a different stream does not take the held one over:
+/// the held playback ends at once, grace or not, and the new one is its own.
+/// Disarm check: with the shape comparison removed, the transcode negotiate
+/// adopts the direct-play session.
+#[actix_web::test]
+async fn a_negotiate_for_another_stream_ends_the_held_one() {
+    let mismatched_before = released_count("ended_mismatch");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let transcode = caps(&["vp9"], &["opus"], &["webm"]);
+
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    drop(grant);
+    let (_grant, second) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &transcode,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        first.method, second.method,
+        "the control: a different stream"
+    );
+    assert_ne!(second.psid, first.psid);
+    assert!(
+        settles_gone(&fx, &first.psid).await,
+        "the held stream ends at once, far inside the 30 s grace"
+    );
+    assert!(stream_is_live(&fx, &second.psid).await);
+    assert!(released_count("ended_mismatch") > mismatched_before);
+}
+
+/// B1397: another device's negotiate never takes a grant it did not hold; the
+/// held one runs out its grace.
+/// Disarm check: with the device left out of the key, the laptop adopts it.
+#[actix_web::test]
+async fn another_device_does_not_adopt_a_released_grant() {
+    let (server, fx) = crate::revocation::start_with_release_grace(TEST_GRACE).await;
+    seed_playable(&fx).await;
+    let after_grace_before = released_count("ended_after_grace");
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let tv = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let laptop_token = fx.state.stores.issue(fx.user_id, "laptop").await.unwrap();
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let laptop = crate::revocation::signed_in(&client2, laptop_token.0.expose()).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, first) = play_on(&tv, &direct).await.unwrap();
+    drop(grant);
+    let (_grant, second) = play_on(&laptop, &direct).await.unwrap();
+
+    assert_ne!(second.psid, first.psid, "the laptop plays its own stream");
+    assert!(
+        settles_gone(&fx, &first.psid).await,
+        "the tv's runs out its grace"
+    );
+    assert!(stream_is_live(&fx, &second.psid).await);
+    assert!(released_count("ended_after_grace") > after_grace_before);
+}
+
+/// B1397: a released grant nobody adopts ends when the grace is up, counted.
+/// Disarm check: with the expiry task not ending it, the stream stays open.
+#[actix_web::test]
+async fn a_released_grant_nobody_adopts_ends_after_the_grace() {
+    let (server, fx) = crate::revocation::start_with_release_grace(TEST_GRACE).await;
+    seed_playable(&fx).await;
+    let after_grace_before = released_count("ended_after_grace");
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    drop(grant);
+    assert!(
+        stream_is_live(&fx, &first.psid).await,
+        "held, not ended, inside the grace"
+    );
+    assert!(settles_gone(&fx, &first.psid).await);
+    assert!(released_count("ended_after_grace") > after_grace_before);
+}
+
+/// B1397: a revoked token does not adopt; what it held ends with the grace.
+/// Disarm check: with the adoption run before the token check, the revoked
+/// session's negotiate would take the stream.
+#[actix_web::test]
+async fn a_revoked_token_does_not_adopt_a_released_grant() {
+    let (server, fx) = crate::revocation::start_with_release_grace(TEST_GRACE).await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    drop(grant);
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    let again = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await;
+    assert!(again.is_err(), "a revoked session negotiates nothing");
+    assert!(settles_gone(&fx, &first.psid).await);
+}
+
+async fn play_on(
+    session: &session::Client,
+    caps: &Capabilities,
+) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate(
+        session,
+        WireId::Real(MOVIE),
+        caps,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
 }
