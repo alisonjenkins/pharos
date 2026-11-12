@@ -279,6 +279,8 @@ fn write_record(dir: &Path, path: &Path, record: &WordsRecord) -> std::io::Resul
 /// (ADR-0121); `None` for a line not timed yet.
 #[derive(Debug, Default)]
 struct Partial {
+    /// The job's cache key: lines timed for other lyrics are not shown.
+    key: String,
     offset_ms: i64,
     lines: Vec<Option<Vec<WordStamp>>>,
     /// When its first line came, for the job's log line.
@@ -287,6 +289,11 @@ struct Partial {
 
 /// The streamed `/align` answer's type (ADR-0121).
 const NDJSON: &str = "application/x-ndjson";
+
+/// The longest streamed event read. The last one carries the whole answer,
+/// at most `MAX_LINES` lines of words, far under this; an aligner that sends
+/// more without a newline fails the job instead of growing the buffer.
+const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 /// One event of a streamed `/align` answer. `done` carries the whole answer,
 /// read by [`parse_answer`]; an event this server does not know is skipped.
@@ -467,7 +474,12 @@ impl Aligner {
     /// Applies one event of a streamed answer for item `id`: an offset or a
     /// line goes to the partial answer, `done` is the whole answer, and
     /// `error` the status the song failed with.
-    fn event(&self, id: u64, line: &[u8], n_lines: usize) -> Result<Option<Aligned>, String> {
+    fn event(
+        &self,
+        (id, key): (u64, &str),
+        line: &[u8],
+        n_lines: usize,
+    ) -> Result<Option<Aligned>, String> {
         let text = std::str::from_utf8(line).map_err(|e| format!("aligner event: {e}"))?;
         let event: Event =
             serde_json::from_str(text).map_err(|e| format!("invalid aligner event: {e}"))?;
@@ -478,6 +490,7 @@ impl Aligner {
                     self.partial_lock().insert(
                         id,
                         Partial {
+                            key: key.to_owned(),
                             offset_ms,
                             lines: std::iter::repeat_with(|| None).take(n_lines).collect(),
                             first_line_at: None,
@@ -500,11 +513,12 @@ impl Aligner {
         Ok(None)
     }
 
-    /// The lines timed so far for item `id`, as an answer with an empty line
-    /// for each still to come; `None` before its offset is known.
-    fn partial_for(&self, id: u64) -> Option<Aligned> {
+    /// The lines timed so far for item `id` under cache `key`, as an answer
+    /// with an empty line for each still to come; `None` before a line is
+    /// timed, or when the job in flight was for other lyrics.
+    fn partial_for(&self, id: u64, key: &str) -> Option<Aligned> {
         let partial = self.partial_lock();
-        let p = partial.get(&id)?;
+        let p = partial.get(&id).filter(|p| p.key == key)?;
         p.lines.iter().any(Option::is_some).then(|| Aligned {
             lines: p
                 .lines
@@ -547,7 +561,7 @@ impl Aligner {
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
         let answered = self
-            .request(&job.path, &job.lines, TIMEOUT, Some(job.id))
+            .request(&job.path, &job.lines, TIMEOUT, Some((job.id, &job.key)))
             .await?;
         let offset_ms = answered.aligned.offset_ms;
         self.store(job.id, job.key.clone(), answered, Source::Song);
@@ -594,7 +608,7 @@ impl Aligner {
         path: &str,
         lines: &[(u64, u64, String)],
         timeout: Duration,
-        stream: Option<u64>,
+        stream: Option<(u64, &str)>,
     ) -> Result<Answered, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
@@ -654,16 +668,21 @@ impl Aligner {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with(NDJSON));
         let aligned = match stream.filter(|_| streamed) {
-            Some(id) => {
+            Some(job) => {
                 let mut buf = Vec::new();
                 let mut done = None;
                 while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
                     buf.extend_from_slice(&chunk);
                     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                         let event: Vec<u8> = buf.drain(..=nl).collect();
-                        if let Some(answer) = self.event(id, &event, lines.len())? {
+                        if let Some(answer) = self.event(job, &event, lines.len())? {
                             done = Some(answer);
                         }
+                    }
+                    if buf.len() > MAX_EVENT_BYTES {
+                        return Err(format!(
+                            "aligner event over {MAX_EVENT_BYTES} bytes without a newline"
+                        ));
                     }
                 }
                 done.ok_or_else(|| "aligner stream ended before its answer".to_owned())?
@@ -766,7 +785,7 @@ impl Aligner {
                 .eta_lock()
                 .eta_ms(item.id, self.now_ms())
                 .map(clamp_u32);
-            return match self.partial_for(item.id) {
+            return match self.partial_for(item.id, &key) {
                 Some(partial) => Lookup::Partial(left, partial),
                 None => Lookup::Pending(left),
             };
@@ -1819,6 +1838,7 @@ mod tests {
         events: Vec<String>,
         hold: usize,
         gate: tokio::sync::oneshot::Receiver<()>,
+        newline: bool,
     ) -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1857,7 +1877,8 @@ mod tests {
             }
             let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
             sock.write_all(head.as_bytes()).await.unwrap();
-            let chunk = |e: &str| format!("{:x}\r\n{e}\n\r\n", e.len() + 1);
+            let end = if newline { "\n" } else { "" };
+            let chunk = |e: &str| format!("{:x}\r\n{e}{end}\r\n", e.len() + end.len());
             for e in &events[..hold] {
                 sock.write_all(chunk(e).as_bytes()).await.unwrap();
             }
@@ -1907,7 +1928,7 @@ mod tests {
             DONE.to_owned(),
         ];
         let (open, gate) = tokio::sync::oneshot::channel();
-        let base = fake_stream(events, 3, gate).await;
+        let base = fake_stream(events, 3, gate, true).await;
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Arc::new(Aligner {
             base,
@@ -1921,7 +1942,7 @@ mod tests {
 
         let mut partial = None;
         for _ in 0..200 {
-            partial = aligner.partial_for(job.id);
+            partial = aligner.partial_for(job.id, &job.key);
             if partial.is_some() {
                 break;
             }
@@ -1966,7 +1987,7 @@ mod tests {
         ];
         let (open, gate) = tokio::sync::oneshot::channel();
         open.send(()).unwrap();
-        let base = fake_stream(events, 0, gate).await;
+        let base = fake_stream(events, 0, gate, true).await;
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Aligner {
             base,
@@ -1985,7 +2006,7 @@ mod tests {
             vec![r#"{"event":"offset","offset_ms":0,"aligner_version":5,"lines":2}"#.to_owned()];
         let (open, gate) = tokio::sync::oneshot::channel();
         open.send(()).unwrap();
-        let base = fake_stream(events, 0, gate).await;
+        let base = fake_stream(events, 0, gate, true).await;
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Aligner {
             base,
@@ -1996,8 +2017,9 @@ mod tests {
         assert!(aligner.cache.get(7, "k").is_none());
     }
 
-    /// V1297: a song in flight with lines timed is looked up as `Partial`,
-    /// and with none yet as `Pending`.
+    /// V1297: a song in flight with lines timed for its current lyrics is
+    /// looked up as `Partial`, and with none yet, or only lines timed for
+    /// other lyrics, as `Pending`.
     #[test]
     fn a_song_in_flight_is_partial_once_a_line_is_timed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2024,10 +2046,30 @@ mod tests {
         .unwrap();
         aligner.pending.lock().unwrap().insert(item.id);
         assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        // The key words_for asks under: each line ends where the next starts,
+        // the last 5 s after its own start.
+        let key = cache_key(
+            &[],
+            "song.flac",
+            &item.path,
+            &[
+                (1000, 3000, "Line one".into()),
+                (3000, 8000, "Line two".into()),
+            ],
+        );
+
+        // Lines timed for other lyrics (an edited sidecar) are not shown.
+        for event in [
+            &br#"{"event":"offset","offset_ms":50,"aligner_version":5,"lines":2}"#[..],
+            br#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1050}],"score":null}"#,
+        ] {
+            aligner.event((item.id, "older lyrics"), event, 2).unwrap();
+        }
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
 
         aligner
             .event(
-                item.id,
+                (item.id, &key),
                 br#"{"event":"offset","offset_ms":50,"aligner_version":5,"lines":2}"#,
                 2,
             )
@@ -2036,7 +2078,7 @@ mod tests {
         assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
         aligner
             .event(
-                item.id,
+                (item.id, &key),
                 br#"{"event":"line","index":1,"words":[{"at":0,"start_ms":3050}],"score":null}"#,
                 2,
             )
@@ -2055,5 +2097,22 @@ mod tests {
                 }]
             ]
         );
+    }
+
+    /// An aligner that streams an event longer than `MAX_EVENT_BYTES`
+    /// without a newline fails the job instead of growing the buffer.
+    #[tokio::test]
+    async fn an_event_too_long_for_one_line_fails_the_job() {
+        let events = vec!["x".repeat(MAX_EVENT_BYTES + 1)];
+        let (open, gate) = tokio::sync::oneshot::channel();
+        open.send(()).unwrap();
+        let base = fake_stream(events, 0, gate, false).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Aligner {
+            base,
+            ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
+        };
+        let err = aligner.process_job(&two_line_job()).await.unwrap_err();
+        assert!(err.contains("without a newline"), "{err}");
     }
 }
