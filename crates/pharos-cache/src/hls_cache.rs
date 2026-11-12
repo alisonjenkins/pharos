@@ -3076,6 +3076,34 @@ impl HlsSegmentCache {
         .await
     }
 
+    /// Is this segment already on disk? The same key as
+    /// [`segment_bytes_keyed`](Self::segment_bytes_keyed), read without
+    /// touching LRU or producing anything, so a caller can label its own
+    /// request warm or cold before it asks for the bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn segment_is_cached(
+        &self,
+        media_id: u64,
+        seg_index: u32,
+        audio_index: Option<u32>,
+        subtitle_index: Option<u32>,
+        source: &Path,
+        edition: Option<&str>,
+        opts: &SegmentOpts,
+    ) -> bool {
+        let key = SegmentIdentity::new(
+            media_id,
+            seg_index,
+            audio_index,
+            subtitle_index,
+            opts,
+            SourceGen::for_read(source, edition),
+        );
+        tokio::fs::metadata(self.segment_path_keyed(key))
+            .await
+            .is_ok()
+    }
+
     /// W1/W2 — per-stream cache lookup. `audio_index` + `subtitle_index`
     /// land in the cache key + the on-disk path so a client switching
     /// audio track doesn't trample the previous track's cached
@@ -5604,6 +5632,13 @@ impl HlsSegmentCache {
     /// genuinely-absent segment only costs latency, and the 30 s
     /// `AUDIO_POLL_MAX` still bounds it.
     const AUDIO_POLL_STALL: usize = 200;
+
+    /// Has some session of this rendition already written `name`? Reads
+    /// nothing and waits for nothing, so a caller can label its own request
+    /// warm or cold before [`audio_hls_file`](Self::audio_hls_file).
+    pub async fn audio_hls_ready(&self, dir: &Path, name: &str) -> bool {
+        Self::resolve_audio_file(dir, name).await.is_some()
+    }
 
     /// Read a produced audio-rendition file (`init.mp4`, `aN.m4s`, or
     /// `audio.m3u8`) from an [`ensure_audio_hls`](Self::ensure_audio_hls)
