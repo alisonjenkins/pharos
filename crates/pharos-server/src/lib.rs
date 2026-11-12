@@ -47,6 +47,7 @@ pub mod person_image_backfill;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod picture_check;
 pub mod portrait;
+pub mod prefetch_pacer;
 pub mod prefetch_registry;
 pub mod progress_writes;
 pub mod quick_connect;
