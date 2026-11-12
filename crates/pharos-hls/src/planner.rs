@@ -452,23 +452,23 @@ fn skip_given_up(
     if actions.iter().any(|a| matches!(a, Action::Skip { .. })) {
         return;
     }
-    let Some(index) = state.given_up.iter().copied().find(|&idx| {
-        range_of_slice(&state.segments, idx).is_some_and(|(s, e)| s <= play_ms && play_ms < e)
+    let Some((index, seg_end)) = state.given_up.iter().copied().find_map(|idx| {
+        range_of_slice(&state.segments, idx)
+            .filter(|&(s, e)| s <= play_ms && play_ms < e)
+            .map(|(_, e)| (idx, e))
     }) else {
         return;
     };
     if point_buffered(track_buffered, play_ms) {
         return;
     }
-    let Some(next_start) = track_buffered
-        .iter()
-        .map(|&(start, _)| start)
-        .filter(|&start| start > play_ms)
-        .min()
-    else {
+    // Only to the end of this segment, and only when something plays there:
+    // anything fetched in between would be skipped, and the seek aborts it.
+    let next_given_up = state.given_up.contains(&index.saturating_add(1));
+    if !point_buffered(track_buffered, seg_end) && !next_given_up {
         return;
-    };
-    let to_ms = next_start.saturating_add(SKIP_PADDING_MS);
+    }
+    let to_ms = seg_end.saturating_add(SKIP_PADDING_MS);
     state.seek_target_ms = None;
     actions.push(Action::Skip { to_ms });
     notes.push(Note::Skipped {
@@ -1002,6 +1002,39 @@ mod tests {
             from_ms: 0,
             to_ms: 6_100
         }));
+    }
+
+    // B1393: the skip went to the first buffered data after the play head,
+    // passing segments never fetched; it goes to the end of the given-up
+    // segment, and only once something plays there.
+    #[test]
+    fn a_skip_stops_at_the_given_up_segment_and_waits_for_the_next_to_buffer() {
+        let segs = make_segments(&[6_000; 12]);
+        let mut planner = Planner::new(segs.clone(), false, None, Config::default(), 0);
+        let mut buffered = Buffered {
+            video: vec![(60_000, 66_000)],
+            audio: Vec::new(),
+        };
+        let mut fetched_one = false;
+        // Segment 0 appends twice without buffering and is given up; segment 1
+        // is then requested and stays in flight.
+        for _ in 0..6 {
+            for action in planner.tick(0, &buffered) {
+                assert!(!matches!(action, Action::Skip { .. }), "{action:?}");
+                if let Action::Fetch { index, .. } = action {
+                    fetched_one |= index == 1;
+                    if index == 0 {
+                        planner.appended(Track::Video);
+                    }
+                }
+            }
+        }
+        assert!(fetched_one);
+        planner.appended(Track::Video);
+        buffered.video = vec![(6_000, 12_000), (60_000, 66_000)];
+        assert!(planner
+            .tick(0, &buffered)
+            .contains(&Action::Skip { to_ms: 6_100 }));
     }
 
     // B1394: a segment appended on two successive rounds that was covered in
