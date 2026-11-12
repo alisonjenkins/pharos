@@ -540,15 +540,15 @@ fn segment_floor(segments: &[Segment], at_ms: u64) -> u64 {
 }
 
 /// What the other track's lead is measured against: its buffered ranges plus
-/// the segments given up on, which will never buffer, so the track waiting on
-/// it does not wait for them forever.
+/// every settled segment (given up on, or buffered short of its end), which
+/// will gain no more data, so the track waiting on it never waits on a gap
+/// that no fetch will fill.
 fn gate_view(state: &TrackState, buffered: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut view = buffered.to_vec();
     view.extend(
-        state
-            .given_up
-            .iter()
-            .filter_map(|&idx| range_of_slice(&state.segments, idx)),
+        (0..state.segments.len())
+            .filter(|&idx| is_settled(state, idx, buffered))
+            .filter_map(|idx| range_of_slice(&state.segments, idx)),
     );
     view.sort_unstable();
     view
@@ -845,6 +845,33 @@ mod tests {
         buf.audio.push((0, 6_000));
         // Video segment 0 is still in flight: audio segment 1 must wait.
         assert_eq!(planner.tick(0, &buf), Vec::new());
+    }
+
+    // B1394: a track whose first segment buffers short (settled by its
+    // midpoint) and whose next lands past the gap left the lead gate measuring
+    // the other track's contiguous end at the gap, holding both tracks forever.
+    #[test]
+    fn a_gap_inside_a_settled_segment_does_not_hold_both_tracks() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs, false)),
+            Config::default(),
+            0,
+        );
+        let buf = Buffered {
+            video: vec![(0, 6_000)],
+            audio: vec![(0, 3_500), (6_000, 12_000)],
+        };
+        let fetched: Vec<Action> = planner.tick(0, &buf);
+        assert!(
+            fetched.contains(&Action::Fetch {
+                track: Track::Video,
+                index: 1
+            }),
+            "{fetched:?}"
+        );
     }
 
     // B1394: when both tracks may fetch, the one further behind goes first.
