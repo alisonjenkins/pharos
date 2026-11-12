@@ -12,6 +12,11 @@ const DEFAULT_BACK_MS: u64 = 15_000;
 /// Minimum forward buffer target in milliseconds after quota reductions.
 const DEFAULT_MIN_FORWARD_MS: u64 = 8_000;
 
+/// The most one track may buffer ahead of the other. Under one 6 s segment, so
+/// a track never starts a segment whose aligned predecessor the other has not
+/// finished, yet above the few hundred ms their range ends differ by.
+const MAX_TRACK_LEAD_MS: u64 = 2_000;
+
 /// Appends of one segment that leave it unbuffered before it is given up on: a
 /// refetch can repair a partial remove, a third cannot change the answer.
 const MAX_APPENDS_PER_SEGMENT: u32 = 2;
@@ -94,6 +99,13 @@ pub enum Note {
         index: usize,
         appends: u32,
     },
+    /// `track` waits for the other: it would buffer `lead_ms` ahead of it,
+    /// over `limit_ms`. Noted once per wait.
+    Held {
+        track: Track,
+        lead_ms: u64,
+        limit_ms: u64,
+    },
 }
 
 impl Note {
@@ -102,6 +114,7 @@ impl Note {
         match self {
             Self::EndOfStream { .. } => "end_of_stream",
             Self::GaveUp { .. } => "gave_up",
+            Self::Held { .. } => "held",
         }
     }
 }
@@ -127,6 +140,8 @@ struct TrackState {
     appends: Option<(usize, u32)>,
     /// Segments left unbuffered after [`MAX_APPENDS_PER_SEGMENT`] appends.
     given_up: Vec<usize>,
+    /// Waiting for the other track; set while the wait has been noted.
+    held: bool,
 }
 
 impl TrackState {
@@ -140,6 +155,7 @@ impl TrackState {
             seek_refetched: false,
             appends: None,
             given_up: Vec::new(),
+            held: false,
         }
     }
 }
@@ -201,7 +217,15 @@ impl Planner {
             .as_ref()
             .map_or_else(Vec::new, |a| gate_view(a, &buffered.audio));
 
-        let order = [Track::Video, Track::Audio];
+        // The track further behind plans first, so it gets the connection.
+        let audio_first = has_audio
+            && buffered_end_at(&buffered.audio, play_ms)
+                < buffered_end_at(&buffered.video, play_ms);
+        let order = if audio_first {
+            [Track::Audio, Track::Video]
+        } else {
+            [Track::Video, Track::Audio]
+        };
         for track in order {
             let (state, own, other, other_finished) = match track {
                 Track::Video => (
@@ -481,11 +505,21 @@ fn plan_track(
     if let Some((other_buffered, other_finished)) = other_track {
         if !other_finished {
             let other_end = buffered_end_at(other_buffered, anchor_ms);
-            if candidate_seg.start_ms > other_end.saturating_add(candidate_seg.duration_ms) {
+            let lead_ms = candidate_seg.start_ms.saturating_sub(other_end);
+            if lead_ms > MAX_TRACK_LEAD_MS {
+                if !state.held {
+                    state.held = true;
+                    notes.push(Note::Held {
+                        track,
+                        lead_ms,
+                        limit_ms: MAX_TRACK_LEAD_MS,
+                    });
+                }
                 return;
             }
         }
     }
+    state.held = false;
 
     if candidate_idx == start_idx && refetch_target {
         state.seek_refetched = true;
@@ -793,6 +827,52 @@ mod tests {
         assert!(eos);
     }
 
+    // B1394: with nothing of video buffered, audio ran two segments (12 s)
+    // ahead, starving video of the bandwidth and of the play start.
+    #[test]
+    fn audio_cannot_run_ahead_of_an_empty_video_buffer() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs, false)),
+            Config::default(),
+            0,
+        );
+        let mut buf = Buffered::default();
+        planner.tick(0, &buf);
+        planner.appended(Track::Audio);
+        buf.audio.push((0, 6_000));
+        // Video segment 0 is still in flight: audio segment 1 must wait.
+        assert_eq!(planner.tick(0, &buf), Vec::new());
+    }
+
+    // B1394: when both tracks may fetch, the one further behind goes first.
+    #[test]
+    fn the_lagging_track_is_fetched_first() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs, false)),
+            Config::default(),
+            0,
+        );
+        let buf = Buffered {
+            video: vec![(0, 6_000)],
+            audio: vec![(0, 5_000)],
+        };
+        let tracks: Vec<Track> = planner
+            .tick(0, &buf)
+            .into_iter()
+            .filter_map(|a| match a {
+                Action::Fetch { track, .. } => Some(track),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tracks.first(), Some(&Track::Audio));
+    }
+
     // Each decision the planner takes silently is a note the adapter logs.
     #[test]
     fn end_of_stream_is_noted_with_the_play_head_and_buffered_end() {
@@ -837,6 +917,32 @@ mod tests {
                 track: Track::Video,
                 index: 2,
                 appends: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn holding_a_track_back_is_noted_once_per_wait() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs, false)),
+            Config::default(),
+            0,
+        );
+        let mut buf = Buffered::default();
+        planner.tick(0, &buf);
+        planner.appended(Track::Audio);
+        buf.audio.push((0, 6_000));
+        planner.tick(0, &buf);
+        planner.tick(0, &buf);
+        assert_eq!(
+            planner.take_notes(),
+            vec![Note::Held {
+                track: Track::Audio,
+                lead_ms: 6_000,
+                limit_ms: 2_000
             }]
         );
     }
@@ -1108,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn lockstep_keeps_video_and_audio_within_one_segment() {
+    fn lockstep_keeps_video_and_audio_within_the_lead_limit() {
         let segs = make_segments(&[6_000, 6_000, 6_000, 6_000]);
         let mut planner = Planner::new(
             segs.clone(),
@@ -1134,25 +1240,13 @@ mod tests {
             ]
         );
 
-        // Video finishes segment 0; audio is still in flight on segment 0 (nothing buffered).
+        // Video finishes segment 0; audio is still in flight on segment 0.
+        // Video segment 1 starts 6_000 past audio's end (0): over the limit.
         planner.appended(Track::Video);
         buf.video.push((0, 6_000));
-
-        // Video may fetch segment 1 (start 6_000 <= audio_end 0 + duration 6_000).
-        assert_eq!(
-            planner.tick(0, &buf),
-            vec![Action::Fetch {
-                track: Track::Video,
-                index: 1
-            }]
-        );
-        planner.appended(Track::Video);
-        buf.video = vec![(0, 12_000)];
-
-        // Video cannot fetch segment 2 (start 12_000 > audio_end 0 + duration 6_000).
         assert_eq!(planner.tick(0, &buf), Vec::new());
 
-        // Once audio finishes segment 0 (audio_end = 6_000), video can fetch segment 2.
+        // Once audio finishes segment 0, both may fetch segment 1.
         planner.appended(Track::Audio);
         buf.audio.push((0, 6_000));
         assert_eq!(
@@ -1160,7 +1254,7 @@ mod tests {
             vec![
                 Action::Fetch {
                     track: Track::Video,
-                    index: 2
+                    index: 1
                 },
                 Action::Fetch {
                     track: Track::Audio,
@@ -1225,9 +1319,11 @@ mod tests {
         planner.tick(0, &buf);
         // Video is on seg 0; advance video to seg 1 so video is on seg 1 and audio is on seg 0.
         planner.appended(Track::Video);
+        // Audio's data stops short of the segment end but past its midpoint, so
+        // it is within the lead limit of video's segment 1.
         let buf_v0 = Buffered {
             video: vec![(0, 6_000)],
-            audio: Vec::new(),
+            audio: vec![(0, 4_000)],
         };
         planner.tick(0, &buf_v0);
         assert_eq!(planner.in_flight(Track::Video), Some(Request::Media(1)));
