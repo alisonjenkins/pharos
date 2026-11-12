@@ -463,21 +463,12 @@ pub async fn for_item(
                 .await
                 .unwrap_or(align::Lookup::Unavailable);
             match lookup {
-                align::Lookup::Ready(aligned) => {
-                    // The aligner moved the song's lines onto the singing
-                    // (B936) before it found the words, so the lines move
-                    // with them, enhanced-LRC word times included.
-                    for (line, new_words) in lyrics.lines.iter_mut().zip(aligned.lines.iter()) {
-                        line.start_ms = line.start_ms.map(|ms| aligned.shift(ms));
-                        if line.words.is_empty() {
-                            line.words.clone_from(new_words);
-                        } else {
-                            for w in &mut line.words {
-                                w.start_ms = aligned.shift(w.start_ms);
-                            }
-                        }
-                    }
-                    start_lines_at_their_first_word(&mut lyrics.lines);
+                align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
+                // The lines timed so far, the rest still guessed by the
+                // client until the next answer (ADR-0121).
+                align::Lookup::Partial(eta_ms, aligned) => {
+                    with_words(&mut lyrics, &aligned);
+                    words_pending = Some(WordsPending { eta_ms });
                 }
                 align::Lookup::Pending(eta_ms) => {
                     words_pending = Some(WordsPending { eta_ms });
@@ -487,6 +478,23 @@ pub async fn for_item(
         }
     }
     Ok(Some((lyrics, words_pending)))
+}
+
+/// The aligner's words onto `lyrics`. The aligner moved the song's lines onto
+/// the singing (B936) before it found the words, so the lines move with them,
+/// enhanced-LRC word times included; a line it gave no words keeps its own.
+fn with_words(lyrics: &mut Lyrics, aligned: &align::Aligned) {
+    for (line, new_words) in lyrics.lines.iter_mut().zip(aligned.lines.iter()) {
+        line.start_ms = line.start_ms.map(|ms| aligned.shift(ms));
+        if line.words.is_empty() {
+            line.words.clone_from(new_words);
+        } else {
+            for w in &mut line.words {
+                w.start_ms = aligned.shift(w.start_ms);
+            }
+        }
+    }
+    start_lines_at_their_first_word(&mut lyrics.lines);
 }
 
 /// The aligner may find a line's first word before its stamp (B1165); the
