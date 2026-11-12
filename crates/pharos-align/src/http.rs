@@ -74,12 +74,25 @@ fn event_line(event: &impl Serialize) -> Option<Bytes> {
     }
 }
 
-/// Whether the caller asked for the streamed answer.
+/// Whether the caller's `Accept` names the streamed answer with a quality
+/// above zero (RFC 9110: `q=0` is "not acceptable").
 fn wants_events(req: &HttpRequest) -> bool {
     req.headers()
         .get(ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains(NDJSON))
+        .is_some_and(accepts_events)
+}
+
+fn accepts_events(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';');
+        let kind = parts.next().unwrap_or("").trim();
+        let q = parts
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+            .map_or(Some(1.0), |(_, v)| v.trim().parse::<f32>().ok());
+        kind.eq_ignore_ascii_case(NDJSON) && q.is_some_and(|q| q > 0.0)
+    })
 }
 
 /// The status and error body a failed song answers with.
@@ -396,7 +409,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-    use super::record_gpu;
+    use super::{accepts_events, record_gpu};
     use crate::obs::GPU_POOL_BYTES;
     use crate::service::{GpuMemory, GpuPool};
 
@@ -442,6 +455,22 @@ mod tests {
                 ("peak".into(), 3.0 * f64::from(1u32 << 30))
             ]
         );
+    }
+
+    #[test]
+    fn only_an_accept_that_names_the_stream_above_zero_quality_gets_it() {
+        assert!(accepts_events("application/x-ndjson"));
+        assert!(accepts_events("application/x-ndjson, application/json"));
+        assert!(accepts_events(
+            "application/json;q=0.5, Application/X-NDJSON; q=0.9"
+        ));
+        assert!(!accepts_events("application/json"));
+        assert!(!accepts_events(
+            "application/json, application/x-ndjson;q=0"
+        ));
+        assert!(!accepts_events("application/x-ndjson; q=0.0"));
+        assert!(!accepts_events("application/x-ndjson;q=nope"));
+        assert!(!accepts_events("application/x-ndjsonish"));
     }
 
     #[test]
