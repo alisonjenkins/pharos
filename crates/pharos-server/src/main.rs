@@ -1666,6 +1666,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         "image tag check for anonymous image requests (ADR-0073)"
     );
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
+        // B1375 — cast portraits are kept beside the artwork, so a title page
+        // asks the provider for each face once, not on every view.
+        state = state.with_portrait_source(std::sync::Arc::new(
+            pharos_server::portrait::DiskPortraits::new(
+                cache_dir.join("portraits"),
+                std::sync::Arc::new(pharos_server::portrait::HttpPortraits::new()),
+            ),
+        ));
         let image_cache =
             ImageCache::new(cache_dir).with_seek_seconds(cfg.server.image_seek_seconds);
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
