@@ -8755,7 +8755,7 @@ dependencies = [
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.17.1",
+ "hashbrown 0.13.2",
  "hi_sparse_bitset 0.10.0",
  "indexmap",
  "inventory",
@@ -10625,9 +10625,9 @@ dependencies = [
 
 [[package]]
 name = "sonic-rs"
-version = "0.5.10"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "756586caeeb21126a57c17d1ef2b9386e2613ba784aae0f27104f5e9982335ec"
+checksum = "a1cd78ade69b3f8bb19338beb2f436f7fa85b9bd6330eb0962a1f4b8491515fc"
 dependencies = [
  "ahash",
  "bumpalo",
