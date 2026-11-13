@@ -486,6 +486,10 @@ pub async fn for_item(
                 }
                 align::Lookup::Unavailable => {}
             }
+        } else {
+            // No aligner configured: the ask still goes unanswered, so it
+            // counts against the ready share like the aligner refusing it.
+            count_words_answer(&align::Lookup::Unavailable);
         }
     }
     Ok(Some((lyrics, words_pending)))
