@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use pharos_client::api::{LyricLine, Lyrics};
+use pharos_client::api::{ItemRef, LyricLine, Lyrics};
 
 use super::platform;
 
@@ -225,6 +225,21 @@ const ETA_TICK_MS: u32 = 1_000;
 /// agreeing.
 pub fn eta_deadline(eta_ms: Option<u32>, now_ms: f64) -> Option<f64> {
     eta_ms.map(|ms| now_ms + f64::from(ms))
+}
+
+/// The song to have the aligner time ahead of its turn (B1415): the queue's
+/// next song, with karaoke on, once this song's word times no longer need
+/// the aligner (so the two never queue against each other), and only once
+/// for each next song (`asked`). A synthesised item has no lyrics to time.
+pub fn align_ahead(
+    karaoke: bool,
+    playing: ItemRef,
+    words_settled: bool,
+    next: Option<ItemRef>,
+    asked: Option<ItemRef>,
+) -> Option<ItemRef> {
+    let next = next.filter(|n| matches!(n, ItemRef::Real(_)))?;
+    (karaoke && words_settled && next != playing && asked != Some(next)).then_some(next)
 }
 
 /// The banner shown while the words are being timed: how long is left when
@@ -831,5 +846,49 @@ mod tests {
         let tv = rule(":root[data-device=\"tv\"] .pharos-lyrics-words {");
         assert!(tv.contains("filter: none"), "{tv}");
         assert!(!tv.contains("transition"), "{tv}");
+    }
+
+    /// B1415, V1385: the next queued song is timed ahead once, with karaoke
+    /// on, after this song's words have settled. Disarm check: with the
+    /// `words_settled` term dropped, the second assert fails.
+    #[test]
+    fn the_next_song_is_timed_ahead_once_this_ones_words_have_settled() {
+        let (now, next) = (ItemRef::Real(1), Some(ItemRef::Real(2)));
+        assert_eq!(align_ahead(true, now, true, next, None), next);
+        assert_eq!(
+            align_ahead(true, now, false, next, None),
+            None,
+            "still timing this one"
+        );
+        assert_eq!(
+            align_ahead(false, now, true, next, None),
+            None,
+            "karaoke off"
+        );
+        assert_eq!(
+            align_ahead(true, now, true, next, next),
+            None,
+            "asked already"
+        );
+        assert_eq!(
+            align_ahead(true, now, true, None, None),
+            None,
+            "nothing queued"
+        );
+        assert_eq!(
+            align_ahead(true, now, true, Some(now), None),
+            None,
+            "this song again"
+        );
+        assert_eq!(
+            align_ahead(true, now, true, Some(ItemRef::Synth(3)), None),
+            None,
+            "a synthesised item"
+        );
+        assert_eq!(
+            align_ahead(true, now, true, Some(ItemRef::Real(4)), next),
+            Some(ItemRef::Real(4)),
+            "a new next song is asked for even after another was"
+        );
     }
 }
