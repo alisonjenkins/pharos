@@ -101,16 +101,26 @@ fn cpu_model(
 fn check_gpu(
     weights: &Path,
     adapter: &device::Adapter,
-) -> Result<pharos_align::forward::vulkan::VulkanModel, String> {
-    use pharos_align::forward::vulkan::VulkanModel;
-    let run = || -> Result<(VulkanModel, Vec<(usize, Duration)>), String> {
+) -> Result<
+    (
+        pharos_align::forward::vulkan::VulkanModel,
+        pharos_align::forward::vulkan::HostWeights,
+    ),
+    String,
+> {
+    use pharos_align::forward::vulkan::{HostWeights, VulkanModel};
+    // The model, its prepared weights, and each bucket's warm-up time.
+    type Warm = (VulkanModel, HostWeights, Vec<(usize, Duration)>);
+    let run = || -> Result<Warm, String> {
         let w = Weights::open(weights).map_err(|e| e.to_string())?;
-        let m = VulkanModel::load(&w, device::burn_device(adapter)).map_err(|e| e.to_string())?;
+        let mut host = HostWeights::default();
+        let m = VulkanModel::load_keeping(&w, device::burn_device(adapter), &mut host)
+            .map_err(|e| e.to_string())?;
         let timed = m.warm_up()?;
-        Ok((m, timed))
+        Ok((m, host, timed))
     };
     let started = std::time::Instant::now();
-    let (model, timed) =
+    let (model, host, timed) =
         std::panic::catch_unwind(run).unwrap_or_else(|_| Err("the GPU pass panicked".into()))?;
     let per_bucket: Vec<String> = timed
         .iter()
@@ -122,7 +132,7 @@ fn check_gpu(
         per_bucket = %per_bucket.join(" "),
         "GPU warm-up"
     );
-    Ok(model)
+    Ok((model, host))
 }
 
 /// R14: compiled kernels persist under `PHAROS_ALIGNER_CACHE_DIR`. cubecl
@@ -141,9 +151,13 @@ fn kernel_cache(dir: &Path) -> String {
 }
 
 /// The model the GPU warm-up loaded, which the first song then uses rather
-/// than uploading the weights again.
+/// than uploading the weights again, and the prepared weights it uploaded,
+/// kept for every reload after an idle unload (B1416).
 #[cfg(feature = "vulkan")]
-type Warmed = Option<pharos_align::forward::vulkan::VulkanModel>;
+type Warmed = Option<(
+    pharos_align::forward::vulkan::VulkanModel,
+    pharos_align::forward::vulkan::HostWeights,
+)>;
 #[cfg(not(feature = "vulkan"))]
 type Warmed = ();
 
@@ -201,17 +215,39 @@ fn loader(config: &Config, choice: device::Choice, warmed: Warmed) -> Loader {
         #[cfg(feature = "vulkan")]
         device::Device::Vulkan(adapter) => {
             use pharos_align::forward::fallback::{gpu_or_cpu, Fallback, RELOAD_FAILED};
-            use pharos_align::forward::vulkan::VulkanModel;
+            use pharos_align::forward::vulkan::{HostWeights, VulkanModel};
             use pharos_align::forward::VulkanAligner;
+            let (warmed, host) = match warmed {
+                Some((m, h)) => (Some(m), h),
+                None => (None, HostWeights::default()),
+            };
             let warmed = std::sync::Mutex::new(warmed);
+            // Held for the process's life: an idle unload frees the GPU's
+            // copy only, so a reload uploads these rather than re-reading and
+            // re-shaping the file (B1416).
+            let host = std::sync::Mutex::new(host);
             let gpu_weights = weights.clone();
             let load_gpu = move || {
                 let model = match warmed.lock().ok().and_then(|mut w| w.take()) {
                     Some(m) => m,
                     None => {
+                        let started = std::time::Instant::now();
+                        let mut host = host
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let kept = !host.is_empty();
                         let w = Weights::open(&gpu_weights).map_err(|e| e.to_string())?;
-                        VulkanModel::load(&w, device::burn_device(&adapter))
-                            .map_err(|e| e.to_string())?
+                        let m =
+                            VulkanModel::load_keeping(&w, device::burn_device(&adapter), &mut host)
+                                .map_err(|e| e.to_string())?;
+                        tracing::info!(
+                            upload_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            host_kept = kept,
+                            host_mib = host.bytes() / (1024 * 1024),
+                            "GPU weights uploaded"
+                        );
+                        m
                     }
                 };
                 let gpu = VulkanAligner::new(model, reason.clone(), adapter.name.clone());
