@@ -2574,7 +2574,15 @@ async fn vp9_audio_file(
     // A failed read ends the request here; a successful one is recorded after
     // the edit-list rewrite below, the last step that can still fail it.
     if is_init && file.is_err() {
-        record_init_served("vp9-audio-init", init_temp, false, media_id, started);
+        record_init_served(
+            "vp9-audio-init",
+            init_temp,
+            InitFrom::Start,
+            0,
+            false,
+            media_id,
+            started,
+        );
     }
     let file = file
         // Carry the cache's give-up reason into the response body. A bare
@@ -2613,6 +2621,8 @@ async fn vp9_audio_file(
         record_init_served(
             "vp9-audio-init",
             init_temp,
+            InitFrom::Start,
+            0,
             shrunk.is_ok(),
             media_id,
             started,
@@ -2747,14 +2757,60 @@ impl InitTemp {
     }
 }
 
+/// Which segment an init was cut from. Stable metric label (`from`): `start`
+/// is segment 0, `playhead` is the segment the stream's viewer is at (V1365).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitFrom {
+    Start,
+    Playhead,
+}
+
+impl InitFrom {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Playhead => "playhead",
+        }
+    }
+}
+
+/// The segment a video init is cut from. Every segment of a rendition carries
+/// the same `ftyp`+`moov` (one encoder config, one device by the V80 pin), so
+/// the init rides the encode at the viewer's playhead: on a resume that is the
+/// segment the player asks for next, instead of a segment-0 encode it never
+/// plays. Segment 0 when nothing has said where the viewer is.
+async fn init_source_segment(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    play_session_id: Option<&str>,
+) -> (u32, InitFrom) {
+    let (Some(psid), Some(sched)) = (play_session_id, state.transcode_scheduler.as_ref()) else {
+        return (0, InitFrom::Start);
+    };
+    let Some(seg) = sched.playhead(StreamKey::of(psid)).await else {
+        return (0, InitFrom::Start);
+    };
+    let on_grid = item.probe.duration_ms.map_or(true, |ms| {
+        super::seek::SegmentGrid::new(ms as f64 / 1000.0, item.probe.frame_rate_mille)
+            .checked(seg)
+            .is_some()
+    });
+    if seg == 0 || !on_grid {
+        return (0, InitFrom::Start);
+    }
+    (seg, InitFrom::Playhead)
+}
+
 /// One init request's outcome, as `pharos_init_segment_total` and
-/// `pharos_init_segment_seconds` (`surface`, `temp`, `outcome`). The init has no
-/// bytes of its own: it is the `moov` of segment 0, so a cold init is a full
-/// segment encode on the first request a player makes, and no existing series
-/// could tell that from a media segment 0.
+/// `pharos_init_segment_seconds` (`surface`, `temp`, `from`, `outcome`). The
+/// init has no bytes of its own: it is the `moov` of a media segment, so a cold
+/// init is a full segment encode on the first request a player makes, and no
+/// existing series could tell that from a media segment.
 fn record_init_served(
     surface: &'static str,
     temp: InitTemp,
+    from: InitFrom,
+    seg: u32,
     ok: bool,
     media_id: u64,
     started: std::time::Instant,
@@ -2763,31 +2819,35 @@ fn record_init_served(
     let secs = started.elapsed().as_secs_f64();
     metrics::counter!(
         "pharos_init_segment_total",
-        "surface" => surface, "temp" => temp.label(), "outcome" => outcome
+        "surface" => surface, "temp" => temp.label(), "from" => from.label(), "outcome" => outcome
     )
     .increment(1);
     metrics::histogram!(
         "pharos_init_segment_seconds",
-        "surface" => surface, "temp" => temp.label(), "outcome" => outcome
+        "surface" => surface, "temp" => temp.label(), "from" => from.label(), "outcome" => outcome
     )
     .record(secs);
     tracing::info!(
         media.id = media_id,
         surface,
         temp = temp.label(),
+        from = from.label(),
+        seg,
         outcome,
         elapsed_ms = (secs * 1000.0) as u64,
         "init segment served"
     );
 }
 
-/// The fMP4 init (`ftyp`+`moov`) of a rendition: split off segment 0's bytes,
-/// which are produced (or read from cache) under the same key as segment 0
-/// itself.
-async fn init_from_first_segment(
+/// The fMP4 init (`ftyp`+`moov`) of a rendition: split off segment `seg`'s
+/// bytes, which are produced (or read from cache) under the same key as that
+/// media segment itself. `opts` must be the ones segment `seg` is served with.
+async fn init_from_segment(
     state: &AppState,
     req: &HttpRequest,
     item: &pharos_core::MediaItem,
+    seg: u32,
+    from: InitFrom,
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
     surface: &'static str,
@@ -2796,7 +2856,7 @@ async fn init_from_first_segment(
     let source = match transcode_source(state, &item.path, opts.video.is_some()).await {
         Ok(source) => source,
         Err(e) => {
-            record_init_served(surface, InitTemp::Cold, false, item.id, started);
+            record_init_served(surface, InitTemp::Cold, from, seg, false, item.id, started);
             return Err(e);
         }
     };
@@ -2805,7 +2865,7 @@ async fn init_from_first_segment(
             if cache
                 .segment_is_cached(
                     item.id,
-                    0,
+                    seg,
                     opts.audio_source_stream_index,
                     opts.burn_subtitle_stream_index,
                     &source,
@@ -2819,22 +2879,23 @@ async fn init_from_first_segment(
         _ => InitTemp::Cold,
     };
     let init = async {
-        let raw = vp9_segment_raw_from(state, req, item, 0, opts, play_session_id, source).await?;
+        let raw =
+            vp9_segment_raw_from(state, req, item, seg, opts, play_session_id, source).await?;
         // The init IS the rendition's clock. Judge it too: an init on the wrong
         // timescale mis-reads every segment that follows it, not just itself.
-        fmp4::record_track_timescale(&raw, item.id, 0);
+        fmp4::record_track_timescale(&raw, item.id, seg);
         fmp4::process_segment(&raw)
             .map(|p| p.init)
             .map_err(|e| error::ErrorInternalServerError(format!("fmp4 init: {e}")))
     }
     .await;
-    record_init_served(surface, temp, init.is_ok(), item.id, started);
+    record_init_served(surface, temp, from, seg, init.is_ok(), item.id, started);
     init
 }
 
-/// Serve the shared fMP4 init segment (`ftyp`+`moov`). Generated by
-/// transcoding segment 0 and splitting off its moov — the init is byte-
-/// identical across a source's segments, so segment 0 is representative.
+/// Serve the shared fMP4 init segment (`ftyp`+`moov`), split off the media
+/// segment at the viewer's playhead — the init is byte-identical across a
+/// source's segments, so any of them is representative (V1365).
 async fn vp9_init(
     state: web::Data<AppState>,
     user: PlaybackUser,
@@ -2859,26 +2920,29 @@ async fn vp9_init(
         crate::session_start::INIT_SEG_VP9,
         "vp9-init",
     );
+    let (seg, from) = init_source_segment(&state, &item, q.play_session_id.as_deref()).await;
     let mut opts = vp9_segment_opts(
         &state,
         &req,
         &item,
-        0,
+        seg,
         q.audio_stream_index,
         q.subtitle_stream_index,
     )
     .await;
-    // B46 — same gating as the media segments so the init shares seg 0's
-    // cache key.
+    // B46 — same gating as the media segments so the init shares its
+    // segment's cache key.
     {
-        let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let init = init_from_first_segment(
+    let init = init_from_segment(
         &state,
         &req,
         &item,
+        seg,
+        from,
         &opts,
         q.play_session_id.as_deref(),
         "vp9-init",
@@ -3153,11 +3217,12 @@ async fn h264cmaf_init_for(
         ),
         rung.map_or("h264cmaf-init", Variant::cmaf_init_surface),
     );
+    let (seg, from) = init_source_segment(&state, &item, q.play_session_id.as_deref()).await;
     let mut opts = fmp4_segment_opts(
         &state,
         &req,
         &item,
-        0,
+        seg,
         SegmentVideo::H264,
         q.audio_stream_index,
         q.subtitle_stream_index,
@@ -3166,14 +3231,16 @@ async fn h264cmaf_init_for(
     opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
     apply_rung_output_size(&mut opts, &item.probe, req.query_string(), rung);
     {
-        let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
+        let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
-    let init = init_from_first_segment(
+    let init = init_from_segment(
         &state,
         &req,
         &item,
+        seg,
+        from,
         &opts,
         q.play_session_id.as_deref(),
         rung.map_or("h264cmaf-init", Variant::cmaf_init_surface),
@@ -6907,6 +6974,14 @@ mod prewarm_edition_tests {
     /// prints segment bytes. Returns the state, the cache root and the
     /// edition's path.
     async fn seed(dir: &Path) -> (web::Data<AppState>, PathBuf, PathBuf) {
+        seed_with(dir, None).await
+    }
+
+    /// [`seed`], with a transcode scheduler attached when given.
+    async fn seed_with(
+        dir: &Path,
+        sched: Option<pharos_transcode::scheduler::TranscodeScheduler>,
+    ) -> (web::Data<AppState>, PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let primary = dir.join("Film.mkv");
@@ -6955,8 +7030,11 @@ mod prewarm_edition_tests {
         let cache =
             pharos_cache::HlsSegmentCache::new(dir.join("cache"), 1 << 30).with_ffmpeg(&bin);
         let root = cache.root().to_path_buf();
-        let state = web::Data::new(AppState::new(stores, "t".into()).with_hls_cache(cache));
-        (state, root, edition)
+        let mut state = AppState::new(stores, "t".into()).with_hls_cache(cache);
+        if let Some(sched) = sched {
+            state = state.with_transcode_scheduler(sched);
+        }
+        (web::Data::new(state), root, edition)
     }
 
     /// Segment filenames under item 7 once `want` of them have landed, or
@@ -7257,9 +7335,17 @@ mod prewarm_edition_tests {
                 let req = actix_web::test::TestRequest::default().to_http_request();
                 for _ in 0..2 {
                     // Outcome is not the point: the stub's moov is not a real one.
-                    let _ =
-                        init_from_first_segment(&state, &req, &item, &opts, None, "h264cmaf-init")
-                            .await;
+                    let _ = init_from_segment(
+                        &state,
+                        &req,
+                        &item,
+                        0,
+                        InitFrom::Start,
+                        &opts,
+                        None,
+                        "h264cmaf-init",
+                    )
+                    .await;
                 }
             })
         });
@@ -7278,6 +7364,7 @@ mod prewarm_edition_tests {
                         DebugValue::Counter(n)
                             if k.name() == "pharos_init_segment_total"
                                 && labels.contains(&"surface=h264cmaf-init".to_string())
+                                && labels.contains(&"from=start".to_string())
                                 && labels.contains(&format!("temp={temp}")) =>
                         {
                             Some(n)
@@ -7328,7 +7415,17 @@ mod prewarm_edition_tests {
                 let opts =
                     fmp4_segment_opts_resolved(&item, 0, SegmentVideo::H264, None, None, None);
                 let req = actix_web::test::TestRequest::default().to_http_request();
-                let r = init_from_first_segment(&state, &req, &item, &opts, None, "vp9-init").await;
+                let r = init_from_segment(
+                    &state,
+                    &req,
+                    &item,
+                    0,
+                    InitFrom::Start,
+                    &opts,
+                    None,
+                    "vp9-init",
+                )
+                .await;
                 assert!(r.is_err());
             })
         });
@@ -7357,6 +7454,55 @@ mod prewarm_edition_tests {
         assert_eq!(
             errors, 1,
             "pharos_init_segment_total{{outcome=error}} for a source that did not resolve"
+        );
+    }
+
+    /// V1365 — an init is cut from the segment its stream's viewer is at, so a
+    /// resume's init rides the encode of the segment it plays next. A stream
+    /// nothing has placed, or a reading off the media's grid, falls back to
+    /// segment 0.
+    #[actix_web::test]
+    async fn an_init_is_cut_from_the_segment_its_viewer_is_at() {
+        use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler};
+        let sched = TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 1),
+            std::sync::Arc::new(pharos_transcode::worker::ProcSpawner::new()),
+            SchedConfig::default(),
+        );
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, _root, _edition) = seed_with(td.path(), Some(sched.clone())).await;
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            None,
+        )
+        .await
+        .unwrap();
+        let psid = "resumed-play-session";
+        assert_eq!(
+            init_source_segment(&state, &item, Some(psid)).await,
+            (0, InitFrom::Start),
+            "no reading yet: segment 0"
+        );
+        assert_eq!(
+            init_source_segment(&state, &item, None).await,
+            (0, InitFrom::Start),
+            "no play session: segment 0"
+        );
+        sched.note_playhead(StreamKey::of(psid), 5);
+        assert_eq!(
+            init_source_segment(&state, &item, Some(psid)).await,
+            (5, InitFrom::Playhead),
+            "a resumed viewer at segment 5 gets segment 5's moov"
+        );
+        // 60 s of media is 10 segments; a reading past them is not served.
+        let other = "seeked-past-the-end";
+        sched.note_playhead(StreamKey::of(other), 400);
+        assert_eq!(
+            init_source_segment(&state, &item, Some(other)).await,
+            (0, InitFrom::Start),
+            "a reading off the grid falls back to segment 0"
         );
     }
 
