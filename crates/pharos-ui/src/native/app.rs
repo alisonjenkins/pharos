@@ -202,6 +202,9 @@ pub fn Root() -> Element {
                 item.map(|i| i.to_string()).unwrap_or_default()
             ));
             stage.set(next);
+        } else if next.lift != stage.peek().lift {
+            // Leaving the page before an asked video mounts cancels its lift.
+            stage.write().lift = next.lift;
         }
     });
     use_context_provider(|| {

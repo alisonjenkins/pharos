@@ -1166,6 +1166,15 @@ mod tests {
     }
 
     #[test]
+    fn leaving_the_page_before_a_started_video_mounts_keeps_the_bar() {
+        let mut stage = video_in_bar(7);
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
+        assert_eq!(stage.follow(&Route::Find), None);
+        assert!(!stage.mounted(true));
+        assert_eq!(stage.view, View::Mini);
+    }
+
+    #[test]
     fn a_video_started_over_a_song_in_the_bar_opens_full() {
         let mut stage = playing_full(7);
         assert!(!stage.mounted(false));
