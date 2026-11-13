@@ -1873,12 +1873,18 @@ fn PagedGrid(
                     platform::scroll_to_top();
                 }
                 platform::warn(&format!(
-                    "pharos: grid tile {target} not in the page to scroll to"
+                    "pharos: grid tile {target} not in the page to scroll to ms={:.0}",
+                    platform::now_ms() - opened
                 ));
             }
             jump.set(None);
         } else if state.failed() || !state.has_more() {
             if land.take().is_some() {
+                platform::info(&format!(
+                    "pharos: grid restore abandoned tile={target} loaded={loaded} failed={} ms={:.0}",
+                    state.failed(),
+                    platform::now_ms() - opened
+                ));
                 platform::scroll_to_top();
             }
             anchor.set(None);
