@@ -153,12 +153,89 @@ fn tensor<const N: usize>(data: &[f32], shape: [usize; N], device: &Device) -> T
     Tensor::from_data(TensorData::new(data.to_vec(), shape), device)
 }
 
+/// Every weight as the GPU takes it (transposed, fused, split into conv
+/// taps), in the order [`VulkanModel::load_keeping`] uploads them. Kept on
+/// the host across an idle unload, a reload is an upload rather than a
+/// re-read and re-shuffle of the whole file (B1416).
+#[derive(Default)]
+pub struct HostWeights {
+    bufs: Vec<Vec<f32>>,
+}
+
+impl HostWeights {
+    /// Bytes held.
+    pub fn bytes(&self) -> usize {
+        self.bufs.iter().map(|b| b.len() * 4).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bufs.is_empty()
+    }
+}
+
+/// Uploads each tensor, from `host` where it already holds that tensor's
+/// buffer and from `make` otherwise, recording what `make` gave.
+struct Uploader<'a> {
+    host: std::cell::RefCell<&'a mut HostWeights>,
+    next: std::cell::Cell<usize>,
+    device: &'a Device,
+}
+
+impl Uploader<'_> {
+    fn put<const N: usize>(
+        &self,
+        shape: [usize; N],
+        make: impl FnOnce() -> Result<Vec<f32>, WeightsError>,
+    ) -> Result<Tensor<N>, WeightsError> {
+        let at = self.next.get();
+        self.next.set(at + 1);
+        let len: usize = shape.iter().product();
+        let mut host = self.host.borrow_mut();
+        let data = host.take_or_make(at, len, make)?;
+        Ok(tensor(data, shape, self.device))
+    }
+}
+
+impl HostWeights {
+    /// The `at`th buffer: the kept one when it has `len` floats, else what
+    /// `make` gives, kept in its place (and anything kept after it dropped,
+    /// since the order no longer matches).
+    fn take_or_make(
+        &mut self,
+        at: usize,
+        len: usize,
+        make: impl FnOnce() -> Result<Vec<f32>, WeightsError>,
+    ) -> Result<&[f32], WeightsError> {
+        if !self.bufs.get(at).is_some_and(|kept| kept.len() == len) {
+            let made = make()?;
+            self.bufs.truncate(at);
+            self.bufs.push(made);
+        }
+        Ok(&self.bufs[at])
+    }
+}
+
 impl VulkanModel {
     /// Uploads every weight to `device`, checking each shape as the CPU pass does.
     pub fn load(weights: &Weights, device: Device) -> Result<Self, WeightsError> {
-        let dev = &device;
+        Self::load_keeping(weights, device, &mut HostWeights::default())
+    }
+
+    /// [`VulkanModel::load`], taking each prepared buffer from `host` where
+    /// it holds one and filling `host` with the rest, so a later load with
+    /// the same `host` skips reading and reshaping the weights (B1416).
+    pub fn load_keeping(
+        weights: &Weights,
+        device: Device,
+        host: &mut HostWeights,
+    ) -> Result<Self, WeightsError> {
+        let up = Uploader {
+            host: std::cell::RefCell::new(host),
+            next: std::cell::Cell::new(0),
+            device: &device,
+        };
         let t1 = |n: &str, len: usize| -> Result<Tensor<1>, WeightsError> {
-            Ok(tensor(weights.get(n, &[len])?, [len], dev))
+            up.put([len], || Ok(weights.get(n, &[len])?.to_vec()))
         };
         let ln = |p: &str, n: usize| -> Result<Norm, WeightsError> {
             Ok(Norm {
@@ -178,28 +255,37 @@ impl VulkanModel {
             t
         };
         let linear = |p: &str, dout: usize, din: usize| -> Result<Linear, WeightsError> {
-            let w = weights.get(&format!("{p}.weight"), &[dout, din])?;
             Ok(Linear {
-                wt: tensor(&host_t(w, dout, din), [1, din, dout], dev),
+                wt: up.put([1, din, dout], || {
+                    let w = weights.get(&format!("{p}.weight"), &[dout, din])?;
+                    Ok(host_t(w, dout, din))
+                })?,
                 b: t1(&format!("{p}.bias"), dout)?,
             })
         };
         // q, k and v as one [D, 3D] matmul, as the CPU pass fuses them.
         let qkv = |p: &str| -> Result<Linear, WeightsError> {
-            let mut wt = vec![0f32; D * 3 * D];
-            let mut b = Vec::with_capacity(3 * D);
-            for (j, n) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
-                let w = weights.get(&format!("{p}.attention.{n}.weight"), &[D, D])?;
-                for o in 0..D {
-                    for i in 0..D {
-                        wt[i * 3 * D + j * D + o] = w[o * D + i];
-                    }
-                }
-                b.extend_from_slice(weights.get(&format!("{p}.attention.{n}.bias"), &[D])?);
-            }
+            let names = ["q_proj", "k_proj", "v_proj"];
             Ok(Linear {
-                wt: tensor(&wt, [1, D, 3 * D], dev),
-                b: tensor(&b, [3 * D], dev),
+                wt: up.put([1, D, 3 * D], || {
+                    let mut wt = vec![0f32; D * 3 * D];
+                    for (j, n) in names.iter().enumerate() {
+                        let w = weights.get(&format!("{p}.attention.{n}.weight"), &[D, D])?;
+                        for o in 0..D {
+                            for i in 0..D {
+                                wt[i * 3 * D + j * D + o] = w[o * D + i];
+                            }
+                        }
+                    }
+                    Ok(wt)
+                })?,
+                b: up.put([3 * D], || {
+                    let mut b = Vec::with_capacity(3 * D);
+                    for n in names {
+                        b.extend_from_slice(weights.get(&format!("{p}.attention.{n}.bias"), &[D])?);
+                    }
+                    Ok(b)
+                })?,
             })
         };
         let fe = FE
@@ -207,22 +293,24 @@ impl VulkanModel {
             .enumerate()
             .map(|(i, &(cin, k, stride))| {
                 let p = format!("feature_extractor.conv_layers.{i}");
-                let w = weights.get(&format!("{p}.conv.weight"), &[FE_C, cin, k])?;
                 let blocks = (0..k.div_ceil(stride))
                     .map(|j| {
                         let taps = stride.min(k - j * stride);
-                        let mut m = vec![0f32; taps * cin * FE_C];
-                        for tap in 0..taps {
-                            for c in 0..cin {
-                                for o in 0..FE_C {
-                                    m[(tap * cin + c) * FE_C + o] =
-                                        w[(o * cin + c) * k + j * stride + tap];
+                        up.put([1, taps * cin, FE_C], || {
+                            let w = weights.get(&format!("{p}.conv.weight"), &[FE_C, cin, k])?;
+                            let mut m = vec![0f32; taps * cin * FE_C];
+                            for tap in 0..taps {
+                                for c in 0..cin {
+                                    for o in 0..FE_C {
+                                        m[(tap * cin + c) * FE_C + o] =
+                                            w[(o * cin + c) * k + j * stride + tap];
+                                    }
                                 }
                             }
-                        }
-                        tensor(&m, [1, taps * cin, FE_C], dev)
+                            Ok(m)
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, WeightsError>>()?;
                 Ok(FeConv {
                     blocks,
                     b: t1(&format!("{p}.conv.bias"), FE_C)?,
@@ -235,20 +323,22 @@ impl VulkanModel {
             .collect::<Result<Vec<_>, WeightsError>>()?;
         let cg = D / POS_G;
         let pos_name = "encoder.transformer.pos_conv_embed.conv.weight";
-        let pw = weights.get(pos_name, &[D, cg, POS_K])?;
         let pos_taps = (0..POS_K)
             .map(|k| {
-                let mut m = vec![0f32; POS_G * cg * cg];
-                for g in 0..POS_G {
-                    for c in 0..cg {
-                        for o in 0..cg {
-                            m[(g * cg + c) * cg + o] = pw[((g * cg + o) * cg + c) * POS_K + k];
+                up.put([1, POS_G, cg, cg], || {
+                    let pw = weights.get(pos_name, &[D, cg, POS_K])?;
+                    let mut m = vec![0f32; POS_G * cg * cg];
+                    for g in 0..POS_G {
+                        for c in 0..cg {
+                            for o in 0..cg {
+                                m[(g * cg + c) * cg + o] = pw[((g * cg + o) * cg + c) * POS_K + k];
+                            }
                         }
                     }
-                }
-                tensor(&m, [1, POS_G, cg, cg], dev)
+                    Ok(m)
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, WeightsError>>()?;
         let layers = (0..LAYERS)
             .map(|l| {
                 let p = format!("encoder.transformer.layers.{l}");
@@ -262,15 +352,20 @@ impl VulkanModel {
                 })
             })
             .collect::<Result<Vec<_>, WeightsError>>()?;
+        let fp_ln = ln("encoder.feature_projection.layer_norm", FE_C)?;
+        let fp = linear("encoder.feature_projection.projection", D, FE_C)?;
+        let pos_b = t1("encoder.transformer.pos_conv_embed.conv.bias", D)?;
+        let final_ln = ln("encoder.transformer.layer_norm", D)?;
+        let aux = linear("aux", LOGITS, D)?;
         Ok(Self {
             fe,
-            fp_ln: ln("encoder.feature_projection.layer_norm", FE_C)?,
-            fp: linear("encoder.feature_projection.projection", D, FE_C)?,
+            fp_ln,
+            fp,
             pos_taps,
-            pos_b: t1("encoder.transformer.pos_conv_embed.conv.bias", D)?,
+            pos_b,
             layers,
-            final_ln: ln("encoder.transformer.layer_norm", D)?,
-            aux: linear("aux", LOGITS, D)?,
+            final_ln,
+            aux,
             device,
         })
     }
@@ -423,5 +518,61 @@ mod tests {
         }
         assert_eq!(buckets_up_to(30 * SECOND).len(), 10);
         assert_eq!(buckets_up_to(100 * SECOND).last(), Some(&(128 * SECOND)));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::HostWeights;
+
+    /// B1416, V1386: a second load takes every prepared buffer from the
+    /// host copy without reading or reshaping the weights again. Disarm
+    /// check: with `take_or_make` always calling `make`, the replay counts
+    /// fail.
+    #[test]
+    fn a_reload_takes_each_buffer_kept_from_the_first_load() {
+        let mut host = HostWeights::default();
+        let mut made = 0;
+        for (at, len) in [(0, 2), (1, 3)] {
+            let got = host
+                .take_or_make(at, len, || {
+                    made += 1;
+                    Ok(vec![at as f32; len])
+                })
+                .unwrap()
+                .to_vec();
+            assert_eq!(got, vec![at as f32; len]);
+        }
+        assert_eq!(made, 2);
+        assert_eq!(host.bytes(), 5 * 4);
+        for (at, len) in [(0, 2), (1, 3)] {
+            let got = host
+                .take_or_make(at, len, || {
+                    made += 1;
+                    Ok(Vec::new())
+                })
+                .unwrap()
+                .to_vec();
+            assert_eq!(got, vec![at as f32; len], "kept, not made");
+        }
+        assert_eq!(made, 2, "nothing made again");
+    }
+
+    /// A buffer whose length no longer fits is made afresh, and what was
+    /// kept after it is dropped, so a changed build never uploads a stale
+    /// buffer.
+    #[test]
+    fn a_kept_buffer_of_the_wrong_length_is_made_again() {
+        let mut host = HostWeights::default();
+        host.take_or_make(0, 2, || Ok(vec![1.0; 2])).unwrap();
+        host.take_or_make(1, 2, || Ok(vec![2.0; 2])).unwrap();
+        let got = host
+            .take_or_make(0, 3, || Ok(vec![9.0; 3]))
+            .unwrap()
+            .to_vec();
+        assert_eq!(got, vec![9.0; 3]);
+        assert_eq!(host.bytes(), 3 * 4, "the later buffer went too");
     }
 }
