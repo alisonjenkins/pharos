@@ -1791,14 +1791,23 @@ fn PagedGrid(
         }
     });
     // The tile `SENTINEL_LEAD` from the end may not be in the page to be
-    // seen: the next page loads once it is among the tiles kept.
+    // seen: the next page loads once it is among the tiles kept, counted
+    // among those shown, which a chain thins.
+    let thinned = chain.clone();
     use_effect(move || {
         let kept = window();
         if !windowed || !measured() {
             return;
         }
         let state = pager.read();
-        if state.sentinel().is_some_and(|s| kept.to > s) {
+        let shown = match &thinned {
+            Some(c) => c.shown(state.items()).len(),
+            None => state.items().len(),
+        };
+        let sentinel = state
+            .has_more()
+            .then(|| shown.saturating_sub(SENTINEL_LEAD));
+        if sentinel.is_some_and(|s| kept.to > s) {
             requests.send(Ask::Next(Trigger::Scroll));
         }
     });
