@@ -501,6 +501,28 @@ addEventListener("keydown", (e) => {
 }, true);
 "#;
 
+/// Controls whose arrows no Dioxus handler takes: a poster tile and a
+/// letter of the browse grid's jump rail. Outside a modal dialog, nothing
+/// above them in the page has an `onkeydown` either (B1404).
+pub const PAGE_ONLY_ARROWS: &str = "a.pharos-poster, button.pharos-letter";
+
+/// An arrow on a [`PAGE_ONLY_ARROWS`] control goes to the bridge straight
+/// from the window's capture phase and stops there, so it never reaches the
+/// root listener Dioxus keeps for any `onkeydown` in the page. That
+/// listener answers every key with a synchronous request to Rust, about
+/// 45 ms on the Shield, and a held arrow's repeats queued behind it for
+/// 300-500 ms (B1404, V1374). Window listeners in the capture phase,
+/// registered before this one, still hear the key.
+pub const ARROWS_SKIP_VDOM_JS: &str = r#"
+addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (!e.key.startsWith("Arrow") || !t || !t.matches || !t.matches('__PAGE_ONLY_ARROWS__')) return;
+  if (t.closest("[aria-modal='true']")) return;
+  bridgeKey(e);
+  e.stopPropagation();
+}, true);
+"#;
+
 /// How long OK is held on a tile that plays on a hold before it plays
 /// (B1340, V1311). A pointer's hold waits as long (views.rs).
 pub const TILE_HOLD_MS: u32 = 600;
@@ -582,6 +604,8 @@ pub fn bridge_script(template: &str) -> String {
     template
         .replace("__BAR_KEYS__", BAR_KEY_JS)
         .replace("__TILE_HOLD__", TILE_HOLD_JS)
+        .replace("__ARROWS_SKIP_VDOM__", ARROWS_SKIP_VDOM_JS)
+        .replace("__PAGE_ONLY_ARROWS__", PAGE_ONLY_ARROWS)
         .replace("__TILE_HOLD_MS__", &TILE_HOLD_MS.to_string())
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
         .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
@@ -1423,6 +1447,40 @@ mod tests {
             "{keys}"
         );
         assert!(!keys.contains("__PLAYER_HOME__"), "{keys}");
+    }
+
+    /// B1404, V1374: an arrow on a poster tile or a jump letter reaches the
+    /// bridge from the capture phase and never reaches Dioxus's root
+    /// listener, whose synchronous round trip per key queued held repeats.
+    #[test]
+    fn an_arrow_on_a_tile_skips_the_vdom_round_trip() {
+        let fast = bridge_script("__ARROWS_SKIP_VDOM__");
+        assert!(!fast.contains("__"), "{fast}");
+        assert!(
+            fast.contains(&format!("t.matches('{PAGE_ONLY_ARROWS}')")),
+            "{fast}"
+        );
+        assert!(
+            fast.contains("a.pharos-poster") && fast.contains("button.pharos-letter"),
+            "{fast}"
+        );
+        // Only arrows, and not inside a modal dialog, whose own handlers
+        // (Escape, focus traps) still have to hear its keys.
+        assert!(fast.contains(r#"!e.key.startsWith("Arrow")"#), "{fast}");
+        assert!(
+            fast.contains(r#"t.closest("[aria-modal='true']")"#),
+            "{fast}"
+        );
+        // The bridge hears the key once, before the stop, and in the
+        // capture phase, ahead of the root listener.
+        let (Some(send), Some(stop)) = (
+            fast.find("bridgeKey(e);"),
+            fast.find("e.stopPropagation();"),
+        ) else {
+            panic!("no bridge send or stop: {fast}");
+        };
+        assert!(send < stop, "{fast}");
+        assert!(fast.trim_end().ends_with("}, true);"), "{fast}");
     }
 
     /// B1340, V1311: on the TV, OK on a tile that plays on a hold opens its
