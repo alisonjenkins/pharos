@@ -1637,6 +1637,7 @@ fn PagedGrid(
                     None => (paged.clone(), start, limit, None),
                 };
                 spawn(async move {
+                    let asked = platform::now_ms();
                     let result = fetch_more(
                         &api,
                         call,
@@ -1647,6 +1648,11 @@ fn PagedGrid(
                         platform::report_event,
                     )
                     .await;
+                    platform::info(&format!(
+                        "pharos: grid page start={start} limit={limit} ok={} ms={:.0}",
+                        result.is_ok(),
+                        platform::now_ms() - asked
+                    ));
                     match result {
                         Ok(page) => match chain {
                             Some((c, part)) => {
@@ -1737,6 +1743,7 @@ fn PagedGrid(
     // set back as far below the top as it was (`land`).
     // A kept grid with nowhere to come back to opens at the top, not
     // wherever the page it replaced was scrolled to.
+    let opened = use_hook(platform::now_ms);
     let saved = use_hook(|| {
         let saved = place.as_deref().filter(|_| restore).and_then(read_place);
         if place.is_some() && saved.is_none() {
@@ -1831,6 +1838,14 @@ fn PagedGrid(
         let loaded = u32::try_from(state.items().len()).unwrap_or(u32::MAX);
         if target < loaded {
             let kept = land.take();
+            if kept.is_some() {
+                // How long a grid coming back took to put its place back,
+                // from mounting (B1417).
+                platform::info(&format!(
+                    "pharos: grid restore asked tile={target} loaded={loaded} ms={:.0}",
+                    platform::now_ms() - opened
+                ));
+            }
             let placed = match kept {
                 Some(top) => platform::scroll_tile_to(target, top),
                 None => platform::scroll_to_tile(target),
