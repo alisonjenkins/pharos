@@ -41,6 +41,20 @@ use pharos_client::mix::radio;
 /// Most children one browse page lists.
 pub const BROWSE_PAGE: u32 = 100;
 
+/// Most tiles one step of a library's grid adds. On a TV each tile is
+/// about a dozen elements and a poster load, and a step of 100 blocked the
+/// Shield for 280-470 ms and put ~100 posters in flight at once (B1405), so
+/// a TV steps by 48, a whole number of rows at 4, 6, 8 or 12 across.
+pub const GRID_PAGE: u32 = grid_page(cfg!(target_os = "android"));
+
+const fn grid_page(tv: bool) -> u32 {
+    if tv {
+        48
+    } else {
+        BROWSE_PAGE
+    }
+}
+
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
 const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
@@ -643,7 +657,7 @@ pub async fn load<A: PharosApi>(
         .as_ref()
         .map_or_else(|| BROWSE_TITLE_FALLBACK.to_owned(), |d| d.item.name.clone());
     let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
-    let paged = |more: Listing| async move { api.query(info, &more, 0, BROWSE_PAGE).await };
+    let paged = |more: Listing| async move { api.query(info, &more, 0, GRID_PAGE).await };
     let library = detail
         .as_ref()
         .is_some_and(|d| d.item.kind == ItemKind::Library);
@@ -1595,9 +1609,9 @@ fn PagedGrid(
         async move {
             while let Some(ask) = rx.next().await {
                 let claimed = match ask {
-                    Ask::Next(trigger) => pager.write().begin(trigger).map(|s| (s, BROWSE_PAGE)),
+                    Ask::Next(trigger) => pager.write().begin(trigger).map(|s| (s, GRID_PAGE)),
                     Ask::Through(target) => {
-                        pager.write().begin_through(target, BROWSE_PAGE, JUMP_PAGE)
+                        pager.write().begin_through(target, GRID_PAGE, JUMP_PAGE)
                     }
                 };
                 let Some((start, limit)) = claimed else {
@@ -4456,6 +4470,19 @@ mod tests {
     }
 
     /// FR-210: a failed paging step says why beside its retry.
+    /// B1405, V1375: a TV's grid steps by whole rows of 4, 6, 8 or 12, and by
+    /// fewer tiles than a browser's.
+    #[test]
+    fn a_tv_grid_steps_by_fewer_whole_rows() {
+        let tv = grid_page(true);
+        assert_eq!(tv, 48);
+        assert!(tv < grid_page(false));
+        for across in [4, 6, 8, 12] {
+            assert_eq!(tv % across, 0, "{across} across");
+        }
+        assert_eq!(grid_page(false), BROWSE_PAGE);
+    }
+
     #[test]
     fn a_failed_page_says_why() {
         let html =
