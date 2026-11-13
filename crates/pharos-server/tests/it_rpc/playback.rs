@@ -65,6 +65,7 @@ fn caps(video: &[&str], audio: &[&str], containers: &[&str]) -> Capabilities {
         max_bitrate: 0,
         hdr: true,
         image_subtitles: Vec::new(),
+        copy_surface: false,
     }
 }
 

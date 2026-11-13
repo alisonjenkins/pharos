@@ -572,6 +572,8 @@ pub struct Capabilities {
     pub hdr: bool,
     /// Image subtitle codecs the player draws from the server's PNGs.
     pub image_subtitles: Vec<String>,
+    /// The player takes the H.264 copy surface (spec 041).
+    pub copy_surface: bool,
 }
 
 /// The server's playback decision.
@@ -1843,6 +1845,7 @@ fn set_caps(mut c: capabilities::Builder<'_>, caps: &Capabilities) {
             .init_image_subtitles(len(&caps.image_subtitles)),
         &caps.image_subtitles,
     );
+    c.set_copy_surface(caps.copy_surface);
 }
 
 /// Items per home rail: a screen's width of posters and some to scroll.
