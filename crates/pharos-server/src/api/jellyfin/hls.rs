@@ -107,6 +107,20 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/videos/{id}/h264cmaf/{seg}.m4s",
             web::get().to(h264cmaf_segment),
         )
+        // Spec 041 — the source's own H.264 packets, cut on its keyframes.
+        // Offered only by a master whose client asked with `copy=1`.
+        .route(
+            "/videos/{id}/h264copy/main.m3u8",
+            web::get().to(h264copy_variant),
+        )
+        .route(
+            "/videos/{id}/h264copy/init.mp4",
+            web::get().to(h264copy_init),
+        )
+        .route(
+            "/videos/{id}/h264copy/{seg}.m4s",
+            web::get().to(h264copy_segment),
+        )
         // The `abr=1` ladder's lower rungs (V644): same grid, same audio group,
         // only the encoder's bitrate cap differs.
         .route(
@@ -990,6 +1004,7 @@ fn is_web_client(req: &HttpRequest) -> bool {
 /// muxed + demuxed audio models in one master. The video is audio-free, so its
 /// segment cache is shared across audio tracks — a swap re-spins only the cheap
 /// audio rendition, not the video.
+#[allow(clippy::too_many_arguments)]
 fn push_h264_cmaf_rungs(
     body: &mut String,
     id: &str,
@@ -998,6 +1013,7 @@ fn push_h264_cmaf_rungs(
     abr: bool,
     bitrate_cap: Option<u64>,
     size: MasterSize,
+    copy: Option<&CopyMain>,
 ) {
     // Without `abr=1` the source rung ignores the cap, as it always has: the
     // master must stay byte-identical for hls.js (V644).
@@ -1010,10 +1026,20 @@ fn push_h264_cmaf_rungs(
          AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
     ));
     let resolution = size.main_resolution();
-    body.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
-         /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
-    ));
+    match copy {
+        // Spec 041: the source's own packets take the main rung's place.
+        Some(c) => body.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{cc}\",AUDIO=\"aud\"{resolution}\n\
+             /videos/{id}/h264copy/main.m3u8?{qs}&{COPY_TOKEN_PARAM}={token}\n",
+            bw = c.bandwidth,
+            cc = c.codecs,
+            token = c.token,
+        )),
+        None => body.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
+             /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
+        )),
+    }
     if !abr {
         return;
     }
@@ -1128,6 +1154,12 @@ async fn master_playlist(
         super::output_size::qs_size_limits(req.query_string()),
         bitrate_cap,
     );
+    let copy = match video {
+        MasterVideo::H264 => {
+            copy_main_for(&state, &req, &user.0, &item, demuxed_h264, bitrate_cap).await
+        }
+        MasterVideo::Vp9 => None,
+    };
     match video {
         MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(
             &mut body,
@@ -1137,6 +1169,7 @@ async fn master_playlist(
             qs_abr(req.query_string()),
             bitrate_cap,
             size,
+            copy.as_ref(),
         ),
         MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap, size),
         MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item, size),
@@ -3394,6 +3427,370 @@ async fn h264cmaf_segment_for(
         .body(processed.media))
 }
 
+// ── H.264 copy surface (spec 041, ADR-0123) ─────────────────────────────
+
+/// The `cp=` plan token a copy playlist stamps on its init and segment URLs.
+const COPY_TOKEN_PARAM: &str = "cp";
+
+/// The surface label the session-start and refetch signals carry.
+const COPY_SURFACE: &str = "h264copy";
+
+/// The source a copy request reads, its index, and the plan token the
+/// request must carry. 404 when the gate is off or the source was refused,
+/// 410 when the token names a plan the file no longer has.
+async fn copy_source(
+    state: &AppState,
+    req: &HttpRequest,
+    path: &std::path::Path,
+    want_token: bool,
+) -> Result<
+    (
+        std::sync::Arc<crate::copy_surface::CopySurface>,
+        std::sync::Arc<crate::copy_surface::Indexed>,
+    ),
+    actix_web::Error,
+> {
+    let surface = state
+        .copy_surface
+        .clone()
+        .ok_or_else(|| error::ErrorNotFound("copy surface off"))?;
+    let indexed = surface.index(path).await.map_err(|e| {
+        tracing::warn!(path = %path.display(), reason = e.label(), error = %e, "copy surface: index failed");
+        error::ErrorServiceUnavailable(format!("copy index: {e}"))
+    })?;
+    if matches!(
+        indexed.verdict,
+        pharos_transcode::copy_surface::CopyIndexVerdict::Refused(_)
+    ) {
+        return Err(error::ErrorNotFound("source is not copyable"));
+    }
+    if want_token {
+        let token = super::items::query_param(req.query_string(), COPY_TOKEN_PARAM);
+        if token != Some(indexed.token.as_str()) {
+            tracing::warn!(
+                path = %path.display(),
+                copy.token = %indexed.token,
+                asked = token.unwrap_or("none"),
+                "copy surface: request names a stale plan"
+            );
+            return Err(error::ErrorGone("copy plan changed"));
+        }
+    }
+    Ok((surface, indexed))
+}
+
+fn copyable(
+    indexed: &crate::copy_surface::Indexed,
+) -> Result<&pharos_transcode::copy_surface::CopySource, actix_web::Error> {
+    match &indexed.verdict {
+        pharos_transcode::copy_surface::CopyIndexVerdict::Copyable(s) => Ok(s),
+        pharos_transcode::copy_surface::CopyIndexVerdict::Refused(_) => {
+            Err(error::ErrorNotFound("source is not copyable"))
+        }
+    }
+}
+
+/// Whether the master may offer the copy surface to this session, judged on
+/// the same segment options the encode surface would use, before any index.
+async fn copy_blocker(
+    state: &AppState,
+    req: &HttpRequest,
+    hls: &HlsItem,
+    item: &pharos_core::MediaItem,
+    bitrate_cap: Option<u64>,
+) -> Option<crate::copy_surface::CopyBlocker> {
+    use crate::copy_surface::CopyBlocker;
+    if !hls.parts.is_empty() {
+        return Some(CopyBlocker::SplitParts);
+    }
+    if hls.video_codec.as_deref() != Some("h264") {
+        return Some(CopyBlocker::Codec);
+    }
+    if bitrate_cap.is_some_and(|cap| hls.source_bitrate_bps.map_or(true, |src| cap < src)) {
+        return Some(CopyBlocker::BitrateCap);
+    }
+    let sub = super::items::query_param(req.query_string(), "SubtitleStreamIndex")
+        .and_then(|v| v.parse::<i64>().ok())
+        .and_then(|i| u32::try_from(i).ok());
+    let opts = fmp4_segment_opts(state, req, item, 0, SegmentVideo::H264, None, sub).await;
+    if opts.burn_subtitle_stream_index.is_some() {
+        return Some(CopyBlocker::Burn);
+    }
+    if opts.output_size.is_some() {
+        return Some(CopyBlocker::OutputSize);
+    }
+    if opts.stereo_output != pharos_transcode::options::StereoOutput::Preserve {
+        return Some(CopyBlocker::Stereo);
+    }
+    if opts.tonemap != pharos_transcode::options::Tonemap::Off {
+        return Some(CopyBlocker::Tonemap);
+    }
+    None
+}
+
+/// The copy rung the master lists in place of the h264cmaf main variant.
+struct CopyMain {
+    codecs: String,
+    bandwidth: u64,
+    token: String,
+}
+
+/// Decide, record and log whether this master offers the copy surface.
+async fn copy_main_for(
+    state: &AppState,
+    req: &HttpRequest,
+    user: &pharos_core::User,
+    hls: &HlsItem,
+    demuxed_h264: bool,
+    bitrate_cap: Option<u64>,
+) -> Option<CopyMain> {
+    use crate::copy_surface::{CopyBlocker, CopyDecision, MASTER_INDEX_WAIT};
+    let surface = state.copy_surface.as_ref()?;
+    if super::items::query_param(req.query_string(), "copy") != Some("1") {
+        return None;
+    }
+    let mut main = None;
+    let decision = if !demuxed_h264 {
+        CopyDecision::Blocked(CopyBlocker::NotCmaf)
+    } else {
+        match fetch_req_item(state, req, user, hls.media_id).await {
+            Err(_) => CopyDecision::IndexError("item_lookup"),
+            Ok(item) => match copy_blocker(state, req, hls, &item, bitrate_cap).await {
+                Some(b) => CopyDecision::Blocked(b),
+                None => match surface.index_within(&hls.path, MASTER_INDEX_WAIT).await {
+                    None => CopyDecision::IndexTimeout,
+                    Some(Err(e)) => CopyDecision::IndexError(e.label()),
+                    Some(Ok(indexed)) => match &indexed.verdict {
+                        pharos_transcode::copy_surface::CopyIndexVerdict::Refused(r) => {
+                            CopyDecision::Refused(r.label())
+                        }
+                        pharos_transcode::copy_surface::CopyIndexVerdict::Copyable(s) => {
+                            match pharos_transcode::copy_fmp4::codecs_string(&s.track.avcc) {
+                                Ok(video) => {
+                                    main = Some(CopyMain {
+                                        codecs: format!("{video},opus"),
+                                        bandwidth: hls
+                                            .source_bitrate_bps
+                                            .unwrap_or_else(|| target_video_bitrate(None))
+                                            + 128_000,
+                                        token: indexed.token.clone(),
+                                    });
+                                    CopyDecision::Copy
+                                }
+                                Err(_) => CopyDecision::Refused("not_avcc"),
+                            }
+                        }
+                    },
+                },
+            },
+        }
+    };
+    decision.record();
+    tracing::info!(
+        media.id = hls.media_id,
+        copy.verdict = decision.verdict(),
+        copy.reason = decision.reason(),
+        copy.token = main.as_ref().map_or("none", |m| m.token.as_str()),
+        "copy surface: master decision"
+    );
+    main
+}
+
+/// `GET /videos/{id}/h264copy/main.m3u8` — the copy rung's media playlist:
+/// one segment per plan range, each EXTINF its own length (spec 041).
+async fn h264copy_variant(
+    state: web::Data<AppState>,
+    user: PlaybackUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = path.into_inner();
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
+    let (_, indexed) = copy_source(&state, &req, &item.path, true).await?;
+    let source = copyable(&indexed)?;
+    let qs = format!(
+        "{}&{COPY_TOKEN_PARAM}={}",
+        rendition_qs(&req, &item.path, item.edition.as_deref()),
+        indexed.token
+    );
+    let body = render_copy_playlist(
+        &source.plan,
+        &format!("/videos/{id}/h264copy"),
+        &qs,
+        cache_epoch_for(&state, item.media_id),
+        resume_offset_secs(&req),
+    );
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.apple.mpegurl")
+        .insert_header(playlist_cache_control(false))
+        .body(body))
+}
+
+fn render_copy_playlist(
+    plan: &pharos_core::copy_plan::CopyPlan,
+    base: &str,
+    qs: &str,
+    cache_epoch: u32,
+    start_offset_secs: Option<f64>,
+) -> String {
+    let scale = f64::from(plan.timescale);
+    let mut body = String::with_capacity(256 + plan.segments.len() * 72);
+    body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    body.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    body.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        plan.target_duration_secs()
+    ));
+    let init = with_cache_epoch(&format!("{base}/init.mp4?{qs}"), cache_epoch);
+    body.push_str(&format!("#EXT-X-MAP:URI=\"{init}\"\n"));
+    if let Some(secs) = start_offset_secs {
+        body.push_str(&format!("#EXT-X-START:TIME-OFFSET={secs:.3},PRECISE=YES\n"));
+    }
+    body.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    for (i, seg) in plan.segments.iter().enumerate() {
+        let len = (seg.end - seg.start) as f64 / scale;
+        body.push_str(&format!("#EXTINF:{len:.3},\n"));
+        body.push_str(&with_cache_epoch(
+            &format!("{base}/{i}.m4s?{qs}"),
+            cache_epoch,
+        ));
+        body.push('\n');
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    body
+}
+
+/// `GET /videos/{id}/h264copy/init.mp4` — `ftyp` + `moov` built from the
+/// source's own `avcC`.
+async fn h264copy_init(
+    state: web::Data<AppState>,
+    user: PlaybackUser,
+    req: HttpRequest,
+    path: web::Path<String>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::CopyInit,
+        None,
+    )
+    .await?;
+    let (_, indexed) = copy_source(&state, &req, &item.path, true).await?;
+    let source = copyable(&indexed)?;
+    let init = pharos_transcode::copy_fmp4::init_segment(&source.track)
+        .map_err(|e| error::ErrorInternalServerError(format!("copy init: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((
+            actix_web::http::header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        ))
+        .body(init))
+}
+
+/// `GET /videos/{id}/h264copy/{seg}.m4s` — plan range `seg` of the source's
+/// video, packets unchanged. Never encodes, so it starts no prefetch either.
+async fn h264copy_segment(
+    state: web::Data<AppState>,
+    user: PlaybackUser,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, seg) = path.into_inner();
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    state.note_playback_activity();
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
+    check_session(
+        &state,
+        q.play_session_id.as_deref(),
+        GoneRoute::CopySegment,
+        Some(seg),
+    )
+    .await?;
+    let (surface, indexed) = copy_source(&state, &req, &item.path, true).await?;
+    let source = copyable(&indexed)?;
+    let segments = &source.plan.segments;
+    let Some(range) = segments.get(seg as usize).copied() else {
+        return Err(error::ErrorNotFound("segment index past end of plan"));
+    };
+    let start_secs = range.start as f64 / f64::from(source.plan.timescale);
+    crate::session_start::note_session_start(
+        &state.session_starts,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        u32::try_from(segments.len()).ok(),
+        start_secs,
+        COPY_SURFACE,
+    );
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        seg,
+        COPY_SURFACE,
+    );
+    let last = seg as usize + 1 == segments.len();
+    let started = std::time::Instant::now();
+    match surface.segment(&item.path, seg, range, last).await {
+        Ok((bytes, report)) => {
+            let elapsed = started.elapsed();
+            crate::copy_surface::record_segment("served", "ok", elapsed);
+            tracing::info!(
+                media.id = id_num,
+                seg,
+                packets = report.packets,
+                bytes = report.bytes,
+                read_ms = elapsed.as_millis() as u64,
+                copy.token = %indexed.token,
+                "copy surface: segment served"
+            );
+            Ok(HttpResponse::Ok()
+                .content_type(Container::Fmp4.content_type())
+                .insert_header((
+                    actix_web::http::header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable",
+                ))
+                .body(bytes))
+        }
+        Err(e) => {
+            let elapsed = started.elapsed();
+            crate::copy_surface::record_segment("failed", e.label(), elapsed);
+            tracing::warn!(
+                media.id = id_num,
+                seg,
+                reason = e.label(),
+                error = %e,
+                read_ms = elapsed.as_millis() as u64,
+                copy.token = %indexed.token,
+                "copy surface: segment failed"
+            );
+            // A segment the worker read and refused breaks the copy rule for
+            // this file: later playbacks get the encode surface.
+            if let crate::copy_surface::CopyError::Source(detail) = &e {
+                surface
+                    .refuse(
+                        &item.path,
+                        pharos_transcode::copy_surface::CopyRefusal::Segment {
+                            seg: seg as usize,
+                            detail: detail.clone(),
+                        },
+                    )
+                    .await;
+            }
+            Err(error::ErrorInternalServerError(format!(
+                "copy seg {seg}: {e}"
+            )))
+        }
+    }
+}
+
 /// Cap on the hardware-encode prefetch depth (~36 s of content at 6 s
 /// segments). Deep enough that a rebuffer / >1× catch-up lands in cache, but
 /// bounded so one viewer's speculative warm never monopolises the GPU: at
@@ -3972,7 +4369,63 @@ pub(crate) fn prewarm_negotiated(state: &web::Data<AppState>, p: NegotiatedPrewa
         // The edition this response negotiated, or the prewarm reloads the
         // item's own file and warms segments under the primary's key.
         p.media_source_id,
+        super::items::query_param(url, "copy") == Some("1"),
     );
+}
+
+/// Whether a prewarm may stand down because playback will start on the copy
+/// surface (spec 041 FR-007). Only when nothing the master checks could send
+/// this session to the encode surface; the index it awaits is the one the
+/// master would otherwise wait on, so a skip also takes that off the critical
+/// path. `None` means prewarm as usual.
+async fn copy_prewarm_skip(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    subtitle_stream_index: Option<u32>,
+    video_bitrate_cap: Option<u64>,
+    size_limits: pharos_transcode::SizeLimits,
+    session_burn: &std::collections::BTreeSet<u32>,
+) -> Option<String> {
+    let surface = state.copy_surface.as_ref()?;
+    let plain = video_bitrate_cap.is_none()
+        && size_limits == pharos_transcode::SizeLimits::default()
+        && item.probe.parts().is_empty()
+        && item.probe.video_codec.as_deref() == Some("h264");
+    if !plain {
+        return None;
+    }
+    // The same opts `copy_blocker` reads: a 3D or HDR source, or a burned
+    // subtitle, sends the master to the encode surface, which then wants
+    // warming. A subtitle the client renders itself does not.
+    let opts = fmp4_segment_opts_resolved(
+        item,
+        0,
+        SegmentVideo::H264,
+        subtitle_stream_index,
+        None,
+        Some(session_burn.clone()),
+    );
+    if opts.burn_subtitle_stream_index.is_some()
+        || opts.output_size.is_some()
+        || opts.stereo_output != pharos_transcode::options::StereoOutput::Preserve
+        || opts.tonemap != pharos_transcode::options::Tonemap::Off
+    {
+        return None;
+    }
+    // The master stops waiting for the index after the same budget and serves
+    // the encode surface, so a slower index must not cancel the warm-up.
+    match surface
+        .index_within(&item.path, crate::copy_surface::MASTER_INDEX_WAIT)
+        .await
+    {
+        Some(Ok(indexed)) => match indexed.verdict {
+            pharos_transcode::copy_surface::CopyIndexVerdict::Copyable(_) => {
+                Some(indexed.token.clone())
+            }
+            pharos_transcode::copy_surface::CopyIndexVerdict::Refused(_) => None,
+        },
+        Some(Err(_)) | None => None,
+    }
 }
 
 /// Cold-start prewarm: transcode the first [`COLD_START_PREWARM_SEGS`] h264/
@@ -4000,6 +4453,7 @@ fn prewarm_cold_start(
     resume_ticks: u64,
     demuxed_cmaf: bool,
     media_source_id: Option<String>,
+    copy_requested: bool,
 ) {
     if state.hls.is_none() {
         tracing::info!(
@@ -4034,6 +4488,27 @@ fn prewarm_cold_start(
                 return;
             }
         };
+        if copy_requested && demuxed_cmaf {
+            if let Some(token) = copy_prewarm_skip(
+                &state,
+                &item,
+                subtitle_stream_index,
+                video_bitrate_cap,
+                size_limits,
+                &session.burn_subtitle_indices,
+            )
+            .await
+            {
+                tracing::info!(
+                    media.id = media_id,
+                    prewarm.route = route.label(),
+                    prewarm.skip_reason = "copy_surface",
+                    copy.token = %token,
+                    "cold-start prewarm: skipped"
+                );
+                return;
+            }
+        }
         let total_segs = item
             .probe
             .duration_ms
@@ -4500,6 +4975,8 @@ enum GoneRoute {
     Vp9Segment,
     CmafInit,
     CmafSegment,
+    CopyInit,
+    CopySegment,
 }
 
 impl GoneRoute {
@@ -4510,6 +4987,8 @@ impl GoneRoute {
             Self::Vp9Segment => "vp9_segment",
             Self::CmafInit => "cmaf_init",
             Self::CmafSegment => "cmaf_segment",
+            Self::CopyInit => "copy_init",
+            Self::CopySegment => "copy_segment",
         }
     }
 }
@@ -5233,6 +5712,11 @@ mod tests {
     }
 
     async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>, String) {
+        let (state, token) = seed_state(probe).await;
+        (web::Data::new(state), token)
+    }
+
+    async fn seed_state(probe: pharos_core::MediaProbe) -> (AppState, String) {
         let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let auth = BuiltinAuth::new(stores.clone());
         let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -5270,7 +5754,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let state = web::Data::new(AppState::new(stores, "t".into()));
+        let state = AppState::new(stores, "t".into());
         (state, token.0.expose().to_string())
     }
 
@@ -5503,6 +5987,147 @@ mod tests {
         assert_eq!(redact(browser_master(8_000_000, "&abr=0").await), golden);
         let capped = redact(browser_master(8_000_000, "&VideoBitrate=2000000").await);
         assert_eq!(capped.replace("&VideoBitrate=2000000", ""), golden);
+        // V1435 — a copy opt-in on a server without the copy surface changes
+        // nothing, and `copy` never rides into the rung URLs.
+        assert_eq!(redact(browser_master(8_000_000, "&copy=1").await), golden);
+    }
+
+    /// The browser master with the copy surface on, and every decision it
+    /// counted as `(verdict, reason, count)`.
+    async fn copy_master(
+        probe: pharos_core::MediaProbe,
+        extra: &str,
+    ) -> (String, Vec<(String, String, u64)>) {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (mut state, token) = seed_state(probe).await;
+        // Never spawned: a blocked decision is made before any index.
+        let pool = pharos_transcode::worker::LibavWorkerPool::new("/nonexistent-worker", 1);
+        state.copy_surface = Some(std::sync::Arc::new(
+            crate::copy_surface::CopySurface::new(pool, &std::env::temp_dir())
+                .expect("copy scratch dir"),
+        ));
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(register),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri(&format!(
+                "/videos/9/master.m3u8?api_key={token}&renditions=h264{extra}"
+            ))
+            .insert_header((
+                actix_web::http::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Firefox/152.0",
+            ))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_copy_surface_decision_total")
+            .map(|(k, _, _, v)| {
+                let label = |name: &str| {
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == name)
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default()
+                };
+                let n = match v {
+                    DebugValue::Counter(n) => n,
+                    other => panic!("not a counter: {other:?}"),
+                };
+                (label("verdict"), label("reason"), n)
+            })
+            .collect();
+        (String::from_utf8(body.to_vec()).unwrap(), counted)
+    }
+
+    fn h264_probe() -> pharos_core::MediaProbe {
+        pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(8_000_000),
+            video_codec: Some("h264".into()),
+            ..Default::default()
+        }
+    }
+
+    // Spec 041 — a copy request the source cannot take keeps the encode
+    // master, and the decision is counted with its reason.
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn a_copy_request_on_a_non_h264_source_keeps_the_cmaf_master() {
+        let probe = pharos_core::MediaProbe {
+            video_codec: Some("hevc".into()),
+            ..h264_probe()
+        };
+        let (s, counted) = copy_master(probe, "&copy=1").await;
+        assert_eq!(
+            stream_inf_uris(&s),
+            vec!["/videos/9/h264cmaf/main.m3u8"],
+            "{s}"
+        );
+        assert_eq!(counted, vec![("encode".into(), "codec".into(), 1)]);
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn a_bitrate_capped_copy_request_is_blocked_on_the_cap() {
+        let (s, counted) = copy_master(h264_probe(), "&copy=1&VideoBitrate=2000000").await;
+        assert!(!s.contains("h264copy"), "{s}");
+        assert_eq!(counted, vec![("encode".into(), "bitrate_cap".into(), 1)]);
+    }
+
+    // Disarm check for the two above: without the opt-in nothing is decided,
+    // so nothing is counted.
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn a_master_without_the_copy_opt_in_counts_no_decision() {
+        let (s, counted) = copy_master(h264_probe(), "").await;
+        assert!(!s.contains("h264copy"), "{s}");
+        assert!(counted.is_empty(), "{counted:?}");
+    }
+
+    // Spec 041 — one segment per plan range, each EXTINF its own length, the
+    // target duration the longest rounded up, the plan token on every URL.
+    #[::core::prelude::v1::test]
+    fn copy_playlist_lists_each_plan_range_at_its_own_length() {
+        use pharos_core::copy_plan::{CopyPlan, CopySegment};
+        let seg = |start, end| CopySegment { start, end };
+        let plan = CopyPlan {
+            timescale: 1000,
+            segments: vec![seg(0, 7120), seg(7120, 14000), seg(14000, 18040)],
+        };
+        let body = render_copy_playlist(&plan, "/videos/9/h264copy", "api_key=T&cp=abc", 0, None);
+        let extinf: Vec<&str> = body.lines().filter(|l| l.starts_with("#EXTINF:")).collect();
+        assert_eq!(
+            extinf,
+            vec!["#EXTINF:7.120,", "#EXTINF:6.880,", "#EXTINF:4.040,"]
+        );
+        assert!(body.contains("#EXT-X-TARGETDURATION:8\n"), "{body}");
+        assert!(body.contains("#EXT-X-VERSION:7\n"), "{body}");
+        assert!(body.ends_with("#EXT-X-ENDLIST\n"), "{body}");
+        assert!(
+            body.contains("#EXT-X-MAP:URI=\"/videos/9/h264copy/init.mp4?api_key=T&cp=abc"),
+            "{body}"
+        );
+        assert!(!body.contains("#EXT-X-START"), "{body}");
+        let uris: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(uris.len(), 3, "{body}");
+        for (i, uri) in uris.iter().enumerate() {
+            assert!(
+                uri.starts_with(&format!("/videos/9/h264copy/{i}.m4s?")),
+                "{uri}"
+            );
+            assert!(uri.contains("cp=abc"), "{uri}");
+        }
     }
 
     // V645's server half — the ladder never lists a rung above the URL ceiling,
@@ -7160,6 +7785,7 @@ mod prewarm_edition_tests {
             0,
             true,
             None,
+            false,
         );
         let want = COLD_START_PREWARM_SEGS as usize;
         let warmed_names = warmed(&root, want).await;
@@ -7249,6 +7875,7 @@ mod prewarm_edition_tests {
                 "{}-{EDITION}",
                 pharos_jellyfin_api::dto::wire_item_id(7)
             )),
+            false,
         );
 
         let gen = format!(
