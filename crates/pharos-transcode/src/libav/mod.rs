@@ -14,6 +14,8 @@ pub mod attachment;
 #[cfg(feature = "backend-lib")]
 pub mod audio_features;
 #[cfg(feature = "backend-lib")]
+pub mod copy_segment;
+#[cfg(feature = "backend-lib")]
 pub mod fingerprint;
 #[cfg(feature = "backend-lib")]
 pub mod frames;

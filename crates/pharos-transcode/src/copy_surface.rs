@@ -46,6 +46,14 @@ pub enum CopyRefusal {
     NoIndex,
     #[error("unknown duration")]
     NoDuration,
+    #[error(
+        "first video packet (pts {pts}, keyframe {keyframe}) is not the first indexed keyframe at {first_keyframe}"
+    )]
+    LeadingPackets {
+        pts: i64,
+        keyframe: bool,
+        first_keyframe: i64,
+    },
     #[error("plan: {0}")]
     Plan(PlanRefusal),
     #[error("segment {seg}: {detail}")]
@@ -66,6 +74,7 @@ impl CopyRefusal {
             Self::TimeBase { .. } => "time_base",
             Self::NoIndex => "no_index",
             Self::NoDuration => "no_duration",
+            Self::LeadingPackets { .. } => "leading_packets",
             Self::Plan(_) => "plan",
             Self::Segment { .. } => "segment",
         }
@@ -106,6 +115,11 @@ mod tests {
             CopyRefusal::TimeBase { num: 0, den: 0 },
             CopyRefusal::NoIndex,
             CopyRefusal::NoDuration,
+            CopyRefusal::LeadingPackets {
+                pts: 0,
+                keyframe: false,
+                first_keyframe: 0,
+            },
             CopyRefusal::Plan(PlanRefusal::NoKeyframes),
             CopyRefusal::Segment {
                 seg: 0,

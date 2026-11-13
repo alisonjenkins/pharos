@@ -345,6 +345,8 @@ impl Worker for ProcWorker {
                         | WorkerEvent::WaveformResult { .. }
                         | WorkerEvent::AudioFeaturesResult { .. }
                         | WorkerEvent::PictureCheckResult { .. }
+                        | WorkerEvent::CopyIndexResult { .. }
+                        | WorkerEvent::CopySegmentResult { .. }
                         | WorkerEvent::SubtitleWindowsResult { .. }
                         | WorkerEvent::IntegrityResult { .. }
                         | WorkerEvent::FingerprintResult { .. }

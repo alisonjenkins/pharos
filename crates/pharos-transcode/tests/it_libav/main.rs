@@ -5,6 +5,7 @@
 mod dvd_subtitle;
 
 mod libav_audio_features;
+mod libav_copy_segment;
 mod libav_frames;
 mod libav_integrity;
 mod libav_pool;
