@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod client_ids;
+pub mod copy_plan;
 pub mod ensemble;
 pub mod fuzzy;
 pub mod language;
