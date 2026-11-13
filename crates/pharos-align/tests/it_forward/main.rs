@@ -195,6 +195,45 @@ fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
         .is_empty());
 }
 
+/// B1416, V1386: a model rebuilt from the kept host weights gives exactly the
+/// logits of one built from the file, and the rebuild is timed against it.
+#[cfg(feature = "vulkan")]
+#[test]
+#[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run with --release --features vulkan"]
+fn a_reload_from_kept_host_weights_gives_the_same_logits() {
+    use pharos_align::device::{self, Device, DeviceMode};
+    use pharos_align::forward::vulkan::{HostWeights, VulkanModel};
+    let choice = match device::choose(DeviceMode::Vulkan, &device::probe()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIPPED: {e}");
+            return;
+        }
+    };
+    let Device::Vulkan(adapter) = choice.device else {
+        panic!("DeviceMode::Vulkan chose {:?}", choice.device);
+    };
+    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
+    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
+    let mut host = HostWeights::default();
+    let t = std::time::Instant::now();
+    let first =
+        VulkanModel::load_keeping(&weights, device::burn_device(&adapter), &mut host).unwrap();
+    let from_file = t.elapsed();
+    let w = normalise(&wave(16_000 * 4, 3));
+    let want = first.logits(&w).unwrap();
+    drop(first);
+    let t = std::time::Instant::now();
+    let again =
+        VulkanModel::load_keeping(&weights, device::burn_device(&adapter), &mut host).unwrap();
+    let from_host = t.elapsed();
+    eprintln!(
+        "load from file {from_file:?}, from host {from_host:?}, host {} MiB",
+        host.bytes() >> 20
+    );
+    assert_eq!(again.logits(&w).unwrap(), want);
+}
+
 /// GPU pool a song may hold at its peak (B1352, V1323).
 #[cfg(feature = "vulkan")]
 const MAX_GPU_POOL_BYTES: u64 = 4 << 30;
