@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 44;
+const schemaVersion :UInt32 = 45;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -425,7 +425,8 @@ interface UserData {
 struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 
 # ---- playback -------------------------------------------------------------
-struct Capabilities { videoCodecs @0 :List(Text); audioCodecs @1 :List(Text); containers @2 :List(Text); maxBitrate @3 :UInt64; hdr @4 :Bool; imageSubtitles @5 :List(Text); }
+# `copySurface`: the player takes the H.264 copy surface (spec 041), so a transcode's stream URL may ask for it with `copy=1`. Since schemaVersion 45.
+struct Capabilities { videoCodecs @0 :List(Text); audioCodecs @1 :List(Text); containers @2 :List(Text); maxBitrate @3 :UInt64; hdr @4 :Bool; imageSubtitles @5 :List(Text); copySurface @6 :Bool; }
 struct Decision {
   method @0 :Text;             # direct_play | audio_remux | video_remux | transcode (pharos_playback_decision_total's decision)
   directPlayBlock @1 :Text;    # same label values as pharos_playback_decision_total

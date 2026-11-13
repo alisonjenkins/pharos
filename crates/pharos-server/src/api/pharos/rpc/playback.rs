@@ -576,6 +576,7 @@ fn read_capabilities(
         } else {
             Vec::new()
         },
+        copy_surface: caps.get_copy_surface(),
     })
 }
 

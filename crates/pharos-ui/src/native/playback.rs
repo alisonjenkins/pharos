@@ -1099,6 +1099,7 @@ pub fn capabilities(
         max_bitrate: 0,
         hdr: false,
         image_subtitles: IMAGE_SUBTITLES.iter().map(|c| (*c).to_owned()).collect(),
+        copy_surface: false,
     }
 }
 
