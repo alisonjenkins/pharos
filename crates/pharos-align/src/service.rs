@@ -82,6 +82,13 @@ pub trait Model: Send {
         lead_star: bool,
     ) -> Result<LineSpans, ModelError>;
 
+    /// One window's log-probabilities, `[frames x tokens::CLASSES]` with
+    /// the star column, for a pass that runs its own CTC over several
+    /// lines (B1402); `None` from a model that cannot give them.
+    fn emission(&mut self, _pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        Ok(None)
+    }
+
     /// Called before each song's first window.
     fn begin_song(&mut self) {}
 
