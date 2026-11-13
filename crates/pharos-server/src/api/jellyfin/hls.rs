@@ -4637,87 +4637,126 @@ fn prewarm_cold_start(
             }
         };
         let session_cap = decision_video_cap(&session.decision);
-        for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
-            let state = state.clone();
-            let item = item.clone();
-            let session = session.clone();
-            let source = source.clone();
-            actix_web::rt::spawn(async move {
-                let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                // B139 — warm the rendition THIS client will actually fetch. A
-                // browser on h264 is served the demuxed all-fMP4 master and
-                // never requests an mpegts segment, so warming one spent three
-                // background encodes on bytes nobody would read AND left the
-                // cold ffmpeg spawn sitting on the first request the prewarm
-                // exists to cover — the same inversion as B136, by container
-                // rather than by position.
-                let mut opts = if demuxed_cmaf {
-                    // Through the SAME function the CMAF route uses (V92): a
-                    // key derived independently drifts from the key requested,
-                    // and both paths just produce segments, so the drift is
-                    // invisible.
-                    fmp4_segment_opts_resolved(
-                        &item,
-                        seg,
-                        SegmentVideo::H264,
-                        subtitle_stream_index,
-                        video_bitrate_cap,
-                        Some(session.burn_subtitle_indices.clone()),
-                    )
-                } else {
-                    let mut opts = build_segment_opts(
-                        Some(session),
-                        &item,
-                        seg,
-                        audio_stream_index,
-                        subtitle_stream_index,
-                    );
-                    // Mirror serve_segment's URL-carried VideoBitrate cap +
-                    // clamp so the prewarmed key matches the client's eventual
-                    // request. The CMAF arm needs no equivalent: its cap is
-                    // folded in by `fmp4_segment_opts_resolved` itself.
-                    if let (Some(cap), Some(cur)) = (video_bitrate_cap, opts.video_bitrate_bps) {
-                        opts.video_bitrate_bps =
-                            Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+        // B1373 — one at a time, base first. Run together, the three encodes
+        // shared the GPU and the base segment the client waits on took ~3.5 s
+        // instead of ~1.1 s alone.
+        warm_in_order(
+            base..(base + COLD_START_PREWARM_SEGS).min(total_segs),
+            |seg| {
+                let state = state.clone();
+                let item = item.clone();
+                let session = session.clone();
+                let source = source.clone();
+                async move {
+                    let started = std::time::Instant::now();
+                    let (start_secs, dur_secs) =
+                        segment_time_range(seg, item.probe.frame_rate_mille);
+                    // B139 — warm the rendition THIS client will actually fetch. A
+                    // browser on h264 is served the demuxed all-fMP4 master and
+                    // never requests an mpegts segment, so warming one spent three
+                    // background encodes on bytes nobody would read AND left the
+                    // cold ffmpeg spawn sitting on the first request the prewarm
+                    // exists to cover — the same inversion as B136, by container
+                    // rather than by position.
+                    let mut opts = if demuxed_cmaf {
+                        // Through the SAME function the CMAF route uses (V92): a
+                        // key derived independently drifts from the key requested,
+                        // and both paths just produce segments, so the drift is
+                        // invisible.
+                        fmp4_segment_opts_resolved(
+                            &item,
+                            seg,
+                            SegmentVideo::H264,
+                            subtitle_stream_index,
+                            video_bitrate_cap,
+                            Some(session.burn_subtitle_indices.clone()),
+                        )
+                    } else {
+                        let mut opts = build_segment_opts(
+                            Some(session),
+                            &item,
+                            seg,
+                            audio_stream_index,
+                            subtitle_stream_index,
+                        );
+                        // Mirror serve_segment's URL-carried VideoBitrate cap +
+                        // clamp so the prewarmed key matches the client's eventual
+                        // request. The CMAF arm needs no equivalent: its cap is
+                        // folded in by `fmp4_segment_opts_resolved` itself.
+                        if let (Some(cap), Some(cur)) = (video_bitrate_cap, opts.video_bitrate_bps)
+                        {
+                            opts.video_bitrate_bps =
+                                Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+                        }
+                        opts
+                    };
+                    // serve_segment's downscale, planned by the same function from
+                    // the same inputs: the URL's MaxWidth/MaxHeight and the session
+                    // and URL bitrate caps.
+                    let (limits, capped) =
+                        output_size_bounds(size_limits, session_cap, video_bitrate_cap, None);
+                    apply_output_size(&mut opts, &item.probe, limits, capped);
+                    // Same per-segment burn gating serve_segment applies before the
+                    // cache read (the burn index is part of the key).
+                    gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
+                    resolve_text_burn_assets(&state, &item, &mut opts).await;
+                    let Some(cache) = state.hls.as_ref() else {
+                        return;
+                    };
+                    let result = cache
+                        .segment_bytes_keyed(
+                            item.id,
+                            seg,
+                            opts.audio_source_stream_index,
+                            opts.burn_subtitle_stream_index,
+                            &source,
+                            item.edition.as_deref(),
+                            &opts,
+                            JobClass::Background,
+                            stream,
+                            // This is the one caller that KNOWS where this stream
+                            // begins: `base` came from the resume position, and no
+                            // interactive request has touched the stream yet.
+                            PlayheadSeed::StatesTheStart,
+                        )
+                        .await;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    match result {
+                        Ok(_) => tracing::info!(
+                            media.id = item.id,
+                            prewarm.route = route.label(),
+                            seg,
+                            prewarm.base = base,
+                            elapsed_ms,
+                            "cold-start prewarm: segment ready"
+                        ),
+                        Err(e) => tracing::info!(
+                            media.id = item.id,
+                            prewarm.route = route.label(),
+                            seg,
+                            prewarm.base = base,
+                            elapsed_ms,
+                            error = %e,
+                            "cold-start prewarm: segment failed"
+                        ),
                     }
-                    opts
-                };
-                // serve_segment's downscale, planned by the same function from
-                // the same inputs: the URL's MaxWidth/MaxHeight and the session
-                // and URL bitrate caps.
-                let (limits, capped) =
-                    output_size_bounds(size_limits, session_cap, video_bitrate_cap, None);
-                apply_output_size(&mut opts, &item.probe, limits, capped);
-                // Same per-segment burn gating serve_segment applies before the
-                // cache read (the burn index is part of the key).
-                gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
-                resolve_text_burn_assets(&state, &item, &mut opts).await;
-                let Some(cache) = state.hls.as_ref() else {
-                    return;
-                };
-                if let Err(e) = cache
-                    .segment_bytes_keyed(
-                        item.id,
-                        seg,
-                        opts.audio_source_stream_index,
-                        opts.burn_subtitle_stream_index,
-                        &source,
-                        item.edition.as_deref(),
-                        &opts,
-                        JobClass::Background,
-                        stream,
-                        // This is the one caller that KNOWS where this stream
-                        // begins: `base` came from the resume position, and no
-                        // interactive request has touched the stream yet.
-                        PlayheadSeed::StatesTheStart,
-                    )
-                    .await
-                {
-                    tracing::debug!(media.id = item.id, seg, error = %e, "cold-start prewarm failed");
                 }
-            });
-        }
+            },
+        )
+        .await;
     });
+}
+
+/// Warm `segs` one after another in order, so the first (the segment playback
+/// starts on) never shares the encoder with the ones behind it.
+async fn warm_in_order<F, Fut>(segs: std::ops::Range<u32>, mut warm: F)
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for seg in segs {
+        warm(seg).await;
+    }
 }
 
 /// How far ahead (in segments) the window-aware burn prefetch looks for the
@@ -7974,6 +8013,34 @@ mod prewarm_edition_tests {
             warmed(&root, want + 1).await.len(),
             want,
             "the request read a prewarmed file instead of encoding its own"
+        );
+    }
+
+    /// B1373 / V1343 — the base segment encodes alone, and the rest follow it
+    /// in order, never alongside it.
+    #[actix_web::test]
+    async fn cold_start_warms_one_segment_at_a_time_base_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        warm_in_order(180..183, |seg| {
+            let (in_flight, peak, order) = (in_flight.clone(), peak.clone(), order.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                order.lock().unwrap().push(seg);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "warms never overlap");
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![180, 181, 182],
+            "base first, then in order"
         );
     }
 
