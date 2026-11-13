@@ -165,6 +165,8 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::Fingerprint { .. } => "fingerprint",
         TinyOp::FingerprintMulti { .. } => "fingerprint_multi",
         TinyOp::SubtitleSignals { .. } => "subtitle_signals",
+        TinyOp::CopyIndex { .. } => "copy_index",
+        TinyOp::CopySegment { .. } => "copy_segment",
         _ => "other",
     }
 }
@@ -190,6 +192,8 @@ fn is_heavy_op(op: &TinyOp) -> bool {
             | TinyOp::SubtitleSignals { .. }
             // Seven seeks and keyframe decodes, each a cold read on NFS.
             | TinyOp::PictureCheck { .. }
+            // A seek-index read plus three segments' packets, cold on NFS.
+            | TinyOp::CopyIndex { .. }
     )
 }
 
@@ -507,6 +511,47 @@ impl LibavWorkerPool {
             .await?;
         match ev {
             WorkerEvent::PictureCheckResult { analysis, .. } => Ok(analysis),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Index `input` for the H.264 copy surface: its segment plan, or why it
+    /// cannot be copied (spec 041).
+    pub async fn copy_index(
+        &self,
+        input: impl Into<PathBuf>,
+    ) -> Result<crate::copy_surface::CopyIndexVerdict, PoolError> {
+        let ev = self
+            .run(TinyOp::CopyIndex {
+                input: input.into(),
+            })
+            .await?;
+        match ev {
+            WorkerEvent::CopyIndexResult { verdict, .. } => Ok(verdict),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Write planned copy segment `index` of `input` to `out` (spec 041).
+    pub async fn copy_segment(
+        &self,
+        input: impl Into<PathBuf>,
+        index: u32,
+        segment: pharos_core::copy_plan::CopySegment,
+        last: bool,
+        out: impl Into<PathBuf>,
+    ) -> Result<crate::copy_surface::CopySegmentReport, PoolError> {
+        let ev = self
+            .run(TinyOp::CopySegment {
+                input: input.into(),
+                index,
+                segment,
+                last,
+                out: out.into(),
+            })
+            .await?;
+        match ev {
+            WorkerEvent::CopySegmentResult { report, .. } => Ok(report),
             other => Err(unexpected(other)),
         }
     }
@@ -871,6 +916,8 @@ impl LibavWorkerPool {
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::AudioFeaturesResult { job_id: j, .. }
                 | WorkerEvent::PictureCheckResult { job_id: j, .. }
+                | WorkerEvent::CopyIndexResult { job_id: j, .. }
+                | WorkerEvent::CopySegmentResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
