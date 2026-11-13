@@ -3590,6 +3590,9 @@ async fn copy_main_for(
         media.id = hls.media_id,
         copy.verdict = decision.verdict(),
         copy.reason = decision.reason(),
+        copy.video_codec = hls.video_codec.as_deref().unwrap_or("unknown"),
+        copy.source_bitrate_bps = hls.source_bitrate_bps,
+        copy.bitrate_cap = bitrate_cap,
         copy.token = main.as_ref().map_or("none", |m| m.token.as_str()),
         "copy surface: master decision"
     );
