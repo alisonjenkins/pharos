@@ -91,6 +91,11 @@ config:
     # not mint. Turn on once pharos_image_tag_check_total{verdict=~"invalid|absent"}
     # has gone quiet; until then the verdict is only counted.
     imageTagsEnforced: false
+    # Spec 041 / ADR-0123: serve an eligible H.264 source's video unchanged
+    # on the h264copy surface to a client that asks for it. Watch
+    # pharos_copy_surface_decision_total and pharos_copy_segment_total once on.
+    # An image older than the copy surface ignores the key.
+    hlsCopySurface: false
     # Soft cap (bytes) on the extracted-image cache; 0 = unbounded. A periodic
     # janitor evicts oldest-first once exceeded. Set it on large libraries so
     # posters/backdrops/thumbs can't slowly fill the shared cache volume.
