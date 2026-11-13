@@ -2338,7 +2338,7 @@ addEventListener("keydown", (e) => {
   if (to) to.focus({ preventScroll: true });
   if (to && to !== player && to.closest(".pharos-control-menus")) to.scrollIntoView({ block: "nearest" });
 }, true);
-addEventListener("keydown", (e) => {
+const bridgeKey = (e) => {
   // An arrow the focused field does not keep leaves it: it is no longer
   // a key "in the field", so the D-pad moves on (FR-606).
   const field = inText(e.target) || isRange(e.target);
@@ -2359,7 +2359,9 @@ addEventListener("keydown", (e) => {
     on_button: !!(at && at.matches && at.matches("a[href], button")),
     field,
   });
-});
+};
+addEventListener("keydown", bridgeKey);
+__ARROWS_SKIP_VDOM__
 // The WebView takes the remote's Back only while it has a page to go back
 // to; at the first one Android leaves the app, over an open player too. A
 // guard entry under the first page keeps one there, and Rust decides what
