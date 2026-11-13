@@ -79,9 +79,20 @@ pub const FADE_MS: u32 = 350;
 /// player that has stalled or failed.
 pub const GIVE_UP_MS: u32 = 30_000;
 /// No caption for a load that is quick anyway.
-const CAPTION_AFTER_MS: u32 = 2_500;
+pub const CAPTION_AFTER_MS: u32 = 2_500;
 /// No step for this long reads as a stall.
-const STALLED_AFTER_MS: u32 = 6_000;
+pub const STALLED_AFTER_MS: u32 = 6_000;
+/// The old episode's still is drawn no wider than this: enough for a face
+/// that is turning away, cheap to draw from a 4K frame on a TV.
+pub const SNAPSHOT_MAX_WIDTH: u32 = 640;
+/// How often the caption and the give-up deadline are looked at.
+pub const TICK_MS: i32 = 250;
+/// Quick off the press, so it answers at once, then easing into flat.
+pub const TURN_EASE: &str = "cubic-bezier(.2,.7,.2,1)";
+pub const FADE_EASE: &str = "cubic-bezier(.4,0,.2,1)";
+/// The `<html>` attribute that hides the player's own spinner (and the
+/// first load's status) while the layer shows the load.
+pub const TURNING_ATTR: &str = "data-turning";
 
 const NEGOTIATED_DONE: f64 = 0.35;
 const METADATA_DONE: f64 = 0.55;
@@ -90,7 +101,7 @@ const METADATA_DONE: f64 = 0.55;
 const BUFFERED_MAX_DONE: f64 = 0.9;
 /// About what a player buffers before its first frame; only a scale for the
 /// bar, never shown as a number.
-const BUFFER_FULL_MS: u32 = 3_000;
+pub const BUFFER_FULL_MS: u32 = 3_000;
 
 /// How full the face's loading bar is, 0 to 1, once `step` has been heard.
 /// Never falls again: [`Turn::hear`] keeps the largest.
