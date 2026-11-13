@@ -1796,7 +1796,9 @@ fn PagedGrid(
     let thinned = chain.clone();
     use_effect(move || {
         let kept = window();
-        if !windowed || !measured() {
+        // A jump past the loaded tiles keeps none, and loads its own pages
+        // (`Ask::Through`) in bigger steps.
+        if !windowed || !measured() || kept.from >= kept.to || jump.peek().is_some() {
             return;
         }
         let state = pager.read();
