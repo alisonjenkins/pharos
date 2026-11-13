@@ -883,6 +883,9 @@ enum SchedMsg {
     Snapshot {
         reply: oneshot::Sender<SchedSnapshot>,
     },
+    /// Where `stream`'s playback starts, from a caller entitled to say so
+    /// ([`PlayheadSeed::StatesTheStart`]): written only when no reading exists.
+    SeedPlayhead { stream: StreamKey, segment: u32 },
     /// Where `stream`'s viewer is, as the playhead map holds it (V1365).
     PlayheadOf {
         stream: StreamKey,
@@ -1622,6 +1625,18 @@ impl TranscodeScheduler {
         rx.await.ok()
     }
 
+    /// Say where `stream`'s playback starts, as a submission carrying
+    /// [`PlayheadSeed::StatesTheStart`] would, for a caller whose segments may
+    /// all be cache hits and so never submit. Never overwrites a reading.
+    pub fn seed_playhead(&self, stream: StreamKey, segment: u32) {
+        if stream == StreamKey::NONE {
+            return;
+        }
+        if let Err(e) = self.tx.try_send(SchedMsg::SeedPlayhead { stream, segment }) {
+            PlayheadDropReason::from_try_send_error(&e).record();
+        }
+    }
+
     /// The segment `stream`'s viewer is at, or `None` when nothing has said
     /// where it is (or the scheduler is gone).
     pub async fn playhead(&self, stream: StreamKey) -> Option<u32> {
@@ -2113,6 +2128,11 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 None
             };
             let _ = reply.send(dev);
+        }
+        SchedMsg::SeedPlayhead { stream, segment } => {
+            if !state.playheads.contains_key(&stream) {
+                note_playhead(state, stream, segment);
+            }
         }
         SchedMsg::PlayheadOf { stream, reply } => {
             let _ = reply.send(state.playheads.get(&stream).map(|&(seg, _)| seg));
@@ -7659,6 +7679,31 @@ mod tests {
         assert_eq!(s.playhead(stream).await, Some(40));
         assert_eq!(s.playhead(StreamKey::of("another-session")).await, None);
         assert_eq!(s.playhead(StreamKey::NONE).await, None);
+    }
+
+    /// A start seeded with no submission behind it (every prewarm segment was a
+    /// cache hit) still places the stream, and never moves a reading a
+    /// client's own request already made.
+    #[tokio::test]
+    async fn a_seeded_start_places_a_stream_but_never_moves_a_reading() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let stream = StreamKey::of("play-session-all-hits");
+        s.seed_playhead(stream, 40);
+        assert_eq!(
+            s.playhead(stream).await,
+            Some(40),
+            "a seed places a stream with no reading"
+        );
+        s.note_playhead(stream, 42);
+        s.seed_playhead(stream, 10);
+        assert_eq!(
+            s.playhead(stream).await,
+            Some(42),
+            "a seed never overwrites a reading"
+        );
     }
 
     #[tokio::test]
