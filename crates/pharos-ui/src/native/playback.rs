@@ -5307,7 +5307,8 @@ mod tests {
     fn firefox_is_not_offered_hevc_it_claims_but_cannot_play() {
         let all = capabilities(|_| true, |_| true);
         assert!(all.video_codecs.iter().any(|c| c == "hevc"));
-        let firefox = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:158.0) Gecko/20100101 Firefox/158.0";
+        let firefox =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:158.0) Gecko/20100101 Firefox/158.0";
         let (caps, dropped) = drop_unplayable_video_codecs(all.clone(), firefox);
         assert_eq!(dropped, ["hevc"]);
         assert!(!caps.video_codecs.iter().any(|c| c == "hevc"));
