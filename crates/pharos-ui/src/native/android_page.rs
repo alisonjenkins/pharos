@@ -2744,7 +2744,8 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Grid { path, view } => {
-            if path != current_path() {
+            // The bridge sends the query too: a sorted or filtered grid's.
+            if path != current_address() {
                 return;
             }
             for f in &listeners {
