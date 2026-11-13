@@ -169,9 +169,10 @@ pub fn mean_score(scores: &[Option<f64>]) -> f64 {
 }
 
 /// V1372: a re-search replaces pass 1 only when it scores better by
-/// [`ACCEPT_MARGIN`].
+/// [`ACCEPT_MARGIN`] and its run would no longer be weak. A small gain that
+/// stays under [`WEAK_SCORE`] is as likely a different wrong placement.
 pub fn accept(before: f64, after: f64) -> bool {
-    after >= before + ACCEPT_MARGIN
+    after >= before + ACCEPT_MARGIN && after >= WEAK_SCORE
 }
 
 /// One forward pass of a long window: the samples it hears (`input`) and
@@ -284,10 +285,16 @@ mod tests {
 
     #[test]
     fn a_re_search_must_beat_pass_one_by_the_margin() {
-        assert!(accept(0.10, 0.10 + ACCEPT_MARGIN));
-        assert!(!accept(0.10, 0.10 + ACCEPT_MARGIN - 0.001));
-        assert!(!accept(0.10, 0.10), "no better is not enough");
-        assert!(!accept(0.10, 0.05));
+        assert!(accept(0.13, 0.13 + ACCEPT_MARGIN));
+        assert!(!accept(0.13, 0.13 + ACCEPT_MARGIN - 0.001));
+        assert!(!accept(0.13, 0.13), "no better is not enough");
+        assert!(!accept(0.13, 0.05));
+    }
+
+    #[test]
+    fn a_re_search_must_also_reach_the_weak_bar() {
+        assert!(accept(0.05, WEAK_SCORE));
+        assert!(!accept(0.05, WEAK_SCORE - 0.001), "better, still weak");
     }
 
     #[test]

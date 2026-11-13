@@ -676,9 +676,10 @@ fn re_search(
             after: Some(after),
             outcome: Outcome::Rejected,
             reason: format!(
-                "{after:.3} not {:.3} over {:.3}",
+                "{after:.3} not {:.3} over {:.3} and at least {:.3}",
                 research::ACCEPT_MARGIN,
-                run.before
+                run.before,
+                research::WEAK_SCORE
             ),
             lines: Vec::new(),
         });

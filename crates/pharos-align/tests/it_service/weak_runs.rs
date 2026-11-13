@@ -182,6 +182,18 @@ fn a_re_search_no_better_than_the_margin_keeps_pass_one() {
 }
 
 #[test]
+fn a_re_search_still_under_the_weak_bar_keeps_pass_one() {
+    let before = engine()
+        .align_song("a.mp3", Path::new("/a"), song())
+        .unwrap();
+    // 0.10 beats pass 1's 0.05 by more than the margin, but is still weak.
+    let (got, heard) = streamed(&engine_with(Some(0.10)), song());
+    assert_eq!(got.runs.rejected, 2, "{:?}", got.runs);
+    assert_eq!(got.answer.lines, before.answer.lines);
+    assert_eq!(heard.len(), 6);
+}
+
+#[test]
 fn a_run_longer_than_the_cap_is_skipped() {
     let lines = vec![
         line(1_000, "found here"),
