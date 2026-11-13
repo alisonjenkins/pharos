@@ -244,7 +244,7 @@ fn encode(p: &Portrait) -> Vec<u8> {
 
 fn decode(stored: &[u8]) -> Option<Portrait> {
     let at = stored.iter().position(|&b| b == b'\n')?;
-    let (content_type, len) = std::str::from_utf8(&stored[..at]).ok()?.split_once(' ')?;
+    let (content_type, len) = std::str::from_utf8(&stored[..at]).ok()?.rsplit_once(' ')?;
     let bytes = &stored[at + 1..];
     let whole = len.parse::<usize>().ok() == Some(bytes.len());
     if !content_type.starts_with("image/") || bytes.is_empty() || !whole {
@@ -367,6 +367,11 @@ mod tests {
             bytes: vec![b'\n', 0, 255],
         };
         assert_eq!(decode(&encode(&p)), Some(p));
+        let with_params = Portrait {
+            content_type: "image/jpeg; charset=binary".into(),
+            bytes: vec![1, 2, 3],
+        };
+        assert_eq!(decode(&encode(&with_params)), Some(with_params));
         assert_eq!(decode(b"text/html 6\n<html>"), None);
         assert_eq!(decode(b"no newline"), None);
         assert_eq!(decode(b"image/jpeg 0\n"), None, "empty");
