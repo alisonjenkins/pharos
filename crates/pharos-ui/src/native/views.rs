@@ -830,31 +830,38 @@ pub fn HomeView(home: Home) -> Element {
     let books = rail_rank(Some(LibraryKind::Books));
     let split = from_music.partition_point(|rail| rail_rank(rail.library.library_kind) < books);
     let (music_rails, from_books) = from_music.split_at(split);
+    // Each rail's place from the top, for its art (B1374).
+    let next_up_row = usize::from(!home.resume.is_empty());
+    let before_music_row = next_up_row + usize::from(!home.next_up.is_empty());
+    let listening_row = before_music_row + before_music.len();
+    let music_row = listening_row + usize::from(!home.listening.is_empty());
+    let reading_row = music_row + music_rails.len();
+    let books_row = reading_row + usize::from(!home.reading.is_empty());
     rsx! {
         div { class: "pharos-home",
             if empty {
                 EmptyHome { admin }
             }
             if !home.resume.is_empty() {
-                Rail { title: "Continue watching", items: home.resume.clone(), play: true }
+                Rail { title: "Continue watching", items: home.resume.clone(), play: true, row: 0 }
             }
             if !home.next_up.is_empty() {
-                Rail { title: "Next up", items: home.next_up.clone(), play: true }
+                Rail { title: "Next up", items: home.next_up.clone(), play: true, row: next_up_row }
             }
-            for rail in before_music {
-                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            for (at, rail) in before_music.iter().enumerate() {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone(), row: before_music_row + at }
             }
             if !home.listening.is_empty() {
-                Rail { title: "Continue listening", items: home.listening.clone() }
+                Rail { title: "Continue listening", items: home.listening.clone(), row: listening_row }
             }
-            for rail in music_rails {
-                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            for (at, rail) in music_rails.iter().enumerate() {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone(), row: music_row + at }
             }
             if !home.reading.is_empty() {
-                Rail { title: "Continue reading", items: home.reading.clone(), read: true }
+                Rail { title: "Continue reading", items: home.reading.clone(), read: true, row: reading_row }
             }
-            for rail in from_books {
-                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            for (at, rail) in from_books.iter().enumerate() {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone(), row: books_row + at }
             }
         }
     }
@@ -887,12 +894,13 @@ fn EmptyHome(admin: bool) -> Element {
 
 /// A library's newest items, titled with a link to the whole library.
 #[component]
-fn LibraryRail(rail: HomeRail) -> Element {
+fn LibraryRail(rail: HomeRail, row: usize) -> Element {
     rsx! {
         Rail {
             title: rail.library.name.clone(),
             link: Route::Browse(rail.library.id),
             items: rail.latest.clone(),
+            row,
         }
     }
 }
@@ -922,6 +930,9 @@ pub fn Rail(
     /// Tiles play on a hold and open the title page on a press (B1340).
     #[props(default)]
     play: bool,
+    /// Where the rail sits among the home page's rails, from the top.
+    #[props(default)]
+    row: Option<usize>,
 ) -> Element {
     // How many tiles have their art, growing as the rail scrolls (B1374).
     let mut shown = use_signal(|| RAIL_FIRST_ART);
@@ -929,16 +940,18 @@ pub fn Rail(
     // On the home page a rail lower down draws no art until it, or the rail
     // above it, comes into view (B1374).
     let reach = try_use_context::<RailReach>();
-    let row = use_hook(|| reach.map_or(0, |r| r.claim_row()));
-    let near = reach.map_or(true, |r| row < (r.rows)());
+    let near = match (reach, row) {
+        (Some(r), Some(row)) => row < (r.rows)(),
+        _ => true,
+    };
     let mut watch = use_signal(|| None::<platform::SentinelWatch>);
-    use_effect(move || {
-        let Some(mut r) = reach else { return };
-        if row < (r.rows)() {
-            watch.set(None);
+    use_effect(use_reactive!(|row| {
+        // A new row is a new pair of sections to watch.
+        watch.set(None);
+        let (Some(mut r), Some(row)) = (reach, row) else {
             return;
-        }
-        if watch.peek().is_none() {
+        };
+        if row >= (r.rows)() {
             let mut reveal = move || {
                 let want = row + 1;
                 if *r.rows.peek() < want {
@@ -955,9 +968,9 @@ pub fn Rail(
                 None => reveal(),
             }
         }
-    });
+    }));
     rsx! {
-        section { class: "pharos-rail", id: reach.map(|_| home_rail_id(row)),
+        section { class: "pharos-rail", id: row.map(home_rail_id),
             h2 { class: "pharos-rail-title",
                 match link {
                     Some(to) => rsx! { Link { to, "{title}" } },
@@ -1009,30 +1022,17 @@ fn home_rail_id(row: usize) -> String {
     format!("pharos-home-rail-{row}")
 }
 
-/// The home page's rails in page order, and how many of them, from the top,
-/// draw their art (B1374).
+/// How many of the home page's rails, from the top, draw their art (B1374).
 #[derive(Clone, Copy)]
 struct RailReach {
     rows: Signal<usize>,
-    next: Signal<usize>,
 }
 
 impl Default for RailReach {
     fn default() -> Self {
         Self {
             rows: Signal::new(RAIL_ROWS_AHEAD),
-            next: Signal::new(0),
         }
-    }
-}
-
-impl RailReach {
-    /// The next rail's row: rails claim one as they are first drawn, in
-    /// page order.
-    fn claim_row(mut self) -> usize {
-        let row = *self.next.peek();
-        self.next.set(row + 1);
-        row
     }
 }
 
