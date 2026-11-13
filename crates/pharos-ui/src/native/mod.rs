@@ -122,6 +122,8 @@ mod xr_web;
 pub mod tv_auth;
 // 025: the Android TV app's page rules (history, proxy, bridge); no I/O.
 pub mod tv_page;
+// The episode turn as the Android TV page runs it (B1412); no I/O.
+pub mod tv_turn;
 pub mod versions;
 pub mod views;
 pub mod visualiser;

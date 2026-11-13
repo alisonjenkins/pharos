@@ -30,6 +30,7 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::tv_page::{self, Bridge, Paths};
+use super::tv_turn;
 
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
@@ -1325,13 +1326,30 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
-pub fn turn_begin(_item: &str, _dir: super::turn::Direction) -> bool {
+/// The episode turn (V790), run by the page's `window.pharosTurn` (B1412,
+/// V1382): the `<video>` and the DOM are in the WebView, not here.
+fn turn_call(call: tv_turn::Call<'_>) {
+    run(tv_turn::call_js(call));
+}
+
+/// Asks the page to turn from the episode on screen. The page decides
+/// whether it has a frame to turn away, so this never knows: `false`.
+pub fn turn_begin(item: &str, dir: super::turn::Direction) -> bool {
+    turn_call(tv_turn::Call::Begin(item, dir));
     false
 }
-pub fn turn_expect(_item: &str, _dir: super::turn::Direction) {}
-pub fn turn_open(_item: &str) {}
-pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
-pub fn turn_cancel(_item: &str, _reason: &str) {}
+pub fn turn_expect(item: &str, dir: super::turn::Direction) {
+    turn_call(tv_turn::Call::Expect(item, dir));
+}
+pub fn turn_open(item: &str) {
+    turn_call(tv_turn::Call::Open(item));
+}
+pub fn turn_ready(item: &str, image: Option<&str>, title: &str) {
+    turn_call(tv_turn::Call::Ready { item, image, title });
+}
+pub fn turn_cancel(item: &str, reason: &str) {
+    turn_call(tv_turn::Call::Cancel(item, reason));
+}
 
 /// A listener for the page going hidden, removed on drop.
 pub struct PageLifecycle(u64);
@@ -1508,6 +1526,9 @@ impl PlaybackEngine for HlsJs {
                     );
                 }
                 tv_page::HlsEvent::Error { kind, details, .. } => {
+                    // The stream is in trouble: show the player's own state,
+                    // not the turn, as the browser does.
+                    turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
                     let mut budget = budget.borrow_mut();
                     let action = budget.on_fatal(&kind, &details);
                     log::warn!(
@@ -2189,6 +2210,7 @@ const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
 __BAR_KEYS__
 __TILE_HOLD__
+__TURN__
 // Not a <select>: OK opens its list, and the arrows have to move off it.
 // A field typed into; a checkbox, switch or slider is not (FR-606).
 const notTyped = /^(checkbox|radio|range|button|submit|reset|color|file|image)$/;
