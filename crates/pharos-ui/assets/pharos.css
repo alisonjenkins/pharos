@@ -1889,13 +1889,18 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   font-size: 0.75rem;
   opacity: 0.7;
 }
-/* The full player's first load: the status and a way out (038 FR-408). */
+/* The full player's first load: the status and a way out (038 FR-408).
+   It shows only once the load has taken a moment, as the player's own
+   spinner does, so a quick start (or one the episode turn is about to
+   cover) never flashes a Back button first (B1413, V1383). */
 .pharos-watch-first-load {
   display: grid;
   gap: 1rem;
   justify-items: center;
   margin: 3rem auto;
   text-align: center;
+  opacity: 0;
+  animation: pharos-fade-in 180ms ease 300ms forwards;
 }
 /* A screen that could not load: plain words, Try again, small print (B823). */
 .pharos-load-failure {
