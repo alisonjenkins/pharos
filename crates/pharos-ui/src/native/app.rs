@@ -4581,10 +4581,16 @@ fn BrowseScreen(id: ItemRef) -> Element {
         let _ = library.map(|l| (l.0)());
         async move {
             let api = api?;
+            let asked = platform::now_ms();
             let result = browse::load(&api, &call("browse", "load"), id, |line| {
                 platform::warn(&line)
             })
             .await;
+            platform::info(&format!(
+                "pharos: browse load ok={} ms={:.0}",
+                result.is_ok(),
+                platform::now_ms() - asked
+            ));
             Some((id, settle_load(ctx.machine, result)))
         }
     }));
