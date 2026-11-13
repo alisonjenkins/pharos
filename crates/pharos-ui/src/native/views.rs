@@ -811,6 +811,7 @@ pub fn PlaybackFailure(
 #[component]
 pub fn HomeView(home: Home) -> Element {
     use_hook(|| std::rc::Rc::new(platform::rail_gestures()));
+    use_context_provider(RailReach::default);
     let empty = home.rails.is_empty()
         && home.resume.is_empty()
         && home.listening.is_empty()
@@ -922,8 +923,49 @@ pub fn Rail(
     #[props(default)]
     play: bool,
 ) -> Element {
+    // How many tiles have their art, growing as the rail scrolls (B1374).
+    let mut shown = use_signal(|| RAIL_FIRST_ART);
+    let count = items.len();
+    // On the home page a rail lower down draws no art until it, or the rail
+    // above it, comes into view (B1374).
+    let reach = try_use_context::<RailReach>();
+    let (row, id) = use_hook(|| {
+        let row = reach.map_or(0, |r| r.claim_row());
+        (
+            row,
+            format!(
+                "pharos-rail-{row}-{}",
+                RAIL_IDS.with(|n| n.replace(n.get() + 1))
+            ),
+        )
+    });
+    let near = reach.map_or(true, |r| row < (r.rows)());
+    let mut watch = use_signal(|| None::<platform::SentinelWatch>);
+    {
+        let id = id.clone();
+        use_effect(move || {
+            let Some(mut r) = reach else { return };
+            if row < (r.rows)() {
+                watch.set(None);
+                return;
+            }
+            if watch.peek().is_none() {
+                let mut reveal = move || {
+                    let want = row + RAIL_ROWS_AHEAD;
+                    if *r.rows.peek() < want {
+                        r.rows.set(want);
+                    }
+                };
+                match platform::watch_sentinel(&[id.as_str()], reveal) {
+                    Some(w) => watch.set(Some(w)),
+                    // Nothing can say when it comes into view: draw it now.
+                    None => reveal(),
+                }
+            }
+        });
+    }
     rsx! {
-        section { class: "pharos-rail",
+        section { class: "pharos-rail", id: "{id}",
             h2 { class: "pharos-rail-title",
                 match link {
                     Some(to) => rsx! { Link { to, "{title}" } },
@@ -931,12 +973,80 @@ pub fn Rail(
                 }
             }
             ul { class: "pharos-rail-items",
-                for item in items {
-                    li { key: "{item.id}", PosterTile { item: item.clone(), read, play } }
+                onscroll: move |evt: ScrollEvent| {
+                    let want = rail_art_reach(
+                        count,
+                        evt.scroll_left(),
+                        evt.client_width(),
+                        evt.scroll_width(),
+                    );
+                    if want > *shown.peek() {
+                        shown.set(want);
+                    }
+                },
+                for (at, item) in items.into_iter().enumerate() {
+                    li { key: "{item.id}", PosterTile { item: item.clone(), read, play, art: near && at < shown() } }
                 }
             }
         }
     }
+}
+
+/// Tiles a rail draws art for before it is scrolled: a tile and its gap are
+/// at most 14rem, so twelve span 2688 px, wider than a 2560 px screen and so
+/// covering any unscrolled view. The rest load as the rail moves, instead of
+/// all at once with the page (B1374).
+const RAIL_FIRST_ART: usize = 12;
+
+/// Rails on the home page that draw their art from the start, and how many
+/// rows past one coming into view load theirs: its own and the one below.
+const RAIL_ROWS_AHEAD: usize = 2;
+
+thread_local! {
+    static RAIL_IDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The home page's rails in page order, and how many of them, from the top,
+/// draw their art (B1374).
+#[derive(Clone, Copy)]
+struct RailReach {
+    rows: Signal<usize>,
+    next: Signal<usize>,
+}
+
+impl Default for RailReach {
+    fn default() -> Self {
+        Self {
+            rows: Signal::new(RAIL_ROWS_AHEAD),
+            next: Signal::new(0),
+        }
+    }
+}
+
+impl RailReach {
+    /// The next rail's row: rails claim one as they are first drawn, in
+    /// page order.
+    fn claim_row(mut self) -> usize {
+        let row = *self.next.peek();
+        self.next.set(row + 1);
+        row
+    }
+}
+
+/// Tiles past the right edge whose art loads ahead of a scroll reaching them.
+const RAIL_ART_AHEAD: usize = 4;
+
+/// How many of a rail's `count` tiles should have art once it is scrolled to
+/// `left` (px), showing `width` of `total` px: those up to the right edge,
+/// plus [`RAIL_ART_AHEAD`]. Tiles are one width, so the share of the scroll
+/// width says how many are in or before the view.
+fn rail_art_reach(count: usize, left: f64, width: i32, total: i32) -> usize {
+    if total <= 0 {
+        return count;
+    }
+    let right = (left + f64::from(width)).max(0.0) / f64::from(total);
+    let reached = (right.min(1.0) * count as f64).ceil() as usize;
+    (reached + RAIL_ART_AHEAD).min(count)
 }
 
 /// Where the shared search stands.
@@ -1331,6 +1441,9 @@ pub fn PosterTile(
     /// the title page, and a held OK, button or finger plays.
     #[props(default)]
     play: bool,
+    /// Draw the art; a rail leaves it out until it scrolls near (B1374).
+    #[props(default = true)]
+    art: bool,
 ) -> Element {
     let play = play && item.kind.playable();
     let nav = use_context::<Nav>();
@@ -1388,7 +1501,8 @@ pub fn PosterTile(
                     onpointermove: move |evt| depth::tilt(&evt),
                     onpointerleave: move |evt| depth::untilt(&evt),
                     match &item.image {
-                        Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
+                        Some(src) if art => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
+                        Some(_) => rsx! {},
                         None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                     }
                     if item.played {
@@ -2086,6 +2200,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pharos_client::api::{Book, BookFormat, ReadPosition};
+
+    /// B1374 / V1344: an unscrolled rail reaches past its view by the
+    /// look-ahead only, and scrolling extends it to the right edge plus that.
+    #[test]
+    fn a_rail_loads_art_up_to_its_right_edge_plus_the_look_ahead() {
+        // 20 tiles over 4000 px, 1000 px shown: 5 tiles in view.
+        assert_eq!(rail_art_reach(20, 0.0, 1000, 4000), 5 + RAIL_ART_AHEAD);
+        assert_eq!(rail_art_reach(20, 2000.0, 1000, 4000), 15 + RAIL_ART_AHEAD);
+        assert_eq!(
+            rail_art_reach(20, 3000.0, 1000, 4000),
+            20,
+            "never past the end"
+        );
+        assert_eq!(
+            rail_art_reach(20, 0.0, 1000, 0),
+            20,
+            "no layout yet: draw all"
+        );
+    }
 
     #[test]
     fn a_latest_group_says_how_many_children_are_new() {
@@ -3225,6 +3358,57 @@ mod tests {
         );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
         assert!(html.contains("Showing 1 of 3."), "{html}");
+    }
+
+    /// B1374 / V1344: a long rail draws art for its first tiles only, and
+    /// keeps the rest as art boxes with nothing to load.
+    #[test]
+    fn a_long_rail_loads_only_its_first_tiles_art() {
+        let items: Vec<Item> = (0..20u64)
+            .map(|n| {
+                let mut movie = item(ItemKind::Movie);
+                movie.id = ItemRef::Real(100 + n);
+                movie.image = Some(format!("/Items/{n}/Images/Primary?tag=t"));
+                movie
+            })
+            .collect();
+        let html = render(move || rsx! { Rail { title: "Films", items: items.clone() } });
+        assert_eq!(html.matches("<img").count(), RAIL_FIRST_ART, "{html}");
+        assert_eq!(html.matches("pharos-poster-art").count(), 20, "{html}");
+    }
+
+    /// B1374 / V1344: home rails below the first two draw no art until they
+    /// come into view.
+    #[test]
+    fn home_rails_past_the_first_two_wait_for_view_to_load_art() {
+        let rail = |id: u64| {
+            let mut lib = item(ItemKind::Library);
+            lib.id = ItemRef::Real(id);
+            lib.name = format!("Library {id}");
+            lib.library_kind = Some(LibraryKind::Movies);
+            let latest = (0..3u64)
+                .map(|n| {
+                    let mut movie = item(ItemKind::Movie);
+                    movie.id = ItemRef::Real(id * 100 + n);
+                    movie.image = Some(format!("/Items/{n}/Images/Primary?tag=t"));
+                    movie
+                })
+                .collect();
+            HomeRail {
+                library: lib,
+                latest,
+            }
+        };
+        let home = Home {
+            reading: vec![],
+            rails: (1..=4).map(rail).collect(),
+            resume: vec![],
+            listening: vec![],
+            next_up: vec![],
+        };
+        let html = render(move || rsx! { HomeView { home: home.clone() } });
+        assert_eq!(html.matches("<img").count(), 2 * 3, "{html}");
+        assert_eq!(html.matches("pharos-poster-art").count(), 4 * 3, "{html}");
     }
 
     /// Spec 022 US1 (V722): a 3D title is badged on its tile, a 2D one is not.
