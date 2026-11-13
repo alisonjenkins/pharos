@@ -170,6 +170,18 @@ impl Model for Fallback {
         }
         self.cpu()?.align(pcm, tokens, lead_star)
     }
+
+    fn emission(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        if self.song_on_cpu.is_none() {
+            let gpu = &mut self.gpu;
+            match catch_unwind(AssertUnwindSafe(|| gpu.emission(pcm))) {
+                Ok(Err(ModelError::Device(e))) => self.fall_back(&e),
+                Ok(other) => return other,
+                Err(panic) => self.fall_back(&format!("panicked: {}", panic_message(&*panic))),
+            }
+        }
+        self.cpu()?.emission(pcm)
+    }
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -248,6 +260,16 @@ mod tests {
                 ("vulkan", 2.0) => panic!("queue submit failed"),
                 ("vulkan", _) => Ok(vec![(1, 1)].into()),
                 _ => Ok(vec![(2, 2)].into()),
+            }
+        }
+
+        fn emission(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            match (self.0, pcm[0]) {
+                ("vulkan", 1.0) => Err(ModelError::Device("device lost".into())),
+                ("vulkan", 2.0) => panic!("queue submit failed"),
+                ("vulkan", _) => Ok(Some(vec![1.0])),
+                _ => Ok(Some(vec![2.0])),
             }
         }
     }
@@ -456,6 +478,22 @@ mod tests {
         };
         assert_eq!(count("gpu_error"), Some(&DebugValue::Counter(3)));
         assert_eq!(count("latched"), Some(&DebugValue::Counter(1)));
+    }
+
+    /// The joint pass's emission falls back as a line's window does.
+    #[test]
+    fn a_gpu_error_on_an_emission_moves_the_song_to_the_cpu() {
+        for failing in [1.0f32, 2.0] {
+            let mut f = Fallback::new(
+                Box::new(Fake("vulkan", Arc::default())),
+                Box::new(|| Ok(Box::new(Fake("cpu", Arc::default())) as Box<dyn Model>)),
+            );
+            f.begin_song();
+            assert_eq!(f.emission(&[0.0]).unwrap(), Some(vec![1.0]));
+            assert_eq!(f.emission(&[failing]).unwrap(), Some(vec![2.0]));
+            assert_eq!(f.emission(&[0.0]).unwrap(), Some(vec![2.0]));
+            assert_eq!(f.device().device, "cpu");
+        }
     }
 
     #[test]
