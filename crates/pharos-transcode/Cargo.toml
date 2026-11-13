@@ -59,6 +59,8 @@ name = "transcode-tool"
 path = "src/bin/transcode_tool.rs"
 
 [dev-dependencies]
+# Reads back the copy surface's fMP4 boxes in tests.
+pharos-hls = { path = "../pharos-hls" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 futures-util = "0.3"

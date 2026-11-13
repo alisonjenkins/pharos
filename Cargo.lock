@@ -8532,6 +8532,7 @@ dependencies = [
  "metrics",
  "metrics-util",
  "pharos-core",
+ "pharos-hls",
  "pharos-test-metrics",
  "rusty-chromaprint",
  "serde",
