@@ -11,6 +11,7 @@ use crate::audio::DecodeError;
 use crate::line::LineSpans;
 use crate::offset::{estimate, shift};
 use crate::plan::{stamps, window, Line, Stamp};
+use crate::research::{self, Open, Outcome, RunCounts, RunReport};
 use crate::text::words;
 
 /// Sent with every answer. The server keeps only answers at or above its
@@ -225,6 +226,8 @@ pub struct Aligned {
     pub probes: Vec<Option<i64>>,
     pub reason: String,
     pub phases: Phases,
+    /// Weak runs found, by what became of them (B1402).
+    pub runs: RunCounts,
 }
 
 struct Slot {
@@ -435,6 +438,9 @@ fn run_song(
     let mut out = Vec::with_capacity(lines.len());
     let mut words_aligned = 0;
     let mut prev_end_ms = 0;
+    let mut runs = RunCounts::default();
+    let mut open: Option<Open> = None;
+    let mut anchor_end_ms = 0;
     for (index, line) in lines.iter().enumerate() {
         let w_list = words(&line.text);
         if w_list.is_empty() {
@@ -473,6 +479,13 @@ fn run_song(
             // A window too short for its text: only that line goes without word times.
             Err(ModelError::Line(e)) => {
                 tracing::warn!(path = %rel_path, line = index, error = %e, "alignment failed");
+                open.get_or_insert(Open {
+                    first: index,
+                    start_ms: anchor_end_ms,
+                    scores: Vec::new(),
+                })
+                .scores
+                .push(None);
                 let done = LineWords::empty();
                 on(Progress::Line {
                     index,
@@ -490,6 +503,21 @@ fn run_song(
             words_aligned += w_list.len();
             prev_end_ms = last.start_ms;
         }
+        if research::is_weak(!line_stamps.is_empty(), spans.score) {
+            open.get_or_insert(Open {
+                first: index,
+                start_ms: anchor_end_ms,
+                scores: Vec::new(),
+            })
+            .scores
+            .push(spans.score);
+        } else {
+            if let (Some(run), Some(first)) = (open.take(), line_stamps.first()) {
+                close_run(rel_path, run, index, first.start_ms, &mut runs);
+            }
+            let last_end = spans.times.last().map_or(0, |&(_, end)| end);
+            anchor_end_ms = w_start + i64::try_from(last_end).unwrap_or(i64::MAX - w_start);
+        }
         let done = LineWords {
             words: line_stamps,
             score: spans.score.and_then(round_score),
@@ -499,6 +527,10 @@ fn run_song(
             words: &done,
         });
         out.push(done);
+    }
+    if let Some(run) = open.take() {
+        let end_ms = lines.last().map_or(run.start_ms, |l| l.end_ms);
+        close_run(rel_path, run, lines.len(), end_ms, &mut runs);
     }
     Ok(Aligned {
         answer: Answer {
@@ -510,7 +542,22 @@ fn run_song(
         probes: found.probes,
         reason: found.reason,
         phases,
+        runs,
     })
+}
+
+/// Ends the weak run `run` before line `next` (or the song's end), whose
+/// audio stops at `end_ms`, and reports it.
+fn close_run(rel_path: &str, run: Open, next: usize, end_ms: i64, runs: &mut RunCounts) {
+    let report = RunReport {
+        lines: run.first..next,
+        window_ms: (run.start_ms, end_ms),
+        before: research::mean_score(&run.scores),
+        after: None,
+        outcome: Outcome::Skipped,
+        reason: "re-search off".into(),
+    };
+    research::record(rel_path, &report, runs);
 }
 
 #[cfg(test)]

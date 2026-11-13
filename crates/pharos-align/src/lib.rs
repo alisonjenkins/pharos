@@ -17,6 +17,7 @@ pub mod obs;
 pub mod offset;
 pub mod pin;
 pub mod plan;
+pub mod research;
 pub mod service;
 pub mod text;
 pub mod tokens;

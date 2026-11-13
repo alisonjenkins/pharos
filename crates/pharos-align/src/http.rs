@@ -328,6 +328,11 @@ fn run_song(
                 rss_mib,
                 gpu_peak_mib,
                 gpu_kept_mib,
+                weak_runs = a.runs.total(),
+                runs_accepted = a.runs.accepted,
+                runs_rejected = a.runs.rejected,
+                runs_failed = a.runs.failed,
+                runs_skipped = a.runs.skipped,
                 "song aligned"
             );
             "ok"
