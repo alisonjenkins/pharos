@@ -206,7 +206,7 @@ pub fn Root() -> Element {
     });
     use_context_provider(|| {
         Nav(EventHandler::new(move |to: Route| {
-            if plays_in_place(stage, &to) {
+            if plays_in_place(stage, &to, true) {
                 return;
             }
             if *route.peek() != to {
@@ -223,7 +223,7 @@ pub fn Root() -> Element {
     });
     use_context_provider(|| {
         Replace(EventHandler::new(move |to: Route| {
-            if plays_in_place(stage, &to) {
+            if plays_in_place(stage, &to, false) {
                 return;
             }
             turn_on_nav(&route.peek(), &to);
@@ -260,11 +260,13 @@ pub fn Root() -> Element {
 
 /// A play the compact player takes in place of a navigation to the watch
 /// page (spec 020 FR-001): the page stays and the stage plays the item.
-fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
+/// `asked` is a navigation someone made, not the queue or a group moving on:
+/// such a play opens full once it mounts as a video (B1411).
+fn plays_in_place(mut stage: Signal<Stage>, to: &Route, asked: bool) -> bool {
     if !matches!(to, Route::Watch(_)) || !stage.peek().compact_shown() {
         return false;
     }
-    let taken = stage.write().takes(to);
+    let taken = stage.write().takes(to, asked);
     if taken {
         let s = stage.peek();
         platform::info(&format!(
@@ -6297,13 +6299,23 @@ fn Player(
     let audio = p.kind == ItemKind::Audio;
     // Whether Back from the full view stops this play on the TV.
     let current = matches!(slot, Slot::Current { .. });
+    let playing_id = p.detail.item.id;
     use_effect(move || {
         let mut stage = stage;
-        if current && stage.peek().video == audio {
-            stage.write().video = !audio;
+        if !current {
+            return;
+        }
+        let lift = {
+            let s = stage.peek();
+            s.video == audio || s.lift
+        };
+        if lift && stage.write().mounted(!audio) {
+            platform::info(&format!(
+                "pharos: stage view=full item={playing_id} reason=video_started"
+            ));
+            nav.0.call(Route::Watch(playing_id));
         }
     });
-    let playing_id = p.detail.item.id;
     // A player that gives up must show why, not sit under the turn (V790).
     use_effect(move || {
         if failed.read().is_some() {

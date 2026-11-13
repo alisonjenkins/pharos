@@ -243,6 +243,9 @@ pub struct Stage {
     /// Whether the item playing is a film or an episode, as its player
     /// reported on mounting: on the TV, leaving its full view stops it.
     pub video: bool,
+    /// A play someone started from a page while the player was compact:
+    /// if its item turns out to be a video, it opens full (B1411).
+    pub lift: bool,
 }
 
 impl Default for Stage {
@@ -256,6 +259,7 @@ impl Default for Stage {
             play: 0,
             handoff: None,
             video: false,
+            lift: false,
         }
     }
 }
@@ -314,6 +318,7 @@ impl Stage {
     /// if any, for the log.
     pub fn follow(&mut self, route: &Route) -> Option<View> {
         let before = (self.item, self.view);
+        self.lift = false;
         match route {
             Route::Watch(id) => {
                 self.set_item(*id);
@@ -343,15 +348,37 @@ impl Stage {
     /// Whether a navigation to `to` is a play the stage takes in place: a
     /// watch route while the player is compact (FR-001). The route stays
     /// where it is and the stage plays `to`'s item in its current view.
-    pub fn takes(&mut self, to: &Route) -> bool {
+    ///
+    /// `asked` is a play someone started (a Play, Resume or Watch link), not
+    /// the queue moving on. Asking for the video already in the compact
+    /// player is let through, so the watch route shows it full; any other
+    /// asked play is taken and marked to open full if it mounts as a video
+    /// (B1411).
+    pub fn takes(&mut self, to: &Route, asked: bool) -> bool {
         let Route::Watch(id) = to else {
             return false;
         };
         if !self.compact_shown() {
             return false;
         }
+        if asked && self.video && self.item == Some(*id) {
+            return false;
+        }
         self.set_item(*id);
+        self.lift = asked;
         true
+    }
+
+    /// The playing item's player mounted, as a video or not. Returns true
+    /// when a play taken in place by [`Stage::takes`] is a video and so now
+    /// shows full; the caller moves the route to its watch page.
+    pub fn mounted(&mut self, video: bool) -> bool {
+        self.video = video;
+        let lift = std::mem::take(&mut self.lift) && video && self.compact_shown();
+        if lift {
+            self.view = View::Full;
+        }
+        lift
     }
 
     /// Play `id`. Another item is a new play; a handoff only survives as the
@@ -460,6 +487,7 @@ impl Stage {
     /// Stop showing anything.
     pub fn close(&mut self) {
         self.video = false;
+        self.lift = false;
         self.item = None;
         self.view = View::Full;
         self.handoff = None;
@@ -1103,18 +1131,73 @@ mod tests {
     fn a_compact_player_takes_a_watch_navigation_in_place() {
         let mut stage = playing_full(7);
         stage.follow(&Route::Home);
-        assert!(stage.takes(&Route::Watch(ItemRef::Real(8))));
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
         assert_eq!(stage.item, Some(ItemRef::Real(8)));
         assert_eq!(stage.view, View::Floating);
-        assert!(!stage.takes(&Route::Home));
+        assert!(!stage.takes(&Route::Home, true));
+    }
+
+    /// A video playing in the bar after Esc or a route change.
+    fn video_in_bar(id: u64) -> Stage {
+        let mut stage = playing_full(id);
+        assert!(!stage.mounted(true));
+        stage.show(View::Mini);
+        stage.follow(&Route::Home);
+        stage
+    }
+
+    #[test]
+    fn resuming_the_video_in_the_bar_lets_the_watch_route_open_it_full() {
+        let mut stage = video_in_bar(7);
+        assert!(!stage.takes(&Route::Watch(ItemRef::Real(7)), true));
+        stage.follow(&Route::Watch(ItemRef::Real(7)));
+        assert_eq!(stage.view, View::Full);
+        assert_eq!(stage.play, 1, "the same play, not a restart");
+    }
+
+    #[test]
+    fn a_new_video_started_over_the_bar_opens_full_once_it_mounts() {
+        let mut stage = video_in_bar(7);
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
+        assert_eq!(stage.view, View::Mini);
+        assert!(stage.mounted(true));
+        assert_eq!(stage.view, View::Full);
+        assert!(!stage.lift);
+    }
+
+    #[test]
+    fn a_video_started_over_a_song_in_the_bar_opens_full() {
+        let mut stage = playing_full(7);
+        assert!(!stage.mounted(false));
+        stage.show(View::Mini);
+        stage.follow(&Route::Home);
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
+        assert!(stage.mounted(true));
+        assert_eq!(stage.view, View::Full);
+    }
+
+    #[test]
+    fn a_song_started_over_the_bar_keeps_the_bar() {
+        let mut stage = video_in_bar(7);
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
+        assert!(!stage.mounted(false));
+        assert_eq!(stage.view, View::Mini);
+    }
+
+    #[test]
+    fn the_queue_moving_on_in_the_bar_keeps_the_bar() {
+        let mut stage = video_in_bar(7);
+        assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), false));
+        assert!(!stage.mounted(true));
+        assert_eq!(stage.view, View::Mini);
     }
 
     #[test]
     fn a_full_or_empty_stage_lets_a_watch_navigation_through() {
         let mut stage = playing_full(7);
-        assert!(!stage.takes(&Route::Watch(ItemRef::Real(8))));
+        assert!(!stage.takes(&Route::Watch(ItemRef::Real(8)), true));
         stage.close();
-        assert!(!stage.takes(&Route::Watch(ItemRef::Real(8))));
+        assert!(!stage.takes(&Route::Watch(ItemRef::Real(8)), true));
         assert_eq!(stage.item, None);
     }
 
