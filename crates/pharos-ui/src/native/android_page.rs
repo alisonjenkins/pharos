@@ -462,6 +462,9 @@ async fn probe_capabilities() {
     let answer = |mime: &str| answers.get(mime).copied().unwrap_or_default();
     let mut caps = super::playback::capabilities(|m| answer(m).0 || answer(m).1, |m| answer(m).1);
     caps.containers = vec![tv_page::NO_DIRECT_PLAY.to_owned()];
+    // The WebView's hls.js plays the copy surface's variable-length fMP4
+    // segments; the server still decides per source whether to offer it.
+    caps.copy_surface = true;
     log::info!(
         "pharos: capabilities video={} audio={} containers={}",
         caps.video_codecs.join(","),
