@@ -1714,7 +1714,8 @@ fn PagedGrid(
     let revision = try_use_context::<super::live::LibraryRev>();
     let index = use_resource(move || {
         let listing = indexed.clone();
-        let key = index_key(&listing, revision.map_or(0, |r| (r.0)()));
+        // A watched mark can change what a watched filter's listing holds.
+        let key = index_key(&listing, revision.map_or(0, |r| (r.0)()), (ctx.marks)());
         async move {
             if let Some(kept) = kept_index(&key) {
                 return Some(kept);
@@ -2165,10 +2166,25 @@ const KEPT_INDEXES: usize = 8;
 /// Each listing's index as last fetched, most recent last.
 static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::new(Vec::new());
 
-/// The key a listing's index is kept under: the listing and the library
-/// revision it was fetched at, so a library change fetches it again.
-fn index_key(listing: &Listing, revision: u32) -> String {
-    format!("{revision} {listing:?}")
+/// Bumped as the account signs out, so an index fetched for one account,
+/// even one still in flight, is never kept for the next.
+static INDEX_ACCOUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The key a listing's index is kept under: the account, the library
+/// revision and the watched marks it was fetched at, and the listing, so a
+/// change to any fetches it again.
+fn index_key(listing: &Listing, revision: u32, marks: u32) -> String {
+    let account = INDEX_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed);
+    format!("{account} {revision} {marks} {listing:?}")
+}
+
+/// Drops every kept index: the account signed out (B1417).
+pub fn forget_indexes() {
+    INDEX_ACCOUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    INDEXES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 fn kept_index(key: &str) -> Option<ListIndex> {
@@ -4683,11 +4699,17 @@ mod tests {
         assert_eq!(reuse_newest(&mut kept, "gone"), None);
 
         let listing = Listing::of(ItemRef::Real(7), None, "SortName");
-        assert_ne!(index_key(&listing, 1), index_key(&listing, 2));
-        let key = index_key(&listing, 1);
+        assert_ne!(index_key(&listing, 1, 0), index_key(&listing, 2, 0));
+        assert_ne!(index_key(&listing, 1, 0), index_key(&listing, 1, 1));
+        let key = index_key(&listing, 1, 0);
         keep_index(key.clone(), ListIndex::default());
         assert_eq!(kept_index(&key), Some(ListIndex::default()));
-        assert_eq!(kept_index(&index_key(&listing, 2)), None);
+        assert_eq!(kept_index(&index_key(&listing, 2, 0)), None);
+        // Signing out drops them, and one fetched before it is never found.
+        forget_indexes();
+        assert_eq!(kept_index(&key), None);
+        keep_index(key.clone(), ListIndex::default());
+        assert_eq!(kept_index(&index_key(&listing, 1, 0)), None);
     }
 
     #[test]

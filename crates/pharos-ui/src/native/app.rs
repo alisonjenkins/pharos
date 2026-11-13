@@ -2227,6 +2227,7 @@ fn NativeApp(route: Route) -> Element {
                     api.set(None);
                     platform::forget_opt_in();
                     search.clear();
+                    browse::forget_indexes();
                 }
             }
         }
