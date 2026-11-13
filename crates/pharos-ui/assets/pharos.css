@@ -751,6 +751,12 @@ input:focus-visible {
   /* A jump to a letter lands its first tile just below the top. */
   scroll-margin-top: 1rem;
 }
+/* The rows a TV leaves out of the page, held open so the rest keep their
+   places (B1406). */
+.pharos-grid > .pharos-grid-spacer {
+  grid-column: 1 / -1;
+  pointer-events: none;
+}
 
 /* A browse grid's cards arrive with the viewer's chosen transition when it
    mounts: a library opening or the viewer switching to another (V476). The

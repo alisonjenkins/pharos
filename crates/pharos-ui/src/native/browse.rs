@@ -18,6 +18,7 @@ use pharos_client::{CallInfo, ClientError};
 
 use super::app::{call, remount_on, Ctx};
 use super::art::Art;
+use super::grid_window::{self, Window};
 use super::group_app::Together;
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
@@ -1747,10 +1748,69 @@ fn PagedGrid(
     let mut jump = use_signal(|| saved.map(|(tile, _)| tile));
     let mut land = use_signal(|| saved.map(|(_, top)| top));
     let mut cursor = use_signal(|| None::<u32>);
+    // On a TV only the rows near the screen are in the page (B1406/V1376):
+    // where the grid stands, as the page last said, and the tile it is being
+    // moved to, kept in the page until the page reports a later placement
+    // than the one current when the move began.
+    let mut view = use_signal(|| None::<grid_window::GridView>);
+    let mut anchor = use_signal(|| saved.map(|(tile, _)| (tile, platform::grid_seq())));
+    use_hook(move || {
+        std::rc::Rc::new(platform::on_grid_view(move |seen| {
+            if anchor.peek().is_some_and(|(_, seq)| seen.seq > seq) {
+                anchor.set(None);
+            }
+            if *view.peek() != Some(seen) {
+                view.set(Some(seen));
+            }
+        }))
+    });
+    let windowed = platform::WINDOWED_GRID;
+    let measured = use_memo(move || view.read().is_some());
+    let counted = chain.clone();
+    let window = use_memo(move || {
+        let state = pager.read();
+        let count = match &counted {
+            Some(c) => c.shown(state.items()).len(),
+            None => state.items().len(),
+        };
+        match (windowed, *view.read()) {
+            (false, _) => Window::all(count),
+            (true, None) => Window::first(count),
+            (true, Some(seen)) => {
+                let at = anchor.read().and_then(|(t, _)| usize::try_from(t).ok());
+                grid_window::window(&seen, count, at)
+            }
+        }
+    });
+    // The page measures the grid once it is in, and again whenever the
+    // tiles kept change, so a move settles on the rows it lands among.
+    use_effect(move || {
+        let _ = window();
+        if windowed {
+            platform::measure_grid();
+        }
+    });
+    // The tile `SENTINEL_LEAD` from the end may not be in the page to be
+    // seen: the next page loads once it is among the tiles kept.
+    use_effect(move || {
+        let kept = window();
+        if !windowed || !measured() {
+            return;
+        }
+        let state = pager.read();
+        if state.sentinel().is_some_and(|s| kept.to > s) {
+            requests.send(Ask::Next(Trigger::Scroll));
+        }
+    });
     use_effect(move || {
         let Some(target) = jump() else {
             return;
         };
+        // A TV keeps the tile's row in the page once it knows where its rows
+        // fall.
+        if windowed && !measured() {
+            return;
+        }
         // The rail takes room from the grid when it appears, which moves
         // the rows; a place to come back to waits for it.
         if rail.is_some() && land.peek().is_some() && index.read().is_none() {
@@ -1783,6 +1843,7 @@ fn PagedGrid(
             if land.take().is_some() {
                 platform::scroll_to_top();
             }
+            anchor.set(None);
             jump.set(None);
         } else if !state.in_flight() {
             requests.send(Ask::Through(target));
@@ -1813,6 +1874,7 @@ fn PagedGrid(
     let mut go = move |target: u32| {
         land.set(None);
         cursor.set(Some(target));
+        anchor.set(Some((target, platform::grid_seq())));
         jump.set(Some(target));
     };
     let mut wheel = use_signal(Wheel::default);
@@ -1922,7 +1984,7 @@ fn PagedGrid(
                 }
             }
         }
-        PosterList { page, square, sentinel, arrive_from, mark }
+        PosterList { page, square, sentinel, arrive_from, mark, window: window() }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
             p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
@@ -2047,6 +2109,10 @@ pub fn arrival_pull(tile: (f64, f64, f64, f64), view: (f64, f64)) -> (f64, f64, 
     (dx, dy, share)
 }
 
+/// The keys of a windowed grid's spacers, apart from any tile's id.
+const SPACER_BEFORE: &str = "pharos-grid-before";
+const SPACER_AFTER: &str = "pharos-grid-after";
+
 /// The tiles of a page; the one at `sentinel` carries [`SENTINEL_ID`].
 #[component]
 fn PosterList(
@@ -2057,6 +2123,10 @@ fn PosterList(
     /// Each tile gets a button that marks it watched, or unwatched again.
     #[props(default)]
     mark: bool,
+    /// The tiles kept in the page, the rest held open by spacers (B1406);
+    /// every tile when `None`.
+    #[props(default)]
+    window: Option<Window>,
 ) -> Element {
     // Each tile that arrives is placed in the wave by where it sits on
     // screen, once it is in the page.
@@ -2069,19 +2139,36 @@ fn PosterList(
         Some(true) => "pharos-grid pharos-grid-square",
         _ => "pharos-grid",
     };
-    let tiles = page.items.iter().enumerate().map(|(at, item)| {
-        let arrive = arrival(at, arrive_from, item.kind == ItemKind::Album);
-        (at, item, arrive)
-    });
+    let kept = window.unwrap_or(Window::all(count));
+    let (from, to) = (kept.from.min(count), kept.to.min(count));
+    let tiles = page
+        .items
+        .iter()
+        .enumerate()
+        .skip(from)
+        .take(to.saturating_sub(from))
+        .map(|(at, item)| {
+            let arrive = arrival(at, arrive_from, item.kind == ItemKind::Album);
+            (at, item, arrive)
+        });
     rsx! {
         if page.items.is_empty() {
             p { class: "pharos-empty", if mark { "Nothing in progress here." } else { "Nothing in here yet." } }
         }
         ul { class,
+            if kept.before > 0.0 {
+                li {
+                    key: "{SPACER_BEFORE}",
+                    class: "pharos-grid-spacer",
+                    aria_hidden: "true",
+                    style: "height: {kept.before}px",
+                }
+            }
             for (at , item , (tile_class , stagger)) in tiles {
                 li {
                     key: "{item.id}",
                     id: if sentinel == Some(at) { SENTINEL_ID },
+                    "data-at": "{at}",
                     class: tile_class,
                     style: stagger,
                     "data-key-row": (item.kind == ItemKind::Album || mark).then_some("true"),
@@ -2104,6 +2191,14 @@ fn PosterList(
                             kind: QueueTarget::AlbumCard,
                         }
                     }
+                }
+            }
+            if kept.after > 0.0 {
+                li {
+                    key: "{SPACER_AFTER}",
+                    class: "pharos-grid-spacer",
+                    aria_hidden: "true",
+                    style: "height: {kept.after}px",
                 }
             }
         }
