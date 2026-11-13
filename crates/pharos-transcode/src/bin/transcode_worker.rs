@@ -585,6 +585,20 @@ fn handle_tiny(
                 Err(e) => frame_err(job_id, e),
             }
         }
+        TinyOp::CopyIndex { input } => match libav::copy_segment::index(&input) {
+            Ok(verdict) => WorkerEvent::CopyIndexResult { job_id, verdict },
+            Err(e) => frame_err(job_id, e),
+        },
+        TinyOp::CopySegment {
+            input,
+            index,
+            segment,
+            last,
+            out,
+        } => match libav::copy_segment::copy_segment(&input, index as usize, segment, last, &out) {
+            Ok(report) => WorkerEvent::CopySegmentResult { job_id, report },
+            Err(e) => frame_err(job_id, e),
+        },
     }
 }
 

@@ -95,9 +95,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             // entirely. ffmpeg's own default stream selection excludes attached
             // pictures for exactly this reason, and the transcoder already maps
             // `0:v:0` to dodge them; the probe has to agree.
-            ffi::AVMediaType::VIDEO
-                if video.is_none() && disp & ffi::AV_DISPOSITION_ATTACHED_PIC == 0 =>
-            {
+            ffi::AVMediaType::VIDEO if video.is_none() && is_primary_video_candidate(par, st) => {
                 video = Some(extract_video(par, st, has_mvc_stream));
             }
             ffi::AVMediaType::AUDIO => {
@@ -222,6 +220,24 @@ struct VideoFields {
     height: Option<u32>,
     frame_rate_mille: Option<u32>,
     pub video_3d_format: Option<Video3DFormat>,
+}
+
+/// The stream the probe reports as the video track: the first video stream
+/// that is not embedded cover art.
+pub(crate) fn primary_video_stream(
+    ictx: &ffmpeg::format::context::Input,
+) -> Option<ffmpeg::format::stream::Stream<'_>> {
+    ictx.streams().find(|stream| {
+        // SAFETY: stream + its codecpar are valid while `ictx` is borrowed.
+        let st = unsafe { &*stream.as_ptr() };
+        let par = unsafe { &*st.codecpar };
+        is_primary_video_candidate(par, st)
+    })
+}
+
+fn is_primary_video_candidate(par: &ffi::AVCodecParameters, st: &ffi::AVStream) -> bool {
+    par.codec_type == ffi::AVMediaType::VIDEO
+        && st.disposition & ffi::AV_DISPOSITION_ATTACHED_PIC == 0
 }
 
 pub(crate) fn classify_libav_3d(

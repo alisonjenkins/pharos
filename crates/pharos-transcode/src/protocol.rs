@@ -296,6 +296,24 @@ pub enum TinyOp {
         /// once; 0 makes it read the container's own.
         duration_ms: u64,
     },
+    /// Read a source's seek index, plan copy segments on its keyframes and
+    /// write the first few in full to prove they tile →
+    /// `WorkerEvent::CopyIndexResult` (spec 041). Last, so bincode's variant
+    /// indices of the older ops stay the same.
+    CopyIndex { input: PathBuf },
+    /// Copy one planned segment's video packets into an fMP4 media segment at
+    /// `out` → `WorkerEvent::CopySegmentResult` (spec 041). The media bytes go
+    /// to a file because a segment outgrows `MAX_FRAME`. Last, for the same
+    /// reason.
+    CopySegment {
+        input: PathBuf,
+        /// The segment's place in the plan; its sequence number is this + 1.
+        index: u32,
+        segment: pharos_core::copy_plan::CopySegment,
+        /// The plan's final segment, which ends at end of file.
+        last: bool,
+        out: PathBuf,
+    },
 }
 
 /// Scheduler → worker.
@@ -389,6 +407,16 @@ pub enum WorkerEvent {
     PictureCheckResult {
         job_id: JobId,
         analysis: crate::picture_area::PictureAnalysis,
+    },
+    /// Reply to `TinyOp::CopyIndex`. Last, for the same reason.
+    CopyIndexResult {
+        job_id: JobId,
+        verdict: crate::copy_surface::CopyIndexVerdict,
+    },
+    /// Reply to `TinyOp::CopySegment`. Last, for the same reason.
+    CopySegmentResult {
+        job_id: JobId,
+        report: crate::copy_surface::CopySegmentReport,
     },
 }
 
