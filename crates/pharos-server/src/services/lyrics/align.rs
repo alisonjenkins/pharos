@@ -1427,6 +1427,16 @@ mod tests {
         (buf.clone(), tracing::subscriber::set_default(sub))
     }
 
+    /// Recompute every registered callsite's interest now that this thread's
+    /// capture subscriber is a dispatcher. A test on another thread with no
+    /// subscriber can register a callsite while `set_default` adds ours, and
+    /// cache it as "never", so the line under test is dropped (2 in 10 plain
+    /// `cargo test` runs). Call it right before the code under test: any
+    /// registration that raced is finished by then and gets redone with ours.
+    fn hear_logs() {
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// The captured line holding `message`, which must carry both ETA fields.
     fn eta_line(buf: &LogBuf, message: &str) -> String {
         let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -1476,6 +1486,7 @@ mod tests {
             queued_at: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
             predicted_ms: Some(2_000),
         };
+        hear_logs();
         aligner.process_job(&job).await.unwrap();
 
         let seen = eta_errors(&snapshotter);
@@ -1559,6 +1570,7 @@ mod tests {
             queued_at: Instant::now(),
             predicted_ms: Some(2_000),
         };
+        hear_logs();
         aligner.job_failed(&job, "aligner said no");
 
         let seen = eta_errors(&snapshotter);
@@ -1993,6 +2005,7 @@ mod tests {
             ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
         });
         let job = two_line_job();
+        hear_logs();
         let running = {
             let aligner = Arc::clone(&aligner);
             tokio::spawn(async move { aligner.process_job(&two_line_job()).await })
