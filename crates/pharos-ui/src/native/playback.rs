@@ -1103,6 +1103,37 @@ pub fn capabilities(
     }
 }
 
+/// Video codecs `user_agent`'s browser claims but does not play (B1410): the
+/// server must not direct-play them, nor pick them as an HLS target.
+///
+/// Firefox answers yes to `hvc1` through `canPlayType` and MSE, then never
+/// decodes a frame: every Firefox HEVC direct play in the server's logs, 8-bit
+/// MP4 and 10-bit Matroska alike, stalled at `readyState` 1 while the file
+/// downloaded. Keyed on the browser, not the answer, because the answer is
+/// the thing that is wrong.
+pub fn unplayable_video_codecs(user_agent: &str) -> &'static [&'static str] {
+    if user_agent.contains("Firefox/") {
+        &["hevc"]
+    } else {
+        &[]
+    }
+}
+
+/// `caps` without the video codecs `user_agent`'s browser cannot really play,
+/// and the codecs taken out.
+pub fn drop_unplayable_video_codecs(
+    mut caps: Capabilities,
+    user_agent: &str,
+) -> (Capabilities, Vec<String>) {
+    let unplayable = unplayable_video_codecs(user_agent);
+    let (dropped, kept) = caps
+        .video_codecs
+        .into_iter()
+        .partition(|c| unplayable.contains(&c.as_str()));
+    caps.video_codecs = kept;
+    (caps, dropped)
+}
+
 /// The image subtitle codecs the player draws (spec 019): the server sends
 /// each event as a PNG, which every browser shows.
 pub const IMAGE_SUBTITLES: &[&str] = &["dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle"];
@@ -5270,6 +5301,21 @@ mod tests {
         assert_eq!(caps.audio_codecs, ["opus", "mp3"]);
         assert_eq!(caps.containers, ["mp4", "m4v"]);
         assert_eq!(caps.max_bitrate, 0);
+    }
+
+    #[test]
+    fn firefox_is_not_offered_hevc_it_claims_but_cannot_play() {
+        let all = capabilities(|_| true, |_| true);
+        assert!(all.video_codecs.iter().any(|c| c == "hevc"));
+        let firefox = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:158.0) Gecko/20100101 Firefox/158.0";
+        let (caps, dropped) = drop_unplayable_video_codecs(all.clone(), firefox);
+        assert_eq!(dropped, ["hevc"]);
+        assert!(!caps.video_codecs.iter().any(|c| c == "hevc"));
+        assert_eq!(caps.video_codecs.len(), all.video_codecs.len() - 1);
+        let chrome = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+        let (caps, dropped) = drop_unplayable_video_codecs(all.clone(), chrome);
+        assert!(dropped.is_empty());
+        assert_eq!(caps, all);
     }
 
     #[test]
