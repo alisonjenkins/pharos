@@ -75,7 +75,7 @@ window.pharosTurn = (() => {
     clearInterval(a.tick);
     clearTimeout(a.turnTimer);
     clearTimeout(a.fadeTimer);
-    if (a.video) for (const [kind, f] of a.listeners) a.video.removeEventListener(kind, f);
+    for (const [at, kind, f, capture] of a.listeners) at.removeEventListener(kind, f, capture);
     log("end item=" + a.item + " reason=" + reason + " after_ms=" + Math.round(performance.now() - a.begun));
   };
   const fadeOut = (a) => {
@@ -134,14 +134,19 @@ window.pharosTurn = (() => {
     a.video = v;
     const on = {
       loadedmetadata: () => hear(a, { kind: "metadata" }),
-      progress: () => hear(a, { kind: "buffered", ms: ahead(v) }),
       loadeddata: () => hear(a, { kind: "first" }),
       error: () => { if (active === a) finish("video-error"); },
     };
     for (const kind in on) {
-      v.addEventListener(kind, on[kind]);
-      a.listeners.push([kind, on[kind]]);
+      v.addEventListener(kind, on[kind], false);
+      a.listeners.push([v, kind, on[kind], false]);
     }
+    // The bridge stops `progress` at the document, in the capture phase, so
+    // it never reaches the video; a capturing listener on the document
+    // itself still hears it.
+    const progress = (e) => { if (e.target === v) hear(a, { kind: "buffered", ms: ahead(v) }); };
+    document.addEventListener("progress", progress, true);
+    a.listeners.push([document, "progress", progress, true]);
     // Events that fired before the hook.
     if (v.readyState >= 2) on.loadeddata();
     else if (v.readyState >= 1) on.loadedmetadata();
@@ -369,6 +374,19 @@ mod tests {
             let first = class.split(' ').next().unwrap_or_default();
             assert!(css.contains(&format!(".{first}")), "{first} not styled");
         }
+    }
+
+    /// The bridge stops `progress` at the document in the capture phase
+    /// (B1386), so the turn hears it there too, or its bar would never
+    /// fill past the metadata step.
+    #[test]
+    fn the_tv_turn_hears_download_progress_where_the_bridge_stops_it() {
+        let js = turn_script();
+        assert!(
+            js.contains(r#"document.addEventListener("progress", progress, true);"#),
+            "{js}"
+        );
+        assert!(!js.contains("progress: () =>"), "{js}");
     }
 
     #[test]
