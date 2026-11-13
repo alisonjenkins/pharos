@@ -6461,7 +6461,9 @@ fn Player(
     use_effect({
         let id = p.detail.item.id;
         move || {
-            if !audio {
+            // Only the playing slot looks ahead: a preloaded next player
+            // would otherwise ask for the song after it.
+            if !audio || !current {
                 return;
             }
             let settled = match &*lyrics.read() {
@@ -6472,7 +6474,12 @@ fn Player(
                     .is_some_and(|(at, a)| *at == id && !a.words_pending),
                 Some(_) => true,
             };
-            let next = queue.read().next();
+            // The same next song playback moves to when this one ends.
+            let next = if queued {
+                queue.read().next_after(id, near.next)
+            } else {
+                near.next
+            };
             let Some(ahead) = super::lyrics::align_ahead(
                 super::listen::karaoke_on(),
                 id,
