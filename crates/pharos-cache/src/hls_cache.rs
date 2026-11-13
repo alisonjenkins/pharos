@@ -273,6 +273,12 @@ pub struct SegmentIdentity {
     /// adds nothing to the file name, so every unscaled segment keeps the name
     /// it had before downscaling existed.
     output_size: Option<pharos_transcode::OutputSize>,
+    /// A segment of a burning rendition whose window holds no subtitle event,
+    /// so the gate cleared its burn index (B1400). Its bytes match a plain
+    /// rendition's segment, but placement reads the rendition's `burn_intent`
+    /// and may put the two on different encoders, and a segment from another
+    /// encoder is undecodable under the init it is played with (V153).
+    quiet_burn: bool,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -1827,6 +1833,7 @@ impl SegmentIdentity {
             stereo_output: opts.stereo_output,
             tonemap: opts.tonemap,
             output_size: opts.output_size,
+            quiet_burn: opts.burn_intent && subtitle_index.is_none(),
         }
     }
 
@@ -1850,6 +1857,7 @@ impl SegmentIdentity {
             stereo_output,
             tonemap,
             output_size,
+            quiet_burn,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -1885,8 +1893,11 @@ impl SegmentIdentity {
         let size = output_size
             .map(|s| format!("_{}x{}", s.width(), s.height()))
             .unwrap_or_default();
+        // Only a burning rendition's quiet segments get a new name; every other
+        // segment keeps its file, so the deploy does not empty the cache.
+        let quiet = if *quiet_burn { "_bq" } else { "" };
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}{size}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}{size}{quiet}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -4411,6 +4422,7 @@ impl HlsSegmentCache {
             stereo_output: pharos_transcode::StereoOutput::Preserve,
             tonemap: Default::default(),
             output_size: None,
+            quiet_burn: false,
         })
     }
 
@@ -11103,6 +11115,46 @@ mod tests {
         assert_ne!(key_hdr.etag(), key_sdr.etag());
     }
 
+    /// B1400 — a burning rendition's quiet segment (its burn index gated off)
+    /// never shares a cache entry with the plain rendition's segment, because
+    /// the two may be placed on different encoders. Every other segment keeps
+    /// the name it had.
+    #[test]
+    fn a_burning_renditions_quiet_segment_is_keyed_apart_from_a_plain_one() {
+        let plain = ident_opts(
+            Some(SegmentVideo::H264),
+            None,
+            SegmentContainer::Fmp4,
+            Some(4_000_000),
+            None,
+        );
+        let mut burning = plain.clone();
+        burning.burn_intent = true;
+        let id = |o: &SegmentOpts, sub: Option<u32>| {
+            SegmentIdentity::new(1, 5, None, sub, o, SourceGen::LOCAL)
+        };
+        let (k_plain, k_quiet, k_dialogue) =
+            (id(&plain, None), id(&burning, None), id(&burning, Some(3)));
+        assert_ne!(k_plain, k_quiet);
+        assert_ne!(k_plain.filename(), k_quiet.filename());
+        assert_ne!(k_plain.etag(), k_quiet.etag());
+        assert!(
+            k_quiet.filename().ends_with("_bq.ts"),
+            "{}",
+            k_quiet.filename()
+        );
+        assert!(
+            !k_plain.filename().contains("_bq"),
+            "{}",
+            k_plain.filename()
+        );
+        assert!(
+            !k_dialogue.filename().contains("_bq"),
+            "a segment that burns keeps its name: {}",
+            k_dialogue.filename()
+        );
+    }
+
     #[test]
     fn segment_identity_output_size_distinguishes_cache_and_etag() {
         let plain = ident_opts(
@@ -11364,6 +11416,7 @@ mod tests {
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: Default::default(),
                     output_size: None,
+                    quiet_burn: false,
                 },
                 body.len() as u64,
             )
