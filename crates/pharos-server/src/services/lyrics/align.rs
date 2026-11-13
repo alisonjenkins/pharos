@@ -1418,21 +1418,36 @@ mod tests {
     }
 
     /// Captures this thread's log lines until the guard drops.
-    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    fn capture_logs() -> (LogBuf, LogGuard) {
         let buf = LogBuf::default();
         let sub = tracing_subscriber::fmt()
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
-        (buf.clone(), tracing::subscriber::set_default(sub))
+        let guard = LogGuard {
+            _capture: tracing::subscriber::set_default(sub),
+            _second: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        };
+        (buf.clone(), guard)
+    }
+
+    /// Keeps the capture subscriber the thread's default, and an inert second
+    /// dispatcher alive beside it. With only one live dispatcher, tracing-core
+    /// takes a newly registered callsite's interest from the registering
+    /// thread's default alone, so a test thread with no subscriber caches
+    /// "never" for every thread. With two, registration asks every live
+    /// dispatcher, the capture subscriber included.
+    struct LogGuard {
+        _capture: tracing::subscriber::DefaultGuard,
+        _second: tracing::Dispatch,
     }
 
     /// Recompute every registered callsite's interest now that this thread's
-    /// capture subscriber is a dispatcher. A test on another thread with no
-    /// subscriber can register a callsite while `set_default` adds ours, and
-    /// cache it as "never", so the line under test is dropped (2 in 10 plain
-    /// `cargo test` runs). Call it right before the code under test: any
-    /// registration that raced is finished by then and gets redone with ours.
+    /// capture subscriber is a dispatcher. A callsite registered before
+    /// [`capture_logs`], by a test thread with no subscriber, cached "never",
+    /// so the line under test was dropped (2 in 10 plain `cargo test` runs).
+    /// Call it right before the code under test, so any registration that
+    /// raced `capture_logs` is finished and gets redone with ours.
     fn hear_logs() {
         tracing::callsite::rebuild_interest_cache();
     }
