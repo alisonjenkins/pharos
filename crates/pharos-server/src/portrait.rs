@@ -259,7 +259,9 @@ fn decode(stored: &[u8]) -> Option<Portrait> {
 /// Write through a temporary name, so a reader never sees half a file.
 async fn store(dir: &std::path::Path, path: &std::path::Path, p: &Portrait) -> std::io::Result<()> {
     tokio::fs::create_dir_all(dir).await?;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
     tokio::fs::write(&tmp, encode(p)).await?;
     tokio::fs::rename(&tmp, path).await
 }
@@ -336,6 +338,25 @@ mod tests {
         let other = fetch(&disk, "https://image.tmdb.org/t/p/w185/b.jpg").await;
         assert!(other.is_some());
         assert_eq!(counting.0.load(Ordering::SeqCst), 2, "a new url is fetched");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_fetches_each_keep_a_whole_file() -> std::io::Result<()> {
+        let td = tempfile::TempDir::new()?;
+        let counting = std::sync::Arc::new(Counting(AtomicUsize::new(0)));
+        let disk = DiskPortraits::new(td.path().join("portraits"), counting.clone());
+        let url = "https://image.tmdb.org/t/p/w185/a.jpg";
+        let all = futures_util::future::join_all((0..8).map(|_| disk.get(url))).await;
+        assert!(all.iter().all(|got| got.is_ok()), "every request is served");
+        let kept = tokio::fs::read(disk.path(url)).await?;
+        assert_eq!(decode(&kept).map(|p| p.bytes), Some(vec![1, 2, 3]));
+        let mut left = tokio::fs::read_dir(td.path().join("portraits")).await?;
+        let mut files = 0;
+        while left.next_entry().await?.is_some() {
+            files += 1;
+        }
+        assert_eq!(files, 1, "no temporary file is left behind");
         Ok(())
     }
 
