@@ -2547,6 +2547,22 @@ mod tests {
         assert!(html.contains(">Back<"), "{html}");
     }
 
+    /// B1413 / V1383: the first load stays unseen for a moment, as the
+    /// player's spinner does, so a quick start never flashes its Back.
+    #[test]
+    fn the_first_load_shows_only_after_a_moment() {
+        let css = include_str!("../../assets/pharos.css");
+        let at = css
+            .find(".pharos-watch-first-load {")
+            .expect("first load rule");
+        let rule = &css[at..at + css[at..].find('}').unwrap_or_default()];
+        assert!(rule.contains("opacity: 0;"), "{rule}");
+        assert!(
+            rule.contains("animation: pharos-fade-in 180ms ease 300ms forwards;"),
+            "{rule}"
+        );
+    }
+
     /// B822: the listing left on screen while the next one loads says so.
     #[test]
     fn a_screen_that_is_loading_the_next_one_is_dimmed_and_busy() {
