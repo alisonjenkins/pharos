@@ -19,7 +19,9 @@ use super::watch_view::VIDEO_ID;
 
 /// The page's turn: `window.pharosTurn`, with `expect`, `begin`, `open`,
 /// `ready`, `cancel` and `cancelCurrent`, the browser's `turn_*` calls by
-/// name. Placeholders are filled by [`turn_script`].
+/// name. Installed once at launch beside the bridge, not inside it: the E2E
+/// harness (`tv-bridge.ts`) rebuilds the bridge from constants alone.
+/// Placeholders are filled by [`turn_script`].
 const TURN_JS: &str = r#"
 window.pharosTurn = (() => {
   const TURN_MS = __TURN_MS__, FADE_MS = __FADE_MS__, GIVE_UP_MS = __GIVE_UP_MS__;
