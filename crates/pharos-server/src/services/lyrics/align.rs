@@ -137,6 +137,19 @@ pub enum Lookup {
     Unavailable,
 }
 
+impl Lookup {
+    /// The `answer` label of `pharos_lyrics_words_total`: a stable string
+    /// for dashboards, one per variant.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ready(_) => "ready",
+            Self::Pending(_) => "pending",
+            Self::Partial(..) => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// Disk or in-memory cache of aligned word timestamps.
 #[derive(Clone)]
 pub struct AlignCache {
@@ -2176,5 +2189,22 @@ mod tests {
             let err = aligner.process_job(&two_line_job()).await.unwrap_err();
             assert!(err.contains("event over"), "newline {newline}: {err}");
         }
+    }
+
+    /// The `answer` labels are a dashboard contract: one per variant, distinct.
+    #[test]
+    fn each_lookup_has_its_own_answer_label() {
+        let aligned = Aligned {
+            lines: Vec::new(),
+            offset_ms: 0,
+            scores: Vec::new(),
+        };
+        let labels = [
+            Lookup::Ready(aligned.clone()).label(),
+            Lookup::Pending(None).label(),
+            Lookup::Partial(None, aligned).label(),
+            Lookup::Unavailable.label(),
+        ];
+        assert_eq!(labels, ["ready", "pending", "partial", "unavailable"]);
     }
 }
