@@ -605,6 +605,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__BAR_KEYS__", BAR_KEY_JS)
         .replace("__TILE_HOLD__", TILE_HOLD_JS)
         .replace("__ARROWS_SKIP_VDOM__", ARROWS_SKIP_VDOM_JS)
+        .replace("__GRID_VIEW__", GRID_VIEW_JS)
         .replace("__PAGE_ONLY_ARROWS__", PAGE_ONLY_ARROWS)
         .replace("__TILE_HOLD_MS__", &TILE_HOLD_MS.to_string())
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
@@ -667,6 +668,14 @@ pub enum Bridge {
     /// settled: the tile with the focus, else the first in view, and how far
     /// below the viewport's top it sits (FR-603).
     Place { path: String, tile: u32, top: f64 },
+    /// Where the browse grid on `path` stands as it scrolls or the
+    /// viewport changes, for keeping only the rows near the screen in the
+    /// page (B1406).
+    Grid {
+        path: String,
+        #[serde(flatten)]
+        view: super::grid_window::GridView,
+    },
     /// The remote's Back closed an open dialog or menu (`what`, its class
     /// or role) instead of going back a page (FR-607). With `restore` the
     /// WebView already went back an entry, which Rust puts back.
@@ -981,14 +990,56 @@ pub fn script_takes(key: &str) -> bool {
 /// The browse grid whose children are the tiles, as `web` finds them.
 const GRID: &str = ".pharos-browse .pharos-grid";
 
+/// Script, in the bridge: the browse grid's geometry, sent as the page
+/// scrolls (at most every 80 ms) or resizes, and on Rust's asking
+/// (`window.__pharosGridView`), so Rust keeps only the rows near the screen
+/// in the page (B1406). Each tile carries its place in the grid as
+/// `data-at`; a row's pitch is measured from one tile to the one a row
+/// below, and `seq` is the last placement carried out
+/// ([`scroll_to_tile_js`]).
+pub const GRID_VIEW_JS: &str = r#"
+let viewTimer = 0, viewLast = 0;
+const gridView = () => {
+  const grid = document.querySelector('__GRID__');
+  const first = grid && grid.querySelector(":scope > [data-at]");
+  if (!first) return;
+  const css = getComputedStyle(grid);
+  const cols = css.gridTemplateColumns.split(" ").filter(Boolean).length;
+  const gap = parseFloat(css.rowGap) || 0;
+  const r = first.getBoundingClientRect();
+  const below = grid.querySelector(`:scope > [data-at="${+first.dataset.at + cols}"]`);
+  const pitch = below ? below.getBoundingClientRect().top - r.top : r.height + gap;
+  if (!(cols > 0 && pitch > 0)) return;
+  send({ t: "grid", path: location.pathname + location.search,
+    top: grid.getBoundingClientRect().top, height: innerHeight, cols, pitch, gap,
+    seq: window.__pharosGridSeq || 0 });
+};
+const gridViewSoon = () => {
+  if (viewTimer) return;
+  viewTimer = setTimeout(() => {
+    viewTimer = 0;
+    viewLast = performance.now();
+    gridView();
+  }, Math.max(0, viewLast + 80 - performance.now()));
+};
+addEventListener("scroll", gridViewSoon, { passive: true });
+addEventListener("resize", gridViewSoon);
+window.__pharosGridView = gridView;
+"#;
+
+/// Script: send where the browse grid stands now ([`GRID_VIEW_JS`]).
+pub const MEASURE_GRID_JS: &str = "if (window.__pharosGridView) window.__pharosGridView();";
+
 /// Script: scroll the browse tile at `at` to the top of the page and focus
 /// its link, so the remote's next press starts from the section jumped to
-/// (B1028). Answers whether the tile was in the page.
-pub fn scroll_to_tile_js(at: u32) -> String {
+/// (B1028). Answers whether the tile was in the page. `seq` numbers the
+/// placement, which the grid's geometry carries from then on (B1406).
+pub fn scroll_to_tile_js(at: u32, seq: u64) -> String {
     format!(
         r#"
+window.__pharosGridSeq = {seq};
 const grid = document.querySelector({grid});
-const tile = grid ? grid.children[{at}] : null;
+const tile = grid ? grid.querySelector(':scope > [data-at="{at}"]') : null;
 if (!tile) return false;
 tile.scrollIntoView(true);
 const link = tile.querySelector("a[href], button, [tabindex]") || tile;
@@ -1001,12 +1052,13 @@ return true;
 
 /// Script: put the browse tile at `at` back `top` CSS px below the top of
 /// the viewport, where it was when the grid was left, and focus it (FR-603).
-pub fn scroll_tile_to_js(at: u32, top: f64) -> String {
+pub fn scroll_tile_to_js(at: u32, top: f64, seq: u64) -> String {
     let top = if top.is_finite() { top } else { 0.0 };
     format!(
         r#"
+window.__pharosGridSeq = {seq};
 const grid = document.querySelector({grid});
-const tile = grid ? grid.children[{at}] : null;
+const tile = grid ? grid.querySelector(':scope > [data-at="{at}"]') : null;
 if (!tile) return false;
 window.scrollBy(0, tile.getBoundingClientRect().top - ({top}));
 const link = tile.querySelector("a[href], button, [tabindex]") || tile;
@@ -1228,11 +1280,12 @@ mod tests {
 
     #[test]
     fn a_kept_place_puts_the_tile_back_where_it_was_and_focuses_it() {
-        let js = scroll_tile_to_js(40, 212.5);
-        assert!(js.contains("grid.children[40]"), "{js}");
+        let js = scroll_tile_to_js(40, 212.5, 3);
+        assert!(js.contains(r#"[data-at="40"]"#), "{js}");
+        assert!(js.contains("window.__pharosGridSeq = 3;"), "{js}");
         assert!(js.contains("getBoundingClientRect().top - (212.5)"), "{js}");
         assert!(js.contains("link.focus({ preventScroll: true })"), "{js}");
-        assert!(scroll_tile_to_js(1, f64::NAN).contains("- (0)"));
+        assert!(scroll_tile_to_js(1, f64::NAN, 0).contains("- (0)"));
         assert_eq!(bridge_script("__GRID__"), GRID);
     }
 
@@ -1334,12 +1387,13 @@ mod tests {
 
     #[test]
     fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
-        let js = scroll_to_tile_js(42);
+        let js = scroll_to_tile_js(42, 9);
         assert!(
             js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#),
             "{js}"
         );
-        assert!(js.contains("grid.children[42]"), "{js}");
+        assert!(js.contains(r#"[data-at="42"]"#), "{js}");
+        assert!(js.contains("window.__pharosGridSeq = 9;"), "{js}");
         assert!(js.contains("scrollIntoView(true)"), "{js}");
         assert!(js.contains("focus({ preventScroll: true })"), "{js}");
         assert!(
@@ -1744,6 +1798,23 @@ mod tests {
                 path: "/ui/browse/1".to_owned(),
                 tile: 40,
                 top: 212.5
+            })
+        );
+        assert_eq!(
+            parse_bridge(
+                &serde_json::json!({"t": "grid", "path": "/ui/browse/1", "top": -900.0,
+                "height": 540.0, "cols": 9, "pitch": 151.5, "gap": 13.6, "seq": 2})
+            ),
+            Some(Bridge::Grid {
+                path: "/ui/browse/1".to_owned(),
+                view: super::super::grid_window::GridView {
+                    top: -900.0,
+                    height: 540.0,
+                    cols: 9,
+                    pitch: 151.5,
+                    gap: 13.6,
+                    seq: 2
+                }
             })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
