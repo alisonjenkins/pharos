@@ -57,6 +57,23 @@ pub fn probe_indices(lines: &[Line]) -> Vec<usize> {
         .collect()
 }
 
+/// The `(start_ms, end_ms)` window each probe line is looked for in, in the
+/// order [`estimate`] asks its decoder for them, so a caller can decode them
+/// all ahead of time (B1414).
+pub fn probe_windows(lines: &[Line]) -> Vec<(i64, i64)> {
+    probe_indices(lines)
+        .into_iter()
+        .map(|i| {
+            let line = &lines[i];
+            let n = i64::try_from(words(&line.text).len()).unwrap_or(i64::MAX);
+            let sung_ms =
+                (line.end_ms - line.start_ms).min(n.saturating_mul(CAP_MS_PER_WORD) + CAP_EXTRA_MS);
+            let start = (line.start_ms - SEARCH_MS).max(0);
+            (start, line.start_ms + sung_ms + SEARCH_MS)
+        })
+        .collect()
+}
+
 /// `statistics.median`: the middle value, or the mean of the middle two.
 fn median(sorted: &[i64]) -> f64 {
     let n = sorted.len();
@@ -81,14 +98,9 @@ where
     A: FnMut(&[(&[f32], &[String])]) -> Result<Vec<Vec<(u64, u64)>>, E>,
 {
     let mut windows = Vec::new();
-    for i in probe_indices(lines) {
+    for (i, (start, end)) in probe_indices(lines).into_iter().zip(probe_windows(lines)) {
         let line = &lines[i];
         let tokens: Vec<String> = words(&line.text).into_iter().map(|w| w.token).collect();
-        let n = i64::try_from(tokens.len()).unwrap_or(i64::MAX);
-        let sung_ms =
-            (line.end_ms - line.start_ms).min(n.saturating_mul(CAP_MS_PER_WORD) + CAP_EXTRA_MS);
-        let start = (line.start_ms - SEARCH_MS).max(0);
-        let end = line.start_ms + sung_ms + SEARCH_MS;
         let pcm = decode(start, end)?;
         windows.push((line.start_ms, start, pcm, tokens));
     }
