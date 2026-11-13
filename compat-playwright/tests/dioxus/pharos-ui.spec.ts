@@ -4503,7 +4503,7 @@ test.describe("pharos Dioxus UI stage", () => {
 
     // Expand shows the song full, on its own watch route.
     await page.locator(".pharos-stage").getByRole("button", { name: "Expand" }).click();
-    await expect(page.locator(".pharos-stage.is-full")).toBeVisible();
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible();
     await expect(page).toHaveURL(/\/ui\/watch\//);
     expect(plays(lines), "expanding keeps the stream").toBe(3);
   });
