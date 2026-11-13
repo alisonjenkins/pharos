@@ -2172,12 +2172,20 @@ fn index_key(listing: &Listing, revision: u32) -> String {
 }
 
 fn kept_index(key: &str) -> Option<ListIndex> {
-    let kept = INDEXES
+    let mut kept = INDEXES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    kept.iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, index)| index.clone())
+    reuse_newest(&mut kept, key)
+}
+
+/// The value under `key`, made the newest, so the least recently used goes
+/// first.
+fn reuse_newest<V: Clone>(kept: &mut Vec<(String, V)>, key: &str) -> Option<V> {
+    let at = kept.iter().position(|(k, _)| k == key)?;
+    let entry = kept.remove(at);
+    let value = entry.1.clone();
+    kept.push(entry);
+    Some(value)
 }
 
 fn keep_index(key: String, index: ListIndex) {
@@ -4666,6 +4674,13 @@ mod tests {
         keep_newest(&mut kept, "k3".to_owned(), 30, 8);
         assert_eq!(kept.last(), Some(&("k3".to_owned(), 30)));
         assert_eq!(kept.iter().filter(|(k, _)| k == "k3").count(), 1);
+
+        // Used again, an entry outlasts the ones kept after it.
+        assert_eq!(reuse_newest(&mut kept, "k2"), Some(2));
+        keep_newest(&mut kept, "k10".to_owned(), 10, 8);
+        assert!(kept.iter().any(|(k, _)| k == "k2"));
+        assert!(!kept.iter().any(|(k, _)| k == "k4"));
+        assert_eq!(reuse_newest(&mut kept, "gone"), None);
 
         let listing = Listing::of(ItemRef::Real(7), None, "SortName");
         assert_ne!(index_key(&listing, 1), index_key(&listing, 2));
