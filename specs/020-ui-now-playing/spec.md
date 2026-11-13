@@ -68,8 +68,10 @@ playing. The player has three views:
 Leaving the full view by navigating (the rail, a link, Back) puts the player in
 the view last used outside full, floating the first time. Starting something
 new from a library page (Play on a track, an episode or a film) while the
-player is floating or in the bar replaces what plays and keeps that view; it
-opens the full view only when no player was showing. The full view gains a
+player is floating or in the bar replaces what plays. A song keeps that view;
+a video (a film, an episode, any video) opens the full view, as does Resume
+on the video already in the compact player (B1411, V1381). With no player
+showing, anything opens the full view. The full view gains a
 Shrink button that swaps to that view and leaves the watch route as Back
 does (to the page before, else home), so the watch route is never left
 showing nothing; Full on the floating window or the bar returns to the watch
@@ -123,7 +125,8 @@ the tab. Hidden where the browser has no PiP.
   route's `remount_on` list, renders `WatchScreen` for that item. Play
   actions (library Play, a queue pick, Watch together, a group's next item)
   go through `NowPlaying::play(item)`, which keeps the current view when a
-  player is showing and opens the full view otherwise. Only the watch route
+  player is showing and opens the full view otherwise; a video someone
+  starts from a page opens the full view either way (B1411, V1381). Only the watch route
   reached directly (a typed URL, reload, Full) sets the full view; the route
   renders nothing itself.
 - **FR-002** The view is a class on the stage's wrapper. Changing it never
