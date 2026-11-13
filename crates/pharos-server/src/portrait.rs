@@ -206,7 +206,14 @@ impl DiskPortraits {
                 return Ok(portrait);
             }
         }
-        let portrait = self.inner.fetch(url).await?;
+        let portrait = match self.inner.fetch(url).await {
+            Ok(p) => p,
+            Err(miss) => {
+                metrics::counter!("pharos_portrait_cache_total", "outcome" => "fetch_failed")
+                    .increment(1);
+                return Err(miss);
+            }
+        };
         let outcome = match store(&self.dir, &path, &portrait).await {
             Ok(()) => "miss",
             Err(e) => {
