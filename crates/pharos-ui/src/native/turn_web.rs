@@ -12,20 +12,11 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{Document, Element, Event, HtmlCanvasElement, HtmlElement, HtmlVideoElement};
 
 use super::platform::{info, now_ms, warn};
-use super::turn::{face_transform, Direction, Step, Turn, FADE_MS, GIVE_UP_MS, START_DEG, TURN_MS};
+use super::turn::{
+    face_transform, Direction, Step, Turn, FADE_EASE, FADE_MS, GIVE_UP_MS, SNAPSHOT_MAX_WIDTH,
+    START_DEG, TICK_MS, TURNING_ATTR, TURN_EASE, TURN_MS,
+};
 use super::watch_view::VIDEO_ID;
-
-/// The old episode's still is drawn no wider than this: enough for a face
-/// that is turning away, cheap to draw from a 4K frame on a TV.
-const SNAPSHOT_MAX_WIDTH: u32 = 640;
-/// How often the caption and the give-up deadline are looked at.
-const TICK_MS: i32 = 250;
-/// Quick off the press, so it answers at once, then easing into flat.
-const TURN_EASE: &str = "cubic-bezier(.2,.7,.2,1)";
-const FADE_EASE: &str = "cubic-bezier(.4,0,.2,1)";
-/// The `<html>` attribute that hides the player's own spinner while the
-/// layer shows the load.
-const TURNING_ATTR: &str = "data-turning";
 
 type Listener = Closure<dyn FnMut(Event)>;
 
