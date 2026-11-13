@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::audio::DecodeError;
 use crate::line::LineSpans;
-use crate::offset::{estimate, shift};
+use crate::offset::{estimate, probe_windows, shift};
 use crate::plan::{stamps, window, Line, Stamp};
 use crate::text::words;
 
@@ -310,25 +310,46 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        if slot.model.is_none() {
-            let started = Instant::now();
-            let model = match (self.loader)() {
-                Ok(m) => m,
-                Err(e) => {
+        // The offset probes' windows are decoded on CPU threads while the
+        // model, if it was unloaded, loads on the GPU: neither waits on the
+        // other, and the first line is out by the slower of the two (B1414).
+        let windows = probe_windows(&lines);
+        let parent = tracing::Span::current();
+        let (loaded, probes) = std::thread::scope(|s| {
+            let load = slot.model.is_none().then(|| {
+                s.spawn(|| {
+                    let started = Instant::now();
+                    (self.loader)().map(|m| (m, started.elapsed()))
+                })
+            });
+            let probes = decode_probes(&self.decoder, full_path, &windows, &parent, s);
+            (load.map(std::thread::ScopedJoinHandle::join), probes)
+        });
+        if let Some(loaded) = loaded {
+            let model = match loaded {
+                Ok(Ok((m, took))) => {
+                    tracing::info!(
+                        load_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                        probes = windows.len(),
+                        "model loaded"
+                    );
+                    m
+                }
+                Ok(Err(e)) => {
                     let e = SongError::Internal(format!("model load failed: {e}"));
                     return (Err(e), None, None);
                 }
+                Err(_) => {
+                    let e = SongError::Internal("model load panicked".into());
+                    return (Err(e), None, None);
+                }
             };
-            tracing::info!(
-                load_ms = started.elapsed().as_millis() as u64,
-                "model loaded"
-            );
             slot.model = Some(model);
         }
         let result = match slot.model.as_deref_mut() {
             Some(model) => {
                 model.begin_song();
-                let r = run_song(model, &self.decoder, rel_path, full_path, lines, on);
+                let r = run_song(model, &self.decoder, rel_path, full_path, lines, probes, on);
                 let used = model.device();
                 (r, Some(used), model.end_song())
             }
@@ -352,36 +373,87 @@ fn probe_list(probes: &[Option<i64>]) -> String {
     format!("[{}]", items.join(", "))
 }
 
+/// One probe window decoded ahead of the offset estimate: its bounds, what
+/// the decoder gave, and how long that took.
+type Probe = ((i64, i64), Result<Vec<f32>, DecodeError>, u64);
+
+/// Every probe window decoded at once, one thread each: ffmpeg runs on CPU
+/// and the seven are independent, so together they take about as long as
+/// the slowest rather than the sum. A window that times out costs only that
+/// probe, and since all of them run together the wait is one timeout at most.
+fn decode_probes<'scope>(
+    decoder: &'scope Decoder,
+    path: &'scope Path,
+    windows: &'scope [(i64, i64)],
+    parent: &'scope tracing::Span,
+    s: &'scope std::thread::Scope<'scope, '_>,
+) -> Vec<Probe> {
+    let handles: Vec<_> = windows
+        .iter()
+        .map(|&(start, end)| {
+            s.spawn(move || {
+                let span = tracing::info_span!(
+                    parent: parent,
+                    "aligner.decode",
+                    stage = "probe",
+                    window_ms = end - start
+                );
+                let started = Instant::now();
+                let got = span.in_scope(|| decoder(path, start, end));
+                let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                ((start, end), got, took)
+            })
+        })
+        .collect();
+    handles
+        .into_iter()
+        .zip(windows)
+        .map(|(h, &bounds)| {
+            h.join().unwrap_or_else(|_| {
+                let e = DecodeError::Io(std::io::Error::other("probe decode panicked"));
+                (bounds, Err(e), 0)
+            })
+        })
+        .collect()
+}
+
 fn run_song(
     model: &mut dyn Model,
     decoder: &Decoder,
     rel_path: &str,
     full_path: &Path,
     lines: Vec<Line>,
+    probes: Vec<Probe>,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Aligned, SongError> {
     let mut phases = Phases::default();
     let path: PathBuf = full_path.to_owned();
+    // Summed over the probes, as the line decodes are, though they ran at once.
+    phases.decode_ms = probes.iter().map(|(_, _, took)| took).sum();
 
     // Probes are optional: a window ffmpeg cannot decode costs the song its
-    // offset, not its word times. After one timeout the rest are skipped, so
-    // seven of them cannot outlast the server's whole-song budget.
-    let mut probe_timed_out = false;
+    // offset, not its word times. They were decoded before the model was
+    // ready (see `decode_probes`); here each is handed over in the order the
+    // estimate asks for it.
+    let mut probes = probes.into_iter();
     let probe_phases = std::cell::RefCell::new(&mut phases);
     let decode_probe = |start: i64, end: i64| -> Result<Vec<f32>, SongError> {
-        if probe_timed_out {
-            return Ok(Vec::new());
-        }
-        let span = tracing::info_span!("aligner.decode", stage = "probe", window_ms = end - start);
-        let got = span.in_scope(|| {
-            let mut p = probe_phases.borrow_mut();
-            Phases::time(&mut p.decode_ms, || decoder(&path, start, end))
-        });
+        let got = match probes.next() {
+            Some((bounds, got, _)) if bounds == (start, end) => got,
+            // Not the window decoded for this probe: decode it now.
+            _ => {
+                let span =
+                    tracing::info_span!("aligner.decode", stage = "probe", window_ms = end - start);
+                span.in_scope(|| {
+                    let mut p = probe_phases.borrow_mut();
+                    Phases::time(&mut p.decode_ms, || decoder(&path, start, end))
+                })
+            }
+        };
         match got {
             Ok(pcm) => Ok(pcm),
             Err(e @ DecodeError::TimedOut { .. }) => {
-                probe_timed_out = true;
-                tracing::warn!(path = %rel_path, error = %e, "offset probe decode timed out; skipping the rest");
+                tracing::warn!(path = %rel_path, error = %e, "offset probe decode timed out");
                 Ok(Vec::new())
             }
             Err(e @ DecodeError::Failed { .. }) => {

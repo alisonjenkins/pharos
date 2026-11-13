@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pharos_align::audio::DecodeError;
@@ -191,27 +191,65 @@ fn a_probe_that_cannot_be_decoded_costs_only_the_offset() {
     assert!(got.answer.lines.iter().all(|l| !l.words.is_empty()));
 }
 
+/// Every probe is decoded at once, so a probe that times out costs only its
+/// own shift, and several that hang wait out one timeout together, not one
+/// after another (B1414).
 #[test]
-fn a_probe_that_times_out_skips_the_other_probes() {
-    let wide = Arc::new(Mutex::new(Vec::new()));
+fn probes_that_time_out_cost_only_the_offset_and_are_waited_on_together() {
+    let wide = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&wide);
     let hang: Decoder = Box::new(move |_: &Path, s, e| {
         if e - s > 10_000 {
-            calls.lock().unwrap().push(s);
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
             return Err(DecodeError::TimedOut {
-                after: Duration::from_secs(120),
+                after: Duration::from_millis(400),
                 start_ms: s,
                 end_ms: e,
             });
         }
         Ok(vec![0.0; 16])
     });
+    let started = std::time::Instant::now();
     let got = engine(hang)
         .align_song("a", Path::new("/a"), three_probe_lines(1000))
         .unwrap();
+    let took = started.elapsed();
     assert_eq!(got.answer.offset_ms, 0);
     assert!(got.answer.lines.iter().all(|l| !l.words.is_empty()));
-    assert_eq!(wide.lock().unwrap().len(), 1);
+    assert_eq!(wide.load(Ordering::SeqCst), 3);
+    // One after another the three would take 1.2 s.
+    assert!(took < Duration::from_millis(1_000), "{took:?}");
+}
+
+/// B1414, V1384: an unloaded model loads while the probes decode, so a cold
+/// song waits for the slower of the two, not both. Disarm check: with the
+/// load joined before the decodes start, this takes 0.8 s and fails.
+#[test]
+fn a_cold_model_loads_while_the_probes_decode() {
+    let slow_load: Loader = Box::new(|| {
+        std::thread::sleep(Duration::from_millis(400));
+        Ok(Box::new(Even {
+            fail_over: usize::MAX,
+            fatal: false,
+        }) as Box<dyn Model>)
+    });
+    let slow_wide: Decoder = Box::new(|_: &Path, s, e| {
+        if e - s > 10_000 {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        Ok(vec![0.0; 16])
+    });
+    let e = Engine::new(slow_load, slow_wide, None);
+    let started = std::time::Instant::now();
+    let got = e
+        .align_song("a", Path::new("/a"), three_probe_lines(1000))
+        .unwrap();
+    let took = started.elapsed();
+    assert!(got.answer.lines.iter().all(|l| !l.words.is_empty()));
+    // Load then the probes: 0.8 s even with the probes decoded together,
+    // 1.6 s with them in turn. Overlapped: about 0.4 s.
+    assert!(took < Duration::from_millis(700), "{took:?}");
 }
 
 /// Panics in the forward pass, poisoning the engine's lock.
