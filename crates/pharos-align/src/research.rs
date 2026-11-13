@@ -130,6 +130,29 @@ pub struct Open {
     pub scores: Vec<Option<f64>>,
 }
 
+impl Open {
+    /// Ends the run before line `next` (or the song's end), its audio
+    /// stopping at `end_ms`.
+    pub fn close(self, next: usize, end_ms: i64) -> Run {
+        Run {
+            lines: self.first..next,
+            window_ms: (self.start_ms, end_ms),
+            before: mean_score(&self.scores),
+        }
+    }
+}
+
+/// A closed weak run, ready to re-search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Run {
+    /// Line indices, empty lines inside included.
+    pub lines: Range<usize>,
+    /// The audio to search, in song milliseconds.
+    pub window_ms: (i64, i64),
+    /// Pass 1's mean score over the run's worded lines, untimed ones as 0.
+    pub before: f64,
+}
+
 /// A worded line is weak when it went untimed or scored below
 /// [`WEAK_SCORE`]; a timed line with no score (a model that gives none)
 /// is an anchor, so such a model never re-searches.

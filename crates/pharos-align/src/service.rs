@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::audio::DecodeError;
+use crate::ctc::Emission;
 use crate::line::LineSpans;
 use crate::offset::{estimate, shift};
 use crate::plan::{stamps, window, Line, Stamp};
-use crate::research::{self, Open, Outcome, RunCounts, RunReport};
+use crate::research::{self, Open, Outcome, Run, RunCounts, RunReport};
 use crate::text::words;
+use crate::tokens::CLASSES;
 
 /// Sent with every answer. The server keeps only answers at or above its
 /// minimum, so an aligner deployed after the server cannot pin old times.
@@ -452,10 +454,13 @@ fn run_song(
         let w_list = words(&line.text);
         if w_list.is_empty() {
             let done = LineWords::empty();
-            on(Progress::Line {
-                index,
-                words: &done,
-            });
+            // Inside an open run it waits, so lines are reported in order.
+            if open.is_none() {
+                on(Progress::Line {
+                    index,
+                    words: &done,
+                });
+            }
             out.push(done);
             continue;
         }
@@ -493,12 +498,7 @@ fn run_song(
                 })
                 .scores
                 .push(None);
-                let done = LineWords::empty();
-                on(Progress::Line {
-                    index,
-                    words: &done,
-                });
-                out.push(done);
+                out.push(LineWords::empty());
                 continue;
             }
             Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
@@ -510,7 +510,8 @@ fn run_song(
             words_aligned += w_list.len();
             prev_end_ms = last.start_ms;
         }
-        if research::is_weak(!line_stamps.is_empty(), spans.score) {
+        let weak = research::is_weak(!line_stamps.is_empty(), spans.score);
+        if weak {
             open.get_or_insert(Open {
                 first: index,
                 start_ms: anchor_end_ms,
@@ -520,7 +521,17 @@ fn run_song(
             .push(spans.score);
         } else {
             if let (Some(run), Some(first)) = (open.take(), line_stamps.first()) {
-                close_run(rel_path, run, index, first.start_ms, &mut runs);
+                let run = run.close(index, first.start_ms);
+                let got = re_search(model, decoder, &path, &lines, &run, &mut phases)?;
+                settle(
+                    rel_path,
+                    run,
+                    got,
+                    &mut out,
+                    &mut words_aligned,
+                    &mut runs,
+                    on,
+                );
             }
             let last_end = spans.times.last().map_or(0, |&(_, end)| end);
             anchor_end_ms = w_start + i64::try_from(last_end).unwrap_or(i64::MAX - w_start);
@@ -529,15 +540,28 @@ fn run_song(
             words: line_stamps,
             score: spans.score.and_then(round_score),
         };
-        on(Progress::Line {
-            index,
-            words: &done,
-        });
+        // A weak line waits for its run's verdict before it is reported.
+        if !weak {
+            on(Progress::Line {
+                index,
+                words: &done,
+            });
+        }
         out.push(done);
     }
     if let Some(run) = open.take() {
         let end_ms = lines.last().map_or(run.start_ms, |l| l.end_ms);
-        close_run(rel_path, run, lines.len(), end_ms, &mut runs);
+        let run = run.close(lines.len(), end_ms);
+        let got = re_search(model, decoder, &path, &lines, &run, &mut phases)?;
+        settle(
+            rel_path,
+            run,
+            got,
+            &mut out,
+            &mut words_aligned,
+            &mut runs,
+            on,
+        );
     }
     Ok(Aligned {
         answer: Answer {
@@ -553,18 +577,174 @@ fn run_song(
     })
 }
 
-/// Ends the weak run `run` before line `next` (or the song's end), whose
-/// audio stops at `end_ms`, and reports it.
-fn close_run(rel_path: &str, run: Open, next: usize, end_ms: i64, runs: &mut RunCounts) {
-    let report = RunReport {
-        lines: run.first..next,
-        window_ms: (run.start_ms, end_ms),
-        before: research::mean_score(&run.scores),
-        after: None,
-        outcome: Outcome::Skipped,
-        reason: "re-search off".into(),
+/// What re-searching one weak run found: its verdict and, when accepted,
+/// the run's worded lines re-timed.
+struct Researched {
+    after: Option<f64>,
+    outcome: Outcome,
+    reason: String,
+    lines: Vec<(usize, LineWords)>,
+}
+
+impl Researched {
+    fn kept(outcome: Outcome, reason: String) -> Self {
+        Self {
+            after: None,
+            outcome,
+            reason,
+            lines: Vec::new(),
+        }
+    }
+}
+
+/// Aligns every worded line of `run` at once over the audio between its
+/// anchors (B1402), ignoring their stamps, and keeps the result only when it
+/// beats pass 1 (V1372). A re-search that cannot run leaves pass 1 alone;
+/// only a fatal model error fails the song, as it would on the next line.
+fn re_search(
+    model: &mut dyn Model,
+    decoder: &Decoder,
+    path: &Path,
+    lines: &[Line],
+    run: &Run,
+    phases: &mut Phases,
+) -> Result<Researched, SongError> {
+    let (start, end) = run.window_ms;
+    let window_ms = end - start;
+    if window_ms > research::MAX_RUN_MS {
+        return Ok(Researched::kept(
+            Outcome::Skipped,
+            format!("window {window_ms} ms over {} ms", research::MAX_RUN_MS),
+        ));
+    }
+    if window_ms <= 0 {
+        return Ok(Researched::kept(
+            Outcome::Skipped,
+            format!("window {window_ms} ms empty"),
+        ));
+    }
+    let worded: Vec<(usize, Vec<_>)> = run
+        .lines
+        .clone()
+        .filter_map(|i| {
+            let w = words(&lines.get(i)?.text);
+            (!w.is_empty()).then_some((i, w))
+        })
+        .collect();
+    let span = tracing::info_span!("aligner.decode", stage = "run", window_ms);
+    let pcm =
+        match span.in_scope(|| Phases::time(&mut phases.decode_ms, || decoder(path, start, end))) {
+            Ok(pcm) => pcm,
+            Err(e) => return Ok(Researched::kept(Outcome::Failed, format!("decode: {e}"))),
+        };
+    let tokens: Vec<Vec<String>> = worded
+        .iter()
+        .map(|(_, w)| w.iter().map(|x| x.token.clone()).collect())
+        .collect();
+    let span = tracing::info_span!("aligner.model", stage = "run", lines = worded.len());
+    let got = span.in_scope(|| {
+        Phases::time(&mut phases.model_ms, || {
+            let Some(probs) = research::stitched(&pcm, |chunk| model.emission(chunk))? else {
+                return Ok(None);
+            };
+            let frames = probs.len() / CLASSES;
+            Ok(Some(Emission::new(&probs, frames, CLASSES).and_then(
+                |em| research::align_run(&em, pcm.len(), &tokens),
+            )))
+        })
+    });
+    let spans = match got {
+        Ok(Some(Ok(spans))) => spans,
+        Ok(Some(Err(e))) => return Ok(Researched::kept(Outcome::Failed, format!("ctc: {e}"))),
+        Ok(None) => {
+            return Ok(Researched::kept(
+                Outcome::Skipped,
+                "model gives no emission".into(),
+            ))
+        }
+        Err(ModelError::Line(e)) => {
+            return Ok(Researched::kept(Outcome::Failed, format!("emission: {e}")))
+        }
+        Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
+            return Err(SongError::Internal(e.to_string()))
+        }
     };
-    research::record(rel_path, &report, runs);
+    let scores: Vec<Option<f64>> = spans.iter().map(|s| s.score).collect();
+    let after = research::mean_score(&scores);
+    if !research::accept(run.before, after) {
+        return Ok(Researched {
+            after: Some(after),
+            outcome: Outcome::Rejected,
+            reason: format!(
+                "{after:.3} not {:.3} over {:.3}",
+                research::ACCEPT_MARGIN,
+                run.before
+            ),
+            lines: Vec::new(),
+        });
+    }
+    let lines = worded
+        .iter()
+        .zip(&spans)
+        .filter_map(|((i, w), s)| {
+            let words = stamps(&lines.get(*i)?.text, w, &s.times, start);
+            Some((
+                *i,
+                LineWords {
+                    words,
+                    score: s.score.and_then(round_score),
+                },
+            ))
+        })
+        .collect();
+    Ok(Researched {
+        after: Some(after),
+        outcome: Outcome::Accepted,
+        reason: format!(
+            "{after:.3} at least {:.3} over {:.3}",
+            research::ACCEPT_MARGIN,
+            run.before
+        ),
+        lines,
+    })
+}
+
+/// Applies a re-search's verdict to the run's lines, records it, and reports
+/// the run's held-back lines in order.
+fn settle(
+    rel_path: &str,
+    run: Run,
+    got: Researched,
+    out: &mut [LineWords],
+    words_aligned: &mut usize,
+    runs: &mut RunCounts,
+    on: &mut dyn FnMut(Progress<'_>),
+) {
+    // A timed line's stamps are one per word plus the line's end.
+    let timed = |l: &LineWords| l.words.len().saturating_sub(1);
+    for (i, done) in got.lines {
+        if let Some(slot) = out.get_mut(i) {
+            *words_aligned = *words_aligned - timed(slot) + timed(&done);
+            *slot = done;
+        }
+    }
+    research::record(
+        rel_path,
+        &RunReport {
+            lines: run.lines.clone(),
+            window_ms: run.window_ms,
+            before: run.before,
+            after: got.after,
+            outcome: got.outcome,
+            reason: got.reason,
+        },
+        runs,
+    );
+    for index in run.lines {
+        if let Some(done) = out.get(index) {
+            on(Progress::Line { index, words: done });
+        }
+    }
 }
 
 #[cfg(test)]
