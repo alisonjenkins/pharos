@@ -20,6 +20,7 @@ pub mod depth;
 pub mod diagnostics;
 pub mod favourites;
 pub mod find;
+pub mod grid_window;
 pub mod group_app;
 // 014: the network Together client, shared by the browser and the TV app.
 #[cfg(any(
