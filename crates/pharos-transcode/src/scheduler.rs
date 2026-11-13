@@ -883,6 +883,11 @@ enum SchedMsg {
     Snapshot {
         reply: oneshot::Sender<SchedSnapshot>,
     },
+    /// Where `stream`'s viewer is, as the playhead map holds it (V1365).
+    PlayheadOf {
+        stream: StreamKey,
+        reply: oneshot::Sender<Option<u32>>,
+    },
     /// What `stream` is waiting behind (038 FR-402).
     StreamWait {
         stream: StreamKey,
@@ -1617,6 +1622,20 @@ impl TranscodeScheduler {
         rx.await.ok()
     }
 
+    /// The segment `stream`'s viewer is at, or `None` when nothing has said
+    /// where it is (or the scheduler is gone).
+    pub async fn playhead(&self, stream: StreamKey) -> Option<u32> {
+        if stream == StreamKey::NONE {
+            return None;
+        }
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedMsg::PlayheadOf { stream, reply })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
     /// What `stream`'s viewer is waiting behind: its own queued client
     /// requests, everyone else's, and whether every device is full. `None`
     /// when the scheduler is gone.
@@ -2094,6 +2113,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 None
             };
             let _ = reply.send(dev);
+        }
+        SchedMsg::PlayheadOf { stream, reply } => {
+            let _ = reply.send(state.playheads.get(&stream).map(|&(seg, _)| seg));
         }
         SchedMsg::StreamWait { stream, reply } => {
             let now = Instant::now();
@@ -7623,6 +7645,22 @@ mod tests {
     /// Ordering is guaranteed without sleeping: `note_playhead` and `snapshot`
     /// travel the same mpsc, which the actor drains in order, so a snapshot
     /// taken after a send has necessarily seen it.
+    /// V1365 — the init route reads a stream's playhead to know which segment
+    /// to cut the init from; a stream with no reading answers `None`.
+    #[tokio::test]
+    async fn a_playhead_reads_back_for_its_stream_only() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(one_gpu(4), spawner, SchedConfig::default());
+        let stream = StreamKey::of("play-session-resumed");
+        assert_eq!(s.playhead(stream).await, None, "no reading yet");
+        s.note_playhead(stream, 40);
+        assert_eq!(s.playhead(stream).await, Some(40));
+        assert_eq!(s.playhead(StreamKey::of("another-session")).await, None);
+        assert_eq!(s.playhead(StreamKey::NONE).await, None);
+    }
+
     #[tokio::test]
     async fn a_hit_may_advance_a_playhead_but_never_drag_it_backwards() {
         let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
