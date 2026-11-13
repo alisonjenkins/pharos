@@ -657,6 +657,7 @@ pub async fn load<A: PharosApi>(
         .as_ref()
         .map_or_else(|| BROWSE_TITLE_FALLBACK.to_owned(), |d| d.item.name.clone());
     let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
+    let grid = |parent, group, sort| api.list(info, parent, group, sort, 0, GRID_PAGE);
     let paged = |more: Listing| async move { api.query(info, &more, 0, GRID_PAGE).await };
     let library = detail
         .as_ref()
@@ -678,8 +679,8 @@ pub async fn load<A: PharosApi>(
         }
         (Plan::MixedLibrary, _) => {
             let (series, stored) = try_join(
-                list(id, Some(ItemKind::Series), "SortName"),
-                list(id, None, "SortName"),
+                grid(id, Some(ItemKind::Series), "SortName"),
+                grid(id, None, "SortName"),
             )
             .await?;
             let chain = Chain {
@@ -698,8 +699,8 @@ pub async fn load<A: PharosApi>(
         }
         (Plan::MusicLibrary, _) => {
             let (artists, albums) = try_join(
-                list(id, Some(ItemKind::Artist), "SortName"),
-                list(id, Some(ItemKind::Album), "SortName"),
+                grid(id, Some(ItemKind::Artist), "SortName"),
+                grid(id, Some(ItemKind::Album), "SortName"),
             )
             .await?;
             Browse::Music {
@@ -1070,7 +1071,7 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
                 call,
                 &listing,
                 0,
-                BROWSE_PAGE,
+                GRID_PAGE,
                 |line| platform::warn(&line),
                 platform::report_event,
             )
@@ -2815,7 +2816,7 @@ fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element 
                 call,
                 &listing,
                 0,
-                BROWSE_PAGE,
+                GRID_PAGE,
                 |line| platform::warn(&line),
                 platform::report_event,
             )
