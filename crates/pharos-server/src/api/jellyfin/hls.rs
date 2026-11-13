@@ -4405,7 +4405,35 @@ pub(crate) fn prewarm_negotiated(state: &web::Data<AppState>, p: NegotiatedPrewa
         // item's own file and warms segments under the primary's key.
         p.media_source_id,
         super::items::query_param(url, "copy") == Some("1"),
+        qs_stereo_output(url.split_once('?').map_or("", |(_, q)| q)),
     );
+}
+
+/// The opts `fmp4_segment_opts` builds for the master, rebuilt from what the
+/// prewarm holds: a 3D source asked for as mono, an HDR source, a burned
+/// subtitle, or a size bound that shrinks the frame sends the master to the
+/// encode surface, which then wants warming.
+fn copy_prewarm_opts(
+    item: &pharos_core::MediaItem,
+    subtitle_stream_index: Option<u32>,
+    bitrate_cap: Option<u64>,
+    size_limits: pharos_transcode::SizeLimits,
+    session_burn: &std::collections::BTreeSet<u32>,
+    stereo_output: Option<pharos_transcode::StereoOutput>,
+) -> SegmentOpts {
+    let mut opts = fmp4_segment_opts_resolved(
+        item,
+        0,
+        SegmentVideo::H264,
+        subtitle_stream_index,
+        bitrate_cap,
+        Some(session_burn.clone()),
+    );
+    apply_output_size(&mut opts, &item.probe, size_limits, bitrate_cap.is_some());
+    if let Some(so) = stereo_output {
+        opts.stereo_output = so;
+    }
+    opts
 }
 
 /// Whether a prewarm may stand down because playback will start on the copy
@@ -4420,6 +4448,7 @@ async fn copy_prewarm_skip(
     bitrate_cap: Option<u64>,
     size_limits: pharos_transcode::SizeLimits,
     session_burn: &std::collections::BTreeSet<u32>,
+    stereo_output: Option<pharos_transcode::StereoOutput>,
 ) -> Option<String> {
     let surface = state.copy_surface.as_ref()?;
     if copy_source_blocker(
@@ -4432,20 +4461,14 @@ async fn copy_prewarm_skip(
     {
         return None;
     }
-    // The checks `copy_blocker` makes on the opts `fmp4_segment_opts` builds:
-    // a 3D or HDR source, a burned subtitle, or a size bound that shrinks the
-    // frame sends the master to the encode surface, which then wants warming.
-    // A subtitle the client renders itself, or a bound the source fits, does
-    // not.
-    let mut opts = fmp4_segment_opts_resolved(
+    let opts = copy_prewarm_opts(
         item,
-        0,
-        SegmentVideo::H264,
         subtitle_stream_index,
         bitrate_cap,
-        Some(session_burn.clone()),
+        size_limits,
+        session_burn,
+        stereo_output,
     );
-    apply_output_size(&mut opts, &item.probe, size_limits, bitrate_cap.is_some());
     if copy_opts_blocker(&opts).is_some() {
         return None;
     }
@@ -4491,6 +4514,7 @@ fn prewarm_cold_start(
     demuxed_cmaf: bool,
     media_source_id: Option<String>,
     copy_requested: bool,
+    stereo_output: Option<pharos_transcode::StereoOutput>,
 ) {
     if state.hls.is_none() {
         tracing::info!(
@@ -4534,6 +4558,7 @@ fn prewarm_cold_start(
                 min_opt(decision_video_cap(&session.decision), video_bitrate_cap),
                 size_limits,
                 &session.burn_subtitle_indices,
+                stereo_output,
             )
             .await
             {
@@ -6146,6 +6171,29 @@ mod tests {
         assert_eq!(
             copy_opts_blocker(&opts_with(shrinks)),
             Some(CopyBlocker::OutputSize)
+        );
+    }
+
+    // Spec 041 FR-007 — a `StereoMode=mono` request sends the master to the
+    // encode surface, so the prewarm must not skip its warm-up.
+    #[::core::prelude::v1::test]
+    fn a_mono_request_blocks_the_copy_prewarm_skip() {
+        use crate::copy_surface::CopyBlocker;
+        let item = item_with_video_codec(Some("h264"));
+        let opts = |so| {
+            copy_prewarm_opts(
+                &item,
+                None,
+                None,
+                pharos_transcode::SizeLimits::default(),
+                &Default::default(),
+                so,
+            )
+        };
+        assert_eq!(copy_opts_blocker(&opts(None)), None);
+        assert_eq!(
+            copy_opts_blocker(&opts(qs_stereo_output("StereoMode=mono"))),
+            Some(CopyBlocker::Stereo)
         );
     }
 
@@ -7876,6 +7924,7 @@ mod prewarm_edition_tests {
             true,
             None,
             false,
+            None,
         );
         let want = COLD_START_PREWARM_SEGS as usize;
         let warmed_names = warmed(&root, want).await;
@@ -7966,6 +8015,7 @@ mod prewarm_edition_tests {
                 pharos_jellyfin_api::dto::wire_item_id(7)
             )),
             false,
+            None,
         );
 
         let gen = format!(
