@@ -929,43 +929,35 @@ pub fn Rail(
     // On the home page a rail lower down draws no art until it, or the rail
     // above it, comes into view (B1374).
     let reach = try_use_context::<RailReach>();
-    let (row, id) = use_hook(|| {
-        let row = reach.map_or(0, |r| r.claim_row());
-        (
-            row,
-            format!(
-                "pharos-rail-{row}-{}",
-                RAIL_IDS.with(|n| n.replace(n.get() + 1))
-            ),
-        )
-    });
+    let row = use_hook(|| reach.map_or(0, |r| r.claim_row()));
     let near = reach.map_or(true, |r| row < (r.rows)());
     let mut watch = use_signal(|| None::<platform::SentinelWatch>);
-    {
-        let id = id.clone();
-        use_effect(move || {
-            let Some(mut r) = reach else { return };
-            if row < (r.rows)() {
-                watch.set(None);
-                return;
-            }
-            if watch.peek().is_none() {
-                let mut reveal = move || {
-                    let want = row + RAIL_ROWS_AHEAD;
-                    if *r.rows.peek() < want {
-                        r.rows.set(want);
-                    }
-                };
-                match platform::watch_sentinel(&[id.as_str()], reveal) {
-                    Some(w) => watch.set(Some(w)),
-                    // Nothing can say when it comes into view: draw it now.
-                    None => reveal(),
+    use_effect(move || {
+        let Some(mut r) = reach else { return };
+        if row < (r.rows)() {
+            watch.set(None);
+            return;
+        }
+        if watch.peek().is_none() {
+            let mut reveal = move || {
+                let want = row + 1;
+                if *r.rows.peek() < want {
+                    r.rows.set(want);
                 }
+            };
+            // The rail above coming into view loads this one too, ahead
+            // of it; its own coming into view covers a jump straight to it.
+            let above = home_rail_id(row.saturating_sub(1));
+            let own = home_rail_id(row);
+            match platform::watch_sentinel(&[above.as_str(), own.as_str()], reveal) {
+                Some(w) => watch.set(Some(w)),
+                // Nothing can say when it comes into view: draw it now.
+                None => reveal(),
             }
-        });
-    }
+        }
+    });
     rsx! {
-        section { class: "pharos-rail", id: "{id}",
+        section { class: "pharos-rail", id: reach.map(|_| home_rail_id(row)),
             h2 { class: "pharos-rail-title",
                 match link {
                     Some(to) => rsx! { Link { to, "{title}" } },
@@ -973,6 +965,16 @@ pub fn Rail(
                 }
             }
             ul { class: "pharos-rail-items",
+                // Draw every tile the unscrolled rail shows, however wide it is.
+                onmounted: move |e: MountedEvent| async move {
+                    let (Ok(rect), Ok(size)) = (e.get_client_rect().await, e.get_scroll_size().await) else {
+                        return;
+                    };
+                    let want = rail_art_reach(count, 0.0, rect.width() as i32, size.width as i32);
+                    if want > *shown.peek() {
+                        shown.set(want);
+                    }
+                },
                 onscroll: move |evt: ScrollEvent| {
                     let want = rail_art_reach(
                         count,
@@ -992,18 +994,19 @@ pub fn Rail(
     }
 }
 
-/// Tiles a rail draws art for before it is scrolled: a tile and its gap are
-/// at most 14rem, so twelve span 2688 px, wider than a 2560 px screen and so
-/// covering any unscrolled view. The rest load as the rail moves, instead of
-/// all at once with the page (B1374).
+/// Tiles a rail draws art for before its width is measured: a rail tile and
+/// its gap are 10rem, so twelve span 1920 px. Once mounted, the rail draws
+/// every tile its width shows plus [`RAIL_ART_AHEAD`]; the rest load as it
+/// moves, instead of all at once with the page (B1374).
 const RAIL_FIRST_ART: usize = 12;
 
-/// Rails on the home page that draw their art from the start, and how many
-/// rows past one coming into view load theirs: its own and the one below.
+/// Home rails that draw their art from the start; each one below draws its
+/// art once the rail above it comes into view.
 const RAIL_ROWS_AHEAD: usize = 2;
 
-thread_local! {
-    static RAIL_IDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+/// The element id of the home page's rail in `row`.
+fn home_rail_id(row: usize) -> String {
+    format!("pharos-home-rail-{row}")
 }
 
 /// The home page's rails in page order, and how many of them, from the top,
