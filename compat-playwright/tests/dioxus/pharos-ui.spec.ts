@@ -4438,7 +4438,9 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(lines.slice(before).some((l) => /ui_action|stage view=full/.test(l))).toBe(false);
   });
 
-  test("a Play while the player floats plays there and leaves the page alone", async ({
+  // A song started while the player is compact plays there and leaves the
+  // page alone; a film started that way opens full (V1381, B1411).
+  test("a film started while a song floats opens full; a song started then stays floating", async ({
     page,
     request,
   }) => {
@@ -4449,6 +4451,15 @@ test.describe("pharos Dioxus UI stage", () => {
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     const lines: string[] = [];
     page.on("console", (m) => lines.push(m.text()));
+    // On a miss, say what the stage became and what the page logged.
+    const explain = async (e: unknown): Promise<never> => {
+      const stage = await page
+        .locator(".pharos-stage")
+        .evaluateAll((els) => els.map((el) => `${el.className}: ${el.innerHTML.slice(0, 600)}`));
+      throw new Error(
+        `${e}\nurl=${page.url()}\nstage=${JSON.stringify(stage)}\nlog:\n${lines.slice(-40).join("\n")}`,
+      );
+    };
     await signIn(page);
 
     await openFirstHit(page, "carefree");
@@ -4457,35 +4468,44 @@ test.describe("pharos Dioxus UI stage", () => {
     await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
 
-    // A film from its title page: the page stays, the window plays it.
+    // A film from its title page opens full, on its own watch route.
     await openFirstHit(page, "Playwright");
     await expect(page).toHaveURL(/\/ui\/title\//);
-    const title = page.url();
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-    const video = page.locator(".pharos-stage.is-floating .pharos-watch video");
-    // On a miss, say what the stage became and what the page logged.
-    await expect(video, "the floating stage plays the film")
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video"), "the film opens full")
       .toBeVisible({ timeout: 15_000 })
-      .catch(async (e) => {
-        const stage = await page
-          .locator(".pharos-stage")
-          .evaluateAll((els) => els.map((el) => `${el.className}: ${el.innerHTML.slice(0, 600)}`));
-        throw new Error(
-          `${e}\nurl=${page.url()}\nstage=${JSON.stringify(stage)}\nlog:\n${lines.slice(-40).join("\n")}`,
-        );
-      });
+      .catch(explain);
+    await expect(page).toHaveURL(/\/ui\/watch\//);
     await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.2);
-    expect(page.url(), "the title page stays").toBe(title);
     expect(plays(lines)).toBe(2);
+    expect(lines.some((l) => /pharos: stage view=full item=\S+ reason=video_started/.test(l))).toBe(
+      true,
+    );
+
+    // Shrink the film, then start the song from its page: the window plays it.
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await openFirstHit(page, "carefree");
+    const songPage = page.url();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect
+      .poll(() => plays(lines), { message: "the song starts", timeout: 15_000 })
+      .toBe(3)
+      .catch(explain);
+    await expect(page.locator(".pharos-stage.is-floating"), "the window plays the song")
+      .toBeVisible()
+      .catch(explain);
+    await expect(page.locator(".pharos-stage.is-full")).toHaveCount(0);
+    expect(page.url(), "the song's page stays").toBe(songPage);
     expect(lines.some((l) => /pharos: stage view=floating item=\S+ reason=play/.test(l))).toBe(
       true,
     );
 
-    // Expand shows the film full, on its own watch route.
+    // Expand shows the song full, on its own watch route.
     await page.locator(".pharos-stage").getByRole("button", { name: "Expand" }).click();
-    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+    await expect(page.locator(".pharos-stage.is-full")).toBeVisible();
     await expect(page).toHaveURL(/\/ui\/watch\//);
-    expect(plays(lines), "expanding keeps the stream").toBe(2);
+    expect(plays(lines), "expanding keeps the stream").toBe(3);
   });
 
   // A video opens full-window, inside the browser window rather than in
