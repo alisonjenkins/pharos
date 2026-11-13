@@ -61,6 +61,18 @@ impl FileKey {
     }
 }
 
+/// `Ok` when the file at `key.path` is still the version `key` names.
+async fn still_version(key: &FileKey) -> Result<(), CopyError> {
+    let now = FileKey::of(&key.path).await?;
+    if now == *key {
+        return Ok(());
+    }
+    Err(CopyError::Changed(format!(
+        "indexed len {} mtime_ns {}, now len {} mtime_ns {}",
+        key.len, key.mtime_ns, now.len, now.mtime_ns
+    )))
+}
+
 /// One indexed source: the worker's verdict and the token that names its plan
 /// in every playlist and segment URL.
 #[derive(Debug)]
@@ -69,6 +81,9 @@ pub struct Indexed {
     /// Changes whenever the file or its plan does, so a segment URL from an
     /// older plan never reads a range of a newer one.
     pub token: String,
+    /// The file version the verdict was read from; a segment is served only
+    /// if the file still is that version once its packets are read.
+    key: FileKey,
 }
 
 /// Why the copy surface could not answer. Never cached: none of these says
@@ -85,6 +100,9 @@ pub enum CopyError {
     Source(String),
     #[error("read segment file: {0}")]
     Read(String),
+    /// The file is no longer the version its plan was indexed from.
+    #[error("source changed: {0}")]
+    Changed(String),
     #[error("copy surface is not available on this platform")]
     Unsupported,
 }
@@ -96,6 +114,7 @@ impl CopyError {
             Self::Worker(_) => "worker",
             Self::Source(_) => "source",
             Self::Read(_) => "read",
+            Self::Changed(_) => "changed",
             Self::Unsupported => "unsupported",
         }
     }
@@ -192,7 +211,11 @@ impl CopySurface {
                     "copy surface: source indexed, refused"
                 ),
             }
-            Ok(Arc::new(Indexed { verdict, token }))
+            Ok(Arc::new(Indexed {
+                verdict,
+                token,
+                key: key.clone(),
+            }))
         })
         .await
         .cloned()
@@ -226,6 +249,7 @@ impl CopySurface {
         let cell = Arc::new(OnceCell::new_with(Some(Arc::new(Indexed {
             verdict,
             token,
+            key: key.clone(),
         }))));
         self.verdicts
             .lock()
@@ -233,19 +257,25 @@ impl CopySurface {
             .insert(key, cell);
     }
 
-    /// Copy plan segment `index` and return its bytes.
+    /// Copy plan segment `index` of the file `indexed` was read from and
+    /// return its bytes. A file replaced while the worker read it fails with
+    /// [`CopyError::Changed`], even when the worker refused the new bytes, so
+    /// the new file is neither served under the old plan nor marked refused.
     pub async fn segment(
         &self,
-        path: &Path,
+        indexed: &Indexed,
         index: u32,
         segment: pharos_core::copy_plan::CopySegment,
         last: bool,
     ) -> Result<(Vec<u8>, CopySegmentReport), CopyError> {
+        let path = indexed.key.path.as_path();
         let n = self.next_file.fetch_add(1, Ordering::Relaxed);
         // Removes the file on every exit, including a client disconnect that
         // drops this future mid-await.
         let out = ScratchFile(self.scratch.path().join(format!("copy-{n}.m4s")));
-        let report = self.run_segment(path, index, segment, last, &out.0).await?;
+        let ran = self.run_segment(path, index, segment, last, &out.0).await;
+        still_version(&indexed.key).await?;
+        let report = ran?;
         let bytes = tokio::fs::read(&out.0)
             .await
             .map_err(|e| CopyError::Read(format!("{}: {e}", out.0.display())))?;
@@ -461,6 +491,19 @@ mod tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), CopyBlocker::ALL.len());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn a_file_replaced_after_its_index_is_not_the_indexed_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("source.mkv");
+        std::fs::write(&path, b"old bytes").expect("write source");
+        let indexed = FileKey::of(&path).await.expect("stat source");
+        still_version(&indexed).await.expect("unchanged file");
+        std::fs::write(&path, b"replacement bytes").expect("replace source");
+        let err = still_version(&indexed).await.expect_err("replaced file");
+        assert_eq!(err.label(), "changed", "{err}");
     }
 
     #[test]
