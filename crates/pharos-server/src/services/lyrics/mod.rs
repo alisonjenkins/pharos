@@ -432,6 +432,16 @@ pub struct WordsPending {
     pub eta_ms: Option<u32>,
 }
 
+/// Whether karaoke found a song's word times ready when it asked: the
+/// share answered `ready` is what aligning the next song ahead raises.
+fn count_words_answer(lookup: &align::Lookup) {
+    metrics::counter!(WORDS_TOTAL, "answer" => lookup.label()).increment(1);
+}
+
+/// Karaoke word-time asks by what they were answered, as
+/// [`align::Lookup::label`] names it.
+pub const WORDS_TOTAL: &str = "pharos_lyrics_words_total";
+
 /// A signed-in user's view of an item's lyrics. `Ok(None)` means the item has
 /// none, or is not a song. When `want_words` is true, word timestamps are
 /// filled in from an aligner when ready or flagged as pending.
@@ -462,6 +472,7 @@ pub async fn for_item(
             let lookup = tokio::task::spawn_blocking(move || aligner.words_for(&item, &asked))
                 .await
                 .unwrap_or(align::Lookup::Unavailable);
+            count_words_answer(&lookup);
             match lookup {
                 align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
                 // The lines timed so far, the rest still guessed by the
@@ -815,5 +826,43 @@ mod tests {
         let finder = LyricsFinder::with_online(online.clone());
         assert_eq!(finder.find(&item).await, None);
         assert_eq!(online.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// B1415, V1385: each karaoke word-time ask is counted by its answer, so
+    /// aligning the next song ahead shows as more `ready` first asks.
+    /// Disarm check: with the `counter!` in `count_words_answer` removed,
+    /// this fails.
+    #[test]
+    fn a_word_time_ask_is_counted_by_its_answer() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            count_words_answer(&align::Lookup::Pending(None));
+            count_words_answer(&align::Lookup::Pending(Some(5)));
+            count_words_answer(&align::Lookup::Unavailable);
+        });
+        let mut got: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == WORDS_TOTAL)
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == "answer")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default(),
+                    n,
+                )),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [("pending".to_owned(), 2), ("unavailable".to_owned(), 1)]
+        );
     }
 }
