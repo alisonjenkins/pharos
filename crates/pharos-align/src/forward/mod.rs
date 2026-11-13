@@ -139,6 +139,15 @@ impl Model for CpuAligner {
         spans(&logits, pcm.len(), tokens, lead_star)
     }
 
+    fn emission(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        if pcm.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(emission(
+            &self.forward(&[pcm]).pop().unwrap_or_default(),
+        )))
+    }
+
     fn align_many(
         &mut self,
         windows: &[(&[f32], &[String])],
@@ -226,6 +235,22 @@ impl Model for VulkanAligner {
         if pcm.is_empty() || tokens.is_empty() {
             return Ok(LineSpans::default());
         }
+        let logits = self.logits(pcm)?;
+        spans(&logits, pcm.len(), tokens, lead_star)
+    }
+
+    fn emission(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        if pcm.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(emission(&self.logits(pcm)?)))
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl VulkanAligner {
+    /// One forward pass, sampling the pool after it.
+    fn logits(&mut self, pcm: &[f32]) -> Result<Vec<f32>, ModelError> {
         let wave = normalise(pcm);
         let logits = tracing::info_span!(
             "aligner.forward",
@@ -238,7 +263,7 @@ impl Model for VulkanAligner {
         .in_scope(|| timed("vulkan", || self.model.logits(&wave)))
         .map_err(ModelError::Device)?;
         self.sample_pool();
-        spans(&logits, pcm.len(), tokens, lead_star)
+        Ok(logits)
     }
 }
 
