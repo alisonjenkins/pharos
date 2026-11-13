@@ -2551,7 +2551,8 @@ async fn vp9_audio_file(
         .and_then(|r| r.strip_suffix(".m4s"))
         .and_then(|r| r.parse::<u32>().ok())
         .unwrap_or(0);
-    let dir = cache
+    let is_init = name == "init.mp4";
+    let dir = match cache
         .ensure_audio_hls_covering(
             &item.path,
             item.edition.as_deref(),
@@ -2561,10 +2562,27 @@ async fn vp9_audio_file(
             want_seg,
         )
         .await
-        .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            if is_init {
+                record_init_served(
+                    "vp9-audio-init",
+                    InitTemp::Cold,
+                    InitFrom::Start,
+                    0,
+                    false,
+                    media_id,
+                    started,
+                );
+            }
+            return Err(error::ErrorInternalServerError(format!(
+                "audio session: {e}"
+            )));
+        }
+    };
     // `ensure` returns once the session is running, not once it has written, so
     // an init already on disk here was there before this request.
-    let is_init = name == "init.mp4";
     let init_temp = if is_init && cache.audio_hls_ready(&dir, &name).await {
         InitTemp::Warm
     } else {
