@@ -335,6 +335,14 @@ impl Stage {
         (before != (self.item, self.view)).then_some(self.view)
     }
 
+    /// The stage after a route change, when anything about it changed (the
+    /// view, the item or a pending lift), with the view change for the log.
+    pub fn routed(&self, route: &Route) -> Option<(Stage, Option<View>)> {
+        let mut next = self.clone();
+        let view = next.follow(route);
+        (next != *self).then_some((next, view))
+    }
+
     /// Signed in again: sign-in closed the player, so a watch route that
     /// never changed puts its item back. A player already on stage, or any
     /// other route, is left alone.
@@ -1169,9 +1177,12 @@ mod tests {
     fn leaving_the_page_before_a_started_video_mounts_keeps_the_bar() {
         let mut stage = video_in_bar(7);
         assert!(stage.takes(&Route::Watch(ItemRef::Real(8)), true));
-        assert_eq!(stage.follow(&Route::Find), None);
-        assert!(!stage.mounted(true));
-        assert_eq!(stage.view, View::Mini);
+        let Some((mut next, view)) = stage.routed(&Route::Find) else {
+            panic!("the cleared lift is a change the route effect keeps");
+        };
+        assert_eq!(view, None, "the view itself does not change");
+        assert!(!next.mounted(true));
+        assert_eq!(next.view, View::Mini);
     }
 
     #[test]

@@ -189,9 +189,11 @@ pub fn Root() -> Element {
     use_effect(move || {
         let at = route();
         super::report::note(&format!("route {}", at.path()));
-        let mut next = stage.peek().clone();
-        let item = next.item;
-        if let Some(view) = next.follow(&at) {
+        let item = stage.peek().item;
+        let Some((next, view)) = stage.peek().routed(&at) else {
+            return;
+        };
+        if let Some(view) = view {
             let view = if next.item.is_some() {
                 view.label()
             } else {
@@ -201,11 +203,8 @@ pub fn Root() -> Element {
                 "pharos: stage view={view} item={} reason=nav",
                 item.map(|i| i.to_string()).unwrap_or_default()
             ));
-            stage.set(next);
-        } else if next.lift != stage.peek().lift {
-            // Leaving the page before an asked video mounts cancels its lift.
-            stage.write().lift = next.lift;
         }
+        stage.set(next);
     });
     use_context_provider(|| {
         Nav(EventHandler::new(move |to: Route| {
