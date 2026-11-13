@@ -413,8 +413,16 @@ pub fn capabilities() -> Capabilities {
             .is_some_and(|v| !v.can_play_type(mime).is_empty())
     };
     let mse = |mime: &str| web_sys::MediaSource::is_type_supported(mime);
-    let mut caps =
+    let caps =
         super::playback::capabilities(|mime| (has_mse() && mse(mime)) || can_play(mime), can_play);
+    let ua = user_agent();
+    let (mut caps, dropped) = super::playback::drop_unplayable_video_codecs(caps, &ua);
+    if !dropped.is_empty() {
+        info(&format!(
+            "pharos: capabilities dropped video codecs the browser claims but does not play dropped={} user_agent={ua}",
+            dropped.join(",")
+        ));
+    }
     caps.hdr = prefers("(dynamic-range: high)");
     caps
 }
