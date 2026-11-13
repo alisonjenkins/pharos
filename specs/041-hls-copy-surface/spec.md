@@ -87,8 +87,9 @@ Everything else keeps today's encode surface, unchanged.
   - `GET /videos/{id}/h264copy/{seg}.m4s`
   - Each checks the play session like the other segment routes (ADR-0100, a new `GoneRoute`).
   - The playlist and segment URLs carry a plan token, so a changed source cannot be mixed with cached segments.
+  - A source replaced while a segment is read is checked once the packets are read: the segment answers 410 and the new file is not marked refused.
 - **FR-006**: The master playlist lists `h264copy` in place of the h264cmaf main variant when the session is eligible. The demuxed audio rendition and the downgrade rungs stay as they are.
-- **FR-007**: The cold-start prewarm and background prefetch start no GPU encodes for a copy session.
+- **FR-007**: The cold-start prewarm and background prefetch start no GPU encodes for a copy session. The prewarm judges eligibility with the master's own checks: the session's and the URL's cap folded together, blocking only below the source's bitrate, and a size bound only when it shrinks the frame.
 - **FR-008**: Each copy segment served logs one line: item, seg, packets, bytes, read_ms, plan token. Each refusal of eligibility logs one line with its reason.
 - **FR-009**: V30 is amended. Stream copy stays forbidden on every CLI-cut surface. It is allowed only on `h264copy`, whose packets are chosen by Pharos.
 
