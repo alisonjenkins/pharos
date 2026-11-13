@@ -3499,20 +3499,47 @@ async fn copy_blocker(
     item: &pharos_core::MediaItem,
     bitrate_cap: Option<u64>,
 ) -> Option<crate::copy_surface::CopyBlocker> {
-    use crate::copy_surface::CopyBlocker;
-    if !hls.parts.is_empty() {
-        return Some(CopyBlocker::SplitParts);
-    }
-    if hls.video_codec.as_deref() != Some("h264") {
-        return Some(CopyBlocker::Codec);
-    }
-    if bitrate_cap.is_some_and(|cap| hls.source_bitrate_bps.map_or(true, |src| cap < src)) {
-        return Some(CopyBlocker::BitrateCap);
+    if let Some(b) = copy_source_blocker(
+        !hls.parts.is_empty(),
+        hls.video_codec.as_deref(),
+        hls.source_bitrate_bps,
+        bitrate_cap,
+    ) {
+        return Some(b);
     }
     let sub = super::items::query_param(req.query_string(), "SubtitleStreamIndex")
         .and_then(|v| v.parse::<i64>().ok())
         .and_then(|i| u32::try_from(i).ok());
     let opts = fmp4_segment_opts(state, req, item, 0, SegmentVideo::H264, None, sub).await;
+    copy_opts_blocker(&opts)
+}
+
+/// The source facts that keep a session off the copy surface: one ladder
+/// over split parts, a codec other than H.264, or a cap below the source's
+/// bitrate (or a cap on a source of unknown bitrate).
+fn copy_source_blocker(
+    split_parts: bool,
+    video_codec: Option<&str>,
+    source_bitrate_bps: Option<u64>,
+    bitrate_cap: Option<u64>,
+) -> Option<crate::copy_surface::CopyBlocker> {
+    use crate::copy_surface::CopyBlocker;
+    if split_parts {
+        return Some(CopyBlocker::SplitParts);
+    }
+    if video_codec != Some("h264") {
+        return Some(CopyBlocker::Codec);
+    }
+    if bitrate_cap.is_some_and(|cap| source_bitrate_bps.map_or(true, |src| cap < src)) {
+        return Some(CopyBlocker::BitrateCap);
+    }
+    None
+}
+
+/// The encode options that keep a session off the copy surface: anything
+/// that changes the frames.
+fn copy_opts_blocker(opts: &SegmentOpts) -> Option<crate::copy_surface::CopyBlocker> {
+    use crate::copy_surface::CopyBlocker;
     if opts.burn_subtitle_stream_index.is_some() {
         return Some(CopyBlocker::Burn);
     }
@@ -4390,34 +4417,36 @@ async fn copy_prewarm_skip(
     state: &AppState,
     item: &pharos_core::MediaItem,
     subtitle_stream_index: Option<u32>,
-    video_bitrate_cap: Option<u64>,
+    bitrate_cap: Option<u64>,
     size_limits: pharos_transcode::SizeLimits,
     session_burn: &std::collections::BTreeSet<u32>,
 ) -> Option<String> {
     let surface = state.copy_surface.as_ref()?;
-    let plain = video_bitrate_cap.is_none()
-        && size_limits == pharos_transcode::SizeLimits::default()
-        && item.probe.parts().is_empty()
-        && item.probe.video_codec.as_deref() == Some("h264");
-    if !plain {
+    if copy_source_blocker(
+        !item.probe.parts().is_empty(),
+        item.probe.video_codec.as_deref(),
+        item.probe.bitrate_bps,
+        bitrate_cap,
+    )
+    .is_some()
+    {
         return None;
     }
-    // The same opts `copy_blocker` reads: a 3D or HDR source, or a burned
-    // subtitle, sends the master to the encode surface, which then wants
-    // warming. A subtitle the client renders itself does not.
-    let opts = fmp4_segment_opts_resolved(
+    // The checks `copy_blocker` makes on the opts `fmp4_segment_opts` builds:
+    // a 3D or HDR source, a burned subtitle, or a size bound that shrinks the
+    // frame sends the master to the encode surface, which then wants warming.
+    // A subtitle the client renders itself, or a bound the source fits, does
+    // not.
+    let mut opts = fmp4_segment_opts_resolved(
         item,
         0,
         SegmentVideo::H264,
         subtitle_stream_index,
-        None,
+        bitrate_cap,
         Some(session_burn.clone()),
     );
-    if opts.burn_subtitle_stream_index.is_some()
-        || opts.output_size.is_some()
-        || opts.stereo_output != pharos_transcode::options::StereoOutput::Preserve
-        || opts.tonemap != pharos_transcode::options::Tonemap::Off
-    {
+    apply_output_size(&mut opts, &item.probe, size_limits, bitrate_cap.is_some());
+    if copy_opts_blocker(&opts).is_some() {
         return None;
     }
     // The master stops waiting for the index after the same budget and serves
@@ -4501,7 +4530,8 @@ fn prewarm_cold_start(
                 &state,
                 &item,
                 subtitle_stream_index,
-                video_bitrate_cap,
+                // The master's cap: the session's, folded with the URL's.
+                min_opt(decision_video_cap(&session.decision), video_bitrate_cap),
                 size_limits,
                 &session.burn_subtitle_indices,
             )
@@ -6065,6 +6095,58 @@ mod tests {
             video_codec: Some("h264".into()),
             ..Default::default()
         }
+    }
+
+    // Spec 041 FR-007 — the master and the prewarm skip judge one predicate:
+    // a cap blocks copy only below the source's bitrate, or when the source's
+    // bitrate is unknown.
+    #[::core::prelude::v1::test]
+    fn a_cap_blocks_copy_only_below_the_source_bitrate() {
+        use crate::copy_surface::CopyBlocker;
+        let src = Some(4_000_000);
+        assert_eq!(copy_source_blocker(false, Some("h264"), src, None), None);
+        assert_eq!(
+            copy_source_blocker(false, Some("h264"), src, Some(10_000_000)),
+            None
+        );
+        assert_eq!(
+            copy_source_blocker(false, Some("h264"), src, Some(2_000_000)),
+            Some(CopyBlocker::BitrateCap)
+        );
+        assert_eq!(
+            copy_source_blocker(false, Some("h264"), None, Some(10_000_000)),
+            Some(CopyBlocker::BitrateCap)
+        );
+        assert_eq!(
+            copy_source_blocker(false, Some("hevc"), src, None),
+            Some(CopyBlocker::Codec)
+        );
+        assert_eq!(
+            copy_source_blocker(true, Some("h264"), src, None),
+            Some(CopyBlocker::SplitParts)
+        );
+    }
+
+    // Spec 041 FR-007 — a size bound the source already fits leaves copy on;
+    // one that shrinks the frame does not.
+    #[::core::prelude::v1::test]
+    fn a_size_bound_blocks_copy_only_when_it_shrinks_the_frame() {
+        use crate::copy_surface::CopyBlocker;
+        let item = item_with_video_codec(Some("h264"));
+        let opts_with = |limits| {
+            let cap = Some(10_000_000);
+            let mut opts =
+                fmp4_segment_opts_resolved(&item, 0, SegmentVideo::H264, None, cap, None);
+            apply_output_size(&mut opts, &item.probe, limits, true);
+            opts
+        };
+        let fits = pharos_transcode::SizeLimits::new(Some(1920), Some(1080));
+        assert_eq!(copy_opts_blocker(&opts_with(fits)), None);
+        let shrinks = pharos_transcode::SizeLimits::new(None, Some(720));
+        assert_eq!(
+            copy_opts_blocker(&opts_with(shrinks)),
+            Some(CopyBlocker::OutputSize)
+        );
     }
 
     // Spec 041 — a copy request the source cannot take keeps the encode
