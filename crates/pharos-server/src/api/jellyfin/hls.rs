@@ -4042,6 +4042,12 @@ fn prewarm_cold_start(
             );
             return;
         };
+        // V1365 — the init is cut from this stream's playhead. A prewarm whose
+        // segments are all cache hits never submits, so the submission's own
+        // seed would never land; say where the stream starts directly.
+        if let Some(sched) = state.transcode_scheduler.as_ref() {
+            sched.seed_playhead(stream, base);
+        }
         // The prewarm's whole value is that it covers the segment the client
         // asks for first, so which segments it chose — and why — is the thing
         // worth being able to query. Silent before: a prewarm warming the wrong
@@ -7503,6 +7509,42 @@ mod prewarm_edition_tests {
             init_source_segment(&state, &item, Some(other)).await,
             (0, InitFrom::Start),
             "a reading off the grid falls back to segment 0"
+        );
+    }
+
+    /// V1365 — the resume prewarm says where the stream starts even when the
+    /// scheduler never sees a submission from it (every segment a cache hit;
+    /// here the cache encodes without the scheduler), so the init request is
+    /// cut from the resume segment and not from an evicted segment 0.
+    #[actix_web::test]
+    async fn a_resume_prewarm_places_the_stream_without_submitting() {
+        use pharos_transcode::scheduler::{SchedConfig, TranscodeScheduler};
+        let sched = TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 1),
+            std::sync::Arc::new(pharos_transcode::worker::ProcSpawner::new()),
+            SchedConfig::default(),
+        );
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, _edition) = seed_with(td.path(), Some(sched.clone())).await;
+        let resume = 300_000_000_u64; // 30 s
+        let grant = native_grant(&state, resume).await;
+        let base = prewarm_base_segment(resume, Some(60_000), None).unwrap();
+        assert!(base > 0, "a resume starts past segment 0");
+        // The prewarm runs detached; its segments landing means it got past the seed.
+        let _ = warmed(&root, COLD_START_PREWARM_SEGS as usize).await;
+        let stream = StreamKey::of(&grant.play_session_id);
+        assert_eq!(sched.playhead(stream).await, Some(base));
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            init_source_segment(&state, &item, Some(&grant.play_session_id)).await,
+            (base, InitFrom::Playhead),
         );
     }
 
