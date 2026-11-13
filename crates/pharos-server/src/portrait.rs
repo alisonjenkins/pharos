@@ -175,6 +175,85 @@ impl PortraitSource for HttpPortraits {
     }
 }
 
+/// Portraits kept on disk under `dir`, fetched through `inner` only the first
+/// time (B1375). A title page's cast was fetched from the provider on every
+/// view, so each portrait cost a provider round trip behind
+/// [`MAX_IN_FLIGHT`] slots.
+pub struct DiskPortraits {
+    dir: std::path::PathBuf,
+    inner: std::sync::Arc<dyn PortraitSource>,
+}
+
+impl DiskPortraits {
+    pub fn new(dir: std::path::PathBuf, inner: std::sync::Arc<dyn PortraitSource>) -> Self {
+        Self { dir, inner }
+    }
+
+    /// The file a portrait of `url` is kept in: a hash of the url, so any
+    /// url maps to a plain file name.
+    fn path(&self, url: &str) -> std::path::PathBuf {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(url.as_bytes());
+        let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        self.dir.join(name)
+    }
+
+    async fn get(&self, url: &str) -> Result<Portrait, PortraitMiss> {
+        let path = self.path(url);
+        if let Ok(stored) = tokio::fs::read(&path).await {
+            if let Some(portrait) = decode(&stored) {
+                metrics::counter!("pharos_portrait_cache_total", "outcome" => "hit").increment(1);
+                return Ok(portrait);
+            }
+        }
+        let portrait = self.inner.fetch(url).await?;
+        let outcome = match store(&self.dir, &path, &portrait).await {
+            Ok(()) => "miss",
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "portrait: could not keep on disk");
+                "write_failed"
+            }
+        };
+        metrics::counter!("pharos_portrait_cache_total", "outcome" => outcome).increment(1);
+        Ok(portrait)
+    }
+}
+
+impl PortraitSource for DiskPortraits {
+    fn fetch<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Portrait, PortraitMiss>> {
+        Box::pin(self.get(url))
+    }
+}
+
+/// A kept portrait: its content type, a newline, then its bytes.
+fn encode(p: &Portrait) -> Vec<u8> {
+    let mut out = Vec::with_capacity(p.content_type.len() + 1 + p.bytes.len());
+    out.extend_from_slice(p.content_type.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(&p.bytes);
+    out
+}
+
+fn decode(stored: &[u8]) -> Option<Portrait> {
+    let at = stored.iter().position(|&b| b == b'\n')?;
+    let content_type = std::str::from_utf8(&stored[..at]).ok()?;
+    if !content_type.starts_with("image/") {
+        return None;
+    }
+    Some(Portrait {
+        content_type: content_type.to_string(),
+        bytes: stored[at + 1..].to_vec(),
+    })
+}
+
+/// Write through a temporary name, so a reader never sees half a file.
+async fn store(dir: &std::path::Path, path: &std::path::Path, p: &Portrait) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    tokio::fs::write(&tmp, encode(p)).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +304,40 @@ mod tests {
         assert_eq!(waited.err(), Some(PortraitMiss::Busy));
         drop(held);
         assert!(take_slot(&slots, Duration::from_millis(10)).await.is_ok());
+    }
+
+    /// B1375 / V1345: a kept portrait is served from disk; the provider is
+    /// asked once per url.
+    #[tokio::test]
+    async fn a_kept_portrait_is_fetched_from_the_provider_once() -> std::io::Result<()> {
+        let td = tempfile::TempDir::new()?;
+        let counting = std::sync::Arc::new(Counting(AtomicUsize::new(0)));
+        let disk = DiskPortraits::new(td.path().join("portraits"), counting.clone());
+        let url = "https://image.tmdb.org/t/p/w185/a.jpg";
+        for _ in 0..3 {
+            let got = fetch(&disk, url).await;
+            assert_eq!(got.map(|p| p.bytes), Some(vec![1, 2, 3]));
+        }
+        assert_eq!(
+            counting.0.load(Ordering::SeqCst),
+            1,
+            "fetched upstream once"
+        );
+        let other = fetch(&disk, "https://image.tmdb.org/t/p/w185/b.jpg").await;
+        assert!(other.is_some());
+        assert_eq!(counting.0.load(Ordering::SeqCst), 2, "a new url is fetched");
+        Ok(())
+    }
+
+    #[test]
+    fn a_kept_portrait_round_trips_and_junk_is_refused() {
+        let p = Portrait {
+            content_type: "image/jpeg".into(),
+            bytes: vec![b'\n', 0, 255],
+        };
+        assert_eq!(decode(&encode(&p)), Some(p));
+        assert_eq!(decode(b"text/html\n<html>"), None);
+        assert_eq!(decode(b"no newline"), None);
     }
 
     #[test]
