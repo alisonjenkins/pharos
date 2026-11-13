@@ -1707,14 +1707,24 @@ fn PagedGrid(
         });
     });
 
-    // Where each section starts, and the genres for the filter bar.
+    // Where each section starts, and the genres for the filter bar: kept
+    // from the last time this listing was open, until the library changes,
+    // so coming back to the grid does not wait on it again (B1417).
     let indexed = source.clone();
+    let revision = try_use_context::<super::live::LibraryRev>();
     let index = use_resource(move || {
         let listing = indexed.clone();
+        let key = index_key(&listing, revision.map_or(0, |r| (r.0)()));
         async move {
+            if let Some(kept) = kept_index(&key) {
+                return Some(kept);
+            }
             let api = ctx.api.peek().clone()?;
             match api.index(&call("browse", "index"), &listing).await {
-                Ok(index) => Some(index),
+                Ok(index) => {
+                    keep_index(key, index.clone());
+                    Some(index)
+                }
                 Err(e) => {
                     platform::warn(&format!(
                         "pharos: browse {} index failed: {e}",
@@ -2133,6 +2143,43 @@ pub fn arrival_pull(tile: (f64, f64, f64, f64), view: (f64, f64)) -> (f64, f64, 
         0.0
     };
     (dx, dy, share)
+}
+
+/// How many listings' indexes are kept (B1417): a few libraries and the
+/// orders and filters last used in them.
+const KEPT_INDEXES: usize = 8;
+
+/// Each listing's index as last fetched, most recent last.
+static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::new(Vec::new());
+
+/// The key a listing's index is kept under: the listing and the library
+/// revision it was fetched at, so a library change fetches it again.
+fn index_key(listing: &Listing, revision: u32) -> String {
+    format!("{revision} {listing:?}")
+}
+
+fn kept_index(key: &str) -> Option<ListIndex> {
+    let kept = INDEXES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, index)| index.clone())
+}
+
+fn keep_index(key: String, index: ListIndex) {
+    let mut kept = INDEXES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    keep_newest(&mut kept, key, index, KEPT_INDEXES);
+}
+
+/// Puts `value` under `key` as the newest of at most `most` entries.
+fn keep_newest<V>(kept: &mut Vec<(String, V)>, key: String, value: V, most: usize) {
+    kept.retain(|(k, _)| *k != key);
+    kept.push((key, value));
+    let over = kept.len().saturating_sub(most);
+    kept.drain(..over);
 }
 
 /// The keys of a windowed grid's spacers, apart from any tile's id.
@@ -4594,6 +4641,27 @@ mod tests {
     /// FR-210: a failed paging step says why beside its retry.
     /// B1405, V1375: a TV's grid steps by whole rows of 4, 6, 8 or 12, and by
     /// fewer tiles than a browser's.
+    #[test]
+    fn a_kept_index_is_dropped_by_age_and_by_a_library_change() {
+        let mut kept = Vec::new();
+        for n in 0..10 {
+            keep_newest(&mut kept, format!("k{n}"), n, 8);
+        }
+        let keys: Vec<_> = kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"]);
+        // Kept again, it is the newest, once.
+        keep_newest(&mut kept, "k3".to_owned(), 30, 8);
+        assert_eq!(kept.last(), Some(&("k3".to_owned(), 30)));
+        assert_eq!(kept.iter().filter(|(k, _)| k == "k3").count(), 1);
+
+        let listing = Listing::of(ItemRef::Real(7), None, "SortName");
+        assert_ne!(index_key(&listing, 1), index_key(&listing, 2));
+        let key = index_key(&listing, 1);
+        keep_index(key.clone(), ListIndex::default());
+        assert_eq!(kept_index(&key), Some(ListIndex::default()));
+        assert_eq!(kept_index(&index_key(&listing, 2)), None);
+    }
+
     #[test]
     fn a_tv_grid_steps_by_fewer_whole_rows() {
         let tv = grid_page(true);
