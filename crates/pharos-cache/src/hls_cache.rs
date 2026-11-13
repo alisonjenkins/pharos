@@ -1893,8 +1893,6 @@ impl SegmentIdentity {
         let size = output_size
             .map(|s| format!("_{}x{}", s.width(), s.height()))
             .unwrap_or_default();
-        // Only a burning rendition's quiet segments get a new name; every other
-        // segment keeps its file, so the deploy does not empty the cache.
         let quiet = if *quiet_burn { "_bq" } else { "" };
         format!(
             "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}{size}{quiet}.ts",
@@ -2444,6 +2442,11 @@ impl std::fmt::Debug for HlsSegmentCache {
 // NVENC-produced init and fail to decode, delivered as a 200. The bias itself
 // is a pure function of the rendition — see `DeviceTable::rendition_device` —
 // but the RULE changing is exactly what these bumps exist for.
+// 19 (B1400): before `quiet_burn` joined `SegmentIdentity`, a burning
+// rendition's quiet segment and a plain rendition's segment shared one file,
+// encoded on whichever device got there first. Nothing on disk says which
+// files hold the burning encode, and a browser holds those URLs for a year,
+// so every segment cached under 18 is dropped, server side and client side.
 //
 // The price is one cold cache after this deploy. The alternative is #114 fired
 // once per moved rendition during the transition, delivered as a 200.
@@ -2453,7 +2456,7 @@ impl std::fmt::Debug for HlsSegmentCache {
 /// generation's init (see `hls::rendition_qs`). That property is what makes
 /// this re-land safe where the first attempt was not: the bump is now visible
 /// to the CLIENT cache, not only to the server's.
-pub const HLS_GEN_VERSION: u32 = 18;
+pub const HLS_GEN_VERSION: u32 = 19;
 /// How long a generation subtree must go untouched before it is reclaimed.
 ///
 /// Sized against a ROLLING UPDATE, not against disk pressure: while the new
