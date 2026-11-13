@@ -841,30 +841,49 @@ pub(crate) async fn embedded_ass_script(
     stream_index: u32,
     permit: &BgPermit,
 ) -> Result<Vec<u8>, actix_web::Error> {
-    let input = item
-        .path
-        .to_str()
-        .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
+    let started = std::time::Instant::now();
+    let (temp, result) = embedded_ass_inner(cache, item, stream_index, permit).await;
+    record_extract("ass", temp, result.is_ok(), stream_index, started);
+    result
+}
+
+async fn embedded_ass_inner(
+    cache: Option<&pharos_cache::SubtitleCache>,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+    permit: &BgPermit,
+) -> (ExtractTemp, Result<Vec<u8>, actix_web::Error>) {
+    let Some(input) = item.path.to_str() else {
+        return (
+            ExtractTemp::Cold,
+            Err(error::ErrorInternalServerError("non-utf8 path")),
+        );
+    };
     let mtime = mtime_secs(&item.path).await;
-    if let Some(cache) = cache {
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
-            .await
-        {
-            return Ok((*bytes).clone());
-        }
-        let lock = cache
-            .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
-            .await;
-        let _guard = lock.lock().await;
-        if let Some(bytes) = cache
-            .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
-            .await
-        {
-            return Ok((*bytes).clone());
-        }
-        let out = run_ffmpeg_embedded_ass(input, stream_index, permit).await?;
-        let stored = cache
+    let Some(cache) = cache else {
+        return (
+            ExtractTemp::Cold,
+            run_ffmpeg_embedded_ass(input, stream_index, permit).await,
+        );
+    };
+    if let Some(bytes) = cache
+        .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+        .await
+    {
+        return (ExtractTemp::Warm, Ok((*bytes).clone()));
+    }
+    let lock = cache
+        .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+        .await;
+    let _guard = lock.lock().await;
+    if let Some(bytes) = cache
+        .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
+        .await
+    {
+        return (ExtractTemp::Coalesced, Ok((*bytes).clone()));
+    }
+    let result = match run_ffmpeg_embedded_ass(input, stream_index, permit).await {
+        Ok(out) => Ok((*cache
             .store(
                 &item.path,
                 mtime,
@@ -872,10 +891,11 @@ pub(crate) async fn embedded_ass_script(
                 SubtitleKind::EmbeddedAss,
                 out,
             )
-            .await;
-        return Ok((*stored).clone());
-    }
-    run_ffmpeg_embedded_ass(input, stream_index, permit).await
+            .await)
+            .clone()),
+        Err(e) => Err(e),
+    };
+    (ExtractTemp::Cold, result)
 }
 
 /// Pre-extract every text subtitle track of `item` into the subtitle cache so
@@ -2989,9 +3009,23 @@ mod tests {
                 // Not stored, and the stub source is no media file: ffmpeg runs
                 // and fails. The outcome is not the point, the temperature is.
                 let _ = embedded_vtt(Some(&cache), &item, 4, &permit).await;
+                cache
+                    .store(
+                        &path,
+                        mtime,
+                        3,
+                        SubtitleKind::EmbeddedAss,
+                        b"[Script Info]\n".to_vec(),
+                    )
+                    .await;
+                let warm = embedded_ass_script(Some(&cache), &item, 3, &permit)
+                    .await
+                    .unwrap();
+                assert_eq!(warm, b"[Script Info]\n");
+                let _ = embedded_ass_script(Some(&cache), &item, 4, &permit).await;
             })
         });
-        let count = |temp: &str| -> u64 {
+        let count = |kind: &str, temp: &str| -> u64 {
             snapshotter
                 .snapshot()
                 .into_vec()
@@ -3005,7 +3039,7 @@ mod tests {
                     match v {
                         DebugValue::Counter(n)
                             if k.name() == "pharos_subtitle_extract_total"
-                                && has("kind=vtt")
+                                && has(&format!("kind={kind}"))
                                 && has(&format!("temp={temp}")) =>
                         {
                             Some(n)
@@ -3015,16 +3049,18 @@ mod tests {
                 })
                 .sum()
         };
-        assert_eq!(
-            count("warm"),
-            1,
-            "pharos_subtitle_extract_total{{temp=warm}}"
-        );
-        assert_eq!(
-            count("cold"),
-            1,
-            "pharos_subtitle_extract_total{{temp=cold}}"
-        );
+        for kind in ["vtt", "ass"] {
+            assert_eq!(
+                count(kind, "warm"),
+                1,
+                "pharos_subtitle_extract_total{{kind={kind},temp=warm}}"
+            );
+            assert_eq!(
+                count(kind, "cold"),
+                1,
+                "pharos_subtitle_extract_total{{kind={kind},temp=cold}}"
+            );
+        }
     }
 
     /// B600: `pharos_subtitle_delivery_total` labels are a dashboard
