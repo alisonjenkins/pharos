@@ -244,6 +244,9 @@ pub struct AppState {
     /// verify. Off by default: the verdict is counted either way, and the
     /// operator turns this on once the counts show clients send good tags.
     pub image_tags_enforced: bool,
+    /// Spec 041 — the `h264copy` surface. `None` while `[server].hls_copy_surface`
+    /// is off: the master then never offers it (V1435).
+    pub copy_surface: Option<Arc<crate::copy_surface::CopySurface>>,
     pub server_name: String,
     pub version: &'static str,
     /// Configured media roots — same list the CLI `pharos scan`
@@ -801,6 +804,7 @@ impl AppState {
             server_id: Uuid::new_v4().simple().to_string(),
             image_tag_key: fresh_image_tag_key(),
             image_tags_enforced: false,
+            copy_surface: None,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
@@ -947,6 +951,7 @@ impl AppState {
             server_id,
             image_tag_key,
             image_tags_enforced: false,
+            copy_surface: None,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,

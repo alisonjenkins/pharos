@@ -19,6 +19,7 @@ pub mod client_ip;
 pub mod client_reports;
 pub mod client_spans;
 pub mod config;
+pub mod copy_surface;
 pub mod dlna;
 pub(crate) mod episode_fit;
 pub mod group_ops;
