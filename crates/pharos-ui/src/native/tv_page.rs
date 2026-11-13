@@ -592,7 +592,6 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__OVERLAYS__", OVERLAYS)
         .replace("__GRID__", GRID)
         .replace("__REMOTE_SLIDERS__", REMOTE_SLIDERS)
-        .replace("__TURN__", &super::tv_turn::turn_script())
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -1408,11 +1407,6 @@ mod tests {
         assert_eq!(bridge_script("__OVERLAYS__"), OVERLAYS);
         // B1330: the seek bar is a remote stop that scrubs.
         assert_eq!(bridge_script("__REMOTE_SLIDERS__"), REMOTE_SLIDERS);
-        // B1412 / V1382: the bridge brings the episode turn into the page.
-        assert_eq!(
-            bridge_script("__TURN__"),
-            super::super::tv_turn::turn_script()
-        );
         assert_eq!(
             REMOTE_SLIDERS,
             format!("#{}", crate::native::watch_view::SEEK_ID)
