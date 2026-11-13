@@ -3738,7 +3738,7 @@ async fn h264copy_segment(
     );
     let last = seg as usize + 1 == segments.len();
     let started = std::time::Instant::now();
-    match surface.segment(&item.path, seg, range, last).await {
+    match surface.segment(&indexed, seg, range, last).await {
         Ok((bytes, report)) => {
             let elapsed = started.elapsed();
             crate::copy_surface::record_segment("served", "ok", elapsed);
@@ -3783,6 +3783,11 @@ async fn h264copy_segment(
                         },
                     )
                     .await;
+            }
+            // The plan this URL names no longer matches the file, as when the
+            // token check fails: the client refetches the playlist.
+            if let crate::copy_surface::CopyError::Changed(_) = &e {
+                return Err(error::ErrorGone("copy plan changed"));
             }
             Err(error::ErrorInternalServerError(format!(
                 "copy seg {seg}: {e}"
