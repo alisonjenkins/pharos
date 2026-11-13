@@ -182,6 +182,7 @@ async fn play_negotiates_and_reports_progress() {
         max_bitrate: 0,
         hdr: true,
         image_subtitles: Vec::new(),
+        copy_surface: false,
     };
     let detail = api
         .detail(&call, ItemRef::Real(MOVIE))

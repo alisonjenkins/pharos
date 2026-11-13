@@ -1411,6 +1411,17 @@ pub(crate) fn resolve_audio_pick(
     }
 }
 
+/// `url` with `copy=1` when the player takes the H.264 copy surface and this
+/// server serves it (spec 041). The master still decides per source; without
+/// both, the URL is unchanged, so its master stays byte-identical (V1435).
+fn with_copy_opt_in(url: String, player_takes: bool, server_serves: bool) -> String {
+    if !(player_takes && server_serves) || !url.contains("/master.m3u8") {
+        return url;
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}copy=1")
+}
+
 /// What a native player says it can play (`Playback.negotiate`).
 #[derive(Debug, Default, Clone)]
 pub struct Capabilities {
@@ -1424,6 +1435,8 @@ pub struct Capabilities {
     pub hdr: bool,
     /// Image subtitle codecs the player draws from extracted PNGs (spec 019).
     pub image_subtitles: Vec<String>,
+    /// The player takes the H.264 copy surface (spec 041).
+    pub copy_surface: bool,
 }
 
 impl Capabilities {
@@ -1854,9 +1867,15 @@ pub async fn grant(
                 },
             );
             delivery_renditions = d.renditions;
-            d.transcoding_url
+            let url = d
+                .transcoding_url
                 .and_then(|url| ensure_audio_index_param(Some(url), audio.index))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            with_copy_opt_in(
+                url,
+                r.capabilities.copy_surface,
+                state.copy_surface.is_some(),
+            )
         }
     };
     let holder = pharos_core::SessionHolder {
@@ -2658,6 +2677,7 @@ mod native_max_bitrate_tests {
             max_bitrate,
             hdr: true,
             image_subtitles: vec![],
+            copy_surface: false,
         }
     }
 
@@ -2771,5 +2791,35 @@ mod split_film_tests {
             DirectPlayBlock::SplitFilm { parts: 3 }
         );
         assert!(split.direct_play_block.to_string().contains('3'));
+    }
+}
+
+#[cfg(test)]
+mod copy_opt_in_tests {
+    use super::with_copy_opt_in;
+
+    const MASTER: &str = "/videos/9/master.m3u8?PlaySessionId=p&renditions=h264";
+
+    // V1435 — the URL only changes when the player takes the copy surface AND
+    // this server serves it.
+    #[test]
+    fn the_stream_url_asks_for_copy_only_when_both_sides_agree() {
+        assert_eq!(
+            with_copy_opt_in(MASTER.into(), true, true),
+            format!("{MASTER}&copy=1")
+        );
+        assert_eq!(with_copy_opt_in(MASTER.into(), true, false), MASTER);
+        assert_eq!(with_copy_opt_in(MASTER.into(), false, true), MASTER);
+        assert_eq!(with_copy_opt_in(MASTER.into(), false, false), MASTER);
+    }
+
+    #[test]
+    fn only_an_hls_master_url_asks_for_copy() {
+        let audio = "/audio/9/universal?PlaySessionId=p".to_owned();
+        assert_eq!(with_copy_opt_in(audio.clone(), true, true), audio);
+        assert_eq!(
+            with_copy_opt_in("/videos/9/master.m3u8".into(), true, true),
+            "/videos/9/master.m3u8?copy=1"
+        );
     }
 }
