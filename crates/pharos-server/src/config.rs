@@ -511,6 +511,11 @@ pub struct ServerConfig {
     /// so turn this on once `invalid` and `absent` have gone quiet.
     #[serde(default)]
     pub image_tags_enforced: bool,
+    /// Spec 041 / ADR-0123 — serve an eligible H.264 source's video unchanged
+    /// on the `h264copy` surface to a client that asks for it, instead of
+    /// re-encoding it. Off by default until it is proven on the TV.
+    #[serde(default)]
+    pub hls_copy_surface: bool,
     /// Soft cap on the extracted-image cache (posters / backdrops / thumbs /
     /// scaled sidecar artwork / chapter thumbs), in bytes. `0` = unbounded
     /// (no janitor — the historical behaviour). When non-zero a periodic

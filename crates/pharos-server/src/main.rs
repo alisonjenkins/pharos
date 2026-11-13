@@ -1634,6 +1634,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
     state.image_tags_enforced = cfg.server.image_tags_enforced;
+    // Spec 041 — the copy surface reads on a pool of its own, so a playback's
+    // segment never waits behind a trickplay or subtitle sweep.
+    #[cfg(unix)]
+    if cfg.server.hls_copy_surface {
+        let bin = pharos_transcode::worker::ProcSpawner::new()
+            .worker_bin()
+            .to_path_buf();
+        let pool = pharos_transcode::worker::LibavWorkerPool::new(
+            bin,
+            pharos_server::copy_surface::COPY_POOL_WORKERS,
+        )
+        .with_idle_timeout(Some(
+            pharos_transcode::worker::libav_pool::DEFAULT_IDLE_TIMEOUT,
+        ));
+        match pharos_server::copy_surface::CopySurface::new(pool, &std::env::temp_dir()) {
+            Ok(surface) => state.copy_surface = Some(std::sync::Arc::new(surface)),
+            Err(error) => tracing::error!(
+                %error,
+                dir = %std::env::temp_dir().display(),
+                "h264 copy surface off: scratch directory not created"
+            ),
+        }
+    }
+    tracing::info!(
+        enabled = state.copy_surface.is_some(),
+        "h264 copy surface (spec 041)"
+    );
     tracing::info!(
         enforced = state.image_tags_enforced,
         "image tag check for anonymous image requests (ADR-0073)"
