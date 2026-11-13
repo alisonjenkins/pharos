@@ -16,6 +16,8 @@ pub mod audio_features;
 pub mod backend;
 pub mod burned_text;
 pub mod capability;
+pub mod copy_fmp4;
+pub mod copy_surface;
 pub mod deep_check;
 pub mod device;
 pub mod fingerprint;
