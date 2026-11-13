@@ -6454,6 +6454,55 @@ fn Player(
             })));
         }
     });
+    // Karaoke times the queue's next song while this one plays, so it starts
+    // with its word times rather than waiting on the aligner (B1415). Asking
+    // for its lyrics with words queues the job; the answer is not kept.
+    let asked_ahead = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
+    use_effect({
+        let id = p.detail.item.id;
+        move || {
+            if !audio {
+                return;
+            }
+            let settled = match &*lyrics.read() {
+                None => false,
+                Some(Ok(Some(l))) if l.words_pending => aligned
+                    .read()
+                    .as_ref()
+                    .is_some_and(|(at, a)| *at == id && !a.words_pending),
+                Some(_) => true,
+            };
+            let next = queue.read().next();
+            let Some(ahead) = super::lyrics::align_ahead(
+                super::listen::karaoke_on(),
+                id,
+                settled,
+                next,
+                asked_ahead.get(),
+            ) else {
+                return;
+            };
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            asked_ahead.set(Some(ahead));
+            spawn(async move {
+                match api
+                    .lyrics(&call("watch", "lyrics ahead"), ahead, true)
+                    .await
+                {
+                    Ok(l) => platform::info(&format!(
+                        "pharos: karaoke align ahead item={ahead} lines={} pending={}",
+                        l.lines.len(),
+                        l.words_pending
+                    )),
+                    Err(e) => platform::warn(&format!(
+                        "pharos: karaoke align ahead item={ahead} failed: {e}"
+                    )),
+                }
+            });
+        }
+    });
 
     let stop = {
         let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
