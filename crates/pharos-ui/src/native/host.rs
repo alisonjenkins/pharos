@@ -511,6 +511,22 @@ pub fn on_scroll_settled(_on_settled: impl FnMut() + 'static) -> ScrollWatch {
     ScrollWatch
 }
 
+/// The grid keeps every tile in the page here: only the TV keeps just the
+/// rows near the screen (B1406).
+pub const WINDOWED_GRID: bool = false;
+
+pub struct GridViewWatch;
+
+pub fn on_grid_view(_on_view: impl FnMut(super::grid_window::GridView) + 'static) -> GridViewWatch {
+    GridViewWatch
+}
+
+pub fn grid_seq() -> u64 {
+    0
+}
+
+pub fn measure_grid() {}
+
 pub fn center_child(_id: &str, _at: u32) -> bool {
     false
 }

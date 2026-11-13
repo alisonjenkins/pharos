@@ -3166,6 +3166,22 @@ pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch 
     }
 }
 
+/// The browser keeps every tile of a grid in the page: only the TV keeps
+/// just the rows near the screen (B1406).
+pub const WINDOWED_GRID: bool = false;
+
+pub struct GridViewWatch;
+
+pub fn on_grid_view(_on_view: impl FnMut(super::grid_window::GridView) + 'static) -> GridViewWatch {
+    GridViewWatch
+}
+
+pub fn grid_seq() -> u64 {
+    0
+}
+
+pub fn measure_grid() {}
+
 /// Scroll the element `id` so its child at `at` sits in the middle of it.
 /// The element must be the children's offset parent (`position: relative`).
 /// False when there is no such child yet.

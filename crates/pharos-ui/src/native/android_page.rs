@@ -1218,7 +1218,7 @@ pub fn tile_in_view(_at: u32) -> bool {
 /// (B1028). The page answers later, so this says `true`: the grid asks only
 /// for a tile it has rendered, and a miss is logged here instead.
 pub fn scroll_to_tile(at: u32) -> bool {
-    let script = tv_page::scroll_to_tile_js(at);
+    let script = tv_page::scroll_to_tile_js(at, next_grid_seq());
     spawn_detached(async move {
         match page_eval(&script).join::<bool>().await {
             Ok(true) => log::debug!("pharos: grid jump tile={at} placed=true"),
@@ -1263,7 +1263,7 @@ pub fn stage_arrival(_again: bool) {}
 /// The page answers later: true means asked, and a tile not in the page
 /// logs `placed=false`.
 pub fn scroll_tile_to(at: u32, top: f64) -> bool {
-    let script = tv_page::scroll_tile_to_js(at, top);
+    let script = tv_page::scroll_tile_to_js(at, top, next_grid_seq());
     spawn_detached(async move {
         match page_eval(&script).join::<bool>().await {
             Ok(placed) => log::info!(
@@ -1295,6 +1295,43 @@ impl Drop for ScrollWatch {
 /// stands, after its scroll or focus settles (FR-603).
 pub fn on_scroll_settled(on_settled: impl FnMut() + 'static) -> ScrollWatch {
     ScrollWatch(listen(Listener::Settled(Box::new(on_settled))))
+}
+
+/// The TV keeps only a browse grid's rows near the screen in the page
+/// (B1406): a whole library's tiles and posters cost the Shield a second
+/// to mount and over 100 MB.
+pub const WINDOWED_GRID: bool = true;
+
+/// A listener for the browse grid's geometry, removed on drop.
+pub struct GridViewWatch(u64);
+
+impl Drop for GridViewWatch {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_view` each time the bridge reports where the browse grid on the
+/// page shown stands, as it scrolls (B1406).
+pub fn on_grid_view(on_view: impl FnMut(super::grid_window::GridView) + 'static) -> GridViewWatch {
+    GridViewWatch(listen(Listener::Grid(Box::new(on_view))))
+}
+
+/// The last placement asked of the grid; geometry measured after the page
+/// carried it out reports it or a later one.
+static GRID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn grid_seq() -> u64 {
+    GRID_SEQ.load(Ordering::Relaxed)
+}
+
+fn next_grid_seq() -> u64 {
+    GRID_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
+/// Asks the page where the browse grid stands now.
+pub fn measure_grid() {
+    run(tv_page::MEASURE_GRID_JS.to_owned());
 }
 
 /// Scrolls the panel `id` so its child `at` sits in the middle (the lyrics'
@@ -2117,6 +2154,8 @@ enum Listener {
     Hidden(Box<dyn FnMut()>),
     /// The browse grid's place settled (`GRID_PLACE`).
     Settled(Box<dyn FnMut()>),
+    /// The browse grid's geometry, as it scrolls.
+    Grid(Box<dyn FnMut(super::grid_window::GridView)>),
     /// The remote's next or previous key; true when a player took it.
     Skip(Box<dyn FnMut(super::watch_view::Skip, &'static str) -> bool>),
 }
@@ -2380,17 +2419,19 @@ const gridPlace = () => {
   placeTimer = setTimeout(() => {
     const grid = document.querySelector('__GRID__');
     if (!grid) return;
-    const tiles = [...grid.children];
+    // Only some of the tiles are in the page (B1406): each says its place.
+    const tiles = [...grid.querySelectorAll(":scope > [data-at]")];
     const at = document.activeElement;
     let i = at && grid.contains(at) ? tiles.findIndex((t) => t.contains(at)) : -1;
     if (i < 0) i = tiles.findIndex((t) => t.getBoundingClientRect().bottom > 0);
     if (i < 0) return;
-    send({ t: "place", path: location.pathname + location.search, tile: i,
+    send({ t: "place", path: location.pathname + location.search, tile: +tiles[i].dataset.at,
       top: tiles[i].getBoundingClientRect().top });
   }, 150);
 };
 addEventListener("scroll", gridPlace, { passive: true });
 addEventListener("focusin", gridPlace);
+__GRID_VIEW__
 // Back closes an open dialog or menu before it goes back a page (FR-607),
 // with the Escape each of them already closes on. One that is still open
 // at the next Back, with no key pressed between, does not close on Escape:
@@ -2672,6 +2713,18 @@ fn on_bridge(message: Bridge) {
                 if let Ok(mut f) = f.try_lock() {
                     if let Listener::Settled(f) = &mut f.0 {
                         f();
+                    }
+                }
+            }
+        }
+        Bridge::Grid { path, view } => {
+            if path != current_path() {
+                return;
+            }
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Grid(f) = &mut f.0 {
+                        f(view);
                     }
                 }
             }
