@@ -232,24 +232,27 @@ impl PortraitSource for DiskPortraits {
     }
 }
 
-/// A kept portrait: its content type, a newline, then its bytes.
+/// A kept portrait: its content type, a space, its length, a newline, then
+/// its bytes. The length lets a truncated file read as absent.
 fn encode(p: &Portrait) -> Vec<u8> {
-    let mut out = Vec::with_capacity(p.content_type.len() + 1 + p.bytes.len());
-    out.extend_from_slice(p.content_type.as_bytes());
-    out.push(b'\n');
+    let header = format!("{} {}\n", p.content_type, p.bytes.len());
+    let mut out = Vec::with_capacity(header.len() + p.bytes.len());
+    out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&p.bytes);
     out
 }
 
 fn decode(stored: &[u8]) -> Option<Portrait> {
     let at = stored.iter().position(|&b| b == b'\n')?;
-    let content_type = std::str::from_utf8(&stored[..at]).ok()?;
-    if !content_type.starts_with("image/") {
+    let (content_type, len) = std::str::from_utf8(&stored[..at]).ok()?.split_once(' ')?;
+    let bytes = &stored[at + 1..];
+    let whole = len.parse::<usize>().ok() == Some(bytes.len());
+    if !content_type.starts_with("image/") || bytes.is_empty() || !whole {
         return None;
     }
     Some(Portrait {
         content_type: content_type.to_string(),
-        bytes: stored[at + 1..].to_vec(),
+        bytes: bytes.to_vec(),
     })
 }
 
@@ -343,8 +346,11 @@ mod tests {
             bytes: vec![b'\n', 0, 255],
         };
         assert_eq!(decode(&encode(&p)), Some(p));
-        assert_eq!(decode(b"text/html\n<html>"), None);
+        assert_eq!(decode(b"text/html 6\n<html>"), None);
         assert_eq!(decode(b"no newline"), None);
+        assert_eq!(decode(b"image/jpeg 0\n"), None, "empty");
+        assert_eq!(decode(b"image/jpeg 9\n\xff\xd8"), None, "truncated");
+        assert_eq!(decode(b"image/jpeg\n\xff\xd8"), None, "no length");
     }
 
     #[test]
