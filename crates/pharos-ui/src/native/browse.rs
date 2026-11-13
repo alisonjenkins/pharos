@@ -1823,9 +1823,11 @@ fn PagedGrid(
             Some(c) => c.shown(state.items()).len(),
             None => state.items().len(),
         };
+        // A held arrow crosses rows faster than a page loads, so the TV asks
+        // further ahead than the browser's sentinel (B1418).
         let sentinel = state
             .has_more()
-            .then(|| shown.saturating_sub(SENTINEL_LEAD));
+            .then(|| shown.saturating_sub(WINDOWED_LEAD));
         if sentinel.is_some_and(|s| kept.to > s) {
             requests.send(Ask::Next(Trigger::Scroll));
         }
@@ -2144,6 +2146,11 @@ pub fn arrival_pull(tile: (f64, f64, f64, f64), view: (f64, f64)) -> (f64, f64, 
     };
     (dx, dy, share)
 }
+
+/// How many tiles past those kept a TV grid asks for its next page (B1418):
+/// two pages, about two seconds of a held arrow at 9 across. Pages past
+/// the screen add no tiles to the page, so loading them early is cheap.
+const WINDOWED_LEAD: usize = 2 * GRID_PAGE as usize;
 
 /// How many listings' indexes are kept (B1417): a few libraries and the
 /// orders and filters last used in them.
