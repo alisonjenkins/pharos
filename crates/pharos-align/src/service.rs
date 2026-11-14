@@ -107,6 +107,13 @@ pub trait Model: Send {
         Ok(None)
     }
 
+    /// [`Model::emission`] for the recogniser's stages, which run on the
+    /// GPU only (V1409): a model with a CPU pass behind it answers a GPU
+    /// failure with an error instead of falling back.
+    fn emission_gpu_only(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        self.emission(pcm)
+    }
+
     /// Called before each song's first window.
     fn begin_song(&mut self) {}
 
@@ -757,7 +764,7 @@ fn improve(
                     if Instant::now() >= deadline {
                         return Err("stopped at the deadline".to_owned());
                     }
-                    let e = model.emission(chunk).map_err(|e| e.to_string())?;
+                    let e = model.emission_gpu_only(chunk).map_err(|e| e.to_string())?;
                     // The stages run on the GPU only (V1409): a model that
                     // fell to the CPU mid-song fails the stage rather than
                     // running the rest of it there.

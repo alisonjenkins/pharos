@@ -400,6 +400,74 @@ fn an_emission_that_falls_back_to_the_cpu_fails_the_stage() {
     assert_eq!(events.len(), 3);
 }
 
+/// Today's windows work on the GPU; its emission meets a lost device.
+struct LostOnEmission;
+
+impl Model for LostOnEmission {
+    fn align(&mut self, _: &[f32], tokens: &[String], _: bool) -> Result<LineSpans, ModelError> {
+        Ok((0..tokens.len() as u64)
+            .map(|i| (i * 100, (i + 1) * 100))
+            .collect::<Vec<_>>()
+            .into())
+    }
+
+    fn emission(&mut self, _: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        Err(ModelError::Device("device lost".into()))
+    }
+
+    fn device(&self) -> DeviceUsed {
+        DeviceUsed {
+            device: "vulkan",
+            reason: "scripted".into(),
+        }
+    }
+}
+
+#[test]
+fn a_gpu_emission_that_fails_fails_the_stage_without_the_cpu_pass() {
+    use pharos_align::forward::fallback::Fallback as GpuOrCpu;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (sung, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard,
+        slow: Duration::ZERO,
+    };
+    let cpu_loads = Arc::new(AtomicUsize::new(0));
+    let loads = Arc::clone(&cpu_loads);
+    let sung = Arc::new(sung);
+    let loader: Loader = Box::new(move || {
+        let loads = Arc::clone(&loads);
+        let sung = Arc::clone(&sung);
+        Ok(Box::new(GpuOrCpu::new(
+            Box::new(LostOnEmission),
+            Box::new(move || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Singer {
+                    sung: Some((*sung).clone()),
+                    device: "cpu",
+                    falls_back: false,
+                }) as Box<dyn Model>)
+            }),
+        )) as Box<dyn Model>)
+    });
+    let (got, _) = run(&Engine::new(loader, silent(), None).with_stages(Box::new(stages)));
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::EmissionFailed));
+    assert!(
+        got.fallback_reason.contains("device lost"),
+        "{}",
+        got.fallback_reason
+    );
+    assert_eq!(words(&got), words(&before));
+    assert_eq!(
+        cpu_loads.load(Ordering::SeqCst),
+        0,
+        "the CPU pass was built"
+    );
+}
+
 #[test]
 fn a_song_past_its_stage_budget_keeps_todays_answer_and_says_where_it_stopped() {
     let (sung, _) = song();
