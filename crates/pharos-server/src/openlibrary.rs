@@ -1,13 +1,16 @@
-//! A book's subjects from Open Library (ADR-0129, spec 043).
+//! A book's subjects and description from Open Library (ADR-0129, spec 043;
+//! descriptions ADR-0135).
 //!
-//! Asked only for a book whose own file gave no usable subject. Two rungs:
+//! Asked only for a book whose own file gave no usable subject or no
+//! description. Two rungs:
 //!
 //! 1. By ISBN: `/isbn/{isbn}.json` names the edition's works; the first
-//!    work's `/works/{id}.json` carries `subjects`.
+//!    work's `/works/{id}.json` carries `subjects` and `description`.
 //! 2. By title and author: `/search.json`, five results at most. A result is
 //!    used only when its normalised title equals the book's and one of its
 //!    author names shares a word with the book's author. A wrong shelf looks
-//!    deliberate, so anything less is a miss.
+//!    deliberate, so anything less is a miss. A match's work is then read
+//!    for its description, which search results do not carry.
 //!
 //! Only the title, author and ISBN leave the server, under a User-Agent with
 //! no contact address ([`USER_AGENT`]). Requests are at most one per
@@ -51,7 +54,7 @@ const MIN_AUTHOR_WORD: usize = 3;
 /// person: no contact address, no host name.
 pub fn user_agent() -> String {
     format!(
-        "pharos/{} (self-hosted media server; book subjects)",
+        "pharos/{} (self-hosted media server; book subjects and descriptions)",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -181,6 +184,8 @@ pub enum Lookup {
     /// The book was found; `subjects` may still be empty.
     Found {
         subjects: Vec<String>,
+        /// The work's description as Open Library wrote it, when it has one.
+        description: Option<String>,
         via: Via,
         /// The work's key (`/works/OL…W`), for the log.
         work: String,
@@ -247,6 +252,24 @@ struct KeyRef {
 struct Work {
     #[serde(default)]
     subjects: Vec<String>,
+    #[serde(default)]
+    description: Option<TextValue>,
+}
+
+/// A work's text field: a plain string, or `{"type": "/type/text", "value": …}`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TextValue {
+    Plain(String),
+    Typed { value: String },
+}
+
+impl TextValue {
+    fn into_text(self) -> Option<String> {
+        let (Self::Plain(s) | Self::Typed { value: s }) = self;
+        let s = s.trim().to_owned();
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,12 +450,21 @@ impl<F: Fetch> OpenLibrary<F> {
         else {
             return Ok(None);
         };
-        let subjects = match self.get_json::<Work>(&format!("{work}.json"), &[]).await? {
-            Some(w) if !w.subjects.is_empty() => w.subjects,
-            _ => edition.subjects,
-        };
+        let (subjects, description) =
+            match self.get_json::<Work>(&format!("{work}.json"), &[]).await? {
+                Some(w) => (
+                    if w.subjects.is_empty() {
+                        edition.subjects
+                    } else {
+                        w.subjects
+                    },
+                    w.description.and_then(TextValue::into_text),
+                ),
+                None => (edition.subjects, None),
+            };
         Ok(Some(Lookup::Found {
             subjects,
+            description,
             via: Via::Isbn,
             work,
         }))
@@ -464,11 +496,19 @@ impl<F: Fetch> OpenLibrary<F> {
             .into_iter()
             .find(|d| is_confident_match(q, d) && valid_work_key(&d.key))
         {
-            Some(doc) => Ok(Lookup::Found {
-                subjects: doc.subject,
-                via: Via::Search,
-                work: doc.key,
-            }),
+            Some(doc) => {
+                let description = self
+                    .get_json::<Work>(&format!("{}.json", doc.key), &[])
+                    .await?
+                    .and_then(|w| w.description)
+                    .and_then(TextValue::into_text);
+                Ok(Lookup::Found {
+                    subjects: doc.subject,
+                    description,
+                    via: Via::Search,
+                    work: doc.key,
+                })
+            }
             None => Ok(Lookup::NoMatch {
                 reason: format!("none of {seen} search results matched title and author"),
             }),
@@ -555,7 +595,9 @@ pub(crate) mod tests {
     const EDITION: &str = r#"{"title":"Synthetic Book","works":[{"key":"/works/OL1W"}],
         "isbn_13":["9780000000002"]}"#;
     const WORK: &str = r#"{"title":"Synthetic Book","key":"/works/OL1W",
-        "subjects":["Rust (Computer program language)","Accessible book"]}"#;
+        "subjects":["Rust (Computer program language)","Accessible book"],
+        "description":{"type":"/type/text","value":"  A synthetic book about synthetic things.  "}}"#;
+    const WORK_2: &str = r#"{"key":"/works/OL2W","description":"A plain-string description."}"#;
     const SEARCH: &str = r#"{"numFound":2,"docs":[
         {"key":"/works/OL9W","title":"Synthetic Book","author_name":["Other Person"],
          "subject":["Cooking"]},
@@ -584,6 +626,7 @@ pub(crate) mod tests {
                     "Rust (Computer program language)".into(),
                     "Accessible book".into()
                 ],
+                description: Some("A synthetic book about synthetic things.".into()),
                 via: Via::Isbn,
                 work: "/works/OL1W".into(),
             }
@@ -595,11 +638,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_unknown_isbn_falls_back_to_a_confident_search() {
-        let fetch = FakeFetch::default().on("/search.json", ok(SEARCH));
+        let fetch = FakeFetch::default()
+            .on("/search.json", ok(SEARCH))
+            .on("/works/OL2W.json", ok(WORK_2));
         let c = client(fetch);
         let got = c.lookup(&query(Some("9780000000002"))).await.unwrap();
         let Lookup::Found {
             subjects,
+            description,
             via,
             work,
         } = got
@@ -614,6 +660,11 @@ pub(crate) mod tests {
         assert_eq!(
             subjects.first().map(String::as_str),
             Some("Machine learning")
+        );
+        assert_eq!(
+            description.as_deref(),
+            Some("A plain-string description."),
+            "a search match's work is read for its description"
         );
         let search = c
             .fetch
@@ -660,7 +711,7 @@ pub(crate) mod tests {
             c.lookup(&query(None)).await.unwrap(),
             Lookup::Found { .. }
         ));
-        assert_eq!(c.fetch.asked().len(), 2);
+        assert_eq!(c.fetch.asked().len(), 3, "two searches, then the work");
 
         let fetch = FakeFetch::default()
             .on("/search.json", status(503, ""))
