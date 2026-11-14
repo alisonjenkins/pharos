@@ -3475,11 +3475,13 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
 #[component]
 pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     let total_ms: u64 = tracks.items.iter().map(|t| t.runtime_ms).sum();
+    let audiobook = detail.item.audiobook;
+    let part = if audiobook { "part" } else { "track" };
     let facts: Vec<String> = [
         detail.item.year.map(|y| y.to_string()),
         Some(match tracks.total {
-            1 => "1 track".to_owned(),
-            n => format!("{n} tracks"),
+            1 => format!("1 {part}"),
+            n => format!("{n} {part}s"),
         }),
         runtime(total_ms),
     ]
@@ -3502,12 +3504,18 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     } else {
         Vec::new()
     };
-    // Play opens the first song: an album folder can also hold a clip.
-    let first_song = tracks
-        .items
-        .iter()
-        .find(|t| t.kind == ItemKind::Audio)
-        .map(|t| t.id);
+    // Play opens the first song: an album folder can also hold a clip. An
+    // audiobook opens where the listener left it (V1403).
+    let first_song = if audiobook {
+        super::audiobook::resume_track(&tracks.items).map(|t| t.id)
+    } else {
+        tracks
+            .items
+            .iter()
+            .find(|t| t.kind == ItemKind::Audio)
+            .map(|t| t.id)
+    };
+    let resumes = audiobook && tracks.items.iter().any(|t| t.position_ms > 0 || t.played);
     let lead = (!tracks.items.is_empty()).then(|| {
         rsx! {
             if let Some(first) = first_song {
@@ -3516,6 +3524,7 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                     name: detail.item.name.clone(),
                     first,
                     tracks: whole.clone(),
+                    resume: resumes,
                 }
             }
             QueueButtons {
@@ -3575,7 +3584,15 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 /// whole album, fetched when the page holds only part of it) and plays the
 /// first of them.
 #[component]
-fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) -> Element {
+fn AlbumPlay(
+    album: ItemRef,
+    name: String,
+    first: ItemRef,
+    tracks: Vec<Item>,
+    /// An audiobook already begun: Play says Resume (ADR-0132).
+    #[props(default)]
+    resume: bool,
+) -> Element {
     let queue = try_use_context::<QueueCtx>().map(|q| q.0);
     let mix = try_use_context::<MixCtx>();
     let nav = try_use_context::<Nav>();
@@ -3692,7 +3709,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             "data-key-action": "play",
             onclick: play,
             Icon { path: ICON_PLAY }
-            span { "Play" }
+            span { if resume { "Resume" } else { "Play" } }
         }
         if queue.is_some() && nav.is_some() && !in_group {
             button {
@@ -5611,6 +5628,43 @@ mod tests {
         assert!(html.contains("3:07"), "{html}");
         assert!(html.contains("3 tracks"), "{html}");
         assert!(html.contains("/ui/watch/1"), "{html}");
+    }
+
+    /// V1403: an audiobook begun opens on Resume, on the part last begun;
+    /// its parts are counted as parts. A music album keeps Play on track 1.
+    #[test]
+    fn a_begun_audiobook_resumes_on_the_part_last_begun() {
+        let part = |id, position_ms, played| {
+            let mut t = item(ItemRef::Real(id), ItemKind::Audio, "Part");
+            t.episode = u32::try_from(id).ok();
+            t.position_ms = position_ms;
+            t.played = played;
+            t
+        };
+        let tracks = vec![part(1, 0, true), part(2, 120_000, false), part(3, 0, false)];
+        let mut book = item(ItemRef::Synth(5), ItemKind::Album, "Gadget Tales");
+        book.audiobook = true;
+        let album = detail(book);
+        let shown = tracks.clone();
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(shown.clone()) } }
+        });
+        assert!(html.contains("Resume"), "{html}");
+        assert!(html.contains("3 parts"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="play" href="/ui/watch/2""#),
+            "{html}"
+        );
+
+        let album = detail(item(ItemRef::Synth(6), ItemKind::Album, "Record"));
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(tracks.clone()) } }
+        });
+        assert!(!html.contains("Resume"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="play" href="/ui/watch/1""#),
+            "{html}"
+        );
     }
 
     /// B1085: an album or an artist can be made a favourite from its page,
