@@ -211,6 +211,8 @@ struct StoreState {
     /// What the server would list for each container, every track waiting.
     catalogue: HashMap<ContainerRef, Download>,
     pinned: Vec<Download>,
+    /// Saved resume positions, by track id.
+    saved: HashMap<String, u64>,
 }
 
 pub struct FakeOfflineStore {
@@ -226,6 +228,7 @@ impl FakeOfflineStore {
                 online: true,
                 catalogue: HashMap::new(),
                 pinned: Vec::new(),
+                saved: HashMap::new(),
             }),
         }
     }
@@ -276,6 +279,11 @@ impl FakeOfflineStore {
 
     pub fn set_online(&self, online: bool) {
         lock(&self.inner).online = online;
+    }
+
+    /// Records where the phone stopped in a track, as the host's resume does.
+    pub fn set_saved_position(&self, track_id: &str, ms: u64) {
+        lock(&self.inner).saved.insert(track_id.to_owned(), ms);
     }
 
     /// Marks a pinned track as failed, as a dropped download would.
@@ -368,6 +376,10 @@ impl OfflineStore for FakeOfflineStore {
     fn is_online(&self) -> bool {
         lock(&self.inner).online
     }
+
+    fn saved_position_ms(&self, track_id: &str) -> Option<u64> {
+        lock(&self.inner).saved.get(track_id).copied()
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +416,14 @@ mod tests {
         );
         let track = d.first().and_then(|d| d.tracks.first());
         assert_eq!(track.map(|t| t.title.as_str()), Some("Song One"));
+    }
+
+    #[test]
+    fn a_saved_position_is_reported_only_for_its_track() {
+        let s = FakeOfflineStore::new();
+        s.set_saved_position("t2", 90_000);
+        assert_eq!(s.saved_position_ms("t2"), Some(90_000));
+        assert_eq!(s.saved_position_ms("t1"), None);
     }
 
     #[test]
