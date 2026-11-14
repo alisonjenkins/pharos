@@ -139,6 +139,20 @@ pub struct VisFrame {
     pub wave: Vec<i8>,
 }
 
+impl VisFrame {
+    /// Bins in a frame: half the analyser's FFT size.
+    pub const BINS: usize = 1024;
+
+    /// A frame of no sound, which draws as an idle visualiser.
+    pub fn silent(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            bins: vec![u8::MAX; Self::BINS],
+            wave: vec![0; 2 * Self::BINS],
+        }
+    }
+}
+
 /// The native audio engine. Commands return at once: the host hops to its own
 /// worker, and the outcome arrives as a snapshot. The UI never blocks on JNI.
 pub trait NativeAudio: Send + Sync {

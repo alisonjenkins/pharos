@@ -23,6 +23,45 @@ pub trait AudioTap {
     fn volume(&self) -> f32;
 }
 
+/// How a host's frame reaches the page's analysis (ADR-0133): bytes pushed
+/// into a window global, read back as an [`AudioTap`].
+pub mod wire {
+    /// Decibels per step of a bin's byte; the host's `pharos-vis` quantises
+    /// with the same step (a test there holds the two together).
+    pub const DB_STEP: f32 = 0.5;
+    /// A bin with no sound.
+    pub const SILENT_BIN: u8 = u8::MAX;
+    /// A pushed frame older than this is not the song now: the host stopped
+    /// sending, because the song paused, the visualiser went, or the song
+    /// cannot be decoded.
+    pub const FRESH_MS: f64 = 500.0;
+
+    pub fn is_fresh(age_ms: f64) -> bool {
+        (0.0..=FRESH_MS).contains(&age_ms)
+    }
+
+    /// The analyser's view of a pushed frame: `bins` in dBFS (`-inf` for
+    /// none) and `wave` from -1 to 1. Anything past the frame's end is
+    /// silence.
+    pub fn dequantise(bytes: &[u8], samples: &[i8], bins: &mut [f32], wave: &mut [f32]) {
+        for (i, out) in bins.iter_mut().enumerate() {
+            *out = match bytes.get(i) {
+                Some(&b) if b != SILENT_BIN => -f32::from(b) * DB_STEP,
+                _ => f32::NEG_INFINITY,
+            };
+        }
+        for (i, out) in wave.iter_mut().enumerate() {
+            *out = samples.get(i).map_or(0.0, |&s| f32::from(s) / 127.0);
+        }
+    }
+
+    /// What the tap reports when no fresh frame is there.
+    pub fn silence(bins: &mut [f32], wave: &mut [f32]) {
+        bins.fill(f32::NEG_INFINITY);
+        wave.fill(0.0);
+    }
+}
+
 /// A visualiser look, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Style {
@@ -298,6 +337,27 @@ impl Analysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pushed_frame_reads_back_as_the_analyser_would_give_it() {
+        let (mut bins, mut wave) = ([0.0; 4], [9.0; 6]);
+        wire::dequantise(&[0, 26, 255], &[127, -127, 0], &mut bins, &mut wave);
+        assert_eq!(
+            bins,
+            [0.0, -13.0, NONE, NONE],
+            "a short frame ends in silence"
+        );
+        assert_eq!(wave, [1.0, -1.0, 0.0, 0.0, 0.0, 0.0]);
+        wire::silence(&mut bins, &mut wave);
+        assert!(bins.iter().all(|b| *b == NONE) && wave.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn only_a_recent_frame_is_fresh() {
+        assert!(wire::is_fresh(0.0) && wire::is_fresh(499.0));
+        assert!(!wire::is_fresh(501.0));
+        assert!(!wire::is_fresh(-1.0), "a clock that went back is not fresh");
+    }
 
     /// No sound in a bin.
     const NONE: f32 = f32::NEG_INFINITY;
