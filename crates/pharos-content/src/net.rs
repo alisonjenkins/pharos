@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use pharos_api::pharos_capnp::{bootstrap, login_result, quick_connect_result, session};
 use pharos_client::api::{
     Capabilities, Item, ItemKind, ItemRef, Listing, MediaToken, NativeApi, NativeGrant, PharosApi,
-    PlaybackGrant, TrackPicks,
+    PlaybackGrant, TrackPicks, Watched,
 };
 use pharos_client::mix::MixSpec;
 use pharos_client::{CallInfo, ClientError};
@@ -112,6 +112,8 @@ pub async fn open(base: &str) -> Result<(bootstrap::Client, Closed), ContentErro
 
 /// How often a waiting call looks at the closed flag.
 const CLOSED_CHECK: Duration = Duration::from_millis(200);
+/// Newest `last_played_at` first, with `descending`.
+const PLAYED_ORDER: &str = "DatePlayed";
 
 /// Run one call with a deadline. A call on a closed socket hangs instead of
 /// failing, so this returns at once when `closed` is set.
@@ -310,6 +312,22 @@ impl Catalogue for NativeCatalogue {
     async fn recent_music(&self) -> Result<Vec<Item>, ContentError> {
         let home = bounded("recently played", &self.closed, self.api.home(&self.info)).await?;
         Ok(home.listening)
+    }
+
+    async fn begun(&self, lib: ItemRef, limit: u32) -> Result<Vec<Item>, ContentError> {
+        let op = format!("begun {lib}");
+        let listing = Listing {
+            watched: Some(Watched::InProgress),
+            descending: true,
+            ..Listing::of(lib, None, PLAYED_ORDER)
+        };
+        let page = bounded(
+            &op,
+            &self.closed,
+            self.api.query(&self.info, &listing, 0, limit),
+        )
+        .await?;
+        Ok(page.items)
     }
 
     async fn list(
