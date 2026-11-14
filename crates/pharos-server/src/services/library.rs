@@ -1609,6 +1609,12 @@ pub async fn index(
     let genres = if matches!(parent, ParentResolution::Empty) {
         Vec::new()
     } else {
+        // V1393 — a Books library's picker offers its books' genres, as its
+        // listing lists its books, not its course lessons'.
+        let unfiltered = ItemQuery {
+            kinds: books_default(state, &parent, &unfiltered.kinds),
+            ..unfiltered
+        };
         let mut base = build_media_query(user.id, &unfiltered, &parent, false);
         apply_policy_scope(&mut base, &user.policy, &state.parental_ratings);
         let only_genres = pharos_core::FacetRequest {
