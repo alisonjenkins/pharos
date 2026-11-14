@@ -26,7 +26,7 @@ There are no audiobooks on disk yet. Everything here is built and tested against
 
 - **FR-001**: The scanner walks `.m4b`.
 - **FR-002**: An audio file whose innermost library is a Books library is classified (`audiobook::classify`):
-  - any `.m4b` is a single-file book (`verdict=single_file`, `reason=m4b`);
+  - an `.m4b` is a single-file book (`verdict=single_file`, `reason=m4b`), unless it has no chapter marks and other `.m4b` files sit in the same folder: then it is one chapter of a book split into a file per chapter, and a track of the folder's book (`verdict=folder_track`, `reason=m4b_in_folder`);
   - another audio file with chapter marks, alone in its book folder or directly in the root, is a single-file book (`reason=chapters`);
   - otherwise, a file in a folder is a track of the folder's book (`verdict=folder_track`, `reason=in_folder`); a disc folder (`CD1`, `Disc 2`, `Part 3`) belongs to the book above it;
   - a file directly in the root with no chapters is no book and is left out (`verdict=skipped`, `reason=loose_without_chapters`).
@@ -51,4 +51,5 @@ There are no audiobooks on disk yet. Everything here is built and tested against
 - Narrator: the probe keeps no `composer` / `narrator` tag (ADR-0132 Consequences).
 - A per-book page distinct from the album page.
 - jellyfin-web: audiobooks show there as music albums.
+- Two whole books kept as chapterless `.m4b` files side by side in one author folder are read as one split book. Give each its own folder.
 - Albums keyed by folder: two books, or a book and a music album, with one title share an album.
