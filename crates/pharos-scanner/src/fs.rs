@@ -470,16 +470,8 @@ impl<P: Prober> FsScanner<P> {
         if prior.source.as_deref() == Some(COURSE_MATCH_SOURCE) {
             return Ok(());
         }
-        store
-            .set_item_match(
-                id,
-                COURSE_MATCH_PROVIDER,
-                "",
-                COURSE_MATCH_SOURCE,
-                None,
-                unix_now(),
-            )
-            .await?;
+        // The mark goes last: a row carrying it is never re-read, so a cleanup
+        // that fails before it is retried by the next scan.
         let art = store.delete_provider_artwork(id).await?;
         if !art.is_empty() {
             let mut kinds = vec![MediaKind::Episode];
@@ -502,6 +494,16 @@ impl<P: Prober> FsScanner<P> {
             }
             store.bump_art_version(id).await?;
         }
+        store
+            .set_item_match(
+                id,
+                COURSE_MATCH_PROVIDER,
+                "",
+                COURSE_MATCH_SOURCE,
+                None,
+                unix_now(),
+            )
+            .await?;
         if let Some(provider) = prior
             .provider
             .filter(|p| !p.is_empty() && p != COURSE_MATCH_PROVIDER)
@@ -5452,6 +5454,9 @@ mod tests {
         overrides: Mutex<Vec<pharos_core::SeriesOverride>>,
         /// Paths `mark_reconcile_paths` marked, in order.
         reconcile_marked: Mutex<Vec<String>>,
+        /// Makes `delete_provider_artwork` fail, like a database that refuses
+        /// the write.
+        fail_art_cleanup: std::sync::atomic::AtomicBool,
     }
 
     impl MediaStore for MemStore {
@@ -6364,6 +6369,9 @@ mod tests {
             &self,
             id: MediaId,
         ) -> DomainResult<Vec<(String, String)>> {
+            if self.fail_art_cleanup.load(Ordering::SeqCst) {
+                return Err(DomainError::Backend("artwork cleanup refused".into()));
+            }
             let mut art = self
                 .artwork
                 .lock()
@@ -12463,6 +12471,44 @@ mod tests {
         assert_eq!(again.skipped, 1, "a stamped lesson is skipped: {again:?}");
         assert_eq!(count("pharos_scan_reprobe_total"), 1);
         assert_eq!(count("pharos_scan_match_reset_total"), 1);
+    }
+
+    /// V1392 — a lesson is marked only once its provider artwork is gone, so
+    /// a cleanup that fails is retried by the next scan rather than skipped.
+    #[tokio::test]
+    async fn a_failed_artwork_cleanup_leaves_the_lesson_unmarked() {
+        let td = TempDir::new().unwrap();
+        let file = "Intro to Widgets/02 - Assembly/03 - Fitting.mp4";
+        touch(td.path(), file).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let id = stable_id(&td.path().join(file));
+        store
+            .set_item_match(id, "tmdb", "1234", "search", Some(0.9), 100)
+            .await
+            .unwrap();
+        store
+            .set_artwork(id, "Primary", "tmdb", "/cache/primary/movie/1.jpg")
+            .await
+            .unwrap();
+
+        let s = FsScanner::new(FakeProber::default()).with_course_roots([td.path().to_path_buf()]);
+        store.fail_art_cleanup.store(true, Ordering::SeqCst);
+        let _ = s.scan_into(td.path(), &store).await;
+        assert_ne!(
+            store.get(id).await.unwrap().match_source.as_deref(),
+            Some("course"),
+            "a lesson whose artwork cleanup failed must not be marked done"
+        );
+
+        store.fail_art_cleanup.store(false, Ordering::SeqCst);
+        s.scan_into(td.path(), &store).await.unwrap();
+        let item = store.get(id).await.unwrap();
+        assert_eq!(item.match_source.as_deref(), Some("course"));
+        assert!(store.artwork_for(id).await.unwrap().is_empty());
     }
 
     /// V1392 — a new lesson is marked on its first write, by the watcher too.
