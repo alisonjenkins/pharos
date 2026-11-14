@@ -33,9 +33,9 @@ platforms = [
 # wasm32-unknown-unknown (spec 026 FR-001). pharos-content builds for
 # Android (spec 044), where the server stack has no place; pharos-classgen
 # is a dependency-free build tool for the same app, and pharos-android is
-# its JNI layer.
+# its JNI layer. pharos-phone is the phone app over both and pharos-ui.
 [final-excludes]
-workspace-members = ["pharos-android", "pharos-api", "pharos-classgen", "pharos-client", "pharos-content", "pharos-hls", "pharos-subs", "pharos-ui", "quire", "quire-pdf", "quire-web"]
+workspace-members = ["pharos-android", "pharos-api", "pharos-classgen", "pharos-client", "pharos-content", "pharos-hls", "pharos-phone", "pharos-subs", "pharos-ui", "quire", "quire-pdf", "quire-web"]
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
@@ -45,6 +45,6 @@ workspace-members = ["pharos-android", "pharos-api", "pharos-classgen", "pharos-
 # workspace member are on, so without this it unifies `mobile` into every
 # crate that depends on workspace-hack and breaks host builds that have no
 # glib. pharos-ui is already kept off the hack (see final-excludes); keep its
-# features out of the unified set too.
+# features out of the unified set too, and pharos-phone's, which turn it on.
 [traversal-excludes]
-workspace-members = ["pharos-ui"]
+workspace-members = ["pharos-phone", "pharos-ui"]

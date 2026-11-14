@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 044: the phone app. dx's activity runs the shared UI; the generated
+     classes (classes2.dex, crates/pharos-classgen) are the car's media
+     service, the art provider and the voice entry. Receivers for noisy
+     audio and the debug actions are registered at run time, not here.
+     The authority is built from the application id, as
+     pharos-android's art::authority() derives it. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application android:hasCode="true" android:icon="@mipmap/ic_launcher"
+        android:extractNativeLibs="true"
+        android:allowNativeHeapPointerTagging="false"
+        android:allowBackup="false"
+        android:label="Pharos"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:networkSecurityConfig="@xml/network_security_config">
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!-- Handled in place, as on the TV (B1323): a recreated
+             NativeActivity comes back with a dark window and no page. -->
+        <activity android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" android:exported="true"
+            android:label="Pharos" android:name="dev.dioxus.main.MainActivity">
+            <meta-data android:name="android.app.lib_name" android:value="main" />
+            <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Phone-side voice entry: the assistant offers "play X on Pharos"
+             only for apps with an activity handling this action. -->
+        <activity
+            android:name="com.alisonjenkins.pharos.auto.PharosSearchActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Artwork: the car host opens content://<id>.art/<key> here.
+             Exported with no permission so the host can read it; it serves
+             only images the app registered or already cached. -->
+        <provider
+            android:name="com.alisonjenkins.pharos.auto.PharosArtProvider"
+            android:authorities="${applicationId}.art"
+            android:exported="true" />
+
+        <service
+            android:name="com.alisonjenkins.pharos.auto.PharosMediaService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
