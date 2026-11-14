@@ -4179,6 +4179,7 @@ mod tests {
             stereo: None,
             damaged: false,
             new_children: 0,
+            audiobook: false,
         };
         let mut c = controls();
         c.up_next = Some(UpNextCard::of(Some(&next), 7_200, 15_000));
