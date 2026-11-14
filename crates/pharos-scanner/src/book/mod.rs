@@ -22,6 +22,7 @@
 //! the log line beside the counter, where cardinality does not matter.
 
 pub mod comic;
+pub mod description;
 pub mod epub;
 pub mod fold;
 pub mod integrity;
