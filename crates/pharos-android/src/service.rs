@@ -32,25 +32,28 @@ pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
         ::log::set_max_level(::log::LevelFilter::Info);
     }
     let files = files_dir(env, ctx)?;
-    let server = std::fs::read_to_string(Path::new(&files).join("server_url"))
+    let stored = std::fs::read_to_string(Path::new(&files).join("server_url"))
         .map(|s| s.trim().to_owned())
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_owned());
+        .filter(|s| !s.is_empty());
+    let server_from = if stored.is_some() { "file" } else { "default" };
+    let server = stored.unwrap_or_else(|| DEFAULT_SERVER.to_owned());
     let lib = content::Library::connect(&server, &Path::new(&files).join("device_token"))
-        .map_err(|e| format!("library {server}: {e}"))?;
+        .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
     lib.on_auth_change(|_| notify_changed());
-    log(&format!(
-        "library server={server} auth={:?}",
-        lib.auth_state()
-    ));
+    let auth = match lib.auth_state() {
+        content::AuthState::SignedOut => "signed_out",
+        content::AuthState::Pending { .. } => "pending",
+        content::AuthState::SignedIn => "signed_in",
+    };
+    log(&format!("library server_from={server_from} auth={auth}"));
     let cache_dir = Path::new(&files).join("audio-cache");
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
         Ok(()) => log(&format!(
             "cache enabled cap_bytes={}",
             lib.cache_cap().unwrap_or(0)
         )),
-        Err(e) => log(&format!("cache disabled: {e}")),
+        Err(e) => log(&format!("cache disabled: {}", e.redacted())),
     }
     let _ = LIBRARY.set(lib);
     Ok(())
@@ -210,7 +213,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
     guarded(&mut env, "onGetRoot", std::ptr::null_mut(), |env| {
         let pkg = string(env, &package)?;
         log(&format!(
-            "onGetRoot package={pkg} uid={uid} verdict=allow reason=spike_allows_all"
+            "onGetRoot package={pkg} uid={uid} verdict=allow reason=any_caller"
         ));
         let root = JObject::from(env.new_string(ROOT).map_err(jerr("root"))?);
         // Without this extra the car hides its search button (DHU check,
