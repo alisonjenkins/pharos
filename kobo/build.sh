@@ -75,11 +75,13 @@ cd "$work"
 cargo test --locked -p kobo-pharos
 cargo clippy --locked -p kobo-pharos --all-targets -- -D warnings
 cargo build --locked -p kobo-cli
-./target/debug/kobo package --out "$work/KoboRoot.tgz"
+# cargo honours a CARGO_TARGET_DIR set by the caller; look for the CLI there.
+kobo_bin="${CARGO_TARGET_DIR:-$work/target}/debug/kobo"
+"$kobo_bin" package --out "$work/KoboRoot.tgz"
 echo "built $work/KoboRoot.tgz for $PHAROS_KOBO_SERVER"
 
 if [ "$setup" = true ]; then
   # --source installs the tree just built, never an official release, and
   # setup waits for the reader to be plugged in.
-  exec ./target/debug/kobo setup --source --wait-for-reader "$@"
+  exec "$kobo_bin" setup --source --wait-for-reader "$@"
 fi
