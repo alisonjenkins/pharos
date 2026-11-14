@@ -1085,6 +1085,9 @@ pub struct ItemQuery {
     pub is_4k: Option<bool>,
     pub is_hd: Option<bool>,
     pub is_3d: Option<bool>,
+    /// Books no client can open: `Some(true)` leaves them out, `Some(false)`
+    /// keeps only them (B1420). Set by the native API; `/Items` never sets it.
+    pub book_readable: Option<bool>,
     pub min_width: Option<u32>,
     pub max_width: Option<u32>,
     /// Fold the films of a box set into one tile for the set (B1086): see
