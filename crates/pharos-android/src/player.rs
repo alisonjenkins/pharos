@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Takes the next play generation, which drops every older request still
+/// in flight.
+pub(crate) fn supersede() -> u64 {
+    PLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Whether `gen` is still the newest request.
+pub(crate) fn is_current(gen: u64) -> bool {
+    PLAY_GEN.load(Ordering::SeqCst) == gen
+}
+
 /// Starts `item` from `source` on a fresh `MediaPlayer`, unless a newer
 /// play request than `gen` exists. Preparation is async;
 /// `PharosPlayerListener.onPrepared` starts playback.
@@ -13,7 +24,7 @@ pub(crate) fn play(
     gen: u64,
 ) -> R<()> {
     let mut guard = state_lock()?;
-    if PLAY_GEN.load(Ordering::SeqCst) != gen {
+    if !is_current(gen) {
         log(&format!(
             "play id={}: a newer request superseded it, dropped",
             item.id
@@ -142,7 +153,7 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
         )
     })();
     if let Err(e) = &outcome {
-        if PLAY_GEN.load(Ordering::SeqCst) == gen {
+        if is_current(gen) {
             snapshot::note_failure(id, &queue_ids, &format!("play {id}: {e}"));
             if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
                 set_error(env, session.as_obj(), "Couldn't play that")?;
@@ -154,9 +165,11 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
 }
 
 /// Plays the book `id` (an `album/` id) from the part and place it stopped,
-/// with every part queued, from a worker thread.
+/// with every part queued, from a worker thread. A newer request made while
+/// the book resolves wins.
 pub(crate) fn play_book(id: &str) -> R<()> {
     let id = id.to_owned();
+    let gen = supersede();
     on_worker("book", move |env| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         let book = match lib.book(&id) {
@@ -164,36 +177,52 @@ pub(crate) fn play_book(id: &str) -> R<()> {
             Err(e) => {
                 let why = format!("book {id}: {}", e.redacted());
                 log(&format!("play {why}"));
-                snapshot::note_error(&why);
-                if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
-                    set_error(env, session.as_obj(), "Couldn't play that")?;
+                if is_current(gen) {
+                    snapshot::note_error(&why);
+                    if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
+                        set_error(env, session.as_obj(), "Couldn't play that")?;
+                    }
                 }
                 return Ok(());
             }
         };
+        if !is_current(gen) {
+            log(&format!(
+                "play book {id}: a newer request superseded it, dropped"
+            ));
+            return Ok(());
+        }
         let queue: Vec<Item> = book.parts.into_iter().map(Item::of_node).collect();
         remember(&queue);
-        let ids = ids(&queue);
+        let at = match start_index(queue.len(), book.start) {
+            Ok(at) => at,
+            Err(why) => {
+                log(&format!("play book {id} verdict=rejected reason={why}"));
+                snapshot::note_error(&why);
+                return Ok(());
+            }
+        };
+        let Some(first) = queue.get(at).map(|i| i.id.clone()) else {
+            return Ok(());
+        };
         log(&format!(
             "book id={id} parts={} start={}",
-            ids.len(),
+            queue.len(),
             book.start
         ));
-        apply(
-            env,
-            Command::Play {
-                ids,
-                index: book.start,
-            },
-            Source::Car,
-        )
+        snapshot::clear_error();
+        start_at(env, &first, Some(queue), gen)
     })
 }
 
 /// Plays `id` with `queue` (or the remembered list holding it): a test
 /// entry at once, a library node from a worker thread.
 pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
-    let gen = PLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    start_at(env, id, queue, supersede())
+}
+
+/// [`start`] for a request that already holds its generation `gen`.
+pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
     if let Some(item) = fixture::playable(id) {
         let source = fixture::source(env, id)?;
         return play(
@@ -346,4 +375,18 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         resume::drop_current(true)?;
         skip(env, 1, false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_request_supersedes_every_older_generation() {
+        let first = supersede();
+        assert!(is_current(first));
+        let second = supersede();
+        assert!(!is_current(first), "the older request is dropped");
+        assert!(is_current(second));
+    }
 }
