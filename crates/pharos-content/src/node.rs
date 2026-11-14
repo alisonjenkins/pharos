@@ -163,6 +163,7 @@ pub(crate) mod tests {
             image: None,
             played: false,
             favorite: false,
+            audiobook: false,
             position_ms: 0,
             series_name: None,
             season: None,
