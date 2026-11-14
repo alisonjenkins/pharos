@@ -8214,6 +8214,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "pharos-content",
+ "tokio",
 ]
 
 [[package]]

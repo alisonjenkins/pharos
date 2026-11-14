@@ -33,6 +33,7 @@ mod resume;
 mod search;
 mod service;
 mod session;
+pub mod snapshot;
 
 mod voice;
 
