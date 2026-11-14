@@ -1101,11 +1101,6 @@ pub fn user_agent() -> String {
     tv_page::USER_AGENT.to_owned()
 }
 
-/// Whether the UI runs inside the Android TV app (spec 025).
-pub fn android_shell() -> bool {
-    cfg!(target_os = "android")
-}
-
 /// No keyboard shortcut opens the palette on a TV: the banner's Search
 /// button does (FR-602).
 pub fn palette_keys() -> &'static str {
