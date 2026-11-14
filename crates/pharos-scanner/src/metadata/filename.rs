@@ -409,6 +409,16 @@ impl MetadataProvider for FilenameProvider {
         let Some(stem) = req.path.file_stem().and_then(|s| s.to_str()) else {
             return Ok(MetadataResult::default());
         };
+        // A book's name is not a release name: the video parse would cut the
+        // title at a year or an edition word and tag it `WEB-DL`. Its stem is
+        // cleaned as a book's, and carries no tags (V1390).
+        if req.kind == MediaKind::Book {
+            let title = crate::book::title::clean_stem_title(stem);
+            return Ok(MetadataResult {
+                title: (!title.is_empty()).then_some(title),
+                ..MetadataResult::default()
+            });
+        }
         let with_year = req.kind == MediaKind::Movie;
         let mut parsed = Self::parse_stem(stem, with_year);
         // An episode's stem leads with the show, so its cleaned stem is the
@@ -872,6 +882,30 @@ mod tests {
             r.title.as_deref(),
             Some("Show B - 487 - The Silent Harbour")
         );
+    }
+
+    /// A book's name is cleaned as a book's: no release tags, and a year or
+    /// edition word in the title stays in it.
+    #[tokio::test]
+    async fn fetch_book_cleans_the_stem_and_tags_nothing() {
+        let provider = FilenameProvider::new();
+        let probe = MediaProbe::default();
+        for (path, title) in [
+            ("/b/Some Title WEB-DL.epub", "Some Title"),
+            (
+                "/b/some_title_2019_remastered.pdf",
+                "some title 2019 remastered",
+            ),
+            ("/b/Some Title (1).epub", "Some Title"),
+        ] {
+            let r = provider
+                .fetch(&req(Path::new(path), MediaKind::Book, &probe))
+                .await
+                .unwrap();
+            assert_eq!(r.title.as_deref(), Some(title), "for {path}");
+            assert!(r.tags.is_empty(), "tags {:?} for {path}", r.tags);
+            assert_eq!(r.production_year, None, "for {path}");
+        }
     }
 
     #[tokio::test]
