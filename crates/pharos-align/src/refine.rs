@@ -398,6 +398,70 @@ fn edge_part(
     }
 }
 
+fn is_placed(m: Option<Method>) -> bool {
+    matches!(
+        m,
+        Some(Method::Anchored | Method::Refined | Method::Between)
+    )
+}
+
+/// Holds every kept line's word starts between the placed lines around it,
+/// so starts never go back anywhere in the song (V1373). Placed lines never
+/// move. Each run of lines between two placed lines takes a running max
+/// from the last start of the placed line before it, capped at the first
+/// start of the placed line after it. Returns how many lines moved.
+fn order(out: &mut [LineWords], methods: &[Option<Method>]) -> usize {
+    debug_assert!(
+        {
+            let placed: Vec<i64> = (0..out.len())
+                .filter(|&i| is_placed(methods[i]))
+                .flat_map(|i| out[i].words.iter().map(|w| w.start_ms))
+                .collect();
+            placed.windows(2).all(|w| w[0] <= w[1])
+        },
+        "placed lines out of order"
+    );
+    let mut held = 0;
+    let mut i = 0;
+    while i < out.len() {
+        if is_placed(methods[i]) {
+            i += 1;
+            continue;
+        }
+        let run = i;
+        while i < out.len() && !is_placed(methods[i]) {
+            i += 1;
+        }
+        let before = run
+            .checked_sub(1)
+            .and_then(|p| out[p].words.last())
+            .map_or(i64::MIN, |w| w.start_ms);
+        let after = out
+            .get(i)
+            .and_then(|l| l.words.first())
+            .map_or(i64::MAX, |w| w.start_ms);
+        let mut bound = before;
+        for (line, l) in out.iter_mut().enumerate().take(i).skip(run) {
+            let mut moved_ms = 0;
+            for w in &mut l.words {
+                let at = w.start_ms.max(bound).min(after);
+                moved_ms = moved_ms.max((at - w.start_ms).abs());
+                w.start_ms = at;
+                bound = at;
+            }
+            if moved_ms > 0 {
+                held += 1;
+                tracing::info!(
+                    line,
+                    moved_ms,
+                    "kept line held between the placed lines around it"
+                );
+            }
+        }
+    }
+    held
+}
+
 /// Places every line: `today` is today's per-line answer, `matched` the
 /// recogniser's anchors.
 pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song<'_>) -> Refined {
@@ -580,8 +644,10 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         }
     }
 
+    let held = order(&mut out, &methods);
     let mut placement = Placement::from_methods(methods.iter().flatten().copied(), share);
     placement.dropped_anchors = n_dropped;
+    placement.held_lines = held;
     Refined {
         lines: out,
         methods,
@@ -871,7 +937,13 @@ mod tests {
         let mut want = a.starts_ms.clone();
         want.push(a.end_ms);
         assert_eq!(starts(&r.lines[0]), want);
-        assert_eq!(r.lines[1], t[1]);
+        // The kept line keeps today's times up to the anchor after it, and
+        // is held there rather than running past it (V1373).
+        let b = m.lines[2].anchor.as_ref().unwrap().starts_ms[0];
+        let held = starts(&r.lines[1]);
+        let today = starts(&t[1]);
+        assert!(held.iter().zip(&today).all(|(h, t)| *h == (*t).min(b)));
+        ordered(&r);
     }
 
     #[test]
@@ -1049,5 +1121,145 @@ mod tests {
         );
         sung_at(&r.lines[2], &[7_000, 7_400, 7_900]);
         assert_eq!(r.lines[3], t[3]);
+    }
+
+    fn ordered(r: &Refined) {
+        let all: Vec<i64> = r.lines.iter().flat_map(starts).collect();
+        assert!(
+            all.windows(2).all(|w| w[0] <= w[1]),
+            "word starts go back: {all:?}"
+        );
+    }
+
+    /// Today's answer for a line: its stamps spread evenly from `from_ms` to `to_ms`.
+    fn spread(l: &Line, from_ms: i64, to_ms: i64) -> LineWords {
+        let ws = text::words(&l.text);
+        let n = ws.len() as i64;
+        let at = |k: i64| from_ms + (to_ms - from_ms) * k / n;
+        let mut words: Vec<Stamp> = ws
+            .iter()
+            .enumerate()
+            .map(|(k, w)| Stamp {
+                at: w.at,
+                start_ms: at(k as i64),
+            })
+            .collect();
+        words.push(Stamp {
+            at: l.text.chars().count(),
+            start_ms: to_ms,
+        });
+        LineWords {
+            words,
+            score: Some(0.5),
+            placement: None,
+        }
+    }
+
+    #[test]
+    fn kept_lines_out_of_order_among_themselves_are_held_in_order() {
+        // Today has lines 0 and 1 overlapping each other, and line 2
+        // running into the placed line after it.
+        let lines = [
+            line(1_000, 3_000, "sea mist"),
+            line(3_000, 8_000, "salt wind blows"),
+            line(8_000, 10_000, "rope coils tight"),
+            line(10_000, 13_000, "nets dry slow"),
+            line(13_000, 16_000, "low tide hums"),
+            line(16_000, 19_000, "boats come home"),
+        ];
+        let mut sung = sing("nets dry slow", 10_000);
+        sung.extend(sing("low tide hums", 13_000));
+        sung.extend(sing("boats come home", 16_000));
+        let frames = 1_000;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("nets dry slow", 10.0);
+        h.extend(heard("low tide hums", 13.0));
+        h.extend(heard("boats come home", 16.0));
+        let m = match_lines(&lines, &h, Options::default());
+        let t = [
+            spread(&lines[0], 1_000, 4_000),
+            spread(&lines[1], 3_000, 7_000),
+            spread(&lines[2], 8_000, 12_000),
+            today(&lines[3], 10_000),
+            today(&lines[4], 13_000),
+            today(&lines[5], 16_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(&r.methods[..2], &[Some(Method::Kept); 2]);
+        assert_eq!(r.methods[3], Some(Method::Refined));
+        ordered(&r);
+        assert!(r.placement.held_lines >= 1);
+        // Line 0 was in order already and stays where it was.
+        assert_eq!(r.lines[0], t[0]);
+    }
+
+    #[test]
+    fn a_line_left_out_of_a_failed_edge_expansion_is_held_in_order() {
+        // Line 1 has more letters than the song has frames before line 2,
+        // so taking it in makes the alignment impossible and it is left out
+        // overlapping the span; line 0 ran late today too.
+        let long = vec!["gull"; 120].join(" ");
+        let lines = [
+            line(0, 500, "sea mist"),
+            line(500, 5_000, &long),
+            line(5_000, 8_000, "nets dry slow"),
+            line(8_000, 11_000, "low tide hums"),
+            line(11_000, 14_000, "boats come home"),
+        ];
+        let mut sung = sing("nets dry slow", 5_000);
+        sung.extend(sing("low tide hums", 8_000));
+        sung.extend(sing("boats come home", 11_000));
+        let frames = 800;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("nets dry slow", 5.0);
+        h.extend(heard("low tide hums", 8.0));
+        let m = match_lines(&lines, &h, Options::default());
+        let t = [
+            today(&lines[0], 8_000),
+            today(&lines[1], 9_000),
+            today(&lines[2], 5_000),
+            today(&lines[3], 8_000),
+            today(&lines[4], 15_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(&r.methods[..2], &[Some(Method::Kept); 2]);
+        assert_eq!(r.methods[2], Some(Method::Refined));
+        ordered(&r);
+        assert_eq!(r.placement.held_lines, 2);
+        assert_eq!(r.lines[4], t[4]);
+    }
+
+    #[test]
+    fn a_low_share_song_keeps_todays_answer_out_of_order() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+        ];
+        let frames = 600;
+        let e = emission(frames, &sing("grey gulls wheel", 1_500));
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let m = match_lines(&lines, &heard("grey gulls wheel", 1.5), Options::default());
+        // Line 1 starts before line 0 ends: today's answer as it stands.
+        let t = [
+            spread(&lines[0], 1_000, 5_000),
+            spread(&lines[1], 2_000, 6_000),
+            spread(&lines[2], 7_000, 9_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.placement.fallback, Some(Fallback::LowAnchorShare));
+        assert_eq!(r.lines, t);
+        assert_eq!(r.placement.held_lines, 0);
     }
 }
