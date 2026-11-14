@@ -483,6 +483,13 @@ pub struct AppState {
     /// with the default policy so fixtures need no wiring; boot replaces it
     /// from `[server].login_throttle` via [`AppState::with_login_throttle`].
     pub login_throttle: crate::auth::LoginThrottle,
+    /// The same throttle for e-reader passwords on `/opds/` (ADR-0128): its
+    /// own budget, so a Kobo holding a revoked password cannot hold back its
+    /// owner's sign-in on the web.
+    pub reader_throttle: crate::auth::LoginThrottle,
+    /// Reader passwords verified lately, so a catalogue page's covers do not
+    /// each cost an argon2 verify (ADR-0128).
+    pub reader_passwords: crate::services::reader_password::VerifiedCache,
     /// Tells open native connections a user's tokens may have been revoked
     /// (T025).
     pub revocations: crate::services::auth::Revocations,
@@ -858,6 +865,8 @@ impl AppState {
             opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_passwords: crate::services::reader_password::VerifiedCache::new(),
             revocations: Default::default(),
             session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
@@ -1005,6 +1014,8 @@ impl AppState {
             opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_passwords: crate::services::reader_password::VerifiedCache::new(),
             revocations: Default::default(),
             session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
@@ -1116,6 +1127,8 @@ impl AppState {
         trusted_proxies: crate::client_ip::TrustedProxies,
     ) -> Self {
         self.login_throttle =
+            crate::auth::LoginThrottle::new(policy).with_per_ip(!trusted_proxies.is_empty());
+        self.reader_throttle =
             crate::auth::LoginThrottle::new(policy).with_per_ip(!trusted_proxies.is_empty());
         self.trusted_proxies = trusted_proxies;
         self
