@@ -404,6 +404,9 @@ mod tests {
             stream_url: None,
             duration_ms: ms,
             album: "An Album".into(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         };
         let item = Item::of_node(track(22_253));
         assert_eq!(

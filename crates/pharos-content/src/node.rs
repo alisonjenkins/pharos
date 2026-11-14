@@ -35,6 +35,13 @@ pub struct Node {
     /// A track's album name; empty when none, not a track, or not known
     /// (a summary does not carry it: see [`super::tree::node`]).
     pub album: String,
+    /// An audiobook part's book title; empty for anything else.
+    pub book: String,
+    /// Where the server says an audiobook part stopped; 0 when played,
+    /// not begun, or not a part.
+    pub position_ms: u64,
+    /// The heading the car shows this row under; empty for none.
+    pub group: String,
 }
 
 impl Node {
@@ -49,6 +56,9 @@ impl Node {
             stream_url: None,
             duration_ms: 0,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         }
     }
 
@@ -65,6 +75,9 @@ impl Node {
             stream_url: None,
             duration_ms: 0,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         }
     }
 }
@@ -130,6 +143,9 @@ impl Urls {
             stream_url: playable.then(|| self.stream(item.id)).flatten(),
             duration_ms: item.runtime_ms,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         })
     }
 }

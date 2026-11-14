@@ -158,6 +158,10 @@ pub struct SavedNode {
     /// Absent in listings saved before it existed.
     #[serde(default)]
     pub album: String,
+    #[serde(default)]
+    pub book: String,
+    #[serde(default)]
+    pub group: String,
 }
 
 impl SavedNode {
@@ -170,6 +174,8 @@ impl SavedNode {
             playable: n.playable,
             duration_ms: n.duration_ms,
             album: n.album.clone(),
+            book: n.book.clone(),
+            group: n.group.clone(),
         }
     }
 
@@ -185,6 +191,11 @@ impl SavedNode {
             stream_url: None,
             duration_ms: self.duration_ms,
             album: self.album.clone(),
+            book: self.book.clone(),
+            // A saved position goes stale; the local resume store is the
+            // offline fallback.
+            position_ms: 0,
+            group: self.group.clone(),
         }
     }
 }
@@ -1156,6 +1167,9 @@ mod tests {
             stream_url: Some("https://h/a?api_key=SECRET".into()),
             duration_ms: 5,
             album: "B".into(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         };
         c.save_listing("album/9", &[n]);
         let raw = std::fs::read_to_string(c.listing_path("album/9")).unwrap();
@@ -1178,6 +1192,9 @@ mod tests {
             stream_url: None,
             duration_ms: 0,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         }
     }
 
