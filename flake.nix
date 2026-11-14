@@ -854,6 +854,12 @@
           sed '1s|^// Generated from ONNX .*|// Generated from htdemucs.onnx by burn-onnx|' gen/htdemucs.rs > $out/htdemucs.rs
           python3 -I ${./crates/pharos-align/tools/strip_param_ids.py} gen/htdemucs.bpk $out/htdemucs.bpk
         '';
+        # Spec 042 / ADR-0125: the recogniser's weights, whisper.cpp's ggml
+        # large-v3-turbo, read at run time; pinned to the repository commit.
+        recogniserModel = pkgs.fetchurl {
+          url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin";
+          hash = "sha256-H8cPd0046xaZk6w5Huo1fvR8iHV+9y7llDh5t+jivGk=";
+        };
         aligner = pkgs.python3Packages.buildPythonApplication {
           pname = "pharos-aligner";
           version = "0.1.0";
@@ -901,17 +907,22 @@
 
         # Spec 039 / ADR-0116: the Rust aligner, GPU pass included. Its own
         # deps artifact, since Burn and wgpu are behind the `vulkan` feature
-        # and the server's artifact never compiles them.
+        # and the server's artifact never compiles them. Spec 042 adds the
+        # recogniser and separator (ADR-0124/0125).
         alignerRsArgs = pharosCommonArgs // {
           pname = "pharos-align";
-          cargoExtraArgs = "--package pharos-align --features vulkan";
+          cargoExtraArgs = "--package pharos-align --features vulkan,recognise,separate";
+          nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ recogniseTools;
+          buildInputs = pharosCommonArgs.buildInputs ++ recogniseLibs;
+          dontUseCmakeConfigure = true;
+          PHAROS_SEPARATOR_MODEL = separatorModel;
         };
         alignerRsDeps = craneLib.buildDepsOnly alignerRsArgs;
         alignerRs = craneLib.buildPackage (
           alignerRsArgs
           // {
             cargoArtifacts = alignerRsDeps;
-            cargoExtraArgs = "--package pharos-align --features vulkan --bin pharos-aligner";
+            cargoExtraArgs = "--package pharos-align --features vulkan,recognise,separate --bin pharos-aligner";
             # The crate's suite runs in pharosTests; its GPU tests need a device.
             doCheck = false;
           }
@@ -944,6 +955,9 @@
               "PHAROS_ALIGNER_WEIGHTS=${alignerWeights}"
               "PHAROS_ALIGNER_FFMPEG=${pkgs.ffmpeg-headless}/bin/ffmpeg"
               "PHAROS_ALIGNER_CACHE_DIR=/var/cache/pharos-aligner"
+              # Spec 042: the recogniser's stages; a blank value turns them
+              # off. The separator's weights are the ones built in.
+              "PHAROS_ALIGNER_RECOGNISER_MODEL=${recogniserModel}"
               # wgpu dlopens libvulkan.so.1, which no FHS path holds here,
               # and the loader then needs radv's manifest. Both names, as
               # older loaders read only the first.
@@ -1446,7 +1460,7 @@
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
           pharosUiOci = pharosUiImage;
-          inherit aligner alignerWeights separatorOnnx separatorModel;
+          inherit aligner alignerWeights separatorOnnx separatorModel recogniserModel;
           alignerOci = alignerImage;
           inherit alignerRs;
           alignerRsOci = alignerRsImage;
