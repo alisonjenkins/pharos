@@ -136,6 +136,44 @@ async fn audiobooks<C: Catalogue>(cat: &C) -> Result<Vec<Item>, ContentError> {
     Ok(books)
 }
 
+/// The heading over the books with a part begun and not finished.
+pub const CONTINUE_LISTENING: &str = "Continue listening";
+/// The heading over the rest, when some are being listened to.
+pub const ALL_BOOKS: &str = "All books";
+
+/// `books` with those that have a part begun and not finished first, most
+/// recently played first, under [`CONTINUE_LISTENING`]. `listening` is the
+/// server's listening rail, newest first; a part names its book as
+/// `parent`. Returns how many came first.
+fn continue_listening(books: &mut [Node], listening: &[Item]) -> usize {
+    let mut begun: Vec<String> = Vec::new();
+    for part in listening {
+        if !part.audiobook || part.played || part.position_ms == 0 {
+            continue;
+        }
+        let Some(book) = part.parent else { continue };
+        let id = NodeId::Album(book).to_string();
+        if !begun.contains(&id) {
+            begun.push(id);
+        }
+    }
+    let rank = |n: &Node| begun.iter().position(|b| *b == n.id);
+    // Stable, so the rest keep their name order.
+    books.sort_by_key(|n| rank(n).unwrap_or(usize::MAX));
+    let first = books.iter().filter(|n| rank(n).is_some()).count();
+    if first > 0 {
+        for (i, b) in books.iter_mut().enumerate() {
+            b.group = if i < first {
+                CONTINUE_LISTENING
+            } else {
+                ALL_BOOKS
+            }
+            .into();
+        }
+    }
+    first
+}
+
 /// Music lists without audiobook parts: a book's chapter is not a song.
 fn not_books(items: Vec<Item>) -> Vec<Item> {
     items.into_iter().filter(|i| !i.audiobook).collect()
@@ -266,6 +304,23 @@ pub async fn children<C: Catalogue>(
             let mut books = nodes(urls, &audiobooks(cat).await?);
             // Tapping a book plays it from where it stopped ([`book`]).
             books.iter_mut().for_each(|b| b.playable = true);
+            match if books.is_empty() {
+                Ok(Vec::new())
+            } else {
+                cat.recent_music().await
+            } {
+                Ok(listening) => {
+                    let first = continue_listening(&mut books, &listening);
+                    log::info!(
+                        "car audiobooks continue_listening={first} order=last_played listening_rail={}",
+                        listening.len()
+                    );
+                }
+                Err(e) => log::warn!(
+                    "car audiobooks continue_listening=0 order=name: listening rail: {}",
+                    e.redacted()
+                ),
+            }
             books
         }
         NodeId::Track(_) | NodeId::SignIn => Vec::new(),
@@ -684,7 +739,11 @@ mod tests {
         );
         assert_eq!(
             *f.calls.borrow(),
-            [format!("list 200 Some(Album) SortName {MAX_CHILDREN}")]
+            [
+                format!("list 200 Some(Album) SortName {MAX_CHILDREN}"),
+                "recent".to_owned(),
+            ],
+            "the listening rail says which books come first"
         );
     }
 
@@ -1099,5 +1158,42 @@ mod tests {
         let labels = [Progress::Playing, Progress::Paused, Progress::Stopped].map(Progress::label);
         let unique: std::collections::BTreeSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len(), "{labels:?}");
+    }
+
+    #[test]
+    fn books_being_listened_to_come_first_most_recent_first() {
+        let book = |n| Node::folder(NodeId::Album(ItemRef::Synth(n)), &format!("Book {n}"));
+        let mut books = vec![book(1), book(2), book(3), book(4)];
+        let heard = |n, of, at, played| {
+            let mut p = item(ItemRef::Real(n), ItemKind::Audio, "Chapter");
+            p.audiobook = true;
+            p.parent = Some(ItemRef::Synth(of));
+            p.position_ms = at;
+            p.played = played;
+            p
+        };
+        let listening = [
+            item(ItemRef::Real(90), ItemKind::Audio, "A Song"),
+            heard(10, 3, 5_000, false),
+            heard(11, 4, 0, false),
+            heard(12, 1, 9_000, true),
+            heard(13, 3, 1_000, false),
+            heard(14, 2, 7_000, false),
+        ];
+        assert_eq!(continue_listening(&mut books, &listening), 2);
+        assert_eq!(
+            ids(&books),
+            ["album/s3", "album/s2", "album/s1", "album/s4"]
+        );
+        assert_eq!(
+            books.iter().map(|b| b.group.as_str()).collect::<Vec<_>>(),
+            [CONTINUE_LISTENING, CONTINUE_LISTENING, ALL_BOOKS, ALL_BOOKS]
+        );
+        let mut none = vec![book(1), book(2)];
+        assert_eq!(continue_listening(&mut none, &listening[..1]), 0);
+        assert!(
+            none.iter().all(|b| b.group.is_empty()),
+            "no headings for one group"
+        );
     }
 }
