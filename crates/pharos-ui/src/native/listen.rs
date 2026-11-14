@@ -1310,6 +1310,7 @@ mod tests {
                         ],
                         book: Some(ItemRef::Synth(5)),
                         playing: ItemRef::Real(1),
+                        stop_at_end: Default::default(),
                     }),
                 }
             }
