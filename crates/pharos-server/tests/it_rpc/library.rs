@@ -4263,3 +4263,101 @@ async fn home_rails_and_jellyfin_latest_carry_the_fold() {
         .count();
     assert_eq!(flat_eps, 3);
 }
+
+/// Adds a Books library at /libBooks with a book and a course ("Intro to
+/// Widgets": module "01 - Basics" with two lessons, a "03" module with one),
+/// and returns its wire id.
+async fn seed_books_library(fx: &crate::common::Fixture) -> String {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    let wire = "d".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("Reading", "/libBooks", LibraryKind::Books, &wire)
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 701,
+            path: "/libBooks/Widget Handbook.epub".into(),
+            title: "Widget Handbook".into(),
+            kind: MediaKind::Book,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let lessons = [
+        (
+            702,
+            "01 - Basics/01 - Introduction.mp4",
+            1,
+            1,
+            "Introduction",
+        ),
+        (703, "01 - Basics/02 - Parts.mp4", 1, 2, "Parts"),
+        (704, "03/001 Fitting.mp4", 3, 1, "Fitting"),
+    ];
+    for (id, rel, season, ep, title) in lessons {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libBooks/Intro to Widgets/{rel}").into(),
+                title: title.into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Intro to Widgets".into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                    series_folder: Some("/libBooks/Intro to Widgets".into()),
+                    series_year: None,
+                    series_key: None,
+                }),
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    wire
+}
+
+/// V1393 — a Books library lists its books, its courses as series, a
+/// course's seasons by their module folders; a TV library lists no course.
+/// Disarm check: with `books_default` keeping `Unset`, the first listing
+/// holds the lessons too; with `season_name` always "Season N", the module
+/// name is missing.
+#[actix_web::test]
+async fn a_books_library_lists_books_and_its_courses_apart() {
+    use pharos_jellyfin_api::dto::series_id_for_key;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let books = seed_books_library(&fx).await;
+
+    assert_eq!(
+        listed(&session, &books, &[], "SortName").await,
+        [("Widget Handbook".to_owned(), None)]
+    );
+    assert_eq!(
+        listed(&session, &books, &[Kind::Series], "SortName").await,
+        [("Intro to Widgets".to_owned(), None)]
+    );
+    let course = series_id_for_key(Some("/libBooks/Intro to Widgets"), "Intro to Widgets");
+    assert_eq!(
+        listed(&session, &course, &[Kind::Season], "").await,
+        [
+            ("Basics".to_owned(), Some(1)),
+            ("Season 3".to_owned(), Some(3))
+        ]
+    );
+    assert_eq!(
+        listed(&session, &tv, &[Kind::Series], "SortName").await,
+        [("Mature".to_owned(), None), ("Show".to_owned(), None)],
+        "a course is never a TV library's show"
+    );
+}
