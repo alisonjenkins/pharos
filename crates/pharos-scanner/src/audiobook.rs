@@ -173,12 +173,14 @@ pub enum InventoryError {
     },
 }
 
-/// The track files of the book in `folder`, every folder below it
-/// included, in natural order of their paths under it.
+/// The track files of the book in `folder`, in natural order of their
+/// paths under it: its own files and those of its disc folders, the only
+/// files whose [`book_folder`] is `folder`. Any other folder below is a
+/// book of its own.
 pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
     let mut found = Vec::new();
-    let mut dirs = vec![folder.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
+    let mut dirs = vec![(folder.to_path_buf(), true)];
+    while let Some((dir, top)) = dirs.pop() {
         let entries = std::fs::read_dir(&dir).map_err(|source| InventoryError::ListFolder {
             folder: dir.clone(),
             source,
@@ -196,7 +198,13 @@ pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
                     source,
                 })?;
             if kind.is_dir() {
-                dirs.push(path);
+                let disc = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_disc_folder);
+                if top && disc {
+                    dirs.push((path, false));
+                }
             } else if is_track_file(&path) {
                 found.push(path);
             }
@@ -627,6 +635,39 @@ mod tests {
             got,
             ["CD1/1 a.mp3", "CD1/2 b.mp3", "CD1/10 c.mp3", "CD2/1 d.mp3"]
         );
+    }
+
+    #[test]
+    fn folder_tracks_leaves_out_books_in_folders_below() {
+        let td = tempfile::TempDir::new().unwrap();
+        let author = td.path().join("Ada Field");
+        for f in [
+            "Gadget Tales.m4a",
+            "Widget Days/01.mp3",
+            "CD1/01.mp3",
+            "CD1/Extras/01.mp3",
+        ] {
+            let p = author.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        }
+        let got: Vec<PathBuf> = folder_tracks(&author)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.strip_prefix(&author).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                PathBuf::from("CD1/01.mp3"),
+                PathBuf::from("Gadget Tales.m4a")
+            ],
+            "a nested book folder is not this book's track"
+        );
+        for p in &got {
+            let parent = author.join(p);
+            assert_eq!(book_folder(parent.parent().unwrap(), td.path()), author);
+        }
     }
 
     #[test]
