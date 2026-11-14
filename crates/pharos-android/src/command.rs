@@ -135,6 +135,7 @@ pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()>
                 .map(|id| item_for(&snapshot::car_id(id)))
                 .collect();
             let id = queue[at].id.clone();
+            snapshot::clear_error();
             log(&format!(
                 "command {name} source={from} id={id} index={at} queue_len={}",
                 queue.len()

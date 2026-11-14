@@ -117,6 +117,27 @@ pub(crate) fn note_error(cause: &str) {
     });
 }
 
+/// A play of `current` (car id) in `queue` (car ids) failed before it
+/// started: the failure is tied to that song, so the UI can tell which
+/// attempt it belongs to.
+pub(crate) fn note_failure(current: &str, queue: &[String], cause: &str) {
+    channel().send_modify(|s| {
+        s.queue = queue.iter().map(|id| ui_id(id)).collect();
+        s.index = queue.iter().position(|id| id == current);
+        s.current_id = Some(ui_id(current));
+        s.state = PlayState::Idle;
+        s.position_ms = 0;
+        s.duration_ms = None;
+        s.error = Some(cause.to_owned());
+    });
+}
+
+/// A new play was asked for: the last attempt's error no longer applies, so
+/// the same cause failing again reads as a new failure.
+pub(crate) fn clear_error() {
+    channel().send_modify(|s| s.error = None);
+}
+
 /// The player moved to `current` (car id) in `queue` (car ids), not yet
 /// started; a new track clears the last error.
 pub(crate) fn note_track(current: &str, queue: &[String], duration_ms: i64) {
@@ -235,5 +256,19 @@ mod tests {
         );
         clear();
         assert_eq!(current(), Snapshot::default());
+
+        note_failure("track/2", &queue, "play track/2: library not connected");
+        let s = current();
+        assert_eq!(s.current_id.as_deref(), Some("2"));
+        assert_eq!(
+            (s.queue.len(), s.index, s.state),
+            (2, Some(1), PlayState::Idle)
+        );
+        assert_eq!(
+            s.error.as_deref(),
+            Some("play track/2: library not connected")
+        );
+        clear_error();
+        assert_eq!(current().error, None);
     }
 }
