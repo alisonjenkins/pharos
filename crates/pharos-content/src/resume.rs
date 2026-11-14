@@ -129,19 +129,34 @@ impl Resume {
             (Verdict::Saved, true)
         };
         if changed {
-            let file = ResumeFile {
-                positions: positions.clone(),
-            };
-            let bytes = serde_json::to_vec(&file).map_err(|e| ContentError::Resume {
-                op: "encode".into(),
-                why: e.to_string(),
-            })?;
-            write_atomic(&self.path, &bytes).map_err(|e| ContentError::Resume {
-                op: format!("write {}", self.path.display()),
-                why: e.to_string(),
-            })?;
+            self.save(&positions)?;
         }
         Ok(verdict)
+    }
+
+    /// Forgets where `id` stopped, so it starts at the beginning. `false`
+    /// when nothing was saved for it.
+    pub fn clear(&self, id: &str) -> Result<bool, ContentError> {
+        let mut positions = self.lock();
+        if positions.remove(id).is_none() {
+            return Ok(false);
+        }
+        self.save(&positions)?;
+        Ok(true)
+    }
+
+    fn save(&self, positions: &BTreeMap<String, u64>) -> Result<(), ContentError> {
+        let file = ResumeFile {
+            positions: positions.clone(),
+        };
+        let bytes = serde_json::to_vec(&file).map_err(|e| ContentError::Resume {
+            op: "encode".into(),
+            why: e.to_string(),
+        })?;
+        write_atomic(&self.path, &bytes).map_err(|e| ContentError::Resume {
+            op: format!("write {}", self.path.display()),
+            why: e.to_string(),
+        })
     }
 }
 
@@ -204,6 +219,20 @@ mod tests {
         assert_eq!(r.position("a", LONG), None);
         r.record("a", 700_000, LONG)?;
         assert_eq!(Resume::open(&d).position("a", LONG), Some(700_000));
+        Ok(())
+    }
+
+    #[test]
+    fn clear_forgets_one_track_and_saves() -> Result<(), ContentError> {
+        let d = dir("clear");
+        let r = Resume::open(&d);
+        assert!(!r.clear("a")?, "nothing saved yet");
+        r.record("a", 700_000, LONG)?;
+        r.record("b", 800_000, LONG)?;
+        assert!(r.clear("a")?);
+        let back = Resume::open(&d);
+        assert_eq!(back.position("a", LONG), None);
+        assert_eq!(back.position("b", LONG), Some(800_000), "others kept");
         Ok(())
     }
 }
