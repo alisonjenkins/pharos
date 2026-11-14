@@ -14,6 +14,8 @@ use super::*;
 /// How often the playhead reaches the snapshot while playing. The UI treats
 /// a jump larger than a few of these as a seek.
 const POSITION_EVERY: Duration = Duration::from_secs(1);
+/// Local references one app command may hold before the frame grows.
+const COMMAND_LOCAL_REFS: i32 = 64;
 /// How long an app command waits for the service's `onCreate`: Android stops
 /// an idle background service, and the app's next play starts it again.
 const SERVICE_WAIT: Duration = Duration::from_secs(2);
@@ -191,8 +193,13 @@ fn command_loop(rx: mpsc::Receiver<Command>) {
         match rx.recv_timeout(POSITION_EVERY) {
             Ok(command) => {
                 await_service(command.label());
+                // This thread never returns to Java, so its local refs would
+                // otherwise pile up until it ends.
                 guarded(&mut env, "app command", (), |env| {
-                    apply(env, command, Source::App)
+                    env.with_local_frame(COMMAND_LOCAL_REFS, |env| {
+                        Ok::<_, jni::errors::Error>(apply(env, command, Source::App))
+                    })
+                    .map_err(jerr("with_local_frame"))?
                 });
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
