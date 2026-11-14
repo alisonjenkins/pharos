@@ -41,4 +41,4 @@ pub use resume::{
     Resume, Verdict as ResumeVerdict, MIN_TRACK_MS as RESUME_MIN_TRACK_MS,
     SAVE_EVERY as RESUME_SAVE_EVERY,
 };
-pub use tree::{autoplay, Book, SearchReport};
+pub use tree::{autoplay, Book, Progress, SearchReport};
