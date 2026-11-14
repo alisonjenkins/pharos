@@ -48,6 +48,9 @@ pub async fn get_text(_url: &str) -> Result<String, (Option<u16>, String)> {
     Err((None, "no network on the host".into()))
 }
 
+/// `sleep_ms` below returns at once, so a loop that waits on it spins.
+pub const SLEEP_IS_REAL: bool = false;
+
 pub async fn sleep_ms(_ms: u32) {}
 
 pub fn set_title(_title: &str) {}

@@ -238,6 +238,8 @@ pub async fn get_text(url: &str) -> Result<String, (Option<u16>, String)> {
     String::from_utf8(body).map_err(|e| (None, e.to_string()))
 }
 
+pub const SLEEP_IS_REAL: bool = true;
+
 pub async fn sleep_ms(ms: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
 }
