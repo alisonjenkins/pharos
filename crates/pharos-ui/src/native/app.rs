@@ -6818,7 +6818,11 @@ fn Player(
     });
     // Before the stream attaches, so autoplay never starts at full volume.
     use_effect(move || {
-        if io.read().music().is_none() {
+        if let Some(music) = io.read().music() {
+            if let Some((volume, muted, _)) = saved_volume.filter(|_| platform::owns_volume()) {
+                music.set_volume(volume, muted);
+            }
+        } else {
             restore_volume(saved_volume);
         }
     });
@@ -7635,10 +7639,13 @@ fn Player(
                 // Without a volume control the device's own volume rules, and
                 // the host's engine has no volume of its own.
                 Control::Volume { .. } if !platform::owns_volume() => {}
-                Control::Volume { .. } if io.read().music().is_some() => {}
                 Control::Volume { volume, muted } => {
                     fade_in_cancel.set(true);
-                    platform::set_volume(VIDEO_ID, volume, muted);
+                    if let Some(music) = io.read().music() {
+                        music.set_volume(volume, muted);
+                    } else {
+                        platform::set_volume(VIDEO_ID, volume, muted);
+                    }
                     remember_volume(volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(),

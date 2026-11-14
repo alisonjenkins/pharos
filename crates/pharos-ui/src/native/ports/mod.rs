@@ -115,6 +115,9 @@ pub trait NativeAudio: Send + Sync {
     fn next(&self);
     fn previous(&self);
     fn stop(&self);
+    /// The engine's output level, 0.0 (silent) to 1.0 (full). Out-of-range
+    /// values are the caller's to clamp.
+    fn set_volume(&self, level: f32);
     /// A receiver that always holds the latest snapshot.
     fn state(&self) -> watch::Receiver<PlayerSnapshot>;
 }
@@ -221,6 +224,7 @@ mod tests {
         fn next(&self) {}
         fn previous(&self) {}
         fn stop(&self) {}
+        fn set_volume(&self, _: f32) {}
         fn state(&self) -> watch::Receiver<PlayerSnapshot> {
             self.0.subscribe()
         }
