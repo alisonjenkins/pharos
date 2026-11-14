@@ -7,11 +7,13 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use super::offline_ui::{
-    cap_from_option, cap_options, cap_selected, format_bytes, KeepState, FREE_GUARD_BYTES,
+    cap_from_option, cap_options, cap_selected, container_route, container_title, format_bytes,
+    saved_line, track_label, KeepState, FREE_GUARD_BYTES, OFFLINE_BANNER,
 };
 use super::platform;
 use super::ports::{offline_store, ContainerRef, Download, OfflineError, OfflineStore};
 use super::settings::Choices;
+use super::views::Link;
 
 /// How often a screen re-reads the store, so a download's progress shows.
 /// The port has no change feed; a read is a cheap call into the host.
@@ -171,6 +173,112 @@ pub fn KeepToggle(store: Store, container: ContainerRef) -> Element {
     }
 }
 
+/// The Downloads view. Nothing without the offline store.
+#[component]
+pub fn DownloadsScreen() -> Element {
+    match offline_store() {
+        Some(store) => rsx! { DownloadsPanel { store: Store(store) } },
+        None => rsx! {},
+    }
+}
+
+#[component]
+pub fn DownloadsPanel(store: Store) -> Element {
+    let mut snap = use_snapshot(&store);
+    let mut problem = use_signal(|| None::<String>);
+    let now = snap();
+    rsx! {
+        section { class: "pharos-downloads", aria_labelledby: "downloads-title",
+            h2 { id: "downloads-title", "Downloads" }
+            if !now.online {
+                p { class: "pharos-offline-banner", role: "status", "{OFFLINE_BANNER}" }
+            }
+            p { class: "pharos-muted",
+                "{format_bytes(now.used)} of {format_bytes(now.cap)} used on this phone."
+            }
+            if let Some(text) = problem() {
+                p { class: "pharos-notice", role: "alert", "{text}" }
+            }
+            if now.downloads.is_empty() {
+                p { class: "pharos-empty",
+                    "Nothing is kept for offline yet. Use Keep for offline on an album or a mix."
+                }
+            }
+            ul { class: "pharos-download-list",
+                for d in now.downloads.iter() {
+                    DownloadRow {
+                        key: "{d.container.kind.label()}-{d.container.id}",
+                        download: d.clone(),
+                        on_remove: {
+                            let store = store.clone();
+                            let container = d.container.clone();
+                            move |()| {
+                                match toggle_keep(&*store.0, &container, true) {
+                                    Ok(()) => {
+                                        platform::info(&format!(
+                                            "pharos: offline removed {} id={:?}",
+                                            container.kind.label(),
+                                            container.id
+                                        ));
+                                        problem.set(None);
+                                    }
+                                    Err(e) => {
+                                        platform::warn(&format!("pharos: offline remove failed error={e}"));
+                                        problem.set(Some(format!("Couldn't remove it: {e}")));
+                                    }
+                                }
+                                snap.set(Snapshot::read(&*store.0));
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn DownloadRow(download: Download, on_remove: EventHandler<()>) -> Element {
+    let title = container_title(&download.container);
+    let state = KeepState::of(std::slice::from_ref(&download), &download.container);
+    let route = container_route(&download.container);
+    rsx! {
+        li { class: "pharos-download", "data-kind": download.container.kind.label(),
+            div { class: "pharos-download-head",
+                div { class: "pharos-download-name",
+                    if let Some(to) = route {
+                        Link { to, "{title}" }
+                    } else {
+                        span { "{title}" }
+                    }
+                    span { class: "pharos-muted",
+                        "{download.container.kind.label()} \u{b7} {format_bytes(download.cached_bytes())} \u{b7} {saved_line(&download)}"
+                    }
+                }
+                span { class: "pharos-offline-chip", role: "status", "data-state": state.name(), "{state.label()}" }
+                button {
+                    class: "pharos-button pharos-button-danger is-small",
+                    r#type: "button",
+                    aria_label: "Remove {title} from this phone",
+                    onclick: move |_| on_remove.call(()),
+                    "Remove"
+                }
+            }
+            details { class: "pharos-download-tracks",
+                summary { "Tracks" }
+                ul {
+                    for t in download.tracks.iter() {
+                        li { key: "{t.id}", "data-state": track_label(t.state),
+                            span { "Track {t.id}" }
+                            span { class: "pharos-muted", "{track_label(t.state)} \u{b7} {format_bytes(t.bytes)}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Settings, Offline music. Nothing without the offline store.
 #[component]
 pub fn OfflineMusicSettings() -> Element {
@@ -318,6 +426,8 @@ mod tests {
     use crate::native::offline_ui::GIB;
     use crate::native::ports::fake::FakeOfflineStore;
     use crate::native::ports::{ContainerKind, ContainerRef};
+    use crate::native::route::Route;
+    use crate::native::views::Nav;
 
     fn album(id: &str) -> ContainerRef {
         ContainerRef {
@@ -506,6 +616,77 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn render_downloads(fake: &Arc<FakeOfflineStore>) -> String {
+        let handle: Arc<dyn OfflineStore> = fake.clone();
+        let mut dom = VirtualDom::new_with_props(
+            |store: Store| {
+                use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+                rsx! { DownloadsPanel { store } }
+            },
+            Store(handle),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn an_empty_downloads_view_says_how_to_keep_something() {
+        let html = render_downloads(&store_with(&[]));
+        assert!(html.contains("Nothing is kept for offline yet"), "{html}");
+        assert!(!html.contains("<li class=\"pharos-download\""), "{html}");
+    }
+
+    #[test]
+    fn each_pinned_container_lists_size_track_states_and_a_remove_button() {
+        let fake = store_with(&["7"]);
+        fake.fail_track("7-2");
+        let html = render_downloads(&fake);
+        assert!(html.contains("Album 7"), "{html}");
+        assert!(
+            html.contains("href=\"/ui/browse/7\""),
+            "the album links to its page: {html}"
+        );
+        assert!(html.contains("1 KiB"), "cached size only: {html}");
+        assert!(html.contains("1 of 2 saved"), "{html}");
+        assert!(html.contains("Saved"), "{html}");
+        assert!(html.contains("Failed"), "{html}");
+        assert!(html.contains("Remove Album 7 from this phone"), "{html}");
+    }
+
+    #[test]
+    fn the_offline_banner_shows_only_when_the_store_is_offline() {
+        let fake = store_with(&["7"]);
+        assert!(!render_downloads(&fake).contains("You're offline"));
+        fake.set_online(false);
+        let html = render_downloads(&fake);
+        assert!(
+            html.contains("You&#39;re offline") || html.contains("You're offline"),
+            "{html}"
+        );
+        assert!(html.contains("role=\"status\""), "{html}");
+    }
+
+    #[test]
+    fn a_mix_row_is_named_by_the_mix_and_is_not_a_link() {
+        let fake = Arc::new(FakeOfflineStore::new());
+        let mix = ContainerRef {
+            kind: ContainerKind::Mix,
+            id: "Morning".into(),
+        };
+        fake.add_container(mix.clone(), vec![("m-1".into(), 10)]);
+        assert_eq!(fake.pin(&mix), Ok(()));
+        let html = render_downloads(&fake);
+        assert!(html.contains("Morning"), "{html}");
+        assert!(!html.contains("href=\"/ui/browse"), "{html}");
+    }
+
+    #[test]
+    fn without_a_registered_store_the_downloads_view_draws_nothing() {
+        let mut dom = VirtualDom::new(|| rsx! { DownloadsScreen {} });
+        dom.rebuild_in_place();
+        assert_eq!(dioxus_ssr::render(&dom), "");
     }
 
     #[test]

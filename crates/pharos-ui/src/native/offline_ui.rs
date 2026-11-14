@@ -3,7 +3,10 @@
 //! the [`OfflineStore`](super::ports::OfflineStore) port, which is registered
 //! only in the phone app, so none of it shows anywhere else.
 
-use super::ports::{ContainerRef, Download, TrackState};
+use pharos_client::api::ItemRef;
+
+use super::ports::{ContainerKind, ContainerRef, Download, TrackState};
+use super::route::Route;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -141,6 +144,33 @@ pub fn track_label(state: TrackState) -> &'static str {
     }
 }
 
+/// What a Downloads row calls a container. A mix is named by its id; the
+/// port carries no album titles, so an album shows its id.
+pub fn container_title(container: &ContainerRef) -> String {
+    match container.kind {
+        ContainerKind::Mix => container.id.clone(),
+        ContainerKind::Album => format!("Album {}", container.id),
+    }
+}
+
+/// The page a Downloads row opens: an album's own page. A mix has none.
+pub fn container_route(container: &ContainerRef) -> Option<Route> {
+    match container.kind {
+        ContainerKind::Album => container.id.parse::<ItemRef>().ok().map(Route::Browse),
+        ContainerKind::Mix => None,
+    }
+}
+
+/// How many tracks of `d` are on the phone, as "2 of 3 saved".
+pub fn saved_line(d: &Download) -> String {
+    let saved = d
+        .tracks
+        .iter()
+        .filter(|t| t.state == TrackState::Cached)
+        .count();
+    format!("{saved} of {} saved", d.tracks.len())
+}
+
 pub const OFFLINE_BANNER: &str = "You're offline. Only the music saved on this phone will play.";
 
 #[cfg(test)]
@@ -252,6 +282,31 @@ mod tests {
         let d = pinned("a", &[TrackState::Failed, TrackState::Queued]);
         let state = KeepState::of(&[d], &album("a"));
         assert_eq!(state, KeepState::Downloading { done: 0, total: 2 });
+    }
+
+    #[test]
+    fn an_album_row_opens_its_page_and_a_mix_row_has_none() {
+        assert_eq!(
+            container_route(&album("42")),
+            Some(Route::Browse(ItemRef::Real(42)))
+        );
+        assert_eq!(container_route(&album("not an id")), None);
+        let mix = ContainerRef {
+            kind: ContainerKind::Mix,
+            id: "Morning".into(),
+        };
+        assert_eq!(container_route(&mix), None);
+        assert_eq!(container_title(&mix), "Morning");
+        assert_eq!(container_title(&album("42")), "Album 42");
+    }
+
+    #[test]
+    fn the_saved_line_counts_only_cached_tracks() {
+        let d = pinned(
+            "a",
+            &[TrackState::Cached, TrackState::Queued, TrackState::Failed],
+        );
+        assert_eq!(saved_line(&d), "1 of 3 saved");
     }
 
     #[test]

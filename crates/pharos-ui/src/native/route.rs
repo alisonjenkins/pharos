@@ -34,6 +34,8 @@ pub enum Route {
     Offline,
     /// Music kept on the phone: cap, space used, clear. Phone app only; under `/settings`.
     OfflineMusic,
+    /// What is kept on the phone for offline, `/downloads`. Phone app only.
+    Downloads,
     /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// The viewer's favourites, a rail per kind, `/favourites` (B1083).
@@ -77,6 +79,7 @@ impl Route {
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
             ["find"] => Route::Find,
+            ["downloads"] => Route::Downloads,
             ["settings"] | ["settings", "appearance"] => Route::Appearance,
             ["favourites"] => Route::Favourites,
             ["together"] => Route::Together,
@@ -110,6 +113,7 @@ impl Route {
             Route::Offline => format!("{MOUNT}/settings/offline"),
             Route::OfflineMusic => format!("{MOUNT}/settings/offline-music"),
             Route::Find => format!("{MOUNT}/find"),
+            Route::Downloads => format!("{MOUNT}/downloads"),
             Route::Favourites => format!("{MOUNT}/favourites"),
             Route::Together => format!("{MOUNT}/together"),
             Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
@@ -148,6 +152,7 @@ impl Route {
             Route::Offline => Some("Offline"),
             Route::OfflineMusic => Some("Offline music"),
             Route::Find => Some("Search"),
+            Route::Downloads => Some("Downloads"),
             Route::Favourites => Some("Favourites"),
             Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
             Route::NotFound(_) => Some("Not found"),
@@ -177,6 +182,7 @@ impl Route {
             Route::Offline => "offline",
             Route::OfflineMusic => "offline_music",
             Route::Find => "find",
+            Route::Downloads => "downloads",
             Route::Favourites => "favourites",
             Route::Together => "together",
             Route::TogetherGroup(_) => "together_group",
@@ -293,6 +299,14 @@ mod tests {
         assert_eq!(Route::Privacy.path(), "/ui/settings/privacy");
         assert_eq!(Route::Offline.path(), "/ui/settings/offline");
         assert_eq!(Route::OfflineMusic.path(), "/ui/settings/offline-music");
+    }
+
+    #[test]
+    fn downloads_has_its_own_path() {
+        assert_eq!(Route::Downloads.path(), "/ui/downloads");
+        assert_eq!(Route::parse("/ui/downloads"), Route::Downloads);
+        assert_eq!(Route::parse("/ui/Downloads/"), Route::Downloads);
+        assert_eq!(Route::Downloads.page_title(None), "Downloads \u{b7} Pharos");
     }
 
     #[test]

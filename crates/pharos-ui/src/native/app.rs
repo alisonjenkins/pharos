@@ -2549,6 +2549,10 @@ fn Screen(route: Route) -> Element {
             rsx! { SettingsLayout { current: Section::OfflineMusic, super::offline_view::OfflineMusicSettings {} } }
         }
         Route::OfflineMusic => rsx! { NotFoundView { path: Route::OfflineMusic.path() } },
+        Route::Downloads if offline_store().is_some() => {
+            rsx! { super::offline_view::DownloadsScreen {} }
+        }
+        Route::Downloads => rsx! { NotFoundView { path: Route::Downloads.path() } },
         Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },

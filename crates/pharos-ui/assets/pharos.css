@@ -8310,6 +8310,61 @@ body:has(.pharos-reader) {
   font-size: var(--px-type-step--1);
 }
 
+/* Downloads view. Rows wrap; the remove button stays on screen. */
+.pharos-downloads {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+.pharos-offline-banner {
+  margin: 0;
+  padding: 0.6rem 1rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface-raised);
+}
+.pharos-download-list {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-download {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface);
+}
+.pharos-download-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+.pharos-download-name {
+  display: grid;
+  flex: 1 1 12rem;
+  gap: 0.15rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pharos-download-tracks ul {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-download-tracks li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+}
+
 /* Offline music (spec 044): the confirm row wraps, never hides, on a phone. */
 .pharos-offline-confirm {
   display: flex;
