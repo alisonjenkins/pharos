@@ -1019,10 +1019,23 @@ fn Visualiser(
     #[cfg(all(feature = "mobile", target_os = "android"))]
     {
         let _ = (program, &tap);
+        // A song playing in the host's engine has no element for the page to
+        // tap: the host's own analysis is pushed in (ADR-0133).
+        let hosted = tap.on_host.get().is_some();
         use_hook(move || {
-            Rc::new(platform::page_visualiser(style.label(), move |reason| {
-                on_fallback.call(Fallback::from_label(&reason));
-            }))
+            Rc::new(platform::page_visualiser(
+                style.label(),
+                hosted,
+                move |reason| {
+                    on_fallback.call(Fallback::from_label(&reason));
+                },
+            ))
+        });
+        use_hook(move || {
+            hosted
+                .then(super::ports::native_audio)
+                .flatten()
+                .map(|port| Rc::new(platform::host_frames(port)))
         });
     }
     #[cfg(not(all(feature = "mobile", target_os = "android")))]

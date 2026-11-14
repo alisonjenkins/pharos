@@ -299,6 +299,32 @@ pub fn visualiser_frame_js(frame: &super::ports::VisFrame) -> String {
     )
 }
 
+/// How often a frame is pushed while the song plays: about 30 Hz.
+pub const FRAME_PUSH_MS: u32 = 33;
+/// How often the host is asked again while it has no frame.
+pub const FRAME_IDLE_MS: u32 = 250;
+
+/// What the frame pump does after asking the host for a frame: the frame to
+/// push, if any, and how long to wait before asking again. When frames stop
+/// after some were sent, one silent frame goes first, so the picture falls
+/// quiet instead of freezing on the last notes; then nothing is sent and the
+/// page goes idle with the stamp.
+pub fn next_push(
+    last_rate: &mut Option<u32>,
+    pulled: Option<super::ports::VisFrame>,
+) -> (Option<super::ports::VisFrame>, u32) {
+    match pulled {
+        Some(frame) => {
+            *last_rate = Some(frame.sample_rate);
+            (Some(frame), FRAME_PUSH_MS)
+        }
+        None => (
+            last_rate.take().map(super::ports::VisFrame::silent),
+            FRAME_IDLE_MS,
+        ),
+    }
+}
+
 /// The script that loads the visualiser module into the page once, from its
 /// wasm-bindgen `glue` (`--target no-modules`) and its wasm as base64;
 /// concurrent callers share the one load, and a failed load can be retried.
@@ -1755,6 +1781,23 @@ mod tests {
             hosted.ends_with(plain.as_str()) || hosted.contains(&plain),
             "{hosted}"
         );
+    }
+
+    #[test]
+    fn the_pump_pushes_frames_then_one_silent_frame_then_nothing() {
+        use super::super::ports::VisFrame;
+        let mut last = None;
+        let frame = VisFrame {
+            sample_rate: 44_100,
+            bins: vec![1],
+            wave: vec![1],
+        };
+        let (sent, wait) = next_push(&mut last, Some(frame.clone()));
+        assert_eq!((sent, wait), (Some(frame), FRAME_PUSH_MS));
+        let (sent, wait) = next_push(&mut last, None);
+        assert_eq!(sent, Some(VisFrame::silent(44_100)), "falls quiet once");
+        assert_eq!(wait, FRAME_IDLE_MS);
+        assert_eq!(next_push(&mut last, None), (None, FRAME_IDLE_MS));
     }
 
     #[test]
