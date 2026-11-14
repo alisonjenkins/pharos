@@ -13,6 +13,7 @@ mod compat;
 mod focus;
 mod debug;
 mod network;
+mod noisy;
 mod receiver;
 mod voice;
 pub mod content;
@@ -1028,6 +1029,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         if let Err(e) = debug::register(env, &this) {
             log(&format!("onCreate: debug receiver unavailable: {e}"));
         }
+        if let Err(e) = noisy::register(env, &this) {
+            log(&format!("onCreate: becoming-noisy receiver unavailable: {e}"));
+        }
         Ok(())
     })
 }
@@ -1042,6 +1046,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         focus::destroy(env)?;
         network::unwatch(env)?;
         debug::unregister(env)?;
+        noisy::unregister(env)?;
         if let Some(p) = st.player {
             env.call_method(p.as_obj(), "release", "()V", &[]).map_err(jerr("player.release"))?;
         }

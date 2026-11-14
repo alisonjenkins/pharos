@@ -168,6 +168,17 @@ public class Check {
     expect(session.state.state == 3 && session.state.pos == 4000 && session.state.speed == 1, "play resumes from the seek position: " + session.state);
     cb.onSeekTo(6000);
     expect(session.state.state == 3 && session.state.pos == 6000, "a seek while playing keeps playing: " + session.state);
+    android.content.BroadcastReceiver noisy = android.content.Context.receivers.get("android.media.AUDIO_BECOMING_NOISY");
+    expect(noisy != null && noisy.getClass().getSimpleName().equals("PharosNoisyReceiver")
+        && Integer.valueOf(4).equals(android.content.Context.receiverFlags.get("android.media.AUDIO_BECOMING_NOISY")),
+        "service registers a not-exported becoming-noisy receiver");
+    if (noisy != null) {
+      noisy.onReceive(s, new android.content.Intent("android.media.AUDIO_BECOMING_NOISY"));
+      expect(session.state.state == 2 && !MediaPlayer.last.playing, "headphones unplugged pauses: " + session.state);
+      noisy.onReceive(s, new android.content.Intent("android.media.AUDIO_BECOMING_NOISY"));
+      expect(session.state.state == 2 && !MediaPlayer.last.playing, "becoming noisy while paused stays paused: " + session.state);
+      cb.onPlay();
+    }
     cb.onSkipToNext();
     cb.onPlayFromSearch("test tone c", null);
 
@@ -204,6 +215,8 @@ public class Check {
     s.onDestroy();
     expect(cm != null && cm.callback == null && cm.unregisters == 1, "onDestroy unregisters the network callback");
     expect(dbg != null && android.content.Context.unregistered.contains(dbg), "onDestroy unregisters the debug receiver");
+    android.content.BroadcastReceiver noisyAfter = android.content.Context.receivers.get("android.media.AUDIO_BECOMING_NOISY");
+    expect(noisyAfter != null && android.content.Context.unregistered.contains(noisyAfter), "onDestroy unregisters the becoming-noisy receiver");
     System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILED");
     System.exit(failures == 0 ? 0 : 1);
   }

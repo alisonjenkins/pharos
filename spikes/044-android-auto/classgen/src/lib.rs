@@ -491,6 +491,15 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
             interfaces: Vec::new(),
             methods: vec![native("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V")],
         },
+        // Pauses when audio would move from headphones to the speaker.
+        ClassSpec {
+            name: format!("{PKG}/PharosNoisyReceiver"),
+            superclass: "android/content/BroadcastReceiver".into(),
+            init: "()V".into(),
+            load_library: None,
+            interfaces: Vec::new(),
+            methods: vec![native("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V")],
+        },
         // Search results go back in a Bundle, which names each item's class;
         // the car casts them to androidx's MediaItem. Its parcel is the
         // framework MediaItem's (flags, then the description), so a subclass

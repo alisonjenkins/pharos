@@ -143,7 +143,7 @@ fn set_volume(env: &mut JNIEnv, v: f32) -> R<()> {
     Ok(())
 }
 
-fn is_playing(env: &mut JNIEnv) -> R<bool> {
+pub(crate) fn is_playing(env: &mut JNIEnv) -> R<bool> {
     let player = state_lock()?.as_ref().filter(|s| s.prepared).and_then(|s| s.player.clone());
     let Some(p) = player else { return Ok(false) };
     env.call_method(p.as_obj(), "isPlaying", "()Z", &[]).and_then(|v| v.z()).map_err(jerr("isPlaying"))
