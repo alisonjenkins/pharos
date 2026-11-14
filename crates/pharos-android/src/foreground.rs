@@ -21,6 +21,8 @@ const IMPORTANCE_LOW: i32 = 2;
 const NOTIFICATION_ID: i32 = 1;
 /// `ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK`, matching the manifest.
 const FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK: i32 = 2;
+/// `startForeground(int, Notification, int)` and service types arrived in API 29.
+const FOREGROUND_TYPE_SDK: i32 = 29;
 /// `Service.STOP_FOREGROUND_REMOVE` / `STOP_FOREGROUND_DETACH`.
 const STOP_FOREGROUND_REMOVE: i32 = 1;
 const STOP_FOREGROUND_DETACH: i32 = 2;
@@ -31,6 +33,7 @@ struct Fg {
     service: GlobalRef,
     token: GlobalRef,
     manager: GlobalRef,
+    sdk: i32,
     title: String,
     text: String,
     /// `startForegroundService` ran, so the service must `stopSelf` on stop.
@@ -63,6 +66,10 @@ pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
     if manager.is_null() {
         return Err("getSystemService(notification) returned null".into());
     }
+    let sdk = env
+        .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+        .and_then(|v| v.i())
+        .map_err(jerr("SDK_INT"))?;
     let id = JObject::from(env.new_string(CHANNEL_ID).map_err(jerr("channel id"))?);
     let label = JObject::from(env.new_string(CHANNEL_NAME).map_err(jerr("channel name"))?);
     let channel = env
@@ -91,6 +98,7 @@ pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
         manager: env
             .new_global_ref(&manager)
             .map_err(jerr("global notification manager"))?,
+        sdk,
         title: String::new(),
         text: String::new(),
         started: false,
@@ -147,16 +155,25 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
                 .map_err(jerr("startForegroundService"))?;
                 f.started = true;
             }
-            env.call_method(
-                f.service.as_obj(),
-                "startForeground",
-                "(ILandroid/app/Notification;I)V",
-                &[
-                    JValue::Int(NOTIFICATION_ID),
-                    JValue::Object(&n),
-                    JValue::Int(FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK),
-                ],
-            )
+            if has_foreground_type(f.sdk) {
+                env.call_method(
+                    f.service.as_obj(),
+                    "startForeground",
+                    "(ILandroid/app/Notification;I)V",
+                    &[
+                        JValue::Int(NOTIFICATION_ID),
+                        JValue::Object(&n),
+                        JValue::Int(FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK),
+                    ],
+                )
+            } else {
+                env.call_method(
+                    f.service.as_obj(),
+                    "startForeground",
+                    "(ILandroid/app/Notification;)V",
+                    &[JValue::Int(NOTIFICATION_ID), JValue::Object(&n)],
+                )
+            }
             .map_err(jerr("startForeground"))?;
             f.foreground = true;
             log(&format!("notify: foreground=on state={state}"));
@@ -218,6 +235,10 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
         }
     }
     Ok(())
+}
+
+fn has_foreground_type(sdk: i32) -> bool {
+    sdk >= FOREGROUND_TYPE_SDK
 }
 
 /// The app's `ic_stat_pharos` drawable, or the system play icon for an APK
@@ -356,4 +377,17 @@ pub fn destroy(env: &mut JNIEnv) -> R<()> {
         log("notify: destroyed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_typed_start_foreground_needs_api_29() {
+        assert!(!has_foreground_type(26));
+        assert!(!has_foreground_type(28));
+        assert!(has_foreground_type(29));
+        assert!(has_foreground_type(34));
+    }
 }
