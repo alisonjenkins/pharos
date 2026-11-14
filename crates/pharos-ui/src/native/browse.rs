@@ -3163,6 +3163,40 @@ pub fn books_query(tab: BooksTab) -> String {
     }
 }
 
+/// The query a Books library's URL takes on switching to `next`, set before
+/// the tab's grid mounts: for Books, the book grid's own last choice
+/// (`saved`, as [`LibraryGrid`] keeps it), so it reopens on its filters
+/// rather than reading another tab's query as the default choice.
+pub fn books_tab_query(next: BooksTab, saved: Option<&str>) -> String {
+    match next {
+        BooksTab::Books => saved
+            .filter(|q| books_choice(q) == BooksTab::Books)
+            .unwrap_or_default()
+            .to_owned(),
+        tab => books_query(tab),
+    }
+}
+
+/// Show tab `next` of Books library `library`, its URL first (see
+/// [`books_tab_query`]).
+fn switch_books_tab(library: ItemRef, mut tab: Signal<BooksTab>, next: BooksTab) {
+    if Route::parse(&platform::current_path()) == Route::Browse(library) {
+        let saved = match platform::session_get(&choice_key(library)) {
+            Ok(saved) => saved,
+            Err(e) => {
+                platform::warn(&format!("pharos: library {library} filters not read: {e}"));
+                None
+            }
+        };
+        platform::replace(&format!(
+            "{}{}",
+            Route::Browse(library).path(),
+            books_tab_query(next, saved.as_deref())
+        ));
+    }
+    tab.set(next);
+}
+
 /// The tab a Books library's URL query names; anything missing or unknown
 /// is Books.
 pub fn books_choice(query: &str) -> BooksTab {
@@ -3210,7 +3244,7 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
             BooksTab::Books
         }
     });
-    let mut tab = use_signal(|| opened);
+    let tab = use_signal(|| opened);
     use_effect(move || {
         let tab = tab();
         let here = Route::parse(&platform::current_path()) == Route::Browse(library);
@@ -3241,7 +3275,7 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
                     onkeydown: move |e: KeyboardEvent| {
                         if let Some(next) = tab().stepped(&e.key()) {
                             e.prevent_default();
-                            tab.set(next);
+                            switch_books_tab(library, tab, next);
                             platform::focus_by_id(next.id());
                         }
                     },
@@ -3254,7 +3288,7 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
                             class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
                             aria_selected: tab() == t,
                             tabindex: if tab() == t { "0" } else { "-1" },
-                            onclick: move |_| tab.set(t),
+                            onclick: move |_| switch_books_tab(library, tab, t),
                             "{t.label()}"
                         }
                     }
@@ -5273,6 +5307,33 @@ mod tests {
         assert_eq!(books_choice("?sort=year"), BooksTab::Books);
         let tokens: HashSet<&str> = BooksTab::ALL.iter().map(|t| t.token()).collect();
         assert_eq!(tokens.len(), BooksTab::ALL.len());
+    }
+
+    /// Books → Courses → Books reopens the book grid on the filters it had:
+    /// the URL takes the grid's saved choice before the grid mounts, never
+    /// the Courses tab's query, which reads as the default choice.
+    #[test]
+    fn returning_to_the_books_tab_keeps_its_filters() {
+        let chosen = Narrow {
+            genre: Some("Gardening".into()),
+            unreadable: Unreadable::Show,
+            descending: true,
+            ..Narrow::default()
+        };
+        let saved = chosen.to_query();
+        assert_eq!(
+            books_tab_query(BooksTab::Courses, Some(&saved)),
+            "?tab=courses"
+        );
+        let back = books_tab_query(BooksTab::Books, Some(&saved));
+        assert_eq!(Narrow::from_query(&back), chosen);
+        assert_eq!(books_choice(&back), BooksTab::Books);
+        assert_eq!(books_tab_query(BooksTab::Books, None), "");
+        assert_eq!(
+            books_tab_query(BooksTab::Books, Some("?tab=courses")),
+            "",
+            "a saved tab query is no book choice"
+        );
     }
 
     #[test]
