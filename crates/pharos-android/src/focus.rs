@@ -74,6 +74,12 @@ impl Intent {
         self.resume_on_gain = true;
     }
 
+    /// Whether an auto-resume that took the intent may still start: a user
+    /// pause that landed since `take` says no.
+    fn may_resume(&self) -> bool {
+        !self.user_paused
+    }
+
     /// A gain: whether to resume. The intent is spent.
     fn take(&mut self) -> bool {
         let resume = std::mem::replace(&mut self.resume_on_gain, false);
@@ -317,8 +323,15 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
                     did.push("unduck");
                 }
                 if intent().take() {
-                    transport(env, "start", STATE_PLAYING)?;
-                    did.push("resume");
+                    // The system's start, not the user's: it must not clear
+                    // `user_paused`. Re-checked just before; a pause during
+                    // the start call pauses afterwards, so the last wins.
+                    if intent().may_resume() {
+                        transport_with(env, "start", STATE_PLAYING, false)?;
+                        did.push("resume");
+                    } else {
+                        did.push("resume-skipped");
+                    }
                 }
                 if did.is_empty() {
                     "none".to_owned()
@@ -394,6 +407,24 @@ mod tests {
         i.arm();
         i.user_pause();
         assert!(!i.take());
+    }
+
+    #[test]
+    fn a_pause_after_take_still_blocks_the_resume() {
+        let mut i = Intent::new();
+        i.arm();
+        assert!(i.take());
+        i.user_pause();
+        assert!(!i.may_resume());
+    }
+
+    #[test]
+    fn an_auto_resume_does_not_clear_a_user_pause() {
+        let mut i = Intent::new();
+        i.user_pause();
+        i.arm();
+        assert!(!i.take());
+        assert!(!i.may_resume(), "only user_play clears it");
     }
 
     #[test]
