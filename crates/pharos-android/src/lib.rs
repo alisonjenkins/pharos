@@ -31,6 +31,7 @@ mod player;
 mod receiver;
 
 mod resume;
+mod runtime;
 mod search;
 mod service;
 mod session;
@@ -43,6 +44,7 @@ use pharos_content as content;
 use browse::*;
 use command::*;
 use player::*;
+pub use runtime::{runtime, Player};
 use search::*;
 use service::*;
 use session::*;

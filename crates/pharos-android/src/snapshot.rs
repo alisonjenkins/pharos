@@ -139,6 +139,14 @@ pub(crate) fn note_duration(duration_ms: i64) {
     });
 }
 
+pub(crate) fn note_position(position_ms: u64) {
+    channel().send_if_modified(|s| {
+        let changed = s.position_ms != position_ms;
+        s.position_ms = position_ms;
+        changed
+    });
+}
+
 /// The queue played out: the last track stays current, the state is `Ended`.
 pub(crate) fn mark_ended() {
     channel().send_modify(|s| s.state = PlayState::Ended);

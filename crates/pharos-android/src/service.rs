@@ -25,6 +25,12 @@ pub(crate) fn files_dir(env: &mut JNIEnv, ctx: &JObject) -> R<String> {
 
 /// Starts the library worker once per process. No network I/O happens here.
 pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+    // Held across the check and the connect, so the service and the app
+    // starting together connect once.
+    static CONNECTING: Mutex<()> = Mutex::new(());
+    let _connecting = CONNECTING
+        .lock()
+        .map_err(|_| "library connect mutex poisoned".to_owned())?;
     if LIBRARY.get().is_some() {
         return Ok(());
     }
@@ -65,25 +71,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
     this: JObject<'l>,
 ) {
     guarded(&mut env, "onCreate", (), |env| {
-        if VM.get().is_none() {
-            let _ = VM.set(env.get_java_vm().map_err(jerr("get_java_vm"))?);
-        }
-        if CLASSES.get().is_none() {
-            let listener = env
-                .find_class("com/alisonjenkins/pharos/auto/PharosPlayerListener")
-                .map_err(jerr("find PharosPlayerListener"))?;
-            let compat_item = env
-                .find_class(compat::ITEM_CLASS)
-                .map_err(jerr("find compat MediaItem"))?;
-            let _ = CLASSES.set(Classes {
-                listener: env
-                    .new_global_ref(&listener)
-                    .map_err(jerr("global listener class"))?,
-                compat_item: env
-                    .new_global_ref(&compat_item)
-                    .map_err(jerr("global compat class"))?,
-            });
-        }
+        runtime(env, &this)?;
         let tag = JObject::from(env.new_string("pharos").map_err(jerr("tag"))?);
         let session = env
             .new_object(
