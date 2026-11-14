@@ -11,6 +11,7 @@
 mod art;
 mod compat;
 mod focus;
+mod foreground;
 mod debug;
 mod network;
 mod noisy;
@@ -592,10 +593,12 @@ fn publish_state(env: &mut JNIEnv, session: &JObject, state: i32, position_ms: i
         .map_err(jerr("PlaybackState.build"))?;
     env.call_method(session, "setPlaybackState", "(Landroid/media/session/PlaybackState;)V", &[JValue::Object(&ps)])
         .map_err(jerr("setPlaybackState"))?;
+    foreground::sync(env, state);
     Ok(())
 }
 
 fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Item, duration_ms: i64) -> R<()> {
+    foreground::describe(&e.title, &e.subtitle)?;
     const B: &str = "Landroid/media/MediaMetadata$Builder;";
     let b = env
         .new_object("android/media/MediaMetadata$Builder", "()V", &[])
@@ -1010,6 +1013,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
             .map_err(jerr("getSessionToken"))?;
         env.call_method(&this, "setSessionToken", "(Landroid/media/session/MediaSession$Token;)V", &[JValue::Object(&token)])
             .map_err(jerr("setSessionToken"))?;
+        if let Err(e) = foreground::create(env, &this, &token) {
+            log(&format!("onCreate: media notification unavailable: {e}"));
+        }
         *state_lock()? = Some(State {
             service: env.new_global_ref(&this).map_err(jerr("global service"))?,
             session: env.new_global_ref(&session).map_err(jerr("global session"))?,
@@ -1044,6 +1050,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
     guarded(&mut env, "onDestroy", (), |env| {
         let Some(st) = state_lock()?.take() else { return Ok(()) };
         focus::destroy(env)?;
+        foreground::destroy(env)?;
         network::unwatch(env)?;
         debug::unregister(env)?;
         noisy::unregister(env)?;
