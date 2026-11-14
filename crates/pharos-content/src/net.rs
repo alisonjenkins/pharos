@@ -68,7 +68,7 @@ pub async fn open(base: &str) -> Result<(bootstrap::Client, Closed), ContentErro
     let chunks = stream
         .take_while(|m| {
             if let Err(e) = m {
-                log::warn!("ws receive: {e}");
+                log::warn!("ws receive failed: class={}", ws_class(e));
             }
             futures::future::ready(m.is_ok())
         })
@@ -89,7 +89,7 @@ pub async fn open(base: &str) -> Result<(bootstrap::Client, Closed), ContentErro
     let pump = async move {
         while let Some(bytes) = rx.next().await {
             if let Err(e) = sink.send(Message::Binary(bytes.into())).await {
-                log::warn!("ws send: {e}");
+                log::warn!("ws send failed: class={}", ws_class(&e));
                 break;
             }
         }
@@ -98,7 +98,7 @@ pub async fn open(base: &str) -> Result<(bootstrap::Client, Closed), ContentErro
     let flag = closed.clone();
     let driven: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
         tokio::select! {
-            r = system => if let Err(e) = r { log::warn!("rpc ended: {e}") },
+            r = system => if let Err(e) = r { log::warn!("rpc ended: kind={:?}", e.kind) },
             () = pump => {}
         }
         flag.set(true);
@@ -226,7 +226,7 @@ pub async fn quick_connect_poll(
         Ok(polled) => polled,
         Err(ContentError::Closed { .. }) => Polled::Closed,
         Err(ContentError::Timeout { .. }) => Polled::TimedOut,
-        Err(e) => Polled::Failed(e.to_string()),
+        Err(e) => Polled::Failed(e.redacted()),
     }
 }
 
@@ -313,6 +313,26 @@ impl Catalogue for NativeCatalogue {
         let op = format!("detail {id}");
         let d = bounded(&op, &self.closed, self.api.detail(&self.info, id)).await?;
         Ok((d.item, d.album))
+    }
+}
+
+/// A websocket error's class for a log line. `Display` can carry the
+/// server's name or a TLS reason, so it stays out of logs.
+fn ws_class(e: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error as E;
+    match e {
+        E::ConnectionClosed => "connection_closed".into(),
+        E::AlreadyClosed => "already_closed".into(),
+        E::Io(io) => format!("io:{:?}", io.kind()),
+        E::Tls(_) => "tls".into(),
+        E::Capacity(_) => "capacity".into(),
+        E::Protocol(_) => "protocol".into(),
+        E::WriteBufferFull(_) => "write_buffer_full".into(),
+        E::Utf8(_) => "utf8".into(),
+        E::AttackAttempt => "attack_attempt".into(),
+        E::Url(_) => "url".into(),
+        E::Http(r) => format!("http:{}", r.status().as_u16()),
+        E::HttpFormat(_) => "http_format".into(),
     }
 }
 
