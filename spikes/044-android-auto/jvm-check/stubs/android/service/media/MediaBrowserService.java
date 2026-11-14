@@ -18,8 +18,15 @@ public abstract class MediaBrowserService extends android.app.Service {
     public String getRootId() { return id; }
   }
   public static class Result<T> {
-    public T value; public boolean sent;
+    public T value; public boolean sent, detached;
     public Result() {}
-    public void sendResult(T result) { value = result; sent = true; }
+    public void detach() { detached = true; }
+    public synchronized void sendResult(T result) { value = result; sent = true; notifyAll(); }
+    /** Waits for a result sent from another thread, as the framework would. */
+    public synchronized Result<T> await() throws InterruptedException {
+      long end = System.currentTimeMillis() + 30_000;
+      while (!sent && System.currentTimeMillis() < end) wait(end - System.currentTimeMillis());
+      return this;
+    }
   }
 }
