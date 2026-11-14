@@ -134,7 +134,7 @@ async fn reader_passwords_round_trip_through_the_client() {
         "Debug never shows the password"
     );
     let listed = api.reader_passwords(&call).await.unwrap();
-    assert_eq!(listed, [created.listed.clone()]);
+    assert_eq!(listed, std::slice::from_ref(&created.listed));
     assert_eq!(listed[0].last_used_at_ms, None);
     api.revoke_reader_password(&call, &listed[0].id)
         .await
