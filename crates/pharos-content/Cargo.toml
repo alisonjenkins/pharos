@@ -1,0 +1,31 @@
+[package]
+name = "pharos-content"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Pharos library as a media browse tree, with an offline audio cache, for the Android app (spec 044)"
+
+[dependencies]
+capnp = { workspace = true }
+futures = "0.3"
+httparse = "1"
+libc = "0.2"
+log = "0.4"
+pharos-api = { path = "../pharos-api" }
+pharos-client = { path = "../pharos-client" }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util"] }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"] }
+
+[lints]
+workspace = true
