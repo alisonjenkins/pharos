@@ -7136,6 +7136,84 @@ body:has(.pharos-stage.is-mini) .pharos-letters {
   font-weight: 400;
 }
 
+/* Settings → Account, "E-readers" (045). Every row wraps, so a phone held
+   upright keeps the copy and revoke buttons on screen. */
+.pharos-settings-page + .pharos-reader-passwords {
+  margin-top: 2.5rem;
+}
+.pharos-reader-password-form,
+.pharos-reader-password-new {
+  gap: 0.9rem;
+  margin-bottom: 1.25rem;
+  padding: 1.1rem 1.4rem;
+}
+.pharos-reader-password-form h3,
+.pharos-reader-password-new h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.pharos-reader-password-form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.6rem 1rem;
+}
+.pharos-reader-password-form label {
+  display: grid;
+  flex: 1 1 14rem;
+  gap: 0.3rem;
+  max-width: 24rem;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-reader-password-details {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.4rem 1rem;
+  margin: 0;
+}
+.pharos-reader-password-details dt {
+  color: var(--px-color-fg-muted);
+}
+.pharos-reader-password-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.pharos-reader-password-secret {
+  font-size: 1.15rem;
+  letter-spacing: 0.04em;
+  user-select: all;
+}
+.pharos-reader-password-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-reader-password-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-reader-password {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem 1.5rem;
+  padding: 0.9rem 1.4rem;
+}
+.pharos-reader-password + .pharos-reader-password {
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-reader-password-text {
+  display: grid;
+  flex: 1 1 14rem;
+  gap: 0.2rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Paths and rows. */
 .pharos-manage-paths {
   display: grid;
