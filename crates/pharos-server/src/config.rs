@@ -38,6 +38,9 @@ pub struct Config {
     /// Song lyrics: the online provider switch and where its answers are kept.
     #[serde(default)]
     pub lyrics: LyricsConfig,
+    /// Books: the Open Library subject lookup switch (spec 043).
+    #[serde(default)]
+    pub books: BooksConfig,
     /// Online metadata/artwork enrichment tunables (refresh cadence, batch
     /// size, match-confidence floor). All fields default when the
     /// `[metadata]` section is absent.
@@ -365,6 +368,16 @@ impl MusicBrainzConfig {
             .map(str::trim)
             .filter(|c| !c.is_empty())
     }
+}
+
+/// `[books]` — where books' subjects come from beyond their own files.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct BooksConfig {
+    /// Look a book with no usable subjects up on Open Library (ADR-0129).
+    /// Off by default: each lookup sends the book's title, author and ISBN
+    /// to that service. Env: `PHAROS_BOOKS_ONLINE`.
+    #[serde(default)]
+    pub online_subjects: bool,
 }
 
 /// `[lyrics]` — where songs' lyrics come from beyond their own tags and
@@ -1750,6 +1763,16 @@ impl Config {
                 self.musicbrainz.contact = Some(v.to_string());
             }
         }
+        if let Ok(v) = std::env::var("PHAROS_BOOKS_ONLINE") {
+            match env_bool(&v) {
+                Some(b) => self.books.online_subjects = b,
+                None if !v.trim().is_empty() => tracing::warn!(
+                    value = %v,
+                    "PHAROS_BOOKS_ONLINE is not a recognised boolean; leaving [books].online_subjects unchanged"
+                ),
+                None => {}
+            }
+        }
         if let Ok(v) = std::env::var("PHAROS_LYRICS_ONLINE") {
             match env_bool(&v) {
                 Some(b) => self.lyrics.online = b,
@@ -2344,6 +2367,25 @@ mod tests {
             cfg.lyrics.aligner_media_root.as_deref(),
             Some(Path::new("/srv/media"))
         );
+    }
+
+    #[test]
+    fn book_lookups_are_off_unless_asked_for() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+        "#;
+        let cfg = Config::from_toml_str(s).unwrap();
+        assert!(
+            !cfg.books.online_subjects,
+            "a third party is never asked by default"
+        );
+        let on = Config::from_toml_str(&format!("{s}\n[books]\nonline_subjects = true\n")).unwrap();
+        assert!(on.books.online_subjects);
+        let _env = [EnvVar::set("PHAROS_BOOKS_ONLINE", "true")];
+        assert!(cfg.apply_env().books.online_subjects);
     }
 
     #[test]
