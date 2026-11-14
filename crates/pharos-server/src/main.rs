@@ -2048,6 +2048,22 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             tracing::info!("T81 person-image backfill disabled (no [tmdb].api_key)");
         }
     }
+    // Spec 043 / ADR-0129 — shelve books whose files name no subject, from
+    // Open Library. Opt-in: each lookup sends a book's title, author and ISBN.
+    if cfg.books.online_subjects {
+        let dir = cfg
+            .server
+            .transcode_cache_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        pharos_server::book_categories::spawn(
+            state.stores.clone(),
+            state.is_bg_leader.clone(),
+            dir.join(".book_subjects.json"),
+        );
+    } else {
+        tracing::info!("book subjects: open library lookups off ([books].online_subjects)");
+    }
     // B341 — IMDb and Rotten Tomatoes scores from OMDb, gated on its key.
     match cfg.omdb.api_key.as_deref() {
         Some(key) if !key.is_empty() => {

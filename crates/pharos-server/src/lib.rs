@@ -4,6 +4,7 @@ pub mod audio_analysis;
 pub mod auth;
 pub mod avatar;
 pub mod bg_io;
+pub mod book_categories;
 pub mod book_convert;
 pub mod book_cover;
 pub mod cast;
