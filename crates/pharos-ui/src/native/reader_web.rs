@@ -26,14 +26,16 @@ use super::keymap::Mode;
 use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
-    check_size, download_href, flatten_toc, key_action, link_key, margin_label, pdf_key,
-    pdf_locator, pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable,
-    save_is_news, save_key, saved_fraction, saved_locator, size_cap, swipe_action, tap_action,
-    too_big_message, JumpVia, KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey,
-    PendingSave, PendingSaves, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface,
-    LINE_HEIGHTS, MARGINS, OFFLINE_NOTE, PENDING_KEY, SETTINGS_KEY,
+    check_size, flatten_toc, key_action, link_key, margin_label, pdf_key, pdf_locator,
+    pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable, save_is_news,
+    save_key, saved_fraction, saved_locator, size_cap, swipe_action, tap_action, too_big_message,
+    JumpVia, KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey, PendingSave, PendingSaves,
+    ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE,
+    PENDING_KEY, SETTINGS_KEY,
 };
+use super::reader::{version_book, version_href};
 use super::route::Route;
+use super::versions;
 use super::views::{display_name, Nav};
 
 const ROOT_ID: &str = "pharos-reader";
@@ -567,12 +569,16 @@ struct Head {
     title: String,
     format: Option<BookFormat>,
     saved: Option<String>,
+    /// The version (another format, V1391) to fetch; `""` is the book's own
+    /// file, and a kept book is always its kept bytes.
+    version: String,
 }
 
 /// The book's bytes: a kept copy first, even online (spec 036 FR-006), then
 /// the network. Says where they came from for the log.
 async fn book_bytes(
     id: ItemRef,
+    version: &str,
     kept_user: Option<&str>,
     online: bool,
 ) -> Result<(js_sys::Uint8Array, &'static str), String> {
@@ -593,7 +599,9 @@ async fn book_bytes(
     if !online {
         return Err("This book is not on this device and there is no connection.".into());
     }
-    fetch_book(id).await.map(|bytes| (bytes, "network"))
+    fetch_book(id, version)
+        .await
+        .map(|bytes| (bytes, "network"))
 }
 
 /// What follows a book opening, off the critical path (FR-008). A kept
@@ -777,10 +785,10 @@ impl Drop for AbortOnDrop {
 /// The book's bytes as the browser holds them, refused before the body is
 /// read when a weak device would hold too many of them. A PDF goes to its
 /// module from here without a copy through this module's memory.
-async fn fetch_book(id: ItemRef) -> Result<js_sys::Uint8Array, String> {
+async fn fetch_book(id: ItemRef, version: &str) -> Result<js_sys::Uint8Array, String> {
     let cap = size_cap(this_device(), &platform::user_agent());
     let controller = AbortOnDrop(web_sys::AbortController::new().map_err(|e| format!("{e:?}"))?);
-    let response = Request::get(&download_href(id))
+    let response = Request::get(&version_href(id, version))
         .abort_signal(Some(&controller.0.signal()))
         .send()
         .await
@@ -1007,6 +1015,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let page = use_signal(|| None::<(usize, usize)>);
     let back = use_signal(|| None::<Locator>);
     let mut is_pdf = use_signal(|| false);
+    let mut book_version = use_signal(String::new);
     let swipe_from = use_hook(|| Rc::new(Cell::new(f64::NAN)));
     let swiped = use_hook(|| Rc::new(Cell::new(false)));
     let mut settings = use_signal(stored_settings);
@@ -1058,14 +1067,27 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             title: book.title.clone(),
                             format: Some(book.format.book_format()),
                             saved: resume_place(book, queued.as_ref()).map(|(locator, _)| locator),
+                            version: String::new(),
                         }
                     }
                     (None, Some(api)) => match api.detail(&call("read", "load"), id).await {
-                        Ok(d) => Head {
-                            title: display_name(&d.item),
-                            format: d.book.as_ref().map(|b| b.format),
-                            saved: d.read_position.as_ref().map(|p| p.locator.clone()),
-                        },
+                        Ok(d) => {
+                            // The format picked on the title page (V1391).
+                            let stored = platform::stored_theme(&versions::version_key(id))
+                                .ok()
+                                .flatten();
+                            let version =
+                                versions::chosen_version(&d.versions, stored.as_deref()).to_owned();
+                            Head {
+                                title: display_name(&d.item),
+                                format: d
+                                    .book
+                                    .as_ref()
+                                    .map(|b| version_book(b, &d.versions, &version).format),
+                                saved: d.read_position.as_ref().map(|p| p.locator.clone()),
+                                version,
+                            }
+                        }
                         Err(e) => {
                             platform::warn(&format!("pharos: reader failed item={id} error={e}"));
                             phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
@@ -1075,6 +1097,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     (None, None) => return,
                 };
                 title.set(head.title.clone());
+                book_version.set(head.version.clone());
+                let version_log = match head.version.as_str() {
+                    "" => "primary".to_owned(),
+                    v => v.to_owned(),
+                };
                 let format = head.format;
                 if !matches!(format, Some(BookFormat::Epub | BookFormat::Pdf)) {
                     platform::warn(&format!(
@@ -1091,16 +1118,17 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 }
                 if format == Some(BookFormat::Pdf) {
                     is_pdf.set(true);
-                    let (bytes, from) = match book_bytes(id, kept_user.as_deref(), online).await {
-                        Ok(b) => b,
-                        Err(message) => {
-                            platform::warn(&format!(
-                                "pharos: reader failed item={id} error={message}"
-                            ));
-                            phase.set(Phase::Failed(message));
-                            return;
-                        }
-                    };
+                    let (bytes, from) =
+                        match book_bytes(id, &head.version, kept_user.as_deref(), online).await {
+                            Ok(b) => b,
+                            Err(message) => {
+                                platform::warn(&format!(
+                                    "pharos: reader failed item={id} error={message}"
+                                ));
+                                phase.set(Phase::Failed(message));
+                                return;
+                            }
+                        };
                     let length = bytes.length();
                     let auto = (!kept && from == "network" && kept_web::wants_auto())
                         .then(|| bytes.clone());
@@ -1150,7 +1178,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                 auto,
                             );
                             platform::info(&format!(
-                                "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={}",
+                                "pharos: reader opened item={id} format=pdf version={} from={from} bytes={length} ms={:.0} resumed={} at={}",
+                                version_log,
                                 platform::now_ms() - began,
                                 saved.is_some(),
                                 at
@@ -1166,14 +1195,17 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                     return;
                 }
-                let (bytes, from) = match book_bytes(id, kept_user.as_deref(), online).await {
-                    Ok(b) => b,
-                    Err(message) => {
-                        platform::warn(&format!("pharos: reader failed item={id} error={message}"));
-                        phase.set(Phase::Failed(message));
-                        return;
-                    }
-                };
+                let (bytes, from) =
+                    match book_bytes(id, &head.version, kept_user.as_deref(), online).await {
+                        Ok(b) => b,
+                        Err(message) => {
+                            platform::warn(&format!(
+                                "pharos: reader failed item={id} error={message}"
+                            ));
+                            phase.set(Phase::Failed(message));
+                            return;
+                        }
+                    };
                 let auto =
                     (!kept && from == "network" && kept_web::wants_auto()).then(|| bytes.clone());
                 let bytes = js_sys::Uint8Array::to_vec(&bytes);
@@ -1240,7 +1272,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             auto,
                         );
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={}",
+                            "pharos: reader opened item={id} format=epub version={} from={from} bytes={length} ms={:.0} resumed={} at={}",
+                            version_log,
                             platform::now_ms() - began,
                             saved.is_some(),
                             at
@@ -1556,7 +1589,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         p { "{message}" }
                         a {
                             class: "pharos-button",
-                            href: download_href(id),
+                            href: version_href(id, &book_version.read()),
                             download: "",
                             "Download"
                         }
