@@ -22,3 +22,8 @@ workspace = true
 # The Test folder of generated tones the host JVM check plays; never in an
 # app build.
 test-catalogue = []
+
+[[example]]
+name = "jvm_check_lib"
+crate-type = ["cdylib"]
+required-features = ["test-catalogue"]
