@@ -4,18 +4,18 @@
 //! usage: separate IN OUT.f32 [IN OUT.f32 ...]
 //!
 //! - IN: any audio ffmpeg reads (`PHAROS_ALIGNER_FFMPEG`, else `ffmpeg`).
-//! - OUT.f32: 44.1 kHz stereo, interleaved f32 little-endian: the vocals, or
-//!   the mix when there is no GPU. Nothing is written when separation fails.
+//! - OUT.f32: 44.1 kHz stereo, interleaved f32 little-endian: the vocals.
+//!   Nothing is written when separation fails.
 //!
-//! Prints one JSON line per song: `{in, outcome, reason, sec}`. Set `CPU` to
-//! take the no-GPU path, and `KERNEL_CACHE` to keep compiled kernels.
+//! Prints one JSON line per song: `{in, outcome, reason, sec}`. Needs a
+//! Vulkan GPU. Set `KERNEL_CACHE` to keep compiled kernels.
 
 use std::path::Path;
 use std::process::Command;
 
 use pharos_align::device::{self, Device, DeviceMode};
 use pharos_align::separate::htdemucs::{Separator, BPK};
-use pharos_align::separate::{vocals_or_mix, Stereo, RATE};
+use pharos_align::separate::{separate_on, Stereo, RATE};
 use serde_json::json;
 
 type Error = Box<dyn std::error::Error>;
@@ -61,32 +61,21 @@ fn main() -> Result<(), Error> {
         return Err(USAGE.into());
     }
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
-    let mode = if std::env::var_os("CPU").is_some() {
-        DeviceMode::Cpu
-    } else {
-        DeviceMode::Auto
+    let choice = device::choose(DeviceMode::Auto, &device::probe())?;
+    let Device::Vulkan(adapter) = &choice.device else {
+        return Err(format!("no Vulkan GPU: {}", choice.reason).into());
     };
-    let choice = device::choose(mode, &device::probe())?;
     if let Some(dir) = std::env::var_os("KERNEL_CACHE") {
         std::fs::create_dir_all(&dir)?;
         pharos_align::forward::vulkan::configure_runtime(Some(Path::new(&dir)));
     }
-    let separator = match &choice.device {
-        Device::Vulkan(a) => Some(Separator::load(Path::new(BPK), a)?),
-        Device::Cpu => None,
-    };
+    let separator = Separator::load(Path::new(BPK), adapter)?;
     for pair in pairs.chunks(2) {
         let [inp, outp] = pair else {
             return Err(USAGE.into());
         };
         let mix = decode(&ffmpeg, inp)?;
-        let (audio, s) = vocals_or_mix(mix, &choice, |_, mix| match &separator {
-            Some(sep) => sep.vocals(mix, None),
-            None => Err(pharos_align::separate::SeparateError::Model {
-                path: BPK.into(),
-                message: "not loaded".into(),
-            }),
-        });
+        let (audio, s) = separate_on(adapter, &mix, |_, mix| separator.vocals(mix, None));
         if let Some(audio) = &audio {
             write(outp, audio)?;
         }

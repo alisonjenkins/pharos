@@ -10,7 +10,7 @@ use crate::device::{Choice, Device};
 use crate::placement::Fallback;
 use crate::recognise::whisper::Recogniser;
 use crate::separate::htdemucs::Separator;
-use crate::separate::{self, vocals_or_mix};
+use crate::separate::{self, separate_on};
 use crate::service::{StageError, Stages};
 use crate::transcript::Word;
 
@@ -33,7 +33,13 @@ impl Stages for Live {
     fn vocals(&self, path: &Path, deadline: Instant) -> Result<Vec<f32>, StageError> {
         let mix = decode_stereo(&self.ffmpeg, path, separate::RATE)
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))?;
-        let (vocals, separation) = vocals_or_mix(mix, &self.choice, |adapter, mix| {
+        let Device::Vulkan(adapter) = &self.choice.device else {
+            return Err(failed(Fallback::NoGpuStages)(format!(
+                "no GPU to separate on: {}",
+                self.choice.reason
+            )));
+        };
+        let (vocals, separation) = separate_on(adapter, &mix, |adapter, mix| {
             let separator = Separator::load(&self.separator, adapter)?;
             let vocals = separator.vocals(mix, Some(deadline));
             separator.release();
