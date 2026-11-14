@@ -123,10 +123,10 @@ pub fn albums_url(server: &str, account: &Account, start: usize) -> String {
 
 /// One album's tracks, in disc and track order.
 #[must_use]
-pub fn tracks_url(server: &str, account: &Account, album: &str) -> String {
+pub fn tracks_url(server: &str, account: &Account, album: &str, start: usize) -> String {
     format!(
         "{server}/Users/{}/Items?ParentId={}&IncludeItemTypes=Audio\
-         &SortBy=ParentIndexNumber,IndexNumber,SortName&Limit={PAGE}",
+         &SortBy=ParentIndexNumber,IndexNumber,SortName&StartIndex={start}&Limit={PAGE}",
         query_escape(&account.user_id),
         query_escape(album)
     )
@@ -325,8 +325,9 @@ mod tests {
         let albums = albums_url("https://p.test", &account(), 50);
         assert!(albums.contains("IncludeItemTypes=MusicAlbum"));
         assert!(albums.contains("StartIndex=50&Limit=50"));
-        let tracks = tracks_url("https://p.test", &account(), "al1");
+        let tracks = tracks_url("https://p.test", &account(), "al1", 50);
         assert!(tracks.contains("ParentId=al1"));
+        assert!(tracks.contains("StartIndex=50&Limit=50"));
         assert!(tracks.contains("SortBy=ParentIndexNumber,IndexNumber"));
     }
 
