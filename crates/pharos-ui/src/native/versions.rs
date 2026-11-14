@@ -52,6 +52,22 @@ pub fn version_label(version: &Version) -> String {
     parts.join(" · ")
 }
 
+/// A book version as the format picker lists it (V1391): its format as the
+/// server names it (`EPUB`, `PDF`, `Kindle (locked)`), else its container,
+/// then its size.
+pub fn book_version_label(version: &Version) -> String {
+    let name = match version.name.trim() {
+        "" => version.container.to_ascii_uppercase(),
+        name => name.to_owned(),
+    };
+    let mut parts: Vec<String> = Some(name).filter(|n| !n.is_empty()).into_iter().collect();
+    parts.extend(file_size(version.size_bytes));
+    if parts.is_empty() {
+        return "Book".to_owned();
+    }
+    parts.join(" · ")
+}
+
 /// The rows a title page lists for the chosen version, as (label, value).
 /// The file row appears only when the server sent a path, which it does for
 /// admins alone.
@@ -242,6 +258,27 @@ fn file_size(bytes: u64) -> Option<String> {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_book_version_is_named_by_its_format_and_size() {
+        let book = |name: &str, container: &str, size_bytes| Version {
+            name: name.into(),
+            container: container.into(),
+            size_bytes,
+            ..Version::default()
+        };
+        assert_eq!(
+            book_version_label(&book("EPUB", "epub", 1_200_000)),
+            "EPUB · 2 MB"
+        );
+        assert_eq!(book_version_label(&book("PDF", "pdf", 0)), "PDF");
+        assert_eq!(
+            book_version_label(&book("Kindle (locked)", "azw3", 0)),
+            "Kindle (locked)"
+        );
+        assert_eq!(book_version_label(&book("", "cbz", 0)), "CBZ");
+        assert_eq!(book_version_label(&Version::default()), "Book");
+    }
 
     fn timed(id: &str, duration_ms: u64) -> Version {
         Version {
