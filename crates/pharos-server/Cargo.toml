@@ -72,7 +72,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # 026 FR-010: cuts embedded subtitle fonts to the glyphs a track draws. Not
 # `subsetter`, which strips the cmap table libass needs.
 skera = { version = "0.9.0", default-features = false }
-read-fonts = { version = "0.46", default-features = false, features = ["std"] }
+read-fonts = { version = "0.47", default-features = false, features = ["std"] }
 
 # glibc malloc kept ~1.6 GiB of freed memory in per-thread arenas under
 # playback load (ADR-0074). Unprefixed, so libav's in-process allocations move
