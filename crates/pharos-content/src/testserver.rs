@@ -21,6 +21,8 @@ pub struct Script {
     /// body bytes.
     drops: VecDeque<usize>,
     valid_token: Option<String>,
+    /// Paths that answer 503 until the script is changed.
+    busy: Vec<String>,
     /// Every request seen: path, `Range` header, status sent.
     pub log: Vec<Seen>,
 }
@@ -51,6 +53,11 @@ impl Script {
 
     pub fn drop_first_after(mut self, bytes: usize) -> Self {
         self.drops.push_back(bytes);
+        self
+    }
+
+    pub fn busy(mut self, path: &str) -> Self {
+        self.busy.push(path.to_owned());
         self
     }
 
@@ -225,6 +232,9 @@ fn plan(
         if token != Some(valid.as_str()) {
             return (plain(401), None);
         }
+    }
+    if s.busy.iter().any(|b| b == path) {
+        return (plain(503), None);
     }
     let Some(file) = s.files.get(path) else {
         return (plain(404), None);
