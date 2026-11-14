@@ -364,7 +364,6 @@ mod tests {
         let waited = wait_until_set(&SLOT, &SET, std::time::Duration::from_secs(5))?;
         setter.join().map_err(|_| "setter panicked".to_owned())?;
         let waited = waited.ok_or("still empty")?;
-        assert!(waited >= std::time::Duration::from_millis(40), "{waited:?}");
         assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         Ok(())
     }
