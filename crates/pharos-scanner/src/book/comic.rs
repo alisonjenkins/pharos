@@ -523,7 +523,7 @@ fn is_page_entry(name: &str) -> bool {
 
 /// Compare two entry names the way a reader orders pages: digit runs compare as
 /// numbers, everything else byte-wise and case-insensitively.
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (mut ai, mut bi) = (a.bytes().peekable(), b.bytes().peekable());
     loop {
