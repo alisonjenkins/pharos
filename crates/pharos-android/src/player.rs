@@ -64,6 +64,7 @@ pub(crate) fn play(
     if !queue.iter().any(|i| i.id == item.id) {
         queue = vec![item.clone()];
     }
+    snapshot::note_track(&item.id, &ids(&queue), item.duration_ms);
     st.current = Some(item.clone());
     st.queue = queue;
     let session = st.session.clone();
@@ -117,6 +118,7 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
     })();
     if let Err(e) = &outcome {
         if PLAY_GEN.load(Ordering::SeqCst) == gen {
+            snapshot::note_error(&format!("play {id}: {e}"));
             if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
                 set_error(env, session.as_obj(), "Couldn't play that")?;
             }
@@ -202,6 +204,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             entry.duration_ms, entry.id
         ));
         set_metadata(env, session.as_obj(), &entry, length)?;
+        snapshot::note_duration(length);
         let at = resume::prepared(env, &entry.id, u64::try_from(length).unwrap_or(0), &player)?;
         let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
         if !focus::request(env)? {
@@ -245,6 +248,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         resume::drop_current(false)?;
         let _ = env.call_method(&mp, "release", "()V", &[]);
         set_playback_state(env, session.as_obj(), STATE_ERROR, 0)?;
+        snapshot::note_error(&format!("player error what={what} extra={extra}"));
         log(&format!(
             "player onError id={} what={what} extra={extra}: released, state ERROR",
             entry.id
