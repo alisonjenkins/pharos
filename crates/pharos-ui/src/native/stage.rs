@@ -30,7 +30,9 @@ pub const STAGE_EXPAND_ID: &str = "pharos-stage-expand";
 /// Whether the D-pad's spatial focus is the only way round the page (a TV):
 /// the floating window's strip is then no focus stop, as its arrows would
 /// move the window rather than the focus (B1031).
-const REMOTE_FOCUS: bool = cfg!(target_os = "android");
+fn remote_focus() -> bool {
+    super::shell::current().remote_driven()
+}
 /// How far an arrow key moves the floating window, in px (FR-007).
 pub const KEY_STEP_PX: f64 = 16.0;
 /// The narrowest the floating window resizes to, in px: the strip's
@@ -302,7 +304,7 @@ impl Stage {
     /// The Android TV app's compact player is always the bar along the
     /// bottom: a remote cannot drag the floating window off what it covers.
     fn docked_on_tv(mut self) -> Self {
-        if cfg!(target_os = "android") {
+        if super::shell::current().remote_driven() {
             self.compact = View::Mini;
         }
         self
@@ -568,7 +570,7 @@ fn strip_movable(floating: bool, remote_focus: bool) -> bool {
 /// the grip would be one more focus stop over the picture whose arrows
 /// resize the window rather than move the focus (B1031).
 pub fn grip_shown(floating: bool) -> bool {
-    floating && !REMOTE_FOCUS
+    floating && !remote_focus()
 }
 
 /// The compact player's chrome: the title strip (the drag handle of the
@@ -625,7 +627,7 @@ pub fn StageBar(
     };
     let on_strip_key = move |evt: KeyboardEvent| {
         // Only on the strip itself; a focused button keeps its own keys.
-        if !strip_movable(floating, REMOTE_FOCUS) || !platform::key_on_itself(&evt, STRIP_CLASS) {
+        if !strip_movable(floating, remote_focus()) || !platform::key_on_itself(&evt, STRIP_CLASS) {
             return;
         }
         let delta = match evt.key() {
@@ -646,8 +648,8 @@ pub fn StageBar(
             "data-view": view.label(),
             div {
                 class: STRIP_CLASS,
-                tabindex: if strip_movable(floating, REMOTE_FOCUS) { "0" } else { "-1" },
-                aria_label: if strip_movable(floating, REMOTE_FOCUS) { "Move the player with the arrow keys" },
+                tabindex: if strip_movable(floating, remote_focus()) { "0" } else { "-1" },
+                aria_label: if strip_movable(floating, remote_focus()) { "Move the player with the arrow keys" },
                 onkeydown: on_strip_key,
                 onpointerdown: move |evt: PointerEvent| {
                     // The strip's buttons are not handles.
@@ -1467,7 +1469,7 @@ mod tests {
     /// D-pad; a keyboard's and a pointer's keep theirs.
     #[test]
     fn only_a_keyboard_or_pointer_gets_the_resize_grip() {
-        assert_eq!(grip_shown(true), !REMOTE_FOCUS);
+        assert_eq!(grip_shown(true), !remote_focus());
         assert!(!grip_shown(false));
     }
 

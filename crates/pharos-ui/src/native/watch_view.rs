@@ -66,11 +66,15 @@ pub(super) const SEEK_STEP_MS: u64 = 10_000;
 /// Whether left and right preview a seek with its thumbnail and commit it
 /// on OK or a pause (B907), as a TV remote wants, instead of seeking 10 s
 /// at once as a keyboard does.
-const SCRUB_KEYS: bool = cfg!(target_os = "android");
+fn scrub_keys() -> bool {
+    super::shell::current().remote_driven()
+}
 /// Whether the D-pad's spatial focus is the only way round the page, as on
 /// a TV remote with no Tab or pointer (B1031): the compact player's picture
 /// is then no focus stop, so the D-pad reaches the stage bar's buttons.
-const REMOTE_FOCUS: bool = cfg!(target_os = "android");
+fn remote_focus() -> bool {
+    super::shell::current().remote_driven()
+}
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
 /// How often a playing picture checks for a still pointer.
@@ -630,7 +634,7 @@ pub fn WatchView(
     // A TV keeps every menu in the sheet (B1338); the remote lands on its
     // first one as it opens, not on the seek bar the D-pad would find.
     use_effect(move || {
-        if sheet_open() && REMOTE_FOCUS {
+        if sheet_open() && remote_focus() {
             platform::info("pharos: player settings opened focus=first");
             platform::focus_first_in(SETTINGS_ID);
         }
@@ -692,7 +696,7 @@ pub fn WatchView(
     let up_next_live = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     up_next_live.set(up_next_shown);
     let _back = use_hook(|| {
-        SCRUB_KEYS.then(|| {
+        scrub_keys().then(|| {
             let mut end_scrub = end_scrub;
             let up_next = std::rc::Rc::clone(&up_next_live);
             std::rc::Rc::new(platform::on_back(move || {
@@ -711,9 +715,9 @@ pub fn WatchView(
     // On a TV the compact picture hands the focus to the stage bar's Expand
     // button, and keeps none of the D-pad for itself (B1031): left and right
     // seeking it would leave the bar's buttons out of reach.
-    let picture_keys = picture_takes_keys(compact, REMOTE_FOCUS);
+    let picture_keys = picture_takes_keys(compact, remote_focus());
     use_effect(use_reactive!(|compact| {
-        if !picture_takes_keys(compact, REMOTE_FOCUS) {
+        if !picture_takes_keys(compact, remote_focus()) {
             platform::info("pharos: stage remote focus to=expand reason=compact");
             platform::focus_out_of(PLAYER_ID, STAGE_EXPAND_ID);
         }
@@ -749,7 +753,7 @@ pub fn WatchView(
         }
         // Shift+P / Shift+N are page-wide (B562), not the player's own.
         let transport = keymap::transport(Mode::Player, &evt.key().to_string());
-        if SCRUB_KEYS {
+        if scrub_keys() {
             let mut end_scrub = end_scrub;
             let scrubbing = scrub.peek().is_some();
             match scrub_key(transport, &evt.key(), scrubbing) {
@@ -811,7 +815,7 @@ pub fn WatchView(
         };
         // Another seek (a digit, a skip) wins over an open preview: its
         // settle timer must not seek back to the old target.
-        if SCRUB_KEYS && drops_preview(&control) {
+        if scrub_keys() && drops_preview(&control) {
             let mut end_scrub = end_scrub;
             end_scrub(scrub::End::Cancelled);
         }
@@ -873,7 +877,7 @@ pub fn WatchView(
         .find(|t| Some(t.index) == c.subtitle_pick)
         .and_then(|t| t.images_url.clone());
     // A TV offers the delay only for image subtitles, which it draws itself.
-    let offer_delay = c.subtitle_pick.is_some() && (!SCRUB_KEYS || image_cues.is_some());
+    let offer_delay = c.subtitle_pick.is_some() && (!scrub_keys() || image_cues.is_some());
 
     rsx! {
         section { class: "pharos-watch",
@@ -1149,7 +1153,7 @@ pub fn WatchView(
                     } else {
                         UpNext { card, on_control }
                     }
-                } else if c.up_next.is_none() && !(REMOTE_FOCUS && sheet_open()) {
+                } else if c.up_next.is_none() && !(remote_focus() && sheet_open()) {
                     // On a TV the open settings panel stands where the skip
                     // card does; the card waits until it closes (B1338).
                     SkipButton { segments: c.segments.clone(), pos, on_control }
@@ -1280,7 +1284,7 @@ pub fn WatchView(
                             on_pick: move |control| on_control.call(control),
                         }
                         // The TV app cannot set the rate yet.
-                        if !SCRUB_KEYS {
+                        if !scrub_keys() {
                             SpeedPicker {
                                 speed: c.speed,
                                 in_group,
@@ -1345,7 +1349,7 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
     // it back to the picture as it goes (B1342).
     let span = seg.as_ref().map(|s| (s.start_ms, s.end_ms));
     use_effect(use_reactive!(|span| {
-        if REMOTE_FOCUS {
+        if remote_focus() {
             if span.is_some() {
                 platform::focus_card(PLAYER_ID, SKIP_ID, "");
             } else {
@@ -1354,7 +1358,7 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
         }
     }));
     use_drop(|| {
-        if REMOTE_FOCUS {
+        if remote_focus() {
             platform::refocus_if_lost(PLAYER_ID, false);
         }
     });
@@ -1431,12 +1435,12 @@ fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
 /// picture takes it back when the card goes (B1342).
 fn use_card_focus() {
     use_effect(|| {
-        if REMOTE_FOCUS {
+        if remote_focus() {
             platform::focus_card(PLAYER_ID, UP_NEXT_PLAY_ID, UP_NEXT_CANCEL_ID);
         }
     });
     use_drop(|| {
-        if REMOTE_FOCUS {
+        if remote_focus() {
             platform::refocus_if_lost(PLAYER_ID, true);
         }
     });
@@ -1826,7 +1830,7 @@ pub(super) fn slider_key(evt: KeyboardEvent, wake: Option<Wake>) {
 /// a TV the menu sits in the open settings sheet, so the remote stays on it
 /// (B1342): the picture would take OK while the sheet is still open.
 fn after_pick() {
-    if !REMOTE_FOCUS {
+    if !remote_focus() {
         platform::focus_by_id(PLAYER_ID);
     }
 }
