@@ -33,6 +33,10 @@ public class Check {
     cb.onPlayFromMediaId("tone:440", null);
     MediaSession session = MediaSession.last;
     expect(session.state.state == 6, "a new item is BUFFERING until prepared: " + session.state);
+    expect(session.flags == 3, "session handles media buttons and transport controls");
+    expect(session.activity != null && session.activity.intent.target.getSimpleName().equals("PharosSearchActivity")
+        && session.activity.flags == 67108864, "session activity is an immutable intent for PharosSearchActivity");
+    expect((session.state.actions & (16384 | 32768 | 65536)) == (16384 | 32768 | 65536), "PREPARE actions advertised");
     cb.onPause();
     expect(session.state.state == 6, "pause while preparing is ignored: " + session.state);
     MediaPlayer.last.firePrepared();
@@ -56,6 +60,12 @@ public class Check {
     MediaPlayer.last.firePrepared();
     MediaPlayer.last.fireCompletion();
     expect("tone:523".equals(session.md.m.get("android.media.metadata.MEDIA_ID")), "completion skips to the next item: " + session.md);
+    android.os.Bundle hints = new android.os.Bundle();
+    hints.putString("android.intent.extra.focus", "vnd.android.cursor.item/audio");
+    cb.onPrepareFromSearch("test chapter", hints);
+    expect(session.state.state == 2 && "tone:330".equals(session.md.m.get("android.media.metadata.MEDIA_ID")),
+        "onPrepareFromSearch loads the match paused: " + session.state);
+    cb.onPlayFromSearch("test tone a", hints);
     cb.onPlayFromMediaId("nope", null);
     cb.onStop();
     s.onDestroy();

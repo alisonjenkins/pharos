@@ -22,7 +22,7 @@ const STATE_ERROR: i32 = 7;
 const STATE_BUFFERING: i32 = 6;
 // PlaybackState.ACTION_*: STOP | PAUSE | PLAY | SKIP_TO_PREVIOUS |
 // SKIP_TO_NEXT | SEEK_TO | PLAY_PAUSE | PLAY_FROM_MEDIA_ID | PLAY_FROM_SEARCH.
-const ACTIONS: i64 = 1 | 2 | 4 | 16 | 32 | 256 | 512 | 1024 | 2048;
+const ACTIONS: i64 = 1 | 2 | 4 | 16 | 32 | 256 | 512 | 1024 | 2048 | 16384 | 32768 | 65536;
 const FLAG_BROWSABLE: i32 = 1;
 const FLAG_PLAYABLE: i32 = 2;
 
@@ -372,6 +372,62 @@ fn skip(env: &mut JNIEnv, step: isize) -> R<()> {
     }
 }
 
+/// Points the session at `PharosSearchActivity`, the app's only activity,
+/// so the system has somewhere to send "open the app".
+fn set_session_activity(env: &mut JNIEnv, ctx: &JObject, session: &JObject) -> R<()> {
+    const FLAG_IMMUTABLE: i32 = 67_108_864;
+    let class = env
+        .find_class("com/alisonjenkins/pharos/auto/PharosSearchActivity")
+        .map_err(jerr("find PharosSearchActivity"))?;
+    let intent = env
+        .new_object(
+            "android/content/Intent",
+            "(Landroid/content/Context;Ljava/lang/Class;)V",
+            &[JValue::Object(ctx), JValue::Object(&class)],
+        )
+        .map_err(jerr("Intent"))?;
+    let pi = env
+        .call_static_method(
+            "android/app/PendingIntent",
+            "getActivity",
+            "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;",
+            &[JValue::Object(ctx), JValue::Int(0), JValue::Object(&intent), JValue::Int(FLAG_IMMUTABLE)],
+        )
+        .and_then(|v| v.l())
+        .map_err(jerr("PendingIntent.getActivity"))?;
+    env.call_method(session, "setSessionActivity", "(Landroid/app/PendingIntent;)V", &[JValue::Object(&pi)])
+        .map_err(jerr("setSessionActivity"))?;
+    Ok(())
+}
+
+/// The keys of `extras`, for logs: which hints (focus, title, artist) the
+/// assistant sent with a request.
+fn bundle_keys(env: &mut JNIEnv, extras: &JObject) -> R<String> {
+    if extras.is_null() {
+        return Ok("null".into());
+    }
+    let keys = env
+        .call_method(extras, "keySet", "()Ljava/util/Set;", &[])
+        .and_then(|v| v.l())
+        .map_err(jerr("keySet"))?;
+    let text = env
+        .call_method(&keys, "toString", "()Ljava/lang/String;", &[])
+        .and_then(|v| v.l())
+        .map_err(jerr("keySet.toString"))?;
+    string(env, &JString::from(text))
+}
+
+/// Loads entry `id` without starting it, as the PREPARE actions ask: the
+/// spike publishes its metadata and PAUSED.
+fn prepare(env: &mut JNIEnv, id: Option<&str>) -> R<()> {
+    let Some(entry) = id.and_then(|id| CATALOGUE.iter().find(|e| e.playable && e.id == id)) else {
+        return Ok(());
+    };
+    let session = state_lock()?.as_ref().ok_or("prepare before onCreate")?.session.clone();
+    set_metadata(env, session.as_obj(), entry, if entry.url.is_empty() { TONE_MS } else { 0 })?;
+    set_playback_state(env, session.as_obj(), STATE_PAUSED, 0)
+}
+
 // ---- PharosMediaService ----------------------------------------------------
 
 #[no_mangle]
@@ -394,6 +450,10 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         env.call_method(&session, "setCallback", "(Landroid/media/session/MediaSession$Callback;)V", &[JValue::Object(&cb)])
             .map_err(jerr("setCallback"))?;
         set_playback_state(env, &session, STATE_STOPPED, 0)?;
+        // FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS:
+        // deprecated no-ops since API 26, set in case the assistant reads them.
+        env.call_method(&session, "setFlags", "(I)V", &[JValue::Int(3)]).map_err(jerr("setFlags"))?;
+        set_session_activity(env, &this, &session)?;
         env.call_method(&session, "setActive", "(Z)V", &[JValue::Bool(1)]).map_err(jerr("setActive"))?;
         let token = env
             .call_method(&session, "getSessionToken", "()Landroid/media/session/MediaSession$Token;", &[])
@@ -569,16 +629,52 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
     mut env: JNIEnv<'l>,
     _this: JObject<'l>,
     query: JString<'l>,
-    _extras: JObject<'l>,
+    extras: JObject<'l>,
 ) {
     guarded(&mut env, "onPlayFromSearch", (), |env| {
         let q = string(env, &query)?;
+        let keys = bundle_keys(env, &extras)?;
         let hit = search(&q).first().map(|e| e.id);
-        log(&format!("session onPlayFromSearch query={q:?} verdict={hit:?}"));
+        log(&format!("session onPlayFromSearch query={q:?} extras={keys} verdict={hit:?}"));
         match hit {
             Some(id) => play(env, id),
             None => Ok(()),
         }
+    })
+}
+
+callback!(Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepare, "onPrepare", |env| {
+    let current = state_lock()?.as_ref().and_then(|s| s.current);
+    prepare(env, current.or_else(|| CATALOGUE.iter().find(|e| e.playable).map(|e| e.id)))
+});
+
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromMediaId<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    id: JString<'l>,
+    _extras: JObject<'l>,
+) {
+    guarded(&mut env, "onPrepareFromMediaId", (), |env| {
+        let id = string(env, &id)?;
+        log(&format!("session onPrepareFromMediaId id={id}"));
+        prepare(env, Some(&id))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromSearch<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    query: JString<'l>,
+    extras: JObject<'l>,
+) {
+    guarded(&mut env, "onPrepareFromSearch", (), |env| {
+        let q = string(env, &query)?;
+        let keys = bundle_keys(env, &extras)?;
+        let hit = search(&q).first().map(|e| e.id);
+        log(&format!("session onPrepareFromSearch query={q:?} extras={keys} verdict={hit:?}"));
+        prepare(env, hit)
     })
 }
 
@@ -680,12 +776,19 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_n
             .and_then(|v| v.l())
             .map_err(jerr("getStringExtra"))?;
         let q = string(env, &JString::from(q))?;
+        let extras = env
+            .call_method(&intent, "getExtras", "()Landroid/os/Bundle;", &[])
+            .and_then(|v| v.l())
+            .map_err(jerr("getExtras"))?;
+        let keys = bundle_keys(env, &extras)?;
         let hit = search(&q).first().map(|e| e.id);
         let service_up = state_lock()?.is_some();
+        let from_search = action == "android.media.action.MEDIA_PLAY_FROM_SEARCH";
         log(&format!(
-            "search activity action={action} query={q:?} verdict={hit:?} service_up={service_up}"
+            "search activity action={action} query={q:?} extras={keys} verdict={hit:?} service_up={service_up}"
         ));
-        let played = match (hit, service_up) {
+        // The session activity opens it without a search: show nothing, play nothing.
+        let played = match (hit, service_up && from_search) {
             (Some(id), true) => play(env, id),
             _ => Ok(()),
         };
