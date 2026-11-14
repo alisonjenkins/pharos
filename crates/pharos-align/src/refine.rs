@@ -105,7 +105,7 @@ fn anchor_words(line: &Line, words: &[text::Word], starts_ms: &[i64], end: i64) 
 /// leap past a line with words: one of the lines between it and a
 /// neighbour, moved by that neighbour's offset, falls on its far side. An
 /// offset far off with no such line is the request's timing being off,
-/// not a repeat.
+/// not a repeat (V1397).
 fn outliers(lines: &[Line], matched: &Matched) -> Vec<bool> {
     let offsets: Vec<(usize, i64)> = matched
         .lines
