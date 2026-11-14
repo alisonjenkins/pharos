@@ -588,6 +588,93 @@ async fn a_3d_edition_is_badged_listed_filtered_and_played() {
     }
 }
 
+/// V1391: a book's other formats are its versions, each named by format,
+/// and a detail of one version reads as that version's format.
+#[actix_web::test]
+async fn a_books_formats_are_listed_as_its_versions() {
+    use pharos_client::api::BookFormat as WireFormat;
+    use pharos_core::{
+        AlternateMediaSource, BookFormat, BookMeta, MediaItem, MediaKind, MediaProbe,
+    };
+
+    const BOOK: u64 = 330;
+    let (api, fx, _server) = api().await;
+    let version = |id: &str, ext: &str, container: &str| AlternateMediaSource {
+        id: id.into(),
+        path: format!("/libA/Widget Cookbook.{ext}").into(),
+        name: Some(id.to_uppercase()),
+        container: Some(container.into()),
+        size_bytes: Some(2_000),
+        probe: Some(Box::new(MediaProbe {
+            container: Some(container.into()),
+            size_bytes: Some(2_000),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let mut locked = version("kindle-locked", "azw3", "azw3");
+    locked.name = Some("Kindle (locked)".into());
+    pharos_core::MediaStore::put(
+        &fx.state.stores,
+        MediaItem {
+            id: BOOK,
+            path: "/libA/Widget Cookbook.epub".into(),
+            title: "Widget Cookbook".into(),
+            kind: MediaKind::Book,
+            book: Some(BookMeta {
+                format: BookFormat::Epub,
+                ..Default::default()
+            }),
+            probe: MediaProbe {
+                size_bytes: Some(1_000),
+                alternate_sources: vec![version("pdf", "pdf", "pdf"), locked],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let call = CallInfo::default();
+
+    let detail = api
+        .detail(&call, ItemRef::Real(BOOK))
+        .await
+        .expect("detail");
+    let versions: Vec<_> = detail
+        .versions
+        .iter()
+        .map(|v| {
+            (
+                v.id.as_str(),
+                v.name.as_str(),
+                v.container.as_str(),
+                v.primary,
+            )
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            ("", "EPUB", "epub", true),
+            ("pdf", "PDF", "pdf", false),
+            ("kindle-locked", "Kindle (locked)", "azw3", false),
+        ]
+    );
+    let format = |d: &pharos_client::api::Detail| d.book.as_ref().map(|b| b.format);
+    assert_eq!(format(&detail), Some(WireFormat::Epub));
+    let pdf = api
+        .detail_version(&call, ItemRef::Real(BOOK), "pdf")
+        .await
+        .expect("the pdf version");
+    assert_eq!(format(&pdf), Some(WireFormat::Pdf));
+    let locked = api
+        .detail_version(&call, ItemRef::Real(BOOK), "kindle-locked")
+        .await
+        .expect("the locked version");
+    assert_eq!(format(&locked), Some(WireFormat::Unreadable));
+}
+
 /// V721: each version carries what tells it apart (resolution, HDR, codecs,
 /// audio, size), and its path on disk only when an admin asks; a detail of
 /// one copy lists that file's subtitles, read through its own source.

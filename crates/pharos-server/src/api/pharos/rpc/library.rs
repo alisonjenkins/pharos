@@ -534,7 +534,11 @@ impl server::library::Handler for Library {
                 return Ok(());
             }
         };
-        let has_versions = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+        // A book's versions are its other formats (V1391).
+        let has_versions = matches!(
+            item.kind,
+            MediaKind::Movie | MediaKind::Episode | MediaKind::Book
+        );
         // The versions list describes every file; the rest of the detail
         // (tracks, fonts, subtitle URLs) describes the one asked for.
         let all = item.clone();
@@ -2227,7 +2231,20 @@ fn write_versions(
     let mut primary = out.reborrow().get(0);
     primary.set_primary(true);
     primary.set_stereo(wire_stereo(item.probe.video_3d_format));
-    write_version_facts(primary, &item.probe, &item.path, admin);
+    match &item.book {
+        // A book's primary has no probe: its name and container are its
+        // format, as its versions' are (V1391).
+        Some(book) => {
+            use pharos_scanner::book::fold::{format_name, readable_container};
+            let probe = MediaProbe {
+                container: Some(readable_container(&item.path, book.format)),
+                ..item.probe.clone()
+            };
+            primary.set_name(format_name(&item.path, book.format).as_str());
+            write_version_facts(primary, &probe, &item.path, admin);
+        }
+        None => write_version_facts(primary, &item.probe, &item.path, admin),
+    }
     for (i, alt) in (1..out.len()).zip(item.probe.versions()) {
         let mut v = out.reborrow().get(i);
         v.set_id(alt.id.as_str());
