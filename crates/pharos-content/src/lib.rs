@@ -12,6 +12,7 @@
 //!                      is approved in the Pharos web UI
 //! ```
 mod cache;
+pub mod credentials;
 mod error;
 mod fault;
 mod fuzzy;
