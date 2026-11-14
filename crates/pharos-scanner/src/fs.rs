@@ -1806,8 +1806,7 @@ impl<P: Prober> FsScanner<P> {
         let title = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .map_or_else(|| "unknown".to_string(), crate::book::title::stem_title);
         // Stat for size only. Everything else on `MediaProbe` describes streams
         // a book does not have.
         let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
