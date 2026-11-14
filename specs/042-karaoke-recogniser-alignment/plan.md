@@ -31,7 +31,7 @@ Three failure classes found, each designed out below:
    - a kept line just outside the span whose today's time overlaps the placed edge line is taken into the span and the pass runs again; if that makes it infeasible, the last feasible answer stands (V1373).
    A line outside any anchor pair keeps today's time.
 7. **Order** the whole song: placed lines (anchored, refined, between) never move; every kept line's word starts are held into the gap between the placed lines around it, scanning each run of kept lines with a running max from the placed line before it, then capping at the first start of the placed line after it. Word starts then never decrease anywhere in the song (FR-006, V1373). This runs for every song placed from anchors, whatever happened at the edges. A song that falls back whole (low anchor share, a stage failure) is exempt and keeps today's answer exactly (FR-011).
-8. **Emit** a corrected event for every line whose time changed, then the whole answer (ADR-0121 shape, additive `placement` per line).
+8. **Emit** a corrected event for every line where any word start differs from the per-line answer already streamed, including a change to a later word only, then the whole answer (ADR-0121 shape, additive `placement` per line).
 
 Models load in stages and are released between them: separator, then recogniser, then the letter model already resident. Peak GPU memory for one song stays under 6 GiB (FR-010).
 
