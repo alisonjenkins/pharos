@@ -2980,6 +2980,14 @@ impl CopyBucket {
 /// copy of a film.
 const FILM_EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "webm", "m4v"];
 
+/// Whether `path` is held in a film container: the files a course lesson
+/// can be (ADR-0126).
+pub(crate) fn is_film_container(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// The buckets `path` is a copy in: for an episode file each episode it
 /// covers, or for a span past [`MAX_EPISODE_SPAN`] only its exact span; for a
 /// film its title and year; for a song its name and folders.
