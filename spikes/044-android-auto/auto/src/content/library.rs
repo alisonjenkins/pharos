@@ -153,6 +153,8 @@ pub struct Library {
     offline: OnceLock<Offline>,
     queues: Mutex<Queues>,
     online: AtomicBool,
+    /// What the platform's network callback last said.
+    network_up: AtomicBool,
 }
 
 /// The audio cache and the thread that fills it.
@@ -305,6 +307,7 @@ impl Library {
             offline: OnceLock::new(),
             queues: Mutex::new(Queues::default()),
             online: AtomicBool::new(true),
+            network_up: AtomicBool::new(true),
         })
     }
 
@@ -524,6 +527,21 @@ impl Library {
     /// pauses downloads and makes browsing answer from saved listings at once
     /// instead of waiting for a timeout.
     pub fn set_online(&self, online: bool) {
+        self.network_up.store(online, Ordering::SeqCst);
+        self.apply_online();
+    }
+
+    /// Debug: refuse every server connection (websocket, listings,
+    /// downloads) as if the server were unreachable, and go offline. Off
+    /// restores what the network callback last said.
+    pub fn debug_offline(&self, on: bool) {
+        super::fault::set_unreachable(on);
+        self.apply_online();
+        log::info!("debug offline {}", if on { "on" } else { "off" });
+    }
+
+    fn apply_online(&self) {
+        let online = self.network_up.load(Ordering::SeqCst) && !super::fault::unreachable();
         self.online.store(online, Ordering::SeqCst);
         if let Some(o) = self.offline.get() {
             o.downloader.set_online(online);
@@ -737,6 +755,13 @@ impl Worker {
     /// A live link: the open one (media token refreshed if near expiry), or
     /// one resumed from the stored device token. No token starts QuickConnect.
     async fn link(&mut self, events: &UnboundedSender<Event>) -> Result<Link, ContentError> {
+        if super::fault::unreachable() {
+            self.link = None;
+            return Err(ContentError::Connect {
+                url: self.base.clone(),
+                why: super::fault::WHY.into(),
+            });
+        }
         if let Some(l) = self.link.as_mut() {
             if l.cat.is_closed() {
                 log::info!("connection closed; reconnecting");
