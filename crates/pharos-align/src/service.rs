@@ -757,7 +757,18 @@ fn improve(
                     if Instant::now() >= deadline {
                         return Err("stopped at the deadline".to_owned());
                     }
-                    model.emission(chunk).map_err(|e| e.to_string())
+                    let e = model.emission(chunk).map_err(|e| e.to_string())?;
+                    // The stages run on the GPU only (V1409): a model that
+                    // fell to the CPU mid-song fails the stage rather than
+                    // running the rest of it there.
+                    let used = model.device();
+                    if !used.on_gpu() {
+                        return Err(format!(
+                            "the letter model fell back to the {}: {}",
+                            used.device, used.reason
+                        ));
+                    }
+                    Ok(e)
                 })?
                 .ok_or_else(|| "the letter model gives no emission".to_owned())
             })
