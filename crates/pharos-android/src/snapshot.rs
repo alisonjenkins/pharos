@@ -130,6 +130,14 @@ pub(crate) fn note_track(current: &str, queue: &[String], duration_ms: i64) {
     });
 }
 
+/// The queue was replaced around the current track, which keeps playing.
+pub(crate) fn note_queue(queue: &[String], index: usize) {
+    channel().send_modify(|s| {
+        s.queue = queue.iter().map(|id| ui_id(id)).collect();
+        s.index = Some(index);
+    });
+}
+
 pub(crate) fn note_duration(duration_ms: i64) {
     channel().send_if_modified(|s| {
         let d = known(duration_ms);
