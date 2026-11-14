@@ -90,8 +90,7 @@ pub fn subscribe() -> watch::Receiver<Snapshot> {
     channel().subscribe()
 }
 
-#[cfg(test)]
-fn current() -> Snapshot {
+pub(crate) fn current() -> Snapshot {
     channel().borrow().clone()
 }
 
