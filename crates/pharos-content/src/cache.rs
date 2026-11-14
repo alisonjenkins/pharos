@@ -512,7 +512,13 @@ impl Cache {
         let Lookup::Hit(path) = self.lookup(id) else {
             return None;
         };
+        // Eviction runs under this lock, so re-checking here and marking the
+        // track current cannot interleave with a delete of its file.
         let mut s = self.lock();
+        if !s.entries.get(id).is_some_and(|e| e.complete) || !path.is_file() {
+            log::warn!("cache id={id} was evicted between lookup and play; not a hit");
+            return None;
+        }
         let t = Self::tick(&mut s);
         if let Some(e) = s.entries.get_mut(id) {
             e.last_played_ms = t;
