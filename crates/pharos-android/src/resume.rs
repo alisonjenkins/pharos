@@ -7,6 +7,7 @@
 //! `REPORT_EVERY_TICKS` ticks while playing and on pause, stop and track
 //! change, so the phone's own player and other devices resume there too.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -32,21 +33,24 @@ struct Now {
 static STORE: OnceLock<Resume> = OnceLock::new();
 static NOW: Mutex<Option<Now>> = Mutex::new(None);
 static TICKER: Ticker = Ticker::new();
-/// Tracks started since the process began. A listing's server position is
-/// from when it was listed; once the car has played a track, the phone's
-/// own position for it is the newer one.
-static STARTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The server position each track was last started with. A listing's
+/// server position is from when it was listed; if a start sees the same
+/// value again the listing has not been refreshed since the car played it,
+/// and the phone's own position is the newer one.
+static STARTED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Whether `id` starts for the first time since the process began.
-fn first_start(id: &str) -> R<bool> {
+/// The server position to start `id` from: `server_ms` unless the same
+/// value already served an earlier start of this track.
+fn fresh_server_ms(id: &str, server_ms: u64) -> R<u64> {
     let mut started = STARTED
         .lock()
         .map_err(|_| "resume started-list mutex poisoned".to_owned())?;
-    if started.iter().any(|s| s == id) {
-        return Ok(false);
+    let seen = started.get_or_insert_with(HashMap::new);
+    if seen.insert(id.to_owned(), server_ms) == Some(server_ms) {
+        Ok(0)
+    } else {
+        Ok(server_ms)
     }
-    started.push(id.to_owned());
-    Ok(true)
 }
 
 /// Which save ticker may run. Each ticker holds the token it was started
@@ -242,7 +246,7 @@ pub fn prepared(
     player: &GlobalRef,
 ) -> R<Option<u64>> {
     let local = STORE.get().and_then(|s| s.position(id, duration_ms));
-    let server_ms = if first_start(id)? { server_ms } else { 0 };
+    let server_ms = fresh_server_ms(id, server_ms)?;
     let (at, from) = start_at(server_ms, local, duration_ms);
     let n = Now {
         id: id.to_owned(),
@@ -345,13 +349,20 @@ mod tests {
     }
 
     #[test]
-    fn a_listings_position_counts_only_the_first_time_a_track_starts() {
-        assert!(first_start("track/t1").unwrap());
-        assert!(
-            !first_start("track/t1").unwrap(),
-            "the phone's is newer now"
+    fn a_listings_position_is_used_until_the_same_value_comes_again() {
+        assert_eq!(fresh_server_ms("track/t1", 61_000).unwrap(), 61_000);
+        assert_eq!(
+            fresh_server_ms("track/t1", 61_000).unwrap(),
+            0,
+            "unchanged listing: the phone's position is newer"
         );
-        assert!(first_start("track/t2").unwrap());
+        assert_eq!(
+            fresh_server_ms("track/t1", 90_000).unwrap(),
+            90_000,
+            "a refreshed listing carries a new position"
+        );
+        assert_eq!(fresh_server_ms("track/t2", 0).unwrap(), 0);
+        assert_eq!(fresh_server_ms("track/t3", 5_000).unwrap(), 5_000);
     }
 
     #[test]
