@@ -14,6 +14,9 @@ use super::*;
 /// How often the playhead reaches the snapshot while playing. The UI treats
 /// a jump larger than a few of these as a seek.
 const POSITION_EVERY: Duration = Duration::from_secs(1);
+/// How long an app command waits for the service's `onCreate`: Android stops
+/// an idle background service, and the app's next play starts it again.
+const SERVICE_WAIT: Duration = Duration::from_secs(2);
 
 /// The phone UI's handle on the native player. Every method returns at once;
 /// the outcome arrives on [`Player::state`].
@@ -187,6 +190,7 @@ fn command_loop(rx: mpsc::Receiver<Command>) {
     loop {
         match rx.recv_timeout(POSITION_EVERY) {
             Ok(command) => {
+                await_service(command.label());
                 guarded(&mut env, "app command", (), |env| {
                     apply(env, command, Source::App)
                 });
@@ -199,6 +203,27 @@ fn command_loop(rx: mpsc::Receiver<Command>) {
                 return;
             }
         }
+    }
+}
+
+/// Holds an app command until the service is up, so a play sent while
+/// Android restarts it is applied rather than failing before `onCreate`.
+fn await_service(name: &str) {
+    if state_lock().is_ok_and(|s| s.is_some()) {
+        return;
+    }
+    match wait_until_set(&STATE, &STATE_SET, SERVICE_WAIT) {
+        Ok(Some(waited)) => log(&format!(
+            "command {name}: service verdict=waited ms={}",
+            waited.as_millis()
+        )),
+        Ok(None) => log(&format!(
+            "command {name}: service verdict=gave_up ms={} reason=no_oncreate",
+            SERVICE_WAIT.as_millis()
+        )),
+        Err(e) => log(&format!(
+            "command {name}: service verdict=gave_up reason={e}"
+        )),
     }
 }
 

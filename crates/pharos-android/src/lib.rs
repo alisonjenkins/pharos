@@ -41,8 +41,8 @@ pub mod snapshot;
 mod voice;
 
 pub use app::{
-    ask_notification_permission, credentials_changed, library, player, start_service,
-    NotificationAsk,
+    ask_notification_permission, credentials_changed, library, player, player_within,
+    start_service, NotificationAsk,
 };
 use browse::*;
 use command::*;
@@ -57,7 +57,7 @@ use std::path::Path;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 
@@ -146,6 +146,8 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// Signalled when `onCreate` sets [`STATE`], for commands that raced it.
+static STATE_SET: Condvar = Condvar::new();
 
 static VM: OnceLock<JavaVM> = OnceLock::new();
 
@@ -247,8 +249,23 @@ fn string(env: &mut JNIEnv, s: &JString) -> R<String> {
         .map_err(jerr("get_string"))
 }
 
-fn state_lock() -> R<std::sync::MutexGuard<'static, Option<State>>> {
+fn state_lock() -> R<MutexGuard<'static, Option<State>>> {
     STATE.lock().map_err(|_| "state mutex poisoned".to_owned())
+}
+
+/// Waits up to `limit` for `slot` to hold a value, returning how long that
+/// took, or `None` if it was still empty at the limit.
+fn wait_until_set<T>(
+    slot: &Mutex<Option<T>>,
+    set: &Condvar,
+    limit: std::time::Duration,
+) -> R<Option<std::time::Duration>> {
+    let started = std::time::Instant::now();
+    let guard = slot.lock().map_err(|_| "state mutex poisoned".to_owned())?;
+    let (guard, _) = set
+        .wait_timeout_while(guard, limit, |s| s.is_none())
+        .map_err(|_| "state mutex poisoned".to_owned())?;
+    Ok(guard.is_some().then(|| started.elapsed()))
 }
 
 impl ::log::Log for ContentLog {
@@ -320,6 +337,43 @@ pub fn link() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wait_returns_once_the_slot_is_set() -> R<()> {
+        static SLOT: Mutex<Option<u32>> = Mutex::new(None);
+        static SET: Condvar = Condvar::new();
+        let setter = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(mut s) = SLOT.lock() {
+                *s = Some(1);
+            }
+            SET.notify_all();
+        });
+        let waited = wait_until_set(&SLOT, &SET, std::time::Duration::from_secs(5))?;
+        setter.join().map_err(|_| "setter panicked".to_owned())?;
+        let waited = waited.ok_or("still empty")?;
+        assert!(waited >= std::time::Duration::from_millis(40), "{waited:?}");
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wait_on_an_empty_slot_gives_up_at_the_limit() -> R<()> {
+        let slot: Mutex<Option<u32>> = Mutex::new(None);
+        let set = Condvar::new();
+        let limit = std::time::Duration::from_millis(30);
+        assert_eq!(wait_until_set(&slot, &set, limit)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_wait_on_a_set_slot_returns_at_once() -> R<()> {
+        let slot = Mutex::new(Some(1));
+        let set = Condvar::new();
+        let waited = wait_until_set(&slot, &set, std::time::Duration::from_secs(5))?;
+        assert!(waited.is_some_and(|w| w < std::time::Duration::from_secs(1)));
+        Ok(())
+    }
 
     #[test]
     fn link_lists_every_export_once() {
