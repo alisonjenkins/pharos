@@ -21,6 +21,7 @@ pub mod plan;
 pub mod service;
 pub mod text;
 pub mod tokens;
+pub mod transcript;
 pub mod weights;
 
 /// Why a line could not be aligned; each variant carries the values that decided it.
