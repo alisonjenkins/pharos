@@ -238,7 +238,9 @@ pub fn DownloadsScreen() -> Element {
 pub fn DownloadsPanel(store: Store) -> Element {
     let mut snap = use_snapshot(&store);
     let mut problem = use_signal(|| None::<String>);
-    let now = snap();
+    let names = use_hook(Names::load);
+    let mut now = snap();
+    now.downloads = names.fill(now.downloads);
     rsx! {
         section { class: "pharos-downloads", aria_labelledby: "downloads-title",
             h2 { id: "downloads-title", "Downloads" }
@@ -780,6 +782,36 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("role=\"status\""), "{html}");
+    }
+
+    #[test]
+    fn a_row_the_host_left_unnamed_is_called_by_its_id_without_a_noted_name() {
+        let fake = Arc::new(FakeOfflineStore::new());
+        fake.add_titled(
+            album("7"),
+            "",
+            None,
+            vec![("7-1".into(), "Song One".into(), 1)],
+        );
+        assert_eq!(fake.pin(&album("7")), Ok(()));
+        let html = render_downloads(&fake);
+        assert!(html.contains(">7<"), "{html}");
+    }
+
+    #[test]
+    fn a_noted_name_fills_a_row_the_host_left_unnamed() {
+        use crate::native::offline_names::Names;
+        let downloads = vec![Download {
+            container: album("7"),
+            title: String::new(),
+            subtitle: None,
+            tracks: vec![],
+        }];
+        let mut names = Names::default();
+        names.remember(&album("7"), "Book one", Some("Author one"));
+        let filled = names.fill(downloads);
+        assert_eq!(filled[0].title, "Book one");
+        assert_eq!(filled[0].subtitle.as_deref(), Some("Author one"));
     }
 
     #[test]
