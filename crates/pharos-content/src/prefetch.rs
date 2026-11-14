@@ -81,7 +81,10 @@ pub enum ResolveError {
 pub type Resolver = Arc<dyn Fn(&str) -> Result<String, ResolveError> + Send + Sync>;
 
 struct Queue {
+    /// Playback read-ahead: replaced by each [`Downloader::prefetch`].
     wanted: VecDeque<String>,
+    /// Pin downloads: kept across prefetches, never spent from `budget`.
+    pinned: VecDeque<String>,
     generation: u64,
     budget: u64,
     busy: bool,
@@ -144,6 +147,7 @@ impl Downloader {
             closed: AtomicBool::new(false),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
+                pinned: VecDeque::new(),
                 generation: 0,
                 budget: 0,
                 busy: false,
@@ -211,19 +215,22 @@ impl Downloader {
         queued
     }
 
-    /// Add `ids` behind whatever is queued, for pins: the playback queue and
-    /// its eviction protection are left alone. Returns how many were added.
+    /// Add `ids` behind the playback queue, for pins: the playback queue and
+    /// its eviction protection are left alone, and a later [`Downloader::prefetch`]
+    /// or the byte budget does not drop them. Returns how many were added.
     pub fn enqueue(&self, ids: &[String]) -> usize {
         let g = &self.gate;
         let mut q = g.lock();
         let mut added = 0usize;
         for id in ids {
-            if !g.cache.is_complete(id) && !q.wanted.iter().any(|w| w == id) {
-                q.wanted.push_back(id.clone());
+            if !g.cache.is_complete(id)
+                && !q.wanted.iter().any(|w| w == id)
+                && !q.pinned.iter().any(|w| w == id)
+            {
+                q.pinned.push_back(id.clone());
                 added = added.saturating_add(1);
             }
         }
-        q.budget = q.budget.saturating_add(g.tuning.max_bytes);
         drop(q);
         log::info!("cache enqueue added={added} requested={}", ids.len());
         g.wake.notify_one();
@@ -253,7 +260,9 @@ impl Downloader {
         let (q, res) = self
             .gate
             .idle
-            .wait_timeout_while(q, timeout, |q| q.busy || !q.wanted.is_empty())
+            .wait_timeout_while(q, timeout, |q| {
+                q.busy || !q.wanted.is_empty() || !q.pinned.is_empty()
+            })
             .unwrap_or_else(PoisonError::into_inner);
         drop(q);
         !res.timed_out()
@@ -313,6 +322,13 @@ impl Gate {
                     q.busy = true;
                     return Some((id, q.generation));
                 }
+                while let Some(id) = q.pinned.pop_front() {
+                    if self.cache.is_complete(&id) || !self.is_pin_work(&id) {
+                        continue;
+                    }
+                    q.busy = true;
+                    return Some((id, q.generation));
+                }
                 q.busy = false;
                 self.idle.notify_all();
             }
@@ -320,11 +336,19 @@ impl Gate {
         }
     }
 
+    /// `id` belongs to a pinned container that still needs it.
+    fn is_pin_work(&self, id: &str) -> bool {
+        self.cache.entry(id).is_some_and(|e| e.pinned)
+    }
+
     /// True while `id` is still wanted by the latest request. A newer request
     /// that still lists `id` adopts the running download.
     fn still_wanted(&self, id: &str, generation: &mut u64) -> bool {
         if self.closed() {
             return false;
+        }
+        if self.is_pin_work(id) {
+            return true;
         }
         let mut q = self.lock();
         if q.generation == *generation {
@@ -579,7 +603,7 @@ impl Gate {
                         .ensure_free(id, left(written))
                         .map_err(Fail::LowDisk)?;
                 }
-                {
+                if !self.is_pin_work(id) {
                     let mut q = self.lock();
                     q.budget = q.budget.saturating_sub(chunk.len() as u64);
                 }
@@ -874,12 +898,68 @@ mod tests {
         }
         let r = rig("enqueue", script, 1 << 20, &["t"], fast());
         r.dl.set_online(false);
+        r.cache.pin("album/1", &ids(&["track/2", "track/3"]));
         r.dl.prefetch(&ids(&["track/1"]));
         assert_eq!(r.dl.enqueue(&ids(&["track/2", "track/3", "track/1"])), 2);
         r.dl.set_online(true);
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
+    }
+
+    fn pin_rig(name: &str, tuning: Tuning, n: usize, size: usize) -> Rig {
+        let mut script = Script::default();
+        for i in 1..=n {
+            script = script.file(&format!("/audio/{i}"), body(size, i));
+        }
+        rig(name, script, 1 << 20, &["t"], tuning)
+    }
+
+    #[test]
+    fn pin_downloads_survive_a_playback_prefetch() {
+        let r = pin_rig("pin-vs-prefetch", fast(), 3, 1000);
+        r.dl.set_online(false);
+        r.cache.pin("album/1", &ids(&["track/2", "track/3"]));
+        r.dl.enqueue(&ids(&["track/2", "track/3"]));
+        r.dl.prefetch(&ids(&["track/1"]));
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        for id in ["track/1", "track/2", "track/3"] {
+            assert!(r.cache.is_complete(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_running_pin_download_is_not_cancelled_by_a_playback_prefetch() {
+        let r = pin_rig("pin-running", fast(), 2, 1000);
+        r.dl.set_online(false);
+        r.cache.pin("album/1", &ids(&["track/2"]));
+        r.dl.enqueue(&ids(&["track/2"]));
+        r.dl.set_online(true);
+        r.dl.prefetch(&ids(&["track/1"]));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/2"));
+    }
+
+    #[test]
+    fn the_byte_budget_does_not_drop_pinned_tracks() {
+        let r = pin_rig(
+            "pin-budget",
+            Tuning {
+                max_bytes: 15_000,
+                ..fast()
+            },
+            3,
+            10_000,
+        );
+        let all = ids(&["track/1", "track/2", "track/3"]);
+        r.cache.pin("album/1", &all);
+        r.dl.enqueue(&all);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        for id in &all {
+            assert!(r.cache.is_complete(id), "{id}");
+        }
     }
 
     #[test]
