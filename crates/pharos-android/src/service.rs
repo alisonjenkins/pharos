@@ -149,6 +149,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
             current: None,
             queue: Vec::new(),
         });
+        STATE_SET.notify_all();
         log("onCreate: session active, token set");
         // The test folder still works when this fails.
         if let Err(e) = connect_library(env, &this) {
