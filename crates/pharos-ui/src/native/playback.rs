@@ -2778,6 +2778,9 @@ pub enum UpNextStep {
     Counting {
         left_ms: u64,
         of_ms: u64,
+        /// Where in the video the countdown ends: fixed while it plays, so
+        /// it names this countdown for the bar's animation.
+        due_ms: u64,
     },
     /// Play the next episode now.
     Go,
@@ -2820,6 +2823,7 @@ impl UpNext {
             Some(left_ms) if left_ms > 0 => UpNextStep::Counting {
                 left_ms,
                 of_ms: due - shown,
+                due_ms: due,
             },
             _ => UpNextStep::Go,
         }
@@ -4126,6 +4130,7 @@ mod tests {
         let counting = |left_ms| UpNextStep::Counting {
             left_ms,
             of_ms: 15_000,
+            due_ms: 115_000,
         };
         assert_eq!(up.step(99_999, from, total), UpNextStep::Hidden);
         assert_eq!(up.step(100_000, from, total), counting(15_000));
@@ -4133,7 +4138,14 @@ mod tests {
         assert_eq!(up.step(115_000, from, total), UpNextStep::Go);
         // Seeking back hides it; coming back starts the count again.
         assert_eq!(up.step(50_000, from, total), UpNextStep::Hidden);
-        assert_eq!(up.step(200_000, from, total), counting(15_000));
+        assert_eq!(
+            up.step(200_000, from, total),
+            UpNextStep::Counting {
+                left_ms: 15_000,
+                of_ms: 15_000,
+                due_ms: 215_000
+            }
+        );
         up.cancel();
         assert_eq!(up.step(210_000, from, total), UpNextStep::Hidden);
     }
@@ -4150,14 +4162,16 @@ mod tests {
             up.step(1_140_000, from, total),
             UpNextStep::Counting {
                 left_ms: 60_000,
-                of_ms: 60_000
+                of_ms: 60_000,
+                due_ms: 1_200_000
             }
         );
         assert_eq!(
             up.step(1_170_000, from, total),
             UpNextStep::Counting {
                 left_ms: 30_000,
-                of_ms: 60_000
+                of_ms: 60_000,
+                due_ms: 1_200_000
             }
         );
         assert_eq!(up.step(1_200_000, from, total), UpNextStep::Go);
@@ -4177,14 +4191,16 @@ mod tests {
             up.step(1_195_000, from, total),
             UpNextStep::Counting {
                 left_ms: 5_000,
-                of_ms: 5_000
+                of_ms: 5_000,
+                due_ms: 1_200_000
             }
         );
         assert_eq!(
             up.step(1_140_000, from, total),
             UpNextStep::Counting {
                 left_ms: 60_000,
-                of_ms: 60_000
+                of_ms: 60_000,
+                due_ms: 1_200_000
             }
         );
     }
@@ -4195,6 +4211,7 @@ mod tests {
         let counting = UpNextStep::Counting {
             left_ms: 3_000,
             of_ms: 15_000,
+            due_ms: 0,
         };
         assert_eq!(
             up.moves_on(UpNextStep::Go, MediaEvent::TimeUpdate),
@@ -4221,7 +4238,8 @@ mod tests {
             up.step(395_000, from, 400_000),
             UpNextStep::Counting {
                 left_ms: 5_000,
-                of_ms: 5_000
+                of_ms: 5_000,
+                due_ms: 400_000
             }
         );
         assert_eq!(up.step(400_000, from, 400_000), UpNextStep::Go);

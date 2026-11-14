@@ -233,8 +233,15 @@ pub struct UpNextCard {
     pub image: Option<String>,
     /// Whole seconds until it plays, rounded up.
     pub seconds: u64,
-    /// How much of the countdown has run, 0 to 100.
-    pub elapsed_pct: f64,
+    /// How long the whole countdown is, in ms.
+    pub of_ms: u64,
+    /// How much of it has run, in ms.
+    pub run_ms: u64,
+    /// Where in the video the countdown ends, in ms: constant while it plays,
+    /// so the bar's animation restarts only when this or `of_ms` changes.
+    pub due_ms: u64,
+    /// The video is paused, so the bar holds.
+    pub paused: bool,
     /// The small pill, not the card: the ending is a guess and more than
     /// the last 15 s are left (038 FR-405).
     pub pill: bool,
@@ -250,7 +257,10 @@ impl UpNextCard {
             number: next.and_then(episode_label),
             image: next.and_then(|n| n.image.clone()),
             seconds: left_ms.div_ceil(1_000),
-            elapsed_pct: percent(run, of_ms),
+            of_ms,
+            run_ms: run,
+            due_ms: 0,
+            paused: false,
             pill: false,
         }
     }
@@ -1446,6 +1456,34 @@ fn use_card_focus() {
     });
 }
 
+/// The inline style of the countdown bar's fill: one linear `scaleX`
+/// animation over the whole countdown, started `run_ms` in (a negative delay)
+/// and held while `paused`. `--pharos-steps` is the whole seconds, for the
+/// stepped fallback under `prefers-reduced-motion`.
+pub fn up_next_bar_style(of_ms: u64, run_ms: u64, paused: bool) -> String {
+    let state = if paused { "paused" } else { "running" };
+    let steps = of_ms.div_ceil(1_000).max(1);
+    format!(
+        "animation-duration: {of_ms}ms; animation-delay: -{run_ms}ms; animation-play-state: {state}; --pharos-steps: {steps}"
+    )
+}
+
+/// The countdown bar. Keyed on the countdown, so it mounts afresh when the
+/// countdown restarts; the run it mounts with is kept, so later ticks do not
+/// rewrite the animation. Only pausing changes its style.
+#[component]
+fn UpNextBar(of_ms: u64, run_ms: u64, paused: bool) -> Element {
+    let run_ms = use_hook(|| run_ms);
+    rsx! {
+        div { class: "pharos-up-next-bar",
+            div {
+                class: "pharos-up-next-bar-fill",
+                style: up_next_bar_style(of_ms, run_ms, paused),
+            }
+        }
+    }
+}
+
 /// The next episode and a countdown to it, over the end of this one.
 #[component]
 fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
@@ -1465,9 +1503,11 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
                 p { class: "pharos-up-next-count", role: "timer",
                     if s == 1 { "Playing in 1 second" } else { "Playing in {s} seconds" }
                 }
-                div {
-                    class: "pharos-up-next-bar",
-                    style: "--pharos-fill: {card.elapsed_pct:.1}%",
+                UpNextBar {
+                    key: "{card.due_ms}-{card.of_ms}",
+                    of_ms: card.of_ms,
+                    run_ms: card.run_ms,
+                    paused: card.paused,
                 }
                 div { class: "pharos-up-next-actions",
                     button {
@@ -4197,7 +4237,11 @@ mod tests {
             html.contains("Play now") && html.contains("Cancel"),
             "{html}"
         );
-        assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
+        assert!(html.contains("pharos-up-next-bar-fill"), "{html}");
+        assert!(
+            html.contains("animation-duration: 15000ms; animation-delay: -7800ms; animation-play-state: running; --pharos-steps: 15"),
+            "{html}"
+        );
         assert!(!html.contains("Skip intro"), "{html}");
         // B1363: Play now leads as the primary; Cancel is on-video.
         assert!(
@@ -4265,7 +4309,37 @@ mod tests {
         assert_eq!(plain.image, None);
         // From a guess it counts to the end, and its bar fills over that.
         let long = UpNextCard::of(None, 45_000, 90_000);
-        assert_eq!((long.seconds, long.elapsed_pct), (45, 50.0));
+        assert_eq!(
+            (long.seconds, long.of_ms, long.run_ms),
+            (45, 90_000, 45_000)
+        );
+    }
+
+    #[test]
+    fn a_paused_player_holds_the_up_next_bar() {
+        let mut c = controls();
+        let mut card = UpNextCard::of(None, 5_000, 15_000);
+        card.paused = true;
+        c.up_next = Some(card);
+        let html = render(c);
+        assert!(html.contains("animation-play-state: paused"), "{html}");
+        assert!(!html.contains("animation-play-state: running"), "{html}");
+    }
+
+    #[test]
+    fn the_up_next_bar_runs_the_whole_countdown_and_holds_when_paused() {
+        let running = up_next_bar_style(15_000, 0, false);
+        assert!(running.contains("animation-duration: 15000ms"), "{running}");
+        assert!(running.contains("animation-delay: -0ms"), "{running}");
+        assert!(running.contains("running"), "{running}");
+        let held = up_next_bar_style(2_500, 1_000, true);
+        assert!(held.contains("animation-delay: -1000ms"), "{held}");
+        assert!(
+            held.contains("paused") && !held.contains("running"),
+            "{held}"
+        );
+        assert!(held.contains("--pharos-steps: 3"), "{held}");
+        assert!(up_next_bar_style(0, 0, false).contains("--pharos-steps: 1"));
     }
 
     #[test]
