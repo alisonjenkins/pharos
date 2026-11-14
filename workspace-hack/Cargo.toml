@@ -138,12 +138,12 @@ zune-jpeg = { version = "0.5" }
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
+bindgen = { version = "0.72" }
 bitflags = { version = "2", default-features = false, features = ["serde", "std"] }
 bumpalo = { version = "3", features = ["collections"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
-clang-sys = { version = "1", default-features = false, features = ["clang_11_0", "runtime"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
 derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "debug", "deref", "deref_mut", "display", "eq", "error", "from", "into", "mul", "mul_assign", "not"] }
