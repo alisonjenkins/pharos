@@ -522,7 +522,7 @@ fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     log(&format!("library server={server} auth={:?}", lib.auth_state()));
     let cache_dir = Path::new(&files).join("audio-cache");
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
-        Ok(()) => log(&format!("cache enabled cap_bytes={}", content::DEFAULT_CAP_BYTES)),
+        Ok(()) => log(&format!("cache enabled cap_bytes={}", lib.cache_cap().unwrap_or(0))),
         Err(e) => log(&format!("cache disabled: {e}")),
     }
     let _ = LIBRARY.set(lib);
