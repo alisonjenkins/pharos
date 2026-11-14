@@ -79,3 +79,38 @@ mod tests {
         assert!((dequantise_sample(quantise_sample(0.5)) - 0.5).abs() < 0.005);
     }
 }
+
+/// The page decodes frames with constants of its own (pharos-ui builds for
+/// wasm and cannot depend on this crate); they must not drift.
+#[cfg(test)]
+mod wire_tests {
+    use pharos_ui::native::ports::VisFrame;
+    use pharos_ui::native::visualiser::wire;
+
+    use super::*;
+    use crate::spectrum::Analyser;
+
+    #[test]
+    fn the_pages_constants_are_ours() {
+        assert_eq!(wire::DB_STEP, DB_STEP);
+        assert_eq!(wire::SILENT_BIN, SILENT_BIN);
+        assert_eq!(VisFrame::BINS, BINS);
+        assert_eq!(VisFrame::silent(1).wave.len(), FFT_SIZE);
+    }
+
+    #[test]
+    fn a_frame_reads_in_the_page_as_it_was_made() {
+        let samples: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 100.0 * i as f32 / FFT_SIZE as f32).sin())
+            .collect();
+        let frame = Analyser::new().frame(&samples);
+        let (mut bins, mut wave) = (vec![0.0; BINS], vec![0.0; FFT_SIZE]);
+        wire::dequantise(&frame.bins, &frame.wave, &mut bins, &mut wave);
+        for (page, ours) in bins.iter().zip(&frame.bins) {
+            assert_eq!(*page, dequantise_db(*ours));
+        }
+        for (page, ours) in wave.iter().zip(&frame.wave) {
+            assert_eq!(*page, dequantise_sample(*ours));
+        }
+    }
+}
