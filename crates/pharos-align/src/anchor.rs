@@ -280,11 +280,26 @@ pub fn match_lines(lines: &[Line], heard: &[Heard], opts: Options) -> Matched {
             let last = s.fold(f64::NEG_INFINITY, f64::max);
             anchored = !over_slot(line, first, last);
             // A weak word heard past the slot came from another repeat too;
-            // it would stretch the anchor the strong words fit in.
-            hits.retain(|&(_, j)| {
-                let t = tr[j].start_s;
-                !over_slot(line, first.min(t), last.max(t))
-            });
+            // it would stretch the anchor the strong words fit in. The span
+            // grows from the strong words, nearest weak word first, and a
+            // weak word that would take it past the cap is left out.
+            let gap = |t: f64| (first - t).max(t - last).max(0.0);
+            let mut weak: Vec<(usize, usize)> = hits
+                .iter()
+                .copied()
+                .filter(|h| !strong.contains(h))
+                .collect();
+            weak.sort_by(|a, b| gap(tr[a.1].start_s).total_cmp(&gap(tr[b.1].start_s)));
+            let (mut lo, mut hi) = (first, last);
+            let mut kept = strong.clone();
+            for h in weak {
+                let t = tr[h.1].start_s;
+                if !over_slot(line, lo.min(t), hi.max(t)) {
+                    (lo, hi) = (lo.min(t), hi.max(t));
+                    kept.push(h);
+                }
+            }
+            hits.retain(|h| kept.contains(h));
         }
         if !anchored {
             continue;
@@ -566,6 +581,30 @@ mod tests {
         let a = m.lines[0].anchor.as_ref().unwrap();
         assert!(a.end_ms < 30_000, "anchor ends at {}", a.end_ms);
         assert!(a.starts_ms.iter().all(|&s| s < 30_000), "{:?}", a.starts_ms);
+    }
+
+    #[test]
+    fn weak_words_on_both_sides_of_the_slot_do_not_stretch_the_anchor_past_its_cap() {
+        let lines = [line(20_000, 24_000, "silver salt and silver")];
+        // Each weak word alone keeps the span within the 11 s cap; the two
+        // together would span 21 s.
+        let h = heard(&[
+            ("silted", 10.0),
+            ("salt", 20.2),
+            ("and", 20.6),
+            ("silted", 31.0),
+        ]);
+        let m = match_lines(&lines, &h, Options::default());
+        assert_eq!(m.lines[0].strong, 2);
+        let a = m.lines[0].anchor.as_ref().unwrap();
+        let cap = 11_000;
+        let first = a.starts_ms[0];
+        assert!(
+            a.starts_ms.last().unwrap() - first <= cap,
+            "{:?}",
+            a.starts_ms
+        );
+        assert!(a.end_ms - first <= cap, "{first}..{}", a.end_ms);
     }
 
     #[test]
