@@ -339,3 +339,18 @@ fn a_later_block_of_tracks_failing_leaves_the_player_alone() {
         "the player stays up"
     );
 }
+
+#[test]
+fn a_loading_album_still_offers_the_player() {
+    let (mut runner, _) = playing();
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-1"));
+    assert!(
+        asked(&commands, "ParentId=al2").is_some(),
+        "the second album loads"
+    );
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("Loading the tracks"), "{screen}");
+    assert!(screen.contains("Playing"), "{screen}");
+}
