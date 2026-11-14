@@ -353,7 +353,8 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     let (choice, warmed) = choose_device(&config)?;
     let stages = stages(&config, &ffmpeg, &choice);
     let loader = loader(&config, choice, warmed);
-    let mut engine = Engine::new(loader, decoder, config.idle_unload);
+    let mut engine =
+        Engine::new(loader, decoder, config.idle_unload).with_stage_budget(config.stage_budget);
     if let Some(stages) = stages {
         engine = engine.with_stages(stages);
     }

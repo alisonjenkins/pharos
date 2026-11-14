@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use pharos_align::line::LineSpans;
 use pharos_align::placement::{Fallback, Method};
@@ -102,10 +103,13 @@ struct Scripted {
     vocals: Step,
     recognise: Step,
     heard: Vec<Word>,
+    /// How long separating takes.
+    slow: Duration,
 }
 
 impl Stages for Scripted {
-    fn vocals(&self, _: &Path) -> Result<Vec<f32>, StageError> {
+    fn vocals(&self, _: &Path, _: Instant) -> Result<Vec<f32>, StageError> {
+        std::thread::sleep(self.slow);
         match self.vocals {
             Step::Works => Ok(vec![0.0; SONG_S * RATE]),
             Step::Fails => Err(StageError {
@@ -116,7 +120,7 @@ impl Stages for Scripted {
         }
     }
 
-    fn recognise(&self, vocals: &[f32]) -> Result<Vec<Word>, StageError> {
+    fn recognise(&self, vocals: &[f32], _: Instant) -> Result<Vec<Word>, StageError> {
         assert_eq!(vocals.len(), SONG_S * RATE);
         match self.recognise {
             Step::Works => Ok(self.heard.clone()),
@@ -195,6 +199,7 @@ fn with(
         vocals,
         recognise,
         heard,
+        slow: Duration::ZERO,
     };
     run(&Engine::new(loader(sung), silent(), None).with_stages(Box::new(stages)))
 }
@@ -324,6 +329,7 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
         vocals: Step::Works,
         recognise: Step::Works,
         heard: Vec::new(),
+        slow: Duration::ZERO,
     };
     let (got, events) =
         run(&Engine::new(loader(Some(sung)), silent(), None).with_stages(Box::new(stages)));
@@ -343,6 +349,7 @@ fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
         vocals: Step::Panics,
         recognise: Step::Panics,
         heard: Vec::new(),
+        slow: Duration::ZERO,
     };
     let (got, events) =
         run(&Engine::new(loader_on(Some(sung), "cpu"), silent(), None)
@@ -354,4 +361,61 @@ fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
     assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn a_song_past_its_stage_budget_keeps_todays_answer_and_says_where_it_stopped() {
+    let (sung, _) = song();
+    let (before, _) = today();
+    let (_, heard) = song();
+    // Separating outlasts the budget, so the recogniser, which would
+    // panic, never runs.
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Panics,
+        heard,
+        slow: Duration::from_millis(50),
+    };
+    let engine = Engine::new(loader(Some(sung)), silent(), None)
+        .with_stages(Box::new(stages))
+        .with_stage_budget(Duration::from_millis(20));
+    let (got, events) = run(&engine);
+    assert_eq!(got.placement.fallback, Some(Fallback::StageTimeout));
+    assert!(
+        got.fallback_reason
+            .starts_with("stage budget 0.02 s passed at "),
+        "{}",
+        got.fallback_reason
+    );
+    assert!(
+        got.fallback_reason.ends_with(", in recognise"),
+        "{}",
+        got.fallback_reason
+    );
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn a_stage_that_fails_past_the_budget_is_a_timeout_naming_its_error() {
+    let (sung, _) = song();
+    let (_, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Fails,
+        recognise: Step::Works,
+        heard,
+        slow: Duration::from_millis(50),
+    };
+    let engine = Engine::new(loader(Some(sung)), silent(), None)
+        .with_stages(Box::new(stages))
+        .with_stage_budget(Duration::from_millis(20));
+    let (got, _) = run(&engine);
+    assert_eq!(got.placement.fallback, Some(Fallback::StageTimeout));
+    assert!(
+        got.fallback_reason
+            .ends_with(", in vocals: out of device memory"),
+        "{}",
+        got.fallback_reason
+    );
 }
