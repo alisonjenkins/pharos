@@ -14,6 +14,17 @@
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
+        <!-- Phone-side voice entry: the assistant only offers "play X on
+             <app>" for apps with an activity handling this action. -->
+        <activity
+            android:name="com.alisonjenkins.pharos.auto.PharosSearchActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
         <service
             android:name="com.alisonjenkins.pharos.auto.PharosMediaService"
             android:exported="true"
