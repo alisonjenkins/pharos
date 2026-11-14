@@ -18,6 +18,7 @@
       "IsFolder": true,
       "MediaType": "Unknown",
       "Name": "Echo Album",
+      "RunTimeTicks": 5000000000,
       "ServerId": "SERVERID",
       "Tags": [],
       "Type": "MusicAlbum",
