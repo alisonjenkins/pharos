@@ -7,6 +7,7 @@
 //! search (`onSearch`, `onPlayFromSearch`), and logs every call with its
 //! inputs so a logcat line proves each hop reached Rust.
 
+mod art;
 pub mod content;
 
 use std::sync::Mutex;
@@ -39,13 +40,15 @@ struct Entry {
     hz: u32,
     /// An http(s) stream; when set it plays instead of the tone.
     url: &'static str,
+    /// An http(s) image shown as the item's icon and album art.
+    art: &'static str,
 }
 
 const CATALOGUE: &[Entry] = &[
-    Entry { id: "music", parent: ROOT, title: "Music", subtitle: "", playable: false, hz: 0, url: "" },
-    Entry { id: "audiobooks", parent: ROOT, title: "Audiobooks", subtitle: "", playable: false, hz: 0, url: "" },
-    Entry { id: "tone:440", parent: "music", title: "Test tone A", subtitle: "Spike 044", playable: true, hz: 440, url: "" },
-    Entry { id: "tone:523", parent: "music", title: "Test tone C", subtitle: "Spike 044", playable: true, hz: 523, url: "" },
+    Entry { id: "music", parent: ROOT, title: "Music", subtitle: "", playable: false, hz: 0, url: "", art: "" },
+    Entry { id: "audiobooks", parent: ROOT, title: "Audiobooks", subtitle: "", playable: false, hz: 0, url: "", art: "" },
+    Entry { id: "tone:440", parent: "music", title: "Test tone A", subtitle: "Spike 044", playable: true, hz: 440, url: "", art: "" },
+    Entry { id: "tone:523", parent: "music", title: "Test tone C", subtitle: "Spike 044", playable: true, hz: 523, url: "", art: "" },
     // A public-domain clip on Wikimedia Commons, to prove streaming.
     Entry {
         id: "stream:example",
@@ -55,8 +58,9 @@ const CATALOGUE: &[Entry] = &[
         playable: true,
         hz: 0,
         url: "https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg",
+        art: "https://upload.wikimedia.org/wikipedia/commons/a/a9/Example.jpg",
     },
-    Entry { id: "tone:330", parent: "audiobooks", title: "Test chapter 1", subtitle: "Spike 044", playable: true, hz: 330, url: "" },
+    Entry { id: "tone:330", parent: "audiobooks", title: "Test chapter 1", subtitle: "Spike 044", playable: true, hz: 330, url: "", art: "" },
 ];
 
 struct State {
@@ -135,6 +139,11 @@ fn media_item<'l>(env: &mut JNIEnv<'l>, e: &Entry) -> R<JObject<'l>> {
         .map_err(jerr("setTitle"))?;
     env.call_method(&b, "setSubtitle", format!("(Ljava/lang/CharSequence;){B}"), &[JValue::Object(&sub)])
         .map_err(jerr("setSubtitle"))?;
+    if !e.art.is_empty() {
+        let icon = art::art_uri_object(env, e.art)?;
+        env.call_method(&b, "setIconUri", format!("(Landroid/net/Uri;){B}"), &[JValue::Object(&icon)])
+            .map_err(jerr("setIconUri"))?;
+    }
     let desc = env
         .call_method(&b, "build", "()Landroid/media/MediaDescription;", &[])
         .and_then(|v| v.l())
@@ -228,11 +237,17 @@ fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Entry, duration_ms: i64
     let b = env
         .new_object("android/media/MediaMetadata$Builder", "()V", &[])
         .map_err(jerr("MediaMetadata.Builder"))?;
-    for (key, value) in [
-        ("android.media.metadata.MEDIA_ID", e.id),
-        ("android.media.metadata.TITLE", e.title),
-        ("android.media.metadata.ARTIST", e.subtitle),
-    ] {
+    let mut fields = vec![
+        ("android.media.metadata.MEDIA_ID", e.id.to_owned()),
+        ("android.media.metadata.TITLE", e.title.to_owned()),
+        ("android.media.metadata.ARTIST", e.subtitle.to_owned()),
+    ];
+    if !e.art.is_empty() {
+        let uri = art::art_uri(e.art);
+        fields.push(("android.media.metadata.ALBUM_ART_URI", uri.clone()));
+        fields.push(("android.media.metadata.DISPLAY_ICON_URI", uri));
+    }
+    for (key, value) in fields {
         let k = JObject::from(env.new_string(key).map_err(jerr("key"))?);
         let v = JObject::from(env.new_string(value).map_err(jerr("value"))?);
         env.call_method(
@@ -312,7 +327,7 @@ fn play(env: &mut JNIEnv, id: &str) -> R<()> {
     let duration = if entry.url.is_empty() { TONE_MS } else { 0 };
     set_metadata(env, session.as_obj(), entry, duration)?;
     set_playback_state(env, session.as_obj(), STATE_BUFFERING, 0)?;
-    log(&format!("preparing id={} source={source}", entry.id));
+    log(&format!("preparing id={} source={}", entry.id, art::redact(&source)));
     Ok(())
 }
 
