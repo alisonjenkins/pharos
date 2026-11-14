@@ -81,7 +81,7 @@ impl Pipeline {
                 let window = self
                     .samples
                     .get(usize::try_from(from - self.samples_from).unwrap_or(0)..)
-                    .and_then(|s| s.get(..usize::try_from(end - from).unwrap_or(0)))
+                    .and_then(|s| s.get(..usize::try_from(end.saturating_sub(from)).unwrap_or(0)))
                     .unwrap_or_default();
                 let frame = self.analyser.frame(window);
                 lock(&self.ring).push(self.next_frame, frame);
@@ -190,6 +190,17 @@ mod tests {
         assert_eq!(r.next_index(), 71);
         drop(r);
         assert!((382..=386).contains(&peak(&ring, 65)));
+    }
+
+    #[test]
+    fn a_seek_that_does_not_land_on_a_frame_edge_never_underflows() {
+        for ms in (1..400).step_by(7) {
+            let (mut p, ring) = pipeline();
+            p.seek(ms).unwrap();
+            let first = p.next_frame();
+            p.fill(first, 3).unwrap();
+            assert!(lock(&ring).get(first).is_some(), "seek to {ms} ms");
+        }
     }
 
     #[test]
