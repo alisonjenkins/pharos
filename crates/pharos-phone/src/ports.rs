@@ -402,4 +402,8 @@ impl OfflineStore for PhoneOffline {
     fn is_online(&self) -> bool {
         pharos_android::library().is_some_and(content::Library::is_online)
     }
+
+    fn saved_position_ms(&self, track_id: &str) -> Option<u64> {
+        pharos_android::saved_resume_ms(&snapshot::car_id(track_id))
+    }
 }

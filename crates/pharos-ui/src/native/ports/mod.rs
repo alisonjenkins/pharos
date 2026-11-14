@@ -307,6 +307,11 @@ pub trait OfflineStore: Send + Sync {
     /// Whether the phone can reach the server now. Offline, only cached
     /// tracks play.
     fn is_online(&self) -> bool;
+    /// Where the phone last stopped in a long track (a book's part), in ms,
+    /// for choosing which part to open. A host that keeps none says `None`.
+    fn saved_position_ms(&self, _track_id: &str) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
