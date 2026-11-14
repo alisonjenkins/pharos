@@ -39,6 +39,26 @@ pub enum ContentError {
 }
 
 impl ContentError {
+    /// A stable class for log fields; unlike `Display` it never names the
+    /// server, a path or a TLS reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ContentError::Url(_) => "bad_url",
+            ContentError::Connect { .. } => "connect",
+            ContentError::Timeout { .. } => "timeout",
+            ContentError::Closed { .. } => "closed",
+            ContentError::Api { .. } => "api",
+            ContentError::Rpc { .. } => "rpc",
+            ContentError::NeedsSignIn => "needs_sign_in",
+            ContentError::NoCode { .. } => "no_code",
+            ContentError::BadId(_) => "bad_id",
+            ContentError::TokenFile { .. } => "token_file",
+            ContentError::Cache { .. } => "cache",
+            ContentError::Resume { .. } => "resume",
+            ContentError::WorkerGone => "worker_gone",
+        }
+    }
+
     /// The server refused because the session or device token is revoked.
     pub fn is_revoked(&self) -> bool {
         matches!(
