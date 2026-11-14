@@ -19,6 +19,10 @@ const JUMP_MS: u64 = 400;
 const MIN_NAP: Duration = Duration::from_millis(100);
 /// How often a finished song looks for a seek back.
 const ENDED_NAP: Duration = Duration::from_secs(1);
+/// How long after a failed open or decode the same track is tried again: a
+/// dropped connection should not blank the visualiser for the whole song, and
+/// a source that stays down is asked about this rarely.
+const SOURCE_RETRY: Duration = Duration::from_secs(5);
 
 /// A song's bytes and a hint at its container.
 pub struct Opened {
@@ -102,6 +106,12 @@ impl Drop for Engine {
 
 impl Engine {
     pub fn new(opener: Arc<dyn Opener>) -> Self {
+        Self::with_retry(opener, SOURCE_RETRY)
+    }
+
+    /// [`Engine::new`] with the wait before a failed open or decode is tried
+    /// again; an unsupported codec is never retried.
+    pub fn with_retry(opener: Arc<dyn Opener>, retry: Duration) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 enabled: false,
@@ -119,7 +129,7 @@ impl Engine {
         let worker = shared.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("pharos-vis".into())
-            .spawn(move || run(&worker, opener.as_ref()))
+            .spawn(move || run(&worker, opener.as_ref(), retry))
         {
             log::error!("visualiser source=decode verdict=off codec=none reason=thread:{e}");
         }
@@ -206,6 +216,13 @@ pub fn needs_seek(playhead: u64, next_frame: u64, held: u64) -> bool {
     playhead > next_frame + FPS || playhead < next_frame.saturating_sub(held)
 }
 
+/// Why a track is not being visualised, and when to try it again. `retry_at`
+/// is `None` for a song that will never work (an unsupported codec).
+struct Failed {
+    track: String,
+    retry_at: Option<Instant>,
+}
+
 struct Snap {
     epoch: u64,
     track: String,
@@ -233,14 +250,21 @@ fn set_status(shared: &Shared, status: Status) {
 fn next_job(
     shared: &Shared,
     pipe: &mut Option<(String, Pipeline)>,
-    failed: &mut Option<String>,
+    failed: &mut Option<Failed>,
 ) -> Option<Snap> {
     let mut st = locked(&shared.state);
     loop {
         if st.shutdown {
             return None;
         }
-        if failed.as_deref() != st.track.as_deref() {
+        if failed.as_ref().map(|f| f.track.as_str()) != st.track.as_deref() {
+            *failed = None;
+        }
+        if failed
+            .as_ref()
+            .and_then(|f| f.retry_at)
+            .is_some_and(|at| Instant::now() >= at)
+        {
             *failed = None;
         }
         if let (true, true, Some(track), Some((position_ms, at)), None) = (
@@ -260,13 +284,22 @@ fn next_job(
         if !st.enabled && pipe.take().is_some() {
             lock(&shared.ring).clear();
         }
-        st = shared.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
+        st = match failed.as_ref().and_then(|f| f.retry_at) {
+            Some(at) => {
+                shared
+                    .wake
+                    .wait_timeout(st, at.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => shared.wake.wait(st).unwrap_or_else(PoisonError::into_inner),
+        };
     }
 }
 
-fn run(shared: &Shared, opener: &dyn Opener) {
+fn run(shared: &Shared, opener: &dyn Opener, retry: Duration) {
     let mut pipe: Option<(String, Pipeline)> = None;
-    let mut failed: Option<String> = None;
+    let mut failed: Option<Failed> = None;
     while let Some(snap) = next_job(shared, &mut pipe, &mut failed) {
         if pipe.as_ref().map_or(true, |(t, _)| *t != snap.track) {
             pipe = None;
@@ -274,7 +307,10 @@ fn run(shared: &Shared, opener: &dyn Opener) {
             match open(shared, opener, &snap.track) {
                 Ok(p) => pipe = Some((snap.track.clone(), p)),
                 Err(status) => {
-                    failed = Some(snap.track.clone());
+                    failed = Some(Failed {
+                        track: snap.track.clone(),
+                        retry_at: (status.verdict != "unsupported").then(|| Instant::now() + retry),
+                    });
                     set_status(shared, status);
                     continue;
                 }
@@ -295,7 +331,10 @@ fn run(shared: &Shared, opener: &dyn Opener) {
             p.fill(playhead, AHEAD_FRAMES)
         })();
         if let Err(e) = result {
-            failed = Some(snap.track.clone());
+            failed = Some(Failed {
+                track: snap.track.clone(),
+                retry_at: Some(Instant::now() + retry),
+            });
             pipe = None;
             lock(&shared.ring).clear();
             set_status(shared, Status::new("off", "unknown", format!("decode:{e}")));
@@ -501,6 +540,41 @@ mod tests {
         e.update_at(true, Some("missing"), 0, Instant::now());
         wait_for(|| e.status().reason.starts_with("source:").then_some(()));
         assert!(e.status().line().contains("reason=source:no track missing"));
+    }
+
+    struct Flaky {
+        fails: usize,
+        opened: AtomicUsize,
+    }
+
+    impl Opener for Flaky {
+        fn open(&self, _id: &str) -> Result<Opened, String> {
+            if self.opened.fetch_add(1, Ordering::SeqCst) < self.fails {
+                return Err("connection reset".into());
+            }
+            Songs {
+                opened: AtomicUsize::new(0),
+            }
+            .open("tones")
+        }
+    }
+
+    #[test]
+    fn a_source_that_failed_to_open_is_tried_again_for_the_same_track() {
+        let flaky = Arc::new(Flaky {
+            fails: 2,
+            opened: AtomicUsize::new(0),
+        });
+        let e = Engine::with_retry(flaky.clone(), Duration::from_millis(20));
+        e.set_enabled(true);
+        e.update_at(true, Some("tones"), 500, Instant::now());
+        let got = wait_for(|| e.frame());
+        assert_eq!(got.sample_rate, RATE);
+        assert_eq!(
+            flaky.opened.load(Ordering::SeqCst),
+            3,
+            "two failures, one success"
+        );
     }
 
     #[test]
