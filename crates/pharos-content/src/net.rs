@@ -4,7 +4,7 @@
 //! (backoff, what a poll answer means) are that app's own `tv_auth`, included
 //! as is. Nothing here logs a token or a QuickConnect secret.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use pharos_api::pharos_capnp::{bootstrap, login_result, quick_connect_result, session};
-use pharos_client::api::{Item, ItemKind, ItemRef, Listing, MediaToken, NativeApi, PharosApi};
+use pharos_client::api::{
+    Capabilities, Item, ItemKind, ItemRef, Listing, MediaToken, NativeApi, NativeGrant, PharosApi,
+    PlaybackGrant, TrackPicks,
+};
 use pharos_client::mix::MixSpec;
 use pharos_client::{CallInfo, ClientError};
 use tokio_tungstenite::tungstenite::Message;
@@ -238,6 +241,9 @@ pub struct NativeCatalogue {
     // Keeps the connection's bootstrap capability alive with the session.
     _bootstrap: bootstrap::Client,
     info: CallInfo,
+    /// The playback the server knows of, for its progress reports: one
+    /// track at a time, the one the car plays.
+    grant: Rc<RefCell<Option<(ItemRef, NativeGrant)>>>,
 }
 
 impl NativeCatalogue {
@@ -247,7 +253,33 @@ impl NativeCatalogue {
             closed,
             _bootstrap: bootstrap,
             info: call_info(),
+            grant: Rc::default(),
         }
+    }
+
+    /// The grant for `id`: the one held, else a new playback. Empty
+    /// capabilities: the car plays the stored file as it is.
+    async fn grant_for(&self, id: ItemRef) -> Result<NativeGrant, ContentError> {
+        if let Some((held, g)) = self.grant.borrow().as_ref() {
+            if *held == id {
+                return Ok(g.clone());
+            }
+        }
+        let op = format!("start playback {id}");
+        let (_, g) = bounded(
+            &op,
+            &self.closed,
+            self.api.play(
+                &self.info,
+                id,
+                "",
+                &Capabilities::default(),
+                TrackPicks::default(),
+            ),
+        )
+        .await?;
+        *self.grant.borrow_mut() = Some((id, g.clone()));
+        Ok(g)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -313,6 +345,34 @@ impl Catalogue for NativeCatalogue {
         let op = format!("detail {id}");
         let d = bounded(&op, &self.closed, self.api.detail(&self.info, id)).await?;
         Ok((d.item, d.album))
+    }
+
+    async fn report(
+        &self,
+        id: ItemRef,
+        position_ms: u64,
+        paused: bool,
+    ) -> Result<(), ContentError> {
+        let g = self.grant_for(id).await?;
+        let op = format!("report {id}");
+        let r = bounded(
+            &op,
+            &self.closed,
+            g.report(&self.info, position_ms, paused, TrackPicks::default()),
+        )
+        .await;
+        if r.is_err() {
+            // A grant the server refused or lost: the next report starts anew.
+            *self.grant.borrow_mut() = None;
+        }
+        r
+    }
+
+    async fn stop(&self, id: ItemRef, position_ms: u64) -> Result<(), ContentError> {
+        let g = self.grant_for(id).await?;
+        *self.grant.borrow_mut() = None;
+        let op = format!("stop {id}");
+        bounded(&op, &self.closed, g.stop(&self.info, position_ms)).await
     }
 }
 
