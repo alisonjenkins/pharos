@@ -34,8 +34,11 @@ allow them while driving.
 | Artwork (`content://` icon URIs) | content provider (slice 1) | serves cached cover images |
 
 Playback uses `android.media.MediaPlayer` from Rust over JNI. The APK is
-built without Gradle (`spikes/044-android-auto/build-apk.sh`): Rust class
-generator → `d8` → `aapt2` → zip → `zipalign` → `apksigner` (the TV dev key).
+built by `scripts/android-phone-apk.sh`: dx and Gradle build the app, the
+Rust class generator (`crates/pharos-classgen`) writes the entry-point
+classes, `d8` dexes them into the next `classesN.dex`, then `zipalign` and
+`apksigner` (the key named by `PHAROS_ANDROID_KEYSTORE`).
+The slice 0 spike built its APK without Gradle (`d8` → `aapt2` → zip).
 
 ## User stories
 
