@@ -131,8 +131,8 @@ struct StoreState {
     cap: u64,
     free: u64,
     online: bool,
-    /// What the server would list for each container: track id and size.
-    catalogue: HashMap<ContainerRef, Vec<(String, u64)>>,
+    /// What the server would list for each container, every track waiting.
+    catalogue: HashMap<ContainerRef, Download>,
     pinned: Vec<Download>,
 }
 
@@ -153,9 +153,44 @@ impl FakeOfflineStore {
         }
     }
 
-    /// Makes `container` pinnable, with these tracks.
+    /// Makes `container` pinnable, with these tracks (id and size). Titles
+    /// are made up from the ids.
     pub fn add_container(&self, container: ContainerRef, tracks: Vec<(String, u64)>) {
-        lock(&self.inner).catalogue.insert(container, tracks);
+        let title = format!("Container {}", container.id);
+        let tracks = tracks
+            .into_iter()
+            .map(|(id, bytes)| {
+                let name = format!("Track {id}");
+                (id, name, bytes)
+            })
+            .collect();
+        self.add_titled(container, &title, None, tracks);
+    }
+
+    /// As [`Self::add_container`], with the names the host would report:
+    /// tracks are id, title and size.
+    pub fn add_titled(
+        &self,
+        container: ContainerRef,
+        title: &str,
+        subtitle: Option<&str>,
+        tracks: Vec<(String, String, u64)>,
+    ) {
+        let download = Download {
+            container: container.clone(),
+            title: title.to_owned(),
+            subtitle: subtitle.map(str::to_owned),
+            tracks: tracks
+                .into_iter()
+                .map(|(id, title, bytes)| TrackDownload {
+                    id,
+                    title,
+                    state: TrackState::Queued,
+                    bytes,
+                })
+                .collect(),
+        };
+        lock(&self.inner).catalogue.insert(container, download);
     }
 
     pub fn set_free_bytes(&self, bytes: u64) {
@@ -213,30 +248,24 @@ impl OfflineStore for FakeOfflineStore {
         if st.pinned.iter().any(|d| &d.container == container) {
             return Ok(());
         }
-        let Some(tracks) = st.catalogue.get(container).cloned() else {
+        let Some(mut found) = st.catalogue.get(container).cloned() else {
             return Err(OfflineError::UnknownContainer {
                 kind: container.kind,
                 id: container.id.clone(),
             });
         };
-        let needed = tracks
+        let needed = found
+            .tracks
             .iter()
-            .fold(0u64, |sum, (_, b)| sum.saturating_add(*b));
+            .fold(0u64, |sum, t| sum.saturating_add(t.bytes));
         let available = st.cap.saturating_sub(Self::used(&st));
         if needed > available {
             return Err(OfflineError::OverCap { needed, available });
         }
-        st.pinned.push(Download {
-            container: container.clone(),
-            tracks: tracks
-                .into_iter()
-                .map(|(id, bytes)| TrackDownload {
-                    id,
-                    state: TrackState::Cached,
-                    bytes,
-                })
-                .collect(),
-        });
+        for t in &mut found.tracks {
+            t.state = TrackState::Cached;
+        }
+        st.pinned.push(found);
         Ok(())
     }
 
@@ -278,6 +307,26 @@ mod tests {
             kind: ContainerKind::Album,
             id: id.into(),
         }
+    }
+
+    #[test]
+    fn a_pinned_container_carries_the_titles_the_host_gave() {
+        let s = FakeOfflineStore::new();
+        s.add_titled(
+            album("a"),
+            "Album One",
+            Some("Artist One"),
+            vec![("t1".into(), "Song One".into(), 10)],
+        );
+        assert_eq!(s.pin(&album("a")), Ok(()));
+        let d = s.downloads();
+        assert_eq!(d.first().map(|d| d.title.as_str()), Some("Album One"));
+        assert_eq!(
+            d.first().and_then(|d| d.subtitle.as_deref()),
+            Some("Artist One")
+        );
+        let track = d.first().and_then(|d| d.tracks.first());
+        assert_eq!(track.map(|t| t.title.as_str()), Some("Song One"));
     }
 
     #[test]

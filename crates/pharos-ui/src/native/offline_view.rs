@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 
 use super::offline_ui::{
     cap_from_option, cap_options, cap_selected, container_route, container_title, format_bytes,
-    saved_line, track_label, KeepState, FREE_GUARD_BYTES, OFFLINE_BANNER,
+    saved_line, track_label, track_title, KeepState, FREE_GUARD_BYTES, OFFLINE_BANNER,
 };
 use super::platform;
 use super::ports::{offline_store, ContainerRef, Download, OfflineError, OfflineStore};
@@ -239,7 +239,7 @@ pub fn DownloadsPanel(store: Store) -> Element {
 
 #[component]
 fn DownloadRow(download: Download, on_remove: EventHandler<()>) -> Element {
-    let title = container_title(&download.container);
+    let title = container_title(&download);
     let state = KeepState::of(std::slice::from_ref(&download), &download.container);
     let route = container_route(&download.container);
     rsx! {
@@ -250,6 +250,9 @@ fn DownloadRow(download: Download, on_remove: EventHandler<()>) -> Element {
                         Link { to, "{title}" }
                     } else {
                         span { "{title}" }
+                    }
+                    if let Some(sub) = download.subtitle.clone() {
+                        span { class: "pharos-muted", "{sub}" }
                     }
                     span { class: "pharos-muted",
                         "{download.container.kind.label()} \u{b7} {format_bytes(download.cached_bytes())} \u{b7} {saved_line(&download)}"
@@ -269,7 +272,7 @@ fn DownloadRow(download: Download, on_remove: EventHandler<()>) -> Element {
                 ul {
                     for t in download.tracks.iter() {
                         li { key: "{t.id}", "data-state": track_label(t.state),
-                            span { "Track {t.id}" }
+                            span { "{track_title(t)}" }
                             span { class: "pharos-muted", "{track_label(t.state)} \u{b7} {format_bytes(t.bytes)}" }
                         }
                     }
@@ -640,10 +643,25 @@ mod tests {
 
     #[test]
     fn each_pinned_container_lists_size_track_states_and_a_remove_button() {
-        let fake = store_with(&["7"]);
+        let fake = Arc::new(FakeOfflineStore::new());
+        fake.add_titled(
+            album("7"),
+            "Album One",
+            Some("Artist One"),
+            vec![
+                ("7-1".into(), "Song One".into(), 1024),
+                ("7-2".into(), "Song Two".into(), 2048),
+            ],
+        );
+        assert_eq!(fake.pin(&album("7")), Ok(()));
         fake.fail_track("7-2");
         let html = render_downloads(&fake);
-        assert!(html.contains("Album 7"), "{html}");
+        assert!(html.contains("Album One"), "{html}");
+        assert!(html.contains("Artist One"), "{html}");
+        assert!(
+            html.contains("Song One") && html.contains("Song Two"),
+            "{html}"
+        );
         assert!(
             html.contains("href=\"/ui/browse/7\""),
             "the album links to its page: {html}"
@@ -652,7 +670,7 @@ mod tests {
         assert!(html.contains("1 of 2 saved"), "{html}");
         assert!(html.contains("Saved"), "{html}");
         assert!(html.contains("Failed"), "{html}");
-        assert!(html.contains("Remove Album 7 from this phone"), "{html}");
+        assert!(html.contains("Remove Album One from this phone"), "{html}");
     }
 
     #[test]
@@ -669,16 +687,21 @@ mod tests {
     }
 
     #[test]
-    fn a_mix_row_is_named_by_the_mix_and_is_not_a_link() {
+    fn a_mix_row_shows_its_title_and_is_not_a_link() {
         let fake = Arc::new(FakeOfflineStore::new());
         let mix = ContainerRef {
             kind: ContainerKind::Mix,
             id: "Morning".into(),
         };
-        fake.add_container(mix.clone(), vec![("m-1".into(), 10)]);
+        fake.add_titled(
+            mix.clone(),
+            "Mix One",
+            None,
+            vec![("m-1".into(), "Song One".into(), 10)],
+        );
         assert_eq!(fake.pin(&mix), Ok(()));
         let html = render_downloads(&fake);
-        assert!(html.contains("Morning"), "{html}");
+        assert!(html.contains("Mix One"), "{html}");
         assert!(!html.contains("href=\"/ui/browse"), "{html}");
     }
 
