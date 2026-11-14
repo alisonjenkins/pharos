@@ -32,6 +32,22 @@ struct Now {
 static STORE: OnceLock<Resume> = OnceLock::new();
 static NOW: Mutex<Option<Now>> = Mutex::new(None);
 static TICKING: AtomicBool = AtomicBool::new(false);
+/// Tracks started since the process began. A listing's server position is
+/// from when it was listed; once the car has played a track, the phone's
+/// own position for it is the newer one.
+static STARTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether `id` starts for the first time since the process began.
+fn first_start(id: &str) -> R<bool> {
+    let mut started = STARTED
+        .lock()
+        .map_err(|_| "resume started-list mutex poisoned".to_owned())?;
+    if started.iter().any(|s| s == id) {
+        return Ok(false);
+    }
+    started.push(id.to_owned());
+    Ok(true)
+}
 
 fn now() -> R<std::sync::MutexGuard<'static, Option<Now>>> {
     NOW.lock().map_err(|_| "resume mutex poisoned".to_owned())
@@ -178,6 +194,7 @@ pub fn prepared(
     player: &GlobalRef,
 ) -> R<Option<u64>> {
     let local = STORE.get().and_then(|s| s.position(id, duration_ms));
+    let server_ms = if first_start(id)? { server_ms } else { 0 };
     let (at, from) = start_at(server_ms, local, duration_ms);
     let n = Now {
         id: id.to_owned(),
@@ -260,6 +277,8 @@ pub fn drop_current(finished: bool) -> R<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -275,6 +294,16 @@ mod tests {
             (None, "phone"),
             "past the end: not a place to seek"
         );
+    }
+
+    #[test]
+    fn a_listings_position_counts_only_the_first_time_a_track_starts() {
+        assert!(first_start("track/t1").unwrap());
+        assert!(
+            !first_start("track/t1").unwrap(),
+            "the phone's is newer now"
+        );
+        assert!(first_start("track/t2").unwrap());
     }
 
     #[test]
