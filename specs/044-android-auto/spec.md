@@ -57,9 +57,11 @@ Pharos already playing, "play <x>" alone goes to Pharos.
 
 ### US4: sign in (P1)
 
-First run in the car shows a browse item "Sign in: approve code NNNNNN". The
-user approves it in the Pharos web UI (QuickConnect, as the TV app does);
-the phone keeps the device token.
+The user signs in on the phone app's own screen (normal Pharos sign-in);
+the car reuses that device token and never shows a sign-in step (Alison,
+2026-11-14T09:17Z). Until the phone screen exists (slice 2), the car shows a
+browse item "Sign in: approve code NNNNNN" approved in the web UI
+(QuickConnect, as the TV app does).
 
 ### US5: offline (P3, later)
 
