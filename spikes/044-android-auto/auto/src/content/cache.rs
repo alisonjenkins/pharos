@@ -64,6 +64,9 @@ pub struct SavedNode {
     pub browsable: bool,
     pub playable: bool,
     pub duration_ms: u64,
+    /// Absent in listings saved before it existed.
+    #[serde(default)]
+    pub album: String,
 }
 
 impl SavedNode {
@@ -75,6 +78,7 @@ impl SavedNode {
             browsable: n.browsable,
             playable: n.playable,
             duration_ms: n.duration_ms,
+            album: n.album.clone(),
         }
     }
 
@@ -89,6 +93,7 @@ impl SavedNode {
             art_url: None,
             stream_url: None,
             duration_ms: self.duration_ms,
+            album: self.album.clone(),
         }
     }
 }
@@ -781,6 +786,7 @@ mod tests {
             art_url: Some("https://h/x?api_key=SECRET".into()),
             stream_url: Some("https://h/a?api_key=SECRET".into()),
             duration_ms: 5,
+            album: "B".into(),
         };
         c.save_listing("album/9", &[n]);
         let raw = std::fs::read_to_string(c.listing_path("album/9")).unwrap();

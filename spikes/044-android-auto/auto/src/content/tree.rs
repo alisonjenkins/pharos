@@ -40,7 +40,8 @@ pub trait Catalogue {
     ) -> Result<Vec<Item>, ContentError>;
     async fn search(&self, text: &str, limit: u32) -> Result<Vec<Item>, ContentError>;
     async fn mix(&self, spec: &MixSpec, count: u32) -> Result<Vec<Item>, ContentError>;
-    async fn item(&self, id: ItemRef) -> Result<Item, ContentError>;
+    /// One item, with its album's name for a song.
+    async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError>;
 }
 
 fn nodes(urls: &Urls, items: &[Item]) -> Vec<Node> {
@@ -117,7 +118,17 @@ pub async fn children<C: Catalogue>(
             &cat.list(a, Some(ItemKind::Album), ARTIST_ALBUM_ORDER, MAX_CHILDREN)
                 .await?,
         ),
-        NodeId::Album(a) => nodes(urls, &cat.list(a, None, TRACK_ORDER, MAX_CHILDREN).await?),
+        NodeId::Album(a) => {
+            let mut tracks = nodes(urls, &cat.list(a, None, TRACK_ORDER, MAX_CHILDREN).await?);
+            match cat.item(a).await {
+                Ok((album, _)) => tracks
+                    .iter_mut()
+                    .filter(|t| t.playable)
+                    .for_each(|t| t.album.clone_from(&album.name)),
+                Err(e) => log::warn!("album {a} name unknown, tracks show none: {e}"),
+            }
+            tracks
+        }
         NodeId::Mix(n) => {
             let all = presets();
             let mix = all.get(usize::from(n)).ok_or_else(|| {
@@ -155,11 +166,15 @@ pub async fn node<C: Catalogue>(cat: &C, urls: &Urls, id: NodeId) -> Result<Node
     let (NodeId::Album(r) | NodeId::Artist(r) | NodeId::Track(r)) = id else {
         return Err(ContentError::BadId(id.to_string()));
     };
-    let item = cat.item(r).await?;
-    urls.node(&item).ok_or_else(|| ContentError::Rpc {
+    let (item, album) = cat.item(r).await?;
+    let mut node = urls.node(&item).ok_or_else(|| ContentError::Rpc {
         op: format!("node {id}"),
         why: format!("item {r} is a {:?}, which the car does not show", item.kind),
-    })
+    })?;
+    if node.playable {
+        node.album = album.unwrap_or_default();
+    }
+    Ok(node)
 }
 
 /// Most server calls one spoken search may make.
@@ -370,7 +385,10 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("list {parent} {group:?} {sort_by} {limit}"));
-            Ok(vec![item(ItemRef::Synth(3), ItemKind::Album, "Al")])
+            Ok(match group {
+                None => vec![item(ItemRef::Real(30), ItemKind::Audio, "Tr")],
+                Some(_) => vec![item(ItemRef::Synth(3), ItemKind::Album, "Al")],
+            })
         }
         async fn search(&self, text: &str, limit: u32) -> Result<Vec<Item>, ContentError> {
             self.calls
@@ -385,16 +403,14 @@ mod tests {
             self.calls.borrow_mut().push(format!("mix {count}"));
             Ok(vec![item(ItemRef::Real(7), ItemKind::Audio, "M")])
         }
-        async fn item(&self, id: ItemRef) -> Result<Item, ContentError> {
-            Ok(item(
-                id,
-                if matches!(id, ItemRef::Real(_)) {
-                    ItemKind::Audio
-                } else {
-                    ItemKind::Movie
-                },
-                "I",
-            ))
+        async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError> {
+            let song = matches!(id, ItemRef::Real(_));
+            let kind = if song {
+                ItemKind::Audio
+            } else {
+                ItemKind::Movie
+            };
+            Ok((item(id, kind, "I"), song.then(|| "Its Album".to_owned())))
         }
     }
 
@@ -472,6 +488,15 @@ mod tests {
     }
 
     #[test]
+    fn album_tracks_carry_the_album_name() {
+        let f = Fake::default();
+        let got = block_on(children(&f, &urls(), NodeId::Album(ItemRef::Synth(3)))).unwrap();
+        assert_eq!(got.len(), 1);
+        // The fake names every item "I": here, the album.
+        assert_eq!(got[0].album, "I");
+    }
+
+    #[test]
     fn recent_keeps_only_what_the_car_shows() {
         let f = Fake::default();
         let got = block_on(children(&f, &urls(), NodeId::Recent)).unwrap();
@@ -524,6 +549,7 @@ mod tests {
             .stream_url
             .unwrap()
             .contains("00000000000000000000000000000008"));
+        assert_eq!(n.album, "Its Album");
         let e = block_on(node(&f, &urls(), NodeId::Album(ItemRef::Synth(8)))).expect_err("movie");
         assert!(e.to_string().contains("Movie"), "{e}");
     }
@@ -562,7 +588,7 @@ mod tests {
         async fn mix(&self, _: &MixSpec, _: u32) -> Result<Vec<Item>, ContentError> {
             Ok(vec![])
         }
-        async fn item(&self, _: ItemRef) -> Result<Item, ContentError> {
+        async fn item(&self, _: ItemRef) -> Result<(Item, Option<String>), ContentError> {
             Err(ContentError::WorkerGone)
         }
     }
