@@ -496,7 +496,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         let id = string(env, &id)?;
         log(&format!("session onPlayFromMediaId id={id}"));
         if is_book_id(&id) {
-            return play_book(&id);
+            return play_book(&id, supersede());
         }
         apply(env, play_from(&id), Source::Car)
     })
