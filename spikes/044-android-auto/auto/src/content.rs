@@ -33,6 +33,7 @@ mod tree;
 #[path = "../../../../crates/pharos-ui/src/native/tv_auth.rs"]
 mod tv_auth;
 
+pub use cache::DEFAULT_CAP_BYTES;
 pub use error::ContentError;
 pub use id::NodeId;
 pub use library::{AuthState, Library, Timeouts};
