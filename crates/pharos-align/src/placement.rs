@@ -70,6 +70,8 @@ pub struct Placement {
     counts: [usize; 4],
     /// Anchored lines over lines with words; `None` when nothing was recognised.
     pub anchor_share: Option<f64>,
+    /// Anchors set aside as a repeat heard in the wrong place.
+    pub dropped_anchors: usize,
     pub fallback: Option<Fallback>,
 }
 
@@ -81,6 +83,7 @@ impl Placement {
         Self {
             counts,
             anchor_share: None,
+            dropped_anchors: 0,
             fallback: Some(why),
         }
     }
@@ -94,6 +97,7 @@ impl Placement {
         Self {
             counts,
             anchor_share: Some(anchor_share),
+            dropped_anchors: 0,
             fallback: None,
         }
     }

@@ -29,6 +29,11 @@ pub const MIN_ANCHOR_SHARE: f64 = 0.4;
 /// where it is expected; the prototype's setting, enough to stop a line
 /// sliding onto a repeat of itself within its band.
 pub const ENTRY_COST_PER_S: f64 = 0.3;
+/// An anchor whose offset from its line's requested time differs this much
+/// from the offsets of the anchors either side is a repeat of the line
+/// heard in the wrong place; the check set's true anchors stay within 3 s
+/// of their neighbours, the false ones were 11 s and more away.
+pub const OUTLIER_MS: i64 = 5_000;
 
 /// The whole song's vocals emission and the samples it came from.
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +97,35 @@ fn anchor_words(line: &Line, words: &[text::Word], starts_ms: &[i64], end: i64) 
         words: out,
         score: None,
     }
+}
+
+/// Anchored lines whose offset stands apart from both neighbouring anchors
+/// (or from its one neighbour, at either end of the song).
+fn outliers(lines: &[Line], matched: &Matched) -> Vec<bool> {
+    let offsets: Vec<(usize, i64)> = matched
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let a = m.anchor.as_ref()?;
+            Some((
+                i,
+                a.starts_ms.first().copied().unwrap_or(a.end_ms) - lines[i].start_ms,
+            ))
+        })
+        .collect();
+    let mut out = vec![false; lines.len()];
+    for (k, &(i, off)) in offsets.iter().enumerate() {
+        let apart = |j: Option<&(usize, i64)>| j.map(|&(_, o)| (off - o).abs() > OUTLIER_MS);
+        let prev = apart(k.checked_sub(1).and_then(|k| offsets.get(k)));
+        let next = apart(offsets.get(k + 1));
+        out[i] = match (prev, next) {
+            (Some(p), Some(n)) => p && n,
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => false,
+        };
+    }
+    out
 }
 
 /// One line's part in the joint alignment: its words' label ids, the band
@@ -308,7 +342,17 @@ fn joint(song: &Song<'_>, parts: &[Part]) -> Option<Vec<Placed>> {
 pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song<'_>) -> Refined {
     let words: Vec<Vec<text::Word>> = lines.iter().map(|l| text::words(&l.text)).collect();
     let with_words = words.iter().filter(|w| !w.is_empty()).count();
-    let share = matched.share().unwrap_or(0.0);
+    let dropped = outliers(lines, matched);
+    let n_dropped = dropped.iter().filter(|&&d| d).count();
+    let anchors = matched
+        .lines
+        .iter()
+        .zip(&dropped)
+        .filter(|(m, &d)| m.anchor.is_some() && !d)
+        .count();
+    let share = matched
+        .share()
+        .map_or(0.0, |_| anchors as f64 / with_words.max(1) as f64);
     let mut out: Vec<LineWords> = today.to_vec();
     let mut methods: Vec<Option<Method>> = words
         .iter()
@@ -317,6 +361,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
     if share < MIN_ANCHOR_SHARE {
         let mut placement = Placement::kept(with_words, Fallback::LowAnchorShare);
         placement.anchor_share = Some(share);
+        placement.dropped_anchors = n_dropped;
         return Refined {
             lines: out,
             methods,
@@ -336,7 +381,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
     // cannot hold keeps the recogniser's times.
     let mut bands: Vec<Option<(f64, f64, f64)>> = vec![None; lines.len()];
     for (i, m) in matched.lines.iter().enumerate() {
-        let (Some(a), Some(t)) = (m.anchor.as_ref(), tokens[i].as_ref()) else {
+        let (Some(a), Some(t), false) = (m.anchor.as_ref(), tokens[i].as_ref(), dropped[i]) else {
             continue;
         };
         let first = a.starts_ms.first().copied().unwrap_or(a.end_ms);
@@ -426,7 +471,8 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         }
     }
 
-    let placement = Placement::from_methods(methods.iter().flatten().copied(), share);
+    let mut placement = Placement::from_methods(methods.iter().flatten().copied(), share);
+    placement.dropped_anchors = n_dropped;
     Refined {
         lines: out,
         methods,
@@ -706,5 +752,45 @@ mod tests {
         assert_eq!(r.placement.count(Method::Kept), 3);
         assert_eq!(r.placement.fallback, Some(Fallback::LowAnchorShare));
         assert_eq!(r.placement.anchor_share, Some(1.0 / 3.0));
+    }
+
+    #[test]
+    fn an_anchor_far_from_its_neighbours_is_dropped() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+            line(10_000, 13_000, "boats come home"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_200);
+        sung.extend(sing("nets dry slow", 4_200));
+        sung.extend(sing("low tide hums", 7_200));
+        // The last line heard sung again twelve seconds late.
+        sung.extend(sing("low tide hums", 19_200));
+        let frames = 1_100;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.2);
+        h.extend(heard("nets dry slow", 4.2));
+        h.extend(heard("low tide hums", 19.2));
+        let m = match_lines(&lines, &h, Options::default());
+        assert!(m.lines[2].anchor.is_some());
+        let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(
+            r.methods,
+            vec![
+                Some(Method::Refined),
+                Some(Method::Refined),
+                Some(Method::Kept),
+                Some(Method::Kept)
+            ]
+        );
+        assert_eq!(r.lines[2], t[2]);
+        assert_eq!(r.placement.dropped_anchors, 1);
+        assert_eq!(r.placement.anchor_share, Some(0.5));
     }
 }
