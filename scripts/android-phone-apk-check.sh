@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Check a built Pharos phone APK carries what the phone and the car need
 # (spec 044, T17): the Pharos label, minSdk 26, the car's media service,
-# art provider and voice search entry, the injected classes2.dex with the
-# car's entry classes, and libmain.so exporting every `Java_` symbol those
+# art provider and voice search entry, a dex holding the car's entry
+# classes, and libmain.so exporting every `Java_` symbol those
 # classes call. An APK whose library lost its exports (no `link()` use)
 # loads, then throws UnsatisfiedLinkError in the car; this catches it here.
 #
@@ -77,20 +77,20 @@ fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-if unzip -q -o "$apk" classes2.dex lib/arm64-v8a/libmain.so -d "$tmp" 2>/dev/null; then
-  pass "APK has classes2.dex and lib/arm64-v8a/libmain.so"
+if unzip -q -o "$apk" 'classes*.dex' lib/arm64-v8a/libmain.so -d "$tmp" 2>/dev/null &&
+  [ -f "$tmp/lib/arm64-v8a/libmain.so" ]; then
+  pass "APK has dex files and lib/arm64-v8a/libmain.so"
 else
-  fail "APK lacks classes2.dex or lib/arm64-v8a/libmain.so"
+  fail "APK lacks dex files or lib/arm64-v8a/libmain.so"
 fi
-if [ -f "$tmp/classes2.dex" ]; then
-  for class in PharosMediaService PharosArtProvider PharosSearchActivity PharosPlayerListener; do
-    if grep -aq "Lcom/alisonjenkins/pharos/auto/$class;" "$tmp/classes2.dex"; then
-      pass "classes2.dex holds $class"
-    else
-      fail "classes2.dex lacks $class"
-    fi
-  done
-fi
+for class in PharosMediaService PharosArtProvider PharosSearchActivity PharosPlayerListener; do
+  holder=$(grep -alF "Lcom/alisonjenkins/pharos/auto/$class;" "$tmp"/classes*.dex 2>/dev/null | head -n 1 || true)
+  if [ -n "$holder" ]; then
+    pass "$(basename "$holder") holds $class"
+  else
+    fail "no dex holds $class"
+  fi
+done
 if [ -f "$tmp/lib/arm64-v8a/libmain.so" ]; then
   exports=$("$LLVM_NM" -D --defined-only "$tmp/lib/arm64-v8a/libmain.so" | awk '$3 ~ /^Java_com_alisonjenkins_pharos_auto_/ {print $3}' | sort -u)
   count=$(printf '%s\n' "$exports" | grep -c . || true)

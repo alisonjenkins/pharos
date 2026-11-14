@@ -3,7 +3,7 @@
 #
 # One libmain.so carries the shared UI and the car's media service: dx
 # builds it with the dx activity, pharos-classgen writes the car's entry
-# classes against it, and they go in as classes2.dex beside dx's own.
+# classes against it, and they go in as the next classesN.dex after gradle's.
 #
 # Signing uses a keystore YOU provide, as for the TV APK:
 #   PHAROS_ANDROID_KEYSTORE            path to the .keystore / .jks
@@ -85,7 +85,6 @@ mapfile -t classes < <(find "$tmp/classes" -name '*.class')
 mkdir -p "$tmp/dex"
 nix develop .#android -c "$build_tools/d8" --release --min-api 26 \
   --lib "$platform" --output "$tmp/dex" "${classes[@]}"
-mv "$tmp/dex/classes.dex" "$tmp/classes2.dex"
 
 # dx has no setting for the launcher icon or app_name: lay the shared
 # Pharos resources, then the phone's own, over the project it generated.
@@ -116,13 +115,15 @@ built=$(find "$apk_dir" -name '*.apk' | head -n 1)
   exit 1
 }
 
-echo "android-phone-apk: 5/6 adding classes2.dex" >&2
+# Gradle may already split its own code over several dex files (a debug
+# build at minSdk 26 does). ART loads classes.dex, classes2.dex, ... up to the
+# first gap, so the car's classes take the next free index.
 cp "$built" "$tmp/unsigned.apk"
-if unzip -l "$tmp/unsigned.apk" classes2.dex >/dev/null 2>&1; then
-  echo "android-phone-apk: gradle already wrote a classes2.dex; refusing to replace it" >&2
-  exit 1
-fi
-(cd "$tmp" && zip -q -0 unsigned.apk classes2.dex)
+last=$(unzip -Z1 "$tmp/unsigned.apk" | sed -n 's/^classes\([0-9]*\)\.dex$/\1/p' | sed 's/^$/1/' | sort -n | tail -n 1)
+car_dex=classes$((${last:-1} + 1)).dex
+echo "android-phone-apk: 5/6 adding the car's classes as $car_dex (gradle wrote ${last:-1})" >&2
+mv "$tmp/dex/classes.dex" "$tmp/$car_dex"
+(cd "$tmp" && zip -q -0 unsigned.apk "$car_dex")
 
 AAPT2=$build_tools/aapt2 bash "$root/scripts/android-phone-apk-check.sh" "$tmp/unsigned.apk" || {
   echo "android-phone-apk: the built APK failed its checks; not signing it" >&2
