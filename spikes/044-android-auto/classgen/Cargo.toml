@@ -1,0 +1,11 @@
+[package]
+name = "pharos-classgen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike 044: writes the Java stub classes Android needs, from Rust, with no Java source"
+
+# Not a member of the pharos workspace while it is a spike.
+[workspace]
+
+[dependencies]
