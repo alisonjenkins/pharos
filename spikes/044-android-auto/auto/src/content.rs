@@ -22,6 +22,7 @@ mod id;
 mod library;
 mod net;
 mod node;
+mod prefetch;
 #[cfg(test)]
 mod testserver;
 mod token;
