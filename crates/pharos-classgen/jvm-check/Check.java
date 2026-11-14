@@ -90,6 +90,11 @@ public class Check {
     }
     expect(s.superCreated, "onCreate ran the framework's onCreate first");
     expect(s.token != null, "Rust set the session token");
+    android.content.pm.PackageManager.packages.put(10123, new String[] {"com.google.android.projection.gearhead"});
+    android.content.pm.PackageManager.system.add("com.google.android.projection.gearhead");
+    android.content.pm.PackageManager.packages.put(10777, new String[] {"org.example.other"});
+    expect(s.onGetRoot("org.example.other", 10777, null) == null, "onGetRoot refuses an installed non-system app");
+    expect(s.onGetRoot("com.google.android.projection.gearhead", 10777, null) == null, "onGetRoot refuses a package name the caller does not own");
     MediaBrowserService.BrowserRoot root = s.onGetRoot("com.google.android.projection.gearhead", 10123, null);
     expect(root != null && root.getRootId().equals("root"), "onGetRoot returned root");
     expect(root.extras != null && Boolean.TRUE.equals(root.extras.m.get("android.media.browse.SEARCH_SUPPORTED")), "root says search is supported");
