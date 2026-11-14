@@ -84,7 +84,10 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         if let Some(path) = lib.local_path(id) {
-            let listed = queue.iter().find(|i| i.id == id).cloned();
+            let listed = queue
+                .iter()
+                .find(|i| i.id == id && !i.title.is_empty())
+                .cloned();
             let item = match listed {
                 Some(i) => i,
                 None => Item::of_node(
