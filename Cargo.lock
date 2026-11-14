@@ -8403,6 +8403,7 @@ dependencies = [
  "ndk-context",
  "pharos-android",
  "pharos-ui",
+ "pharos-vis",
  "tokio",
 ]
 
