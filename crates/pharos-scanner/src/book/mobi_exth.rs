@@ -45,6 +45,8 @@ const EXTH_AUTHOR: u32 = 100;
 const EXTH_PUBLISHER: u32 = 101;
 const EXTH_DESCRIPTION: u32 = 103;
 const EXTH_ISBN: u32 = 104;
+/// Repeated once per subject (spec 043 FR-002).
+const EXTH_SUBJECT: u32 = 105;
 const EXTH_DATE: u32 = 106;
 const EXTH_COVER_OFFSET: u32 = 201;
 const EXTH_THUMB_OFFSET: u32 = 202;
@@ -62,6 +64,8 @@ pub struct ExthMetadata {
     pub date: Option<String>,
     /// Raw EXTH 104 value; the caller filters it with the shared ISBN rule.
     pub isbn: Option<String>,
+    /// Every EXTH 105 record, trimmed, in file order.
+    pub subjects: Vec<String>,
     /// PalmDOC encryption type: 0 none, 1 old mobipocket, 2 mobipocket DRM.
     pub encryption: u16,
     /// Record index of the cover image, when EXTH 201 names one.
@@ -79,6 +83,7 @@ impl ExthMetadata {
             || self.description.is_some()
             || self.date.is_some()
             || self.isbn.is_some()
+            || !self.subjects.is_empty()
     }
 }
 
@@ -310,6 +315,13 @@ fn parse_exth(
             EXTH_DESCRIPTION if meta.description.is_none() => meta.description = text(),
             EXTH_ISBN if meta.isbn.is_none() => meta.isbn = text(),
             EXTH_DATE if meta.date.is_none() => meta.date = text(),
+            EXTH_SUBJECT => {
+                if let Some(s) = text() {
+                    if !meta.subjects.contains(&s) {
+                        meta.subjects.push(s);
+                    }
+                }
+            }
             EXTH_UPDATED_TITLE => meta.title = text().or(meta.title.take()),
             EXTH_COVER_OFFSET => meta.cover_record = image_record(first_image, data),
             EXTH_THUMB_OFFSET => meta.thumb_record = image_record(first_image, data),
@@ -470,6 +482,28 @@ pub(crate) mod tests {
             b"Full Name Title",
             Some(0),
         )
+    }
+
+    /// Spec 043 FR-002: a locked book's subjects are in its clear header.
+    #[test]
+    fn every_subject_record_is_read() {
+        let bytes = drm_azw(
+            65001,
+            &[
+                (EXTH_SUBJECT, b"Computers".to_vec()),
+                (EXTH_SUBJECT, b" Programming ".to_vec()),
+                (EXTH_SUBJECT, b"".to_vec()),
+                (EXTH_SUBJECT, b"Computers".to_vec()),
+            ],
+            b"Locked Title",
+            None,
+        );
+        let m = read_exth_from(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            m.subjects,
+            vec!["Computers".to_owned(), "Programming".to_owned()]
+        );
+        assert!(m.has_descriptive());
     }
 
     #[test]
