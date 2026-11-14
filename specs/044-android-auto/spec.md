@@ -55,8 +55,11 @@ Depends on spec 004's audiobook work.
 
 ### US3: voice (P2)
 
-"Play <album / artist / book> on <app name>" via Gemini starts it. With
-Pharos already playing, "play <x>" alone goes to Pharos.
+"Play <album / artist / book> on <app name>" via Gemini is the goal. It does
+not work today: Gemini sends "play X on <app>" to YouTube Music (see Voice
+findings). Transport commands to the active session and the in-app search mic
+do work. With Pharos already playing, "play <x>" alone is expected to go to
+Pharos; that is not yet verified.
 
 ### US4: sign in (P1)
 
