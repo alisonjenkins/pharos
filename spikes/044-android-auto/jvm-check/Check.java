@@ -67,6 +67,8 @@ public class Check {
     java.nio.file.Files.write(new java.io.File(new android.content.Context().getFilesDir(), "server_url").toPath(),
         "http://127.0.0.1:9\n".getBytes());
     new java.io.File(new android.content.Context().getFilesDir(), "device_token").delete();
+    java.io.File resumeFile = new java.io.File(new android.content.Context().getFilesDir(), "resume.json");
+    resumeFile.delete();
     PharosMediaService s = new PharosMediaService();
     s.onCreate();
     android.net.ConnectivityManager cm = android.net.ConnectivityManager.last;
@@ -192,6 +194,19 @@ public class Check {
       expect(session.state.state == 2 && !MediaPlayer.last.playing, "becoming noisy while paused stays paused: " + session.state);
       cb.onPlay();
     }
+    MediaPlayer.duration = 20 * 60 * 1000;
+    cb.onPlayFromMediaId("tone:440", null);
+    MediaPlayer.last.firePrepared();
+    expect(session.state.state == 3 && MediaPlayer.last.getCurrentPosition() == 0, "a long track with nothing saved starts at 0: " + session.state);
+    cb.onSeekTo(300000);
+    cb.onPause();
+    String saved = resumeFile.exists() ? new String(java.nio.file.Files.readAllBytes(resumeFile.toPath())) : "";
+    expect(saved.contains("\"tone:440\"") && saved.contains("300000"), "pausing a long track saves its position: " + saved);
+    cb.onPlayFromMediaId("tone:440", null);
+    MediaPlayer.last.firePrepared();
+    expect(session.state.state == 3 && session.state.pos == 300000 && MediaPlayer.last.getCurrentPosition() == 300000,
+        "replaying a long track resumes where it stopped: " + session.state);
+    MediaPlayer.duration = 10000;
     cb.onSkipToNext();
     cb.onPlayFromSearch("test tone c", null);
 
