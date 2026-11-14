@@ -23,6 +23,15 @@ pub(crate) fn files_dir(env: &mut JNIEnv, ctx: &JObject) -> R<String> {
     string(env, &JString::from(dir))
 }
 
+/// The application id (`Context.getPackageName`).
+pub(crate) fn package_name(env: &mut JNIEnv, ctx: &JObject) -> R<String> {
+    let name = env
+        .call_method(ctx, "getPackageName", "()Ljava/lang/String;", &[])
+        .and_then(|v| v.l())
+        .map_err(jerr("getPackageName"))?;
+    string(env, &JString::from(name))
+}
+
 /// Starts the library worker once per process. No network I/O happens here.
 pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     // Held across the check and the connect, so the service and the app
