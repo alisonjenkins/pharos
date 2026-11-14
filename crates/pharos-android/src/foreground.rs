@@ -220,6 +220,58 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
     Ok(())
 }
 
+/// The app's `ic_stat_pharos` drawable, or the system play icon for an APK
+/// built without it (the spike's). Looked up once: resource ids are fixed for
+/// the life of the process.
+fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
+    static ICON: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    if let Some(icon) = ICON.get() {
+        return Ok(*icon);
+    }
+    let res = env
+        .call_method(
+            ctx,
+            "getResources",
+            "()Landroid/content/res/Resources;",
+            &[],
+        )
+        .and_then(|v| v.l())
+        .map_err(jerr("getResources"))?;
+    let pkg = env
+        .call_method(ctx, "getPackageName", "()Ljava/lang/String;", &[])
+        .and_then(|v| v.l())
+        .map_err(jerr("getPackageName"))?;
+    let name = JObject::from(
+        env.new_string("ic_stat_pharos")
+            .map_err(jerr("icon name"))?,
+    );
+    let kind = JObject::from(env.new_string("drawable").map_err(jerr("icon kind"))?);
+    let app = env
+        .call_method(
+            &res,
+            "getIdentifier",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+            &[
+                JValue::Object(&name),
+                JValue::Object(&kind),
+                JValue::Object(&pkg),
+            ],
+        )
+        .and_then(|v| v.i())
+        .map_err(jerr("getIdentifier"))?;
+    let (icon, source) = if app != 0 {
+        (app, "app")
+    } else {
+        let system = env
+            .get_static_field("android/R$drawable", "ic_media_play", "I")
+            .and_then(|v| v.i())
+            .map_err(jerr("ic_media_play"))?;
+        (system, "system")
+    };
+    log(&format!("notify: small_icon={source}"));
+    Ok(*ICON.get_or_init(|| icon))
+}
+
 fn build<'l>(env: &mut JNIEnv<'l>, f: &Fg) -> R<JObject<'l>> {
     const B: &str = "Landroid/app/Notification$Builder;";
     let id = JObject::from(env.new_string(CHANNEL_ID).map_err(jerr("channel id"))?);
@@ -230,10 +282,7 @@ fn build<'l>(env: &mut JNIEnv<'l>, f: &Fg) -> R<JObject<'l>> {
             &[JValue::Object(f.service.as_obj()), JValue::Object(&id)],
         )
         .map_err(jerr("Notification.Builder"))?;
-    let icon = env
-        .get_static_field("android/R$drawable", "ic_media_play", "I")
-        .and_then(|v| v.i())
-        .map_err(jerr("ic_media_play"))?;
+    let icon = small_icon(env, f.service.as_obj())?;
     env.call_method(&b, "setSmallIcon", format!("(I){B}"), &[JValue::Int(icon)])
         .map_err(jerr("setSmallIcon"))?;
     let title = JObject::from(

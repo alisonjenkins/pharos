@@ -150,7 +150,7 @@ public class Check {
     expect(s.inForeground && s.foregroundType == 2 && s.startedService != null && s.startedService.target == PharosMediaService.class,
         "playing starts the service and holds it in the foreground as media playback");
     android.app.Notification fgn = s.foregroundNotification;
-    expect(fgn != null && "playback".equals(fgn.channel) && fgn.visibility == 1 && fgn.icon == android.R.drawable.ic_media_play
+    expect(fgn != null && "playback".equals(fgn.channel) && fgn.visibility == 1 && fgn.icon == 0x7f080001
         && fgn.title != null && fgn.title.length() > 0 && fgn.style instanceof android.app.Notification.MediaStyle
         && ((android.app.Notification.MediaStyle) fgn.style).token == s.token,
         "the foreground notification is a public MediaStyle tied to the session, titled with the track");
