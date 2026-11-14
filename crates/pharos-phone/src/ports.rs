@@ -50,6 +50,7 @@ impl PhoneAudio {
 
 impl NativeAudio for PhoneAudio {
     fn play(&self, ids: Vec<String>, start_index: usize) {
+        crate::activity::ask_notifications_on_first_play();
         self.with("play", |p| p.play(ids, start_index));
     }
 

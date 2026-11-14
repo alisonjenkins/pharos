@@ -1,6 +1,8 @@
 //! Calls that need the app's Activity, reached through the context tao
 //! records at start-up.
 
+use std::sync::Once;
+
 use jni::objects::JObject;
 use jni::JNIEnv;
 
@@ -28,4 +30,18 @@ pub fn start_media_service() {
     if let Err(e) = with_activity(pharos_android::start_service) {
         log::warn!("pharos: media service not started error={e}");
     }
+}
+
+/// Asks for the notification permission the first time music plays, so the
+/// playback notification shows; later plays do not ask again.
+pub fn ask_notifications_on_first_play() {
+    static ASKED: Once = Once::new();
+    ASKED.call_once(|| {
+        let asked = with_activity(|env, activity| {
+            pharos_android::ask_notification_permission(env, activity).map(|_| ())
+        });
+        if let Err(e) = asked {
+            log::warn!("pharos: notification permission not asked error={e}");
+        }
+    });
 }
