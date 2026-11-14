@@ -53,7 +53,7 @@ const FE: [(usize, usize, usize); 7] = [
 /// Samples the feature extractor needs for one frame.
 pub const MIN_SAMPLES: usize = 400;
 /// Samples between frames: the strides' product.
-const FE_HOP: usize = 320;
+pub(crate) const FE_HOP: usize = 320;
 /// Frames the extractor makes per pass over a window. Every step of it works
 /// frame by frame, so pieces give the same frames, and its buffers (512
 /// channels at a fifth of the sample rate in the first layer) stay near
