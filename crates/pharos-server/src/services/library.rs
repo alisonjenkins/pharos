@@ -1609,11 +1609,11 @@ pub async fn index(
     let genres = if matches!(parent, ParentResolution::Empty) {
         Vec::new()
     } else {
-        // The genres of what the listing holds: under a Books library with no
-        // kind named that is its books, not its course lessons (spec 043).
+        // V1393 — a Books library's picker offers its books' genres, as its
+        // listing lists its books, not its course lessons'.
         let unfiltered = ItemQuery {
             kinds: books_default(state, &parent, &unfiltered.kinds),
-            ..unfiltered.clone()
+            ..unfiltered
         };
         let mut base = build_media_query(user.id, &unfiltered, &parent, false);
         apply_policy_scope(&mut base, &user.policy, &state.parental_ratings);

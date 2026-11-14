@@ -73,9 +73,30 @@ fn collapse(s: &str) -> String {
     joined.trim().to_string()
 }
 
+/// How many separator-then-junk passes a stem gets. Each pass that changes
+/// anything removes a hyphen or shortens the stem, so real stems settle in two.
+const MAX_PASSES: usize = 8;
+
 /// The stem with separators spaced and download, copy and purchaser junk
 /// removed. Returns the stem unchanged when cleaning would leave nothing.
+///
+/// The passes repeat until the title settles: removing `- Copy` can leave a
+/// stem whose hyphens now outnumber its spaces, and cleaning must give it the
+/// same title as the file it copies (and as cleaning it again would).
 pub fn clean_stem_title(stem: &str) -> String {
+    let mut s = clean_once(stem);
+    for _ in 1..MAX_PASSES {
+        let next = clean_once(&s);
+        if next == s {
+            break;
+        }
+        s = next;
+    }
+    s
+}
+
+/// One pass: separators first, then trailing junk.
+fn clean_once(stem: &str) -> String {
     let mut s = stem.replace('_', " ");
     if hyphens_are_separators(&s) {
         // Only hyphens between two word characters; ` - ` stays.
@@ -153,6 +174,8 @@ mod tests {
             ("A Book Title (2)", "A Book Title"),
             ("A Book Title - Copy", "A Book Title"),
             ("A Book Title - Copy (2)", "A Book Title"),
+            // A copy's junk does not hide its separators.
+            ("learn-rust-fast - Copy", "learn rust fast"),
             // Purchaser stamp, then a counter beneath it.
             ("Some Title (for Mr A B Smith)", "Some Title"),
             ("Some Title (1) (for Mr A B Smith)", "Some Title"),
@@ -190,6 +213,8 @@ mod tests {
             "learning_rust_the_hard_way",
             "Some Title (1) (for Mr A B Smith)",
             "Learning Go eBook www SomeSite se",
+            "learn-rust-fast - Copy",
+            "learn-rust-fast",
         ] {
             let once = clean_stem_title(input);
             assert_eq!(clean_stem_title(&once), once, "for {input:?}");

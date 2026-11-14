@@ -5,7 +5,8 @@
 //!
 //! Two files fold only when they sit in the same folder, their stems give the
 //! same title once cleaned ([`clean_stem_title`], case folded), and their
-//! authors agree or one of them names none. The primary is the file the
+//! authors agree or one of them names none (a file naming none never joins
+//! two authors' books into one). The primary is the file the
 //! reader opens best ([`FormatRank`]); the others become its versions,
 //! labelled by format.
 //!
@@ -125,14 +126,21 @@ pub(crate) fn read_fold_facts(path: &Path) -> Option<FoldFacts> {
             })
             .flatten(),
         ),
-        BookFormat::Unreadable => {
-            match guard_parser(path, format, "kindle fold facts", || {
-                kindle::read_kindle(path)
-            }) {
-                Some(Ok(meta)) => (FormatRank::Kindle, meta.author),
-                _ => (FormatRank::Locked, None),
+        BookFormat::Unreadable => guard_parser(path, format, "kindle fold facts", || {
+            match kindle::read_kindle(path) {
+                Ok(meta) => (FormatRank::Kindle, meta.author),
+                // DRM encrypts the text only; the EXTH header still names the
+                // author, which keeps a locked file out of another's book.
+                Err(kindle::KindleError::Drm(_)) => (
+                    FormatRank::Locked,
+                    super::mobi_exth::read_exth(path)
+                        .ok()
+                        .and_then(|m| m.author),
+                ),
+                Err(_) => (FormatRank::Locked, None),
             }
-        }
+        })
+        .unwrap_or((FormatRank::Locked, None)),
     };
     Some(FoldFacts { rank, author, size })
 }
@@ -220,11 +228,18 @@ fn fold_key(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 /// Whether the stem carries junk the title cleanup removes (`(1)`,
-/// `- Copy`): such a file is the copy, the clean one its original.
+/// `- Copy`): such a file is the copy, the clean one its original. Spacing
+/// separators (`learn-rust-fast`) is not junk.
 fn has_junk_stem(path: &Path) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
     path.file_stem()
         .and_then(|s| s.to_str())
-        .is_some_and(|s| clean_stem_title(s) != s)
+        .is_some_and(|s| words(&clean_stem_title(s)) != words(s))
 }
 
 /// How a file ranks for its title's primary, best first: the format the
@@ -297,8 +312,18 @@ pub(crate) fn fold(
         // author's book of the same title) wait for the next round.
         while let Some((&(primary, primary_path, primary_facts), rest)) = ranked.split_first() {
             let mut apart = Vec::new();
+            // The book's author, once any file of it names one: a primary
+            // naming none may take one author's files, never two authors'.
+            let mut author = primary_facts.author.as_deref();
             for &(member, path, f) in rest {
-                let reason = FoldReason::of(primary_facts.author.as_deref(), f.author.as_deref());
+                let reason = FoldReason::of(author, f.author.as_deref());
+                let names_one = f
+                    .author
+                    .as_deref()
+                    .is_some_and(|a| a.chars().any(char::is_alphanumeric));
+                if reason == FoldReason::AuthorUnknown && names_one {
+                    author = f.author.as_deref();
+                }
                 decisions.push(Decision {
                     primary: primary_path.to_path_buf(),
                     copy: path.to_path_buf(),
@@ -621,6 +646,83 @@ mod tests {
                 outcome: FoldOutcome::KeptApart,
                 reason: FoldReason::AuthorsDiffer,
             }]
+        );
+    }
+
+    /// A copy whose junk suffix outnumbers its separators still folds with
+    /// the file it copies.
+    #[test]
+    fn a_hyphenated_stem_and_its_copy_fold() {
+        let groups = lone(&["/b/learn-rust-fast.epub", "/b/learn-rust-fast - Copy.epub"]);
+        assert_eq!(candidates(&groups).len(), 2, "both files share a title");
+        let f = table(&[
+            ("/b/learn-rust-fast.epub", facts(FormatRank::Epub, None)),
+            (
+                "/b/learn-rust-fast - Copy.epub",
+                facts(FormatRank::Epub, None),
+            ),
+        ]);
+        let (out, _) = fold(groups, &f);
+        assert_eq!(
+            out,
+            vec![(
+                PathBuf::from("/b/learn-rust-fast.epub"),
+                vec![(
+                    "EPUB copy".to_string(),
+                    PathBuf::from("/b/learn-rust-fast - Copy.epub")
+                )]
+            )]
+        );
+    }
+
+    /// A DRM-locked Kindle file names its author from the clear EXTH header,
+    /// so it cannot fold into another author's book of the same title.
+    #[test]
+    fn a_locked_kindle_file_names_its_author_from_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Gardening.azw3");
+        let bytes = super::super::mobi_exth::tests::drm_azw(
+            65001,
+            &[(100, b"Ada Field".to_vec())],
+            b"Gardening",
+            None,
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let f = read_fold_facts(&path).expect("a kindle path is a book");
+        assert_eq!(f.rank, FormatRank::Locked);
+        assert_eq!(f.author.as_deref(), Some("Ada Field"));
+    }
+
+    /// A primary that names no author joins either known author's book, but
+    /// never both: the first known author to join decides for the rest.
+    #[test]
+    fn an_unknown_author_never_bridges_two_known_authors() {
+        let groups = lone(&["/b/Gardening.epub", "/b/Gardening.pdf", "/b/Gardening.cbz"]);
+        let f = table(&[
+            ("/b/Gardening.epub", facts(FormatRank::Epub, Some(" "))),
+            (
+                "/b/Gardening.pdf",
+                facts(FormatRank::Pdf, Some("Ada Field")),
+            ),
+            (
+                "/b/Gardening.cbz",
+                facts(FormatRank::Comic, Some("Ben Stone")),
+            ),
+        ]);
+        let (out, decisions) = fold(groups, &f);
+        assert_eq!(
+            out,
+            vec![
+                (
+                    PathBuf::from("/b/Gardening.epub"),
+                    vec![("PDF".to_string(), PathBuf::from("/b/Gardening.pdf"))]
+                ),
+                (PathBuf::from("/b/Gardening.cbz"), Vec::new()),
+            ]
+        );
+        assert_eq!(
+            decisions.iter().map(|d| d.reason).collect::<Vec<_>>(),
+            [FoldReason::AuthorUnknown, FoldReason::AuthorsDiffer]
         );
     }
 
