@@ -4292,6 +4292,135 @@ where
     assert_eq!(items, [2], "a lesson is never matched");
 }
 
+/// 045 (ADR-0128): reader passwords round-trip, list only their owner's live
+/// rows, refuse a taken id, revoke once, and prune only old revoked rows.
+async fn run_reader_password_conformance<S>(store: S)
+where
+    S: pharos_core::UserStore + pharos_core::ReaderPasswordStore + Send + Sync,
+{
+    use pharos_core::{ReaderPasswordId, ReaderPasswordRecord};
+    let owner = user_record("kobo-owner");
+    let uid = owner.id;
+    UserStore::create(&store, owner).await.unwrap();
+    let other = user_record("someone-else");
+    let other_id = other.id;
+    UserStore::create(&store, other).await.unwrap();
+    let id = |s: &str| ReaderPasswordId::parse(s).unwrap();
+    let record = |rid: &str, user, created_at| ReaderPasswordRecord {
+        id: id(rid),
+        user,
+        label: format!("label {rid}"),
+        hash: SecretString::new(format!("$argon2id$hash-of-{rid}")),
+        created_at,
+        last_used_at: None,
+        revoked_at: None,
+    };
+
+    assert!(store
+        .create_reader_password(record("abcdef", uid, 100))
+        .await
+        .unwrap());
+    assert!(store
+        .create_reader_password(record("bcdefg", uid, 200))
+        .await
+        .unwrap());
+    assert!(store
+        .create_reader_password(record("cdefgh", other_id, 150))
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .create_reader_password(record("abcdef", other_id, 300))
+            .await
+            .unwrap(),
+        "a taken id is refused, not overwritten"
+    );
+
+    let listed = store.reader_passwords_for(uid).await.unwrap();
+    let ids: Vec<&str> = listed.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["bcdefg", "abcdef"], "newest first, owner's rows only");
+    assert_eq!(listed[1].label, "label abcdef");
+
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(got.user, uid);
+    assert_eq!(got.hash.expose(), "$argon2id$hash-of-abcdef");
+    assert_eq!(got.revoked_at, None);
+    assert!(store
+        .reader_password(&id("zzzzzz"))
+        .await
+        .unwrap()
+        .is_none());
+
+    store
+        .touch_reader_password(&id("abcdef"), 500)
+        .await
+        .unwrap();
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(got.last_used_at, Some(500));
+
+    assert!(
+        !store
+            .revoke_reader_password(other_id, &id("abcdef"), 600)
+            .await
+            .unwrap(),
+        "another user cannot revoke it"
+    );
+    assert!(store
+        .revoke_reader_password(uid, &id("abcdef"), 600)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .revoke_reader_password(uid, &id("abcdef"), 700)
+            .await
+            .unwrap(),
+        "revoking twice changes nothing"
+    );
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(
+        got.revoked_at,
+        Some(600),
+        "the first revocation's time stands"
+    );
+    let ids: Vec<String> = store
+        .reader_passwords_for(uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id.to_string())
+        .collect();
+    assert_eq!(ids, ["bcdefg"], "a revoked password is not listed");
+
+    assert_eq!(
+        store
+            .prune_revoked_reader_passwords(uid, 600)
+            .await
+            .unwrap(),
+        0,
+        "revoked at the cutoff is kept"
+    );
+    assert_eq!(
+        store
+            .prune_revoked_reader_passwords(uid, 601)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store
+        .reader_password(&id("abcdef"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store
+            .reader_password(&id("bcdefg"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a live password is never pruned"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_course_rows_are_never_asked_to_match() {
@@ -4299,6 +4428,15 @@ async fn sqlite_course_rows_are_never_asked_to_match() {
         .await
         .expect("connect in-memory sqlite");
     run_course_rows_are_never_asked_to_match(s).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_reader_password_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_reader_password_conformance(s).await;
 }
 
 #[cfg(feature = "postgres")]
@@ -4315,4 +4453,18 @@ async fn postgres_course_rows_are_never_asked_to_match() {
         .await
         .expect("connect postgres");
     run_course_rows_are_never_asked_to_match(p).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_reader_password_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_reader_password_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "reader_password").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_reader_password_conformance(p).await;
 }
