@@ -732,6 +732,56 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.getByRole("button", { name: "Show more" })).toHaveCount(0);
     });
 
+    // A grid's posters start loading well before they scroll into view, in
+    // every browser: Firefox's own lazy loading waits until a tile is about
+    // one row below the fold (B1443, V1417).
+    test("grid posters below the fold start loading before they are scrolled to", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await page.locator("section.pharos-rail h2 a", { hasText: /^Bulk$/ }).click();
+      const tiles = page.locator("section.pharos-browse ul.pharos-grid li");
+      await expect(tiles.first()).toBeVisible({ timeout: 15_000 });
+      // The tiles from one to about four rows under the fold.
+      const ahead = () =>
+        page.evaluate(() => {
+          const fold = window.innerHeight;
+          const started = new Set(
+            performance.getEntriesByType("resource").map((e) => e.name),
+          );
+          return [...document.querySelectorAll("ul.pharos-grid li .pharos-poster-art img")]
+            .map((img) => img as HTMLImageElement)
+            .filter((img) => {
+              const top = img.getBoundingClientRect().top;
+              return top > fold + 300 && top < fold + 1200;
+            })
+            .map((img) => ({
+              loading: img.loading,
+              requested: started.has(img.currentSrc) || (img.complete && img.naturalWidth > 0),
+            }));
+        });
+      expect((await ahead()).length, "the grid reaches past the fold").toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await ahead()).filter((t) => !t.requested || t.loading !== "eager").length, {
+          timeout: 10_000,
+        })
+        .toBe(0);
+    });
+
     // A mouse wheel over a rail scrolls the page, not the rail: turning it
     // sideways trapped the page under the shelves on the home screen.
     // Sideways input still scrolls the rail.
