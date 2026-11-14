@@ -3676,6 +3676,7 @@ impl SeriesMetadataStore for SqliteStore {
                       MIN(series_name) AS series_name, MAX(series_year) AS series_year \
                FROM media_items \
                WHERE kind = 'episode' AND series_name IS NOT NULL AND series_name <> '' \
+                 AND (match_source IS NULL OR match_source <> 'course') \
                GROUP BY COALESCE(series_key, series_folder, series_name) \
              ) s \
              LEFT JOIN series_metadata sm ON sm.series_key = s.series_key \
