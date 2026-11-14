@@ -25,16 +25,54 @@ pub struct CourseLesson {
     pub title: String,
 }
 
-/// The lesson `path` is, when it is a video under one of `roots`; `None`
-/// for any other file, or a path under no root.
-pub fn lesson(path: &Path, roots: &[PathBuf]) -> Option<CourseLesson> {
+/// The library roots a lesson is read against: each library's root, and
+/// whether it is a Books library. A video is a lesson only when the
+/// innermost library holding it is a Books library, so a TV library nested
+/// in a Books root keeps its episodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CourseRoots {
+    roots: Vec<(PathBuf, bool)>,
+}
+
+impl CourseRoots {
+    /// From each library's `(root, is_books)`.
+    pub fn new(libraries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
+        Self {
+            roots: libraries.into_iter().collect(),
+        }
+    }
+
+    /// Books roots alone, with no other library known.
+    pub fn books(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self::new(roots.into_iter().map(|r| (r, true)))
+    }
+
+    /// The Books root `path` lies under, when the innermost library holding
+    /// it is a Books library.
+    pub fn root_of(&self, path: &Path) -> Option<&Path> {
+        let (root, books) = self
+            .roots
+            .iter()
+            .filter(|(r, _)| path.starts_with(r))
+            .max_by_key(|(r, _)| r.components().count())?;
+        books.then_some(root.as_path())
+    }
+}
+
+impl<const N: usize> From<[PathBuf; N]> for CourseRoots {
+    fn from(roots: [PathBuf; N]) -> Self {
+        Self::books(roots)
+    }
+}
+
+/// The lesson `path` is, when it is a video under a Books root of `roots`
+/// ([`CourseRoots::root_of`]); `None` for any other file, or a path under no
+/// such root.
+pub fn lesson(path: &Path, roots: &CourseRoots) -> Option<CourseLesson> {
     if !crate::fs::is_film_container(path) {
         return None;
     }
-    let root = roots
-        .iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())?;
+    let root = roots.root_of(path)?;
     let parts: Vec<&str> = path
         .strip_prefix(root)
         .ok()?
@@ -150,8 +188,27 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
 
-    fn roots() -> Vec<PathBuf> {
-        vec![PathBuf::from("/lib/Books")]
+    fn roots() -> CourseRoots {
+        CourseRoots::books([PathBuf::from("/lib/Books")])
+    }
+
+    /// A library nested in a Books root keeps its own videos; a Books
+    /// library nested in another library's root holds lessons.
+    #[test]
+    fn the_innermost_library_decides() {
+        let roots = CourseRoots::new([
+            (PathBuf::from("/lib/Books"), true),
+            (PathBuf::from("/lib/Books/Shows"), false),
+            (PathBuf::from("/lib/Media"), false),
+            (PathBuf::from("/lib/Media/Courses"), true),
+        ]);
+        let is_lesson = |p: &str| lesson(Path::new(p), &roots).is_some();
+        assert!(is_lesson("/lib/Books/Intro to Widgets/01 - Start.mp4"));
+        assert!(!is_lesson("/lib/Books/Shows/Show A/Season 1/S01E01.mkv"));
+        assert!(is_lesson(
+            "/lib/Media/Courses/Intro to Widgets/01 - Start.mp4"
+        ));
+        assert!(!is_lesson("/lib/Media/Film A (2001).mkv"));
     }
 
     fn read(path: &str) -> Option<(String, String, u32, Option<u32>, String)> {
@@ -233,14 +290,17 @@ mod tests {
             assert_eq!(read(path), None, "{path}");
         }
         assert_eq!(
-            lesson(Path::new("/lib/Books/Intro to Widgets/01 - Start.mp4"), &[]),
+            lesson(
+                Path::new("/lib/Books/Intro to Widgets/01 - Start.mp4"),
+                &CourseRoots::default()
+            ),
             None
         );
     }
 
     #[test]
     fn a_nested_root_takes_its_own_files() {
-        let roots = vec![PathBuf::from("/lib"), PathBuf::from("/lib/Books")];
+        let roots = CourseRoots::books([PathBuf::from("/lib"), PathBuf::from("/lib/Books")]);
         let l = lesson(
             Path::new("/lib/Books/Intro to Widgets/01 - Start.mp4"),
             &roots,

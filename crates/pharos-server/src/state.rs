@@ -1332,14 +1332,15 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The roots of the Books libraries, under which a video is a course
-    /// lesson (ADR-0126).
-    pub fn course_roots(&self) -> Vec<std::path::PathBuf> {
-        self.libraries()
-            .iter()
-            .filter(|l| l.kind == pharos_core::LibraryKind::Books)
-            .map(|l| std::path::PathBuf::from(&l.root_path))
-            .collect()
+    /// The libraries' roots, under which a video is a course lesson when
+    /// the innermost library holding it is a Books library (ADR-0126).
+    pub fn course_roots(&self) -> pharos_scanner::course::CourseRoots {
+        pharos_scanner::course::CourseRoots::new(self.libraries().iter().map(|l| {
+            (
+                std::path::PathBuf::from(&l.root_path),
+                l.kind == pharos_core::LibraryKind::Books,
+            )
+        }))
     }
 
     /// Replace the typed-library set at runtime (dashboard Add/Remove).

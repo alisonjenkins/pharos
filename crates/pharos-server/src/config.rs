@@ -1224,14 +1224,15 @@ impl MediaConfig {
         out
     }
 
-    /// The roots of the configured Books libraries, under which a video is a
-    /// course lesson (ADR-0126).
-    pub fn course_roots(&self) -> Vec<PathBuf> {
-        self.library_specs()
-            .into_iter()
-            .filter(|(_, _, kind)| *kind == pharos_core::LibraryKind::Books)
-            .map(|(_, path, _)| path)
-            .collect()
+    /// The configured libraries' roots, under which a video is a course
+    /// lesson when the innermost library holding it is a Books library
+    /// (ADR-0126).
+    pub fn course_roots(&self) -> pharos_scanner::course::CourseRoots {
+        pharos_scanner::course::CourseRoots::new(
+            self.library_specs()
+                .into_iter()
+                .map(|(_, path, kind)| (path, kind == pharos_core::LibraryKind::Books)),
+        )
     }
 
     /// LIB-C1 — reconcile config into `(name, root_path, kind)` tuples for
@@ -2177,7 +2178,44 @@ mod tests {
             kind = "books"
         "#;
         let c = Config::from_toml_str(s).unwrap();
-        assert_eq!(c.media.course_roots(), vec![PathBuf::from("/srv/Reading")]);
+        let roots = c.media.course_roots();
+        let under = |p: &str| roots.root_of(Path::new(p)).map(Path::to_path_buf);
+        assert_eq!(
+            under("/srv/Reading/Intro to Widgets/01 - Start.mp4"),
+            Some(PathBuf::from("/srv/Reading"))
+        );
+        assert_eq!(under("/srv/Shows/Show A/S01E01.mkv"), None);
+        assert_eq!(under("/srv/Shared/Intro to Widgets/01 - Start.mp4"), None);
+    }
+
+    /// ADR-0126 — a TV library nested in a Books root keeps its episodes:
+    /// only a video whose innermost library is the Books one is a lesson.
+    #[test]
+    fn a_tv_library_nested_in_a_books_root_holds_no_lessons() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+
+            [[media.libraries]]
+            path = "/srv/Reading"
+            kind = "books"
+
+            [[media.libraries]]
+            path = "/srv/Reading/Shows"
+            kind = "tvshows"
+        "#;
+        let c = Config::from_toml_str(s).unwrap();
+        let roots = c.media.course_roots();
+        assert_eq!(
+            roots.root_of(Path::new("/srv/Reading/Shows/Show A/S01E01.mkv")),
+            None
+        );
+        assert_eq!(
+            roots.root_of(Path::new("/srv/Reading/Intro to Widgets/01 - Start.mp4")),
+            Some(Path::new("/srv/Reading"))
+        );
     }
 
     #[test]
