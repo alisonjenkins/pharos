@@ -25,6 +25,12 @@
                 <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
+            <!-- A launcher entry: the assistant may match "on Lighthouse"
+                 only against launchable apps' labels. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
         </activity>
         <!-- Artwork: the car host opens content://…art/<key> URIs here.
              Exported with no permission so the host can read it; it serves
