@@ -962,4 +962,46 @@ mod tests {
         sung_at(&r.lines[2], &[19_200, 19_600, 20_100]);
         assert_eq!(r.placement.dropped_anchors, 0);
     }
+
+    #[test]
+    fn a_line_after_the_last_anchor_that_runs_back_into_it_is_placed_after_it() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+            line(10_000, 13_000, "boats come home"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_000);
+        sung.extend(sing("nets dry slow", 4_000));
+        sung.extend(sing("low tide hums", 7_000));
+        sung.extend(sing("boats come home", 10_000));
+        let frames = 700;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.0);
+        h.extend(heard("nets dry slow", 4.0));
+        let m = match_lines(&lines, &h, Options::default());
+        // Today started line 2 inside line 1; line 3 it left well clear.
+        let t = [
+            today(&lines[0], 1_000),
+            today(&lines[1], 4_000),
+            today(&lines[2], 5_000),
+            today(&lines[3], 12_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(
+            r.methods,
+            vec![
+                Some(Method::Refined),
+                Some(Method::Refined),
+                Some(Method::Between),
+                Some(Method::Kept)
+            ]
+        );
+        sung_at(&r.lines[2], &[7_000, 7_400, 7_900]);
+        assert_eq!(r.lines[3], t[3]);
+    }
 }
