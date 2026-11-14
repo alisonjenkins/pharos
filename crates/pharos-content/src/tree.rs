@@ -34,6 +34,9 @@ pub trait Catalogue {
     async fn views(&self) -> Result<Vec<Item>, ContentError>;
     /// Music the user listened to lately (`Library.home`'s listening rail).
     async fn recent_music(&self) -> Result<Vec<Item>, ContentError>;
+    /// Up to `limit` items under `lib` begun and not finished, most recently
+    /// played first.
+    async fn begun(&self, lib: ItemRef, limit: u32) -> Result<Vec<Item>, ContentError>;
     async fn list(
         &self,
         parent: ItemRef,
@@ -111,9 +114,9 @@ async fn music_library<C: Catalogue>(cat: &C) -> Result<ItemRef, ContentError> {
         })
 }
 
-/// Every Books library's audiobooks, which the server stores as albums
-/// (ADR-0132). No Books library is an empty list, not an error.
-async fn audiobooks<C: Catalogue>(cat: &C) -> Result<Vec<Item>, ContentError> {
+/// The Books libraries, and their audiobooks, which the server stores as
+/// albums (ADR-0132). No Books library is empty lists, not an error.
+async fn audiobooks<C: Catalogue>(cat: &C) -> Result<(Vec<ItemRef>, Vec<Item>), ContentError> {
     let views = cat.views().await?;
     let libs: Vec<ItemRef> = views
         .iter()
@@ -133,7 +136,17 @@ async fn audiobooks<C: Catalogue>(cat: &C) -> Result<Vec<Item>, ContentError> {
         libs.len(),
         books.len()
     );
-    Ok(books)
+    Ok((libs, books))
+}
+
+/// Every part begun and not finished in `libs`, one call per library, most
+/// recently played first within each.
+async fn begun_parts<C: Catalogue>(cat: &C, libs: &[ItemRef]) -> Result<Vec<Item>, ContentError> {
+    let mut parts = Vec::new();
+    for lib in libs {
+        parts.extend(cat.begun(*lib, MAX_CHILDREN).await?);
+    }
+    Ok(parts)
 }
 
 /// The heading over the books with a part begun and not finished.
@@ -143,8 +156,8 @@ pub const ALL_BOOKS: &str = "All books";
 
 /// `books` with those that have a part begun and not finished first, most
 /// recently played first, under [`CONTINUE_LISTENING`]. `listening` is the
-/// server's listening rail, newest first; a part names its book as
-/// `parent`. Returns how many came first.
+/// begun parts, newest first; a part names its book as `parent`. Returns
+/// how many came first.
 fn continue_listening(books: &mut [Node], listening: &[Item]) -> usize {
     let mut begun: Vec<String> = Vec::new();
     for part in listening {
@@ -358,25 +371,26 @@ pub async fn children<C: Catalogue>(
             Node::folder(NodeId::Mixes, "Mixes"),
         ],
         NodeId::Audiobooks => {
-            let mut books = nodes(urls, &audiobooks(cat).await?);
+            let (libs, books) = audiobooks(cat).await?;
+            let mut books = nodes(urls, &books);
             // Tapping a book plays it from where it stopped ([`book`]).
             books.iter_mut().for_each(|b| b.playable = true);
-            match if books.is_empty() {
-                Ok(Vec::new())
-            } else {
-                cat.recent_music().await
-            } {
-                Ok(listening) => {
-                    let first = continue_listening(&mut books, &listening);
-                    log::info!(
-                        "car audiobooks continue_listening={first} order=last_played listening_rail={}",
-                        listening.len()
-                    );
+            if !books.is_empty() {
+                match begun_parts(cat, &libs).await {
+                    Ok(begun) => {
+                        let first = continue_listening(&mut books, &begun);
+                        log::info!(
+                            "car audiobooks continue_listening={first} order=last_played calls={} begun_parts={}",
+                            libs.len(),
+                            begun.len()
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "car audiobooks continue_listening=0 order=name calls={}: begun parts: {}",
+                        libs.len(),
+                        e.redacted()
+                    ),
                 }
-                Err(e) => log::warn!(
-                    "car audiobooks continue_listening=0 order=name: listening rail: {}",
-                    e.redacted()
-                ),
             }
             books
         }
@@ -682,6 +696,8 @@ mod tests {
         books: bool,
         /// When set, an album lists these and is a book.
         parts: Vec<Item>,
+        /// What `begun` answers; `None` fails it.
+        begun: Option<Vec<Item>>,
     }
 
     impl Catalogue for Fake {
@@ -709,6 +725,10 @@ mod tests {
                 item(ItemRef::Real(2), ItemKind::Movie, "dropped"),
                 part,
             ])
+        }
+        async fn begun(&self, lib: ItemRef, limit: u32) -> Result<Vec<Item>, ContentError> {
+            self.calls.borrow_mut().push(format!("begun {lib} {limit}"));
+            self.begun.clone().ok_or(ContentError::WorkerGone)
         }
         async fn list(
             &self,
@@ -814,6 +834,7 @@ mod tests {
     fn audiobooks_list_the_books_librarys_albums() {
         let f = Fake {
             books: true,
+            begun: Some(vec![]),
             ..Fake::default()
         };
         let books = block_on(children(&f, &urls(), NodeId::Audiobooks)).unwrap();
@@ -826,10 +847,43 @@ mod tests {
             *f.calls.borrow(),
             [
                 format!("list 200 Some(Album) SortName {MAX_CHILDREN}"),
-                "recent".to_owned(),
+                format!("begun 200 {MAX_CHILDREN}"),
             ],
-            "the listening rail says which books come first"
+            "one call per Books library finds the begun parts"
         );
+    }
+
+    /// A book begun long ago, off the home rail, still comes first.
+    #[test]
+    fn a_begun_book_comes_first_without_the_listening_rail() {
+        let mut begun = part(40, 5_000, false);
+        begun.parent = Some(ItemRef::Synth(3));
+        let f = Fake {
+            books: true,
+            begun: Some(vec![begun]),
+            ..Fake::default()
+        };
+        let books = block_on(children(&f, &urls(), NodeId::Audiobooks)).unwrap();
+        assert_eq!(ids(&books), ["album/s3"]);
+        assert_eq!(books[0].group, CONTINUE_LISTENING);
+        assert!(
+            !f.calls.borrow().iter().any(|c| c == "recent"),
+            "{:?}",
+            f.calls.borrow()
+        );
+    }
+
+    /// The books still list, by name, when the begun parts can't be had.
+    #[test]
+    fn audiobooks_list_by_name_when_begun_parts_fail() {
+        let f = Fake {
+            books: true,
+            begun: None,
+            ..Fake::default()
+        };
+        let books = block_on(children(&f, &urls(), NodeId::Audiobooks)).unwrap();
+        assert_eq!(ids(&books), ["album/s3"]);
+        assert!(books[0].group.is_empty());
     }
 
     /// A book part: `position` ms in, `played` or not.
@@ -1058,6 +1112,9 @@ mod tests {
             Ok(vec![])
         }
         async fn recent_music(&self) -> Result<Vec<Item>, ContentError> {
+            Ok(vec![])
+        }
+        async fn begun(&self, _: ItemRef, _: u32) -> Result<Vec<Item>, ContentError> {
             Ok(vec![])
         }
         async fn list(
