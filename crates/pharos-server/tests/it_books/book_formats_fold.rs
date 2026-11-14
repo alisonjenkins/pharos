@@ -6,8 +6,8 @@
 
 use actix_web::{http::StatusCode, test, web, App};
 use pharos_core::{
-    MediaKind, MediaStore, SecretString, TokenStore, UserDataStore, UserId, UserItemData,
-    UserPolicy, UserRecord, UserStore,
+    MediaKind, MediaStore, ReadPosition, ReadPositionStore, SecretString, TokenStore,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 use pharos_scanner::fs::FsScanner;
 use pharos_server::{
@@ -170,6 +170,19 @@ async fn a_folded_row_hands_its_marks_to_the_surviving_item() {
         .await
         .unwrap();
 
+    stores
+        .set_read_position(
+            uid,
+            pdf_row,
+            ReadPosition {
+                locator: "pdf1:4".into(),
+                fraction: 0.4,
+                updated_at: 1_700_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
     let epub = td.path().join("Widget Cookbook.epub");
     write_epub(&epub);
     scanner.scan_into(td.path(), &stores).await.unwrap();
@@ -185,4 +198,10 @@ async fn a_folded_row_hands_its_marks_to_the_surviving_item() {
     );
     let kept = stores.get_user_data(uid, books[0].id).await.unwrap();
     assert!(kept.played && kept.is_favorite, "{kept:?}");
+    let place = stores.get_read_position(uid, books[0].id).await.unwrap();
+    assert_eq!(
+        place.map(|p| (p.locator, p.fraction)),
+        Some(("pdf1:4".to_string(), 0.4)),
+        "the reading place moves with the row"
+    );
 }
