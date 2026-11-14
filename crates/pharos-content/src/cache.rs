@@ -13,7 +13,7 @@
 //! `cache evict`, ...). Tokens never reach a log line or a file here: listings
 //! drop stream and art URLs because those carry `api_key`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,6 +92,51 @@ pub enum Lookup {
     /// Some bytes are on disk but the track is not whole.
     Partial,
     Miss,
+}
+
+/// One pinned album or mix, as a downloads view lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Download {
+    /// The pinned container id (`album/..` or `mix/..`).
+    pub container: String,
+    /// The container's title from a saved listing that names it, if any.
+    pub title: Option<String>,
+    /// In play order.
+    pub tracks: Vec<DownloadTrack>,
+}
+
+impl Download {
+    /// Bytes on the phone for this container's finished tracks.
+    pub fn bytes(&self) -> u64 {
+        self.tracks
+            .iter()
+            .filter(|t| t.complete)
+            .fold(0u64, |b, t| b.saturating_add(t.bytes))
+    }
+
+    /// How many of its tracks are whole on the phone.
+    pub fn complete(&self) -> usize {
+        self.tracks.iter().filter(|t| t.complete).count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadTrack {
+    pub id: String,
+    /// Zero until the track is whole.
+    pub bytes: u64,
+    pub complete: bool,
+}
+
+/// The cache's numbers for a settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineSummary {
+    pub cap_bytes: u64,
+    pub used_bytes: u64,
+    /// `None` when the filesystem could not be read.
+    pub free_bytes: Option<u64>,
+    /// Downloads stop when free space falls below this.
+    pub min_free_bytes: u64,
 }
 
 /// A browse row as kept for offline use: no URLs, so no token.
@@ -393,7 +438,6 @@ impl Cache {
     }
 
     /// Bytes held by finished tracks (an in-progress `.part` is not counted).
-    #[cfg(test)]
     pub fn used_bytes(&self) -> u64 {
         Self::totals(&self.lock()).1
     }
@@ -578,6 +622,51 @@ impl Cache {
     #[cfg(test)]
     pub fn is_pinned(&self, container: &str) -> bool {
         self.lock().pins.contains_key(container)
+    }
+
+    /// Every pinned container with its tracks' state, ordered by container id.
+    pub fn downloads(&self) -> Vec<Download> {
+        let pins: Vec<(String, Vec<DownloadTrack>)> = {
+            let s = self.lock();
+            s.pins
+                .iter()
+                .map(|(container, ids)| {
+                    let tracks = ids
+                        .iter()
+                        .map(|id| {
+                            let e = s.entries.get(id);
+                            let complete = e.is_some_and(|e| e.complete);
+                            DownloadTrack {
+                                id: id.clone(),
+                                bytes: if complete { e.map_or(0, |e| e.size) } else { 0 },
+                                complete,
+                            }
+                        })
+                        .collect();
+                    (container.clone(), tracks)
+                })
+                .collect()
+        };
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        let titles: HashMap<String, String> = self
+            .all_listings()
+            .into_iter()
+            .flat_map(|(_, rows)| rows.into_iter().map(|r| (r.id, r.title)))
+            .collect();
+        pins.into_iter()
+            .map(|(container, tracks)| Download {
+                title: titles.get(&container).cloned(),
+                container,
+                tracks,
+            })
+            .collect()
+    }
+
+    /// Space left on the cache's filesystem, as the low-disk guard reads it.
+    pub fn free_bytes(&self) -> std::io::Result<u64> {
+        (self.free)(&self.dir)
     }
 
     /// Strictly increasing so two plays in one millisecond still order.
@@ -1029,5 +1118,71 @@ mod tests {
         assert_eq!(back[0].id, "track/1");
         assert_eq!(c.all_listings().len(), 1);
         assert!(c.load_listing("album/none").is_none());
+    }
+
+    fn row(id: &str, title: &str) -> Node {
+        Node {
+            id: id.into(),
+            title: title.into(),
+            subtitle: String::new(),
+            browsable: true,
+            playable: true,
+            art_url: None,
+            stream_url: None,
+            duration_ms: 0,
+            album: String::new(),
+        }
+    }
+
+    #[test]
+    fn downloads_list_pins_with_titles_sizes_and_track_state() {
+        let d = tmp("downloads");
+        let c = Cache::open(&d, 1000).unwrap();
+        assert!(c.downloads().is_empty());
+        put(&c, "track/a", 100);
+        c.pin("album/1", &ids(&["track/a", "track/b"]));
+        c.pin("mix/2", &ids(&["track/a"]));
+        c.save_listing("music/albums", &[row("album/1", "Album One")]);
+
+        let got = c.downloads();
+        assert_eq!(got.len(), 2);
+        let album = &got[0];
+        assert_eq!(album.container, "album/1");
+        assert_eq!(album.title.as_deref(), Some("Album One"));
+        assert_eq!(
+            album.tracks,
+            vec![
+                DownloadTrack {
+                    id: "track/a".into(),
+                    bytes: 100,
+                    complete: true
+                },
+                DownloadTrack {
+                    id: "track/b".into(),
+                    bytes: 0,
+                    complete: false
+                },
+            ]
+        );
+        assert_eq!((album.bytes(), album.complete()), (100, 1));
+        assert_eq!(got[1].container, "mix/2");
+        assert_eq!(got[1].title, None, "no saved listing names it");
+
+        c.unpin("mix/2");
+        assert_eq!(c.downloads().len(), 1);
+    }
+
+    #[test]
+    fn used_and_free_bytes_read_the_cache_and_the_probe() {
+        let d = tmp("summary");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(12_345)).unwrap();
+        assert_eq!(c.used_bytes(), 0);
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 50);
+        assert_eq!(c.used_bytes(), 150);
+        assert_eq!(c.free_bytes().unwrap(), 12_345);
+        let failing: FreeProbe = Box::new(|_| Err(std::io::Error::other("statvfs")));
+        let c = Cache::open_with_probe(&tmp("summary-err"), 1000, failing).unwrap();
+        assert!(c.free_bytes().is_err());
     }
 }
