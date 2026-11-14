@@ -147,6 +147,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
             player: None,
             prepared: false,
             started: false,
+            from_start: false,
             current: None,
             queue: Vec::new(),
         });

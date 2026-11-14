@@ -407,6 +407,7 @@ pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen
         }
         st.prepared = false;
         st.started = false;
+        st.from_start = false;
         if !queue.iter().any(|i| i.id == item.id) {
             queue = vec![item.clone()];
         }
@@ -496,7 +497,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         let id = string(env, &id)?;
         log(&format!("session onPlayFromMediaId id={id}"));
         if is_book_id(&id) {
-            return play_book(&id, supersede());
+            return play_book(&id, supersede(), false);
         }
         apply(env, play_from(&id), Source::Car)
     })

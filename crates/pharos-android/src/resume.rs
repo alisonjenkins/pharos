@@ -235,6 +235,21 @@ fn start_at(server_ms: u64, local: Option<u64>, duration_ms: u64) -> (Option<u64
     }
 }
 
+/// [`start_at`], except that a play asked to start over begins at 0 whatever
+/// either side saved.
+fn start_position(
+    from_start: bool,
+    server_ms: u64,
+    local: Option<u64>,
+    duration_ms: u64,
+) -> (Option<u64>, &'static str) {
+    if from_start {
+        (None, "start_over")
+    } else {
+        start_at(server_ms, local, duration_ms)
+    }
+}
+
 /// `player` is prepared with `id`. Returns where to seek before starting,
 /// and logs the decision. `report` sends its progress to the server too.
 pub fn prepared(
@@ -243,11 +258,12 @@ pub fn prepared(
     duration_ms: u64,
     server_ms: u64,
     report: bool,
+    from_start: bool,
     player: &GlobalRef,
 ) -> R<Option<u64>> {
     let local = STORE.get().and_then(|s| s.position(id, duration_ms));
     let server_ms = fresh_server_ms(id, server_ms)?;
-    let (at, from) = start_at(server_ms, local, duration_ms);
+    let (at, from) = start_position(from_start, server_ms, local, duration_ms);
     let n = Now {
         id: id.to_owned(),
         duration_ms,
@@ -271,7 +287,9 @@ pub fn prepared(
             ));
         }
         None => {
-            let reason = if server_ms > 0 {
+            let reason = if from_start {
+                "start_over"
+            } else if server_ms > 0 {
                 "server_past_end"
             } else if duration_ms <= RESUME_MIN_TRACK_MS {
                 "short"
@@ -359,6 +377,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_start_over_ignores_both_saved_positions() {
+        assert_eq!(
+            start_position(true, 61_000, Some(5_000), 600_000),
+            (None, "start_over")
+        );
+        assert_eq!(
+            start_position(false, 61_000, Some(5_000), 600_000),
+            (Some(61_000), "server")
+        );
+    }
 
     #[test]
     fn the_servers_position_wins_and_the_phones_is_the_fallback() {

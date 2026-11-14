@@ -155,6 +155,9 @@ struct State {
     /// `start` was called on the prepared player. Android rejects `pause` on
     /// one that is prepared but never started.
     started: bool,
+    /// The play that made this player asked to start at 0, not at the saved
+    /// position.
+    from_start: bool,
     current: Option<Item>,
     /// What skip next/previous moves through; holds `current`.
     queue: Vec<Item>,
