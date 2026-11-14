@@ -541,8 +541,10 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         if let Some((_, end)) = (0..i).rev().find_map(|j| fixed[j]) {
             part.lo_ms = part.lo_ms.max(end);
         }
+        // A letter may sit on the frame at hi_ms and its word ends a frame
+        // later, so the last frame is one before the fixed first start.
         if let Some((first, _)) = (i + 1..lines.len()).find_map(|j| fixed[j]) {
-            part.hi_ms = part.hi_ms.min(first);
+            part.hi_ms = part.hi_ms.min(first - song.ms_per_frame());
         }
         part
     };
@@ -1249,6 +1251,44 @@ mod tests {
         assert_eq!(r.methods[2], Some(Method::Refined));
         let end = *starts(&r.lines[1]).last().unwrap();
         assert!(starts(&r.lines[2])[0] >= end);
+        ordered(&r);
+    }
+
+    #[test]
+    fn a_line_before_an_anchor_too_long_for_its_band_ends_by_its_first_start() {
+        let long = ["wheel"; 50].join(" ");
+        let lines = [
+            line(1_000, 3_000, "grey gulls wheel"),
+            line(3_000, 5_000, &long),
+            line(5_000, 8_000, "low tide hums"),
+        ];
+        // The first line's last letter is sung on the frame the middle
+        // line's recognised words start at.
+        let mut sung = sing("grey gulls", 1_000);
+        sung.extend(sing("wheel", 3_100));
+        sung.extend(sing("low tide hums", 5_600));
+        let frames = 500;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.0);
+        h.extend((0..50).map(|k| Heard {
+            text: " wheel".into(),
+            start_s: 3.5 + 0.02 * k as f64,
+            end_s: 3.5 + 0.02 * k as f64 + 0.015,
+            prob: 0.9,
+        }));
+        h.extend(heard("low tide hums", 5.6));
+        let m = match_lines(&lines, &h, Options::default());
+        let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.methods[0], Some(Method::Refined));
+        assert_eq!(r.methods[1], Some(Method::Anchored));
+        let first = starts(&r.lines[1])[0];
+        let end = *starts(&r.lines[0]).last().unwrap();
+        assert!(end <= first, "the line before ends at {end}, past {first}");
         ordered(&r);
     }
 
