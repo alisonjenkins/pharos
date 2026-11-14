@@ -632,9 +632,11 @@ pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
                 // B1419 — the cover record is not encrypted.
                 Err(kindle::KindleError::Drm(_)) => {
                     let cover = drm_exth_cover(path);
+                    // Filed under the format the book is stored as: a
+                    // locked book stays unreadable even with a cover.
                     if cover.is_some() {
                         record_classify(
-                            BookFormat::Epub,
+                            format,
                             ClassifyVerdict::CoverFound,
                             ClassifyReason::DrmExth,
                         );
@@ -805,8 +807,9 @@ mod tests {
                 classify
                     .iter()
                     .any(|l| l.get("verdict").map(String::as_str) == Some(verdict)
-                        && l.get("reason").map(String::as_str) == Some("drm_exth")),
-                "{verdict} from EXTH must carry reason drm_exth: {classify:?}"
+                        && l.get("reason").map(String::as_str) == Some("drm_exth")
+                        && l.get("format").map(String::as_str) == Some("unreadable")),
+                "{verdict} from EXTH must carry reason drm_exth on the unreadable format: {classify:?}"
             );
         }
     }
