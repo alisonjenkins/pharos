@@ -189,7 +189,8 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
 }
 
 /// Moves `step` through the queue; past either end it wraps when `wrap`,
-/// and stops otherwise. An empty queue plays the first test entry.
+/// and stops otherwise. An empty queue plays the first test entry when the
+/// test catalogue is built in, and does nothing otherwise.
 pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
     let (current, queue) = {
         let guard = state_lock()?;
@@ -197,10 +198,10 @@ pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
         (st.current.as_ref().map(|i| i.id.clone()), st.queue.clone())
     };
     if queue.is_empty() {
-        let first = test_playables()
-            .into_iter()
-            .next()
-            .ok_or("no test entries")?;
+        let Some(first) = fixture::playables().into_iter().next() else {
+            log("skip verdict=none reason=empty_queue");
+            return Ok(());
+        };
         return start(env, &first.id, None);
     }
     // A track played alone (from search, or offline) still has an album.
@@ -306,8 +307,8 @@ pub(crate) fn prepare(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>) -> R<(
 
 /// Prepares `id`: a test entry at once, a library node from a worker.
 pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
-    if let Some(e) = test_entry(id).filter(|e| e.playable) {
-        return prepare(env, Item::of_entry(e), test_playables());
+    if let Some(item) = fixture::playable(id) {
+        return prepare(env, item, fixture::playables());
     }
     let id = id.to_owned();
     on_worker("prepare", move |env| {
@@ -419,8 +420,8 @@ callback!(
                     .unwrap_or_default();
                 prepare(env, item, queue)
             }
-            None => match test_playables().into_iter().next() {
-                Some(first) => prepare(env, first, test_playables()),
+            None => match fixture::playables().into_iter().next() {
+                Some(first) => prepare(env, first, fixture::playables()),
                 None => Ok(()),
             },
         }

@@ -90,12 +90,8 @@ pub(crate) fn item_list<'l>(env: &mut JNIEnv<'l>, entries: &[Item]) -> R<JObject
 
 /// What `parent` holds. Blocks on the network for a library node.
 pub(crate) fn children(parent: &str) -> Vec<Item> {
-    let mut kids: Vec<Item> = if parent != ROOT && test_entry(parent).is_some() {
-        CATALOGUE
-            .iter()
-            .filter(|e| e.parent == parent)
-            .map(Item::of_entry)
-            .collect()
+    let mut kids: Vec<Item> = if let Some(rows) = fixture::folder(parent) {
+        rows
     } else {
         match LIBRARY.get() {
             None => vec![Item::notice(
@@ -112,12 +108,7 @@ pub(crate) fn children(parent: &str) -> Vec<Item> {
         }
     };
     if parent == ROOT {
-        kids.extend(
-            CATALOGUE
-                .iter()
-                .filter(|e| e.parent == ROOT)
-                .map(Item::of_entry),
-        );
+        kids.extend(fixture::root_rows());
     }
     kids
 }
