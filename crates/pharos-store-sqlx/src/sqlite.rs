@@ -1947,6 +1947,21 @@ impl GenreStore for SqliteStore {
         Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
     }
 
+    #[tracing::instrument(skip(self), fields(media.id = %item))]
+    async fn item_genre_names(&self, item: MediaId) -> DomainResult<Vec<String>> {
+        let item_i64 =
+            i64::try_from(item).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT g.name FROM item_genres ig JOIN genres g ON g.id = ig.genre_id \
+             WHERE ig.item_id = ? ORDER BY g.name",
+        )
+        .bind(item_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn backfill_genres(&self) -> DomainResult<u64> {
         // Read every (id, genre) pair, split the genre string, and

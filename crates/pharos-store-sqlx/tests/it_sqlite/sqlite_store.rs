@@ -583,6 +583,11 @@ async fn link_item_genres_replaces_stale_links() {
         s.item_ids_for_genre(&genre_wire_id("Drama")).await.unwrap(),
         vec![1]
     );
+    assert_eq!(
+        s.item_genre_names(1).await.unwrap(),
+        vec!["Drama".to_string()]
+    );
+    assert!(s.item_genre_names(2).await.unwrap().is_empty());
 }
 
 // ---- LIB-C2: people as entities -------------------------------------
