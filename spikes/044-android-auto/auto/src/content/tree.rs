@@ -179,6 +179,8 @@ pub struct SearchReport {
     pub calls: usize,
     pub candidates: usize,
     pub top_score: f64,
+    /// Score of the second result returned; 0 when fewer than two.
+    pub second_score: f64,
     /// `full-hit`, `fuzzy-hit`, `no-match` or `empty-query`.
     pub verdict: &'static str,
 }
@@ -244,6 +246,7 @@ pub async fn search_reported<C: Catalogue>(
         calls: 0,
         candidates: 0,
         top_score: 0.0,
+        second_score: 0.0,
         verdict: "empty-query",
     };
     if heard.is_empty() {
@@ -297,7 +300,24 @@ pub async fn search_reported<C: Catalogue>(
         "fuzzy-hit"
     };
     found.truncate(SEARCH_LIMIT as usize);
+    report.second_score = found.get(1).map_or(0.0, |c| c.score);
     Ok((found.into_iter().map(|c| c.node).collect(), report))
+}
+
+/// How far the top result must lead the second to be played unasked. Two
+/// readings of one spoken title rarely differ by more; distinct titles do.
+const CLEAR_LEAD: f64 = 0.15;
+
+/// Whether a search's top result is clear enough to play at once, and why.
+/// `returned` is how many results the search gave.
+pub fn autoplay(report: &SearchReport, returned: usize) -> (bool, &'static str) {
+    match returned {
+        0 => (false, "no_results"),
+        1 => (true, "single_result"),
+        _ if report.top_score < GOOD_SCORE => (false, "weak_top"),
+        _ if report.top_score - report.second_score < CLEAR_LEAD => (false, "close_second"),
+        _ => (true, "clear_lead"),
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +490,23 @@ mod tests {
     }
 
     #[test]
+    fn autoplay_needs_one_result_or_a_clear_lead() {
+        let r = |top, second| SearchReport {
+            normalized: String::new(),
+            calls: 1,
+            candidates: 2,
+            top_score: top,
+            second_score: second,
+            verdict: "full-hit",
+        };
+        assert_eq!(autoplay(&r(0.0, 0.0), 0), (false, "no_results"));
+        assert_eq!(autoplay(&r(0.4, 0.0), 1), (true, "single_result"));
+        assert_eq!(autoplay(&r(0.95, 0.6), 5), (true, "clear_lead"));
+        assert_eq!(autoplay(&r(0.95, 0.9), 5), (false, "close_second"));
+        assert_eq!(autoplay(&r(0.7, 0.2), 5), (false, "weak_top"));
+    }
+
+    #[test]
     fn search_drops_kinds_the_car_does_not_show() {
         let f = Fake::default();
         let got = block_on(search(&f, &urls(), "a song")).unwrap();
@@ -571,6 +608,10 @@ mod tests {
             "{report:?}"
         );
         assert!(report.top_score > 0.8, "{report:?}");
+        assert!(
+            report.second_score > 0.0 && report.second_score < report.top_score,
+            "{report:?}"
+        );
     }
 
     #[test]
