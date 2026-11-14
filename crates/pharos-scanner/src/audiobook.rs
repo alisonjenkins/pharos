@@ -206,7 +206,7 @@ pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
                 if top && disc && !crate::fs::is_ignored_dir(&path) {
                     dirs.push((path, false));
                 }
-            } else if is_track_file(&path) {
+            } else if kind.is_file() && is_track_file(&path) {
                 found.push(path);
             }
         }
@@ -636,6 +636,24 @@ mod tests {
             got,
             ["CD1/1 a.mp3", "CD1/2 b.mp3", "CD1/10 c.mp3", "CD2/1 d.mp3"]
         );
+    }
+
+    /// The walk takes files only, so a link named like a track is no part.
+    #[cfg(unix)]
+    #[test]
+    fn folder_tracks_leaves_out_a_symlink_named_like_a_track() {
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::write(td.path().join("1 real.mp3"), b"").unwrap();
+        std::os::unix::fs::symlink(td.path().join("1 real.mp3"), td.path().join("2 link.mp3"))
+            .unwrap();
+        std::os::unix::fs::symlink(td.path().join("nowhere"), td.path().join("3 dead.mp3"))
+            .unwrap();
+        let got: Vec<_> = folder_tracks(td.path())
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(got, ["1 real.mp3"]);
     }
 
     #[test]
