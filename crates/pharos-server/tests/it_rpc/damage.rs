@@ -141,3 +141,57 @@ async fn a_damaged_file_is_badged_and_its_detail_says_where() {
         "a clean verdict is no damage"
     );
 }
+
+/// V1405: a damaged book is flagged but names no time: a book has no timeline, and
+/// the verdict's fallback span would read as "damaged at 0:00". Disarm check:
+/// with `write_damage` writing `damage_ranges()` for a book, the span is sent.
+#[actix_web::test]
+async fn a_damaged_book_names_no_time() {
+    const BOOK: u64 = 303;
+    let memo = IntegrityMemo::load("/nonexistent/integrity.json", INTEGRITY_SCAN_VERSION);
+    memo.record(
+        BOOK,
+        Some((1, 1)),
+        IntegrityReport {
+            read_errors: 1,
+            first_fault: Some("not a mobi file".into()),
+            complete: false,
+            ranges: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    let (server, fx) = crate::revocation::start_with_integrity_memo(memo).await;
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: BOOK,
+            path: "/libA/Broken Book.azw3".into(),
+            title: "Broken Book".into(),
+            kind: MediaKind::Book,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    req.get().init_id().set_real(BOOK);
+    let reply = req.send().promise.await.expect("detail");
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail refused");
+    };
+    let damage = d.unwrap().get_damage().unwrap();
+    assert_eq!(
+        damage.get_verdict().unwrap().to_str().unwrap(),
+        "unreadable"
+    );
+    assert_eq!(
+        damage.get_ranges().unwrap().len(),
+        0,
+        "a book names no time"
+    );
+}
