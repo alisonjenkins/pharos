@@ -5,7 +5,8 @@
 //!
 //! Two files fold only when they sit in the same folder, their stems give the
 //! same title once cleaned ([`clean_stem_title`], case folded), and their
-//! authors agree or one of them names none. The primary is the file the
+//! authors agree or one of them names none (a file naming none never joins
+//! two authors' books into one). The primary is the file the
 //! reader opens best ([`FormatRank`]); the others become its versions,
 //! labelled by format.
 //!
@@ -297,8 +298,18 @@ pub(crate) fn fold(
         // author's book of the same title) wait for the next round.
         while let Some((&(primary, primary_path, primary_facts), rest)) = ranked.split_first() {
             let mut apart = Vec::new();
+            // The book's author, once any file of it names one: a primary
+            // naming none may take one author's files, never two authors'.
+            let mut author = primary_facts.author.as_deref();
             for &(member, path, f) in rest {
-                let reason = FoldReason::of(primary_facts.author.as_deref(), f.author.as_deref());
+                let reason = FoldReason::of(author, f.author.as_deref());
+                let names_one = f
+                    .author
+                    .as_deref()
+                    .is_some_and(|a| a.chars().any(char::is_alphanumeric));
+                if reason == FoldReason::AuthorUnknown && names_one {
+                    author = f.author.as_deref();
+                }
                 decisions.push(Decision {
                     primary: primary_path.to_path_buf(),
                     copy: path.to_path_buf(),
@@ -621,6 +632,39 @@ mod tests {
                 outcome: FoldOutcome::KeptApart,
                 reason: FoldReason::AuthorsDiffer,
             }]
+        );
+    }
+
+    /// A primary that names no author joins either known author's book, but
+    /// never both: the first known author to join decides for the rest.
+    #[test]
+    fn an_unknown_author_never_bridges_two_known_authors() {
+        let groups = lone(&["/b/Gardening.epub", "/b/Gardening.pdf", "/b/Gardening.cbz"]);
+        let f = table(&[
+            ("/b/Gardening.epub", facts(FormatRank::Epub, Some(" "))),
+            (
+                "/b/Gardening.pdf",
+                facts(FormatRank::Pdf, Some("Ada Field")),
+            ),
+            (
+                "/b/Gardening.cbz",
+                facts(FormatRank::Comic, Some("Ben Stone")),
+            ),
+        ]);
+        let (out, decisions) = fold(groups, &f);
+        assert_eq!(
+            out,
+            vec![
+                (
+                    PathBuf::from("/b/Gardening.epub"),
+                    vec![("PDF".to_string(), PathBuf::from("/b/Gardening.pdf"))]
+                ),
+                (PathBuf::from("/b/Gardening.cbz"), Vec::new()),
+            ]
+        );
+        assert_eq!(
+            decisions.iter().map(|d| d.reason).collect::<Vec<_>>(),
+            [FoldReason::AuthorUnknown, FoldReason::AuthorsDiffer]
         );
     }
 
