@@ -1,6 +1,6 @@
 //! Playback on `MediaPlayer` and the `PharosPlayerListener` callbacks.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use super::*;
 
@@ -14,6 +14,17 @@ pub(crate) fn want_start() {
 
 pub(crate) fn cancel_start() {
     START_ON_PREPARED.store(false, Ordering::SeqCst);
+}
+
+/// The newest play generation that asked to start at 0.
+static FROM_START_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn want_from_start(gen: u64) {
+    FROM_START_GEN.store(gen, Ordering::SeqCst);
+}
+
+fn asked_from_start(gen: u64) -> bool {
+    gen != 0 && FROM_START_GEN.load(Ordering::SeqCst) == gen
 }
 
 pub(crate) fn start_wanted() -> bool {
@@ -69,6 +80,7 @@ pub(crate) fn play(
     }
     st.prepared = false;
     st.started = false;
+    st.from_start = asked_from_start(gen);
     want_start();
     let classes = CLASSES.get().ok_or("play before onCreate")?;
     let player = env
@@ -235,7 +247,7 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
 /// with every part queued, from a worker thread. A newer request made while
 /// the book resolves wins; `gen` is the request's own generation, taken
 /// when it was made, so an older book request cannot overtake a newer play.
-pub(crate) fn play_book(id: &str, gen: u64) -> R<()> {
+pub(crate) fn play_book(id: &str, gen: u64, from_start: bool) -> R<()> {
     let id = id.to_owned();
     on_worker("book", move |env| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
@@ -261,7 +273,9 @@ pub(crate) fn play_book(id: &str, gen: u64) -> R<()> {
         }
         let queue: Vec<Item> = book.parts.into_iter().map(Item::of_node).collect();
         remember(&queue);
-        let at = match start_index(queue.len(), book.start) {
+        // Start over plays the book from its first part.
+        let wanted_start = if from_start { 0 } else { book.start };
+        let at = match start_index(queue.len(), wanted_start) {
             Ok(at) => at,
             Err(why) => {
                 log(&format!("play book {id} verdict=rejected reason={why}"));
@@ -294,11 +308,18 @@ pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<(
     start_at(env, id, queue, supersede())
 }
 
+/// [`start`] that plays from 0 whatever position was saved for the item.
+pub(crate) fn start_over(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
+    let gen = supersede();
+    want_from_start(gen);
+    start_at(env, id, queue, gen)
+}
+
 /// [`start`] for a request that already holds its generation `gen`.
 pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
     if is_book_id(id) {
         log(&format!("start id={id}: a book, resolving its parts"));
-        return play_book(id, gen);
+        return play_book(id, gen, asked_from_start(gen));
     }
     if let Some(item) = fixture::playable(id) {
         let source = fixture::source(env, id)?;
@@ -377,6 +398,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
                 u64::try_from(length).unwrap_or(0),
                 entry.position_ms,
                 !entry.book.is_empty(),
+                st.from_start,
                 &player,
             )?;
             let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);

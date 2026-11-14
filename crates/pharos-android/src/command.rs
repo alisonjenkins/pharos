@@ -26,6 +26,8 @@ pub(crate) enum Command {
     Play {
         ids: Vec<String>,
         index: usize,
+        /// Start the track at 0, whatever position was saved for it.
+        from_start: bool,
     },
     Pause,
     /// Continue what is loaded; with nothing loaded, play the queue's
@@ -110,10 +112,15 @@ pub(crate) fn play_from(id: &str) -> Command {
     };
     let ids = ids(&list);
     match ids.iter().position(|i| i == id) {
-        Some(index) => Command::Play { ids, index },
+        Some(index) => Command::Play {
+            ids,
+            index,
+            from_start: false,
+        },
         None => Command::Play {
             ids: vec![id.to_owned()],
             index: 0,
+            from_start: false,
         },
     }
 }
@@ -122,7 +129,11 @@ pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()>
     let name = command.label();
     let from = source.label();
     match command {
-        Command::Play { ids, index } => {
+        Command::Play {
+            ids,
+            index,
+            from_start,
+        } => {
             let at = match start_index(ids.len(), index) {
                 Ok(at) => at,
                 Err(why) => {
@@ -140,10 +151,14 @@ pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()>
             let id = queue[at].id.clone();
             snapshot::clear_error();
             log(&format!(
-                "command {name} source={from} id={id} index={at} queue_len={}",
+                "command {name} source={from} id={id} index={at} queue_len={} from_start={from_start}",
                 queue.len()
             ));
-            start(env, &id, Some(queue))
+            if from_start {
+                start_over(env, &id, Some(queue))
+            } else {
+                start(env, &id, Some(queue))
+            }
         }
         Command::Pause => {
             log(&format!("command {name} source={from}"));
@@ -312,7 +327,8 @@ mod tests {
             play_from("track/987655"),
             Command::Play {
                 ids: vec!["track/987655".to_owned()],
-                index: 0
+                index: 0,
+                from_start: false
             }
         );
     }
@@ -362,6 +378,7 @@ mod tests {
             Command::Play {
                 ids: Vec::new(),
                 index: 0,
+                from_start: false,
             },
             Command::Pause,
             Command::Resume,
