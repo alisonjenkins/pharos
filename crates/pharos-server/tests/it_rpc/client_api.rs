@@ -118,6 +118,44 @@ async fn my_devices_read_and_set_their_converted_sound() {
     );
 }
 
+/// 045: the account screen's e-reader section, through the client: make
+/// one, see it listed without its password, revoke it.
+#[actix_web::test]
+async fn reader_passwords_round_trip_through_the_client() {
+    let (api, _fx, _server) = api().await;
+    let call = CallInfo::default();
+    let created = api
+        .create_reader_password(&call, "Tablet")
+        .await
+        .expect("made");
+    assert_eq!(created.opds_path, "/opds/");
+    assert!(
+        !format!("{created:?}").contains(&created.password),
+        "Debug never shows the password"
+    );
+    let listed = api.reader_passwords(&call).await.unwrap();
+    assert_eq!(listed, [created.listed.clone()]);
+    assert_eq!(listed[0].last_used_at_ms, None);
+    api.revoke_reader_password(&call, &listed[0].id)
+        .await
+        .expect("revoked");
+    assert!(api.reader_passwords(&call).await.unwrap().is_empty());
+    let err = api
+        .revoke_reader_password(&call, &listed[0].id)
+        .await
+        .expect_err("already revoked");
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "notFound",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// The watched toggle as the UI drives it: a title, then a whole season,
 /// and the detail read afterwards agrees.
 #[actix_web::test]
