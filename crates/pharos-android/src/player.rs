@@ -20,6 +20,19 @@ pub(crate) fn start_wanted() -> bool {
     START_ON_PREPARED.load(Ordering::SeqCst)
 }
 
+/// Whether a player is preparing and will start when ready.
+pub(crate) fn is_starting() -> R<bool> {
+    let guard = state_lock()?;
+    let preparing = guard
+        .as_ref()
+        .is_some_and(|s| s.player.is_some() && !s.prepared);
+    Ok(will_start(preparing, start_wanted()))
+}
+
+fn will_start(preparing: bool, wanted: bool) -> bool {
+    preparing && wanted
+}
+
 /// Takes the next play generation, which drops every older request still
 /// in flight.
 pub(crate) fn supersede() -> u64 {
@@ -415,6 +428,13 @@ mod tests {
         let second = supersede();
         assert!(!is_current(first), "the older request is dropped");
         assert!(is_current(second));
+    }
+
+    #[test]
+    fn only_a_preparing_player_that_is_wanted_will_start() {
+        assert!(will_start(true, true));
+        assert!(!will_start(true, false), "paused while preparing");
+        assert!(!will_start(false, true), "already prepared or none");
     }
 
     #[test]
