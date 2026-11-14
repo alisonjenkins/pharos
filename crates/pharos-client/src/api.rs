@@ -197,6 +197,10 @@ pub struct Item {
     /// are newly added. 0 otherwise, and from a server older than
     /// schemaVersion 42.
     pub new_children: u32,
+    /// A song or album that is an audiobook or one of its tracks
+    /// (ADR-0132); an audiobook album's `artist` is its author. False from
+    /// a server older than schemaVersion 48.
+    pub audiobook: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2307,6 +2311,7 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
         stereo: read_stereo(item.get_stereo()),
         damaged: item.get_damaged(),
         new_children: item.get_new_children(),
+        audiobook: item.get_audiobook(),
     })
 }
 
