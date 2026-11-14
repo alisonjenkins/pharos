@@ -3160,6 +3160,16 @@ impl BooksTab {
             .collect()
     }
 
+    /// The tab shown when this one is chosen: itself while `tabs` offers
+    /// it, else Books, as a list can empty while its tab is open.
+    pub fn within(self, tabs: &[Self]) -> Self {
+        if tabs.contains(&self) {
+            self
+        } else {
+            Self::Books
+        }
+    }
+
     /// Its `tab=` value in the URL.
     pub fn token(self) -> &'static str {
         match self {
@@ -3300,18 +3310,14 @@ fn BooksTabs(
 ) -> Element {
     let tabs = BooksTab::shown(courses.total, audiobooks.total);
     let opened = use_hook(|| {
-        let asked = if Route::parse(&platform::current_path()) == Route::Browse(library) {
+        if Route::parse(&platform::current_path()) == Route::Browse(library) {
             books_choice(&platform::current_search())
-        } else {
-            BooksTab::Books
-        };
-        if BooksTab::shown(courses.total, audiobooks.total).contains(&asked) {
-            asked
         } else {
             BooksTab::Books
         }
     });
     let tab = use_signal(|| opened);
+    let current = tab().within(&tabs);
     use_effect(move || {
         let tab = tab();
         let here = Route::parse(&platform::current_path()) == Route::Browse(library);
@@ -3340,7 +3346,7 @@ fn BooksTabs(
                     aria_label: "{title}",
                     "data-key-tabs": "books",
                     onkeydown: move |e: KeyboardEvent| {
-                        if let Some(next) = tab().stepped(&tabs, &e.key()) {
+                        if let Some(next) = current.stepped(&tabs, &e.key()) {
                             e.prevent_default();
                             switch_books_tab(library, tab, next);
                             platform::focus_by_id(next.id());
@@ -3352,16 +3358,16 @@ fn BooksTabs(
                             r#type: "button",
                             role: "tab",
                             id: t.id(),
-                            class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
-                            aria_selected: tab() == t,
-                            tabindex: if tab() == t { "0" } else { "-1" },
+                            class: if current == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                            aria_selected: current == t,
+                            tabindex: if current == t { "0" } else { "-1" },
                             onclick: move |_| switch_books_tab(library, tab, t),
                             "{t.label()}"
                         }
                     }
                 }
             }
-            match tab() {
+            match current {
                 BooksTab::Books => remount_on(
                     &format!("books {library}"),
                     rsx! {
@@ -5487,6 +5493,21 @@ mod tests {
         );
         assert_eq!(BooksTab::shown(1, 1), BooksTab::ALL);
         assert_eq!(books_query(BooksTab::Audiobooks), "?tab=audiobooks");
+    }
+
+    /// ADR-0132: a tab whose list emptied while it was open gives way to
+    /// Books, so no hidden panel stays drawn and the arrows step from Books.
+    #[test]
+    fn a_tab_no_longer_shown_falls_back_to_books() {
+        let left = BooksTab::shown(1, 0);
+        assert_eq!(BooksTab::Audiobooks.within(&left), BooksTab::Books);
+        assert_eq!(BooksTab::Courses.within(&left), BooksTab::Courses);
+        assert_eq!(
+            BooksTab::Audiobooks
+                .within(&left)
+                .stepped(&left, &Key::Named(NamedKey::ArrowRight)),
+            Some(BooksTab::Courses)
+        );
     }
 
     /// ADR-0132: a Books library lists its audiobooks as albums beside its
