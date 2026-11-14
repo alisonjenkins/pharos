@@ -122,6 +122,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "MouseEvent",
     "HtmlCollection",
     "IntersectionObserverEntry",
+    "IntersectionObserverInit",
+    "NodeList",
     "DomRect",
     "ImageBitmap",
     "CanvasRenderingContext2d",
