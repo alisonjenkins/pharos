@@ -537,6 +537,8 @@ impl Library {
                 }
             }
         }
+        downloader.set_online(self.online.load(Ordering::SeqCst));
+        downloader.resume_pins();
         let _ = self.offline.set(Offline { cache, downloader });
         Ok(())
     }
