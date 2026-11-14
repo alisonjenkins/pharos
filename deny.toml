@@ -160,6 +160,10 @@ allow = [
     # `notify` (the FS-watcher crate, P48/LIB-A8) is licensed CC0-1.0 —
     # a public-domain dedication, FSF Free/Libre, maximally permissive.
     "CC0-1.0",
+    # `whisper-rs` / `whisper-rs-sys` (the aligner's recogniser, ADR-0125)
+    # are under the Unlicense, a public-domain dedication, OSI approved and
+    # FSF Free/Libre.
+    "Unlicense",
 ]
 # Internal workspace crates (cargo-hakari's `workspace-hack`) carry no
 # license field and are never published; exempt publish = false crates.
