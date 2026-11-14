@@ -260,7 +260,7 @@ pub fn match_lines(lines: &[Line], heard: &[Heard], opts: Options) -> Matched {
         if ks.is_empty() {
             continue;
         }
-        let hits: Vec<(usize, usize)> = ks
+        let mut hits: Vec<(usize, usize)> = ks
             .iter()
             .filter_map(|&q| pairs[q].map(|j| (q, j)))
             .collect();
@@ -279,6 +279,12 @@ pub fn match_lines(lines: &[Line], heard: &[Heard], opts: Options) -> Matched {
             let first = s.clone().fold(f64::INFINITY, f64::min);
             let last = s.fold(f64::NEG_INFINITY, f64::max);
             anchored = !over_slot(line, first, last);
+            // A weak word heard past the slot came from another repeat too;
+            // it would stretch the anchor the strong words fit in.
+            hits.retain(|&(_, j)| {
+                let t = tr[j].start_s;
+                !over_slot(line, first.min(t), last.max(t))
+            });
         }
         if !anchored {
             continue;
@@ -548,6 +554,18 @@ mod tests {
         assert_eq!(capped.share(), Some(0.0));
         let uncapped = match_lines(&lines, &h, Options { slot_cap: false });
         assert!(uncapped.lines[0].anchor.is_some());
+    }
+
+    #[test]
+    fn a_weak_word_far_past_the_slot_does_not_widen_the_anchor() {
+        let lines = [line(20_000, 24_000, "salt and silver")];
+        // Two strong words in the slot; the third heard weakly 30 s on.
+        let h = heard(&[("salt", 20.2), ("and", 20.6), ("silted", 50.0)]);
+        let m = match_lines(&lines, &h, Options::default());
+        assert_eq!(m.lines[0].strong, 2);
+        let a = m.lines[0].anchor.as_ref().unwrap();
+        assert!(a.end_ms < 30_000, "anchor ends at {}", a.end_ms);
+        assert!(a.starts_ms.iter().all(|&s| s < 30_000), "{:?}", a.starts_ms);
     }
 
     #[test]
