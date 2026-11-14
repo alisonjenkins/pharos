@@ -118,6 +118,7 @@ impl Resume {
             return Ok(Verdict::Short);
         }
         let mut positions = self.lock();
+        let before = positions.clone();
         let (verdict, changed) = if position_ms.saturating_add(END_MARGIN_MS) >= duration_ms {
             (Verdict::Finished, positions.remove(id).is_some())
         } else if position_ms < START_MARGIN_MS {
@@ -129,7 +130,11 @@ impl Resume {
             (Verdict::Saved, true)
         };
         if changed {
-            self.save(&positions)?;
+            if let Err(e) = self.save(&positions) {
+                // Keep memory equal to disk so an identical retry writes again.
+                *positions = before;
+                return Err(e);
+            }
         }
         Ok(verdict)
     }
@@ -138,10 +143,13 @@ impl Resume {
     /// when nothing was saved for it.
     pub fn clear(&self, id: &str) -> Result<bool, ContentError> {
         let mut positions = self.lock();
-        if positions.remove(id).is_none() {
+        let Some(old) = positions.remove(id) else {
             return Ok(false);
+        };
+        if let Err(e) = self.save(&positions) {
+            positions.insert(id.to_owned(), old);
+            return Err(e);
         }
-        self.save(&positions)?;
         Ok(true)
     }
 
@@ -233,6 +241,27 @@ mod tests {
         let back = Resume::open(&d);
         assert_eq!(back.position("a", LONG), None);
         assert_eq!(back.position("b", LONG), Some(800_000), "others kept");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_save_stays_retryable() -> Result<(), ContentError> {
+        let d = dir("retry");
+        let r = Resume::open(&d);
+        r.record("a", 700_000, LONG)?;
+        r.record("b", 800_000, LONG)?;
+        let blocker = d.join(FILE);
+        std::fs::remove_file(&blocker).ok();
+        std::fs::create_dir(&blocker).ok();
+        assert!(r.clear("a").is_err());
+        assert!(r.record("b", 900_000, LONG).is_err());
+        assert!(r.record("c", 700_000, LONG).is_err());
+        std::fs::remove_dir(&blocker).ok();
+        assert!(r.clear("a")?, "the failed clear is still pending");
+        assert_eq!(r.record("c", 700_000, LONG)?, Verdict::Saved);
+        let back = Resume::open(&d);
+        assert_eq!(back.position("a", LONG), None);
+        assert_eq!(back.position("c", LONG), Some(700_000));
         Ok(())
     }
 }
