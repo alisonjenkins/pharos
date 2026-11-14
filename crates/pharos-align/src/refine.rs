@@ -776,6 +776,40 @@ mod tests {
     }
 
     #[test]
+    fn a_line_in_a_long_gap_stays_near_its_expected_time() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(50_000, 53_000, "nets dry slow"),
+            line(60_000, 63_000, "low tide hums"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_000);
+        // Only a stray copy of line 1, deep in the instrumental between the
+        // anchors, 30 s before where it is due.
+        sung.extend(sing("nets dry slow", 20_000));
+        sung.extend(sing("low tide hums", 60_000));
+        let frames = 3_300;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.0);
+        h.extend(heard("low tide hums", 60.0));
+        let m = match_lines(&lines, &h, Options::default());
+        let t = [
+            today(&lines[0], 1_000),
+            today(&lines[1], 50_000),
+            today(&lines[2], 60_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        let first = starts(&r.lines[1])[0];
+        assert!(
+            (50_000 - BETWEEN_MS..=50_000 + BETWEEN_MS).contains(&first),
+            "line 1 starts at {first} ms, more than {BETWEEN_MS} ms from 50000"
+        );
+    }
+
+    #[test]
     fn a_line_sung_twice_in_its_band_takes_the_one_nearer_its_anchor() {
         let lines = [line(1_000, 5_000, "grey gulls wheel")];
         // Sung at the anchor and again, a little more clearly, 1.3 s later.
