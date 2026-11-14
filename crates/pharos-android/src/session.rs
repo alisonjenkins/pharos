@@ -332,44 +332,31 @@ pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlay,
     "onPlay",
-    |env| {
-        let has_player = state_lock()?
-            .as_ref()
-            .is_some_and(|s| s.player.is_some() && s.prepared);
-        if has_player {
-            transport(env, "start", STATE_PLAYING)
-        } else {
-            skip(env, 0, true)
-        }
-    }
+    |env| { apply(env, Command::Resume, Source::Car) }
 );
 
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPause,
     "onPause",
-    |env| { transport(env, "pause", STATE_PAUSED) }
+    |env| { apply(env, Command::Pause, Source::Car) }
 );
 
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onStop,
     "onStop",
-    |env| {
-        transport(env, "stop", STATE_STOPPED)?;
-        snapshot::clear();
-        Ok(())
-    }
+    |env| { apply(env, Command::Stop, Source::Car) }
 );
 
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSkipToNext,
     "onSkipToNext",
-    |env| { skip(env, 1, true) }
+    |env| { apply(env, Command::Next, Source::Car) }
 );
 
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSkipToPrevious,
     "onSkipToPrevious",
-    |env| { skip(env, -1, true) }
+    |env| { apply(env, Command::Previous, Source::Car) }
 );
 
 #[no_mangle]
@@ -380,29 +367,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 ) {
     guarded(&mut env, "onSeekTo", (), |env| {
         log(&format!("session onSeekTo pos_ms={pos}"));
-        let guard = state_lock()?;
-        let Some(st) = guard.as_ref() else {
-            return Ok(());
-        };
-        let (Some(player), session) = (st.player.clone(), st.session.clone()) else {
-            return Ok(());
-        };
-        if !st.prepared {
-            log("onSeekTo: player still preparing, ignored");
-            return Ok(());
-        }
-        drop(guard);
-        let ms = i32::try_from(pos).unwrap_or(i32::MAX);
-        env.call_method(player.as_obj(), "seekTo", "(I)V", &[JValue::Int(ms)])
-            .map_err(jerr("seekTo"))?;
-        // A seek while paused stays paused: the car's progress bar runs only at PLAYING.
-        let playing = env
-            .call_method(player.as_obj(), "isPlaying", "()Z", &[])
-            .and_then(|v| v.z())
-            .map_err(jerr("isPlaying"))?;
-        let state = if playing { STATE_PLAYING } else { STATE_PAUSED };
-        log(&format!("onSeekTo pos_ms={pos} state={state}"));
-        set_playback_state(env, session.as_obj(), state, pos)
+        apply(
+            env,
+            Command::Seek(u64::try_from(pos).unwrap_or(0)),
+            Source::Car,
+        )
     })
 }
 
@@ -418,7 +387,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
     guarded(&mut env, "onPlayFromMediaId", (), |env| {
         let id = string(env, &id)?;
         log(&format!("session onPlayFromMediaId id={id}"));
-        start(env, &id, None)
+        apply(env, play_from(&id), Source::Car)
     })
 }
 

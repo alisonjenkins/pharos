@@ -12,6 +12,7 @@
 
 mod art;
 mod browse;
+mod command;
 
 mod compat;
 
@@ -40,6 +41,7 @@ mod voice;
 use pharos_content as content;
 
 use browse::*;
+use command::*;
 use player::*;
 use search::*;
 use service::*;
