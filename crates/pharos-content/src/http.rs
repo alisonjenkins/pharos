@@ -349,7 +349,13 @@ pub async fn get(
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     };
-    let content_length = find("content-length").and_then(|v| v.parse::<u64>().ok());
+    let content_length = match find("content-length") {
+        Some(v) => Some(v.parse::<u64>().map_err(|_| HttpError::BadResponse {
+            host: host.clone(),
+            why: format!("invalid Content-Length {v:?}"),
+        })?),
+        None => None,
+    };
     let chunked =
         find("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
     let framing = if chunked {
@@ -661,6 +667,28 @@ mod tests {
                 "chunked={chunked}: {e}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_content_length_fails_the_response() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: twelve\r\n\r\nabc");
+        });
+        let url = Url::parse(&format!("http://{addr}/a")).unwrap();
+        let e = get(&url, &Request::default(), T, T)
+            .await
+            .err()
+            .expect("rejected");
+        assert!(
+            matches!(&e, HttpError::BadResponse { why, .. } if why.contains("Content-Length")),
+            "{e}"
+        );
     }
 
     #[tokio::test]
