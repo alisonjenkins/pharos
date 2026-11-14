@@ -5407,6 +5407,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // rest of its album (B435/V375); once per song, as the screen remounts
     // per item.
     let queue = try_use_context::<QueueCtx>();
+    // The queue's start count when this screen mounted, kept for its life: a
+    // player that remounts later still knows the queue has taken the song in.
+    let mounted_at = use_hook(|| queue.map_or(0, |QueueCtx(q)| q.peek().starts()));
     let start_over = try_use_context::<StartOver>();
     // The item this screen was asked to start over, kept past the press so a
     // renegotiation before the player reports a position still starts at zero.
@@ -5855,6 +5858,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 rsx! {
                     Player {
                         playing: p.clone(),
+                        mounted_at,
                         last_ms: LastMs(Rc::clone(&last_ms)),
                         near: {
                             let mut n = near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default();
@@ -6208,6 +6212,8 @@ const BUFFER_POLLS: bool = cfg!(any(target_arch = "wasm32", target_os = "android
 #[component]
 fn Player(
     playing: PlayingRef,
+    /// The queue's start count when the watch screen mounted.
+    mounted_at: u64,
     last_ms: LastMs,
     near: Neighbours,
     upcoming: Option<Item>,
@@ -6525,9 +6531,6 @@ fn Player(
     // Whether Back from the full view stops this play on the TV.
     let current = matches!(slot, Slot::Current { .. });
     let playing_id = p.detail.item.id;
-    // The queue's start count when this screen mounted: once it moves, the
-    // queue has taken `playing_id` in and its head is no longer that song.
-    let mounted_at = use_hook(|| queue.peek().starts());
     use_effect(move || {
         let mut stage = stage;
         if !current {
