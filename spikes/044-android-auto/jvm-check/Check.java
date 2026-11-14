@@ -24,6 +24,30 @@ public class Check {
     r = new MediaBrowserService.Result<>();
     s.onLoadChildren("music", r);
     expect(r.sent && r.value.size() == 3 && r.value.get(0).flags == 2, "music has two tones and a stream: " + r.value);
+    android.net.Uri icon = r.value.get(2).d.icon;
+    expect(icon != null && icon.toString().startsWith("content://com.alisonjenkins.pharos.auto.art/"), "the stream has a content:// icon: " + icon);
+
+    // Typed as the framework class, so a descriptor typo fails here.
+    android.content.ContentProvider art = new com.alisonjenkins.pharos.auto.PharosArtProvider();
+    expect(art.onCreate(), "art provider onCreate");
+    expect("image/*".equals(art.getType(icon)), "art type is image/*");
+    expect(art.query(icon, null, null, null, null) == null && art.insert(icon, null) == null
+        && art.delete(icon, null, null) == 0 && art.update(icon, null, null, null) == 0, "art provider is read-only");
+    java.io.File cached = new java.io.File(new android.content.Context().getCacheDir(), "art/" + icon.getLastPathSegment());
+    cached.getParentFile().mkdirs();
+    java.nio.file.Files.write(cached.toPath(), new byte[] {1, 2, 3});
+    android.os.ParcelFileDescriptor pfd = art.openFile(icon, "r");
+    expect(pfd.file.equals(cached) && pfd.mode == android.os.ParcelFileDescriptor.MODE_READ_ONLY, "openFile serves the cached image read-only");
+    cached.delete();
+    for (String bad : new String[] {"content://com.alisonjenkins.pharos.auto.art/00000000deadbeef", "content://com.alisonjenkins.pharos.auto.art/..%2f..%2fx"}) {
+      boolean refused = false;
+      try { art.openFile(android.net.Uri.parse(bad), "r"); } catch (java.io.FileNotFoundException e) { refused = true; }
+      expect(refused, "openFile refuses " + bad);
+    }
+    boolean writeRefused = false;
+    try { art.openFile(icon, "w"); } catch (java.io.FileNotFoundException e) { writeRefused = true; }
+    expect(writeRefused, "openFile refuses write mode");
+
     r = new MediaBrowserService.Result<>();
     s.onSearch("chapter", null, r);
     expect(r.sent && r.value.size() == 1, "voice search finds the chapter: " + r.value);
@@ -50,6 +74,8 @@ public class Check {
     cb.onPlayFromMediaId("stream:example", null);
     MediaPlayer stream = MediaPlayer.last;
     expect(stream.source().startsWith("https://"), "a stream entry plays its URL: " + stream.source());
+    expect(String.valueOf(session.md.m.get("android.media.metadata.ALBUM_ART_URI")).equals(icon.toString())
+        && icon.toString().equals(session.md.m.get("android.media.metadata.DISPLAY_ICON_URI")), "stream metadata carries its album art: " + session.md);
     cb.onPlayFromMediaId("tone:523", null);
     MediaPlayer tone = MediaPlayer.last;
     stream.firePrepared();
