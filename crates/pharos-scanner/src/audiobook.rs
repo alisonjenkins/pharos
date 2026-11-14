@@ -176,7 +176,8 @@ pub enum InventoryError {
 /// The track files of the book in `folder`, in natural order of their
 /// paths under it: its own files and those of its disc folders, the only
 /// files whose [`book_folder`] is `folder`. Any other folder below is a
-/// book of its own.
+/// book of its own, and a disc folder holding `.ignore` is left out, as
+/// the scan's walk leaves it out.
 pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
     let mut found = Vec::new();
     let mut dirs = vec![(folder.to_path_buf(), true)];
@@ -202,7 +203,7 @@ pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(is_disc_folder);
-                if top && disc {
+                if top && disc && !crate::fs::is_ignored_dir(&path) {
                     dirs.push((path, false));
                 }
             } else if is_track_file(&path) {
@@ -668,6 +669,21 @@ mod tests {
             let parent = author.join(p);
             assert_eq!(book_folder(parent.parent().unwrap(), td.path()), author);
         }
+    }
+
+    #[test]
+    fn folder_tracks_leaves_out_an_ignored_disc_folder() {
+        let td = tempfile::TempDir::new().unwrap();
+        for f in ["CD1/01.mp3", "CD2/01.mp3", "CD2/.ignore"] {
+            let p = td.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        }
+        assert_eq!(
+            folder_tracks(td.path()).unwrap(),
+            [td.path().join("CD1/01.mp3")],
+            "the walk does not see CD2, so it does not number this book"
+        );
     }
 
     #[test]
