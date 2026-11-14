@@ -24,6 +24,9 @@ pub struct RangedReader {
     /// The offset the next byte read is at.
     pos: u64,
     len: Option<u64>,
+    /// Body bytes the current response has produced; a reopen that yields
+    /// none ends the read instead of looping.
+    resp_bytes: u64,
 }
 
 fn io_err(e: HttpError) -> io::Error {
@@ -45,6 +48,7 @@ impl RangedReader {
             chunk_at: 0,
             pos: 0,
             len: None,
+            resp_bytes: 0,
         };
         me.connect()?;
         Ok(me)
@@ -64,6 +68,7 @@ impl RangedReader {
         self.resp = None;
         self.chunk.clear();
         self.chunk_at = 0;
+        self.resp_bytes = 0;
         let req = Request {
             range_from: (self.pos > 0).then_some(self.pos),
             if_range: None,
@@ -115,11 +120,17 @@ impl Read for RangedReader {
             };
             match self.rt.block_on(resp.next_chunk()).map_err(io_err)? {
                 Some(next) => {
+                    self.resp_bytes += next.len() as u64;
                     self.chunk = next;
                     self.chunk_at = 0;
                 }
                 None => {
                     self.resp = None;
+                    // A ranged window can end before the song does.
+                    if self.resp_bytes > 0 && self.len.is_some_and(|l| self.pos < l) {
+                        self.connect()?;
+                        continue;
+                    }
                     return Ok(0);
                 }
             }
@@ -225,6 +236,17 @@ mod tests {
         let mut head = [0u8; 3];
         r.read_exact(&mut head).unwrap();
         assert_eq!(head, data[5..8]);
+    }
+
+    #[test]
+    fn a_response_that_ends_before_the_song_continues_from_where_it_stopped() {
+        let data = body(100_000);
+        let srv = TestServer::start(Script::default().file("/s", data.clone()).window(30_000));
+        let mut r = RangedReader::open(&srv.url("/s")).unwrap();
+        r.seek(SeekFrom::Start(10)).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data[10..]);
     }
 
     #[test]
