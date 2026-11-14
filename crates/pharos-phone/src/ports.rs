@@ -2,9 +2,10 @@
 //! UI's music plays on the same player the car drives, and its offline
 //! screens read the same cache.
 //!
-//! Both reach the player and library the media service sets up, so the app
-//! starts that service first ([`pharos_android::start_service`]). A command
-//! sent before it runs is dropped and logged.
+//! Both reach the player and library the media service sets up. Android
+//! stops that service once the app has been idle in the background, so every
+//! music command starts it again ([`pharos_android::start_service`]) and
+//! waits briefly for it; a command it never reaches is dropped and logged.
 
 use std::sync::{Arc, OnceLock};
 
@@ -37,12 +38,17 @@ pub fn register() {
 
 struct PhoneAudio;
 
+/// How long a music command waits for the service to start the player.
+const PLAYER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl PhoneAudio {
     fn with(&self, command: &str, f: impl FnOnce(&Player)) {
-        match pharos_android::player() {
+        crate::activity::start_media_service();
+        match pharos_android::player_within(PLAYER_WAIT) {
             Some(p) => f(p),
             None => log::warn!(
-                "pharos: native audio command={command} verdict=dropped reason=service_not_started"
+                "pharos: native audio command={command} verdict=dropped reason=service_not_started waited_ms={}",
+                PLAYER_WAIT.as_millis()
             ),
         }
     }
