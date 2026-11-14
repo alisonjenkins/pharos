@@ -43,6 +43,7 @@ pub mod musicbrainz;
 pub mod obs;
 pub mod omdb;
 pub mod online_enrich;
+pub mod openlibrary;
 pub mod opensubtitles;
 pub mod parental;
 pub mod pending_release;
