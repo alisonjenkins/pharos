@@ -64,9 +64,9 @@ public class Check {
 
   public static void main(String[] a) throws Exception {
     // A closed port: library calls fail fast, and the Test folder must still work.
-    java.nio.file.Files.write(new java.io.File(new android.content.Context().getFilesDir(), "server_url").toPath(),
-        "http://127.0.0.1:9\n".getBytes());
-    new java.io.File(new android.content.Context().getFilesDir(), "device_token").delete();
+    java.nio.file.Files.write(new java.io.File(new android.content.Context().getFilesDir(), "server").toPath(),
+        "https://127.0.0.1:9\n".getBytes());
+    new java.io.File(new android.content.Context().getFilesDir(), "device-token").delete();
     java.io.File resumeFile = new java.io.File(new android.content.Context().getFilesDir(), "resume.json");
     resumeFile.delete();
     PharosMediaService s = new PharosMediaService();
