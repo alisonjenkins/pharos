@@ -84,4 +84,12 @@ impl Separator {
     pub fn vocals(&self, mix: &Stereo) -> Result<Stereo, SeparateError> {
         super::vocals(mix, |m, s| self.segment(m, s))
     }
+
+    /// Drops the weights and hands the device pool's freed pages back: the
+    /// letter model shares the pool, so dropping alone keeps them reserved.
+    pub fn release(self) {
+        let Self { model, device } = self;
+        drop(model);
+        device.memory_cleanup();
+    }
 }
