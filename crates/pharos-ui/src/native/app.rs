@@ -6132,6 +6132,20 @@ fn upcoming_ids(queue: Signal<Queue>) -> Vec<ItemRef> {
     queue.peek().upcoming().iter().map(|e| e.id).collect()
 }
 
+/// The songs the host plays after `playing`. Until the queue has started a
+/// song since `mounted_at`, its head may be `playing` itself; after that, a
+/// copy of it is a repeat the listener queued. Reads `queue`, so an effect
+/// using it follows the queue.
+fn host_upcoming(queue: Signal<Queue>, playing: ItemRef, mounted_at: u64) -> Vec<ItemRef> {
+    let q = queue.read();
+    let ids: Vec<ItemRef> = q.upcoming().iter().map(|e| e.id).collect();
+    if q.starts() > mounted_at {
+        music_bridge::after(playing, &ids)
+    } else {
+        music_bridge::after_unstarted(playing, &ids)
+    }
+}
+
 /// A shuffle seed: a play order needs no more randomness than the clock.
 fn seed() -> u64 {
     platform::now_ms().to_bits()
@@ -6505,6 +6519,9 @@ fn Player(
     // Whether Back from the full view stops this play on the TV.
     let current = matches!(slot, Slot::Current { .. });
     let playing_id = p.detail.item.id;
+    // The queue's start count when this screen mounted: once it moves, the
+    // queue has taken `playing_id` in and its head is no longer that song.
+    let mounted_at = use_hook(|| queue.peek().starts());
     use_effect(move || {
         let mut stage = stage;
         if !current {
@@ -7022,7 +7039,8 @@ fn Player(
             let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
             if let Some(music) = io.read().music().cloned() {
                 // The host plays it; there is no stream to attach.
-                if current && music.begin(playing_id, &upcoming_ids(queue)) {
+                if current && music.begin(playing_id, &host_upcoming(queue, playing_id, mounted_at))
+                {
                     platform::info(&format!(
                         "pharos: host play item={playing_id} queued={}",
                         music.sent().len()
@@ -7726,7 +7744,7 @@ fn Player(
     use_effect({
         let following = Rc::clone(&following);
         move || {
-            let upcoming: Vec<ItemRef> = queue.read().upcoming().iter().map(|e| e.id).collect();
+            let upcoming = host_upcoming(queue, playing_id, mounted_at);
             if !following.get() {
                 return;
             }
