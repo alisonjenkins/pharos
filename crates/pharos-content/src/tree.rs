@@ -197,7 +197,8 @@ pub fn resume_part(parts: &[Item]) -> Option<usize> {
 }
 
 /// Marks `parts` (listed under `book`, in order) as parts of that book:
-/// the book's title, an author when the part names none, and "Part N of M".
+/// the book's title, an author when the part names none, and "Part N of M"
+/// when there is more than one.
 fn as_parts(parts: &mut [Node], book: &Item) {
     let total = parts.len();
     for (n, part) in parts.iter_mut().enumerate() {
@@ -205,7 +206,9 @@ fn as_parts(parts: &mut [Node], book: &Item) {
         if part.subtitle.is_empty() {
             part.subtitle = book.series_name.clone().unwrap_or_default();
         }
-        part.album = format!("Part {} of {total}", n + 1);
+        if total > 1 {
+            part.album = format!("Part {} of {total}", n + 1);
+        }
     }
 }
 
@@ -216,7 +219,11 @@ fn continue_row(a: ItemRef, items: &[Item], parts: &[Node]) -> Option<Node> {
     let begun = items.iter().any(|i| i.played || i.position_ms > 0);
     let verb = if begun { "Continue" } else { "Start" };
     Some(Node {
-        title: format!("{verb}: {}", at.album),
+        title: if at.album.is_empty() {
+            verb.to_owned()
+        } else {
+            format!("{verb}: {}", at.album)
+        },
         subtitle: at.title.clone(),
         browsable: false,
         playable: true,
@@ -850,7 +857,8 @@ mod tests {
             ..Fake::default()
         };
         let got = block_on(children(&fresh, &urls(), NodeId::Album(ItemRef::Synth(3)))).unwrap();
-        assert_eq!(got[0].title, "Start: Part 1 of 1");
+        assert_eq!(got[0].title, "Start", "one part: no \"Part 1 of 1\"");
+        assert_eq!(got[1].album, "");
     }
 
     #[test]
