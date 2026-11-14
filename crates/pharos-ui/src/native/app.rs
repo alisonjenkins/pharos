@@ -7498,7 +7498,7 @@ fn Player(
                     return;
                 };
                 let mut rx = music.receiver();
-                let mut follow = Follow::default();
+                let mut follow = Follow::after(&rx.borrow());
                 loop {
                     let snapshot = rx.borrow_and_update().clone();
                     if following.get() {
@@ -7515,10 +7515,15 @@ fn Player(
                                     ));
                                     go(to);
                                 }
-                                Step::Failed(reason) => fatal.send(Fatal {
-                                    reason,
-                                    kind: FailureKind::Unplayable,
-                                }),
+                                Step::Failed(reason) => {
+                                    platform::info(&format!(
+                                        "pharos: host play verdict=failed reason={reason} item={playing_id}"
+                                    ));
+                                    fatal.send(Fatal {
+                                        reason,
+                                        kind: FailureKind::Unplayable,
+                                    });
+                                }
                             }
                         }
                     }
