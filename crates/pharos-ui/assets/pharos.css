@@ -4609,11 +4609,12 @@ label.pharos-setting {
   border-bottom-color: var(--px-color-accent);
   font-weight: 600;
 }
-/* B1334/V1305: a music library's tabs and its Albums order share one row,
+/* B1334/V1305, B1424: a music or books library's tabs and its Albums order share one row,
    the size of the library filter row (B1311): a segmented row of pill tabs
    and, on Albums, the Sort pill at the far end. The row scrolls sideways
    on a narrow phone, with room kept for the TV's focus ring (B1312). */
-.pharos-music-bar {
+.pharos-music-bar,
+.pharos-books-bar {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -4622,10 +4623,12 @@ label.pharos-setting {
   overflow-x: auto;
   scrollbar-width: none;
 }
-.pharos-music-bar::-webkit-scrollbar {
+.pharos-music-bar::-webkit-scrollbar,
+.pharos-books-bar::-webkit-scrollbar {
   display: none;
 }
-.pharos-music-bar .pharos-tabs {
+.pharos-music-bar .pharos-tabs,
+.pharos-books-bar .pharos-tabs {
   flex: none;
   gap: 0.15rem;
   margin: 0;
@@ -4635,7 +4638,8 @@ label.pharos-setting {
   border-radius: 999px;
   background: var(--px-color-surface);
 }
-.pharos-music-bar .pharos-tab {
+.pharos-music-bar .pharos-tab,
+.pharos-books-bar .pharos-tab {
   display: inline-flex;
   align-items: center;
   min-height: 2rem;
@@ -4645,7 +4649,8 @@ label.pharos-setting {
   font-size: 0.9rem;
   white-space: nowrap;
 }
-.pharos-music-bar .pharos-tab-active {
+.pharos-music-bar .pharos-tab-active,
+.pharos-books-bar .pharos-tab-active {
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
 }
@@ -4655,7 +4660,8 @@ label.pharos-setting {
 /* A phone has no room for both: the Sort pill goes under the tabs rather
    than off the edge, where it would hide the order it names. */
 @media (max-width: 40rem) {
-  .pharos-music-bar {
+  .pharos-music-bar,
+  .pharos-books-bar {
     flex-wrap: wrap;
   }
   .pharos-music-bar .pharos-sort-pill {
@@ -8196,10 +8202,12 @@ body:has(.pharos-reader) {
   --pharos-button-font-small: 0.72rem;
 }
 /* B1334: the music tab row at the TV filter row's size. */
-:root[data-device="tv"] .pharos-music-bar {
+:root[data-device="tv"] .pharos-music-bar,
+:root[data-device="tv"] .pharos-books-bar {
   margin-bottom: calc(0.5rem - 12px);
 }
-:root[data-device="tv"] .pharos-music-bar .pharos-tab {
+:root[data-device="tv"] .pharos-music-bar .pharos-tab,
+:root[data-device="tv"] .pharos-books-bar .pharos-tab {
   min-height: 1.65rem;
   font-size: 0.8rem;
 }
