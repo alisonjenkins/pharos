@@ -234,9 +234,73 @@ impl ::log::Log for ContentLog {
     fn flush(&self) {}
 }
 
+/// Every `Java_` export, as addresses. The app's cdylib calls [`link`] so
+/// the linker keeps these: an rlib's `#[no_mangle]` functions that nothing
+/// in the final library reaches are dropped, and the JVM only finds out on
+/// the first call. `jvm-check/run.sh` lists the .so's symbols to prove it.
+pub fn exports() -> [*const (); 33] {
+    [
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_delete as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_getType as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_insert as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_onCreate as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_openFile as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_query as *const (),
+        art::Java_com_alisonjenkins_pharos_auto_PharosArtProvider_update as *const (),
+        compat::Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_handleMessage as *const (),
+        debug::Java_com_alisonjenkins_pharos_auto_PharosDebugReceiver_onReceive as *const (),
+        focus::Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onAudioFocusChange
+            as *const (),
+        network::Java_com_alisonjenkins_pharos_auto_PharosNetworkCallback_onAvailable as *const (),
+        network::Java_com_alisonjenkins_pharos_auto_PharosNetworkCallback_onLost as *const (),
+        noisy::Java_com_alisonjenkins_pharos_auto_PharosNoisyReceiver_onReceive as *const (),
+        player::Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onCompletion as *const (),
+        player::Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onError as *const (),
+        player::Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onPrepared as *const (),
+        search::Java_com_alisonjenkins_pharos_auto_PharosMediaService_onSearch as *const (),
+        search::Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_nativeOnCreate as *const (),
+        search::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlayFromSearch
+            as *const (),
+        search::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromSearch
+            as *const (),
+        service::Java_com_alisonjenkins_pharos_auto_PharosMediaService_nativeOnCreate as *const (),
+        service::Java_com_alisonjenkins_pharos_auto_PharosMediaService_nativeOnDestroy as *const (),
+        service::Java_com_alisonjenkins_pharos_auto_PharosMediaService_onGetRoot as *const (),
+        service::Java_com_alisonjenkins_pharos_auto_PharosMediaService_onLoadChildren as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPause as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlay as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlayFromMediaId
+            as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepare as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromMediaId
+            as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSeekTo as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSkipToNext as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSkipToPrevious
+            as *const (),
+        session::Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onStop as *const (),
+    ]
+}
+
+/// Keeps every JNI export in the final library. Call it once from the
+/// app's cdylib, for example from a `#[used]` static or its own export.
+pub fn link() {
+    std::hint::black_box(exports());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_lists_every_export_once() {
+        let mut seen = exports().to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), exports().len());
+        assert!(seen.iter().all(|p| !p.is_null()));
+        link();
+    }
 
     #[test]
     fn track_length_prefers_the_player_and_falls_back_to_the_server() {
