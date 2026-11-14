@@ -54,16 +54,23 @@ platform=$android_home/platforms/android-34/android.jar
 
 # Phones are arm64; a 32-bit-only phone is not a target (spec 044).
 echo "android-phone-apk: 1/6 building libmain.so for arm64 ($profile)" >&2
+# The manifest names xml/automotive_app_desc, which only the overlay in step
+# 3 supplies, and dx has no setting to add resources. So dx's own gradle run
+# fails at resource linking after it has built libmain.so and written the
+# project; step 4 runs gradle again with the resources in place. Removing the
+# old library first means one found afterwards came from this build.
+rm -rf "$main_dir/jniLibs"
+dx_status=0
 nix develop .#android -c dx build --platform android --package pharos-phone \
   --bin pharos-phone --features mobile --target aarch64-linux-android \
-  "${dx_flags[@]}" || {
-  echo "android-phone-apk: dx build failed (see its error above)" >&2
+  "${dx_flags[@]}" || dx_status=$?
+[ -f "$main_dir/jniLibs/arm64-v8a/libmain.so" ] && [ -f "$gradle_root/gradlew" ] || {
+  echo "android-phone-apk: dx build failed with status $dx_status and left no libmain.so or gradle project (see its error above)" >&2
   exit 1
 }
-[ -f "$main_dir/jniLibs/arm64-v8a/libmain.so" ] || {
-  echo "android-phone-apk: dx left no jniLibs/arm64-v8a/libmain.so" >&2
-  exit 1
-}
+if [ "$dx_status" -ne 0 ]; then
+  echo "android-phone-apk: dx assemble status=$dx_status, expected before the resource overlay; libmain.so is built, continuing" >&2
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
