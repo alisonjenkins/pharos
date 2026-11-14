@@ -284,14 +284,6 @@ impl Cache {
         Ok(cache)
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub fn cap_bytes(&self) -> u64 {
-        self.cap
-    }
-
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -306,6 +298,7 @@ impl Cache {
     }
 
     /// Bytes held by finished tracks (an in-progress `.part` is not counted).
+    #[cfg(test)]
     pub fn used_bytes(&self) -> u64 {
         Self::totals(&self.lock()).1
     }
@@ -326,16 +319,23 @@ impl Cache {
         self.lock().entries.get(id).is_some_and(|e| e.complete)
     }
 
-    /// What the cache holds for `id`; logged, does not count as a play.
+    /// What the cache holds for `id`; logged, does not count as a play. An
+    /// indexed track whose file has vanished is forgotten, not reported as a hit.
     pub fn lookup(&self, id: &str) -> Lookup {
-        let complete = self.is_complete(id);
-        let verdict = if complete {
-            Lookup::Hit(self.final_path(id))
+        let path = self.final_path(id);
+        let verdict = if self.is_complete(id) && path.is_file() {
+            Lookup::Hit(path)
         } else if std::fs::metadata(self.part_path(id)).is_ok_and(|m| m.len() > 0) {
             Lookup::Partial
         } else {
             Lookup::Miss
         };
+        if self.is_complete(id) && !matches!(verdict, Lookup::Hit(_)) {
+            log::warn!("cache id={id} is indexed but its file is gone; forgetting");
+            let mut s = self.lock();
+            s.entries.remove(id);
+            self.persist_locked(&s);
+        }
         let word = match verdict {
             Lookup::Hit(_) => "hit",
             Lookup::Partial => "partial",
@@ -348,22 +348,10 @@ impl Cache {
     /// The finished file for `id`, counted as a play (it becomes the newest
     /// for eviction and is never evicted while current).
     pub fn local_path(&self, id: &str) -> Option<PathBuf> {
-        let mut s = self.lock();
-        let hit = s.entries.get(id).is_some_and(|e| e.complete);
-        let path = self.final_path(id);
-        let present = hit && path.is_file();
-        log::info!(
-            "cache lookup id={id} verdict={}",
-            if present { "hit" } else { "miss" }
-        );
-        if !present {
-            if hit {
-                log::warn!("cache id={id} is indexed but its file is gone; forgetting");
-                s.entries.remove(id);
-                self.persist_locked(&s);
-            }
+        let Lookup::Hit(path) = self.lookup(id) else {
             return None;
-        }
+        };
+        let mut s = self.lock();
         let t = Self::tick(&mut s);
         if let Some(e) = s.entries.get_mut(id) {
             e.last_played_ms = t;
@@ -487,10 +475,12 @@ impl Cache {
     }
 
     /// Track ids pinned through `container`, if it is pinned.
+    #[cfg(test)]
     pub fn pinned_tracks(&self, container: &str) -> Option<Vec<String>> {
         self.lock().pins.get(container).cloned()
     }
 
+    #[cfg(test)]
     pub fn is_pinned(&self, container: &str) -> bool {
         self.lock().pins.contains_key(container)
     }

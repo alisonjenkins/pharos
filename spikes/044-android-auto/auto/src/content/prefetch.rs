@@ -235,6 +235,7 @@ impl Downloader {
     }
 
     /// Wait until nothing is queued or downloading; false on timeout.
+    #[cfg(test)]
     pub fn wait_idle(&self, timeout: Duration) -> bool {
         let q = self.gate.lock();
         let (q, res) = self
