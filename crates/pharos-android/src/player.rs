@@ -135,25 +135,59 @@ fn book_part(queue: &[Item], id: &str) -> Option<Item> {
         .cloned()
 }
 
+/// The row to show for a track whose file is cached: the listed book part
+/// or titled row, else `lookup`'s node, else whatever the queue holds for
+/// it, else a bare row. The file plays whatever the metadata, so an offline
+/// library must not stop it.
+fn cached_item(queue: &[Item], id: &str, lookup: impl FnOnce() -> Option<Item>) -> Item {
+    book_part(queue, id)
+        .or_else(|| {
+            queue
+                .iter()
+                .find(|i| i.id == id && !i.title.is_empty())
+                .cloned()
+        })
+        .or_else(lookup)
+        .or_else(|| queue.iter().find(|i| i.id == id).cloned())
+        .map(|mut i| {
+            if i.title.is_empty() {
+                i.title = FALLBACK_TITLE.to_owned();
+            }
+            i
+        })
+        .unwrap_or_else(|| Item {
+            id: id.to_owned(),
+            title: FALLBACK_TITLE.to_owned(),
+            subtitle: String::new(),
+            browsable: false,
+            playable: true,
+            art: String::new(),
+            duration_ms: 0,
+            album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
+        })
+}
+
+const FALLBACK_TITLE: &str = "Downloaded track";
+
 /// Asks the library for `id`'s fresh stream URL (blocking) and plays it.
 pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
     let queue_ids: Vec<String> = queue.iter().map(|i| i.id.clone()).collect();
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         if let Some(path) = lib.local_path(id) {
-            let listed = book_part(&queue, id).or_else(|| {
-                queue
-                    .iter()
-                    .find(|i| i.id == id && !i.title.is_empty())
-                    .cloned()
+            let item = cached_item(&queue, id, || match lib.node(id) {
+                Ok(node) => Some(Item::of_node(node)),
+                Err(e) => {
+                    log(&format!(
+                        "play id={id}: node lookup failed, using fallback metadata: {}",
+                        e.redacted()
+                    ));
+                    None
+                }
             });
-            let item = match listed {
-                Some(i) => i,
-                None => Item::of_node(
-                    lib.node(id)
-                        .map_err(|e| format!("node {id} (cached, unlisted): {}", e.redacted()))?,
-                ),
-            };
             let ahead = lib.prefetch_from(id);
             log(&format!(
                 "play id={id} verdict=cache-hit prefetch_queued={ahead}"
@@ -454,6 +488,47 @@ mod tests {
         let second = supersede();
         assert!(!is_current(first), "the older request is dropped");
         assert!(is_current(second));
+    }
+
+    fn row(id: &str, title: &str) -> Item {
+        Item {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            subtitle: String::new(),
+            browsable: false,
+            playable: true,
+            art: String::new(),
+            duration_ms: 0,
+            album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_cached_track_plays_with_fallback_metadata_when_the_library_is_offline() {
+        let untitled = [row("track/1", "")];
+        let bare = cached_item(&untitled, "track/1", || None);
+        assert_eq!(bare.id, "track/1");
+        assert!(!bare.title.is_empty(), "something to show");
+        let unlisted = cached_item(&[], "track/2", || None);
+        assert_eq!(unlisted.id, "track/2");
+        assert!(!unlisted.title.is_empty());
+    }
+
+    #[test]
+    fn a_titled_row_or_a_found_node_wins_over_the_fallback() {
+        let listed = [row("track/1", "Listed")];
+        let looked_up = std::cell::Cell::new(false);
+        let item = cached_item(&listed, "track/1", || {
+            looked_up.set(true);
+            None
+        });
+        assert_eq!(item.title, "Listed");
+        assert!(!looked_up.get(), "no lookup for a listed row");
+        let found = cached_item(&[], "track/2", || Some(row("track/2", "Found")));
+        assert_eq!(found.title, "Found");
     }
 
     #[test]
