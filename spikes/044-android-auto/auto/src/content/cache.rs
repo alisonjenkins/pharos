@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! <dir>/index.json                   size, last_played, pinned, complete per track
+//! <dir>/settings.json                the cap the user set, when they set one
 //! <dir>/<id>.audio                   a finished track (id percent-escaped)
 //! <dir>/<id>.audio.part              a download in progress, renamed when whole
 //! <dir>/listings/<container>.json    last browse listing, for offline browse
@@ -15,6 +16,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +44,37 @@ pub struct Entry {
     pub last_played_ms: u64,
     pub pinned: bool,
     pub complete: bool,
+}
+
+/// What the user chose, kept beside the index.
+#[derive(Debug, Serialize, Deserialize)]
+struct Settings {
+    cap_bytes: u64,
+}
+
+const SETTINGS_FILE: &str = "settings.json";
+
+/// The cap saved in `dir` by [`Cache::set_cap`], if any. An unreadable file
+/// counts as none, so the default applies.
+pub fn saved_cap(dir: &Path) -> Option<u64> {
+    let path = dir.join(SETTINGS_FILE);
+    match std::fs::read(&path) {
+        Ok(b) => match serde_json::from_slice::<Settings>(&b) {
+            Ok(s) => Some(s.cap_bytes),
+            Err(e) => {
+                log::warn!("cache settings unreadable ({e}); using the default cap");
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::warn!(
+                "cache settings not read ({}): {e}; using the default cap",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -117,7 +150,7 @@ struct State {
 
 pub struct Cache {
     dir: PathBuf,
-    cap: u64,
+    cap: AtomicU64,
     state: Mutex<State>,
     free: FreeProbe,
 }
@@ -301,7 +334,7 @@ impl Cache {
             .unwrap_or(0);
         let cache = Self {
             dir: dir.to_owned(),
-            cap: cap_bytes,
+            cap: AtomicU64::new(cap_bytes),
             state: Mutex::new(State {
                 entries: index.entries,
                 pins: index.pins,
@@ -321,6 +354,29 @@ impl Cache {
             cache.persist_locked(&s);
         }
         Ok(cache)
+    }
+
+    pub fn cap(&self) -> u64 {
+        self.cap.load(Ordering::SeqCst)
+    }
+
+    /// Change the cap now and save it, so the next open keeps it. A smaller
+    /// cap evicts at once; returns the evicted ids.
+    pub fn set_cap(&self, cap_bytes: u64) -> Result<Vec<String>, ContentError> {
+        let path = self.dir.join(SETTINGS_FILE);
+        let bytes = serde_json::to_vec(&Settings { cap_bytes })
+            .map_err(|e| err("encode settings", &path, e))?;
+        write_atomic(&path, &bytes).map_err(|e| err("save settings", &path, e))?;
+        let mut s = self.lock();
+        self.cap.store(cap_bytes, Ordering::SeqCst);
+        let evicted = self.evict_locked(&mut s);
+        self.persist_locked(&s);
+        let (n, used) = Self::totals(&s);
+        log::info!(
+            "cache cap bytes={cap_bytes} source=set tracks={n} used={used} evicted={}",
+            evicted.len()
+        );
+        Ok(evicted)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -536,13 +592,13 @@ impl Cache {
         let mut evicted = Vec::new();
         loop {
             let (_, used) = Self::totals(s);
-            if used <= self.cap {
+            if used <= self.cap() {
                 break;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
                 log::warn!(
                     "cache over cap used={used} cap={} and nothing is evictable (pinned, queued or playing)",
-                    self.cap
+                    self.cap()
                 );
                 break;
             };
@@ -709,6 +765,41 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_set_cap_is_saved_and_read_back() {
+        let d = tmp("cap-saved");
+        assert_eq!(saved_cap(&d), None);
+        let c = Cache::open(&d, 1000).unwrap();
+        c.set_cap(12_345).unwrap();
+        assert_eq!(c.cap(), 12_345);
+        drop(c);
+        assert_eq!(saved_cap(&d), Some(12_345));
+        assert!(!d.join("settings.json.tmp").exists(), "written atomically");
+        std::fs::write(d.join("settings.json"), b"not json").unwrap();
+        assert_eq!(
+            saved_cap(&d),
+            None,
+            "a broken file falls back to the default"
+        );
+    }
+
+    #[test]
+    fn shrinking_the_cap_evicts_at_once() {
+        let d = tmp("cap-shrink");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 100);
+        put(&c, "track/c", 100);
+        c.protect(&[]);
+        assert_eq!(c.set_cap(150).unwrap(), ids(&["track/a", "track/b"]));
+        assert_eq!(c.used_bytes(), 100);
+        assert!(c.is_complete("track/c"), "the newest stays");
+        assert!(
+            c.set_cap(1000).unwrap().is_empty(),
+            "growing evicts nothing"
+        );
     }
 
     fn fixed_free(bytes: u64) -> FreeProbe {

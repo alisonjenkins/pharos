@@ -16,7 +16,7 @@ use pharos_api::pharos_capnp::{bootstrap, session};
 use pharos_client::api::MediaToken;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use super::cache::Cache;
+use super::cache::{self, Cache};
 use super::error::ContentError;
 use super::id::NodeId;
 use super::net::{self, Closed, NativeCatalogue};
@@ -412,13 +412,19 @@ impl Library {
         Some(nodes)
     }
 
-    /// Start keeping tracks in `dir` (at most `cap_bytes`; see
-    /// [`super::cache::DEFAULT_CAP_BYTES`]) and downloading ahead. Call once
-    /// after [`Library::connect`]; calling again is a no-op.
-    pub fn enable_cache(&self, dir: &Path, cap_bytes: u64) -> Result<(), ContentError> {
+    /// Start keeping tracks in `dir` and downloading ahead. The cap is the
+    /// one last given to [`Library::set_cache_cap`], else `default_cap`
+    /// (see [`super::cache::DEFAULT_CAP_BYTES`]). Call once after
+    /// [`Library::connect`]; calling again is a no-op.
+    pub fn enable_cache(&self, dir: &Path, default_cap: u64) -> Result<(), ContentError> {
         if self.offline.get().is_some() {
             return Ok(());
         }
+        let (cap_bytes, source) = match cache::saved_cap(dir) {
+            Some(c) => (c, "saved"),
+            None => (default_cap, "default"),
+        };
+        log::info!("cache cap bytes={cap_bytes} source={source}");
         let cache = Arc::new(Cache::open(dir, cap_bytes)?);
         let (tx, timeouts) = (self.tx.clone(), self.timeouts);
         let resolve: Resolver = Arc::new(move |id| resolve_stream(&tx, &timeouts, id));
@@ -433,6 +439,23 @@ impl Library {
         }
         let _ = self.offline.set(Offline { cache, downloader });
         Ok(())
+    }
+
+    /// Keep at most `cap_bytes` of music from now on, and after a restart.
+    /// A smaller cap evicts least recently played tracks at once.
+    pub fn set_cache_cap(&self, cap_bytes: u64) -> Result<(), ContentError> {
+        let Some(o) = self.offline.get() else {
+            return Err(ContentError::Cache {
+                op: "set cap".into(),
+                why: format!("bytes={cap_bytes}: the cache is not enabled"),
+            });
+        };
+        o.cache.set_cap(cap_bytes).map(|_| ())
+    }
+
+    /// The cap in force, when the cache is enabled.
+    pub fn cache_cap(&self) -> Option<u64> {
+        self.offline.get().map(|o| o.cache.cap())
     }
 
     /// The finished cached file for a track id (`track/..`), or `None` when it
@@ -939,6 +962,34 @@ mod tests {
         let dir = cache_dir(name);
         lib.enable_cache(&dir, 1 << 20).unwrap();
         (lib, dir)
+    }
+
+    #[test]
+    fn a_set_cache_cap_survives_a_restart() {
+        let (lib, dir) = offline_lib("cap");
+        assert_eq!(
+            lib.cache_cap(),
+            Some(1 << 20),
+            "the default with nothing saved"
+        );
+        lib.set_cache_cap(4096).unwrap();
+        assert_eq!(lib.cache_cap(), Some(4096));
+        drop(lib);
+        let lib2 = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        lib2.enable_cache(&dir, 1 << 20).unwrap();
+        assert_eq!(
+            lib2.cache_cap(),
+            Some(4096),
+            "the saved cap beats the default"
+        );
+    }
+
+    #[test]
+    fn a_cap_needs_the_cache() {
+        let lib =
+            Library::connect_with(&dead_server(), &cache_dir("nocap").join("t"), quick()).unwrap();
+        assert!(lib.set_cache_cap(1).is_err());
+        assert_eq!(lib.cache_cap(), None);
     }
 
     fn track(n: u32) -> Node {
