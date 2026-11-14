@@ -30,9 +30,10 @@ pub const MIN_ANCHOR_SHARE: f64 = 0.4;
 /// sliding onto a repeat of itself within its band.
 pub const ENTRY_COST_PER_S: f64 = 0.3;
 /// An anchor whose offset from its line's requested time differs this much
-/// from the offsets of the anchors either side is a repeat of the line
-/// heard in the wrong place; the check set's true anchors stay within 3 s
-/// of their neighbours, the false ones were 11 s and more away.
+/// from the offsets of the anchors either side, and leaps past a line,
+/// is a repeat of the line heard in the wrong place; in the check set the
+/// true anchors that leap stay within 3 s of their neighbours, the false
+/// ones were 11 s and more away.
 pub const OUTLIER_MS: i64 = 5_000;
 
 /// The whole song's vocals emission and the samples it came from.
@@ -100,7 +101,11 @@ fn anchor_words(line: &Line, words: &[text::Word], starts_ms: &[i64], end: i64) 
 }
 
 /// Anchored lines whose offset stands apart from both neighbouring anchors
-/// (or from its one neighbour, at either end of the song).
+/// (or from its one neighbour, at either end of the song) and that would
+/// leap past a line with words: one of the lines between it and a
+/// neighbour, moved by that neighbour's offset, falls on its far side. An
+/// offset far off with no such line is the request's timing being off,
+/// not a repeat.
 fn outliers(lines: &[Line], matched: &Matched) -> Vec<bool> {
     let offsets: Vec<(usize, i64)> = matched
         .lines
@@ -114,16 +119,30 @@ fn outliers(lines: &[Line], matched: &Matched) -> Vec<bool> {
             ))
         })
         .collect();
+    let sung = |j: usize| !text::words(&lines[j].text).is_empty();
     let mut out = vec![false; lines.len()];
     for (k, &(i, off)) in offsets.iter().enumerate() {
-        let apart = |j: Option<&(usize, i64)>| j.map(|&(_, o)| (off - o).abs() > OUTLIER_MS);
-        let prev = apart(k.checked_sub(1).and_then(|k| offsets.get(k)));
-        let next = apart(offsets.get(k + 1));
-        out[i] = match (prev, next) {
+        let before = k.checked_sub(1).and_then(|k| offsets.get(k)).copied();
+        let after = offsets.get(k + 1).copied();
+        let apart = |j: Option<(usize, i64)>| j.map(|(_, o)| (off - o).abs() > OUTLIER_MS);
+        let far = match (apart(before), apart(after)) {
             (Some(p), Some(n)) => p && n,
             (Some(x), None) | (None, Some(x)) => x,
             (None, None) => false,
         };
+        if !far {
+            continue;
+        }
+        let at = lines[i].start_ms + off;
+        let near = |j: Option<(usize, i64)>| j.or(before).or(after).map(|(_, o)| o);
+        let leaps_back = near(before).is_some_and(|o| {
+            (before.map_or(0, |(p, _)| p + 1)..i).any(|j| sung(j) && lines[j].start_ms + o > at)
+        });
+        let leaps_on = near(after).is_some_and(|o| {
+            (i + 1..after.map_or(lines.len(), |(n, _)| n))
+                .any(|j| sung(j) && lines[j].start_ms + o < at)
+        });
+        out[i] = leaps_back || leaps_on;
     }
     out
 }
@@ -913,5 +932,34 @@ mod tests {
         );
         sung_at(&r.lines[0], &[1_000, 1_500, 2_100]);
         assert_eq!(r.lines[3], t[3]);
+    }
+
+    #[test]
+    fn an_anchor_far_from_its_neighbour_that_leaps_no_line_is_kept() {
+        // The request has the last line twelve seconds early, and nothing
+        // after it to leap past: the request is off, not the recogniser.
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_200);
+        sung.extend(sing("nets dry slow", 4_200));
+        sung.extend(sing("low tide hums", 19_200));
+        let frames = 1_100;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.2);
+        h.extend(heard("nets dry slow", 4.2));
+        h.extend(heard("low tide hums", 19.2));
+        let m = match_lines(&lines, &h, Options::default());
+        let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.methods[2], Some(Method::Refined));
+        sung_at(&r.lines[2], &[19_200, 19_600, 20_100]);
+        assert_eq!(r.placement.dropped_anchors, 0);
     }
 }
