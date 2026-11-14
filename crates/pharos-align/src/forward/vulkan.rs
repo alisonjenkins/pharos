@@ -485,21 +485,56 @@ impl VulkanModel {
     }
 }
 
-/// Keeps compiled kernels and autotune results under `dir` across restarts,
-/// so each bucket compiles once per cache rather than once per process.
-/// Call before the first GPU device starts; false when something read the
-/// kernel settings first, which leaves them per process.
-pub fn use_kernel_cache(dir: &std::path::Path) -> bool {
-    use cubecl_runtime::config::{cache::CacheConfig, CubeClRuntimeConfig, RuntimeConfig};
+/// The cubecl settings the aligner runs with: one stream for every thread
+/// (B1427), and compiled kernels and autotune results kept under `cache`
+/// across restarts when given, so each bucket compiles once per cache
+/// rather than once per process.
+///
+/// cubecl's default gives each OS thread its own stream with its own pools,
+/// and never frees a stream when its thread ends. Songs run on the blocking
+/// pool, whose idle threads exit, so each song after a pause left a stream's
+/// pages behind on the GPU. The songs already take turns on the model, so
+/// one stream costs no concurrency.
+fn runtime_config(cache: Option<&std::path::Path>) -> cubecl_runtime::config::CubeClRuntimeConfig {
+    use cubecl_runtime::config::{
+        cache::CacheConfig, streaming::StreamPolicy, CubeClRuntimeConfig,
+    };
     let mut config = CubeClRuntimeConfig::default();
-    config.compilation.cache = true;
-    config.environment.path = CacheConfig::Directory(dir.to_path_buf());
-    CubeClRuntimeConfig::try_set(config)
+    config.streaming.policy = StreamPolicy::Single;
+    if let Some(dir) = cache {
+        config.compilation.cache = true;
+        config.environment.path = CacheConfig::Directory(dir.to_path_buf());
+    }
+    config
+}
+
+/// Applies [`runtime_config`]. Call before the first GPU device starts;
+/// false when something read cubecl's settings first, which leaves its
+/// defaults in place: kernels per process and a stream per thread.
+pub fn configure_runtime(cache: Option<&std::path::Path>) -> bool {
+    use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig};
+    CubeClRuntimeConfig::try_set(runtime_config(cache))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_thread_shares_one_stream_with_or_without_a_kernel_cache() {
+        use cubecl_runtime::config::{cache::CacheConfig, streaming::StreamPolicy};
+        let bare = runtime_config(None);
+        assert_eq!(bare.streaming.policy, StreamPolicy::Single);
+        assert!(!bare.compilation.cache);
+        let dir = std::path::Path::new("/kernels");
+        let cached = runtime_config(Some(dir));
+        assert_eq!(cached.streaming.policy, StreamPolicy::Single);
+        assert!(cached.compilation.cache);
+        assert!(matches!(
+            cached.environment.path,
+            CacheConfig::Directory(ref d) if d == dir
+        ));
+    }
 
     #[test]
     fn windows_round_up_to_a_few_lengths() {
