@@ -16,6 +16,8 @@ use jni::JNIEnv;
 const STATE_STOPPED: i32 = 1;
 const STATE_PAUSED: i32 = 2;
 const STATE_PLAYING: i32 = 3;
+const STATE_ERROR: i32 = 7;
+const STATE_BUFFERING: i32 = 6;
 // PlaybackState.ACTION_*: STOP | PAUSE | PLAY | SKIP_TO_PREVIOUS |
 // SKIP_TO_NEXT | SEEK_TO | PLAY_PAUSE | PLAY_FROM_MEDIA_ID | PLAY_FROM_SEARCH.
 const ACTIONS: i64 = 1 | 2 | 4 | 16 | 32 | 256 | 512 | 1024 | 2048;
@@ -31,22 +33,36 @@ struct Entry {
     title: &'static str,
     subtitle: &'static str,
     playable: bool,
-    /// Tone frequency for playable entries.
+    /// Tone frequency for playable entries without a `url`.
     hz: u32,
+    /// An http(s) stream; when set it plays instead of the tone.
+    url: &'static str,
 }
 
 const CATALOGUE: &[Entry] = &[
-    Entry { id: "music", parent: ROOT, title: "Music", subtitle: "", playable: false, hz: 0 },
-    Entry { id: "audiobooks", parent: ROOT, title: "Audiobooks", subtitle: "", playable: false, hz: 0 },
-    Entry { id: "tone:440", parent: "music", title: "Test tone A", subtitle: "Spike 044", playable: true, hz: 440 },
-    Entry { id: "tone:523", parent: "music", title: "Test tone C", subtitle: "Spike 044", playable: true, hz: 523 },
-    Entry { id: "tone:330", parent: "audiobooks", title: "Test chapter 1", subtitle: "Spike 044", playable: true, hz: 330 },
+    Entry { id: "music", parent: ROOT, title: "Music", subtitle: "", playable: false, hz: 0, url: "" },
+    Entry { id: "audiobooks", parent: ROOT, title: "Audiobooks", subtitle: "", playable: false, hz: 0, url: "" },
+    Entry { id: "tone:440", parent: "music", title: "Test tone A", subtitle: "Spike 044", playable: true, hz: 440, url: "" },
+    Entry { id: "tone:523", parent: "music", title: "Test tone C", subtitle: "Spike 044", playable: true, hz: 523, url: "" },
+    // A public-domain clip on Wikimedia Commons, to prove streaming.
+    Entry {
+        id: "stream:example",
+        parent: "music",
+        title: "Test stream",
+        subtitle: "Spike 044",
+        playable: true,
+        hz: 0,
+        url: "https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg",
+    },
+    Entry { id: "tone:330", parent: "audiobooks", title: "Test chapter 1", subtitle: "Spike 044", playable: true, hz: 330, url: "" },
 ];
 
 struct State {
     service: GlobalRef,
     session: GlobalRef,
     player: Option<GlobalRef>,
+    /// False while `player` is still preparing; transport calls wait for it.
+    prepared: bool,
     current: Option<&'static str>,
 }
 
@@ -205,7 +221,7 @@ fn set_playback_state(env: &mut JNIEnv, session: &JObject, state: i32, position_
     Ok(())
 }
 
-fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Entry) -> R<()> {
+fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Entry, duration_ms: i64) -> R<()> {
     const B: &str = "Landroid/media/MediaMetadata$Builder;";
     let b = env
         .new_object("android/media/MediaMetadata$Builder", "()V", &[])
@@ -226,7 +242,7 @@ fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Entry) -> R<()> {
         .map_err(jerr("putString"))?;
     }
     let k = JObject::from(env.new_string("android.media.metadata.DURATION").map_err(jerr("key"))?);
-    env.call_method(&b, "putLong", format!("(Ljava/lang/String;J){B}"), &[JValue::Object(&k), JValue::Long(10_000)])
+    env.call_method(&b, "putLong", format!("(Ljava/lang/String;J){B}"), &[JValue::Object(&k), JValue::Long(duration_ms)])
         .map_err(jerr("putLong"))?;
     let md = env
         .call_method(&b, "build", "()Landroid/media/MediaMetadata;", &[])
@@ -237,8 +253,12 @@ fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Entry) -> R<()> {
     Ok(())
 }
 
-/// Plays catalogue entry `id`: writes its tone to the cache dir and hands
-/// the file to a fresh `MediaPlayer`.
+/// Length of every generated tone, in `tone_wav`.
+const TONE_MS: i64 = 10_000;
+
+/// Starts catalogue entry `id` on a fresh `MediaPlayer`: its `url` if it
+/// has one, else its tone written to the cache dir. Preparation is async;
+/// `PharosPlayerListener.onPrepared` starts playback.
 fn play(env: &mut JNIEnv, id: &str) -> R<()> {
     let entry = CATALOGUE
         .iter()
@@ -249,34 +269,62 @@ fn play(env: &mut JNIEnv, id: &str) -> R<()> {
     if let Some(old) = st.player.take() {
         let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
     }
-    let dir = env
-        .call_method(st.service.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])
-        .and_then(|v| v.l())
-        .map_err(jerr("getCacheDir"))?;
-    let dir = env
-        .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
-        .and_then(|v| v.l())
-        .map_err(jerr("getAbsolutePath"))?;
-    let dir = string(env, &JString::from(dir))?;
-    let path = format!("{dir}/{}.wav", entry.id.replace(':', "-"));
-    std::fs::write(&path, tone_wav(entry.hz)).map_err(|e| format!("write {path}: {e}"))?;
+    st.prepared = false;
+    let source = if entry.url.is_empty() {
+        let dir = env
+            .call_method(st.service.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])
+            .and_then(|v| v.l())
+            .map_err(jerr("getCacheDir"))?;
+        let dir = env
+            .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .and_then(|v| v.l())
+            .map_err(jerr("getAbsolutePath"))?;
+        let dir = string(env, &JString::from(dir))?;
+        let path = format!("{dir}/{}.wav", entry.id.replace(':', "-"));
+        std::fs::write(&path, tone_wav(entry.hz)).map_err(|e| format!("write {path}: {e}"))?;
+        path
+    } else {
+        entry.url.to_owned()
+    };
 
     let player = env.new_object("android/media/MediaPlayer", "()V", &[]).map_err(jerr("MediaPlayer"))?;
-    let p = JObject::from(env.new_string(&path).map_err(jerr("path"))?);
-    env.call_method(&player, "setDataSource", "(Ljava/lang/String;)V", &[JValue::Object(&p)])
+    let listener = env
+        .new_object("com/alisonjenkins/pharos/auto/PharosPlayerListener", "()V", &[])
+        .map_err(jerr("PharosPlayerListener"))?;
+    for (setter, iface) in [
+        ("setOnPreparedListener", "OnPreparedListener"),
+        ("setOnErrorListener", "OnErrorListener"),
+        ("setOnCompletionListener", "OnCompletionListener"),
+    ] {
+        env.call_method(&player, setter, format!("(Landroid/media/MediaPlayer${iface};)V"), &[JValue::Object(&listener)])
+            .map_err(jerr(setter))?;
+    }
+    let src = JObject::from(env.new_string(&source).map_err(jerr("source"))?);
+    env.call_method(&player, "setDataSource", "(Ljava/lang/String;)V", &[JValue::Object(&src)])
         .map_err(jerr("setDataSource"))?;
-    // A local file prepares in milliseconds; a stream will need prepareAsync
-    // and a listener (an interface, so a runtime proxy can implement it).
-    env.call_method(&player, "prepare", "()V", &[]).map_err(jerr("prepare"))?;
-    env.call_method(&player, "start", "()V", &[]).map_err(jerr("start"))?;
+    env.call_method(&player, "prepareAsync", "()V", &[]).map_err(jerr("prepareAsync"))?;
     st.player = Some(env.new_global_ref(&player).map_err(jerr("global player"))?);
     st.current = Some(entry.id);
     let session = st.session.clone();
     drop(guard);
-    set_metadata(env, session.as_obj(), entry)?;
-    set_playback_state(env, session.as_obj(), STATE_PLAYING, 0)?;
-    log(&format!("playing id={} hz={} path={path}", entry.id, entry.hz));
+    let duration = if entry.url.is_empty() { TONE_MS } else { 0 };
+    set_metadata(env, session.as_obj(), entry, duration)?;
+    set_playback_state(env, session.as_obj(), STATE_BUFFERING, 0)?;
+    log(&format!("preparing id={} source={source}", entry.id));
     Ok(())
+}
+
+/// The state's session and current entry when `mp` is still the current
+/// player; `None` for a player `play` has already replaced.
+fn if_current(env: &mut JNIEnv, mp: &JObject) -> R<Option<(GlobalRef, GlobalRef, &'static Entry)>> {
+    let guard = state_lock()?;
+    let Some(st) = guard.as_ref() else { return Ok(None) };
+    let Some(player) = &st.player else { return Ok(None) };
+    if !env.is_same_object(player.as_obj(), mp).map_err(jerr("is_same_object"))? {
+        return Ok(None);
+    }
+    let entry = st.current.and_then(|id| CATALOGUE.iter().find(|e| e.id == id)).ok_or("player without an entry")?;
+    Ok(Some((st.session.clone(), player.clone(), entry)))
 }
 
 /// Calls `method` on the current player, then publishes `state`.
@@ -288,6 +336,19 @@ fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         log(&format!("{method}: nothing loaded, ignored"));
         return Ok(());
     };
+    if !st.prepared {
+        if method != "stop" {
+            log(&format!("{method}: player still preparing, ignored"));
+            return Ok(());
+        }
+        drop(guard);
+        if let Some(st) = state_lock()?.as_mut() {
+            st.player = None;
+        }
+        env.call_method(player.as_obj(), "release", "()V", &[]).map_err(jerr("release"))?;
+        log("stop: released a player still preparing");
+        return set_playback_state(env, session.as_obj(), state, 0);
+    }
     drop(guard);
     env.call_method(player.as_obj(), method, "()V", &[]).map_err(jerr(method))?;
     let pos = env
@@ -342,6 +403,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
             service: env.new_global_ref(&this).map_err(jerr("global service"))?,
             session: env.new_global_ref(&session).map_err(jerr("global session"))?,
             player: None,
+            prepared: false,
             current: None,
         });
         log("onCreate: session active, token set");
@@ -444,7 +506,7 @@ macro_rules! callback {
 }
 
 callback!(Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlay, "onPlay", |env| {
-    let has_player = state_lock()?.as_ref().is_some_and(|s| s.player.is_some());
+    let has_player = state_lock()?.as_ref().is_some_and(|s| s.player.is_some() && s.prepared);
     if has_player {
         transport(env, "start", STATE_PLAYING)
     } else {
@@ -475,6 +537,10 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         let guard = state_lock()?;
         let Some(st) = guard.as_ref() else { return Ok(()) };
         let (Some(player), session) = (st.player.clone(), st.session.clone()) else { return Ok(()) };
+        if !st.prepared {
+            log("onSeekTo: player still preparing, ignored");
+            return Ok(());
+        }
         drop(guard);
         let ms = i32::try_from(pos).unwrap_or(i32::MAX);
         env.call_method(player.as_obj(), "seekTo", "(I)V", &[JValue::Int(ms)]).map_err(jerr("seekTo"))?;
@@ -511,6 +577,77 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
             Some(id) => play(env, id),
             None => Ok(()),
         }
+    })
+}
+
+// ---- PharosPlayerListener -------------------------------------------------
+
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onPrepared<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    mp: JObject<'l>,
+) {
+    guarded(&mut env, "onPrepared", (), |env| {
+        let Some((session, player, entry)) = if_current(env, &mp)? else {
+            log("player onPrepared: stale player, not started");
+            return Ok(());
+        };
+        let duration = env
+            .call_method(player.as_obj(), "getDuration", "()I", &[])
+            .and_then(|v| v.i())
+            .map_err(jerr("getDuration"))?;
+        env.call_method(player.as_obj(), "start", "()V", &[]).map_err(jerr("start"))?;
+        if let Some(st) = state_lock()?.as_mut() {
+            st.prepared = true;
+        }
+        // getDuration is -1 for a live stream; leave the length unknown.
+        set_metadata(env, session.as_obj(), entry, i64::from(duration.max(0)))?;
+        set_playback_state(env, session.as_obj(), STATE_PLAYING, 0)?;
+        log(&format!("player onPrepared id={} duration_ms={duration}: started", entry.id));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onError<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    mp: JObject<'l>,
+    what: jni::sys::jint,
+    extra: jni::sys::jint,
+) -> jni::sys::jboolean {
+    guarded(&mut env, "onError", (), |env| {
+        let Some((session, _, entry)) = if_current(env, &mp)? else {
+            log(&format!("player onError what={what} extra={extra}: stale player, ignored"));
+            return Ok(());
+        };
+        if let Some(st) = state_lock()?.as_mut() {
+            st.player = None;
+            st.prepared = false;
+        }
+        let _ = env.call_method(&mp, "release", "()V", &[]);
+        set_playback_state(env, session.as_obj(), STATE_ERROR, 0)?;
+        log(&format!("player onError id={} what={what} extra={extra}: released, state ERROR", entry.id));
+        Ok(())
+    });
+    // Handled: without this MediaPlayer also calls onCompletion.
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onCompletion<'l>(
+    mut env: JNIEnv<'l>,
+    _this: JObject<'l>,
+    mp: JObject<'l>,
+) {
+    guarded(&mut env, "onCompletion", (), |env| {
+        let Some((_, _, entry)) = if_current(env, &mp)? else {
+            log("player onCompletion: stale player, ignored");
+            return Ok(());
+        };
+        log(&format!("player onCompletion id={}: skipping to next", entry.id));
+        skip(env, 1)
     })
 }
 
