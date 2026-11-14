@@ -73,29 +73,31 @@ pub fn lesson(path: &Path, roots: &CourseRoots) -> Option<CourseLesson> {
         return None;
     }
     let root = roots.root_of(path)?;
-    let parts: Vec<&str> = path
+    // Paths stay `OsStr`, so a folder whose name is not UTF-8 is still found
+    // on disk; only the names shown read lossily.
+    let parts: Vec<&std::ffi::OsStr> = path
         .strip_prefix(root)
         .ok()?
         .components()
-        .map(|c| c.as_os_str().to_str())
-        .collect::<Option<_>>()?;
-    let stem = path.file_stem()?.to_str()?;
-    let title = clean_title(stem);
+        .map(|c| c.as_os_str())
+        .collect();
+    let stem = path.file_stem()?.to_string_lossy();
+    let title = clean_title(&stem);
     let (series_name, folder, season, episode) = match parts.as_slice() {
         [] => return None,
         // A video directly in the root is a course of one lesson.
         [_file] => (title.clone(), path.to_path_buf(), 1, Some(1)),
         [course, _file] => (
-            (*course).to_owned(),
+            course.to_string_lossy().into_owned(),
             root.join(course),
             1,
-            last_leading_number(stem),
+            last_leading_number(&stem),
         ),
         [course, module, ..] => (
-            (*course).to_owned(),
+            course.to_string_lossy().into_owned(),
             root.join(course),
-            first_leading_number(module).unwrap_or(1),
-            last_leading_number(stem),
+            first_leading_number(&module.to_string_lossy()).unwrap_or(1),
+            last_leading_number(&stem),
         ),
     };
     Some(CourseLesson {
@@ -190,6 +192,34 @@ mod tests {
 
     fn roots() -> CourseRoots {
         CourseRoots::books([PathBuf::from("/lib/Books")])
+    }
+
+    /// A folder or file name that is not UTF-8 still makes a lesson; its
+    /// name reads with the bad bytes replaced, its folder is the real one.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_name_still_makes_a_lesson() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+        let course = OsStr::from_bytes(b"Intro to \xffWidgets");
+        let path = PathBuf::from("/lib/Books")
+            .join(course)
+            .join(OsStr::from_bytes(b"01 - Basics"))
+            .join(OsStr::from_bytes(b"02 - Fitting \xfe.mp4"));
+        let l = lesson(&path, &roots()).expect("a video under the root is a lesson");
+        assert_eq!(l.series.series_name, "Intro to \u{fffd}Widgets");
+        assert_eq!(
+            l.series.series_folder,
+            Some(
+                PathBuf::from("/lib/Books")
+                    .join(course)
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(l.series.season_number, Some(1));
+        assert_eq!(l.series.episode_number, Some(2));
+        assert_eq!(l.title, "Fitting \u{fffd}");
     }
 
     /// A library nested in a Books root keeps its own videos; a Books
