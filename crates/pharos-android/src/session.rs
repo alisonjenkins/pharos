@@ -216,8 +216,18 @@ pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explici
         env.call_method(player.as_obj(), method, "()V", &[])
             .map_err(jerr(method))?;
         if method == "start" {
+            // Only if the player whose start just succeeded is still current:
+            // a newer play may have replaced it while the lock was released.
             if let Some(st) = state_lock()?.as_mut() {
-                st.started = true;
+                let same = match st.player.as_ref() {
+                    Some(now) => env
+                        .is_same_object(now.as_obj(), player.as_obj())
+                        .map_err(jerr("isSameObject"))?,
+                    None => false,
+                };
+                if same {
+                    st.started = true;
+                }
             }
         }
     } else {
