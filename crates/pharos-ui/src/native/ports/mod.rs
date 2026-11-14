@@ -78,16 +78,40 @@ pub fn register_on_credentials_changed(hook: fn()) -> Result<(), AlreadyRegister
         .map_err(|_| AlreadyRegistered)
 }
 
-/// Runs the host's hook after the stored token changed; returns whether one
-/// was registered.
-pub fn credentials_changed() -> bool {
-    match ON_CREDENTIALS_CHANGED.get() {
-        Some(hook) => {
-            hook();
-            true
-        }
-        None => false,
+/// The thread that runs the hook, so the caller (the UI) never waits for the
+/// host's reload, which queues behind the content worker. One thread keeps the
+/// changes in the order they happened.
+static CREDENTIALS_NOTIFIER: OnceLock<std::sync::mpsc::Sender<fn()>> = OnceLock::new();
+
+fn notifier() -> Option<&'static std::sync::mpsc::Sender<fn()>> {
+    if let Some(tx) = CREDENTIALS_NOTIFIER.get() {
+        return Some(tx);
     }
+    let (tx, rx) = std::sync::mpsc::channel::<fn()>();
+    std::thread::Builder::new()
+        .name("pharos-credentials".into())
+        .spawn(move || {
+            while let Ok(hook) = rx.recv() {
+                hook();
+            }
+        })
+        .ok()?;
+    Some(CREDENTIALS_NOTIFIER.get_or_init(|| tx))
+}
+
+/// Queues the host's hook to run after the stored token changed, off the
+/// caller's thread; returns whether one was registered.
+pub fn credentials_changed() -> bool {
+    let Some(hook) = ON_CREDENTIALS_CHANGED.get() else {
+        return false;
+    };
+    match notifier() {
+        Some(tx) if tx.send(*hook).is_ok() => {}
+        _ => {
+            hook();
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -356,6 +380,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         fn hook() {
+            std::thread::sleep(std::time::Duration::from_millis(150));
             CALLS.fetch_add(1, Ordering::SeqCst);
         }
         assert!(!credentials_changed());
@@ -364,8 +389,17 @@ mod tests {
             register_on_credentials_changed(hook),
             Err(AlreadyRegistered)
         );
+        let asked = std::time::Instant::now();
         assert!(credentials_changed());
         assert!(credentials_changed());
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(100),
+            "the caller does not wait for the hook"
+        );
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while CALLS.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 }
