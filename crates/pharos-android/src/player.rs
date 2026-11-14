@@ -1,6 +1,24 @@
 //! Playback on `MediaPlayer` and the `PharosPlayerListener` callbacks.
 
+use std::sync::atomic::AtomicBool;
+
 use super::*;
+
+/// Whether the player being prepared should start once it is ready. A new
+/// player wants to; a pause or headphone removal before it is ready says no.
+static START_ON_PREPARED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn want_start() {
+    START_ON_PREPARED.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn cancel_start() {
+    START_ON_PREPARED.store(false, Ordering::SeqCst);
+}
+
+pub(crate) fn start_wanted() -> bool {
+    START_ON_PREPARED.load(Ordering::SeqCst)
+}
 
 /// Takes the next play generation, which drops every older request still
 /// in flight.
@@ -37,6 +55,7 @@ pub(crate) fn play(
         let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
     }
     st.prepared = false;
+    want_start();
     let classes = CLASSES.get().ok_or("play before onCreate")?;
     let player = env
         .new_object("android/media/MediaPlayer", "()V", &[])
@@ -305,6 +324,14 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             &player,
         )?;
         let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
+        if !start_wanted() {
+            set_playback_state(env, session.as_obj(), STATE_PAUSED, at)?;
+            log(&format!(
+                "player onPrepared id={}: paused while preparing, not started",
+                entry.id
+            ));
+            return Ok(());
+        }
         if !focus::request(env)? {
             set_playback_state(env, session.as_obj(), STATE_PAUSED, at)?;
             log(&format!(
@@ -388,5 +415,15 @@ mod tests {
         let second = supersede();
         assert!(!is_current(first), "the older request is dropped");
         assert!(is_current(second));
+    }
+
+    #[test]
+    fn a_pause_while_preparing_cancels_the_start_until_the_next_player() {
+        want_start();
+        assert!(start_wanted(), "a new player starts when ready");
+        cancel_start();
+        assert!(!start_wanted());
+        want_start();
+        assert!(start_wanted());
     }
 }
