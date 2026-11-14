@@ -14,6 +14,7 @@
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod cache;
 mod error;
 mod fuzzy;
 mod http;
