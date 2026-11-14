@@ -203,6 +203,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
         .with_series_identity_repair(cfg.metadata.series_identity_repair)
+        .with_course_roots(cfg.media.course_roots())
         .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner = FsScanner::new(FfmpegProber::new())
@@ -210,6 +211,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
         .with_series_identity_repair(cfg.metadata.series_identity_repair)
+        .with_course_roots(cfg.media.course_roots())
         .with_force(force);
     // 004-books — the CLI scan writes book covers too. Without this a
     // `pharos scan` would index books with no tiles and the next server-side
@@ -2321,7 +2323,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // The closure builds a fresh owned scanner per root (each spawned task
         // owns its own — the prober isn't required to be Clone).
         let scan_memo = probe_memo_for(&cfg);
+        let course_state = app_state.clone();
         let make_scanner = move || {
+            let course_roots = course_state.course_roots();
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             let s =
                 pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
@@ -2329,6 +2333,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     .with_probe_concurrency_opt(probe_concurrency)
                     .with_probe_memo(scan_memo.clone())
                     .with_series_identity_repair(series_identity_repair)
+                    .with_course_roots(course_roots)
                     .with_io_gate(io_gate.clone());
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             let s = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
@@ -2336,6 +2341,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 .with_probe_concurrency_opt(probe_concurrency)
                 .with_probe_memo(scan_memo.clone())
                 .with_series_identity_repair(series_identity_repair)
+                .with_course_roots(course_roots)
                 .with_io_gate(io_gate.clone());
             match cover_sink.clone() {
                 Some(sink) => s.with_cover_sink(sink),
