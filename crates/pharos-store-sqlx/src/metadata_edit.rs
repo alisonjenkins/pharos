@@ -1,7 +1,8 @@
 //! `MetadataEditStore` for both backends (spec 015 US3, ADR-0097, migration
 //! 0078). The `locked_fields` columns are written here and nowhere else; the
 //! scan's put and the series enricher's upsert read them to keep a locked
-//! column's stored value (V1030).
+//! column's stored value (V1030), and `link_item_genres` reads the Genres bit
+//! to keep a locked genre list (spec 043).
 
 #[cfg(test)]
 use pharos_core::EditableField;
@@ -145,7 +146,7 @@ macro_rules! edit_impl {
                 let locked: Option<i64> = match target {
                     EditTarget::Item(id) => {
                         let b = ItemBinds::of(edit);
-                        sqlx::query_scalar(EDIT_ITEM)
+                        let row: Option<i64> = sqlx::query_scalar(EDIT_ITEM)
                             .bind(b.title.is_some())
                             .bind(b.title)
                             .bind(b.title_fold)
@@ -171,7 +172,14 @@ macro_rules! edit_impl {
                             .bind(item_id(*id)?)
                             .fetch_optional(self.pool())
                             .await
-                            .map_err(backend)?
+                            .map_err(backend)?;
+                        // Genres are a join, not a column. The UPDATE above set
+                        // their lock first, so no scan relinks them in between
+                        // (spec 043 FR-011, FR-012).
+                        if let (Some(_), Some(genres)) = (row, edit.genres.as_deref()) {
+                            self.write_item_genres(*id, genres, false).await?;
+                        }
+                        row
                     }
                     EditTarget::Series { key, name } => {
                         let set = edit.fields().without(edit.unlock);

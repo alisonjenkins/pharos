@@ -763,6 +763,82 @@ impl crate::ServerConfigStore for SqliteStore {
 }
 
 impl SqliteStore {
+    /// Replace `item`'s genre links with `names` (trimmed, blanks and repeats
+    /// dropped). With `respect_lock`, an item whose Genres an admin locked is
+    /// left alone (spec 043 FR-012): every writer but the admin edit passes
+    /// `true`. The lock is read in the same transaction as the write.
+    pub(crate) async fn write_item_genres(
+        &self,
+        item: MediaId,
+        names: &[String],
+        respect_lock: bool,
+    ) -> DomainResult<()> {
+        let backend = |e: sqlx::Error| DomainError::Backend(e.to_string());
+        let item_i64 =
+            i64::try_from(item).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let mut wanted: Vec<String> = Vec::new();
+        for n in names {
+            let t = n.trim();
+            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
+                wanted.push(t.to_string());
+            }
+        }
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        if respect_lock {
+            let locked: Option<i64> =
+                sqlx::query_scalar("SELECT locked_fields FROM media_items WHERE id = ?")
+                    .bind(item_i64)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+            if locked.is_some_and(|bits| {
+                pharos_core::LockedFields::from_bits(bits)
+                    .contains(pharos_core::EditableField::Genres)
+            }) {
+                tracing::debug!(
+                    media.id = item,
+                    kept_out = ?wanted,
+                    "genres locked by an admin edit; not relinked"
+                );
+                return Ok(());
+            }
+        }
+        // Replace this item's links wholesale so a rescan that dropped a
+        // genre doesn't leave a stale join row.
+        sqlx::query("DELETE FROM item_genres WHERE item_id = ?")
+            .bind(item_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        for name in &wanted {
+            let wire_id = pharos_core::genre_wire_id(name);
+            sqlx::query(
+                "INSERT INTO genres (name, wire_id) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&wire_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            let (gid,) = sqlx::query_as::<_, (i64,)>("SELECT id FROM genres WHERE name = ?")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(backend)?;
+            sqlx::query(
+                "INSERT INTO item_genres (item_id, genre_id) VALUES (?, ?) \
+                 ON CONFLICT(item_id, genre_id) DO NOTHING",
+            )
+            .bind(item_i64)
+            .bind(gid)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn put_rows_in_tx(&self, rows: &[&MediaItem]) -> DomainResult<()> {
         use crate::sqlite_put::{bind_item, upsert_sql, MAX_ROWS_PER_STATEMENT};
         let backend = |e: sqlx::Error| DomainError::Backend(e.to_string());
@@ -1860,58 +1936,7 @@ impl GenreStore for SqliteStore {
 
     #[tracing::instrument(skip(self, names), fields(media.id = %item))]
     async fn link_item_genres(&self, item: MediaId, names: &[String]) -> DomainResult<()> {
-        let item_i64 =
-            i64::try_from(item).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
-        // Normalise: trim, drop blanks, de-dup — the same set the
-        // /Genres list + ParentId pivot resolve against.
-        let mut wanted: Vec<String> = Vec::new();
-        for n in names {
-            let t = n.trim();
-            if !t.is_empty() && !wanted.iter().any(|w| w == t) {
-                wanted.push(t.to_string());
-            }
-        }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        // Replace this item's links wholesale so a rescan that dropped a
-        // genre doesn't leave a stale join row.
-        sqlx::query("DELETE FROM item_genres WHERE item_id = ?")
-            .bind(item_i64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        for name in &wanted {
-            let wire_id = pharos_core::genre_wire_id(name);
-            sqlx::query(
-                "INSERT INTO genres (name, wire_id) VALUES (?, ?) ON CONFLICT(name) DO NOTHING",
-            )
-            .bind(name)
-            .bind(&wire_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-            let (gid,) = sqlx::query_as::<_, (i64,)>("SELECT id FROM genres WHERE name = ?")
-                .bind(name)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| DomainError::Backend(e.to_string()))?;
-            sqlx::query(
-                "INSERT INTO item_genres (item_id, genre_id) VALUES (?, ?) \
-                 ON CONFLICT(item_id, genre_id) DO NOTHING",
-            )
-            .bind(item_i64)
-            .bind(gid)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        Ok(())
+        self.write_item_genres(item, names, true).await
     }
 
     #[tracing::instrument(skip(self))]
