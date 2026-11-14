@@ -493,6 +493,18 @@ pub fn artwork_source_is_item_servable(source: &str) -> bool {
     )
 }
 
+/// `artwork.source` of a Primary that is not a file pharos holds but a cover
+/// inside the media file itself; the image route extracts it on demand (B1437).
+/// Deliberately not [`artwork_source_is_item_servable`]: there is no locator
+/// file to serve or sweep, so the route falls through to extraction.
+pub const EMBEDDED_ARTWORK_SOURCE: &str = "embedded";
+
+/// Whether a Primary row of this `source` lets the item advertise a Primary
+/// image: every servable source, plus an embedded cover (V1411, V82).
+pub fn artwork_source_advertises_primary(source: &str) -> bool {
+    artwork_source_is_item_servable(source) || source.eq_ignore_ascii_case(EMBEDDED_ARTWORK_SOURCE)
+}
+
 /// One `artwork` row as the stale-art sweep reads it. `(item_id, role)` keys
 /// the row; `source` and `locator` say where its bytes are supposed to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2778,7 +2790,7 @@ pub struct MediaProbe {
     #[serde(default)]
     pub picture_check: Option<PictureCheck>,
     /// The file carries an embedded cover (an `attached_pic` stream). Set by
-    /// the prober, read by the scanner to record an embedded
+    /// the prober, read by the scanner to record an [`EMBEDDED_ARTWORK_SOURCE`]
     /// Primary row (B1437). Not stored: the artwork row is the record.
     // No `skip_serializing_if`: bincode over the worker pipe (see above).
     #[serde(default)]
@@ -3265,6 +3277,15 @@ mod artwork_source_tests {
         // care.
         assert!(artwork_source_is_item_servable("Local"));
         assert!(artwork_source_is_item_servable("MusicBrainz"));
+    }
+
+    #[test]
+    fn embedded_cover_advertises_but_is_not_a_servable_file() {
+        use super::artwork_source_advertises_primary;
+        assert!(artwork_source_advertises_primary("embedded"));
+        assert!(artwork_source_advertises_primary("local"));
+        assert!(!artwork_source_advertises_primary("url"));
+        assert!(!artwork_source_is_item_servable("embedded"));
     }
 
     #[test]

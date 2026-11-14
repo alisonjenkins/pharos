@@ -1373,7 +1373,7 @@ impl MediaStore for PostgresStore {
         // item-servable, so it clears the flag. Non-Primary roles never touch
         // it.
         if role.eq_ignore_ascii_case("Primary") {
-            let servable = pharos_core::artwork_source_is_item_servable(source);
+            let servable = pharos_core::artwork_source_advertises_primary(source);
             sqlx::query("UPDATE media_items SET has_primary_art = $1 WHERE id = $2")
                 .bind(servable)
                 .bind(id_i64)
