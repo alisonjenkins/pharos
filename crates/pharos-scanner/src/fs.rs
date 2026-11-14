@@ -248,6 +248,9 @@ pub struct FsScanner<P: Prober> {
     /// counter must report the same rate wherever the scan runs — and then
     /// dropped, so no `Primary` row is written and no tag is advertised.
     cover_sink: Option<Arc<dyn CoverSink>>,
+    /// ADR-0126 — the roots of the Books libraries, under which a video is a
+    /// course lesson ([`crate::course`]). Empty: no video is a lesson.
+    course_roots: Vec<PathBuf>,
 }
 
 /// 004-books (T063) — destination for a book cover's bytes.
@@ -346,6 +349,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
+            course_roots: Vec::new(),
         }
     }
 
@@ -365,6 +369,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
+            course_roots: Vec::new(),
         }
     }
 
@@ -433,6 +438,29 @@ impl<P: Prober> FsScanner<P> {
     pub fn with_cover_sink(mut self, sink: Arc<dyn CoverSink>) -> Self {
         self.cover_sink = Some(sink);
         self
+    }
+
+    /// ADR-0126 — the Books library roots, under which a video is read as a
+    /// course lesson rather than a film.
+    pub fn with_course_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.course_roots = roots.into_iter().collect();
+        self
+    }
+
+    /// The lesson `path` is, under this scanner's Books roots.
+    fn course_lesson(&self, path: &Path) -> Option<crate::course::CourseLesson> {
+        crate::course::lesson(path, &self.course_roots)
+    }
+
+    /// A lesson keeps the title its name gives: the filename resolver would
+    /// otherwise put its numbers back.
+    fn keep_lesson_title(&self, item: &mut MediaItem) {
+        if item.kind != MediaKind::Episode {
+            return;
+        }
+        if let Some(lesson) = self.course_lesson(&item.path) {
+            item.title = lesson.title;
+        }
     }
 
     /// LIB-D7 — override the metadata resolver. Production callers use the
@@ -651,6 +679,11 @@ impl<P: Prober> FsScanner<P> {
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
+        // A course's lessons are neither a show to split nor copies of one
+        // another: two modules can each hold an `Introduction` (ADR-0126).
+        let (lessons, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| self.course_lesson(p).is_some());
         let series_folders = crate::series_split::folders_of(&paths);
         let root_prefix = root.to_string_lossy().into_owned();
         // The split runs before the fold, so a split folder's groups are
@@ -701,6 +734,7 @@ impl<P: Prober> FsScanner<P> {
             .instrument(tracing::info_span!("scan.book_formats"))
             .await;
         groups.extend(stacks);
+        groups.extend(lessons.into_iter().map(|p| (p, Vec::new())));
         tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
@@ -1127,6 +1161,7 @@ impl<P: Prober> FsScanner<P> {
                     collections,
                     tags,
                 } = merge_metadata_into_item(&mut item, meta);
+                self.keep_lesson_title(&mut item);
                 // Captured before `put` consumes the item; the cover write below
                 // needs them and must run AFTER the row exists.
                 let (item_kind, item_path) = (item.kind, item.path.clone());
@@ -1672,6 +1707,7 @@ impl<P: Prober> FsScanner<P> {
             collections,
             tags,
         } = merge_metadata_into_item(&mut item, meta);
+        self.keep_lesson_title(&mut item);
         let item_kind = item.kind;
         let stale = match existing {
             Some(_) => store
@@ -1891,9 +1927,23 @@ impl<P: Prober> FsScanner<P> {
                         probe.size_bytes = Some(meta.len());
                     }
                 }
+                // ADR-0126 — a video under a Books root is a course lesson,
+                // whatever its name looks like.
+                let lesson = matches!(info.kind, MediaKind::Movie)
+                    .then(|| self.course_lesson(&path))
+                    .flatten();
+                if let Some(lesson) = &lesson {
+                    record_course_lesson(&path, lesson, &self.course_roots);
+                }
+                let title = match &lesson {
+                    Some(lesson) => lesson.title.clone(),
+                    None => title,
+                };
                 // Promote video-kind items to Episode when the path
                 // looks like a TV layout. Audio stays as classified.
-                let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_file(&path) {
+                let kind = if lesson.is_some() {
+                    MediaKind::Episode
+                } else if matches!(info.kind, MediaKind::Movie) && is_episode_file(&path) {
                     let reason = if is_episode_path(&path) {
                         "name_or_season_folder"
                     } else {
@@ -1911,7 +1961,9 @@ impl<P: Prober> FsScanner<P> {
                 // Every probe path (full scan, edition grouping, watcher)
                 // goes through here, so 3D resolution happens once.
                 resolve_item_3d_format(&path, kind, &mut probe);
-                let series = if matches!(kind, MediaKind::Episode) {
+                let series = if let Some(lesson) = lesson {
+                    Some(lesson.series)
+                } else if matches!(kind, MediaKind::Episode) {
                     episode_series_info(&path)
                 } else {
                     None
@@ -1955,6 +2007,50 @@ impl<P: Prober> FsScanner<P> {
             }
         }
     }
+}
+
+/// What became of a video read as a course lesson: the
+/// `outcome` label of `pharos_scan_course_lesson_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CourseLessonOutcome {
+    /// Probed and stored as an episode of its course.
+    Classified,
+}
+
+impl CourseLessonOutcome {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 1] = [Self::Classified];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Classified => "classified",
+        }
+    }
+}
+
+/// ADR-0126 — a probed video read as a course lesson: logged with where it
+/// sits in its course, and counted.
+fn record_course_lesson(path: &Path, lesson: &crate::course::CourseLesson, roots: &[PathBuf]) {
+    let root = roots.iter().find(|r| path.starts_with(r));
+    let module = lesson
+        .series
+        .series_folder
+        .as_deref()
+        .and_then(|folder| crate::course::module_title(path, Path::new(folder)));
+    tracing::info!(
+        path = %path.display(),
+        course = %lesson.series.series_name,
+        module = module.as_deref().unwrap_or(""),
+        season = lesson.series.season_number,
+        episode = lesson.series.episode_number,
+        root = %root.map(|r| r.display().to_string()).unwrap_or_default(),
+        "scanner: video in a books library read as a course lesson"
+    );
+    metrics::counter!(
+        "pharos_scan_course_lesson_total",
+        "outcome" => CourseLessonOutcome::Classified.label()
+    )
+    .increment(1);
 }
 
 /// What follows a probed item's row write: the entity joins, artwork, the
@@ -11868,5 +11964,138 @@ mod tests {
         ] {
             assert!(!reshapes_indexed_rows(Path::new(other)), "{other}");
         }
+    }
+
+    fn counter_labelled(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        label: &str,
+        value: &str,
+    ) -> u64 {
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == name
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == label && l.value() == value) =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// V1392 — each course layout under a Books root is stored as lessons of
+    /// its course, two modules' same-named lessons stay two items, and every
+    /// lesson is counted.
+    #[tokio::test]
+    async fn videos_under_a_books_root_are_stored_as_course_lessons() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let files = [
+            (
+                "Intro to Widgets/01 - Basics/01 - Introduction.mp4",
+                1,
+                Some(1),
+                "Introduction",
+            ),
+            (
+                "Intro to Widgets/02 - Assembly/01 - Introduction.mp4",
+                2,
+                Some(1),
+                "Introduction",
+            ),
+            (
+                "Intro to Widgets/02 - Assembly/03_-_0201_Fitting_the_Base.mp4",
+                2,
+                Some(201),
+                "Fitting the Base",
+            ),
+            (
+                "Widget Repair/02. Tools/02_05-Choosing.mp4",
+                2,
+                Some(5),
+                "Choosing",
+            ),
+            ("Widget Care/03/007 Cleaning.mp4", 3, Some(7), "Cleaning"),
+            (
+                "Widget Basics/01 - Getting Started.mp4",
+                1,
+                Some(1),
+                "Getting Started",
+            ),
+            ("Widget Basics/02 - Wrap Up.mp4", 1, Some(2), "Wrap Up"),
+            (
+                "Widget Basics/02 - Wrap Up - Extended.mp4",
+                1,
+                Some(2),
+                "Wrap Up - Extended",
+            ),
+        ];
+        for (f, ..) in files {
+            touch(td.path(), f).await;
+        }
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default()).with_course_roots([td.path().to_path_buf()]);
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(out.added.len(), files.len(), "{out:?}");
+        for (f, season, episode, title) in files {
+            let item = store.get(stable_id(&td.path().join(f))).await.unwrap();
+            assert_eq!(item.kind, MediaKind::Episode, "{f}");
+            assert_eq!(item.title, title, "{f}");
+            let series = item.series.unwrap();
+            let course = f.split('/').next().unwrap();
+            assert_eq!(series.series_name, course, "{f}");
+            assert_eq!(
+                series.series_folder.as_deref(),
+                Some(td.path().join(course).to_string_lossy().as_ref()),
+                "{f}"
+            );
+            assert_eq!(
+                (series.season_number, series.episode_number),
+                (Some(season), episode),
+                "{f}"
+            );
+            assert_eq!(series.series_year, None, "{f}");
+        }
+        assert_eq!(
+            counter_labelled(
+                &snapshotter,
+                "pharos_scan_course_lesson_total",
+                "outcome",
+                "classified"
+            ),
+            files.len() as u64
+        );
+    }
+
+    /// V1392 — with no Books root the same video is a film, as before.
+    #[tokio::test]
+    async fn a_video_outside_any_books_root_is_not_a_lesson() {
+        let td = TempDir::new().unwrap();
+        let f = "Intro to Widgets/02 - Assembly/01 - Introduction.mp4";
+        touch(td.path(), f).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .with_course_roots([td.path().join("Books")])
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let item = store.get(stable_id(&td.path().join(f))).await.unwrap();
+        assert_eq!(item.kind, MediaKind::Movie);
+    }
+
+    #[test]
+    fn course_lesson_outcome_labels_are_distinct() {
+        let labels: HashSet<&str> = CourseLessonOutcome::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), CourseLessonOutcome::ALL.len());
     }
 }
