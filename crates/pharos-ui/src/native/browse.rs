@@ -362,6 +362,14 @@ pub enum Browse {
         artists: Page,
         albums: Page,
     },
+    /// A Books library: its books, and its video courses as series
+    /// (ADR-0126).
+    Books {
+        title: String,
+        library: ItemRef,
+        books: Page,
+        courses: Page,
+    },
     Artist {
         detail: Detail,
         albums: Page,
@@ -394,7 +402,8 @@ impl Browse {
         match self {
             Browse::Grid { title, .. }
             | Browse::Mixed { title, .. }
-            | Browse::Music { title, .. } => title.clone(),
+            | Browse::Music { title, .. }
+            | Browse::Books { title, .. } => title.clone(),
             Browse::Show(show) => match show
                 .seasons
                 .iter()
@@ -498,6 +507,8 @@ pub enum Plan {
     /// other stored items; episodes appear only inside their series.
     MixedLibrary,
     MusicLibrary,
+    /// A Books library: its books, and its courses on a tab of their own.
+    BooksLibrary,
     /// A series: its seasons, the first regular one shown.
     Series,
     /// A season: its series' page with this season shown.
@@ -515,6 +526,7 @@ pub fn plan(detail: Option<&Detail>) -> Plan {
     match (item.kind, item.library_kind) {
         (ItemKind::Library, Some(LibraryKind::TvShows)) => Plan::SeriesGrid,
         (ItemKind::Library, Some(LibraryKind::Music)) => Plan::MusicLibrary,
+        (ItemKind::Library, Some(LibraryKind::Books)) => Plan::BooksLibrary,
         (ItemKind::Library, Some(LibraryKind::Mixed)) => Plan::MixedLibrary,
         (ItemKind::Series, _) => Plan::Series,
         (ItemKind::Season, _) => Plan::Season {
@@ -735,6 +747,25 @@ pub async fn load<A: PharosApi>(
                 albums,
             }
         }
+        (Plan::BooksLibrary, _) => {
+            // The books are the page; a course listing that fails leaves
+            // the library as it was before it had courses.
+            let (books, courses) = join(
+                paged(Listing::of(id, None, "SortName")),
+                grid(id, Some(ItemKind::Series), "SortName"),
+            )
+            .await;
+            let courses = courses.unwrap_or_else(|e| {
+                warn(format!("pharos: browse {id}: courses unavailable: {e}"));
+                Page::default()
+            });
+            Browse::Books {
+                title,
+                library: id,
+                books: books?,
+                courses,
+            }
+        }
         (Plan::Series, series) => {
             // The seasons and the viewer's last played episode do not depend
             // on each other: one round trip for both (FR-205).
@@ -950,6 +981,12 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
             artists,
             albums,
         } => rsx! { MusicLibraryView { title, library, artists, albums } },
+        Browse::Books {
+            title,
+            library,
+            books,
+            courses,
+        } => rsx! { BooksLibraryView { title, library, books, courses } },
         Browse::Artist { detail, albums } => rsx! { ArtistView { detail, albums } },
         Browse::Album { detail, tracks } => rsx! { AlbumView { detail, tracks } },
     }
@@ -3067,6 +3104,180 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
     }
 }
 
+/// Which list a Books library shows (ADR-0126).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooksTab {
+    Books,
+    /// Its video courses, each opening on the show page.
+    Courses,
+}
+
+impl BooksTab {
+    pub const ALL: [Self; 2] = [Self::Books, Self::Courses];
+
+    /// Its `tab=` value in the URL.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Books => "books",
+            Self::Courses => "courses",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Books => "Books",
+            Self::Courses => "Courses",
+        }
+    }
+
+    /// The tab button's `id`, which an arrow key focuses.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Books => "pharos-books-tab-books",
+            Self::Courses => "pharos-books-tab-courses",
+        }
+    }
+
+    /// The tab an arrow key, Home or End moves to from this one, wrapping
+    /// at either end; `None` for any other key.
+    pub fn stepped(self, key: &Key) -> Option<Self> {
+        let at = Self::ALL.iter().position(|t| *t == self)?;
+        let last = Self::ALL.len() - 1;
+        let to = match key {
+            Key::Named(NamedKey::ArrowRight) => (at + 1) % Self::ALL.len(),
+            Key::Named(NamedKey::ArrowLeft) => at.checked_sub(1).unwrap_or(last),
+            Key::Named(NamedKey::Home) => 0,
+            Key::Named(NamedKey::End) => last,
+            _ => return None,
+        };
+        Self::ALL.get(to).copied()
+    }
+}
+
+/// A Books library's URL query for `tab`, `?` included: empty for Books,
+/// whose grid keeps its own filter choice there.
+pub fn books_query(tab: BooksTab) -> String {
+    match tab {
+        BooksTab::Books => String::new(),
+        tab => format!("?tab={}", tab.token()),
+    }
+}
+
+/// The tab a Books library's URL query names; anything missing or unknown
+/// is Books.
+pub fn books_choice(query: &str) -> BooksTab {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("tab="))
+        .and_then(|t| BooksTab::ALL.into_iter().find(|tab| tab.token() == t))
+        .unwrap_or(BooksTab::Books)
+}
+
+/// A Books library: its books' grid, unchanged, and once it has any
+/// courses, a Courses tab of their series tiles (B1424). The tab is kept in
+/// the URL, so Back returns to it.
+#[component]
+pub fn BooksLibraryView(title: String, library: ItemRef, books: Page, courses: Page) -> Element {
+    if courses.total == 0 {
+        return rsx! {
+            GridView {
+                title,
+                page: books,
+                more: Some(Listing::of(library, None, "SortName")),
+                library: true,
+                sets: false,
+            }
+        };
+    }
+    rsx! { BooksTabs { title, library, books, courses } }
+}
+
+#[component]
+fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Element {
+    let opened = use_hook(|| {
+        if Route::parse(&platform::current_path()) == Route::Browse(library) {
+            books_choice(&platform::current_search())
+        } else {
+            BooksTab::Books
+        }
+    });
+    let mut tab = use_signal(|| opened);
+    use_effect(move || {
+        let tab = tab();
+        let here = Route::parse(&platform::current_path()) == Route::Browse(library);
+        let search = platform::current_search();
+        // The Books grid writes its own filter choice; only a stale tab is
+        // taken off for it.
+        let stale = match tab {
+            BooksTab::Books => books_choice(&search) != BooksTab::Books,
+            _ => search != books_query(tab),
+        };
+        if here && stale {
+            platform::replace(&format!(
+                "{}{}",
+                Route::Browse(library).path(),
+                books_query(tab)
+            ));
+        }
+    });
+    rsx! {
+        section { class: "pharos-browse pharos-browse-library pharos-books",
+            h2 { "{title}" }
+            div { class: "pharos-books-bar",
+                div {
+                    class: "pharos-tabs",
+                    role: "tablist",
+                    aria_label: "{title}",
+                    "data-key-tabs": "books",
+                    onkeydown: move |e: KeyboardEvent| {
+                        if let Some(next) = tab().stepped(&e.key()) {
+                            e.prevent_default();
+                            tab.set(next);
+                            platform::focus_by_id(next.id());
+                        }
+                    },
+                    for t in BooksTab::ALL {
+                        button {
+                            key: "{t.token()}",
+                            r#type: "button",
+                            role: "tab",
+                            id: t.id(),
+                            class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                            aria_selected: tab() == t,
+                            tabindex: if tab() == t { "0" } else { "-1" },
+                            onclick: move |_| tab.set(t),
+                            "{t.label()}"
+                        }
+                    }
+                }
+            }
+            match tab() {
+                BooksTab::Books => remount_on(
+                    &format!("books {library}"),
+                    rsx! {
+                        LibraryGrid {
+                            first: books.clone(),
+                            base: Listing::of(library, None, "SortName"),
+                            sets: false,
+                        }
+                    },
+                ),
+                BooksTab::Courses => remount_on(
+                    &format!("courses {library}"),
+                    rsx! {
+                        PagedGrid {
+                            first: courses.clone(),
+                            source: Listing::of(library, Some(ItemKind::Series), "SortName"),
+                            rail: Some(Rail::Letters),
+                        }
+                    },
+                ),
+            }
+        }
+    }
+}
+
 /// A music library's albums in the order chosen on the tab row's Sort
 /// pill.
 /// The albums by name were fetched with the page; any other order is
@@ -4097,6 +4308,8 @@ mod tests {
         refuse_lists: bool,
         /// Refuses the listings of these parents only.
         refuse_parents: Vec<ItemRef>,
+        /// Refuses the listings grouped as these kinds only.
+        refuse_groups: Vec<ItemKind>,
         /// Whether each listing asked for box sets folded (B1086).
         collapsed: RefCell<Vec<bool>>,
     }
@@ -4135,7 +4348,10 @@ mod tests {
                 start,
                 limit,
             ));
-            if self.refuse_lists || self.refuse_parents.contains(&parent) {
+            if self.refuse_lists
+                || self.refuse_parents.contains(&parent)
+                || group.is_some_and(|g| self.refuse_groups.contains(&g))
+            {
                 return Err(refused());
             }
             let all = self
@@ -4878,6 +5094,7 @@ mod tests {
         };
         assert_eq!(plan(Some(&library(LibraryKind::TvShows))), Plan::SeriesGrid);
         assert_eq!(plan(Some(&library(LibraryKind::Music))), Plan::MusicLibrary);
+        assert_eq!(plan(Some(&library(LibraryKind::Books))), Plan::BooksLibrary);
         assert_eq!(plan(Some(&library(LibraryKind::Movies))), Plan::Grid);
         assert_eq!(plan(Some(&library(LibraryKind::Mixed))), Plan::MixedLibrary);
         assert_eq!(plan(None), Plan::Grid);
@@ -4949,6 +5166,172 @@ mod tests {
         let (part, start, limit) = chain.step(BROWSE_PAGE, BROWSE_PAGE);
         assert_eq!(chain.listing(part).group, Some(ItemKind::Series));
         assert_eq!((start, limit), (BROWSE_PAGE, 20));
+    }
+
+    /// B1424: a Books library loads its books' grid as before and its
+    /// courses as series.
+    #[test]
+    fn a_books_library_loads_its_books_and_its_courses() {
+        let lib = ItemRef::Synth(61);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Reading");
+        l.library_kind = Some(LibraryKind::Books);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, None),
+            vec![item(ItemRef::Real(1), ItemKind::Book, "Widget Handbook")],
+        );
+        fake.lists.insert(
+            (lib, Some(ItemKind::Series)),
+            vec![item(
+                ItemRef::Synth(2),
+                ItemKind::Series,
+                "Intro to Widgets",
+            )],
+        );
+        let Browse::Books {
+            library,
+            books,
+            courses,
+            ..
+        } = run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a books library");
+        };
+        assert_eq!(library, lib);
+        assert_eq!(books.items[0].name, "Widget Handbook");
+        assert_eq!(courses.items[0].name, "Intro to Widgets");
+        assert!(fake
+            .asked
+            .borrow()
+            .iter()
+            .any(|(parent, group, _)| *parent == lib && *group == Some(ItemKind::Series)));
+    }
+
+    /// B1424: courses that cannot be listed leave the books' grid shown.
+    #[test]
+    fn a_books_library_whose_courses_fail_still_lists_its_books() {
+        let lib = ItemRef::Synth(61);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Reading");
+        l.library_kind = Some(LibraryKind::Books);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, None),
+            vec![item(ItemRef::Real(1), ItemKind::Book, "Widget Handbook")],
+        );
+        fake.lists.insert(
+            (lib, Some(ItemKind::Series)),
+            vec![item(
+                ItemRef::Synth(2),
+                ItemKind::Series,
+                "Intro to Widgets",
+            )],
+        );
+        fake.refuse_groups = vec![ItemKind::Series];
+        let warned = RefCell::new(Vec::new());
+        let Browse::Books { books, courses, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |line| {
+                warned.borrow_mut().push(line)
+            }))
+            .unwrap()
+        else {
+            panic!("not a books library");
+        };
+        assert_eq!(books.items.len(), 1);
+        assert_eq!(courses.total, 0);
+        assert!(
+            warned
+                .borrow()
+                .iter()
+                .any(|l| l.contains("courses unavailable")),
+            "{:?}",
+            warned.borrow()
+        );
+    }
+
+    #[test]
+    fn a_books_tab_round_trips_through_the_url() {
+        assert_eq!(books_query(BooksTab::Books), "");
+        assert_eq!(books_query(BooksTab::Courses), "?tab=courses");
+        for tab in BooksTab::ALL {
+            assert_eq!(books_choice(&books_query(tab)), tab);
+        }
+        assert_eq!(books_choice("?sort=year&tab=courses"), BooksTab::Courses);
+        assert_eq!(books_choice("?tab=nonsense"), BooksTab::Books);
+        assert_eq!(books_choice("?sort=year"), BooksTab::Books);
+        let tokens: HashSet<&str> = BooksTab::ALL.iter().map(|t| t.token()).collect();
+        assert_eq!(tokens.len(), BooksTab::ALL.len());
+    }
+
+    #[test]
+    fn the_books_tabs_step_with_the_arrows() {
+        let key = |k| Key::Named(k);
+        assert_eq!(
+            BooksTab::Books.stepped(&key(NamedKey::ArrowRight)),
+            Some(BooksTab::Courses)
+        );
+        assert_eq!(
+            BooksTab::Courses.stepped(&key(NamedKey::ArrowRight)),
+            Some(BooksTab::Books)
+        );
+        assert_eq!(
+            BooksTab::Books.stepped(&key(NamedKey::ArrowLeft)),
+            Some(BooksTab::Courses)
+        );
+        assert_eq!(
+            BooksTab::Courses.stepped(&key(NamedKey::Home)),
+            Some(BooksTab::Books)
+        );
+        assert_eq!(
+            BooksTab::Books.stepped(&key(NamedKey::End)),
+            Some(BooksTab::Courses)
+        );
+        assert_eq!(BooksTab::Books.stepped(&Key::Character("a".into())), None);
+    }
+
+    /// B1424: the tab row shows only once the library has a course; without
+    /// one the books' grid is the page, as before.
+    #[test]
+    fn a_books_library_shows_its_tabs_only_with_courses() {
+        let view = |courses: Vec<Item>| {
+            render(move || {
+                let api = use_signal(|| None::<pharos_client::api::NativeApi>);
+                let machine = use_signal(super::super::machine::Machine::new);
+                let marks = use_signal(|| 0);
+                use_context_provider(|| Ctx {
+                    api,
+                    machine,
+                    marks,
+                });
+                rsx! {
+                    BooksLibraryView {
+                        title: "Reading".to_owned(),
+                        library: ItemRef::Real(1),
+                        books: page(vec![item(ItemRef::Real(2), ItemKind::Book, "Widget Handbook")]),
+                        courses: page(courses.clone()),
+                    }
+                }
+            })
+        };
+        let plain = view(Vec::new());
+        assert!(!plain.contains("role=\"tablist\""), "{plain}");
+        let tabbed = view(vec![item(
+            ItemRef::Synth(3),
+            ItemKind::Series,
+            "Intro to Widgets",
+        )]);
+        let bar = tabbed
+            .split("class=\"pharos-books-bar\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no tab row: {tabbed}"));
+        assert!(bar.contains("role=\"tablist\""), "{tabbed}");
+        assert!(tabbed.contains("data-key-tabs=\"books\""), "{tabbed}");
+        assert!(
+            tabbed.contains("id=\"pharos-books-tab-courses\""),
+            "{tabbed}"
+        );
+        assert_eq!(tabbed.matches("role=\"tab\"").count(), 2, "{tabbed}");
     }
 
     #[test]
@@ -5621,7 +6004,8 @@ mod tests {
         assert!(sets(&opened(ItemRef::Real(9))));
         assert!(!sets(&opened(ItemRef::Real(8))));
         assert!(!sets(&opened(set)));
-        assert_eq!(*fake.collapsed.borrow(), [true, false, false]);
+        // The Books library asks for its books and its courses.
+        assert_eq!(*fake.collapsed.borrow(), [true, false, false, false]);
         assert!(collections_on(None));
         assert!(collections_on(Some("on")));
         assert!(!collections_on(Some("off")));
@@ -6381,11 +6765,15 @@ mod tests {
         // The filter row scrolls sideways too (B1311), and so does the
         // music library's tab row (B1334), whose tabs inside it are no
         // scroll box of their own to clip the ring again.
-        for row in [nav, rule(".pharos-filters"), rule(".pharos-music-bar")] {
+        for row in [
+            nav,
+            rule(".pharos-filters"),
+            rule(".pharos-music-bar,\n.pharos-books-bar"),
+        ] {
             assert!(px(&row, "padding") >= reach, "{row}\nreach {reach}");
             assert!(row.contains("overflow-x: auto"), "{row}");
         }
-        let tabs = rule(".pharos-music-bar .pharos-tabs");
+        let tabs = rule(".pharos-music-bar .pharos-tabs,\n.pharos-books-bar .pharos-tabs");
         assert!(tabs.contains("overflow: visible"), "{tabs}");
     }
 
