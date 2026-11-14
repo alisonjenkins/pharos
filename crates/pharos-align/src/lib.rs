@@ -19,6 +19,7 @@ pub mod offset;
 pub mod pin;
 pub mod placement;
 pub mod plan;
+pub mod recognise;
 pub mod refine;
 pub mod service;
 pub mod text;
