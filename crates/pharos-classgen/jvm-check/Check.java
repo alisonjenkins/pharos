@@ -148,8 +148,8 @@ public class Check {
     MediaSession session = MediaSession.last;
     expect(session.state.state == 6, "a new item is BUFFERING until prepared: " + session.state);
     expect(session.flags == 3, "session handles media buttons and transport controls");
-    expect(session.activity != null && session.activity.intent.target.getSimpleName().equals("PharosSearchActivity")
-        && session.activity.flags == 67108864, "session activity is an immutable intent for PharosSearchActivity");
+    expect(session.activity != null && session.activity.intent.target.getSimpleName().equals("MainActivity")
+        && session.activity.flags == 67108864, "session activity is an immutable intent for the launcher MainActivity");
     expect((session.state.actions & (16384 | 32768 | 65536)) == (16384 | 32768 | 65536), "PREPARE actions advertised");
     cb.onPause();
     expect(session.state.state == 2, "a pause while preparing is kept: " + session.state);
