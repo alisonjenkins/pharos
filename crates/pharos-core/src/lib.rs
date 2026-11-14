@@ -3386,7 +3386,11 @@ pub const PROBE_SCHEMA_VERSION: i64 = 9;
 /// v3: a book's subjects (`dc:subject`, EXTH 105, PDF `/Keywords`) are read
 /// and mapped to shelves stored as its genres (spec 043), so every book row
 /// must be re-read to gain them.
-pub const BOOK_SCHEMA_VERSION: i64 = 3;
+///
+/// v4: a stem title also loses a bracketed format or edition tag (`[eBook]`,
+/// `[Kindle in Motion]`) and a trailing `-ebook` (B1433), so every book row
+/// must be re-read to lose them.
+pub const BOOK_SCHEMA_VERSION: i64 = 4;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
