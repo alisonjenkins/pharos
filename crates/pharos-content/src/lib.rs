@@ -22,6 +22,7 @@ mod library;
 mod net;
 mod node;
 mod prefetch;
+pub mod ranged;
 mod resume;
 #[cfg(test)]
 mod testlog;
