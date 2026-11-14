@@ -7,3 +7,7 @@ android_manifest = "android/AndroidManifest.xml"
 [bundle]
 identifier = "com.alisonjenkins.pharos.phone"
 publisher = "pharos"
+
+# MediaBrowserService and the car's browse hints need Android 8 (API 26).
+[android]
+min_sdk = 26
