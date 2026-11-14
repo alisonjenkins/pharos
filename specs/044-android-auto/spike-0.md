@@ -1,8 +1,12 @@
 # 044 slice 0 spike — results (2026-11-14)
 
 **Verdict: go.** A phone app with no Java or Kotlin source works in Android
-Auto. Code: `spikes/044-android-auto/` on branch
-`claude/project-thread-7hfc6m`. Decision: ADR-0127.
+Auto. The spike code lived in `spikes/044-android-auto/`; it was removed
+once the phone app covered it (T32) and git history keeps it. It now lives
+in `crates/pharos-classgen` (class writer, `jvm-check/`), `crates/pharos-content`
+(library, cache), `crates/pharos-android` (JNI service, session, player) and
+`crates/pharos-phone` (the app), built by `scripts/android-phone-apk.sh`.
+Decision: ADR-0127.
 
 ## What was built
 
