@@ -52,4 +52,21 @@ impl CoverSink for ImageCacheCoverSink {
                 .map_err(std::io::Error::other)
         })
     }
+
+    fn forget<'a>(
+        &'a self,
+        item_id: MediaId,
+        role: &'a str,
+        kind: MediaKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(role) = ImageRole::from_str_ci(role) else {
+                return Ok(());
+            };
+            self.cache
+                .remove(item_id, role, kind, 0)
+                .await
+                .map_err(std::io::Error::other)
+        })
+    }
 }
