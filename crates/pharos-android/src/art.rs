@@ -17,7 +17,7 @@ use jni::objects::{JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jobject};
 use jni::JNIEnv;
 
-use crate::{jerr, log, string, R};
+use crate::{jerr, log, string, take_exception, R};
 
 /// The spike APK's authority, used until [`set_authority`] runs and in tests.
 const FALLBACK_AUTHORITY: &str = "com.alisonjenkins.pharos.auto.art";
@@ -194,7 +194,10 @@ fn download(env: &mut JNIEnv, url: &str, dest: &str) -> R<()> {
             ],
         )
         .and_then(|v| v.j())
-        .map_err(jerr("Files.copy"));
+        .map_err(|e| {
+            let exception = take_exception(env);
+            format!("Files.copy: {e}{exception}")
+        });
     let _ = env.call_method(&input, "close", "()V", &[]);
     let bytes = match copied {
         Ok(n) => n,
