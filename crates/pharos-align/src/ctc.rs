@@ -52,7 +52,7 @@ impl<'a> Emission<'a> {
         }
     }
 
-    fn at(&self, t: usize, c: u32) -> f32 {
+    pub(crate) fn at(&self, t: usize, c: u32) -> f32 {
         self.data[t * self.classes + c as usize]
     }
 }
