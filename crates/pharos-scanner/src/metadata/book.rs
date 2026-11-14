@@ -237,7 +237,10 @@ impl MetadataProvider for BookMetadataProvider {
             // `None` here falls through to the filename provider, which is
             // exactly what FR-007 asks for — no book is ever listed untitled.
             title,
-            overview: clean(d.description),
+            overview: crate::book::description::record_description(
+                d.description.as_deref(),
+                "book",
+            ),
             production_year: date.as_deref().and_then(leading_year),
             // Only a FULL date sets a premiere date; a bare `1965` leaves it
             // unset rather than inventing the 1st of January.
