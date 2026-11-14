@@ -43,16 +43,26 @@ static TRAILING: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\s+\d{10,13}[xX]?$",
         // Release tag meant for video.
         r"(?i)\s+(?:web-?dl|web-?rip)$",
-        // A bracketed format or edition tag: `[eBook]`, `(Kindle Edition)`,
-        // `[Kindle in Motion]`. Only these words, so `[Part 1]` stays.
-        r"(?i)\s*[(\[](?:e[-\s]?book|kindle(?:\s+(?:edition|in\s+motion))?|retail|epub|pdf|mobi|azw3?)[)\]]$",
-        // A bare format word left by a hyphenated stem: `Title-ebook`.
-        r"(?i)[\s-]+e[-\s]?book$",
     ]
     .iter()
+    .chain(FORMAT_TAG_PATTERNS)
     .filter_map(|p| rule(p))
     .collect()
 });
+
+/// Format and edition tags. They are also removed before the separator
+/// decision, so a tag's own hyphens (`-e-book`) never tip a stem into having
+/// its hyphens read as spaces.
+const FORMAT_TAG_PATTERNS: &[&str] = &[
+    // A bracketed format or edition tag: `[eBook]`, `(Kindle Edition)`,
+    // `[Kindle in Motion]`. Only these words, so `[Part 1]` stays.
+    r"(?i)\s*[(\[](?:e[-\s]?book|kindle(?:\s+(?:edition|in\s+motion))?|retail|epub|pdf|mobi|azw3?)[)\]]$",
+    // A bare format word: `Title-ebook`, `Title e-book`.
+    r"(?i)[\s-]+e[-\s]?book$",
+];
+
+static FORMAT_TAGS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| FORMAT_TAG_PATTERNS.iter().filter_map(|p| rule(p)).collect());
 
 static WHITESPACE: LazyLock<Option<Regex>> = LazyLock::new(|| rule(r"\s+"));
 
@@ -100,9 +110,28 @@ pub fn clean_stem_title(stem: &str) -> String {
     s
 }
 
-/// One pass: separators first, then trailing junk.
+/// Remove trailing matches of `rules` until none matches. A rule that would
+/// eat the whole title is not a cleanup and is skipped.
+fn strip_trailing(mut s: String, rules: &[Regex]) -> String {
+    loop {
+        let before = s.len();
+        for re in rules {
+            let cut = re.replace(&s, "");
+            let cut = cut.trim_end_matches([' ', '-', '.']).trim();
+            if !cut.is_empty() && cut.len() < s.len() {
+                s = cut.to_string();
+            }
+        }
+        if s.len() == before {
+            break;
+        }
+    }
+    s
+}
+
+/// One pass: format tags, then separators, then trailing junk.
 fn clean_once(stem: &str) -> String {
-    let mut s = stem.replace('_', " ");
+    let mut s = strip_trailing(stem.replace('_', " "), &FORMAT_TAGS);
     if hyphens_are_separators(&s) {
         // Only hyphens between two word characters; ` - ` stays.
         let chars: Vec<char> = s.chars().collect();
@@ -122,21 +151,7 @@ fn clean_once(stem: &str) -> String {
             })
             .collect();
     }
-    let mut s = collapse(&s);
-    loop {
-        let before = s.len();
-        for re in TRAILING.iter() {
-            let cut = re.replace(&s, "");
-            let cut = cut.trim_end_matches([' ', '-', '.']).trim();
-            // A rule that would eat the whole title is not a cleanup.
-            if !cut.is_empty() && cut.len() < s.len() {
-                s = cut.to_string();
-            }
-        }
-        if s.len() == before {
-            break;
-        }
-    }
+    let s = strip_trailing(collapse(&s), &TRAILING);
     if s.is_empty() {
         stem.to_string()
     } else {
@@ -194,7 +209,8 @@ mod tests {
             ("Some Title-ebook", "Some Title"),
             ("Some Title - eBook", "Some Title"),
             // A hyphenated stem's hyphens become spaces before the rules run.
-            ("Some-Title-e-book", "Some Title"),
+            ("Some-Title-e-book", "Some-Title"),
+            ("making-a-paper-kite-e-book", "making a paper kite"),
             ("long-title-here [e-book]", "long title here"),
             ("Some Title [Part 1]", "Some Title [Part 1]"),
             ("Ebook", "Ebook"),
@@ -232,6 +248,7 @@ mod tests {
             "Learning Go eBook www SomeSite se",
             "learn-rust-fast - Copy",
             "learn-rust-fast",
+            "Some-Title-e-book",
         ] {
             let once = clean_stem_title(input);
             assert_eq!(clean_stem_title(&once), once, "for {input:?}");
