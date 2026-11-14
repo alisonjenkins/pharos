@@ -12,8 +12,8 @@ use pharos_core::{
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
     PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ReadPosition, ReadPositionStore, ResolvedToken, ScanState, SearchQuery, SecretString,
-    SeriesEpisodeRow, SeriesIdentityRow, SeriesIdentityStore, SeriesKeyUpdate,
+    ReadPosition, ReadPositionStore, ReaderPasswordStore, ResolvedToken, ScanState, SearchQuery,
+    SecretString, SeriesEpisodeRow, SeriesIdentityRow, SeriesIdentityStore, SeriesKeyUpdate,
     SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride, Studio, StudioCount,
     StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenRecord, TokenScope,
     TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
@@ -738,6 +738,71 @@ impl pharos_core::RatingsStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.set_ratings(target, ratings, fetched_at).await,
             AnyStore::Postgres(p) => p.set_ratings(target, ratings, fetched_at).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// ReaderPasswordStore
+// ---------------------------------------------------------------------
+impl ReaderPasswordStore for AnyStore {
+    async fn create_reader_password(
+        &self,
+        record: pharos_core::ReaderPasswordRecord,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.create_reader_password(record).await,
+            AnyStore::Postgres(p) => p.create_reader_password(record).await,
+        }
+    }
+
+    async fn reader_passwords_for(
+        &self,
+        user: UserId,
+    ) -> DomainResult<Vec<pharos_core::ReaderPassword>> {
+        match self {
+            AnyStore::Sqlite(s) => s.reader_passwords_for(user).await,
+            AnyStore::Postgres(p) => p.reader_passwords_for(user).await,
+        }
+    }
+
+    async fn reader_password(
+        &self,
+        id: &pharos_core::ReaderPasswordId,
+    ) -> DomainResult<Option<pharos_core::ReaderPasswordRecord>> {
+        match self {
+            AnyStore::Sqlite(s) => s.reader_password(id).await,
+            AnyStore::Postgres(p) => p.reader_password(id).await,
+        }
+    }
+
+    async fn revoke_reader_password(
+        &self,
+        user: UserId,
+        id: &pharos_core::ReaderPasswordId,
+        at: i64,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.revoke_reader_password(user, id, at).await,
+            AnyStore::Postgres(p) => p.revoke_reader_password(user, id, at).await,
+        }
+    }
+
+    async fn touch_reader_password(
+        &self,
+        id: &pharos_core::ReaderPasswordId,
+        at: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.touch_reader_password(id, at).await,
+            AnyStore::Postgres(p) => p.touch_reader_password(id, at).await,
+        }
+    }
+
+    async fn prune_revoked_reader_passwords(&self, user: UserId, before: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.prune_revoked_reader_passwords(user, before).await,
+            AnyStore::Postgres(p) => p.prune_revoked_reader_passwords(user, before).await,
         }
     }
 }

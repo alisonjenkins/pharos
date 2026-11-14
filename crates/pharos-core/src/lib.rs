@@ -10,6 +10,7 @@ pub mod language;
 pub mod metadata_edit;
 pub mod origin;
 pub mod parental_rank;
+pub mod reader_password;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
@@ -32,6 +33,10 @@ pub use metadata_edit::{
     EditRejected, EditTarget, EditableField, LockedFields, MetadataEdit, MetadataEditStore,
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
+pub use reader_password::{
+    format_reader_password, ReaderPassword, ReaderPasswordId, ReaderPasswordRecord,
+    ReaderPasswordStore, TypedReaderPassword,
+};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
 pub use video_range::{ParseVideoRangeTypeError, VideoRangeType};

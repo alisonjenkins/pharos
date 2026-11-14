@@ -57,6 +57,7 @@ pub const COPIED_TABLES: &[&str] = &[
     "display_preferences",
     "user_prefs",
     "read_positions",
+    "reader_passwords",
     "artwork",
     "item_genres",
     "item_people",

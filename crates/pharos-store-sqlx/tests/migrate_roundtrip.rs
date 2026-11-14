@@ -685,6 +685,9 @@ async fn seed_raw(store: &SqliteStore) {
          ('g1', 1700000003000, '{\"state\":\"paused\"}', 1700000003)",
         "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at) \
          SELECT id, 1, 'epubcfi(/6/4)', 0.25, 1700000004 FROM users LIMIT 1",
+        "INSERT INTO reader_passwords (id, user_id, label, hash, created_at, last_used_at, \
+         revoked_at) SELECT 'abcdef', id, 'E-reader', '$argon2id$x', 1700000012, 1700000013, \
+         NULL FROM users LIMIT 1",
         "INSERT INTO episode_fingerprints (item_id, kind, points, schema_version) VALUES \
          (2, 'intro', X'01020304', 3)",
         "INSERT INTO media_segments (item_id, kind, start_ms, end_ms, detector, confidence, \

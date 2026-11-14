@@ -38,13 +38,15 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 /// Extension → `Content-Type` for the formats a client actually opens.
+/// Also what the OPDS feed advertises, so a link's type is what its download
+/// sends (045).
 ///
 /// The book MIME types matter: `comicsPlayer` and `bookPlayer` fetch these
 /// bytes as an `ArrayBuffer` and sniff content themselves, but a browser that
 /// sees `application/octet-stream` on a same-origin navigation may offer a
 /// download dialog instead. Everything unrecognised stays
 /// `application/octet-stream` rather than guessing.
-fn content_type_for(path: &std::path::Path) -> &'static str {
+pub(crate) fn content_type_for(path: &std::path::Path) -> &'static str {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -86,8 +88,44 @@ fn disposition_for(source: &std::path::Path, served: &std::path::Path) -> String
         Some(ext) => format!("{stem}.{ext}"),
         None => stem.to_string(),
     };
-    let name: String = name.chars().filter(|c| *c != '"' && *c != '\\').collect();
-    format!("attachment; filename=\"{name}\"")
+    // B1425: a control character made the header invalid, so it was dropped
+    // and the reader saved "Download"; a non-ASCII name went out as raw
+    // UTF-8, which clients read as Latin-1. Now control characters go, an
+    // ASCII stand-in fills `filename`, and the real name rides in
+    // `filename*` (RFC 6266).
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let fallback: String = name
+        .chars()
+        .filter(|c| *c != '"' && *c != '\\')
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+    let fallback = if fallback.trim().is_empty() {
+        "download".to_owned()
+    } else {
+        fallback
+    };
+    if name.is_ascii() {
+        format!("attachment; filename=\"{fallback}\"")
+    } else {
+        format!(
+            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+            rfc5987(&name)
+        )
+    }
+}
+
+/// `value` percent-encoded as an RFC 5987 `ext-value`: every byte outside
+/// `attr-char` as `%XX`.
+fn rfc5987(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 async fn download(
@@ -113,7 +151,19 @@ async fn download(
     // it names an edition on the video routes; the item's own file otherwise.
     let requested = media_source::requested_id(req.query_string());
     let item = media_source::select(media_source::Route::Download, item, requested.as_deref());
+    serve_item_file(&state, &req, &item).await
+}
 
+/// `item`'s bytes as a streamed `NamedFile` response, a converted Kindle
+/// book as its EPUB, with the `Content-Type` and `Content-Disposition` of
+/// what is sent. The caller has already checked the requester may reach it.
+/// Shared by this route and the OPDS acquisition link (045).
+pub(crate) async fn serve_item_file(
+    state: &AppState,
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = item.id;
     // 005-kindle-conversion — a Kindle book was stored as `Epub` because it
     // converts, so this route must hand over the EPUB and not the `.azw3` the
     // item still points at. Converting here rather than at scan keeps the
@@ -162,7 +212,7 @@ async fn download(
     let mut resp = file
         .use_etag(true)
         .use_last_modified(true)
-        .into_response(&req);
+        .into_response(req);
 
     // Both derived from what is actually being SENT, not from the item's
     // stored path: a converted book must arrive as `application/epub+zip`,
@@ -174,5 +224,44 @@ async fn download(
     if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path, &serve_path)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
-    Ok::<HttpResponse, actix_web::Error>(resp)
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn an_ascii_name_is_sent_as_before() {
+        assert_eq!(
+            disposition_for(Path::new("/m/Book A.epub"), Path::new("/m/Book A.epub")),
+            "attachment; filename=\"Book A.epub\""
+        );
+        assert_eq!(
+            disposition_for(
+                Path::new("/m/Say \"Hi\".pdf"),
+                Path::new("/m/Say \"Hi\".pdf")
+            ),
+            "attachment; filename=\"Say Hi.pdf\""
+        );
+    }
+
+    /// B1425. Disarm check: with the old body, the first assertion sees raw
+    /// UTF-8 and the second a header value that does not parse.
+    #[test]
+    fn any_name_gives_a_valid_header_that_keeps_the_real_name() {
+        let d = disposition_for(Path::new("/m/Élan vital.azw3"), Path::new("/c/42.epub"));
+        assert_eq!(
+            d,
+            "attachment; filename=\"_lan vital.epub\"; filename*=UTF-8''%C3%89lan%20vital.epub"
+        );
+        assert!(d.is_ascii());
+        let d = disposition_for(Path::new("/m/Bad\nName.pdf"), Path::new("/m/Bad\nName.pdf"));
+        assert!(
+            actix_web::http::header::HeaderValue::from_str(&d).is_ok(),
+            "{d}"
+        );
+        assert_eq!(d, "attachment; filename=\"BadName.pdf\"");
+    }
 }

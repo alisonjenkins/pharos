@@ -2529,7 +2529,12 @@ fn Screen(route: Route) -> Element {
         Route::Appearance => {
             rsx! { SettingsLayout { current: Section::Appearance, AppearanceScreen {} } }
         }
-        Route::Account => rsx! { SettingsLayout { current: Section::Account, AccountScreen {} } },
+        Route::Account => rsx! {
+            SettingsLayout { current: Section::Account,
+                AccountScreen {}
+                ReaderPasswordsScreen {}
+            }
+        },
         Route::ApproveDevice => {
             rsx! {
                 SettingsLayout { current: Section::Devices,
@@ -3691,6 +3696,150 @@ fn MyDevicesScreen() -> Element {
                         }
                     }
                     saving.write().remove(&device_id);
+                });
+            },
+        }
+    }
+}
+
+/// Settings → Account, "E-readers" (045): loads the user's e-reader
+/// passwords, makes one and shows it once, and revokes one. One call at a
+/// time; a new connection loads the list again and drops a password still
+/// shown, which belongs to the session that made it.
+#[component]
+fn ReaderPasswordsScreen() -> Element {
+    use super::reader_passwords::{
+        opds_url, ReaderPasswordsState, ReaderPasswordsView, ShownPassword,
+    };
+    let ctx = use_context::<Ctx>();
+    let account = use_context::<AccountMe>();
+    let mut state = use_signal(|| ReaderPasswordsState::Loading);
+    let mut busy = use_signal(|| false);
+    let mut shown = use_signal(|| None::<ShownPassword>);
+    let mut copied = use_signal(|| None::<bool>);
+    let mut problem = use_signal(|| None::<String>);
+    let mut opds_path = use_signal(|| "/opds/".to_owned());
+    let mut connection = use_signal(|| 0u64);
+    let username = account.0.read().clone().flatten().map(|me| me.name);
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("reader_passwords: {what} failed: {e}"));
+    };
+    let load = move |api: NativeApi| {
+        let loaded_on = *connection.peek();
+        spawn(async move {
+            let result = api
+                .reader_passwords(&call("reader_passwords", "reader_passwords"))
+                .await;
+            if *connection.peek() != loaded_on {
+                return;
+            }
+            match result {
+                Ok(list) => state.set(ReaderPasswordsState::Loaded(list)),
+                Err(e) => {
+                    report(&e, "list");
+                    state.set(ReaderPasswordsState::Failed(format!(
+                        "Couldn't load your e-reader passwords: {e}"
+                    )));
+                }
+            }
+        });
+    };
+    use_effect(move || {
+        let api = ctx.api.read().clone();
+        *connection.write() += 1;
+        busy.set(false);
+        shown.set(None);
+        copied.set(None);
+        let Some(api) = api else {
+            return;
+        };
+        state.set(ReaderPasswordsState::Loading);
+        load(api);
+    });
+    rsx! {
+        ReaderPasswordsView {
+            state: state(),
+            busy: busy(),
+            shown: shown(),
+            copied: copied(),
+            problem: problem(),
+            opds_url: opds_url(&platform::page_origin(), &opds_path()),
+            username,
+            on_create: move |label: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                problem.set(None);
+                copied.set(None);
+                let started_on = *connection.peek();
+                spawn(async move {
+                    let result = api
+                        .create_reader_password(&call("reader_passwords", "create_reader_password"), &label)
+                        .await;
+                    if *connection.peek() != started_on {
+                        return;
+                    }
+                    match result {
+                        Ok(created) => {
+                            opds_path.set(created.opds_path.clone());
+                            shown.set(Some(ShownPassword {
+                                label: created.listed.label.clone(),
+                                password: created.password,
+                            }));
+                            load(api);
+                        }
+                        Err(e) => {
+                            report(&e, "create");
+                            problem.set(Some(super::reader_passwords::create_problem(&e)));
+                        }
+                    }
+                    busy.set(false);
+                });
+            },
+            on_copy: move |password: String| {
+                spawn(async move {
+                    let ok = platform::copy_text(&password).await;
+                    if !ok {
+                        platform::select_field("reader-password-secret");
+                    }
+                    copied.set(Some(ok));
+                });
+            },
+            on_done: move |()| {
+                shown.set(None);
+                copied.set(None);
+            },
+            on_revoke: move |id: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                problem.set(None);
+                let started_on = *connection.peek();
+                spawn(async move {
+                    let result = api
+                        .revoke_reader_password(&call("reader_passwords", "revoke_reader_password"), &id)
+                        .await;
+                    if *connection.peek() != started_on {
+                        return;
+                    }
+                    if let Err(e) = &result {
+                        report(e, "revoke");
+                        problem.set(Some(format!("Couldn't revoke the password: {e}")));
+                    }
+                    load(api);
+                    busy.set(false);
                 });
             },
         }

@@ -8412,6 +8412,7 @@ dependencies = [
  "pharos-test-metrics",
  "pharos-transcode",
  "proptest",
+ "quick-xml",
  "read-fonts 0.46.0",
  "regex-lite",
  "reqwest",
