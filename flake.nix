@@ -214,6 +214,26 @@
             cargoClippyExtraArgs = "-p pharos-server --features pharos-server/postgres --all-targets -- -D warnings";
           }
         );
+        # Spec 042 slice 2 / ADR-0125: whisper.cpp under `whisper-rs`, behind
+        # pharos-align's `recognise` feature. Its build runs cmake and compiles
+        # the Vulkan shaders with glslc, then links the Vulkan loader.
+        recogniseBuildInputs = [ pkgs.cmake pkgs.shaderc pkgs.vulkan-headers pkgs.vulkan-loader ];
+        # The workspace checks never enable `recognise`, so lint it here.
+        # Own deps artifact: the C++ build stays out of every other check.
+        alignerRecogniseArgs = ciArgs // {
+          pname = "pharos-align-recognise";
+          cargoExtraArgs = "--package pharos-align --features recognise";
+          nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ recogniseBuildInputs;
+          # cmake's setup hook would take over the build phase.
+          dontUseCmakeConfigure = true;
+        };
+        alignerRecogniseClippy = craneLib.cargoClippy (
+          alignerRecogniseArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly alignerRecogniseArgs;
+            cargoClippyExtraArgs = "--package pharos-align --features recognise --all-targets -- -D warnings";
+          }
+        );
         pharosFmt = craneLib.cargoFmt { inherit (pharosCommonArgs) pname version src; };
         # Postgres-backend conformance: the store trait suite run against a REAL
         # Postgres started INSIDE the nix sandbox (TCP on loopback — the sandbox
@@ -1453,6 +1473,8 @@
             pkgs.pkg-config
             # spec 039: pharos-align links OpenBLAS for its CPU forward pass.
             pkgs.openblas
+            # spec 042: whisper.cpp for pharos-align's `recognise` feature.
+          ] ++ recogniseBuildInputs ++ [
             pkgs.git
             pkgs.just
             pkgs.curl
@@ -1632,6 +1654,7 @@
         checks.doctests = pharosDoctests;
         checks.clippy = pharosClippy;
         checks.clippy-postgres = pharosClippyPostgres;
+        checks.clippy-recognise = alignerRecogniseClippy;
         checks.fmt = pharosFmt;
         # B278: the angie access log must not carry query strings (tokens).
         checks.angie-access-log = pkgs.runCommand "angie-access-log-check" { } ''
