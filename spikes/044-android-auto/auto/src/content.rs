@@ -38,3 +38,4 @@ pub use error::ContentError;
 pub use id::NodeId;
 pub use library::{AuthState, Library, Timeouts};
 pub use node::{Node, ART_WIDTH};
+pub use tree::{autoplay, SearchReport};

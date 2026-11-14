@@ -215,23 +215,25 @@ fn rank(c: &mut [Scored]) {
 /// for the rest, and the hits are re-ranked by how alike they read and sound
 /// to what was heard. When that finds little, each significant word is
 /// searched too and the merged candidates must clear [`MIN_SCORE`]. Returns
-/// empty rather than guess; the caller decides what to do then.
+/// empty rather than guess; the caller decides what to do then. The
+/// report says how it ranked them.
 pub async fn search<C: Catalogue>(
     cat: &C,
     urls: &Urls,
     text: &str,
-) -> Result<Vec<Node>, ContentError> {
+) -> Result<(Vec<Node>, SearchReport), ContentError> {
     let (nodes, report) = search_reported(cat, urls, text).await?;
     log::info!(
-        "search query={text:?} normalized={:?} calls={} candidates={} top_score={:.2} verdict={} returned={}",
+        "search query={text:?} normalized={:?} calls={} candidates={} top_score={:.2} second_score={:.2} verdict={} returned={}",
         report.normalized,
         report.calls,
         report.candidates,
         report.top_score,
+        report.second_score,
         report.verdict,
         nodes.len()
     );
-    Ok(nodes)
+    Ok((nodes, report))
 }
 
 pub async fn search_reported<C: Catalogue>(
@@ -509,7 +511,7 @@ mod tests {
     #[test]
     fn search_drops_kinds_the_car_does_not_show() {
         let f = Fake::default();
-        let got = block_on(search(&f, &urls(), "a song")).unwrap();
+        let got = block_on(search(&f, &urls(), "a song")).unwrap().0;
         assert_eq!(ids(&got), ["track/5"]);
         assert_eq!(f.calls.borrow()[0], "search a song 25");
     }
