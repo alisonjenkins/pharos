@@ -89,7 +89,7 @@ As the operator, I can tell from logs and metrics, per song and in aggregate, ho
 - Recogniser hallucinations in gaps ("thank you", captions, other languages): ignored unless they match lyric words in order.
 - Short repeated lines ("oh", a two-word hook) that the recogniser mishears.
 - Lyrics in a language or script the letter model cannot spell: placement falls back to today's behaviour for those lines.
-- The GPU runs out of memory or is busy with another workload: the song falls back to CPU or to today's pipeline, and says which.
+- No usable Vulkan GPU, or the GPU runs out of memory or is busy with another workload: the song keeps today's per-line answer and records why (`no_gpu_stages`, `separate_failed`, `stage_timeout`). There is no CPU path for the separator or the recogniser.
 - A very long track (over the 500-line or duration limits): rejected or degraded as today, not crashed.
 
 ## Requirements *(mandatory)*
@@ -97,14 +97,14 @@ As the operator, I can tell from logs and metrics, per song and in aggregate, ho
 ### Functional Requirements
 
 - **FR-001**: The aligner MUST place each lyric line from what is sung in the audio. Synced-lyrics stamps may only break ties and give the fallback position.
-- **FR-002**: The aligner MUST separate the vocals from the music before recognition.
+- **FR-002**: The aligner MUST separate the vocals from the music before recognition. The recogniser never hears the unseparated mix; a song whose vocals cannot be separated keeps today's per-line answer (FR-011).
 - **FR-003**: The aligner MUST recognise the sung words with per-word times, and match them to the lyric words in lyric order. A line counts as anchored when at least half of its words (minimum 2) match.
 - **FR-004**: Inside each anchored line, word starts MUST be refined letter by letter against the audio, within a bounded margin of the anchor (prototype: ±1.5 s).
 - **FR-005**: An unanchored line between two anchored neighbours MUST stay between them. With no usable audio evidence it MUST fall back to its stamp moved by the nearest anchor's offset. A line before the first anchor or after the last MUST keep today's per-line time, unless today's time overlaps the placed edge line (then FR-006 applies).
 - **FR-006**: Lines MUST come out in lyric order with non-decreasing word starts (V1373).
 - **FR-007**: Whatever the alignment output looks like today (`POST /align` contract, streamed line events per ADR-0121, `score`) MUST stay compatible; any new per-line field is additive. `aligner_version` MUST rise so the server re-aligns cached songs when the operator chooses.
 - **FR-008**: Each song MUST log and count how each line was placed (anchored / refined / between anchors / fallback), the recogniser's anchor share, and the reason for every fallback, carrying the offending value (constitution III).
-- **FR-009**: The pipeline MUST run without Python, on the GPU when one is usable and on the CPU otherwise, with the same answers on both within 20 ms per word.
+- **FR-009**: The pipeline MUST run without Python. The separator and recogniser stages run only on a usable Vulkan GPU; without one the song keeps today's per-line answer, fallback `no_gpu_stages` (V1409). Today's per-line pass keeps running on the GPU or the CPU, with the same answers on both within 20 ms per word.
 - **FR-010**: Models MUST load in stages and release memory between stages, so GPU memory held for one song stays under 6 GiB, and MUST unload when idle as today.
 - **FR-011**: When a stage fails (out of memory, model error, timeout), the song MUST fall back to today's per-line alignment rather than fail, and record why.
 - **FR-012**: No song, artist, album or file details of the owner's library may appear in tests, fixtures, specs or logs pushed to the repository.
