@@ -2629,6 +2629,9 @@ async fn persist_artwork<S: MediaStore>(
     artwork: &[pharos_core::ArtworkRef],
 ) -> DomainResult<()> {
     let mut written: HashSet<&'static str> = HashSet::new();
+    // A Primary only counts against the embedded cover when its source can
+    // actually be served; a bare `url` row 404s on every render.
+    let mut primary_servable = false;
     for art in artwork {
         let role = art.role.as_str();
         // One row per role; the first ref for a role (highest priority,
@@ -2642,10 +2645,12 @@ async fn persist_artwork<S: MediaStore>(
             ArtworkSource::Url(u) => ("url", u.clone()),
         };
         store.set_artwork(item_id, role, source, &locator).await?;
+        if role == "Primary" && pharos_core::artwork_source_advertises_primary(source) {
+            primary_servable = true;
+        }
     }
     if kind == MediaKind::Audio {
-        let primary_written = written.contains("Primary");
-        record_embedded_cover(store, item_id, path, embedded_cover, primary_written).await?;
+        record_embedded_cover(store, item_id, path, embedded_cover, primary_servable).await?;
     }
     Ok(())
 }
@@ -2697,13 +2702,16 @@ async fn record_embedded_cover<S: MediaStore>(
     let existing_embedded = existing
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case(pharos_core::EMBEDDED_ARTWORK_SOURCE));
+    let existing_servable = existing
+        .as_deref()
+        .is_some_and(pharos_core::artwork_source_advertises_primary);
     let outcome = if sidecar_written {
         if !embedded_cover {
             return Ok(());
         }
         EmbeddedCoverOutcome::SidecarWins
     } else if embedded_cover {
-        if existing.is_some() && !existing_embedded {
+        if existing_servable && !existing_embedded {
             EmbeddedCoverOutcome::KeptProvider
         } else {
             store
@@ -7372,6 +7380,53 @@ mod tests {
             .unwrap();
         assert!(store.artwork_for(id).await.unwrap().is_empty());
         assert_eq!(embedded_cover_count(&snap, "withdrawn"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unservable_url_primary_does_not_suppress_the_embedded_cover() {
+        let td = TempDir::new().unwrap();
+        let (store, items) = scan_audio_cover(false, &["Part 1.m4b"], &td).await;
+        let id = items[0].id;
+        let url_primary = [pharos_core::ArtworkRef {
+            role: pharos_core::ArtworkRole::Primary,
+            source: pharos_core::ArtworkSource::Url("https://example.invalid/c.jpg".into()),
+        }];
+        persist_artwork(
+            &store,
+            id,
+            MediaKind::Audio,
+            &td.path().join("Part 1.m4b"),
+            true,
+            &url_primary,
+        )
+        .await
+        .unwrap();
+        let rows = store.artwork_for(id).await.unwrap();
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].1, "embedded", "the url row is replaced");
+    }
+
+    #[tokio::test]
+    async fn a_url_row_left_by_an_earlier_scan_yields_to_the_embedded_cover() {
+        let td = TempDir::new().unwrap();
+        let (store, items) = scan_audio_cover(false, &["Part 1.m4b"], &td).await;
+        let id = items[0].id;
+        store
+            .set_artwork(id, "Primary", "url", "https://example.invalid/c.jpg")
+            .await
+            .unwrap();
+        persist_artwork(
+            &store,
+            id,
+            MediaKind::Audio,
+            &td.path().join("Part 1.m4b"),
+            true,
+            &[],
+        )
+        .await
+        .unwrap();
+        let rows = store.artwork_for(id).await.unwrap();
+        assert_eq!(rows[0].1, "embedded");
     }
 
     #[test]
