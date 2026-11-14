@@ -37,6 +37,9 @@ pub struct EpubMetadata {
     pub isbn: Option<String>,
     pub series_name: Option<String>,
     pub series_index: Option<u32>,
+    /// Every `dc:subject`, trimmed, in file order (spec 043 FR-001). Mapped to
+    /// shelves by `book::shelf`, not here.
+    pub subjects: Vec<String>,
     /// Zip entry path of the cover image, when the OPF declares one. The BYTES
     /// are read separately (T061) so metadata-only callers do not pay for them.
     pub cover_href: Option<String>,
@@ -282,7 +285,8 @@ fn parse_opf(xml: &str) -> Result<EpubMetadata, String> {
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref()).to_ascii_lowercase();
                 match name.as_str() {
-                    "title" | "creator" | "publisher" | "description" | "date" | "identifier" => {
+                    "title" | "creator" | "publisher" | "description" | "date" | "identifier"
+                    | "subject" => {
                         current = Some(name);
                         text.clear();
                     }
@@ -353,6 +357,12 @@ fn assign_dc(field: &str, text: String, out: &mut EpubMetadata) {
         "publisher" => &mut out.publisher,
         "description" => &mut out.description,
         "date" => &mut out.date,
+        "subject" => {
+            if !out.subjects.contains(&text) {
+                out.subjects.push(text);
+            }
+            return;
+        }
         "identifier" => {
             // Only keep an identifier that actually looks like an ISBN — the
             // element is also used for UUIDs and calibre's internal ids, and
@@ -561,6 +571,32 @@ mod tests {
         assert_eq!(bm.format, BookFormat::Epub);
         assert_eq!(bm.page_count, None);
         assert_eq!(bm.author.as_deref(), Some("Author A"));
+    }
+
+    /// Spec 043 FR-001: every subject, in order, blanks and repeats dropped.
+    #[test]
+    fn every_dc_subject_is_read_in_order() {
+        let opf = r#"<package><metadata>
+            <dc:title>X</dc:title>
+            <dc:subject>COMPUTERS / Programming / General</dc:subject>
+            <dc:subject> Rust (Computer program language) </dc:subject>
+            <dc:subject></dc:subject>
+            <dc:subject>Systems &amp; Concurrency</dc:subject>
+            <dc:subject>COMPUTERS / Programming / General</dc:subject>
+          </metadata><manifest/></package>"#;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("x.epub");
+        write_epub(&p, Some(CONTAINER), Some(("OEBPS/content.opf", opf)));
+        let meta = read_epub(&p).unwrap();
+        assert_eq!(
+            meta.subjects,
+            vec![
+                "COMPUTERS / Programming / General".to_owned(),
+                "Rust (Computer program language)".to_owned(),
+                "Systems & Concurrency".to_owned(),
+            ]
+        );
+        assert_eq!(meta.title.as_deref(), Some("X"));
     }
 
     #[test]
