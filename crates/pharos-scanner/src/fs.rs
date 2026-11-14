@@ -3054,7 +3054,11 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
             continue;
         };
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        if split_edition_tag(stem).is_some() {
+        // A book's formats and copies are grouped by the book fold, which
+        // checks the author; an edition tag alone never makes two books one.
+        if crate::book::format_for_path(&path).is_some() {
+            standalone.push(path);
+        } else if split_edition_tag(stem).is_some() {
             alternates.push((parent, stem.to_string(), path));
         } else {
             primaries.insert((parent.clone(), stem.to_ascii_lowercase()), path.clone());
@@ -9152,6 +9156,21 @@ mod tests {
         assert_eq!(groups[0].1.len(), 1);
         assert_eq!(groups[0].1[0].0, "Director's Cut");
         assert_eq!(groups[0].1[0].1, alt);
+    }
+
+    /// A book's other formats are grouped by the book fold, which checks the
+    /// author; an edition tag on a book's stem never groups it.
+    #[test]
+    fn group_editions_leaves_books_to_the_book_fold() {
+        let dir = std::path::PathBuf::from("/srv/books");
+        let primary = dir.join("Gardening.epub");
+        let special = dir.join("Gardening - Special Edition.pdf");
+        let groups = group_by_edition(vec![primary.clone(), special.clone()]);
+        assert_eq!(
+            groups,
+            vec![(primary, Vec::new()), (special, Vec::new())],
+            "a book must not be grouped as a video edition"
+        );
     }
 
     #[test]
