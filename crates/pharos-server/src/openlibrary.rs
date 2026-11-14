@@ -39,6 +39,10 @@ pub const THROTTLE_BACKOFF: Duration = Duration::from_secs(5);
 /// rest are rarely the same book.
 const SEARCH_LIMIT: &str = "5";
 
+/// Largest answer read. A work or a five-result search is a few KiB; this
+/// bounds a misbehaving server without refusing a long subject list.
+const MAX_BODY: usize = 2 << 20;
+
 /// Shortest author word that counts towards an overlap. Initials and "de",
 /// "von" match too many people.
 const MIN_AUTHOR_WORD: usize = 3;
@@ -97,7 +101,7 @@ impl Default for HttpFetch {
 
 impl Fetch for HttpFetch {
     async fn get(&self, url: &str) -> Result<FetchResponse, String> {
-        let resp = self.http.get(url).send().await.map_err(|e| {
+        let mut resp = self.http.get(url).send().await.map_err(|e| {
             let mut cause = e.to_string();
             let mut src = std::error::Error::source(&e);
             while let Some(s) = src {
@@ -114,11 +118,17 @@ impl Fetch for HttpFetch {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = resp
-            .bytes()
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
             .map_err(|e| format!("reading the body: {e}"))?
-            .to_vec();
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_BODY {
+                return Err(format!("the answer passed {MAX_BODY} bytes"));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(FetchResponse {
             status,
             retry_after,
