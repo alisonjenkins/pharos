@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// The extra that puts rows sharing its value under one heading in the car.
+const GROUP_TITLE_HINT: &str = "android.media.browse.CONTENT_STYLE_GROUP_TITLE_HINT";
+
 pub(crate) fn description<'l>(env: &mut JNIEnv<'l>, e: &Item) -> R<JObject<'l>> {
     let b = env
         .new_object("android/media/MediaDescription$Builder", "()V", &[])
@@ -41,6 +44,27 @@ pub(crate) fn description<'l>(env: &mut JNIEnv<'l>, e: &Item) -> R<JObject<'l>> 
             &[JValue::Object(&icon)],
         )
         .map_err(jerr("setIconUri"))?;
+    }
+    if !e.group.is_empty() {
+        let extras = env
+            .new_object("android/os/Bundle", "()V", &[])
+            .map_err(jerr("Bundle"))?;
+        let k = JObject::from(env.new_string(GROUP_TITLE_HINT).map_err(jerr("key"))?);
+        let v = JObject::from(env.new_string(&e.group).map_err(jerr("group"))?);
+        env.call_method(
+            &extras,
+            "putString",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&k), JValue::Object(&v)],
+        )
+        .map_err(jerr("putString(group)"))?;
+        env.call_method(
+            &b,
+            "setExtras",
+            format!("(Landroid/os/Bundle;){B}"),
+            &[JValue::Object(&extras)],
+        )
+        .map_err(jerr("setExtras"))?;
     }
     env.call_method(&b, "build", "()Landroid/media/MediaDescription;", &[])
         .and_then(|v| v.l())
