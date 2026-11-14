@@ -16,10 +16,18 @@
 
 mod error;
 mod id;
+mod library;
+mod net;
 mod node;
 mod token;
 mod tree;
+// The Android TV app's sign-in state machine, shared rather than copied: it
+// is std-only and covered by its own tests.
+#[allow(dead_code)]
+#[path = "../../../../crates/pharos-ui/src/native/tv_auth.rs"]
+mod tv_auth;
 
 pub use error::ContentError;
 pub use id::NodeId;
+pub use library::{AuthState, Library, Timeouts};
 pub use node::{Node, ART_WIDTH};
