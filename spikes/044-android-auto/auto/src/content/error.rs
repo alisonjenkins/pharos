@@ -30,6 +30,8 @@ pub enum ContentError {
     BadId(String),
     #[error("token file {}: {why}", path.display())]
     TokenFile { path: PathBuf, why: String },
+    #[error("audio cache {op}: {why}")]
+    Cache { op: String, why: String },
     #[error("the content worker thread is gone")]
     WorkerGone,
 }
