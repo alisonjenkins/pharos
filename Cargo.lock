@@ -8402,6 +8402,7 @@ dependencies = [
  "log",
  "ndk-context",
  "pharos-android",
+ "pharos-client",
  "pharos-ui",
  "pharos-vis",
  "tokio",

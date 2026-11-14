@@ -25,6 +25,7 @@ jni = "0.21.1"
 log = "0.4"
 ndk-context = "0.1"
 pharos-android = { path = "../pharos-android" }
+pharos-client = { path = "../pharos-client" }
 pharos-vis = { path = "../pharos-vis" }
 pharos-ui = { path = "../pharos-ui", features = ["mobile"] }
 tokio = { workspace = true, features = ["sync", "rt"] }
