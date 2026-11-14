@@ -144,7 +144,11 @@ impl Urls {
             duration_ms: item.runtime_ms,
             album: String::new(),
             book: String::new(),
-            position_ms: 0,
+            position_ms: if item.audiobook && !item.played {
+                item.position_ms
+            } else {
+                0
+            },
             group: String::new(),
         })
     }
