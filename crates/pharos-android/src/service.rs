@@ -179,6 +179,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
     _this: JObject<'l>,
 ) {
     guarded(&mut env, "onDestroy", (), |env| {
+        // A play still on a worker must not build a player for a dead service.
+        supersede();
         let Some(st) = state_lock()?.take() else {
             return Ok(());
         };
