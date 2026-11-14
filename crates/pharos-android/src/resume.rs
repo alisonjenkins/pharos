@@ -97,6 +97,13 @@ fn now() -> R<std::sync::MutexGuard<'static, Option<Now>>> {
     NOW.lock().map_err(|_| "resume mutex poisoned".to_owned())
 }
 
+/// Where the phone last stopped in the track with library id `id`, for a
+/// screen picking which part of a book to open. `None` before the store is
+/// open or when nothing is kept.
+pub fn saved_ms(id: &str) -> Option<u64> {
+    STORE.get().and_then(|s| s.saved(id))
+}
+
 /// Loads the saved positions from `files_dir` and starts the save ticker.
 pub fn open(files_dir: &str) -> R<()> {
     STORE.get_or_init(|| Resume::open(std::path::Path::new(files_dir)));
