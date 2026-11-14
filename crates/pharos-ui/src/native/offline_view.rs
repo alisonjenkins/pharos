@@ -60,16 +60,41 @@ pub fn use_snapshot(store: &Store) -> Signal<Snapshot> {
     use_future(move || {
         let store = poll.clone();
         async move {
-            loop {
-                platform::sleep_ms(POLL_MS).await;
-                let now = Snapshot::read(&*store.0);
-                if *snap.peek() != now {
-                    snap.set(now);
-                }
-            }
+            poll_every(
+                platform::SLEEP_IS_REAL,
+                || platform::sleep_ms(POLL_MS),
+                || {
+                    let now = Snapshot::read(&*store.0);
+                    if *snap.peek() != now {
+                        snap.set(now);
+                    }
+                    true
+                },
+            )
+            .await;
         }
     });
     snap
+}
+
+/// Calls `tick` after each `sleep` until it returns false. Where the
+/// platform's sleep returns at once (`real` is false) it does not start: a
+/// loop on a no-op sleep would spin the thread.
+pub async fn poll_every<S, F, T>(real: bool, mut sleep: S, mut tick: T)
+where
+    S: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+    T: FnMut() -> bool,
+{
+    if !real {
+        return;
+    }
+    loop {
+        sleep().await;
+        if !tick() {
+            return;
+        }
+    }
 }
 
 /// Applies a cap choice. A value that is not one of the choices is refused
@@ -459,6 +484,50 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map(|rt| rt.block_on(f))
+            .unwrap_or_else(|e| panic!("no runtime: {e}"))
+    }
+
+    #[test]
+    fn a_poll_on_a_no_op_sleep_never_starts() {
+        let ticks = std::cell::Cell::new(0u32);
+        block_on(poll_every(
+            false,
+            || async {},
+            || {
+                ticks.set(ticks.get().saturating_add(1));
+                ticks.get() < 1_000
+            },
+        ));
+        assert_eq!(ticks.get(), 0, "a no-op sleep must not drive the loop");
+    }
+
+    #[test]
+    fn a_poll_on_a_real_sleep_ticks_until_told_to_stop() {
+        let ticks = std::cell::Cell::new(0u32);
+        block_on(poll_every(
+            true,
+            || async {},
+            || {
+                ticks.set(ticks.get().saturating_add(1));
+                ticks.get() < 3
+            },
+        ));
+        assert_eq!(ticks.get(), 3);
+    }
+
+    #[cfg(not(any(
+        all(feature = "web", target_arch = "wasm32"),
+        all(feature = "mobile", target_os = "android")
+    )))]
+    #[test]
+    fn the_host_build_does_not_claim_a_real_sleep() {
+        const { assert!(!platform::SLEEP_IS_REAL) };
     }
 
     #[test]
