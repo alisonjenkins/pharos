@@ -331,7 +331,7 @@ pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
     Ok(out)
 }
 
-/// The two classes the Android Auto spike needs.
+/// The classes the Android Auto spike needs.
 pub fn android_auto_classes() -> Vec<ClassSpec> {
     const PKG: &str = "com/alisonjenkins/pharos/auto";
     let native = |name: &str, descriptor: &str| Method::Native {
@@ -384,6 +384,26 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 native("onPlayFromMediaId", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
                 // Gemini / Assistant voice requests ("play X on Pharos").
                 native("onPlayFromSearch", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
+            ],
+        },
+        // MediaPlayer reports a stream's progress through listener
+        // interfaces. A generated class implementing them keeps each
+        // callback a direct native call; a java.lang.reflect.Proxy would
+        // still need a generated InvocationHandler and adds reflection to
+        // every callback. Rust creates it after the library is loaded.
+        ClassSpec {
+            name: format!("{PKG}/PharosPlayerListener"),
+            superclass: "java/lang/Object".into(),
+            load_library: None,
+            interfaces: vec![
+                "android/media/MediaPlayer$OnPreparedListener".into(),
+                "android/media/MediaPlayer$OnErrorListener".into(),
+                "android/media/MediaPlayer$OnCompletionListener".into(),
+            ],
+            methods: vec![
+                native("onPrepared", "(Landroid/media/MediaPlayer;)V"),
+                native("onError", "(Landroid/media/MediaPlayer;II)Z"),
+                native("onCompletion", "(Landroid/media/MediaPlayer;)V"),
             ],
         },
         // The phone-side voice entry point: the assistant lists an app as
