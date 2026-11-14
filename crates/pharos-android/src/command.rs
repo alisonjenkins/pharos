@@ -46,7 +46,7 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Command::Play { .. } => "play",
             Command::Pause => "pause",
