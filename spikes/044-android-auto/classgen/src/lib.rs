@@ -3,7 +3,8 @@
 //! subclass), with no Java or Kotlin source anywhere.
 //!
 //! Every generated method is one of three shapes:
-//! - a no-argument constructor that calls the superclass constructor,
+//! - a constructor that passes its arguments to the superclass constructor
+//!   with the same descriptor,
 //! - a static initialiser that runs `System.loadLibrary(lib)`,
 //! - a `native` method (Rust implements it through JNI), or
 //! - a "super, then native" method: it calls the superclass method with the
@@ -20,6 +21,8 @@ use std::collections::HashMap;
 pub struct ClassSpec {
     pub name: String,
     pub superclass: String,
+    /// Constructor descriptor, e.g. `()V`; it must exist on the superclass.
+    pub init: String,
     /// Library loaded in `<clinit>`, e.g. `pharos_auto` for `libpharos_auto.so`.
     pub load_library: Option<String>,
     /// Interfaces the class declares it implements, e.g. a listener.
@@ -194,6 +197,18 @@ fn push_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+/// Pushes each argument from its local slot, starting after `this`.
+fn load_args(code: &mut Vec<u8>, args: &[Arg]) -> Result<(), GenError> {
+    let mut slot: u16 = 1;
+    for a in args {
+        let s = u8::try_from(slot).map_err(|_| GenError::TooBig("locals"))?;
+        code.push(a.load_opcode());
+        code.push(s);
+        slot += a.slots();
+    }
+    Ok(())
+}
+
 /// Writes the class file bytes for `spec`.
 pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
     let mut pool = Pool::default();
@@ -207,16 +222,26 @@ pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
     let code_attr = pool.utf8("Code")?;
     let mut methods = Vec::new();
 
-    // Constructor: aload_0; invokespecial super.<init>()V; return.
-    let super_init = pool.method_ref(&spec.superclass, "<init>", "()V")?;
-    let mut code = vec![0x2a, 0xb7];
+    // Constructor: aload_0; load each argument; invokespecial super.<init>; return.
+    let (init_args, init_ret) = parse_descriptor(&spec.init)?;
+    if init_ret != "V" {
+        return Err(GenError::NotVoid {
+            method: "<init>".into(),
+            descriptor: spec.init.clone(),
+        });
+    }
+    let super_init = pool.method_ref(&spec.superclass, "<init>", &spec.init)?;
+    let mut code = vec![0x2a];
+    load_args(&mut code, &init_args)?;
+    code.push(0xb7);
     push_u16(&mut code, super_init);
     code.push(0xb1);
+    let init_locals = 1 + init_args.iter().map(|a| a.slots()).sum::<u16>();
     methods.push(MethodOut {
         access: ACC_PUBLIC,
         name: pool.utf8("<init>")?,
-        descriptor: pool.utf8("()V")?,
-        code: Some((1, 1, code)),
+        descriptor: pool.utf8(&spec.init)?,
+        code: Some((init_locals, init_locals, code)),
     });
 
     if let Some(lib) = &spec.load_library {
@@ -263,13 +288,7 @@ pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
                     // invokespecial for both: a private method is invoked
                     // with invokespecial in class version 52.
                     code.push(0x2a); // aload_0
-                    let mut slot: u16 = 1;
-                    for a in &args {
-                        let s = u8::try_from(slot).map_err(|_| GenError::TooBig("locals"))?;
-                        code.push(a.load_opcode());
-                        code.push(s);
-                        slot += a.slots();
-                    }
+                    load_args(&mut code, &args)?;
                     code.push(op);
                     push_u16(&mut code, target);
                 }
@@ -342,6 +361,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
         ClassSpec {
             name: format!("{PKG}/PharosMediaService"),
             superclass: "android/service/media/MediaBrowserService".into(),
+            init: "()V".into(),
             load_library: Some("pharos_auto".into()),
             interfaces: Vec::new(),
             methods: vec![
@@ -372,6 +392,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
         ClassSpec {
             name: format!("{PKG}/PharosSessionCallback"),
             superclass: "android/media/session/MediaSession$Callback".into(),
+            init: "()V".into(),
             load_library: None,
             interfaces: Vec::new(),
             methods: vec![
@@ -395,6 +416,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
         ClassSpec {
             name: format!("{PKG}/PharosArtProvider"),
             superclass: "android/content/ContentProvider".into(),
+            init: "()V".into(),
             load_library: Some("pharos_auto".into()),
             interfaces: Vec::new(),
             methods: vec![
@@ -421,6 +443,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
         ClassSpec {
             name: format!("{PKG}/PharosPlayerListener"),
             superclass: "java/lang/Object".into(),
+            init: "()V".into(),
             load_library: None,
             interfaces: vec![
                 "android/media/MediaPlayer$OnPreparedListener".into(),
@@ -440,6 +463,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
         ClassSpec {
             name: format!("{PKG}/PharosSearchActivity"),
             superclass: "android/app/Activity".into(),
+            init: "()V".into(),
             load_library: Some("pharos_auto".into()),
             interfaces: Vec::new(),
             methods: vec![Method::SuperThenNative {
@@ -470,6 +494,7 @@ mod tests {
         let spec = ClassSpec {
             name: "a/B".into(),
             superclass: "java/lang/Object".into(),
+            init: "()V".into(),
             load_library: None,
             interfaces: Vec::new(),
             methods: vec![Method::SuperThenNative {
@@ -477,6 +502,19 @@ mod tests {
                 descriptor: "()I".into(),
                 hook: "y".into(),
             }],
+        };
+        assert!(matches!(generate(&spec), Err(GenError::NotVoid { .. })));
+    }
+
+    #[test]
+    fn constructor_must_be_void() {
+        let spec = ClassSpec {
+            name: "a/B".into(),
+            superclass: "java/lang/Object".into(),
+            init: "(I)I".into(),
+            load_library: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
         };
         assert!(matches!(generate(&spec), Err(GenError::NotVoid { .. })));
     }
