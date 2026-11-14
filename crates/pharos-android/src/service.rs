@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Used when `<filesDir>/server_url` is absent or empty.
+/// Used when the app has stored no `https://` server (`credentials::SERVER_FILE`).
 pub(crate) const DEFAULT_SERVER: &str = "https://prototype.aliflix.alison-jenkins.com";
 
 /// Sends the `log` crate's records (the content layer's) to logcat.
@@ -32,14 +32,14 @@ pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
         ::log::set_max_level(::log::LevelFilter::Info);
     }
     let files = files_dir(env, ctx)?;
-    let stored = std::fs::read_to_string(Path::new(&files).join("server_url"))
-        .map(|s| s.trim().to_owned())
-        .ok()
-        .filter(|s| !s.is_empty());
+    let stored = content::credentials::load_server(Path::new(&files));
     let server_from = if stored.is_some() { "file" } else { "default" };
     let server = stored.unwrap_or_else(|| DEFAULT_SERVER.to_owned());
-    let lib = content::Library::connect(&server, &Path::new(&files).join("device_token"))
-        .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
+    let lib = content::Library::connect(
+        &server,
+        &content::credentials::token_path(Path::new(&files)),
+    )
+    .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
     lib.on_auth_change(|_| notify_changed());
     let auth = match lib.auth_state() {
         content::AuthState::SignedOut => "signed_out",
