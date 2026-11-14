@@ -84,6 +84,7 @@ pub(crate) fn play(
 
 /// Asks the library for `id`'s fresh stream URL (blocking) and plays it.
 pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
+    let queue_ids: Vec<String> = queue.iter().map(|i| i.id.clone()).collect();
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         if let Some(path) = lib.local_path(id) {
@@ -124,7 +125,7 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
     })();
     if let Err(e) = &outcome {
         if PLAY_GEN.load(Ordering::SeqCst) == gen {
-            snapshot::note_error(&format!("play {id}: {e}"));
+            snapshot::note_failure(id, &queue_ids, &format!("play {id}: {e}"));
             if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
                 set_error(env, session.as_obj(), "Couldn't play that")?;
             }
