@@ -1,19 +1,22 @@
-//! Shelve the books whose own files named no usable subject, from Open
-//! Library (spec 043, ADR-0129).
+//! Shelve the books whose own files named no usable subject, and describe
+//! the ones whose files carry no description, from Open Library (spec 043,
+//! ADR-0129, ADR-0135).
 //!
 //! A slow background pass, off unless `[books].online_subjects` is set. It
-//! takes each book whose genres are empty or only `Other`, asks
-//! [`OpenLibrary`] for its subjects, maps them to shelves with
-//! `pharos_scanner::book::shelf`, and links the shelves as the book's genres.
-//! `link_item_genres` keeps an admin's locked list, and a locked book is not
-//! asked about at all.
+//! takes each book whose genres are empty or only `Other`, or whose overview
+//! is empty, asks [`OpenLibrary`] for its work, maps the subjects to shelves
+//! with `pharos_scanner::book::shelf` and links them as the book's genres,
+//! and stores the work's description, cleaned to plain text, as the book's
+//! overview. `link_item_genres` keeps an admin's locked list; a field an admin
+//! locked is never filled, and a book needing only locked fields is not asked
+//! about at all.
 //!
 //! # Memo
 //!
 //! Every answer, and every miss, is kept in `.book_subjects.json` beside the
-//! cache, keyed by the ISBN, title and author asked. A book shelved this way
-//! loses its shelf when a rescan relinks genres from the file; the next pass
-//! puts it back from the memo without a request. A miss is asked again after
+//! cache, keyed by the ISBN, title and author asked. A book shelved or
+//! described this way loses that when a rescan re-reads the file; the next
+//! pass puts it back from the memo without a request. A miss is asked again after
 //! [`MISS_TTL_SECS`]. A failed request is not kept, so the next pass retries.
 //!
 //! # Signals
@@ -21,6 +24,8 @@
 //! `sum by (source, outcome) (increase(pharos_book_category_total{source="openlibrary"}[1d]))`
 //! and `{namespace="pharos"} |= "book categorised"`, which names the item, the
 //! raw subjects, the shelves and the work matched, or the reason for a miss.
+//! Descriptions: `sum by (outcome) (increase(pharos_book_description_total{source="openlibrary"}[1d]))`
+//! and `{namespace="pharos"} |= "book described"`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,7 +33,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use pharos_core::{DomainResult, EditableField, GenreStore, MediaId, MediaKind, MediaStore};
+use pharos_core::{
+    DomainResult, EditableField, GenreStore, MediaId, MediaItem, MediaKind, MediaStore,
+};
 use pharos_scanner::book::shelf::{self, Outcome, Source};
 use serde::{Deserialize, Serialize};
 
@@ -50,13 +57,18 @@ pub const MISS_TTL_SECS: i64 = 30 * 24 * 3600;
 /// Most raw subjects written to the log line per book.
 const LOGGED_SUBJECTS: usize = 12;
 /// Bumped when what an answer means changes, which drops every entry.
-const MEMO_VERSION: u32 = 1;
+/// v2: an answer carries the work's description, so every book is asked once
+/// more.
+const MEMO_VERSION: u32 = 2;
 
 /// One remembered answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoEntry {
     /// `None` is a miss.
     pub subjects: Option<Vec<String>>,
+    /// The work's description as Open Library wrote it.
+    #[serde(default)]
+    pub description: Option<String>,
     pub work: Option<String>,
     /// Unix seconds.
     pub checked_at: i64,
@@ -148,6 +160,7 @@ pub struct PassReport {
     pub asked: usize,
     pub from_memo: usize,
     pub shelved: usize,
+    pub described: usize,
     pub misses: usize,
     pub unavailable: usize,
     pub locked: usize,
@@ -192,6 +205,35 @@ async fn apply<S: GenreStore>(
     Ok(outcome)
 }
 
+/// Store `raw`, cleaned, as `item`'s overview, then count and log it.
+/// Whether the book was described.
+async fn describe<S: MediaStore>(
+    store: &S,
+    item: &MediaItem,
+    raw: &str,
+    via: &str,
+    work: Option<&str>,
+) -> DomainResult<bool> {
+    let Some(text) =
+        pharos_scanner::book::description::record_description(Some(raw), "openlibrary")
+    else {
+        tracing::info!(
+            media.id = item.id,
+            via,
+            work,
+            raw_chars = raw.chars().count(),
+            "book described: open library's description was too short to use"
+        );
+        return Ok(false);
+    };
+    let chars = text.chars().count();
+    let mut item = item.clone();
+    item.metadata.overview = Some(text);
+    store.put(item.clone()).await?;
+    tracing::info!(media.id = item.id, via, work, chars, "book described");
+    Ok(true)
+}
+
 /// One pass over the library's books.
 pub async fn run_pass<S, F>(
     store: &S,
@@ -214,10 +256,15 @@ where
         .collect();
     for item in books {
         let current = store.item_genre_names(item.id).await?;
-        if !shelf::needs_lookup(&current) {
-            continue;
-        }
-        if item.locked.contains(EditableField::Genres) {
+        let mut wants_shelf = shelf::needs_lookup(&current);
+        let wants_text = item
+            .metadata
+            .overview
+            .as_deref()
+            .map_or(true, |o| o.trim().is_empty())
+            && !item.locked.contains(EditableField::Overview);
+        if wants_shelf && item.locked.contains(EditableField::Genres) {
+            wants_shelf = false;
             let first = state
                 .locked_seen
                 .lock()
@@ -233,6 +280,8 @@ where
                     "book categorised: genres locked by an admin, not looked up"
                 );
             }
+        }
+        if !wants_shelf && !wants_text {
             continue;
         }
         let book = item.book.clone().unwrap_or_default();
@@ -248,19 +297,27 @@ where
         match memo.get(&key) {
             Some(MemoEntry {
                 subjects: Some(subjects),
+                description,
                 work,
                 ..
             }) => {
                 let would = shelf::names(&shelf::shelves_for(&subjects));
-                if would.is_empty() || would == current {
-                    // Already as the memo would leave it: not a new decision.
-                    continue;
+                // Already as the memo would leave it: not a new decision.
+                let shelve = wants_shelf && !would.is_empty() && would != current;
+                let text = description.filter(|_| wants_text);
+                if shelve || text.is_some() {
+                    report.from_memo += 1;
                 }
-                report.from_memo += 1;
-                if apply(store, item.id, &current, &subjects, "memo", work.as_deref()).await?
-                    == Outcome::Shelved
+                if shelve
+                    && apply(store, item.id, &current, &subjects, "memo", work.as_deref()).await?
+                        == Outcome::Shelved
                 {
                     report.shelved += 1;
+                }
+                if let Some(text) = text {
+                    if describe(store, &item, &text, "memo", work.as_deref()).await? {
+                        report.described += 1;
+                    }
                 }
                 continue;
             }
@@ -288,6 +345,7 @@ where
         match client.lookup(&query).await {
             Ok(Lookup::Found {
                 subjects,
+                description,
                 via,
                 work,
             }) => {
@@ -296,22 +354,29 @@ where
                     key,
                     MemoEntry {
                         subjects: Some(subjects.clone()),
+                        description: description.clone(),
                         work: Some(work.clone()),
                         checked_at: now,
                     },
                 );
-                if apply(
-                    store,
-                    item.id,
-                    &current,
-                    &subjects,
-                    via.label(),
-                    Some(&work),
-                )
-                .await?
-                    == Outcome::Shelved
+                if wants_shelf
+                    && apply(
+                        store,
+                        item.id,
+                        &current,
+                        &subjects,
+                        via.label(),
+                        Some(&work),
+                    )
+                    .await?
+                        == Outcome::Shelved
                 {
                     report.shelved += 1;
+                }
+                if let Some(text) = description.filter(|_| wants_text) {
+                    if describe(store, &item, &text, via.label(), Some(&work)).await? {
+                        report.described += 1;
+                    }
                 }
             }
             Ok(Lookup::NoMatch { reason }) => {
@@ -321,6 +386,7 @@ where
                     key,
                     MemoEntry {
                         subjects: None,
+                        description: None,
                         work: None,
                         checked_at: now,
                     },
@@ -393,6 +459,7 @@ pub fn spawn(stores: crate::state::Stores, bg_leader: Arc<AtomicBool>, memo_path
                     asked = r.asked,
                     from_memo = r.from_memo,
                     shelved = r.shelved,
+                    described = r.described,
                     misses = r.misses,
                     unavailable = r.unavailable,
                     locked = r.locked,
@@ -436,12 +503,121 @@ mod tests {
                     isbn: isbn.map(str::to_owned),
                     ..Default::default()
                 }),
+                metadata: pharos_core::MediaMetadata {
+                    overview: Some(FILE_TEXT.into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
             .unwrap();
         }
         s
+    }
+
+    const FILE_TEXT: &str = "Described by its own file.";
+    const OL_TEXT: &str = "A field guide to keeping doors locked.";
+    const DESCRIBED_WORK: &str = r#"{"subjects":["Computer security"],
+        "description":{"type":"/type/text","value":"<p>A field guide to keeping doors locked.</p>"}}"#;
+
+    /// The book's overview as a rescan of a file with no description leaves it.
+    async fn undescribe(store: &crate::state::Stores, id: MediaId) {
+        let mut item = store.get(id).await.unwrap();
+        item.metadata.overview = None;
+        store.put(item).await.unwrap();
+    }
+
+    async fn overview(store: &crate::state::Stores, id: MediaId) -> Option<String> {
+        store.get(id).await.unwrap().metadata.overview
+    }
+
+    fn described(snap: &metrics_util::debugging::Snapshotter, outcome: &str) -> u64 {
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| {
+                let key = k.key();
+                key.name() == "pharos_book_description_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "source" && l.value() == "openlibrary")
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// ADR-0135 — a book whose file carries no description is described from its
+    /// work, as plain text, and a rescan's loss is put back from the memo.
+    #[tokio::test]
+    async fn a_book_with_no_description_is_described_and_remembered() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let store = store_with(&[(20, "Locked Doors", Some("9780000000019"))]).await;
+        store
+            .link_item_genres(20, &["Security".into()])
+            .await
+            .unwrap();
+        undescribe(&store, 20).await;
+        let c = client(
+            FakeFetch::default()
+                .on("/isbn/9780000000019.json", ok(EDITION))
+                .on("/works/OL5W.json", ok(DESCRIBED_WORK)),
+        );
+        let (_dir, memo) = memo();
+        let state = JobState::default();
+        let r = run_pass(&store, &c, &memo, &state, NOW).await.unwrap();
+        assert_eq!((r.asked, r.described, r.shelved), (1, 1, 0), "{r:?}");
+        assert_eq!(overview(&store, 20).await.as_deref(), Some(OL_TEXT));
+        assert_eq!(
+            store.item_genre_names(20).await.unwrap(),
+            vec!["Security".to_string()],
+            "a shelved book keeps its shelf"
+        );
+        assert_eq!(described(&snap, "cleaned"), 1);
+
+        let r = run_pass(&store, &c, &memo, &state, NOW).await.unwrap();
+        assert_eq!(r, PassReport::default(), "described now: nothing to do");
+
+        undescribe(&store, 20).await;
+        let r = run_pass(&store, &c, &memo, &state, NOW).await.unwrap();
+        assert_eq!((r.asked, r.from_memo, r.described), (0, 1, 1), "{r:?}");
+        assert_eq!(overview(&store, 20).await.as_deref(), Some(OL_TEXT));
+        assert_eq!(c_asked(&c), 2, "edition and work, once");
+    }
+
+    /// ADR-0135 — a description from the file, or one an admin locked, is never
+    /// replaced, and a book needing nothing is never asked.
+    #[tokio::test]
+    async fn a_files_or_locked_description_is_kept() {
+        let store = store_with(&[(21, "Own Words", None), (22, "Hand Written", None)]).await;
+        for id in [21, 22] {
+            store.link_item_genres(id, &["Web".into()]).await.unwrap();
+        }
+        store
+            .edit_metadata(
+                &pharos_core::EditTarget::Item(22),
+                &MetadataEdit {
+                    overview: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let c = client(FakeFetch::default());
+        let (_dir, memo) = memo();
+        let r = run_pass(&store, &c, &memo, &JobState::default(), NOW)
+            .await
+            .unwrap();
+        assert_eq!(r, PassReport::default(), "{r:?}");
+        assert_eq!(overview(&store, 21).await.as_deref(), Some(FILE_TEXT));
+        assert_eq!(c_asked(&c), 0);
     }
 
     fn memo() -> (tempfile::TempDir, SubjectMemo) {
