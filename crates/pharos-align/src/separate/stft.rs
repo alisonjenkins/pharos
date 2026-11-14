@@ -35,7 +35,7 @@ pub enum StftError {
 }
 
 /// Frames the spectrogram of `len` samples has.
-pub fn frames(len: usize) -> usize {
+pub const fn frames(len: usize) -> usize {
     len.div_ceil(HOP)
 }
 
