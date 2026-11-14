@@ -3642,6 +3642,60 @@ where
             .last_played_position_ticks,
         0
     );
+
+    // V1391 — a book's other format folded into it as a version hands its
+    // reading place over when it is the newer save, and only with its resume.
+    let (kept, folded): (MediaId, MediaId) = (8_104, 8_105);
+    for (id, title) in [(kept, "Book D"), (folded, "Book D copy")] {
+        MediaStore::put(&store, media_item(id, title))
+            .await
+            .unwrap();
+    }
+    store
+        .set_read_position(uid, kept, pos("epub1:2:0", 0.2, 1_700_000_100))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, folded, pos("pdf1:9", 0.6, 1_700_000_200))
+        .await
+        .unwrap();
+    store
+        .set_read_position(other, folded, pos("pdf1:1", 0.1, 1_700_000_050))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Drop)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("epub1:2:0", 0.2, 1_700_000_100)),
+        "a dropped resume leaves the place alone"
+    );
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Carry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("pdf1:9", 0.6, 1_700_000_200)),
+        "the newer save wins"
+    );
+    assert_eq!(
+        store.get_read_position(other, kept).await.unwrap(),
+        Some(pos("pdf1:1", 0.1, 1_700_000_050)),
+        "a reader with no place on the item gets the folded one"
+    );
+    store
+        .set_read_position(uid, kept, pos("epub1:7:0", 0.7, 1_700_000_300))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Carry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("epub1:7:0", 0.7, 1_700_000_300)),
+        "an older save never overwrites a newer one"
+    );
 }
 
 /// A database of its own for one postgres conformance arm, dropped and
