@@ -237,6 +237,20 @@
             cargoClippyExtraArgs = "--package pharos-align --features recognise --all-targets -- -D warnings";
           }
         );
+        # The separator (spec 042 slice 3) includes the network the flake
+        # converts, so its build needs PHAROS_SEPARATOR_MODEL.
+        alignerSeparateArgs = ciArgs // {
+          pname = "pharos-align-separate";
+          cargoExtraArgs = "--package pharos-align --features separate";
+          PHAROS_SEPARATOR_MODEL = separatorModel;
+        };
+        alignerSeparateClippy = craneLib.cargoClippy (
+          alignerSeparateArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly alignerSeparateArgs;
+            cargoClippyExtraArgs = "--package pharos-align --features separate --all-targets -- -D warnings";
+          }
+        );
         pharosFmt = craneLib.cargoFmt { inherit (pharosCommonArgs) pname version src; };
         # Postgres-backend conformance: the store trait suite run against a REAL
         # Postgres started INSIDE the nix sandbox (TCP on loopback — the sandbox
@@ -1597,6 +1611,8 @@
             # suite needs no `npx playwright install` and behaves the same
             # on every machine. The version matches package.json's
             # @playwright/test, so chromium-<rev> is present here.
+            # The separator's converted network and weights (`--features separate`).
+            export PHAROS_SEPARATOR_MODEL=${separatorModel}
             export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
             # nix-store browsers are prebuilt + immutable; skip Playwright's
             # apt-style host-dependency probe (false-negatives on non-Debian
@@ -1703,6 +1719,7 @@
         checks.clippy = pharosClippy;
         checks.clippy-postgres = pharosClippyPostgres;
         checks.clippy-recognise = alignerRecogniseClippy;
+        checks.clippy-separate = alignerSeparateClippy;
         checks.fmt = pharosFmt;
         # B278: the angie access log must not carry query strings (tokens).
         checks.angie-access-log = pkgs.runCommand "angie-access-log-check" { } ''
