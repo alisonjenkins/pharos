@@ -951,6 +951,7 @@ mod tests {
             art_url: None,
             stream_url: Some("https://h/x?api_key=SECRET".into()),
             duration_ms: 1000,
+            album: String::new(),
         }
     }
 
