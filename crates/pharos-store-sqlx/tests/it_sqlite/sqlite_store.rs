@@ -1264,6 +1264,25 @@ async fn set_primary_artwork_flips_has_primary_art() {
 }
 
 #[tokio::test]
+async fn embedded_primary_artwork_flips_has_primary_art() {
+    // B1437 — a cover inside the media file is advertised although there is no
+    // file to serve; the image route extracts it on demand.
+    let s = fresh().await;
+    s.put(item(
+        900030,
+        "/books/Some Book/01.m4b",
+        "Part",
+        MediaKind::Audio,
+    ))
+    .await
+    .unwrap();
+    s.set_artwork(900030, "Primary", "embedded", "/books/Some Book/01.m4b")
+        .await
+        .unwrap();
+    assert!(s.get(900030).await.unwrap().has_primary_art);
+}
+
+#[tokio::test]
 async fn tmdb_primary_artwork_flips_has_primary_art() {
     // Task 8: a downloaded provider artwork (`tmdb`/`tvdb` source, an
     // absolute on-disk cache path) is just as servable as a local sidecar —
