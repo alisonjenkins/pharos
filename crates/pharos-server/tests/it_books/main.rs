@@ -9,5 +9,6 @@ mod book_read_progress;
 mod course_lessons;
 mod item_download;
 mod library_watch_fallback;
+mod opds;
 mod remote_end_to_end;
 mod rescan_held_path;
