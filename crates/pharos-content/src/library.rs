@@ -116,6 +116,7 @@ enum Op {
     Children(NodeId),
     Node(NodeId),
     Book(ItemRef),
+    Progress(ItemRef, u64, tree::Progress),
     Search(String),
     SignOut,
     Reload,
@@ -127,6 +128,7 @@ impl Op {
             Op::Children(id) => format!("browse {id}"),
             Op::Node(id) => format!("node {id}"),
             Op::Book(a) => format!("book {a}"),
+            Op::Progress(id, at, p) => format!("progress {} {id} at_ms={at}", p.label()),
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
             Op::Reload => "reload credentials".into(),
@@ -363,6 +365,35 @@ impl Library {
             Out::One(n) => Ok(n),
             _ => Err(ContentError::WorkerGone),
         }
+    }
+
+    /// Tells the server, without waiting, that the track `media_id` is at
+    /// `at_ms`, so the phone and any other device resume there. Offline, the
+    /// report is dropped: the position kept on this phone covers it.
+    pub fn progress(
+        &self,
+        media_id: &str,
+        at_ms: u64,
+        p: tree::Progress,
+    ) -> Result<(), ContentError> {
+        let NodeId::Track(id) = NodeId::parse(media_id)? else {
+            return Err(ContentError::BadId(format!("{media_id} is not a track")));
+        };
+        if !self.online.load(Ordering::SeqCst) {
+            log::info!(
+                "car progress {} {id} at_ms={at_ms}: outcome=skipped_offline",
+                p.label()
+            );
+            return Ok(());
+        }
+        // Nobody waits for the reply: the worker logs the outcome.
+        let (reply, _) = mpsc::channel();
+        self.tx
+            .send(Cmd {
+                op: Op::Progress(id, at_ms, p),
+                reply,
+            })
+            .map_err(|_| ContentError::WorkerGone)
     }
 
     /// Every part of the book `media_id` (an `album/` id) and the one to
@@ -839,6 +870,14 @@ impl Worker {
                 Op::Children(id) => tree::children(&link.cat, &urls, *id).await.map(Out::Nodes),
                 Op::Node(id) => tree::node(&link.cat, &urls, *id).await.map(Out::One),
                 Op::Book(a) => tree::book(&link.cat, &urls, *a).await.map(Out::Book),
+                Op::Progress(id, at, p) => {
+                    let r = tree::progress(&link.cat, *id, *at, *p).await;
+                    match &r {
+                        Ok(()) => log::info!("car {}: outcome=ok", op.name()),
+                        Err(e) => log::warn!("car {}: outcome=failed: {}", op.name(), e.redacted()),
+                    }
+                    r.map(|()| Out::Done)
+                }
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
@@ -1294,6 +1333,26 @@ mod tests {
             "nothing kept: the error stands"
         );
         assert!(lib.book("track/2").is_err(), "not a book");
+    }
+
+    #[test]
+    fn progress_offline_is_dropped_and_says_so() {
+        let (lib, _) = offline_lib("progress");
+        lib.set_online(false);
+        crate::testlog::start();
+        lib.progress("track/2", 61_000, tree::Progress::Paused)
+            .unwrap();
+        assert!(
+            crate::testlog::lines()
+                .iter()
+                .any(|l| l.ends_with("paused 2 at_ms=61000: outcome=skipped_offline")),
+            "{:?}",
+            crate::testlog::lines()
+        );
+        assert!(
+            lib.progress("album/7", 1, tree::Progress::Playing).is_err(),
+            "only a track has a position"
+        );
     }
 
     #[test]
