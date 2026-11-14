@@ -1,6 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
 use super::*;
+use crate::device::AdapterKind;
 
 const PLANE: usize = BINS * FRAMES;
 
@@ -158,6 +161,111 @@ fn a_network_error_names_its_segment() {
         err.to_string(),
         "running the network on the segment at sample 0: lost the device"
     );
+}
+
+#[test]
+fn outcome_labels_are_distinct() {
+    let mut l: Vec<_> = Outcome::ALL.iter().map(|o| o.label()).collect();
+    l.sort_unstable();
+    l.dedup();
+    assert_eq!(l.len(), Outcome::ALL.len());
+}
+
+fn gpu() -> Choice {
+    Choice {
+        device: Device::Vulkan(Adapter {
+            name: "Test GPU".into(),
+            kind: AdapterKind::Discrete,
+            ordinal: 0,
+        }),
+        reason: "adapter_found".into(),
+    }
+}
+
+/// `SEPARATION_TOTAL` by `outcome`, and whether `SEPARATION_SECONDS` saw it.
+fn counted(f: impl FnOnce()) -> Vec<(String, Option<u64>, bool)> {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, f);
+    let snapshot = snapshotter.snapshot().into_vec();
+    Outcome::ALL
+        .iter()
+        .map(|o| {
+            let has = |name: &str| {
+                snapshot.iter().find(|(k, ..)| {
+                    k.key().name() == name
+                        && k.key()
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == o.label())
+                })
+            };
+            (
+                o.label().to_owned(),
+                has(SEPARATION_TOTAL).and_then(|(.., v)| match v {
+                    DebugValue::Counter(c) => Some(*c),
+                    _ => None,
+                }),
+                has(SEPARATION_SECONDS).is_some(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn without_a_gpu_the_recogniser_hears_the_mix() {
+    let mix = song(1_000, 2);
+    let choice = Choice {
+        device: Device::Cpu,
+        reason: "no_adapter".into(),
+    };
+    let mut got = None;
+    let seen = counted(|| {
+        got = Some(vocals_or_mix(mix.clone(), &choice, |_, _| {
+            panic!("separated without a GPU")
+        }));
+    });
+    let (audio, s) = got.unwrap();
+    assert_eq!(audio, Some(mix));
+    assert_eq!(
+        (s.outcome, s.reason.as_str()),
+        (Outcome::NoGpu, "no_adapter")
+    );
+    assert_eq!(seen[1], ("no_gpu".into(), Some(1), false));
+    assert_eq!(seen[0].1, None);
+    assert_eq!(seen[2].1, None);
+}
+
+#[test]
+fn on_a_gpu_the_recogniser_hears_the_vocals() {
+    let mut got = None;
+    let seen = counted(|| {
+        got = Some(vocals_or_mix(song(1_000, 2), &gpu(), |a, _| {
+            assert_eq!(a.name, "Test GPU");
+            Ok([vec![1.0], vec![2.0]])
+        }));
+    });
+    let (audio, s) = got.unwrap();
+    assert_eq!(audio, Some([vec![1.0], vec![2.0]]));
+    assert_eq!(s.outcome, Outcome::Separated);
+    assert_eq!(seen[0], ("separated".into(), Some(1), true));
+}
+
+#[test]
+fn a_failed_separation_hears_nothing_and_says_why() {
+    let mut got = None;
+    let seen = counted(|| {
+        got = Some(vocals_or_mix(song(1_000, 2), &gpu(), |_, _| {
+            Err(SeparateError::Network {
+                offset: 0,
+                message: "out of memory".into(),
+            })
+        }));
+    });
+    let (audio, s) = got.unwrap();
+    assert_eq!(audio, None);
+    assert_eq!(s.outcome, Outcome::Failed);
+    assert!(s.reason.contains("out of memory"), "{}", s.reason);
+    assert_eq!(seen[2], ("failed".into(), Some(1), true));
 }
 
 #[test]

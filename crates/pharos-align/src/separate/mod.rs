@@ -5,6 +5,10 @@
 
 pub mod stft;
 
+use std::time::Instant;
+
+use crate::device::{Adapter, Choice, Device};
+use crate::obs::{SEPARATION_SECONDS, SEPARATION_TOTAL};
 use stft::{Stft, StftError, BINS};
 
 pub const RATE: u32 = 44_100;
@@ -175,6 +179,87 @@ pub fn vocals(
         }
     }
     Ok(out)
+}
+
+/// What the recogniser heard, by [`SEPARATION_TOTAL`]'s `outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The separator ran; the recogniser hears the vocals.
+    Separated,
+    /// No GPU to run it on; the recogniser hears the mix.
+    NoGpu,
+    /// It failed; the song keeps today's answer.
+    Failed,
+}
+
+impl Outcome {
+    pub const ALL: [Self; 3] = [Self::Separated, Self::NoGpu, Self::Failed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Separated => "separated",
+            Self::NoGpu => "no_gpu",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One song's separation: how it ended, why, and how long it took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Separation {
+    pub outcome: Outcome,
+    /// The device choice's reason without a GPU, the error on failure.
+    pub reason: String,
+    pub seconds: f64,
+}
+
+impl Separation {
+    /// Logs and counts it; the time goes in [`SEPARATION_SECONDS`] only when
+    /// the separator ran.
+    pub fn record(&self) {
+        tracing::info!(
+            outcome = self.outcome.label(),
+            reason = %self.reason,
+            seconds = self.seconds,
+            "vocals separated"
+        );
+        metrics::counter!(SEPARATION_TOTAL, "outcome" => self.outcome.label()).increment(1);
+        if self.outcome != Outcome::NoGpu {
+            metrics::histogram!(SEPARATION_SECONDS, "outcome" => self.outcome.label())
+                .record(self.seconds);
+        }
+    }
+}
+
+/// The audio the recogniser hears: the vocals from `run` on the chosen GPU,
+/// the mix when there is no GPU (the CPU separator is too slow to wait
+/// for), or nothing when the separator failed. Records the separation.
+pub fn vocals_or_mix(
+    mix: Stereo,
+    choice: &Choice,
+    run: impl FnOnce(&Adapter, &Stereo) -> Result<Stereo, SeparateError>,
+) -> (Option<Stereo>, Separation) {
+    let Device::Vulkan(adapter) = &choice.device else {
+        let s = Separation {
+            outcome: Outcome::NoGpu,
+            reason: choice.reason.clone(),
+            seconds: 0.0,
+        };
+        s.record();
+        return (Some(mix), s);
+    };
+    let t = Instant::now();
+    let (audio, outcome, reason) = match run(adapter, &mix) {
+        Ok(v) => (Some(v), Outcome::Separated, adapter.name.clone()),
+        Err(e) => (None, Outcome::Failed, e.to_string()),
+    };
+    let s = Separation {
+        outcome,
+        reason,
+        seconds: t.elapsed().as_secs_f64(),
+    };
+    s.record();
+    (audio, s)
 }
 
 #[cfg(test)]
