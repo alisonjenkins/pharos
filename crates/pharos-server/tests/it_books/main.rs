@@ -6,6 +6,7 @@ mod book_end_to_end;
 mod book_formats_fold;
 mod book_offers_nothing_to_play;
 mod book_read_progress;
+mod course_lessons;
 mod item_download;
 mod library_watch_fallback;
 mod remote_end_to_end;
