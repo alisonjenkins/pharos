@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pharos_align::crash::{CrashGuard, IN_FLIGHT};
 use pharos_align::line::LineSpans;
 use pharos_align::placement::{Fallback, Method};
 use pharos_align::plan::Line;
@@ -418,4 +419,72 @@ fn a_stage_that_fails_past_the_budget_is_a_timeout_naming_its_error() {
         "{}",
         got.fallback_reason
     );
+}
+
+fn guard_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("pharos-align-guard-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+/// Separates, and says whether the song was marked in flight meanwhile.
+struct Watched {
+    marker: std::path::PathBuf,
+    saw: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Stages for Watched {
+    fn vocals(&self, _: &Path, _: Instant) -> Result<Vec<f32>, StageError> {
+        *self.saw.lock().unwrap() = std::fs::read_to_string(&self.marker).ok();
+        Ok(vec![0.0; SONG_S * RATE])
+    }
+
+    fn recognise(&self, _: &[f32], _: Instant) -> Result<Vec<Word>, StageError> {
+        Ok(song().1)
+    }
+}
+
+#[test]
+fn a_song_is_marked_in_flight_only_while_its_stages_run() {
+    let (sung, _) = song();
+    let d = guard_dir("flight");
+    let saw = Arc::default();
+    let stages = Watched {
+        marker: d.join(IN_FLIGHT),
+        saw: Arc::clone(&saw),
+    };
+    let engine = Engine::new(loader(Some(sung)), silent(), None)
+        .with_stages(Box::new(stages))
+        .with_crash_guard(CrashGuard::open(&d).unwrap());
+    let (got, _) = run(&engine);
+    assert_eq!(got.placement.fallback, None);
+    assert_eq!(saw.lock().unwrap().as_deref(), Some("a"));
+    assert!(!d.join(IN_FLIGHT).exists());
+}
+
+#[test]
+fn a_song_whose_stages_ended_the_last_process_skips_them() {
+    let (sung, _) = song();
+    let (before, _) = today();
+    let d = guard_dir("crashed");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(IN_FLIGHT), "a").unwrap();
+    let stages = Scripted {
+        vocals: Step::Panics,
+        recognise: Step::Panics,
+        heard: Vec::new(),
+        slow: Duration::ZERO,
+    };
+    let engine = Engine::new(loader(Some(sung)), silent(), None)
+        .with_stages(Box::new(stages))
+        .with_crash_guard(CrashGuard::open(&d).unwrap());
+    let (got, events) = run(&engine);
+    assert_eq!(got.placement.fallback, Some(Fallback::StageCrashed));
+    assert_eq!(
+        got.fallback_reason,
+        "the stages ended an earlier process on this song"
+    );
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
 }
