@@ -7,7 +7,7 @@
 //! `REPORT_EVERY_TICKS` ticks while playing and on pause, stop and track
 //! change, so the phone's own player and other devices resume there too.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{GlobalRef, JValue};
@@ -31,7 +31,7 @@ struct Now {
 
 static STORE: OnceLock<Resume> = OnceLock::new();
 static NOW: Mutex<Option<Now>> = Mutex::new(None);
-static TICKING: AtomicBool = AtomicBool::new(false);
+static TICKER: Ticker = Ticker::new();
 /// Tracks started since the process began. A listing's server position is
 /// from when it was listed; once the car has played a track, the phone's
 /// own position for it is the newer one.
@@ -49,6 +49,46 @@ fn first_start(id: &str) -> R<bool> {
     Ok(true)
 }
 
+/// Which save ticker may run. Each ticker holds the token it was started
+/// with and stops once the token is no longer the live one, so a close
+/// followed by an open cannot leave the old ticker running beside the new.
+struct Ticker {
+    live: AtomicU64,
+    issued: AtomicU64,
+}
+
+impl Ticker {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU64::new(0),
+            issued: AtomicU64::new(0),
+        }
+    }
+
+    /// A token for a new ticker, or `None` while one is live.
+    fn start(&self) -> Option<u64> {
+        let token = self.issued.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        self.live
+            .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| token)
+    }
+
+    fn stop(&self) {
+        self.live.store(0, Ordering::SeqCst);
+    }
+
+    fn release(&self, token: u64) {
+        let _ = self
+            .live
+            .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn is_live(&self, token: u64) -> bool {
+        self.live.load(Ordering::SeqCst) == token
+    }
+}
+
 fn now() -> R<std::sync::MutexGuard<'static, Option<Now>>> {
     NOW.lock().map_err(|_| "resume mutex poisoned".to_owned())
 }
@@ -56,34 +96,42 @@ fn now() -> R<std::sync::MutexGuard<'static, Option<Now>>> {
 /// Loads the saved positions from `files_dir` and starts the save ticker.
 pub fn open(files_dir: &str) -> R<()> {
     STORE.get_or_init(|| Resume::open(std::path::Path::new(files_dir)));
-    if !TICKING.swap(true, Ordering::SeqCst) {
-        std::thread::Builder::new()
+    if let Some(token) = TICKER.start() {
+        if let Err(e) = std::thread::Builder::new()
             .name("pharos-resume".into())
-            .spawn(tick_loop)
-            .map_err(|e| format!("spawn resume ticker: {e}"))?;
+            .spawn(move || tick_loop(token))
+        {
+            TICKER.release(token);
+            return Err(format!("spawn resume ticker: {e}"));
+        }
     }
     Ok(())
 }
 
 /// Stops the ticker after its current sleep.
 pub fn close() {
-    TICKING.store(false, Ordering::SeqCst);
+    TICKER.stop();
 }
 
-fn tick_loop() {
+fn tick_loop(token: u64) {
     let Some(vm) = VM.get() else {
         log("resume: ticker has no JavaVM, not saving while playing");
+        TICKER.release(token);
         return;
     };
     let mut env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(e) => {
             log(&format!("resume: ticker attach failed: {e}"));
+            TICKER.release(token);
             return;
         }
     };
-    while TICKING.load(Ordering::SeqCst) {
+    while TICKER.is_live(token) {
         std::thread::sleep(RESUME_SAVE_EVERY);
+        if !TICKER.is_live(token) {
+            break;
+        }
         if let Err(e) = note_if_playing(&mut env) {
             log(&format!("resume: tick failed: {e}"));
             if env.exception_check().unwrap_or(false) {
@@ -304,6 +352,35 @@ mod tests {
             "the phone's is newer now"
         );
         assert!(first_start("track/t2").unwrap());
+    }
+
+    #[test]
+    fn a_ticker_started_after_a_close_outlives_the_one_it_replaced() {
+        let t = Ticker::new();
+        let first = t.start().unwrap();
+        assert!(t.start().is_none(), "one ticker at a time");
+        t.stop();
+        let second = t.start().unwrap();
+        assert!(!t.is_live(first), "the old ticker must see it is stale");
+        assert!(t.is_live(second));
+    }
+
+    #[test]
+    fn a_ticker_that_fails_to_start_frees_the_slot() {
+        let t = Ticker::new();
+        let token = t.start().unwrap();
+        t.release(token);
+        assert!(t.start().is_some());
+    }
+
+    #[test]
+    fn a_stale_ticker_cannot_release_its_successor() {
+        let t = Ticker::new();
+        let first = t.start().unwrap();
+        t.stop();
+        let second = t.start().unwrap();
+        t.release(first);
+        assert!(t.is_live(second));
     }
 
     #[test]
