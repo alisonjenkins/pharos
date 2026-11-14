@@ -11,13 +11,21 @@ pub struct Word {
     #[serde(rename = "w")]
     pub text: String,
     /// Seconds from the start of the song.
-    #[serde(rename = "s")]
+    #[serde(rename = "s", deserialize_with = "exact_f64")]
     pub start_s: f64,
-    #[serde(rename = "e")]
+    #[serde(rename = "e", deserialize_with = "exact_f64")]
     pub end_s: f64,
     /// The recogniser's confidence, 0 to 1.
     #[serde(rename = "p", default)]
     pub prob: f64,
+}
+
+/// serde_json's own float parse can land one ulp off the nearest double,
+/// and a time just under a whole millisecond then truncates to the one
+/// before; the standard library's parse is correctly rounded, as Python's is.
+fn exact_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let raw: Box<serde_json::value::RawValue> = serde::Deserialize::deserialize(d)?;
+    raw.get().parse().map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
@@ -87,6 +95,18 @@ mod tests {
         assert_eq!(t.words[0].text, " Paper");
         assert_eq!((t.words[0].start_s, t.words[0].end_s), (1.5, 1.9));
         assert_eq!(t.words[1].prob, 0.0);
+    }
+
+    #[test]
+    fn times_parse_to_the_nearest_double() {
+        let t = Transcript::from_json(r#"{"words":[{"w":"x","s":188.01999999999998,"e":1e1}]}"#)
+            .unwrap();
+        assert_eq!(
+            t.words[0].start_s,
+            "188.01999999999998".parse::<f64>().unwrap()
+        );
+        assert_eq!((t.words[0].start_s * 1000.0) as i64, 188_019);
+        assert_eq!(t.words[0].end_s, 10.0);
     }
 
     #[test]

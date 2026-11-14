@@ -30,7 +30,7 @@ opentelemetry_sdk.workspace = true
 libc = "0.2"
 rayon = "1"
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
