@@ -8253,6 +8253,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-classgen"
+version = "0.0.0"
+
+[[package]]
 name = "pharos-client"
 version = "0.0.0"
 dependencies = [
