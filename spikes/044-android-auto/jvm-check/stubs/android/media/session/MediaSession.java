@@ -2,7 +2,8 @@ package android.media.session;
 import android.os.Bundle;
 public final class MediaSession {
   public Callback cb; public boolean active; public PlaybackState state; public android.media.MediaMetadata md;
-  public MediaSession(android.content.Context context, String tag) { System.out.println("stub: MediaSession(" + tag + ")"); }
+  public static MediaSession last;
+  public MediaSession(android.content.Context context, String tag) { last = this; System.out.println("stub: MediaSession(" + tag + ")"); }
   public void setCallback(Callback callback) { cb = callback; }
   public void setActive(boolean a) { active = a; }
   public Token getSessionToken() { return new Token(); }
