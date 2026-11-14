@@ -147,7 +147,12 @@ impl Downloader {
                     .enable_all()
                     .build()
                 {
-                    Ok(rt) => rt.block_on(for_thread.run()),
+                    Ok(rt) => {
+                        rt.block_on(for_thread.run());
+                        // A resolver call may still be waiting on the content
+                        // worker; do not make a drop wait for it.
+                        rt.shutdown_background();
+                    }
                     Err(e) => log::error!("cache downloader: no runtime: {e}"),
                 }
             })
@@ -192,6 +197,25 @@ impl Downloader {
         }
         g.wake.notify_one();
         queued
+    }
+
+    /// Add `ids` behind whatever is queued, for pins: the playback queue and
+    /// its eviction protection are left alone. Returns how many were added.
+    pub fn enqueue(&self, ids: &[String]) -> usize {
+        let g = &self.gate;
+        let mut q = g.lock();
+        let mut added = 0usize;
+        for id in ids {
+            if !g.cache.is_complete(id) && !q.wanted.iter().any(|w| w == id) {
+                q.wanted.push_back(id.clone());
+                added = added.saturating_add(1);
+            }
+        }
+        q.budget = q.budget.saturating_add(g.tuning.max_bytes);
+        drop(q);
+        log::info!("cache enqueue added={added} requested={}", ids.len());
+        g.wake.notify_one();
+        added
     }
 
     /// Pause (`false`) or resume (`true`) downloading, from the network
@@ -771,6 +795,22 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         assert!(!r.cache.is_complete("track/1"));
         assert!(r.cache.is_complete("track/2"));
+    }
+
+    #[test]
+    fn enqueued_tracks_download_behind_the_playback_queue_without_displacing_it() {
+        let mut script = Script::default();
+        for n in 1..=3 {
+            script = script.file(&format!("/audio/{n}"), body(1000, n));
+        }
+        let r = rig("enqueue", script, 1 << 20, &["t"], fast());
+        r.dl.set_online(false);
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert_eq!(r.dl.enqueue(&ids(&["track/2", "track/3", "track/1"])), 2);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
     }
 
     #[test]
