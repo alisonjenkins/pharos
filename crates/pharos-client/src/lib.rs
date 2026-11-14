@@ -13,6 +13,7 @@ pub mod byte_stream;
 pub mod events;
 pub mod group;
 pub mod mix;
+pub mod tv_auth;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use futures::io::{AsyncRead, AsyncWrite};

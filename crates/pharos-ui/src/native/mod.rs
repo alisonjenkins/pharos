@@ -120,7 +120,7 @@ pub mod wait;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod xr_web;
 // 025: Android TV sign-in logic (backoff, QuickConnect steps); no I/O, builds everywhere.
-pub mod tv_auth;
+pub use pharos_client::tv_auth;
 // 025: the Android TV app's page rules (history, proxy, bridge); no I/O.
 pub mod tv_page;
 // The episode turn as the Android TV page runs it (B1412); no I/O.
