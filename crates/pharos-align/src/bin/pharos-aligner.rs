@@ -267,6 +267,46 @@ fn loader(config: &Config, choice: device::Choice, warmed: Warmed) -> Loader {
     }
 }
 
+/// The recogniser's stages (spec 042) when the build has them and a
+/// recogniser model is set; otherwise every song keeps today's answer.
+#[cfg(all(feature = "recognise", feature = "separate"))]
+fn stages(
+    config: &Config,
+    ffmpeg: &str,
+    choice: &device::Choice,
+) -> Option<Box<dyn pharos_align::service::Stages>> {
+    use pharos_align::separate::htdemucs::BPK;
+    let Some(recogniser) = config.recogniser.clone() else {
+        tracing::info!("recogniser stages off: PHAROS_ALIGNER_RECOGNISER_MODEL is unset");
+        return None;
+    };
+    let separator = config.separator.clone().unwrap_or_else(|| BPK.into());
+    tracing::info!(
+        recogniser = %recogniser.display(),
+        separator = %separator.display(),
+        device = %choice.device.label(),
+        "recogniser stages on"
+    );
+    Some(Box::new(pharos_align::stages::Live {
+        ffmpeg: ffmpeg.to_owned(),
+        choice: choice.clone(),
+        separator,
+        recogniser,
+    }))
+}
+
+#[cfg(not(all(feature = "recognise", feature = "separate")))]
+fn stages(
+    config: &Config,
+    _: &str,
+    _: &device::Choice,
+) -> Option<Box<dyn pharos_align::service::Stages>> {
+    if config.recogniser.is_some() {
+        tracing::warn!("recogniser stages off: built without the recognise and separate features");
+    }
+    None
+}
+
 fn main() -> std::process::ExitCode {
     let config = match Config::from_env(|k| std::env::var(k).ok()) {
         Ok(c) => c,
@@ -306,11 +346,18 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     }
     let metrics = Metrics::install()?;
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
-    let decoder: Decoder =
-        Box::new(move |path, start, end| pharos_align::audio::decode(&ffmpeg, path, start, end));
+    let decode_with = ffmpeg.clone();
+    let decoder: Decoder = Box::new(move |path, start, end| {
+        pharos_align::audio::decode(&decode_with, path, start, end)
+    });
     let (choice, warmed) = choose_device(&config)?;
+    let stages = stages(&config, &ffmpeg, &choice);
     let loader = loader(&config, choice, warmed);
-    let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
+    let mut engine = Engine::new(loader, decoder, config.idle_unload);
+    if let Some(stages) = stages {
+        engine = engine.with_stages(stages);
+    }
+    let engine = Arc::new(engine);
 
     if let Some(idle) = config.idle_unload {
         let engine = Arc::clone(&engine);

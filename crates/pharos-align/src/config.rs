@@ -37,6 +37,11 @@ pub struct Config {
     pub device: DeviceMode,
     /// Where the GPU pass keeps compiled kernels between restarts.
     pub cache_dir: PathBuf,
+    /// whisper's ggml model; `None` leaves the recogniser's stages off
+    /// (spec 042), so every song keeps today's answer.
+    pub recogniser: Option<PathBuf>,
+    /// htdemucs's weights, in place of the ones the binary was built with.
+    pub separator: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -160,6 +165,8 @@ impl Config {
             cache_dir: PathBuf::from(
                 set(get("PHAROS_ALIGNER_CACHE_DIR")).unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
             ),
+            recogniser: set(get("PHAROS_ALIGNER_RECOGNISER_MODEL")).map(PathBuf::from),
+            separator: set(get("PHAROS_ALIGNER_SEPARATOR_WEIGHTS")).map(PathBuf::from),
         })
     }
 }
@@ -194,6 +201,8 @@ mod tests {
         assert_eq!(c.batch_samples, 1_000_000);
         assert_eq!(c.device, DeviceMode::Auto);
         assert_eq!(c.cache_dir, PathBuf::from("/var/cache/pharos-aligner"));
+        assert_eq!(c.recogniser, None, "the recogniser's stages are off");
+        assert_eq!(c.separator, None);
     }
 
     #[test]
@@ -209,8 +218,12 @@ mod tests {
             ("PHAROS_ALIGNER_BATCH_SAMPLES", "48000"),
             ("PHAROS_ALIGNER_DEVICE", "cpu"),
             ("PHAROS_ALIGNER_CACHE_DIR", "/var/cache/aligner"),
+            ("PHAROS_ALIGNER_RECOGNISER_MODEL", "/r/ggml.bin"),
+            ("PHAROS_ALIGNER_SEPARATOR_WEIGHTS", "/s/htdemucs.bpk"),
         ]))
         .unwrap();
+        assert_eq!(c.recogniser, Some(PathBuf::from("/r/ggml.bin")));
+        assert_eq!(c.separator, Some(PathBuf::from("/s/htdemucs.bpk")));
         assert_eq!(c.device, DeviceMode::Cpu);
         assert_eq!(c.cache_dir, PathBuf::from("/var/cache/aligner"));
         assert_eq!(c.pin, PinMode::Off);
