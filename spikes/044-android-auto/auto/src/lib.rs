@@ -89,6 +89,8 @@ struct Item {
     art: String,
     /// 0 when unknown.
     duration_ms: i64,
+    /// Empty when unknown or not a track.
+    album: String,
 }
 
 impl Item {
@@ -101,6 +103,7 @@ impl Item {
             playable: e.playable,
             art: e.art.to_owned(),
             duration_ms: if e.playable && e.url.is_empty() { TONE_MS } else { 0 },
+            album: String::new(),
         }
     }
 
@@ -113,6 +116,7 @@ impl Item {
             playable: n.playable,
             art: n.art_url.unwrap_or_default(),
             duration_ms: i64::try_from(n.duration_ms).unwrap_or(0),
+            album: n.album,
         }
     }
 
@@ -127,6 +131,7 @@ impl Item {
             playable: false,
             art: String::new(),
             duration_ms: 0,
+            album: String::new(),
         }
     }
 }
@@ -598,6 +603,9 @@ fn set_metadata(env: &mut JNIEnv, session: &JObject, e: &Item, duration_ms: i64)
         ("android.media.metadata.TITLE", e.title.clone()),
         ("android.media.metadata.ARTIST", e.subtitle.clone()),
     ];
+    if !e.album.is_empty() {
+        fields.push(("android.media.metadata.ALBUM", e.album.clone()));
+    }
     if !e.art.is_empty() {
         let uri = art::art_uri(&e.art);
         fields.push(("android.media.metadata.ALBUM_ART_URI", uri.clone()));
