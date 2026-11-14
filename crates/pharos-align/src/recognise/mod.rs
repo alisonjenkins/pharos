@@ -103,7 +103,7 @@ pub fn words(tokens: &[Token]) -> Vec<Word> {
             let (first, last) = (g.first()?, g.last()?);
             let start_s = prev_end.unwrap_or(first.t0_s);
             let end_s = last.dtw_s.max(start_s);
-            prev_end = Some(last.dtw_s);
+            prev_end = Some(end_s);
             Some(Word {
                 text: g.iter().map(|t| t.text.as_str()).collect(),
                 start_s,
