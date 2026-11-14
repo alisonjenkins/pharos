@@ -169,10 +169,16 @@ pub(crate) fn ids(items: &[Item]) -> Vec<String> {
 
 /// Calls `method` on the current player, then publishes `state`.
 pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
+    transport_with(env, method, state, true)
+}
+
+/// [`transport`]; `explicit` is false for a pause the system caused (a
+/// transient focus loss), which must not cancel the resume-on-gain it set.
+pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explicit: bool) -> R<()> {
     if method == "stop" {
         supersede();
     }
-    if method != "start" {
+    if cancels_resume_on_gain(method, explicit) {
         focus::clear_resume_on_gain();
     }
     let mut guard = state_lock()?;
@@ -227,6 +233,12 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         resume::note(i64::from(pos), method)?;
     }
     set_playback_state(env, session.as_obj(), state, i64::from(pos))
+}
+
+/// A user's pause or stop forgets a pending resume-on-gain; a start, or a
+/// pause the system made, keeps it.
+fn cancels_resume_on_gain(method: &str, explicit: bool) -> bool {
+    method != "start" && explicit
 }
 
 /// Whether `method` may be called on a prepared player. Android rejects
@@ -529,6 +541,17 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_explicit_pause_or_stop_cancels_resume_on_gain() {
+        assert!(cancels_resume_on_gain("pause", true));
+        assert!(cancels_resume_on_gain("stop", true));
+        assert!(
+            !cancels_resume_on_gain("pause", false),
+            "focus loss keeps it"
+        );
+        assert!(!cancels_resume_on_gain("start", true));
+    }
+
     #[test]
     fn pause_is_not_called_on_a_player_that_never_started() {
         assert!(!player_call_valid("pause", false));
