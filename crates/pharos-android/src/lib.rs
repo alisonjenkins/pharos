@@ -193,8 +193,8 @@ fn jerr(what: &str) -> impl Fn(jni::errors::Error) -> String + '_ {
     move |e| format!("{what}: {e}")
 }
 
-/// Runs `f`; on error logs it with `context`, describes and clears any Java
-/// exception so the call returns to Java cleanly.
+/// Runs `f`; on error logs it with `context` and clears any Java exception,
+/// naming its class, so the call returns to Java cleanly.
 fn guarded<T>(
     env: &mut JNIEnv,
     context: &str,
@@ -204,13 +204,33 @@ fn guarded<T>(
     match f(env) {
         Ok(v) => v,
         Err(e) => {
-            log(&format!("{context} failed: {e}"));
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_describe();
-                let _ = env.exception_clear();
-            }
+            let exception = take_exception(env);
+            log(&format!("{context} failed: {e}{exception}"));
             fallback
         }
+    }
+}
+
+/// Clears a pending Java exception and names its class for the log.
+/// The message stays out: it can name the server or a TLS reason.
+pub(crate) fn take_exception(env: &mut JNIEnv) -> String {
+    let Ok(throwable) = env.exception_occurred() else {
+        return String::new();
+    };
+    if throwable.is_null() {
+        return String::new();
+    }
+    let _ = env.exception_clear();
+    let name = env
+        .call_method(&throwable, "getClass", "()Ljava/lang/Class;", &[])
+        .and_then(|v| v.l())
+        .and_then(|c| env.call_method(&c, "getName", "()Ljava/lang/String;", &[]))
+        .and_then(|v| v.l())
+        .map(jni::objects::JString::from)
+        .and_then(|s| env.get_string(&s).map(String::from));
+    match name {
+        Ok(n) => format!(" exception={n}"),
+        Err(_) => " exception=unknown".to_owned(),
     }
 }
 
