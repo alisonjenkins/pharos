@@ -1,7 +1,7 @@
 # ADR-0131: One APK for the phone UI and the car service
 
 - **Status:** Accepted
-- **Date:** 2026-11-14T12:00:00Z
+- **Date:** 2026-11-14T10:15:00Z
 - **Deciders:** Alison (wants one real app for the phone and the car, in pure Rust)
 
 ## Context
