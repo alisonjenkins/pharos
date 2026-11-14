@@ -1013,6 +1013,32 @@ fn run_song(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_line_whose_second_word_alone_moves_is_a_corrected_line() {
+        use super::LineWords;
+        use crate::plan::Stamp;
+        let line = |second| LineWords {
+            words: vec![
+                Stamp {
+                    at: 0,
+                    start_ms: 1000,
+                },
+                Stamp {
+                    at: 4,
+                    start_ms: second,
+                },
+                Stamp {
+                    at: 9,
+                    start_ms: 2400,
+                },
+            ],
+            score: Some(0.8),
+            placement: None,
+        };
+        assert!(line(1500).same_times(&line(1500)));
+        assert!(!line(1500).same_times(&line(1700)));
+    }
+
+    #[test]
     fn a_pool_high_water_mark_keeps_each_counts_largest_reading() {
         use super::GpuPool;
         let p = |in_use, reserved| GpuPool { in_use, reserved };
