@@ -264,6 +264,13 @@ impl Downloader {
         self.gate.wake.notify_one();
     }
 
+    /// Jobs queued or running.
+    #[cfg(test)]
+    pub fn pending(&self) -> usize {
+        let q = self.gate.lock();
+        q.wanted.len() + q.pinned.len() + usize::from(q.busy)
+    }
+
     /// Wait until nothing is queued or downloading; false on timeout.
     #[cfg(test)]
     pub fn wait_idle(&self, timeout: Duration) -> bool {
