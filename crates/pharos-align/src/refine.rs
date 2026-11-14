@@ -35,6 +35,10 @@ pub const ENTRY_COST_PER_S: f64 = 0.3;
 /// true anchors that leap stay within 3 s of their neighbours, the false
 /// ones were 11 s and more away.
 pub const OUTLIER_MS: i64 = 5_000;
+/// How far a line between two anchors may move from where it is expected.
+/// Without it a line after a long instrumental was pulled 20 s back into
+/// the gap by stray emission there; requested times are within ~5 s.
+pub const BETWEEN_MS: i64 = 5_000;
 
 /// The whole song's vocals emission and the samples it came from.
 #[derive(Debug, Clone, Copy)]
@@ -481,15 +485,20 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
                 let (Some(p), Some(q)) = (bands[prev], bands[next]) else {
                     continue;
                 };
-                parts.push((
-                    i,
-                    Part {
-                        words: t,
-                        lo_ms: p.1 - 2.0 * PAD_MS as f64,
-                        hi_ms: q.0 + 2.0 * PAD_MS as f64,
-                        expect_ms: lines[i].start_ms as f64 + shift,
-                    },
-                ));
+                let expect_ms = lines[i].start_ms as f64 + shift;
+                let length = (lines[i].end_ms - lines[i].start_ms) as f64;
+                let gap = (p.1 - 2.0 * PAD_MS as f64, q.0 + 2.0 * PAD_MS as f64);
+                let mut part = Part {
+                    words: t,
+                    lo_ms: gap.0.max(expect_ms - BETWEEN_MS as f64),
+                    hi_ms: gap.1.min(expect_ms + length + BETWEEN_MS as f64),
+                    expect_ms,
+                };
+                // Too little room near where it is expected: the whole gap.
+                if (part.hi_ms - part.lo_ms) / song.ms_per_frame() < part.min_frames() as f64 {
+                    (part.lo_ms, part.hi_ms) = gap;
+                }
+                parts.push((i, part));
             }
         }
         let shift_at = |i: usize| bands[i].map_or(0.0, |b| b.2 - lines[i].start_ms as f64);
