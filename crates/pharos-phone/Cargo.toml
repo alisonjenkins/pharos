@@ -21,9 +21,12 @@ mobile = []
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
 dioxus = { workspace = true, features = ["mobile", "launch", "document"] }
+jni = "0.21.1"
 log = "0.4"
+ndk-context = "0.1"
 pharos-android = { path = "../pharos-android" }
 pharos-ui = { path = "../pharos-ui", features = ["mobile"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 [lints]
 workspace = true
