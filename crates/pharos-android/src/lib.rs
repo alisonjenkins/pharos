@@ -37,7 +37,6 @@ mod voice;
 use pharos_content as content;
 
 use browse::*;
-use fixture::*;
 use player::*;
 use search::*;
 use service::*;
@@ -95,23 +94,6 @@ struct Item {
 }
 
 impl Item {
-    fn of_entry(e: &Entry) -> Self {
-        Self {
-            id: e.id.to_owned(),
-            title: e.title.to_owned(),
-            subtitle: e.subtitle.to_owned(),
-            browsable: !e.playable,
-            playable: e.playable,
-            art: e.art.to_owned(),
-            duration_ms: if e.playable && e.url.is_empty() {
-                TONE_MS
-            } else {
-                0
-            },
-            album: String::new(),
-        }
-    }
-
     fn of_node(n: content::Node) -> Self {
         Self {
             id: n.id,

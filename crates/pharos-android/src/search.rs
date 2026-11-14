@@ -10,7 +10,7 @@ pub(crate) fn find(query: &str) -> Vec<Item> {
 
 /// [`find`], with the library's ranking when it searched.
 pub(crate) fn find_ranked(query: &str) -> (Vec<Item>, Option<content::SearchReport>) {
-    let mut hits = test_matches(query);
+    let mut hits = fixture::matches(query);
     let mut report = None;
     if let Some(lib) = LIBRARY.get() {
         match lib.search_ranked(query) {
@@ -39,7 +39,7 @@ pub(crate) fn autoplay_search(
     report: Option<&content::SearchReport>,
 ) -> R<()> {
     let (top, second) = report.map_or((0.0, 0.0), |r| (r.top_score, r.second_score));
-    let tests = test_matches_count(hits);
+    let tests = hits.iter().filter(|i| fixture::is_fixture(&i.id)).count();
     let (mut play_it, mut reason) = match report {
         None => (false, "no_ranking"),
         Some(_) if tests > 0 => (false, "test_matches"),
@@ -80,12 +80,12 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
         log(&format!("{what} verdict={cmd:?} reason=voice_command"));
         return voice::run(env, cmd);
     }
-    let tests = test_matches(&query);
+    let tests = fixture::matches(&query);
     if let Some(first) = tests.first() {
         log(&format!("{what} verdict={} reason=test_match", first.id));
         let id = first.id.clone();
         return if then_play {
-            start(env, &id, Some(test_playables()))
+            start(env, &id, Some(fixture::playables()))
         } else {
             prepare_id(env, &id)
         };

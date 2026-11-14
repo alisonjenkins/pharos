@@ -17,3 +17,8 @@ pharos-content = { path = "../pharos-content" }
 
 [lints]
 workspace = true
+
+[features]
+# The Test folder of generated tones the host JVM check plays; never in an
+# app build.
+test-catalogue = []

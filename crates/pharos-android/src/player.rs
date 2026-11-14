@@ -128,13 +128,13 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
 /// entry at once, a library node from a worker thread.
 pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
     let gen = PLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    if let Some(e) = test_entry(id).filter(|e| e.playable) {
-        let source = test_source(env, e)?;
+    if let Some(item) = fixture::playable(id) {
+        let source = fixture::source(env, id)?;
         return play(
             env,
-            Item::of_entry(e),
+            item,
             &source,
-            queue.unwrap_or_else(test_playables),
+            queue.unwrap_or_else(fixture::playables),
             gen,
         );
     }
