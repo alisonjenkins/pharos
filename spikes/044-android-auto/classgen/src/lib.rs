@@ -456,6 +456,29 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 native("onCompletion", "(Landroid/media/MediaPlayer;)V"),
             ],
         },
+        // Android Auto searches over androidx's compat protocol: a Messenger
+        // whose binder the root extras carry. This Handler behind it hands
+        // each message to Rust.
+        ClassSpec {
+            name: format!("{PKG}/PharosCompatHandler"),
+            superclass: "android/os/Handler".into(),
+            init: "()V".into(),
+            load_library: None,
+            interfaces: Vec::new(),
+            methods: vec![native("handleMessage", "(Landroid/os/Message;)V")],
+        },
+        // Search results go back in a Bundle, which names each item's class;
+        // the car casts them to androidx's MediaItem. Its parcel is the
+        // framework MediaItem's (flags, then the description), so a subclass
+        // under androidx's name parcels as one.
+        ClassSpec {
+            name: "android/support/v4/media/MediaBrowserCompat$MediaItem".into(),
+            superclass: "android/media/browse/MediaBrowser$MediaItem".into(),
+            init: "(Landroid/media/MediaDescription;I)V".into(),
+            load_library: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+        },
         // The phone-side voice entry point: the assistant lists an app as
         // able to take "play X on <app>" only if an activity handles
         // MEDIA_PLAY_FROM_SEARCH. It has no UI; Rust reads the query and
