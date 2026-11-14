@@ -589,16 +589,19 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
             let start = placed.first().and_then(|p| p.words.first());
             let end = placed.last().and_then(|p| p.words.last());
             let mut grew = false;
-            if let (Some(&(s, _)), Some(i)) = (start, lo_i.checked_sub(1)) {
+            // A wordless line has nothing to align, so the edge is the
+            // nearest line with words past it.
+            let outside_before = (0..lo_i).rev().find(|&i| tokens[i].is_some());
+            let outside_after = (hi_i + 1..lines.len()).find(|&i| tokens[i].is_some());
+            if let (Some(&(s, _)), Some(i)) = (start, outside_before) {
                 let edge = song.ms(s) as f64;
                 if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(from), edge, true) {
                     before.push((i, p));
                     grew = true;
                 }
             }
-            if let (Some(&(_, e)), true) = (end, hi_i + 1 < lines.len()) {
+            if let (Some(&(_, e)), Some(i)) = (end, outside_after) {
                 let edge = song.ms(e) as f64;
-                let i = hi_i + 1;
                 if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(to), edge, false) {
                     after.push((i, p));
                     grew = true;
@@ -1008,6 +1011,72 @@ mod tests {
         assert_eq!(r.lines[2], t[2]);
         assert_eq!(r.placement.dropped_anchors, 1);
         assert_eq!(r.placement.anchor_share, Some(0.5));
+    }
+
+    #[test]
+    fn a_wordless_line_at_the_edge_does_not_stop_the_span_growing() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(3_900, 4_000, "♪"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_000);
+        sung.extend(sing("nets dry slow", 4_000));
+        sung.extend(sing("low tide hums", 7_000));
+        let frames = 600;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("nets dry slow", 4.0);
+        h.extend(heard("low tide hums", 7.0));
+        let m = match_lines(&lines, &h, Options::default());
+        // Today ran line 0 on into line 2, past the wordless line 1.
+        let t = [
+            today(&lines[0], 3_500),
+            today(&lines[1], 3_900),
+            today(&lines[2], 4_000),
+            today(&lines[3], 7_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.methods[0], Some(Method::Between));
+        assert_eq!(r.methods[1], None);
+        sung_at(&r.lines[0], &[1_000, 1_500, 2_100]);
+    }
+
+    #[test]
+    fn a_wordless_line_after_the_span_does_not_stop_it_growing() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 7_100, "♪"),
+            line(7_100, 10_000, "low tide hums"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_000);
+        sung.extend(sing("nets dry slow", 4_000));
+        sung.extend(sing("low tide hums", 7_100));
+        let frames = 600;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.0);
+        h.extend(heard("nets dry slow", 4.0));
+        let m = match_lines(&lines, &h, Options::default());
+        // Today started line 3 inside line 1, before the wordless line 2.
+        let t = [
+            today(&lines[0], 1_000),
+            today(&lines[1], 4_000),
+            today(&lines[2], 7_000),
+            today(&lines[3], 5_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.methods[2], None);
+        assert_eq!(r.methods[3], Some(Method::Between));
+        sung_at(&r.lines[3], &[7_100, 7_500, 8_000]);
     }
 
     #[test]
