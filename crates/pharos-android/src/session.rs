@@ -34,6 +34,7 @@ pub(crate) fn publish_state(
     position_ms: i64,
     error: Option<&str>,
 ) -> R<()> {
+    snapshot::note_state(state, position_ms, error);
     const B: &str = "Landroid/media/session/PlaybackState$Builder;";
     let b = env
         .new_object("android/media/session/PlaybackState$Builder", "()V", &[])
@@ -142,6 +143,11 @@ pub(crate) fn set_metadata(
     Ok(())
 }
 
+/// The ids of `items`, in order.
+pub(crate) fn ids(items: &[Item]) -> Vec<String> {
+    items.iter().map(|i| i.id.clone()).collect()
+}
+
 /// Calls `method` on the current player, then publishes `state`.
 pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
     let guard = state_lock()?;
@@ -220,7 +226,9 @@ pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
     let next = at as isize + step;
     if !wrap && !(0..len).contains(&next) {
         log("skip: end of the queue, stopping");
-        return transport(env, "stop", STATE_STOPPED);
+        transport(env, "stop", STATE_STOPPED)?;
+        snapshot::mark_ended();
+        return Ok(());
     }
     let id = queue[next.rem_euclid(len) as usize].id.clone();
     start(env, &id, Some(queue))
@@ -295,6 +303,7 @@ pub(crate) fn prepare(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>) -> R<(
         if !queue.iter().any(|i| i.id == item.id) {
             queue = vec![item.clone()];
         }
+        snapshot::note_track(&item.id, &ids(&queue), item.duration_ms);
         st.current = Some(item.clone());
         st.queue = queue;
         st.session.clone()
@@ -344,7 +353,11 @@ callback!(
 callback!(
     Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onStop,
     "onStop",
-    |env| { transport(env, "stop", STATE_STOPPED) }
+    |env| {
+        transport(env, "stop", STATE_STOPPED)?;
+        snapshot::clear();
+        Ok(())
+    }
 );
 
 callback!(
