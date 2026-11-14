@@ -19,8 +19,9 @@ pub const SHADOW_TOTAL: &str = "pharos_lyrics_shadow_total";
 /// The only shadow `aligner_version` that can match: the Rust service's once
 /// it answers each line's `score`. A shadow pointed at the Python service
 /// (2, or 4 with scores) or at a Rust service without scores (3) cannot pass
-/// the cutover gate.
-pub const SHADOW_VERSION: u32 = 5;
+/// the cutover gate. 6 adds each line's `placement` (ADR-0124); the
+/// shadow follows the aligner it is pointed at.
+pub const SHADOW_VERSION: u32 = 6;
 
 /// How one song's comparison ended; `label()` is the metric's `outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
