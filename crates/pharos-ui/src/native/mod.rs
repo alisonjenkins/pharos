@@ -48,6 +48,7 @@ pub mod manage;
 pub mod mixes;
 pub mod music_bridge;
 pub mod my_devices;
+pub mod offline_ui;
 pub mod paging;
 pub mod palette;
 pub mod person;
