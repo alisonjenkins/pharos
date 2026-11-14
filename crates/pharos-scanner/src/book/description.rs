@@ -43,12 +43,15 @@ pub fn clean_description(raw: &str) -> Option<(Option<String>, DescriptionOutcom
     }
     // Escaped markup decodes to markup, so decode before stripping tags,
     // and decode again after for entities that sat inside the markup.
+    // Up to two rounds, for markup escaped twice (`&amp;lt;p&amp;gt;`), named
+    // or numeric (`&#60;p&#62;`).
     let mut text = raw.to_owned();
     for _ in 0..2 {
-        if !text.contains("&lt;") && !text.contains("&amp;") {
+        let decoded = decode_entities(&text);
+        if decoded == text {
             break;
         }
-        text = decode_entities(&text);
+        text = decoded;
     }
     let text = decode_entities(&strip_tags(&text));
     let text = tidy(&text);
@@ -88,32 +91,52 @@ pub fn record_description(raw: Option<&str>, source: &'static str) -> Option<Str
 const BREAK_TAGS: &[&str] = &["p", "br", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"];
 
 /// `s` with every `<…>` tag removed; block tags leave a paragraph break.
+/// A `<` not followed by a tag name is text.
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(open) = rest.find('<') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let Some(close) = after.find('>') else {
-            // A lone `<` is text, not a tag.
-            out.push_str(&rest[open..]);
-            return out;
-        };
-        let name: String = after[..close]
+        let name: String = after
             .trim_start_matches('/')
             .chars()
             .take_while(char::is_ascii_alphanumeric)
             .collect::<String>()
             .to_ascii_lowercase();
-        if name.is_empty() {
-            out.push_str(&rest[open..open + 1 + close + 1]);
-        } else if BREAK_TAGS.contains(&name.as_str()) {
+        let end = if name.is_empty() {
+            None
+        } else {
+            tag_end(after)
+        };
+        let Some(end) = end else {
+            out.push('<');
+            rest = after;
+            continue;
+        };
+        if BREAK_TAGS.contains(&name.as_str()) {
             out.push_str("\n\n");
         }
-        rest = &after[close + 1..];
+        rest = &after[end + 1..];
     }
     out.push_str(rest);
     out
+}
+
+/// Byte offset of the `>` closing a tag whose body starts `tag`, skipping
+/// any `>` inside a quoted attribute value.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in tag.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => return Some(i),
+            (None, _) => {}
+        }
+    }
+    None
 }
 
 /// `s` with HTML entities decoded. An unknown entity is left as written.
@@ -164,10 +187,36 @@ fn entity(name: &str) -> Option<char> {
         "ndash" => '\u{2013}',
         "mdash" => '\u{2014}',
         "hellip" => '\u{2026}',
-        "copy" => '\u{A9}',
-        "eacute" => '\u{E9}',
-        _ => return None,
+        "lsaquo" => '\u{2039}',
+        "rsaquo" => '\u{203A}',
+        "bull" => '\u{2022}',
+        "trade" => '\u{2122}',
+        "euro" => '\u{20AC}',
+        "oelig" => '\u{153}',
+        "OElig" => '\u{152}',
+        _ => return latin1(name),
     })
+}
+
+/// The HTML names of Latin-1's characters U+00A0 to U+00FF, in code order.
+/// With the names above they cover the accented letters and punctuation
+/// book blurbs use; HTML's full table of named references is not carried.
+const LATIN1: [&str; 96] = [
+    "nbsp", "iexcl", "cent", "pound", "curren", "yen", "brvbar", "sect", "uml", "copy", "ordf",
+    "laquo", "not", "shy", "reg", "macr", "deg", "plusmn", "sup2", "sup3", "acute", "micro",
+    "para", "middot", "cedil", "sup1", "ordm", "raquo", "frac14", "frac12", "frac34", "iquest",
+    "Agrave", "Aacute", "Acirc", "Atilde", "Auml", "Aring", "AElig", "Ccedil", "Egrave", "Eacute",
+    "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml", "ETH", "Ntilde", "Ograve", "Oacute",
+    "Ocirc", "Otilde", "Ouml", "times", "Oslash", "Ugrave", "Uacute", "Ucirc", "Uuml", "Yacute",
+    "THORN", "szlig", "agrave", "aacute", "acirc", "atilde", "auml", "aring", "aelig", "ccedil",
+    "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml", "eth", "ntilde",
+    "ograve", "oacute", "ocirc", "otilde", "ouml", "divide", "oslash", "ugrave", "uacute", "ucirc",
+    "uuml", "yacute", "thorn", "yuml",
+];
+
+fn latin1(name: &str) -> Option<char> {
+    let i = LATIN1.iter().position(|n| *n == name)?;
+    char::from_u32(0xA0 + u32::try_from(i).ok()?)
 }
 
 /// Runs of spaces collapsed within each paragraph; empty paragraphs dropped.
@@ -219,6 +268,34 @@ mod tests {
         assert_eq!(
             text(&raw).unwrap(),
             format!("{LONG} It\u{2019}s \u{201C}fine\u{201D} \u{2014} mostly.")
+        );
+    }
+
+    #[test]
+    fn numeric_escaped_markup_is_stripped() {
+        for raw in [
+            format!("&#60;p&#62;{LONG}&#60;/p&#62;"),
+            format!("&#x3C;p&#x3E;{LONG}&#x3c;/p&#x3e;"),
+        ] {
+            assert_eq!(text(&raw).unwrap(), LONG, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_a_tag() {
+        let raw = format!("<p title=\"a > b\">{LONG}</p>");
+        assert_eq!(text(&raw).unwrap(), LONG);
+    }
+
+    #[test]
+    fn latin1_names_decode() {
+        assert_eq!(
+            text("K&ouml;nig searches for a lost city.").unwrap(),
+            "K\u{F6}nig searches for a lost city."
+        );
+        assert_eq!(
+            text("&Aacute; la carte &yuml; &laquo;quoted&raquo;").unwrap(),
+            "\u{C1} la carte \u{FF} \u{AB}quoted\u{BB}"
         );
     }
 
