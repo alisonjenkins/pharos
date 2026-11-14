@@ -656,6 +656,52 @@ pub fn download_href(id: ItemRef) -> String {
     format!("/Items/{id}/Download")
 }
 
+/// Where version `version` of a book has its bytes (V1391); `""` is the
+/// book's own file.
+pub fn version_href(id: ItemRef, version: &str) -> String {
+    if version.is_empty() {
+        return download_href(id);
+    }
+    let version: String = url_safe(version);
+    format!("/Items/{id}/Download?mediaSourceId={id}-{version}")
+}
+
+/// A version id as it goes in a URL: the server issues ASCII letters, digits
+/// and `-`, and nothing else is let through.
+fn url_safe(version: &str) -> String {
+    version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
+}
+
+/// The book as version `version` reads (V1391): another format of it may be
+/// one the reader opens, or one it cannot. The primary (`""`), or a version
+/// the detail does not list, is `book` as the server sent it.
+pub fn version_book(book: &Book, versions: &[pharos_client::api::Version], version: &str) -> Book {
+    let chosen = versions
+        .iter()
+        .find(|v| !version.is_empty() && v.id == version);
+    match chosen {
+        Some(v) => Book {
+            format: format_of_container(&v.container),
+            ..book.clone()
+        },
+        None => book.clone(),
+    }
+}
+
+/// The format a version's container reads as; a container the reader does
+/// not know is unreadable.
+fn format_of_container(container: &str) -> BookFormat {
+    match container.to_ascii_lowercase().as_str() {
+        "epub" => BookFormat::Epub,
+        "pdf" => BookFormat::Pdf,
+        "cbz" | "cbr" | "cbt" | "cb7" => BookFormat::Comic,
+        _ => BookFormat::Unreadable,
+    }
+}
+
 /// What a book's title page offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookAction {
@@ -1283,6 +1329,36 @@ mod tests {
         assert!((saved_fraction(f64::NAN, false)).abs() < f32::EPSILON);
     }
 
+    /// V1391: a picked version opens as its own format; a locked one is
+    /// closed even when the primary reads.
+    #[test]
+    fn a_picked_version_reads_as_its_own_format() {
+        use pharos_client::api::Version;
+        let epub = Book {
+            format: BookFormat::Epub,
+            author: "A".into(),
+            page_count: 0,
+        };
+        let version = |id: &str, container: &str| Version {
+            id: id.into(),
+            container: container.into(),
+            ..Version::default()
+        };
+        let versions = [
+            version("", "epub"),
+            version("pdf", "pdf"),
+            version("kindle-locked", "azw3"),
+            version("kindle", "epub"),
+        ];
+        let format = |v: &str| version_book(&epub, &versions, v).format;
+        assert_eq!(format(""), BookFormat::Epub);
+        assert_eq!(format("pdf"), BookFormat::Pdf);
+        assert_eq!(format("kindle-locked"), BookFormat::Unreadable);
+        assert_eq!(format("kindle"), BookFormat::Epub);
+        assert_eq!(format("gone"), BookFormat::Epub);
+        assert_eq!(version_book(&epub, &versions, "pdf").author, "A");
+    }
+
     #[test]
     fn the_title_page_offers_what_the_format_allows() {
         let book = |format| Book {
@@ -1329,6 +1405,15 @@ mod tests {
             BookAction::Closed(line) if line.contains("Kindle")
         ));
         assert_eq!(download_href(ItemRef::Real(9)), "/Items/9/Download");
+        assert_eq!(version_href(ItemRef::Real(9), ""), "/Items/9/Download");
+        assert_eq!(
+            version_href(ItemRef::Real(9), "pdf"),
+            "/Items/9/Download?mediaSourceId=9-pdf"
+        );
+        assert_eq!(
+            version_href(ItemRef::Real(9), "a&b=c"),
+            "/Items/9/Download?mediaSourceId=9-abc"
+        );
     }
 
     #[test]
