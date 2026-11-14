@@ -88,7 +88,7 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
                 Some(i) => i,
                 None => Item::of_node(
                     lib.node(id)
-                        .map_err(|e| format!("node {id} (cached, unlisted): {e}"))?,
+                        .map_err(|e| format!("node {id} (cached, unlisted): {}", e.redacted()))?,
                 ),
             };
             let ahead = lib.prefetch_from(id);
@@ -102,7 +102,9 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
                 "node {id}: not cached and the server is unreachable (debug offline)"
             ));
         }
-        let node = lib.node(id).map_err(|e| format!("node {id}: {e}"))?;
+        let node = lib
+            .node(id)
+            .map_err(|e| format!("node {id}: {}", e.redacted()))?;
         let url = node
             .stream_url
             .clone()

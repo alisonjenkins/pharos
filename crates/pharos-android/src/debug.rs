@@ -105,7 +105,10 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosDebugReceiver_on
             match u64::try_from(cap) {
                 Ok(bytes) => match lib.set_cache_cap(bytes) {
                     Ok(()) => log(&format!("debug: cache cap set bytes={bytes}")),
-                    Err(e) => log(&format!("debug: cache cap bytes={bytes} not set: {e}")),
+                    Err(e) => log(&format!(
+                        "debug: cache cap bytes={bytes} not set: {}",
+                        e.redacted()
+                    )),
                 },
                 // `--ei` or a missing `--el` reads as the -1 default.
                 Err(_) => log(&format!(

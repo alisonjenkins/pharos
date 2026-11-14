@@ -101,8 +101,9 @@ pub(crate) fn children(parent: &str) -> Vec<Item> {
             Some(lib) => match lib.children(parent) {
                 Ok(nodes) => nodes.into_iter().map(Item::of_node).collect(),
                 Err(e) => {
-                    log(&format!("browse {parent} failed: {e}"));
-                    vec![Item::notice("Couldn't load this list", &e.to_string())]
+                    let why = e.redacted();
+                    log(&format!("browse {parent} failed: {why}"));
+                    vec![Item::notice("Couldn't load this list", &why)]
                 }
             },
         }
