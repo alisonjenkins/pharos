@@ -141,6 +141,21 @@ pub fn proxied(segment: &str) -> bool {
     PROXIED.contains(&segment)
 }
 
+/// An error and every cause under it, `outer: inner: ...`, for a log line.
+/// reqwest's own `Display` names only the top layer ("error sending
+/// request"), which hides whether the connection was refused, reset or
+/// never resolved.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 /// A bounded label for a proxied request's route, for logs: the path's first
 /// segment when proxied, `subtitle_image` for image subtitle frames, else
 /// `other`. Never the path itself, which carries item ids.
@@ -1943,6 +1958,31 @@ mod tests {
             "/videos/1/master.m3u8"
         );
         assert_eq!(art_src("https://s", "https://x/a.png"), "https://x/a.png");
+    }
+
+    #[test]
+    fn a_proxy_error_logs_every_cause() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+        let error = Layer(
+            "error sending request",
+            Some(Box::new(Layer("connection reset", None))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request: connection reset"
+        );
+        assert_eq!(error_chain(&Layer("alone", None)), "alone");
     }
 
     #[test]

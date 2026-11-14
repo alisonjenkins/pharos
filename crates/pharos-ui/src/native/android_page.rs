@@ -3112,7 +3112,10 @@ async fn fetch_server(
     for (name, value) in headers {
         req = req.header(name, value);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("stage=send {}", tv_page::error_chain(&e.without_url())))?;
     let status = resp.status().as_u16();
     let back = PASSED_BACK
         .iter()
@@ -3123,7 +3126,16 @@ async fn fetch_server(
                 .map(|v| ((*name).to_owned(), v.to_owned()))
         })
         .collect();
-    let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| {
+            format!(
+                "stage=body status={status} {}",
+                tv_page::error_chain(&e.without_url())
+            )
+        })?
+        .to_vec();
     Ok((status, back, body))
 }
 
@@ -3152,7 +3164,9 @@ pub fn use_server_proxy() {
                 let started = std::time::Instant::now();
                 let fetched = tokio::time::timeout(PROXY_DEADLINE, fetch_server(&path, &headers))
                     .await
-                    .unwrap_or_else(|_| Err(String::from("timed out")));
+                    .unwrap_or_else(|_| {
+                        Err(format!("stage=deadline timed out after {PROXY_DEADLINE:?}"))
+                    });
                 let response = match fetched {
                     Ok((status, back, body)) => {
                         let mut builder = dioxus::mobile::wry::http::Response::builder()
