@@ -23,6 +23,7 @@
 
 pub mod comic;
 pub mod epub;
+pub mod fold;
 pub mod integrity;
 pub mod kindle;
 pub mod mobi_exth;
@@ -235,11 +236,13 @@ pub const BOOK_EXTENSIONS: &[&str] = &[
 /// Known client limitations — pharos does not misreport a path to work around
 /// a client-side compare).
 pub fn format_for_path(path: &Path) -> Option<BookFormat> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)?;
-    match ext.as_str() {
+    format_for_extension(path.extension()?.to_str()?)
+}
+
+/// The [`BookFormat`] for a file extension (or a book version's container),
+/// case-insensitive; `None` if it is not a book.
+pub fn format_for_extension(ext: &str) -> Option<BookFormat> {
+    match ext.to_ascii_lowercase().as_str() {
         "epub" => Some(BookFormat::Epub),
         "pdf" => Some(BookFormat::Pdf),
         "cbz" | "cbr" | "cbt" | "cb7" => Some(BookFormat::Comic),
