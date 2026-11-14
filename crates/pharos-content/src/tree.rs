@@ -45,6 +45,43 @@ pub trait Catalogue {
     async fn mix(&self, spec: &MixSpec, count: u32) -> Result<Vec<Item>, ContentError>;
     /// One item, with its album's name for a song.
     async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError>;
+    /// Tells the server `id` is at `position_ms`, so any device resumes there.
+    async fn report(&self, id: ItemRef, position_ms: u64, paused: bool)
+        -> Result<(), ContentError>;
+    /// Tells the server `id` stopped at `position_ms`.
+    async fn stop(&self, id: ItemRef, position_ms: u64) -> Result<(), ContentError>;
+}
+
+/// What a progress report tells the server about a playing track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    Playing,
+    Paused,
+    Stopped,
+}
+
+impl Progress {
+    pub fn label(self) -> &'static str {
+        match self {
+            Progress::Playing => "playing",
+            Progress::Paused => "paused",
+            Progress::Stopped => "stopped",
+        }
+    }
+}
+
+/// Sends `p` for `id` at `at_ms` to the server.
+pub async fn progress<C: Catalogue>(
+    cat: &C,
+    id: ItemRef,
+    at_ms: u64,
+    p: Progress,
+) -> Result<(), ContentError> {
+    match p {
+        Progress::Playing => cat.report(id, at_ms, false).await,
+        Progress::Paused => cat.report(id, at_ms, true).await,
+        Progress::Stopped => cat.stop(id, at_ms).await,
+    }
 }
 
 fn nodes(urls: &Urls, items: &[Item]) -> Vec<Node> {
@@ -578,6 +615,16 @@ mod tests {
             };
             Ok((item(id, kind, "I"), song.then(|| "Its Album".to_owned())))
         }
+        async fn report(&self, id: ItemRef, at: u64, paused: bool) -> Result<(), ContentError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("report {id} {at} paused={paused}"));
+            Ok(())
+        }
+        async fn stop(&self, id: ItemRef, at: u64) -> Result<(), ContentError> {
+            self.calls.borrow_mut().push(format!("stop {id} {at}"));
+            Ok(())
+        }
     }
 
     fn urls() -> Urls {
@@ -892,6 +939,12 @@ mod tests {
         async fn item(&self, _: ItemRef) -> Result<(Item, Option<String>), ContentError> {
             Err(ContentError::WorkerGone)
         }
+        async fn report(&self, _: ItemRef, _: u64, _: bool) -> Result<(), ContentError> {
+            Err(ContentError::WorkerGone)
+        }
+        async fn stop(&self, _: ItemRef, _: u64) -> Result<(), ContentError> {
+            Err(ContentError::WorkerGone)
+        }
     }
 
     fn track(n: u64, name: &str, artist: &str) -> Item {
@@ -1018,5 +1071,33 @@ mod tests {
         let (_, report) = titles(&t, "alpha bravo charlie delta echo foxtrot");
         assert_eq!(t.calls.borrow().len(), SEARCH_CALLS);
         assert_eq!(report.calls, SEARCH_CALLS);
+    }
+
+    #[test]
+    fn progress_reaches_the_server_as_a_report_or_a_stop() {
+        let f = Fake::default();
+        let id = ItemRef::Real(8);
+        for (p, at) in [
+            (Progress::Playing, 10_000),
+            (Progress::Paused, 12_000),
+            (Progress::Stopped, 13_000),
+        ] {
+            block_on(progress(&f, id, at, p)).unwrap();
+        }
+        assert_eq!(
+            *f.calls.borrow(),
+            [
+                format!("report {id} 10000 paused=false"),
+                format!("report {id} 12000 paused=true"),
+                format!("stop {id} 13000"),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_labels_are_distinct() {
+        let labels = [Progress::Playing, Progress::Paused, Progress::Stopped].map(Progress::label);
+        let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
     }
 }
