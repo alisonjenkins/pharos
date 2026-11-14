@@ -8417,6 +8417,11 @@ fn Player(
                 on_queue,
                 on_media,
                 on_control,
+                audiobook: p.detail.item.audiobook.then(|| super::audiobook::Audiobook {
+                    chapters: p.detail.chapters.clone(),
+                    book: p.detail.item.parent,
+                    playing: p.detail.item.id,
+                }),
             }
         } else {
             WatchView {

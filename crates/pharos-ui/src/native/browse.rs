@@ -58,7 +58,7 @@ const fn grid_page(tv: bool) -> u32 {
 
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
-const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
+pub(super) const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
 
 /// `SortBy` for an artist's albums: oldest first, then by name.
 const ARTIST_ALBUM_ORDER: &str = "ProductionYear,SortName";
@@ -4154,7 +4154,7 @@ pub async fn neighbours_and_rest<A: PharosApi>(
 }
 
 /// Every child of `parent`, page after page: a season can run past one page.
-async fn list_all<A: PharosApi>(
+pub(super) async fn list_all<A: PharosApi>(
     api: &A,
     info: &CallInfo,
     parent: ItemRef,
