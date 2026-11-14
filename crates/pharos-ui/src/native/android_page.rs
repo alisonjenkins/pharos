@@ -3118,16 +3118,26 @@ pub fn use_server_proxy() {
                         for (name, value) in back {
                             builder = builder.header(name, value);
                         }
-                        log::debug!(
-                            "pharos: proxy status={status} bytes={} ms={}",
-                            body.len(),
-                            started.elapsed().as_millis()
-                        );
+                        let ms = started.elapsed().as_millis();
+                        if status >= 400 {
+                            // The server's own refusal, passed on: no "proxy failed" line.
+                            log::warn!(
+                                "pharos: proxy server_status={status} segment={} bytes={} ms={ms}",
+                                tv_page::proxy_segment(&path),
+                                body.len()
+                            );
+                        } else {
+                            log::debug!(
+                                "pharos: proxy status={status} bytes={} ms={ms}",
+                                body.len()
+                            );
+                        }
                         builder.body(body)
                     }
                     Err(e) => {
                         log::warn!(
-                            "pharos: proxy failed path_len={} ms={} error={e}",
+                            "pharos: proxy failed segment={} path_len={} ms={} error={e}",
+                            tv_page::proxy_segment(&path),
                             path.len(),
                             started.elapsed().as_millis()
                         );
