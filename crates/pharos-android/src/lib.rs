@@ -106,6 +106,8 @@ struct Item {
     book: String,
     /// Where the server says a book's part stopped; 0 for none.
     position_ms: u64,
+    /// The heading the car shows this row under; empty for none.
+    group: String,
 }
 
 impl Item {
@@ -121,6 +123,7 @@ impl Item {
             album: n.album,
             book: n.book,
             position_ms: n.position_ms,
+            group: n.group,
         }
     }
 
@@ -138,6 +141,7 @@ impl Item {
             album: String::new(),
             book: String::new(),
             position_ms: 0,
+            group: String::new(),
         }
     }
 }
