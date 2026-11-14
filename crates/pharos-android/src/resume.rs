@@ -297,6 +297,33 @@ pub fn note(pos: i64, why: &str) -> R<()> {
     record(n, pos, why)
 }
 
+/// As [`note`], only while `player` is the one being tracked: a newer
+/// player's progress is not another's to record.
+pub fn note_for(env: &mut JNIEnv, player: &GlobalRef, pos: i64, why: &str) -> R<()> {
+    if !tracks(env, player)? {
+        log(&format!("resume: {why} for a replaced player, not saved"));
+        return Ok(());
+    }
+    note(pos, why)
+}
+
+/// As [`drop_current`], only while `player` is the one being tracked.
+pub fn drop_for(env: &mut JNIEnv, player: &GlobalRef) -> R<()> {
+    if !tracks(env, player)? {
+        return Ok(());
+    }
+    drop_current(false)
+}
+
+fn tracks(env: &mut JNIEnv, player: &GlobalRef) -> R<bool> {
+    let guard = now()?;
+    let Some(n) = guard.as_ref() else {
+        return Ok(false);
+    };
+    env.is_same_object(n.player.as_obj(), player.as_obj())
+        .map_err(jerr("is_same_object"))
+}
+
 /// The current player is about to be released: save where it was.
 pub fn leave(env: &mut JNIEnv, why: &str) -> R<()> {
     let taken = now()?.take();
