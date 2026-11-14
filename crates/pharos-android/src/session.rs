@@ -288,13 +288,13 @@ pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
     start(env, &id, Some(queue))
 }
 
-/// Points the session at `PharosSearchActivity`, the app's only activity,
-/// so the system has somewhere to send "open the app".
+/// Points the session at the app's launcher activity,
+/// so a tap on the media notification or the car's app button opens the app.
 pub(crate) fn set_session_activity(env: &mut JNIEnv, ctx: &JObject, session: &JObject) -> R<()> {
     const FLAG_IMMUTABLE: i32 = 67_108_864;
     let class = env
-        .find_class("com/alisonjenkins/pharos/auto/PharosSearchActivity")
-        .map_err(jerr("find PharosSearchActivity"))?;
+        .find_class("dev/dioxus/main/MainActivity")
+        .map_err(jerr("find MainActivity"))?;
     let intent = env
         .new_object(
             "android/content/Intent",
