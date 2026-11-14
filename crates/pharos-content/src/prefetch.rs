@@ -387,6 +387,7 @@ impl Gate {
         let mut attempt = 0u32;
         let mut st = JobState::default();
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
+        self.cache.clear_failed(id);
         let outcome = loop {
             if let Err(free) = self.cache.ensure_free(id, 0) {
                 break Outcome::LowDisk(free);
@@ -468,6 +469,7 @@ impl Gate {
                     part_len()
                 );
                 self.cache.discard_part(id);
+                self.cache.mark_failed(id);
             }
             Outcome::Failed(why) => {
                 log::warn!(
@@ -475,6 +477,7 @@ impl Gate {
                     part_len()
                 );
                 self.cache.discard_part(id);
+                self.cache.mark_failed(id);
             }
         }
     }
@@ -850,10 +853,17 @@ mod tests {
             &["t"],
             fast(),
         );
+        r.cache.pin("album/9", &ids(&["track/1", "track/2"]));
         r.dl.prefetch(&ids(&["track/1", "track/2"]));
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         assert!(!r.cache.is_complete("track/1"));
         assert!(r.cache.is_complete("track/2"));
+        let failed: Vec<bool> = r.cache.downloads()[0]
+            .tracks
+            .iter()
+            .map(|t| t.failed)
+            .collect();
+        assert_eq!(failed, [true, false], "the missing track shows as failed");
     }
 
     #[test]

@@ -130,6 +130,9 @@ pub struct DownloadTrack {
     /// Zero until the track is whole.
     pub bytes: u64,
     pub complete: bool,
+    /// Its last download gave up (see [`Cache::mark_failed`]) and it is not
+    /// whole. In memory only: the next prefetch tries it again.
+    pub failed: bool,
 }
 
 /// The cache's numbers for a settings screen.
@@ -194,6 +197,8 @@ struct State {
     protected: HashSet<String>,
     /// The track last handed to the player.
     current: Option<String>,
+    /// Tracks whose last download gave up; cleared when one starts again.
+    failed: HashSet<String>,
     clock: u64,
 }
 
@@ -541,6 +546,16 @@ impl Cache {
         Ok(evicted)
     }
 
+    /// Record that the download of `id` gave up, for [`Cache::downloads`].
+    pub fn mark_failed(&self, id: &str) {
+        self.lock().failed.insert(id.to_owned());
+    }
+
+    /// A download of `id` is starting again: it is no longer failed.
+    pub fn clear_failed(&self, id: &str) {
+        self.lock().failed.remove(id);
+    }
+
     /// Remove the in-progress file for `id`.
     pub fn discard_part(&self, id: &str) {
         let p = self.part_path(id);
@@ -645,6 +660,7 @@ impl Cache {
                                 title: None,
                                 bytes: if complete { e.map_or(0, |e| e.size) } else { 0 },
                                 complete,
+                                failed: !complete && s.failed.contains(id),
                             }
                         })
                         .collect();
@@ -1177,6 +1193,7 @@ mod tests {
         album_row.subtitle = "An Artist".into();
         c.save_listing("music/albums", &[album_row]);
         c.save_listing("album/1", &[row("track/a", "Track A")]);
+        c.mark_failed("track/b");
 
         let got = c.downloads();
         assert_eq!(got.len(), 2);
@@ -1192,12 +1209,14 @@ mod tests {
                     title: Some("Track A".into()),
                     bytes: 100,
                     complete: true,
+                    failed: false,
                 },
                 DownloadTrack {
                     id: "track/b".into(),
                     title: None,
                     bytes: 0,
                     complete: false,
+                    failed: true,
                 },
             ]
         );
@@ -1205,6 +1224,14 @@ mod tests {
         assert_eq!(got[1].container, "mix/2");
         assert_eq!(got[1].title, None, "no saved listing names it");
         assert_eq!(got[1].subtitle, None);
+
+        c.clear_failed("track/b");
+        assert!(!c.downloads()[0].tracks[1].failed, "a retry clears it");
+        c.mark_failed("track/a");
+        assert!(
+            !c.downloads()[0].tracks[0].failed,
+            "a whole track is never failed"
+        );
 
         c.unpin("mix/2");
         assert_eq!(c.downloads().len(), 1);

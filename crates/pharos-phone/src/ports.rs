@@ -189,15 +189,19 @@ fn to_ui_download(d: content::Download) -> Option<Download> {
             .map(|t| TrackDownload {
                 id: snapshot::ui_id(&t.id),
                 title: t.title.unwrap_or_default(),
-                state: if t.complete {
-                    TrackState::Cached
-                } else {
-                    TrackState::Queued
-                },
+                state: track_state(t.complete, t.failed),
                 bytes: t.bytes,
             })
             .collect(),
     })
+}
+
+fn track_state(complete: bool, failed: bool) -> TrackState {
+    match (complete, failed) {
+        (true, _) => TrackState::Cached,
+        (false, true) => TrackState::Failed,
+        (false, false) => TrackState::Queued,
+    }
 }
 
 impl OfflineStore for PhoneOffline {
