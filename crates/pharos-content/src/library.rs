@@ -117,6 +117,7 @@ enum Op {
     Node(NodeId),
     Search(String),
     SignOut,
+    Reload,
 }
 
 impl Op {
@@ -126,6 +127,7 @@ impl Op {
             Op::Node(id) => format!("node {id}"),
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
+            Op::Reload => "reload credentials".into(),
         }
     }
 }
@@ -289,7 +291,7 @@ impl Library {
                     token_path,
                     shared: for_worker,
                     link: None,
-                    qc_running: false,
+                    qc: None,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -377,6 +379,14 @@ impl Library {
     /// Forget the device token and drop the connection.
     pub fn sign_out(&self) -> Result<(), ContentError> {
         self.call(Op::SignOut).map(|_| ())
+    }
+
+    /// Re-read the device token file after the phone app signed in or out,
+    /// so the car follows without a code. Signed in resumes at once; no token
+    /// leaves the car signed out until it is next browsed. The server stays
+    /// the one given to [`Library::connect`].
+    pub fn reload_credentials(&self) -> Result<(), ContentError> {
+        self.call(Op::Reload).map(|_| ())
     }
 
     /// Keep the listing for offline browse and remember the play order.
@@ -666,7 +676,8 @@ struct Worker {
     token_path: PathBuf,
     shared: Arc<Shared>,
     link: Option<Link>,
-    qc_running: bool,
+    /// The QuickConnect poller, while one runs.
+    qc: Option<tokio::task::JoinHandle<()>>,
     limit: Duration,
 }
 
@@ -731,7 +742,7 @@ impl Worker {
                 session,
                 token,
             } => {
-                self.qc_running = false;
+                self.qc = None;
                 if let Err(e) = token::store(&self.token_path, &token) {
                     log::warn!("device token not kept, signing in again next start: {e}");
                 }
@@ -762,6 +773,9 @@ impl Worker {
             self.shared.set_auth(AuthState::SignedOut);
             return Ok(Out::Done);
         }
+        if matches!(op, Op::Reload) {
+            return self.reload(events).await;
+        }
         let mut last = None;
         for attempt in 0..2 {
             let link = self.link(events).await?;
@@ -772,7 +786,7 @@ impl Worker {
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
-                Op::SignOut => Ok(Out::Done),
+                Op::SignOut | Op::Reload => Ok(Out::Done),
             };
             match r {
                 Err(e) if e.is_revoked() => {
@@ -846,12 +860,40 @@ impl Worker {
         Ok(link)
     }
 
+    /// Drop the connection and any QuickConnect, then resume from the token
+    /// file as it is now: another part of the app signed in or out.
+    async fn reload(&mut self, events: &UnboundedSender<Event>) -> Result<Out, ContentError> {
+        self.link = None;
+        let polling = self.qc.take().inspect(|h| h.abort()).is_some();
+        let token = token::load(&self.token_path)?.is_some();
+        let (verdict, result) = if token {
+            match self.link(events).await {
+                Ok(_) => ("signed_in", Ok(Out::Done)),
+                Err(e) => ("failed", Err(e)),
+            }
+        } else {
+            self.shared.set_auth(AuthState::SignedOut);
+            ("signed_out", Ok(Out::Done))
+        };
+        let reason = match &result {
+            Err(e) => e.label(),
+            Ok(_) if token => "token_file_present",
+            Ok(_) => "no_token_file",
+        };
+        log::info!(
+            "credentials reloaded: verdict={verdict} reason={reason} quickconnect_stopped={polling}"
+        );
+        result
+    }
+
     fn start_sign_in(&mut self, events: &UnboundedSender<Event>) {
-        if self.qc_running {
+        if self.qc.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
-        self.qc_running = true;
-        tokio::task::spawn_local(quick_connect(self.base.clone(), events.clone()));
+        self.qc = Some(tokio::task::spawn_local(quick_connect(
+            self.base.clone(),
+            events.clone(),
+        )));
     }
 }
 
@@ -1002,6 +1044,28 @@ mod tests {
             lib2.cache_cap(),
             Some(4096),
             "the saved cap beats the default"
+        );
+    }
+
+    #[test]
+    fn reloading_with_no_token_file_signs_out_quietly() {
+        let tok = cache_dir("reload-none").join("device-token");
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        lib.reload_credentials().unwrap();
+        assert_eq!(lib.auth_state(), AuthState::SignedOut);
+    }
+
+    #[test]
+    fn reloading_a_new_token_file_resumes_from_it_and_keeps_it() {
+        let tok = cache_dir("reload-token").join("device-token");
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        token::store(&tok, "from-the-phone").unwrap();
+        let e = lib.reload_credentials().unwrap_err();
+        assert_eq!(e.label(), "connect", "it tried the server: {e}");
+        assert_eq!(
+            token::load(&tok).unwrap().as_deref(),
+            Some("from-the-phone"),
+            "an unreachable server is not a refusal"
         );
     }
 
