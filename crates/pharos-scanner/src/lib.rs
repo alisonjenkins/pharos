@@ -3,6 +3,7 @@
 //! parks the async runtime (V5).
 
 pub mod book;
+pub mod course;
 pub mod detect;
 pub mod ffmpeg;
 pub mod fingerprint;
