@@ -657,7 +657,7 @@ impl server::library::Handler for Library {
             }
         }
         if let Some(entry) = verdict.as_ref().filter(|_| item.path == all.path) {
-            write_damage(out.reborrow().init_damage(), entry);
+            write_damage(out.reborrow().init_damage(), entry, item.kind);
         }
         let segments: Vec<_> = segments::for_item(state, &item)
             .await
@@ -1956,16 +1956,23 @@ pub(super) fn write_user_state(mut out: user_state::Builder<'_>, data: UserItemD
     out.set_play_count(data.play_count);
 }
 
-/// A damaged verdict as the player and title page show it.
+/// A damaged verdict as the player and title page show it (B1431, V1405). A book has no
+/// timeline, so it names no span: a fallback span at 0:00 would read as a
+/// place in it.
 fn write_damage(
     mut out: pharos_api::pharos_capnp::damage::Builder<'_>,
     entry: &crate::integrity_memo::Entry,
+    kind: MediaKind,
 ) {
     let r = &entry.report;
     out.set_verdict(r.label());
     out.set_reason(r.first_fault.as_deref().unwrap_or_default());
     out.set_checked_at(entry.checked_at.unwrap_or(0));
-    let ranges = r.damage_ranges();
+    let ranges = if kind == MediaKind::Book {
+        Vec::new()
+    } else {
+        r.damage_ranges()
+    };
     let mut list = out.init_ranges(len(&ranges));
     for (i, d) in (0..).zip(&ranges) {
         let mut w = list.reborrow().get(i);
