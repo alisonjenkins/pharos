@@ -247,10 +247,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_ha
         }
         // The library search blocks on the network; the main thread must not.
         crate::on_worker("compat search", move |env| {
-            let hits = crate::find(&query);
+            let (hits, report) = crate::find_ranked(&query);
             log(&format!("compat onSearch query={query:?} hits={}", hits.len()));
             crate::remember(&hits);
-            reply(env, receiver.as_obj(), &hits)
+            reply(env, receiver.as_obj(), &hits)?;
+            crate::autoplay_search(env, query.chars().count(), &hits, report.as_ref())
         })
     })
 }
