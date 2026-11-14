@@ -348,11 +348,11 @@ pub fn similarity(heard: &str, candidate: &str) -> f64 {
     }
     let spelling = 0.5 * jaro_winkler(&a, &b) + 0.5 * lev_similarity(&a, &b);
     let (ka, kb) = (phonetic_key(&a), phonetic_key(&b));
-    let sound = if ka.is_empty() || kb.is_empty() {
-        0.0
-    } else {
-        0.5 * jaro_winkler(&ka, &kb) + 0.5 * lev_similarity(&ka, &kb)
-    };
+    if ka.is_empty() || kb.is_empty() {
+        // No sound key (non-Latin script): spelling is the only evidence.
+        return spelling;
+    }
+    let sound = 0.5 * jaro_winkler(&ka, &kb) + 0.5 * lev_similarity(&ka, &kb);
     0.5 * spelling + 0.5 * sound
 }
 
@@ -372,6 +372,12 @@ pub fn best_similarity(heard: &str, title: &str, artist: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exact_title_with_no_sound_key_scores_as_a_full_match() {
+        let s = similarity("夜に駆ける", "夜に駆ける");
+        assert!(s > 0.99, "exact non-Latin match scored {s}");
+    }
 
     #[test]
     fn normalize_folds_case_punctuation_and_apostrophes() {
