@@ -100,7 +100,7 @@ As the operator, I can tell from logs and metrics, per song and in aggregate, ho
 - **FR-003**: The aligner MUST recognise the sung words with per-word times, and match them to the lyric words in lyric order. A line counts as anchored when at least half of its words (minimum 2) match.
 - **FR-004**: Inside each anchored line, word starts MUST be refined letter by letter against the audio, within a bounded margin of the anchor (prototype: ±1.5 s).
 - **FR-005**: An unanchored line MUST stay between its anchored neighbours. With no usable audio evidence it MUST fall back to its stamp moved by the nearest anchor's offset.
-- **FR-006**: Lines MUST come out in lyric order with non-decreasing word starts (V1372).
+- **FR-006**: Lines MUST come out in lyric order with non-decreasing word starts (V1373).
 - **FR-007**: Whatever the alignment output looks like today (`POST /align` contract, streamed line events per ADR-0121, `score`) MUST stay compatible; any new per-line field is additive. `aligner_version` MUST rise so the server re-aligns cached songs when the operator chooses.
 - **FR-008**: Each song MUST log and count how each line was placed (anchored / refined / between anchors / fallback), the recogniser's anchor share, and the reason for every fallback, carrying the offending value (constitution III).
 - **FR-009**: The pipeline MUST run without Python, on the GPU when one is usable and on the CPU otherwise, with the same answers on both within 20 ms per word.
