@@ -12,7 +12,7 @@ use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind,
-    ListIndex, Listing, Page, PharosApi, Watched,
+    ListIndex, Listing, Page, PharosApi, Unreadable, Watched,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -142,6 +142,9 @@ pub struct Narrow {
     pub watched: Option<Watched>,
     /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles (V722).
     pub stereo: Option<bool>,
+    /// Books no client can open (DRM): hidden unless asked for (B1420). Only
+    /// a Books library offers it; elsewhere it changes nothing.
+    pub unreadable: Unreadable,
 }
 
 impl Default for Narrow {
@@ -152,6 +155,7 @@ impl Default for Narrow {
             genre: None,
             watched: None,
             stereo: None,
+            unreadable: Unreadable::Hide,
         }
     }
 }
@@ -168,6 +172,13 @@ impl Narrow {
             genre: self.genre.clone(),
             watched: self.watched,
             stereo: self.stereo,
+            // The base says whether the library has the facet: only a Books
+            // library's listing is made to hide them (B1420).
+            unreadable: if base.unreadable == Unreadable::Show {
+                Unreadable::Show
+            } else {
+                self.unreadable
+            },
             ..base.clone()
         }
     }
@@ -213,6 +224,11 @@ impl Narrow {
             Some(false) => pairs.push("3d=2d".to_owned()),
             None => {}
         }
+        match self.unreadable {
+            Unreadable::Hide => {}
+            Unreadable::Show => pairs.push("unreadable=show".to_owned()),
+            Unreadable::Only => pairs.push("unreadable=only".to_owned()),
+        }
         if pairs.is_empty() {
             String::new()
         } else {
@@ -228,6 +244,7 @@ impl Narrow {
         let mut genre = None;
         let mut watched = None;
         let mut stereo = None;
+        let mut unreadable = Unreadable::Hide;
         for pair in query.trim_start_matches('?').split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             let value = decode_component(value);
@@ -239,6 +256,8 @@ impl Narrow {
                 ("watched", v) => watched = watched_of(v),
                 ("3d", "3d") => stereo = Some(true),
                 ("3d", "2d") => stereo = Some(false),
+                ("unreadable", "show") => unreadable = Unreadable::Show,
+                ("unreadable", "only") => unreadable = Unreadable::Only,
                 _ => {}
             }
         }
@@ -248,6 +267,7 @@ impl Narrow {
             genre,
             watched,
             stereo,
+            unreadable,
         }
     }
 }
@@ -663,6 +683,10 @@ pub async fn load<A: PharosApi>(
     let library = detail
         .as_ref()
         .is_some_and(|d| d.item.kind == ItemKind::Library);
+    let books = library
+        && detail
+            .as_ref()
+            .is_some_and(|d| d.item.library_kind == Some(LibraryKind::Books));
     let sets = library
         && detail
             .as_ref()
@@ -892,6 +916,11 @@ pub async fn load<A: PharosApi>(
             // The library opens as the device last chose, so its first page
             // is fetched once (B1086).
             more.collapse = sets && stored_collections();
+            // A Books library hides the books no client can open until the
+            // viewer asks for them (B1420).
+            if books {
+                more.unreadable = Unreadable::Hide;
+            }
             Browse::Grid {
                 title,
                 page: paged(more.clone()).await?,
@@ -1029,6 +1058,8 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     let opened_grouped = base.collapse;
     let grouped = use_signal(|| opened_grouped);
     let library = base.parent;
+    // Only a Books library's listing is made to hide unopenable books.
+    let books = base.unreadable != Unreadable::Show;
     let opened = use_hook(|| opening_choice(library));
     let narrow = use_signal(|| opened.clone());
     use_effect(move || {
@@ -1086,7 +1117,7 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     // so, or the change looks ignored (FR-210, A19).
     let busy = listed.pending() && listed.read().is_some();
     rsx! {
-        FilterBar { narrow, genres, grouped: sets.then_some(grouped) }
+        FilterBar { narrow, genres, grouped: sets.then_some(grouped), books }
         if busy {
             p { class: "pharos-muted pharos-filter-busy", role: "status", "Updating…" }
         }
@@ -1152,12 +1183,23 @@ fn stereo_label(stereo: Option<bool>) -> &'static str {
     }
 }
 
+/// The words for a choice about books that cannot be opened.
+fn unreadable_label(unreadable: Unreadable) -> &'static str {
+    match unreadable {
+        Unreadable::Hide => "Hide",
+        Unreadable::Show => "Show",
+        Unreadable::Only => "Only",
+    }
+}
+
 /// One way a [`Narrow`] leaves things out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Facet {
     Watched,
     Genre,
     Stereo,
+    /// Books no client can open (B1420).
+    Unreadable,
 }
 
 impl Facet {
@@ -1168,6 +1210,7 @@ impl Facet {
             Facet::Watched => next.watched = None,
             Facet::Genre => next.genre = None,
             Facet::Stereo => next.stereo = None,
+            Facet::Unreadable => next.unreadable = Unreadable::Hide,
         }
         next
     }
@@ -1186,6 +1229,12 @@ pub fn active_filters(narrow: &Narrow) -> Vec<(Facet, String)> {
     }
     if narrow.stereo.is_some() {
         on.push((Facet::Stereo, stereo_label(narrow.stereo).to_owned()));
+    }
+    if narrow.unreadable != Unreadable::Hide {
+        on.push((
+            Facet::Unreadable,
+            format!("Can't open: {}", unreadable_label(narrow.unreadable)),
+        ));
     }
     on
 }
@@ -1259,6 +1308,10 @@ fn FilterBar(
     /// Whether films are grouped into box sets, on a Movies library (B1086).
     #[props(default)]
     grouped: Option<Signal<bool>>,
+    /// Whether to offer the choice about books that cannot be opened: a
+    /// Books library (B1420).
+    #[props(default)]
+    books: bool,
 ) -> Element {
     let now = narrow.read().clone();
     let direction = direction_label(now.order, now.descending);
@@ -1322,7 +1375,7 @@ fn FilterBar(
             }
         }
         if let Some(opened) = *open.read() {
-            FilterSheet { narrow, genres, grouped, opened, open }
+            FilterSheet { narrow, genres, grouped, opened, open, books }
         }
     }
 }
@@ -1344,6 +1397,9 @@ fn FilterSheet(
     /// music library's albums (B1334).
     #[props(default)]
     sort_only: bool,
+    /// Offer the choice about books that cannot be opened (B1420).
+    #[props(default)]
+    books: bool,
 ) -> Element {
     super::views::use_modal_hold(".pharos-filter-sheet-root");
     let mut open = open;
@@ -1480,6 +1536,20 @@ fn FilterSheet(
                                     aria_pressed: "{choice == now.stereo}",
                                     onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
                                     "{stereo_label(choice)}"
+                                }
+                            }
+                        }
+                        if books {
+                            SheetGroup { title: "Can't open",
+                                for choice in [Unreadable::Hide, Unreadable::Show, Unreadable::Only] {
+                                    button {
+                                        key: "{unreadable_label(choice)}",
+                                        class: "pharos-chip",
+                                        r#type: "button",
+                                        aria_pressed: "{choice == now.unreadable}",
+                                        onclick: move |_| narrow.with_mut(|n| n.unreadable = choice),
+                                        "{unreadable_label(choice)}"
+                                    }
                                 }
                             }
                         }
@@ -5385,6 +5455,42 @@ mod tests {
         assert_eq!(newest.rail(), Rail::Years);
     }
 
+    /// B1420: books that cannot be opened are hidden by default, the default
+    /// keeps the bare URL, and only a listing that already hides them (a Books
+    /// library's) takes the choice.
+    #[test]
+    fn unopenable_books_are_hidden_unless_the_choice_and_the_library_say_otherwise() {
+        assert_eq!(Narrow::default().unreadable, Unreadable::Hide);
+        assert_eq!(
+            Narrow::from_query("?unreadable=bogus").unreadable,
+            Unreadable::Hide
+        );
+        assert_eq!(
+            Narrow::from_query("?unreadable=show").to_query(),
+            "?unreadable=show"
+        );
+        let books = Listing {
+            unreadable: Unreadable::Hide,
+            ..Listing::of(ItemRef::Real(1), None, "SortName")
+        };
+        let films = Listing::of(ItemRef::Real(2), None, "SortName");
+        let show = Narrow {
+            unreadable: Unreadable::Only,
+            ..Narrow::default()
+        };
+        assert_eq!(Narrow::default().apply(&books).unreadable, Unreadable::Hide);
+        assert_eq!(show.apply(&books).unreadable, Unreadable::Only);
+        assert_eq!(
+            show.apply(&films).unreadable,
+            Unreadable::Show,
+            "a library without the facet never filters"
+        );
+        assert!(active_filters(&Narrow::default()).is_empty());
+        let on = active_filters(&show);
+        assert_eq!(on, [(Facet::Unreadable, "Can't open: Only".to_owned())]);
+        assert_eq!(Facet::Unreadable.cleared(&show), Narrow::default());
+    }
+
     #[test]
     fn a_library_choice_round_trips_through_its_query() {
         assert_eq!(
@@ -5416,6 +5522,15 @@ mod tests {
             },
             Narrow {
                 stereo: Some(false),
+                ..Narrow::default()
+            },
+            Narrow {
+                unreadable: Unreadable::Show,
+                ..Narrow::default()
+            },
+            Narrow {
+                unreadable: Unreadable::Only,
+                watched: Some(Watched::Unwatched),
                 ..Narrow::default()
             },
         ] {
@@ -5510,6 +5625,28 @@ mod tests {
         assert!(collections_on(None));
         assert!(collections_on(Some("on")));
         assert!(!collections_on(Some("off")));
+    }
+
+    /// B1420: a Books library opens listing without the books no client can
+    /// open; a Movies library's listing is not made to hide anything.
+    #[test]
+    fn a_books_library_opens_hiding_unopenable_books() {
+        let mut fake = Fake::default();
+        for (n, kind) in [(9, LibraryKind::Movies), (8, LibraryKind::Books)] {
+            let id = ItemRef::Real(n);
+            let mut library = item(id, ItemKind::Library, "Lib");
+            library.library_kind = Some(kind);
+            fake.details.insert(id, detail(library));
+        }
+        let hides =
+            |n| match run(load(&fake, &CallInfo::default(), ItemRef::Real(n), |_| {})).unwrap() {
+                Browse::Grid {
+                    more: Some(more), ..
+                } => more.unreadable,
+                other => panic!("not a grid: {other:?}"),
+            };
+        assert_eq!(hides(8), Unreadable::Hide);
+        assert_eq!(hides(9), Unreadable::Show);
     }
 
     #[test]
@@ -6094,6 +6231,32 @@ mod tests {
         assert!(!bare.contains("Reset filters"), "{bare}");
     }
 
+    /// B1420: the "Can't open" group is offered in a Books library only, with
+    /// Hide pressed as it opens.
+    #[test]
+    fn the_filter_sheet_offers_cant_open_only_in_a_books_library() {
+        let sheet = |books: bool| {
+            render(move || {
+                let narrow = use_signal(Narrow::default);
+                let genres = use_signal(Vec::<String>::new);
+                let open = use_signal(|| Some(Opened::Filters));
+                rsx! { FilterSheet { narrow, genres, opened: Opened::Filters, open, books } }
+            })
+        };
+        let books = sheet(true);
+        assert!(
+            books.contains("Can&#39;t open") || books.contains("Can't open"),
+            "{books}"
+        );
+        assert!(
+            books.contains(">Only<") && books.contains(">Show<"),
+            "{books}"
+        );
+        let films = sheet(false);
+        assert!(!films.contains("t open"), "{films}");
+        assert!(!films.contains(">Only<"), "{films}");
+    }
+
     /// B1311/V1283: the sheet is a modal dialog of pills, the chosen one
     /// in each group pressed, so a D-pad walks it and stays inside it;
     /// Collections is offered only on a library that groups box sets.
@@ -6107,6 +6270,7 @@ mod tests {
                     watched: Some(Watched::InProgress),
                     genre: Some("Gone".to_owned()),
                     stereo: Some(false),
+                    unreadable: Unreadable::Hide,
                 });
                 let genres = use_signal(|| vec!["Comedy".to_owned()]);
                 let open = use_signal(|| Some(Opened::Filters));
@@ -6154,6 +6318,7 @@ mod tests {
             genre: Some("Drama".to_owned()),
             watched: Some(Watched::Watched),
             stereo: Some(true),
+            unreadable: Unreadable::Hide,
         };
         assert_eq!(
             active_filters(&narrow),
