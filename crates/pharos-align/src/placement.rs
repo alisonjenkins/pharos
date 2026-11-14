@@ -101,6 +101,9 @@ pub struct Placement {
     pub anchor_share: Option<f64>,
     /// Anchors set aside as a repeat heard in the wrong place.
     pub dropped_anchors: usize,
+    /// Kept lines whose word starts were held between the placed lines
+    /// around them (V1373).
+    pub held_lines: usize,
     pub fallback: Option<Fallback>,
 }
 
@@ -113,6 +116,7 @@ impl Placement {
             counts,
             anchor_share: None,
             dropped_anchors: 0,
+            held_lines: 0,
             fallback: Some(why),
         }
     }
@@ -127,6 +131,7 @@ impl Placement {
             counts,
             anchor_share: Some(anchor_share),
             dropped_anchors: 0,
+            held_lines: 0,
             fallback: None,
         }
     }

@@ -327,6 +327,7 @@ fn run_song(
                 placed_kept = p.count(Method::Kept),
                 anchor_share = p.anchor_share,
                 anchors_dropped = p.dropped_anchors,
+                lines_held = p.held_lines,
                 fallback = p.fallback_label(),
                 fallback_reason = %a.fallback_reason,
                 lines_corrected = a.corrected,
