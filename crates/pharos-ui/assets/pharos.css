@@ -8276,6 +8276,40 @@ body:has(.pharos-reader) {
   opacity: 1;
 }
 
+/* Keep for offline: the toggle, its state chip and any problem sit in one
+   wrapping row, so nothing is hidden at phone width. */
+.pharos-keep-offline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  min-width: 0;
+}
+.pharos-offline-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.5rem;
+  padding: 0 0.6rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 999);
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+  white-space: nowrap;
+}
+.pharos-offline-chip[data-state="kept"] {
+  border-color: var(--px-color-accent);
+  color: var(--px-color-fg);
+}
+.pharos-offline-chip[data-state="failed"] {
+  border-color: var(--px-color-danger);
+  color: var(--px-color-danger);
+}
+.pharos-keep-offline-problem {
+  flex-basis: 100%;
+  color: var(--px-color-danger);
+  font-size: var(--px-type-step--1);
+}
+
 /* Offline music (spec 044): the confirm row wraps, never hides, on a phone. */
 .pharos-offline-confirm {
   display: flex;

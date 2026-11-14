@@ -28,6 +28,7 @@ use super::machine::Event;
 use super::mixes::{self, MixCtx, ICON_MIX};
 use super::paging::{Chain, Pager, Trigger, SENTINEL_LEAD};
 use super::platform;
+use super::ports::{ContainerKind, ContainerRef};
 use super::queue::{added_line, video_kind, QueueCtx, Track, VideoQueueCtx};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
@@ -3144,6 +3145,12 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                 tracks: whole.clone(),
                 album: detail.item.id,
                 kind: QueueTarget::AlbumPage,
+            }
+            super::offline_view::KeepForOffline {
+                container: ContainerRef {
+                    kind: ContainerKind::Album,
+                    id: detail.item.id.to_string(),
+                },
             }
         }
     });

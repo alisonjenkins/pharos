@@ -20,6 +20,7 @@ use super::app::{call, remount_on, Ctx, Flash};
 use super::group_app::Together;
 use super::listen::Icon;
 use super::platform;
+use super::ports::{ContainerKind, ContainerRef};
 use super::queue::{Queue, QueueAction, QueueCtx, Source, Track};
 use super::route::Route;
 use super::stage::StageCtx;
@@ -835,6 +836,14 @@ pub fn MixShelf() -> Element {
                                 // content is not announced as a live region.
                                 if let Some(text) = status.or_else(|| is_on.then(|| "Playing".to_owned())) {
                                     span { class: "pharos-mix-tile-on", role: "status", {text} }
+                                }
+                                if !newer {
+                                    super::offline_view::KeepForOffline {
+                                        container: ContainerRef {
+                                            kind: ContainerKind::Mix,
+                                            id: m.name.clone(),
+                                        },
+                                    }
                                 }
                             }
                         }

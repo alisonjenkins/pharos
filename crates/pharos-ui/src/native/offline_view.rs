@@ -7,10 +7,10 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use super::offline_ui::{
-    cap_from_option, cap_options, cap_selected, format_bytes, FREE_GUARD_BYTES,
+    cap_from_option, cap_options, cap_selected, format_bytes, KeepState, FREE_GUARD_BYTES,
 };
 use super::platform;
-use super::ports::{offline_store, Download, OfflineError, OfflineStore};
+use super::ports::{offline_store, ContainerRef, Download, OfflineError, OfflineStore};
 use super::settings::Choices;
 
 /// How often a screen re-reads the store, so a download's progress shows.
@@ -99,6 +99,76 @@ pub fn clear_downloads(store: &dyn OfflineStore) -> Result<usize, String> {
         removed = removed.saturating_add(1);
     }
     Ok(removed)
+}
+
+/// Keeps a container for offline, or lets it go. `kept` is what the toggle
+/// showed when pressed. The error names the container and why.
+pub fn toggle_keep(
+    store: &dyn OfflineStore,
+    container: &ContainerRef,
+    kept: bool,
+) -> Result<(), String> {
+    let result = if kept {
+        store.unpin(container)
+    } else {
+        store.pin(container)
+    };
+    result.map_err(|e| format!("{} {:?}: {e}", container.kind.label(), container.id))
+}
+
+/// The "Keep for offline" toggle and its state chip, for an album or mix
+/// page. Draws nothing without the offline store.
+#[component]
+pub fn KeepForOffline(container: ContainerRef) -> Element {
+    match offline_store() {
+        Some(store) => rsx! { KeepToggle { store: Store(store), container } },
+        None => rsx! {},
+    }
+}
+
+#[component]
+pub fn KeepToggle(store: Store, container: ContainerRef) -> Element {
+    let mut snap = use_snapshot(&store);
+    let mut problem = use_signal(|| None::<String>);
+    let state = KeepState::of(&snap().downloads, &container);
+    let kept = state.is_kept();
+    let label = state.label();
+    let target = container.clone();
+    rsx! {
+        span { class: "pharos-keep-offline", "data-state": state.name(),
+            button {
+                class: "pharos-button pharos-button-secondary is-small",
+                r#type: "button",
+                aria_pressed: if kept { "true" } else { "false" },
+                onclick: {
+                    let store = store.clone();
+                    move |_| {
+                        match toggle_keep(&*store.0, &target, kept) {
+                            Ok(()) => {
+                                platform::info(&format!(
+                                    "pharos: offline keep {} {} id={:?}",
+                                    if kept { "released" } else { "requested" },
+                                    target.kind.label(),
+                                    target.id
+                                ));
+                                problem.set(None);
+                            }
+                            Err(e) => {
+                                platform::warn(&format!("pharos: offline keep refused error={e}"));
+                                problem.set(Some(e));
+                            }
+                        }
+                        snap.set(Snapshot::read(&*store.0));
+                    }
+                },
+                "Keep for offline"
+            }
+            span { class: "pharos-offline-chip", role: "status", "data-state": state.name(), "{label}" }
+            if let Some(text) = problem() {
+                span { class: "pharos-keep-offline-problem", role: "alert", "Couldn't keep it: {text}" }
+            }
+        }
+    }
 }
 
 /// Settings, Offline music. Nothing without the offline store.
@@ -348,6 +418,103 @@ mod tests {
     fn clearing_nothing_is_fine() {
         let fake = store_with(&[]);
         assert_eq!(clear_downloads(&*fake), Ok(0));
+    }
+
+    fn render_toggle(fake: &Arc<FakeOfflineStore>, container: ContainerRef) -> String {
+        let handle: Arc<dyn OfflineStore> = fake.clone();
+        let mut dom = VirtualDom::new_with_props(
+            |(store, container): (Store, ContainerRef)| rsx! { KeepToggle { store, container } },
+            (Store(handle), container),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn pinned_fake(id: &str) -> Arc<FakeOfflineStore> {
+        let fake = Arc::new(FakeOfflineStore::new());
+        fake.add_container(
+            album(id),
+            vec![(format!("{id}-1"), 10), (format!("{id}-2"), 20)],
+        );
+        fake
+    }
+
+    #[test]
+    fn an_unkept_album_shows_an_unpressed_toggle_and_not_kept() {
+        let fake = pinned_fake("a");
+        let html = render_toggle(&fake, album("a"));
+        assert!(html.contains("aria-pressed=\"false\""), "{html}");
+        assert!(html.contains("Keep for offline"), "{html}");
+        assert!(html.contains("Not kept"), "{html}");
+        assert!(html.contains("pharos-button-secondary"), "{html}");
+    }
+
+    #[test]
+    fn a_kept_album_shows_a_pressed_toggle_and_kept() {
+        let fake = pinned_fake("a");
+        assert_eq!(fake.pin(&album("a")), Ok(()));
+        let html = render_toggle(&fake, album("a"));
+        assert!(html.contains("aria-pressed=\"true\""), "{html}");
+        assert!(html.contains("data-state=\"kept\""), "{html}");
+        assert!(html.contains(">Kept<"), "{html}");
+    }
+
+    #[test]
+    fn a_failed_track_shows_on_the_chip_instead_of_kept() {
+        let fake = pinned_fake("a");
+        assert_eq!(fake.pin(&album("a")), Ok(()));
+        fake.fail_track("a-2");
+        let html = render_toggle(&fake, album("a"));
+        assert!(html.contains("1 track failed"), "{html}");
+        assert!(!html.contains(">Kept<"), "{html}");
+    }
+
+    #[test]
+    fn the_toggle_pins_then_unpins() {
+        let fake = pinned_fake("a");
+        assert_eq!(toggle_keep(&*fake, &album("a"), false), Ok(()));
+        assert!(fake.is_cached("a-1"));
+        assert_eq!(toggle_keep(&*fake, &album("a"), true), Ok(()));
+        assert!(!fake.is_cached("a-1"));
+    }
+
+    #[test]
+    fn a_refused_pin_names_the_container_and_the_numbers() {
+        let fake = pinned_fake("a");
+        assert_eq!(fake.set_cache_cap_bytes(5), Ok(()));
+        let err = toggle_keep(&*fake, &album("a"), false)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("album \"a\""), "{err}");
+        assert!(err.contains("30") && err.contains('5'), "{err}");
+    }
+
+    #[test]
+    fn a_mix_is_pinned_under_its_own_kind() {
+        let fake = Arc::new(FakeOfflineStore::new());
+        let mix = ContainerRef {
+            kind: ContainerKind::Mix,
+            id: "Morning".into(),
+        };
+        fake.add_container(mix.clone(), vec![("m-1".into(), 10)]);
+        assert_eq!(toggle_keep(&*fake, &mix, false), Ok(()));
+        let html = render_toggle(&fake, mix);
+        assert!(html.contains(">Kept<"), "{html}");
+        assert_eq!(
+            render_toggle(&fake, album("Morning"))
+                .matches("Not kept")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn without_a_registered_store_the_toggle_draws_nothing() {
+        let mut dom = VirtualDom::new(
+            || rsx! { KeepForOffline { container: ContainerRef { kind: ContainerKind::Album, id: "a".into() } } },
+        );
+        dom.rebuild_in_place();
+        assert_eq!(dioxus_ssr::render(&dom), "");
     }
 
     #[test]
