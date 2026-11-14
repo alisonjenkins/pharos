@@ -10,6 +10,7 @@
 //! results are detached and sent from there. Every call logs its inputs so a
 //! logcat line proves each hop reached Rust; logs carry ids, never titles.
 
+mod app;
 mod art;
 mod browse;
 mod command;
@@ -39,10 +40,13 @@ pub mod snapshot;
 
 mod voice;
 
-use pharos_content as content;
-
+pub use app::{
+    ask_notification_permission, credentials_changed, library, player, start_service,
+    NotificationAsk,
+};
 use browse::*;
 use command::*;
+pub use pharos_content as content;
 use player::*;
 pub use runtime::{runtime, Player};
 use search::*;
