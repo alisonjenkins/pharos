@@ -61,7 +61,7 @@ done <<'LINES'
 ^pharos-auto: noisy: receiver unregistered$
 ^pharos-auto: resume: id=tone:440 verdict=start reason=none_saved duration_ms=1200000$
 ^pharos-auto: resume: id=tone:440 verdict=saved at_ms=300000 duration_ms=1200000 why=pause$
-^pharos-auto: resume: id=tone:440 verdict=seek at_ms=300000 duration_ms=1200000$
+^pharos-auto: resume: id=tone:440 verdict=seek from=phone at_ms=300000 duration_ms=1200000$
 LINES
 if [ "$log_failures" -ne 0 ]; then
   echo "FAIL $log_failures decision log line(s) missing" >&2
