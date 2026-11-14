@@ -1,0 +1,29 @@
+[package]
+name = "pharos-phone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Pharos phone app: the shared UI over the native player and the car's media service (spec 044)"
+
+[[bin]]
+name = "pharos-phone"
+path = "src/main.rs"
+
+[features]
+default = []
+# dx passes `--features mobile`; the Android dependencies below are always on.
+mobile = []
+
+# Android only: on the host `main` prints a message, so the workspace builds
+# without the WebView stack.
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+dioxus = { workspace = true, features = ["mobile", "launch", "document"] }
+log = "0.4"
+pharos-android = { path = "../pharos-android" }
+pharos-ui = { path = "../pharos-ui", features = ["mobile"] }
+
+[lints]
+workspace = true

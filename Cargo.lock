@@ -8367,6 +8367,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-phone"
+version = "0.0.0"
+dependencies = [
+ "android_logger",
+ "dioxus",
+ "log",
+ "pharos-android",
+ "pharos-ui",
+]
+
+[[package]]
 name = "pharos-scanner"
 version = "0.0.0"
 dependencies = [

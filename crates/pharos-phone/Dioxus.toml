@@ -1,0 +1,9 @@
+[application]
+name = "pharos-phone"
+# 044: the car's media service, art provider and voice entry beside the
+# dx activity, and the label.
+android_manifest = "android/AndroidManifest.xml"
+
+[bundle]
+identifier = "com.alisonjenkins.pharos.phone"
+publisher = "pharos"
