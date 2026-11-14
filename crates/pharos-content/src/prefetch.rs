@@ -223,13 +223,15 @@ impl Downloader {
         let mut q = g.lock();
         let mut added = 0usize;
         for id in ids {
-            if !g.cache.is_complete(id)
-                && !q.wanted.iter().any(|w| w == id)
-                && !q.pinned.iter().any(|w| w == id)
-            {
-                q.pinned.push_back(id.clone());
+            if g.cache.is_complete(id) || q.pinned.iter().any(|w| w == id) {
+                continue;
+            }
+            // Kept even when read-ahead already lists it: the budget may drop
+            // that entry, and the pin must still download.
+            if !q.wanted.iter().any(|w| w == id) {
                 added = added.saturating_add(1);
             }
+            q.pinned.push_back(id.clone());
         }
         drop(q);
         log::info!("cache enqueue added={added} requested={}", ids.len());
@@ -984,6 +986,41 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
+    }
+
+    #[test]
+    fn a_pinned_track_already_queued_for_playback_survives_the_budget_running_out() {
+        let r = pin_rig(
+            "pin-queued-budget",
+            Tuning {
+                max_bytes: 5_000,
+                ..fast()
+            },
+            2,
+            10_000,
+        );
+        r.dl.set_online(false);
+        r.dl.prefetch(&ids(&["track/1", "track/2"]));
+        r.cache.pin("album/1", &ids(&["track/2"]));
+        r.dl.enqueue(&ids(&["track/2"]));
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/1"));
+        assert!(r.cache.is_complete("track/2"), "pinned, so not dropped");
+    }
+
+    #[test]
+    fn a_pinned_track_already_queued_for_playback_survives_a_later_prefetch() {
+        let r = pin_rig("pin-queued-replaced", fast(), 3, 1000);
+        r.dl.set_online(false);
+        r.dl.prefetch(&ids(&["track/2"]));
+        r.cache.pin("album/1", &ids(&["track/2"]));
+        r.dl.enqueue(&ids(&["track/2"]));
+        r.dl.prefetch(&ids(&["track/3"]));
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/3"));
+        assert!(r.cache.is_complete("track/2"), "pinned, so not replaced");
     }
 
     #[test]
