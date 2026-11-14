@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 
+use super::offline_names::Names;
 use super::offline_ui::{
     cap_from_option, cap_options, cap_selected, container_route, container_title, format_bytes,
     saved_line, track_label, track_title, KeepState, FREE_GUARD_BYTES, OFFLINE_BANNER,
@@ -143,18 +144,43 @@ pub fn toggle_keep(
     result.map_err(|e| format!("{} {:?}: {e}", container.kind.label(), container.id))
 }
 
+/// Notes the name of a container just kept, or drops it once released.
+fn note_name(container: &ContainerRef, released: bool, title: &str, subtitle: Option<&str>) {
+    let mut names = Names::load();
+    if released {
+        if !names.forget(container) {
+            return;
+        }
+    } else {
+        names.remember(container, title, subtitle);
+    }
+    names.save();
+}
+
 /// The "Keep for offline" toggle and its state chip, for an album or mix
 /// page. Draws nothing without the offline store.
 #[component]
-pub fn KeepForOffline(container: ContainerRef) -> Element {
+pub fn KeepForOffline(
+    container: ContainerRef,
+    /// What the page calls it, noted on the device so the offline start
+    /// screen can name it with no server.
+    #[props(default)]
+    title: String,
+    #[props(default)] subtitle: Option<String>,
+) -> Element {
     match offline_store() {
-        Some(store) => rsx! { KeepToggle { store: Store(store), container } },
+        Some(store) => rsx! { KeepToggle { store: Store(store), container, title, subtitle } },
         None => rsx! {},
     }
 }
 
 #[component]
-pub fn KeepToggle(store: Store, container: ContainerRef) -> Element {
+pub fn KeepToggle(
+    store: Store,
+    container: ContainerRef,
+    #[props(default)] title: String,
+    #[props(default)] subtitle: Option<String>,
+) -> Element {
     let mut snap = use_snapshot(&store);
     let mut problem = use_signal(|| None::<String>);
     let state = KeepState::of(&snap().downloads, &container);
@@ -172,6 +198,7 @@ pub fn KeepToggle(store: Store, container: ContainerRef) -> Element {
                     move |_| {
                         match toggle_keep(&*store.0, &target, kept) {
                             Ok(()) => {
+                                note_name(&target, kept, &title, subtitle.as_deref());
                                 platform::info(&format!(
                                     "pharos: offline keep {} {} id={:?}",
                                     if kept { "released" } else { "requested" },

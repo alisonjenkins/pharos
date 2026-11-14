@@ -3580,6 +3580,8 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                     kind: ContainerKind::Album,
                     id: detail.item.id.to_string(),
                 },
+                title: detail.item.name.clone(),
+                subtitle: detail.item.artist.clone(),
             }
         }
     });
