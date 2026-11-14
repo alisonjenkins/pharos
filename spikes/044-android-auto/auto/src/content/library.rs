@@ -5,19 +5,23 @@
 //! callers send it a command and wait with a deadline. A call that gets no
 //! answer returns an error naming the call, never hangs the binder thread.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pharos_api::pharos_capnp::{bootstrap, session};
 use pharos_client::api::MediaToken;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
+use super::cache::Cache;
 use super::error::ContentError;
 use super::id::NodeId;
 use super::net::{self, Closed, NativeCatalogue};
 use super::node::{Node, Urls};
+use super::prefetch::{Downloader, ResolveError, Resolver, Tuning};
 use super::token;
 use super::tree;
 use super::tv_auth::{self, Action, Polled, QuickConnect};
@@ -144,6 +148,101 @@ pub struct Library {
     shared: Arc<Shared>,
     timeouts: Timeouts,
     server: String,
+    /// Set by [`Library::enable_cache`]; without it nothing is kept offline.
+    offline: OnceLock<Offline>,
+    queues: Mutex<Queues>,
+    online: AtomicBool,
+}
+
+/// The audio cache and the thread that fills it.
+struct Offline {
+    cache: Arc<Cache>,
+    downloader: Downloader,
+}
+
+/// Which album or mix each track was last listed in, in play order.
+#[derive(Default)]
+struct Queues {
+    lists: HashMap<String, Vec<String>>,
+    container_of: HashMap<String, String>,
+}
+
+impl Queues {
+    fn note(&mut self, container: &str, nodes: impl IntoIterator<Item = (String, bool)>) {
+        let tracks: Vec<String> = nodes
+            .into_iter()
+            .filter_map(|(id, playable)| playable.then_some(id))
+            .collect();
+        for t in &tracks {
+            self.container_of.insert(t.clone(), container.to_owned());
+        }
+        self.lists.insert(container.to_owned(), tracks);
+    }
+
+    fn after(&self, track: &str) -> Vec<String> {
+        let Some(list) = self.container_of.get(track).and_then(|c| self.lists.get(c)) else {
+            return Vec::new();
+        };
+        match list.iter().position(|t| t == track) {
+            Some(i) => list.iter().skip(i.saturating_add(1)).cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Containers whose children are the tracks to play on from.
+fn is_track_list(id: NodeId) -> bool {
+    matches!(id, NodeId::Album(_) | NodeId::Mix(_))
+}
+
+/// The server could not be reached or did not answer, as opposed to
+/// answering "no".
+fn is_unreachable(e: &ContentError) -> bool {
+    matches!(
+        e,
+        ContentError::Timeout { .. }
+            | ContentError::Closed { .. }
+            | ContentError::Connect { .. }
+            | ContentError::Rpc { .. }
+            | ContentError::NoCode { .. }
+    )
+}
+
+fn wait_reply(
+    timeouts: &Timeouts,
+    name: &str,
+    rx: &mpsc::Receiver<Result<Out, ContentError>>,
+) -> Result<Out, ContentError> {
+    match rx.recv_timeout(timeouts.command + REPLY_SLACK) {
+        Ok(r) => r,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ContentError::Timeout {
+            op: name.to_owned(),
+            secs: (timeouts.command + REPLY_SLACK).as_secs(),
+        }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ContentError::WorkerGone),
+    }
+}
+
+/// A fresh stream URL for the downloader, which runs on its own thread.
+fn resolve_stream(
+    tx: &UnboundedSender<Cmd>,
+    timeouts: &Timeouts,
+    id: &str,
+) -> Result<String, ResolveError> {
+    let nid = NodeId::parse(id).map_err(|e| ResolveError::Permanent(e.to_string()))?;
+    let op = Op::Node(nid);
+    let name = op.name();
+    let (rtx, rrx) = mpsc::channel();
+    tx.send(Cmd { op, reply: rtx })
+        .map_err(|_| ResolveError::Permanent(ContentError::WorkerGone.to_string()))?;
+    match wait_reply(timeouts, &name, &rrx) {
+        Ok(Out::One(n)) => n
+            .stream_url
+            .ok_or_else(|| ResolveError::Permanent(format!("{id} has no stream url"))),
+        Ok(_) => Err(ResolveError::Permanent("unexpected reply".into())),
+        Err(e) if is_unreachable(&e) => Err(ResolveError::Transient(e.to_string())),
+        Err(e) => Err(ResolveError::Permanent(e.to_string())),
+    }
 }
 
 impl Library {
@@ -202,6 +301,9 @@ impl Library {
             shared,
             timeouts,
             server: server_url.to_owned(),
+            offline: OnceLock::new(),
+            queues: Mutex::new(Queues::default()),
+            online: AtomicBool::new(true),
         })
     }
 
@@ -217,9 +319,26 @@ impl Library {
 
     /// What `media_id` holds. Signed out, every node holds the sign-in row
     /// carrying the QuickConnect code.
+    ///
+    /// With the cache enabled, a listing that cannot be fetched because the
+    /// server is unreachable (or [`Library::set_online`] said so) is answered
+    /// from the last one seen; an album or mix then shows only the tracks
+    /// that are on the phone.
     pub fn children(&self, media_id: &str) -> Result<Vec<Node>, ContentError> {
         let id = NodeId::parse(media_id)?;
-        self.nodes_or_sign_in(Op::Children(id))
+        if !self.online.load(Ordering::SeqCst) {
+            if let Some(nodes) = self.offline_children(media_id, id) {
+                return Ok(nodes);
+            }
+        }
+        match self.nodes_or_sign_in(Op::Children(id)) {
+            Ok(nodes) => {
+                self.note_listing(media_id, id, &nodes);
+                Ok(nodes)
+            }
+            Err(e) if is_unreachable(&e) => self.offline_children(media_id, id).ok_or(e),
+            Err(e) => Err(e),
+        }
     }
 
     /// One node, with a fresh stream URL for a track.
@@ -239,6 +358,160 @@ impl Library {
     /// Forget the device token and drop the connection.
     pub fn sign_out(&self) -> Result<(), ContentError> {
         self.call(Op::SignOut).map(|_| ())
+    }
+
+    /// Keep the listing for offline browse and remember the play order.
+    fn note_listing(&self, media_id: &str, id: NodeId, nodes: &[Node]) {
+        let signed_out = nodes.iter().any(|n| n.id == NodeId::SignIn.to_string());
+        if signed_out || nodes.is_empty() {
+            return;
+        }
+        if is_track_list(id) {
+            self.queues
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note(media_id, nodes.iter().map(|n| (n.id.clone(), n.playable)));
+        }
+        if let Some(o) = self.offline.get() {
+            o.cache.save_listing(media_id, nodes);
+        }
+    }
+
+    fn offline_children(&self, media_id: &str, id: NodeId) -> Option<Vec<Node>> {
+        let cache = &self.offline.get()?.cache;
+        let rows = cache.load_listing(media_id)?;
+        let total = rows.len();
+        let nodes: Vec<Node> = rows
+            .iter()
+            .filter(|r| !(is_track_list(id) && r.playable && !cache.is_complete(&r.id)))
+            .map(|r| r.to_node())
+            .collect();
+        log::info!(
+            "browse offline id={media_id} snapshot_rows={total} shown={}",
+            nodes.len()
+        );
+        Some(nodes)
+    }
+
+    /// Start keeping tracks in `dir` (at most `cap_bytes`; see
+    /// [`super::cache::DEFAULT_CAP_BYTES`]) and downloading ahead. Call once
+    /// after [`Library::connect`]; calling again is a no-op.
+    pub fn enable_cache(&self, dir: &Path, cap_bytes: u64) -> Result<(), ContentError> {
+        if self.offline.get().is_some() {
+            return Ok(());
+        }
+        let cache = Arc::new(Cache::open(dir, cap_bytes)?);
+        let (tx, timeouts) = (self.tx.clone(), self.timeouts);
+        let resolve: Resolver = Arc::new(move |id| resolve_stream(&tx, &timeouts, id));
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default())?;
+        {
+            let mut q = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            for (container, rows) in cache.all_listings() {
+                if NodeId::parse(&container).is_ok_and(is_track_list) {
+                    q.note(&container, rows.into_iter().map(|r| (r.id, r.playable)));
+                }
+            }
+        }
+        let _ = self.offline.set(Offline { cache, downloader });
+        Ok(())
+    }
+
+    /// The finished cached file for a track id (`track/..`), or `None` when it
+    /// is not whole on the phone. Counts as a play for eviction.
+    pub fn local_path(&self, track_id: &str) -> Option<PathBuf> {
+        self.offline.get()?.cache.local_path(track_id)
+    }
+
+    /// The tracks after `track_id` in the album or mix it was last listed in,
+    /// in play order. Empty when unknown (e.g. it came from a search).
+    pub fn play_queue(&self, track_id: &str) -> Vec<String> {
+        self.queues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .after(track_id)
+    }
+
+    /// Download `ids` in order in the background (the first should be the
+    /// track being played). Replaces the previous request. Never blocks.
+    /// Returns how many are not yet cached and will be fetched.
+    pub fn prefetch(&self, ids: &[String]) -> usize {
+        match self.offline.get() {
+            Some(o) => o.downloader.prefetch(ids),
+            None => 0,
+        }
+    }
+
+    /// [`Library::prefetch`] of `track_id` followed by its [`Library::play_queue`].
+    pub fn prefetch_from(&self, track_id: &str) -> usize {
+        let mut ids = vec![track_id.to_owned()];
+        ids.extend(self.play_queue(track_id));
+        self.prefetch(&ids)
+    }
+
+    /// Keep every track of an album or mix on the phone, never evicted, and
+    /// download the missing ones. Returns the number of tracks pinned. Needs
+    /// the listing (from the server, or the saved one when offline).
+    pub fn pin(&self, container_id: &str) -> Result<usize, ContentError> {
+        let id = NodeId::parse(container_id)?;
+        if !is_track_list(id) {
+            return Err(ContentError::Cache {
+                op: format!("pin {container_id}"),
+                why: "only an album or a mix can be pinned".into(),
+            });
+        }
+        let o = self.offline.get().ok_or_else(|| ContentError::Cache {
+            op: format!("pin {container_id}"),
+            why: "the cache is not enabled".into(),
+        })?;
+        let fetched = if self.online.load(Ordering::SeqCst) {
+            self.nodes_or_sign_in(Op::Children(id))
+        } else {
+            Err(ContentError::Cache {
+                op: format!("pin {container_id}"),
+                why: "offline".into(),
+            })
+        };
+        let playable = |nodes: Vec<Node>| -> Vec<String> {
+            nodes
+                .into_iter()
+                .filter(|n| n.playable)
+                .map(|n| n.id)
+                .collect()
+        };
+        let tracks = match fetched {
+            Ok(nodes) => {
+                self.note_listing(container_id, id, &nodes);
+                playable(nodes)
+            }
+            Err(e) => match o.cache.load_listing(container_id) {
+                Some(rows) => rows
+                    .into_iter()
+                    .filter(|r| r.playable)
+                    .map(|r| r.id)
+                    .collect(),
+                None => return Err(e),
+            },
+        };
+        o.cache.pin(container_id, &tracks);
+        o.downloader.enqueue(&tracks);
+        Ok(tracks.len())
+    }
+
+    /// Release a pin; its tracks become ordinary, evictable cache entries.
+    pub fn unpin(&self, container_id: &str) {
+        if let Some(o) = self.offline.get() {
+            o.cache.unpin(container_id);
+        }
+    }
+
+    /// Whether the phone has a network, from the platform's callback. Offline
+    /// pauses downloads and makes browsing answer from saved listings at once
+    /// instead of waiting for a timeout.
+    pub fn set_online(&self, online: bool) {
+        self.online.store(online, Ordering::SeqCst);
+        if let Some(o) = self.offline.get() {
+            o.downloader.set_online(online);
+        }
     }
 
     fn nodes_or_sign_in(&self, op: Op) -> Result<Vec<Node>, ContentError> {
@@ -269,14 +542,7 @@ impl Library {
         name: &str,
         rx: &mpsc::Receiver<Result<Out, ContentError>>,
     ) -> Result<Out, ContentError> {
-        match rx.recv_timeout(self.timeouts.command + REPLY_SLACK) {
-            Ok(r) => r,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ContentError::Timeout {
-                op: name.to_owned(),
-                secs: (self.timeouts.command + REPLY_SLACK).as_secs(),
-            }),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ContentError::WorkerGone),
-        }
+        wait_reply(&self.timeouts, name, rx)
     }
 
     /// The sign-in row, once a code exists.
@@ -611,6 +877,150 @@ mod tests {
         assert!(matches!(e, ContentError::NoCode { .. }), "{text}");
         assert!(text.contains(&base.replace("http", "ws")), "{text}");
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
+    }
+
+    fn cache_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "pharos-auto-libcache-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn offline_lib(name: &str) -> (Library, PathBuf) {
+        let base = dead_server();
+        let tok =
+            std::env::temp_dir().join(format!("pharos-auto-lib-{name}-{}", std::process::id()));
+        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
+        let dir = cache_dir(name);
+        lib.enable_cache(&dir, 1 << 20).unwrap();
+        (lib, dir)
+    }
+
+    fn track(n: u32) -> Node {
+        Node {
+            id: format!("track/{n}"),
+            title: format!("T{n}"),
+            subtitle: "A".into(),
+            browsable: false,
+            playable: true,
+            art_url: None,
+            stream_url: Some("https://h/x?api_key=SECRET".into()),
+            duration_ms: 1000,
+        }
+    }
+
+    fn keep(lib: &Library, id: &str) {
+        let c = &lib.offline.get().unwrap().cache;
+        std::fs::write(c.part_path(id), b"audio").unwrap();
+        c.commit(id, Some(5)).unwrap();
+    }
+
+    #[test]
+    fn play_queue_is_the_rest_of_the_album_in_order() {
+        let (lib, _) = offline_lib("queue");
+        let album = NodeId::parse("album/7").unwrap();
+        lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
+        assert_eq!(lib.play_queue("track/1"), ["track/2", "track/3"]);
+        assert_eq!(lib.play_queue("track/3"), Vec::<String>::new());
+        assert_eq!(lib.play_queue("track/99"), Vec::<String>::new());
+        // Recent is not a play queue: playing from it queues nothing.
+        let recent = NodeId::parse("music/recent").unwrap();
+        lib.note_listing("music/recent", recent, &[track(8), track(9)]);
+        assert!(lib.play_queue("track/8").is_empty());
+    }
+
+    #[test]
+    fn local_path_is_only_for_whole_cached_files() {
+        let (lib, _) = offline_lib("local");
+        assert_eq!(lib.local_path("track/1"), None);
+        keep(&lib, "track/1");
+        let p = lib.local_path("track/1").unwrap();
+        assert_eq!(std::fs::read(p).unwrap(), b"audio");
+    }
+
+    #[test]
+    fn without_the_cache_nothing_is_local_and_prefetch_is_a_no_op() {
+        let lib = Library::connect_with(
+            &dead_server(),
+            &std::env::temp_dir().join("pharos-auto-lib-nocache"),
+            quick(),
+        )
+        .unwrap();
+        assert_eq!(lib.local_path("track/1"), None);
+        assert_eq!(lib.prefetch(&["track/1".to_owned()]), 0);
+        assert!(lib.pin("album/1").is_err());
+    }
+
+    /// Browsing an album with no signal lists the tracks that are on the
+    /// phone, and those rows carry no URL (and so no token).
+    #[test]
+    fn an_unreachable_server_still_lists_the_cached_tracks_of_an_album() {
+        let (lib, _) = offline_lib("browse");
+        let album = NodeId::parse("album/7").unwrap();
+        lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
+        keep(&lib, "track/2");
+        let nodes = lib.children("album/7").unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["track/2"]);
+        assert_eq!(nodes[0].stream_url, None);
+        assert_eq!(nodes[0].title, "T2");
+        // Folders are served as they were last seen.
+        lib.note_listing(
+            "music",
+            NodeId::Music,
+            &[Node::folder(NodeId::Albums, "Albums")],
+        );
+        assert_eq!(lib.children("music").unwrap()[0].id, "music/albums");
+        // No snapshot: the original error stands.
+        assert!(lib.children("album/8").is_err());
+    }
+
+    #[test]
+    fn set_offline_answers_from_the_snapshot_without_waiting_for_the_network() {
+        let (lib, _) = offline_lib("flag");
+        let album = NodeId::parse("album/7").unwrap();
+        lib.note_listing("album/7", album, &[track(1)]);
+        keep(&lib, "track/1");
+        lib.set_online(false);
+        let t = std::time::Instant::now();
+        assert_eq!(lib.children("album/7").unwrap().len(), 1);
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn the_play_order_and_snapshots_survive_a_restart() {
+        let (lib, dir) = offline_lib("restart");
+        let album = NodeId::parse("album/7").unwrap();
+        lib.note_listing("album/7", album, &[track(1), track(2)]);
+        keep(&lib, "track/1");
+        drop(lib);
+        let lib2 = Library::connect_with(
+            &dead_server(),
+            &std::env::temp_dir().join("pharos-auto-lib-restart2"),
+            quick(),
+        )
+        .unwrap();
+        lib2.enable_cache(&dir, 1 << 20).unwrap();
+        assert_eq!(lib2.play_queue("track/1"), ["track/2"]);
+        assert!(lib2.local_path("track/1").is_some());
+    }
+
+    #[test]
+    fn only_albums_and_mixes_pin_and_a_pin_survives_for_the_tracks_it_names() {
+        let (lib, dir) = offline_lib("pin");
+        assert!(lib.pin("music/albums").is_err());
+        let album = NodeId::parse("album/7").unwrap();
+        lib.note_listing("album/7", album, &[track(1), track(2)]);
+        lib.set_online(false);
+        assert_eq!(lib.pin("album/7").unwrap(), 2);
+        let c = &lib.offline.get().unwrap().cache;
+        assert_eq!(c.pinned_tracks("album/7").unwrap(), ["track/1", "track/2"]);
+        lib.unpin("album/7");
+        assert!(!c.is_pinned("album/7"));
+        drop(lib);
+        let _ = dir;
     }
 
     #[test]
