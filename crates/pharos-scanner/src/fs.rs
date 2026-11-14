@@ -2431,6 +2431,11 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         let paths = walk(root.to_path_buf(), self.extensions.clone())
             .await?
             .files;
+        // A course's lessons are not editions or copies of one another, as
+        // in `scan_into` (ADR-0126).
+        let (lessons, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| self.course_lesson(p).is_some());
         let groups = group_by_edition(paths);
         let candidates: Vec<PathBuf> = copy_candidates(&groups)
             .into_iter()
@@ -2438,7 +2443,8 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .collect();
         let sizes = copy_sizes(&candidates).await;
         let groups = group_copies(groups, &sizes, &mut CopyTally::default());
-        let groups = crate::book::fold::fold_formats(groups).await;
+        let mut groups = crate::book::fold::fold_formats(groups).await;
+        groups.extend(lessons.into_iter().map(|p| (p, Vec::new())));
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -12343,6 +12349,31 @@ mod tests {
             ),
             files.len() as u64
         );
+    }
+
+    /// V1392 — the bare `scan` keeps a lesson whose name carries an edition
+    /// tag its own item, as `scan_into` does.
+    #[tokio::test]
+    async fn the_bare_scan_keeps_each_lesson_its_own_item() {
+        let td = TempDir::new().unwrap();
+        let files = [
+            "Widget Basics/02 - Wrap Up.mp4",
+            "Widget Basics/02 - Wrap Up - Extended.mp4",
+        ];
+        for f in files {
+            touch(td.path(), f).await;
+        }
+        let items = FsScanner::new(FakeProber::default())
+            .with_course_roots([td.path().to_path_buf()])
+            .scan(td.path())
+            .await
+            .unwrap();
+        let mut paths: Vec<PathBuf> = items.iter().map(|i| i.path.clone()).collect();
+        paths.sort();
+        let mut want = files.map(|f| td.path().join(f)).to_vec();
+        want.sort();
+        assert_eq!(paths, want, "each lesson is its own item");
+        assert!(items.iter().all(|i| i.probe.alternate_sources.is_empty()));
     }
 
     /// V1392 — with no Books root the same video is a film, as before.
