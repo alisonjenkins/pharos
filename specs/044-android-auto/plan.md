@@ -26,7 +26,7 @@ The owner wants one real app, for the phone and the car, in pure Rust.
 | D5 | The spike moves into three workspace crates, kept off `workspace-hack`. | See "Crate layout". |
 | D6 | Phone sign-in writes the files the car already reads. QuickConnect on the car stays behind a debug feature. | Spec US4. |
 
-D1, D2 and D4 are load-bearing and hard to undo. They get **a new ADR (id pending)**
+D1, D2 and D4 are load-bearing and hard to undo. They get **ADR-0131**
 (task T30), Proposed until T1 confirms the open facts below.
 
 ## 1. How dx's Android build works today

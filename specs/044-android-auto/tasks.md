@@ -47,7 +47,7 @@ one task must leave the workspace compiling.
 | T26 | D | M | T5, T20 | Downloads view: route, pinned containers, size, per-track state, remove, offline banner. |
 | T27 | D | S | T16 | Phone pass on the narrow layout inside the app WebView: safe areas, back button, now-playing bar; ask for notification permission on first play. CSS and one JNI call. |
 | T28 | E | M | T17, T21, T10, T11, T12 | Device checklist on a phone and the Desktop Head Unit: locked-screen play, notification actions, unplug headphones, focus loss, resume, offline in airplane mode, pin then browse offline, car reuses the phone sign-in. Capture the logcat query output per row. |
-| T30 | F | S | none | New ADR, id pending (one APK, dx Gradle project plus injected dex, one `.so`, in-process bridge). Own commit, row in `docs/adr/README.md`. Proposed until T1 closes, then Accepted. |
+| T30 | F | S | none | ADR-0131 (one APK, dx Gradle project plus injected dex, one `.so`, in-process bridge). Own commit, row in `docs/adr/README.md`. Proposed until T1 closes, then Accepted. |
 | T31 | F | XS | T28 | Update `spec.md` slices 2 and 3; append bugs and invariants found; set status. |
 | T32 | F | XS | T17, T3, T4, T8 | Delete `spikes/044-android-auto/` (history keeps it). Point `spike-0.md` at the new crates. |
 
