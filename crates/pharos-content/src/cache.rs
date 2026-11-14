@@ -101,6 +101,8 @@ pub struct Download {
     pub container: String,
     /// The container's title from a saved listing that names it, if any.
     pub title: Option<String>,
+    /// That listing row's subtitle (an album's artist), if it has one.
+    pub subtitle: Option<String>,
     /// In play order.
     pub tracks: Vec<DownloadTrack>,
 }
@@ -123,6 +125,8 @@ impl Download {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadTrack {
     pub id: String,
+    /// The track's title from a saved listing (its album's or mix's), if any.
+    pub title: Option<String>,
     /// Zero until the track is whole.
     pub bytes: u64,
     pub complete: bool,
@@ -638,6 +642,7 @@ impl Cache {
                             let complete = e.is_some_and(|e| e.complete);
                             DownloadTrack {
                                 id: id.clone(),
+                                title: None,
                                 bytes: if complete { e.map_or(0, |e| e.size) } else { 0 },
                                 complete,
                             }
@@ -650,16 +655,24 @@ impl Cache {
         if pins.is_empty() {
             return Vec::new();
         }
-        let titles: HashMap<String, String> = self
+        let rows: HashMap<String, SavedNode> = self
             .all_listings()
             .into_iter()
-            .flat_map(|(_, rows)| rows.into_iter().map(|r| (r.id, r.title)))
+            .flat_map(|(_, rows)| rows.into_iter().map(|r| (r.id.clone(), r)))
             .collect();
+        let non_empty = |t: &str| (!t.is_empty()).then(|| t.to_owned());
         pins.into_iter()
-            .map(|(container, tracks)| Download {
-                title: titles.get(&container).cloned(),
-                container,
-                tracks,
+            .map(|(container, mut tracks)| {
+                for t in &mut tracks {
+                    t.title = rows.get(&t.id).and_then(|r| non_empty(&r.title));
+                }
+                let row = rows.get(&container);
+                Download {
+                    title: row.and_then(|r| non_empty(&r.title)),
+                    subtitle: row.and_then(|r| non_empty(&r.subtitle)),
+                    container,
+                    tracks,
+                }
             })
             .collect()
     }
@@ -1160,31 +1173,38 @@ mod tests {
         put(&c, "track/a", 100);
         c.pin("album/1", &ids(&["track/a", "track/b"]));
         c.pin("mix/2", &ids(&["track/a"]));
-        c.save_listing("music/albums", &[row("album/1", "Album One")]);
+        let mut album_row = row("album/1", "Album One");
+        album_row.subtitle = "An Artist".into();
+        c.save_listing("music/albums", &[album_row]);
+        c.save_listing("album/1", &[row("track/a", "Track A")]);
 
         let got = c.downloads();
         assert_eq!(got.len(), 2);
         let album = &got[0];
         assert_eq!(album.container, "album/1");
         assert_eq!(album.title.as_deref(), Some("Album One"));
+        assert_eq!(album.subtitle.as_deref(), Some("An Artist"));
         assert_eq!(
             album.tracks,
             vec![
                 DownloadTrack {
                     id: "track/a".into(),
+                    title: Some("Track A".into()),
                     bytes: 100,
-                    complete: true
+                    complete: true,
                 },
                 DownloadTrack {
                     id: "track/b".into(),
+                    title: None,
                     bytes: 0,
-                    complete: false
+                    complete: false,
                 },
             ]
         );
         assert_eq!((album.bytes(), album.complete()), (100, 1));
         assert_eq!(got[1].container, "mix/2");
         assert_eq!(got[1].title, None, "no saved listing names it");
+        assert_eq!(got[1].subtitle, None);
 
         c.unpin("mix/2");
         assert_eq!(c.downloads().len(), 1);
