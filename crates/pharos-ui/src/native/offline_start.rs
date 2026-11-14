@@ -62,7 +62,7 @@ impl Decision {
     }
 }
 
-/// Which screen a start gets. `cut_off` is the app's own verdict that the
+/// Which screen a start gets (V1413). `cut_off` is the app's own verdict that the
 /// server cannot be reached; `can_play` says the phone has both ports;
 /// `items` is how many downloaded items could play.
 pub fn decide(cut_off: bool, can_play: bool, items: usize) -> Decision {
@@ -408,6 +408,7 @@ fn OfflineRow(item: OfflineItem, audio: Audio) -> Element {
 
 #[cfg(test)]
 mod tests {
+    //! V1413: the offline start's decision, list and wording.
     use super::*;
     use crate::native::offline_view::Store;
     use crate::native::ports::fake::{FakeAudio, FakeOfflineStore};
