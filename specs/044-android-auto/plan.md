@@ -285,11 +285,45 @@ T23 to T27), Wave 5 (T28, T31, T32). Details and dependencies in `tasks.md`.
 
 ## Open questions
 
-1. **dx's generated tree (T1).** Exact class and lib names, whether the
-   cdylib keeps dependency `Java_` exports, whether dx 0.8's
-   `#[manganis::ffi]` Gradle modules could take a prebuilt jar and replace
-   the post-Gradle dex step. (ADR-0078 says dx 0.8 "bundles Android Gradle
-   modules declared with `#[manganis::ffi]`"; I did not read how.)
+1. **dx's generated tree (T1).** Answered 2026-11-14 from a bare stub
+   (`pharos-phone` bin plus a `jnidep` rlib), debug, `aarch64-linux-android`.
+   - Versions: `dx` 0.8.0-alpha.3 (the shell's; `scripts/android-apk.sh`
+     comments still say 0.7), NDK 29.0.14206865, build-tools 35.0.0. The
+     generated Gradle has compileSdk 34, minSdk 24, targetSdk 34.
+   - Tree: `target/dx/pharos-phone/debug/android/app/`. The glue is Kotlin
+     only, in `app/src/main/kotlin/dev/dioxus/main/` (`MainActivity`,
+     `WryActivity`, `Rust`, `Ipc`, `Logger`, `PermissionHelper`, and wry's
+     WebView classes). `app/src/main/java/` exists and is empty.
+   - Names: launcher `dev.dioxus.main.MainActivity` (extends `WryActivity`).
+     `android.app.lib_name` is `main`. One library,
+     `app/src/main/jniLibs/arm64-v8a/libmain.so`, loaded by `Rust.kt` with
+     `System.loadLibrary("main")`. The application id comes from the cargo
+     package name (`com.example.PharosPhone` for the stub), so T-tasks must
+     set it explicitly.
+   - No `JNI_OnLoad` is exported; wry's natives are
+     `Java_dev_dioxus_main_*`. Our `Java_com_alisonjenkins_*` names do not
+     clash.
+   - **Dependency `Java_` exports are dropped.** An unreferenced
+     `#[no_mangle] extern "system"` fn in an rlib is absent from
+     `llvm-nm -D libmain.so`. A `link()` fn called from `main` that takes
+     each export's address through `std::hint::black_box` keeps it
+     (`T Java_com_example_t1_Probe_ping`). The `build.rs`
+     `-Wl,--undefined=` arg alone did **not** keep it (cause not found).
+     So `pharos_android::link()` is required, not a fallback, and the
+     check script's `llvm-nm` assertion stays. Not verified: release
+     profile (LTO, strip) and armv7.
+   - `llvm-nm` is not on the dev shell's PATH; use
+     `$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/*/bin/llvm-nm`.
+   - `#[manganis::ffi("<dir>")] extern "Kotlin" { ... }` generates
+     Rust-to-Kotlin JNI calls. The path must be a Gradle module directory
+     (copied to `plugins/<name>`) or a prebuilt `.aar` (copied to
+     `app/libs/`); a bare `.jar` is rejected
+     (`dioxus-cli-0.8.0-alpha.3/src/build/android.rs`,
+     `install_android_artifacts`). Its metadata rides in the binary's
+     assets symbol, so the declaring crate must be linked. Our generated
+     `.class` files would need wrapping in an `.aar` to use it; the
+     post-Gradle `classes2.dex` append needs no wrapper, so it stays the
+     plan. Not exercised end to end.
 2. **Does `ndk_context` give the Activity or the Application?** It decides
    how the UI asks for `POST_NOTIFICATIONS`.
 3. **Cache cap default.** 4 GiB is still an assumption from the spec, not
