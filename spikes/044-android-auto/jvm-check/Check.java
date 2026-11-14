@@ -81,6 +81,8 @@ public class Check {
       dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", true));
       dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", false));
       dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE"));
+      dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("cap_bytes", 1073741824L));
+      dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("cap_bytes", -5L));
     }
     expect(s.superCreated, "onCreate ran the framework's onCreate first");
     expect(s.token != null, "Rust set the session token");
