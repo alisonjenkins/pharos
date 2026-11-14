@@ -577,14 +577,15 @@ struct Head {
 /// The book's bytes: a kept copy first, even online (spec 036 FR-006), then
 /// the network. Says where they came from for the log, and which version
 /// they are. A kept copy (`kept`: the user and its format) that is gone is
-/// fetched again in its own format, never as another.
+/// fetched again in its own format, never as another. A failure carries the
+/// version it meant to read, so the failure screen's Download asks for it.
 async fn book_bytes(
     id: ItemRef,
     version: &str,
     kept: Option<(&str, BookFormat)>,
     api: Option<&NativeApi>,
     online: bool,
-) -> Result<(js_sys::Uint8Array, &'static str, String), String> {
+) -> Result<(js_sys::Uint8Array, &'static str, String), (String, String)> {
     let mut version = version.to_owned();
     if let Some((user, format)) = kept {
         match kept_web::cached_book(user, id).await {
@@ -600,12 +601,20 @@ async fn book_bytes(
             )),
         }
         let (Some(api), true) = (api, online) else {
-            return Err("This book is not on this device and there is no connection.".into());
+            return Err((
+                "This book is not on this device and there is no connection.".into(),
+                version,
+            ));
         };
         let d = api
             .detail(&call("read", "refetch"), id)
             .await
-            .map_err(|e| format!("The book could not be loaded: {e}"))?;
+            .map_err(|e| {
+                (
+                    format!("The book could not be loaded: {e}"),
+                    version.clone(),
+                )
+            })?;
         let found = d
             .book
             .as_ref()
@@ -614,7 +623,10 @@ async fn book_bytes(
             platform::warn(&format!(
                 "pharos: reader failed item={id} kept={format:?} error=no version in the kept format"
             ));
-            return Err("This book is no longer offered in the format kept here.".into());
+            return Err((
+                "This book is no longer offered in the format kept here.".into(),
+                version,
+            ));
         };
         platform::info(&format!(
             "pharos: reader refetching kept copy item={id} kept={format:?} version={}",
@@ -627,11 +639,15 @@ async fn book_bytes(
         version = found;
     }
     if !online {
-        return Err("This book is not on this device and there is no connection.".into());
+        return Err((
+            "This book is not on this device and there is no connection.".into(),
+            version,
+        ));
     }
-    fetch_book(id, &version)
-        .await
-        .map(|bytes| (bytes, "network", version))
+    match fetch_book(id, &version).await {
+        Ok(bytes) => Ok((bytes, "network", version)),
+        Err(message) => Err((message, version)),
+    }
 }
 
 /// What follows a book opening, off the critical path (FR-008). A kept
@@ -1209,7 +1225,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     .await
                     {
                         Ok(b) => b,
-                        Err(message) => {
+                        Err((message, meant)) => {
+                            book_version.set(meant);
                             platform::warn(&format!(
                                 "pharos: reader failed item={id} error={message}"
                             ));
@@ -1294,7 +1311,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 .await
                 {
                     Ok(b) => b,
-                    Err(message) => {
+                    Err((message, meant)) => {
+                        book_version.set(meant);
                         platform::warn(&format!("pharos: reader failed item={id} error={message}"));
                         phase.set(Phase::Failed(message));
                         return;
