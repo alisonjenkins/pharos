@@ -33,7 +33,7 @@ use super::reader::{
     ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE,
     PENDING_KEY, SETTINGS_KEY,
 };
-use super::reader::{kept_copy_serves, version_book, version_href};
+use super::reader::{kept_copy_serves, version_book, version_for_format, version_href};
 use super::route::Route;
 use super::versions;
 use super::views::{display_name, Nav};
@@ -575,33 +575,63 @@ struct Head {
 }
 
 /// The book's bytes: a kept copy first, even online (spec 036 FR-006), then
-/// the network. Says where they came from for the log.
+/// the network. Says where they came from for the log, and which version
+/// they are. A kept copy (`kept`: the user and its format) that is gone is
+/// fetched again in its own format, never as another.
 async fn book_bytes(
     id: ItemRef,
     version: &str,
-    kept_user: Option<&str>,
+    kept: Option<(&str, BookFormat)>,
+    api: Option<&NativeApi>,
     online: bool,
-) -> Result<(js_sys::Uint8Array, &'static str), String> {
-    if let Some(user) = kept_user {
+) -> Result<(js_sys::Uint8Array, &'static str, String), String> {
+    let mut version = version.to_owned();
+    if let Some((user, format)) = kept {
         match kept_web::cached_book(user, id).await {
             Some(bytes) => {
                 platform::info(&format!(
                     "pharos: reader cache hit item={id} bytes={}",
                     bytes.length()
                 ));
-                return Ok((bytes, "cache"));
+                return Ok((bytes, "cache", version));
             }
             None => platform::warn(&format!(
                 "pharos: reader cache miss item={id}; the kept copy is gone"
             )),
         }
+        let (Some(api), true) = (api, online) else {
+            return Err("This book is not on this device and there is no connection.".into());
+        };
+        let d = api
+            .detail(&call("read", "refetch"), id)
+            .await
+            .map_err(|e| format!("The book could not be loaded: {e}"))?;
+        let found = d
+            .book
+            .as_ref()
+            .and_then(|b| version_for_format(b, &d.versions, format));
+        let Some(found) = found else {
+            platform::warn(&format!(
+                "pharos: reader failed item={id} kept={format:?} error=no version in the kept format"
+            ));
+            return Err("This book is no longer offered in the format kept here.".into());
+        };
+        platform::info(&format!(
+            "pharos: reader refetching kept copy item={id} kept={format:?} version={}",
+            if found.is_empty() {
+                "primary"
+            } else {
+                found.as_str()
+            }
+        ));
+        version = found;
     }
     if !online {
         return Err("This book is not on this device and there is no connection.".into());
     }
-    fetch_book(id, version)
+    fetch_book(id, &version)
         .await
-        .map(|bytes| (bytes, "network"))
+        .map(|bytes| (bytes, "network", version))
 }
 
 /// What follows a book opening, off the critical path (FR-008). A kept
@@ -1068,8 +1098,19 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     (&held, &api, stored.as_deref().filter(|p| !p.is_empty()))
                 {
                     if !kept_web::is_offline() {
-                        match api.detail(&call("read", "load"), id).await {
-                            Ok(d) => {
+                        // Bounded: a slow server must not hold up a book
+                        // this device already has.
+                        let checked = kept_web::within(
+                            kept_web::SERVER_CHECK_MS,
+                            api.detail(&call("read", "load"), id),
+                        )
+                        .await;
+                        match checked {
+                            None => platform::warn(&format!(
+                                "pharos: reader kept copy used item={id} why=no answer on the picked format in {} ms",
+                                kept_web::SERVER_CHECK_MS
+                            )),
+                            Some(Ok(d)) => {
                                 let kept = book.format.book_format();
                                 let passed_over = d.book.as_ref().is_some_and(|b| {
                                     !kept_copy_serves(kept, b, &d.versions, pick)
@@ -1083,7 +1124,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                     detail = Some(d);
                                 }
                             }
-                            Err(e) => platform::warn(&format!(
+                            Some(Err(e)) => platform::warn(&format!(
                                 "pharos: reader kept copy used item={id} why=could not check the picked format: {e}"
                             )),
                         }
@@ -1158,17 +1199,25 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 }
                 if format == Some(BookFormat::Pdf) {
                     is_pdf.set(true);
-                    let (bytes, from) =
-                        match book_bytes(id, &head.version, kept_user.as_deref(), online).await {
-                            Ok(b) => b,
-                            Err(message) => {
-                                platform::warn(&format!(
-                                    "pharos: reader failed item={id} error={message}"
-                                ));
-                                phase.set(Phase::Failed(message));
-                                return;
-                            }
-                        };
+                    let (bytes, from, fetched) = match book_bytes(
+                        id,
+                        &head.version,
+                        kept_user.as_deref().zip(format),
+                        api.as_ref(),
+                        online,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(message) => {
+                            platform::warn(&format!(
+                                "pharos: reader failed item={id} error={message}"
+                            ));
+                            phase.set(Phase::Failed(message));
+                            return;
+                        }
+                    };
+                    book_version.set(fetched);
                     let length = bytes.length();
                     let auto = (!kept && from == "network" && kept_web::wants_auto())
                         .then(|| bytes.clone());
@@ -1235,17 +1284,23 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                     return;
                 }
-                let (bytes, from) =
-                    match book_bytes(id, &head.version, kept_user.as_deref(), online).await {
-                        Ok(b) => b,
-                        Err(message) => {
-                            platform::warn(&format!(
-                                "pharos: reader failed item={id} error={message}"
-                            ));
-                            phase.set(Phase::Failed(message));
-                            return;
-                        }
-                    };
+                let (bytes, from, fetched) = match book_bytes(
+                    id,
+                    &head.version,
+                    kept_user.as_deref().zip(format),
+                    api.as_ref(),
+                    online,
+                )
+                .await
+                {
+                    Ok(b) => b,
+                    Err(message) => {
+                        platform::warn(&format!("pharos: reader failed item={id} error={message}"));
+                        phase.set(Phase::Failed(message));
+                        return;
+                    }
+                };
+                book_version.set(fetched);
                 let auto =
                     (!kept && from == "network" && kept_web::wants_auto()).then(|| bytes.clone());
                 let bytes = js_sys::Uint8Array::to_vec(&bytes);

@@ -707,6 +707,23 @@ pub fn kept_copy_serves(
             .any(|v| !picked.is_empty() && v.id == picked)
 }
 
+/// The version to fetch in place of a copy kept as `kept` that this device
+/// lost: the book's own file (`""`) when it reads as `kept`, else the first
+/// version that does; `None` when the server offers the format no longer.
+pub fn version_for_format(
+    book: &Book,
+    versions: &[pharos_client::api::Version],
+    kept: BookFormat,
+) -> Option<String> {
+    if book.format == kept {
+        return Some(String::new());
+    }
+    versions
+        .iter()
+        .find(|v| !v.id.is_empty() && format_of_container(&v.container) == kept)
+        .map(|v| v.id.clone())
+}
+
 /// The format a version's container reads as; a container the reader does
 /// not know is unreadable.
 fn format_of_container(container: &str) -> BookFormat {
@@ -1395,6 +1412,32 @@ mod tests {
         assert!(serves(BookFormat::Epub, "gone"), "a gone pick: kept first");
         assert!(!serves(BookFormat::Epub, "pdf"), "a PDF pick is fetched");
         assert!(serves(BookFormat::Pdf, "pdf"), "the kept format picked");
+    }
+
+    /// A kept PDF of a book whose own file is an EPUB is fetched again as
+    /// its PDF version, never as the EPUB.
+    #[test]
+    fn a_lost_kept_copy_is_fetched_in_its_own_format() {
+        use pharos_client::api::Version;
+        let book = Book {
+            format: BookFormat::Epub,
+            author: String::new(),
+            page_count: 0,
+        };
+        let version = |id: &str, container: &str| Version {
+            id: id.into(),
+            container: container.into(),
+            ..Version::default()
+        };
+        let versions = [version("", "epub"), version("pdf", "pdf")];
+        let pick = |kept| version_for_format(&book, &versions, kept);
+        assert_eq!(pick(BookFormat::Epub).as_deref(), Some(""));
+        assert_eq!(pick(BookFormat::Pdf).as_deref(), Some("pdf"));
+        assert_eq!(
+            version_for_format(&book, &versions[..1], BookFormat::Pdf),
+            None,
+            "a format the server no longer offers is not the primary"
+        );
     }
 
     #[test]
