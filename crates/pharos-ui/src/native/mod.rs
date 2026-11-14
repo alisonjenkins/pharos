@@ -106,6 +106,7 @@ pub mod scrub;
 pub mod seek_wait;
 pub mod seen;
 pub mod settings;
+pub mod shell;
 pub mod show_tracks;
 pub mod stage;
 pub mod stereo;

@@ -391,9 +391,9 @@ struct Boot {
 fn boot_theme() -> Boot {
     let device = this_device();
     platform::info(&format!(
-        "pharos: device class={} android_shell={}",
+        "pharos: device class={} shell={}",
         device.label(),
-        platform::android_shell()
+        super::shell::current().label()
     ));
     platform::apply_device(device);
     platform::apply_subtitle_size(stored_subtitle_size());
@@ -1012,7 +1012,7 @@ pub(crate) fn this_device() -> DeviceClass {
         &platform::user_agent(),
         platform::prefers("(pointer: coarse)"),
         platform::prefers(NARROW_SCREEN),
-        platform::android_shell(),
+        super::shell::current(),
     )
 }
 
