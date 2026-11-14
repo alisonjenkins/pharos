@@ -842,8 +842,12 @@
         # htdemucs.bpk (read at run time).
         separatorModel = pkgs.runCommand "pharos-separator-model" {
           nativeBuildInputs = [ onnx2burn ];
+          # The generated source names the ONNX file in its first comment,
+          # which would carry the 200 MiB ONNX copy into every closure.
+          disallowedReferences = [ separatorOnnx ];
         } ''
           onnx2burn ${separatorOnnx}/htdemucs.onnx $out --no-development
+          sed -i '1s|^// Generated from ONNX .*|// Generated from htdemucs.onnx by burn-onnx|' $out/htdemucs.rs
         '';
         aligner = pkgs.python3Packages.buildPythonApplication {
           pname = "pharos-aligner";
