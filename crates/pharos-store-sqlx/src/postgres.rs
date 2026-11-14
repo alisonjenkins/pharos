@@ -1319,6 +1319,25 @@ impl MediaStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
+        // V1391 — a book's reading place carries with its resume point: the
+        // newer save wins. A locator names its format (`epub1:`, `pdf1:`), so
+        // one saved in another format opens at the start rather than misplaced.
+        if resume == pharos_core::FoldResume::Carry {
+            sqlx::query(
+                "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at) \
+                 SELECT user_id, $2, locator, fraction, updated_at FROM read_positions \
+                 WHERE item_id = $1 AND EXISTS (SELECT 1 FROM media_items WHERE id = $2) \
+                 ON CONFLICT (user_id, item_id) DO UPDATE SET \
+                 locator = excluded.locator, fraction = excluded.fraction, \
+                 updated_at = excluded.updated_at \
+                 WHERE excluded.updated_at > read_positions.updated_at",
+            )
+            .bind(from)
+            .bind(into)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 

@@ -4367,8 +4367,10 @@ pub trait MediaStore: Send + Sync {
     /// stays `into`'s own, for files whose timelines differ (a double
     /// episode folded into one of its episodes). Stored audio and subtitle
     /// choices are not copied: their stream indexes name the other file's
-    /// streams. Used when a file's row is folded into another item as one
-    /// of its versions. Idempotent; a no-op when `into` has no row. Stores
+    /// streams. A book's reading place follows its resume point: with
+    /// [`FoldResume::Carry`] the newer save of the two is kept (V1391). Used
+    /// when a file's row is folded into another item as one of its versions.
+    /// Idempotent; a no-op when `into` has no row. Stores
     /// without user data keep the default.
     fn merge_user_data(
         &self,
