@@ -751,7 +751,7 @@ pub async fn load<A: PharosApi>(
             // The books are the page; a course listing that fails leaves
             // the library as it was before it had courses.
             let (books, courses) = join(
-                paged(Listing::of(id, None, "SortName")),
+                paged(books_listing(id)),
                 grid(id, Some(ItemKind::Series), "SortName"),
             )
             .await;
@@ -3174,6 +3174,14 @@ pub fn books_choice(query: &str) -> BooksTab {
         .unwrap_or(BooksTab::Books)
 }
 
+/// A Books library's book grid: by name, without the books no client can
+/// open until the viewer asks for them (B1420).
+fn books_listing(library: ItemRef) -> Listing {
+    let mut listing = Listing::of(library, None, "SortName");
+    listing.unreadable = Unreadable::Hide;
+    listing
+}
+
 /// A Books library: its books' grid, unchanged, and once it has any
 /// courses, a Courses tab of their series tiles (B1424). The tab is kept in
 /// the URL, so Back returns to it.
@@ -3184,7 +3192,7 @@ pub fn BooksLibraryView(title: String, library: ItemRef, books: Page, courses: P
             GridView {
                 title,
                 page: books,
-                more: Some(Listing::of(library, None, "SortName")),
+                more: Some(books_listing(library)),
                 library: true,
                 sets: false,
             }
@@ -3258,7 +3266,7 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
                     rsx! {
                         LibraryGrid {
                             first: books.clone(),
-                            base: Listing::of(library, None, "SortName"),
+                            base: books_listing(library),
                             sets: false,
                         }
                     },
@@ -4312,6 +4320,8 @@ mod tests {
         refuse_groups: Vec<ItemKind>,
         /// Whether each listing asked for box sets folded (B1086).
         collapsed: RefCell<Vec<bool>>,
+        /// Each listing's choice about books no client can open (B1420).
+        unreadable: RefCell<Vec<Unreadable>>,
     }
 
     fn refused() -> ClientError {
@@ -4339,6 +4349,7 @@ mod tests {
         ) -> Result<Page, ClientError> {
             let (parent, group) = (listing.parent, listing.group);
             self.collapsed.borrow_mut().push(listing.collapse);
+            self.unreadable.borrow_mut().push(listing.unreadable);
             self.asked
                 .borrow_mut()
                 .push((parent, group, listing.sort_by.clone()));
@@ -6022,15 +6033,24 @@ mod tests {
             library.library_kind = Some(kind);
             fake.details.insert(id, detail(library));
         }
-        let hides =
-            |n| match run(load(&fake, &CallInfo::default(), ItemRef::Real(n), |_| {})).unwrap() {
-                Browse::Grid {
-                    more: Some(more), ..
-                } => more.unreadable,
-                other => panic!("not a grid: {other:?}"),
-            };
-        assert_eq!(hides(8), Unreadable::Hide);
-        assert_eq!(hides(9), Unreadable::Show);
+        match run(load(&fake, &CallInfo::default(), ItemRef::Real(9), |_| {})).unwrap() {
+            Browse::Grid {
+                more: Some(more), ..
+            } => assert_eq!(more.unreadable, Unreadable::Show),
+            other => panic!("not a grid: {other:?}"),
+        }
+        fake.unreadable.borrow_mut().clear();
+        let books = run(load(&fake, &CallInfo::default(), ItemRef::Real(8), |_| {})).unwrap();
+        assert!(matches!(books, Browse::Books { .. }), "{books:?}");
+        // The book grid's first page hides them; the course listing is not
+        // a book listing and is left alone.
+        assert_eq!(
+            fake.unreadable.borrow().first(),
+            Some(&Unreadable::Hide),
+            "{:?}",
+            fake.unreadable.borrow()
+        );
+        assert_eq!(books_listing(ItemRef::Real(8)).unreadable, Unreadable::Hide);
     }
 
     #[test]
