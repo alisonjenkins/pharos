@@ -11,6 +11,7 @@
 mod art;
 mod compat;
 mod focus;
+mod debug;
 mod network;
 mod voice;
 pub mod content;
@@ -710,6 +711,9 @@ fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()>
             log(&format!("play id={id} verdict=cache-hit prefetch_queued={ahead}"));
             return play(env, item, &path.to_string_lossy(), queue, gen);
         }
+        if content::server_unreachable() {
+            return Err(format!("node {id}: not cached and the server is unreachable (debug offline)"));
+        }
         let node = lib.node(id).map_err(|e| format!("node {id}: {e}"))?;
         let url = node.stream_url.clone().ok_or_else(|| format!("node {id} has no stream"))?;
         let ahead = lib.prefetch_from(id);
@@ -1012,6 +1016,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         if let Err(e) = network::watch(env, &this) {
             log(&format!("onCreate: network callback unavailable: {e}"));
         }
+        if let Err(e) = debug::register(env, &this) {
+            log(&format!("onCreate: debug receiver unavailable: {e}"));
+        }
         Ok(())
     })
 }
@@ -1025,6 +1032,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         let Some(st) = state_lock()?.take() else { return Ok(()) };
         focus::destroy(env)?;
         network::unwatch(env)?;
+        debug::unregister(env)?;
         if let Some(p) = st.player {
             env.call_method(p.as_obj(), "release", "()V", &[]).map_err(jerr("player.release"))?;
         }

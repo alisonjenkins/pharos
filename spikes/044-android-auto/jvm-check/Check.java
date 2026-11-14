@@ -73,6 +73,15 @@ public class Check {
     expect(cm != null && cm.callback != null && cm.callback.getClass().getSimpleName().equals("PharosNetworkCallback"),
         "service registers a default-network callback");
     if (cm != null && cm.callback != null) { cm.callback.onLost(new android.net.Network()); cm.callback.onAvailable(new android.net.Network()); }
+    android.content.BroadcastReceiver dbg = android.content.Context.receiver;
+    expect(dbg != null && dbg.getClass().getSimpleName().equals("PharosDebugReceiver")
+        && android.content.Context.filter.action.equals("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE")
+        && android.content.Context.receiverFlags == 2, "service registers the exported debug receiver");
+    if (dbg != null) {
+      dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", true));
+      dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", false));
+      dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE"));
+    }
     expect(s.superCreated, "onCreate ran the framework's onCreate first");
     expect(s.token != null, "Rust set the session token");
     MediaBrowserService.BrowserRoot root = s.onGetRoot("com.google.android.projection.gearhead", 10123, null);
@@ -192,6 +201,7 @@ public class Check {
     cb.onStop();
     s.onDestroy();
     expect(cm != null && cm.callback == null && cm.unregisters == 1, "onDestroy unregisters the network callback");
+    expect(android.content.Context.receiverUnregistered, "onDestroy unregisters the debug receiver");
     System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILED");
     System.exit(failures == 0 ? 0 : 1);
   }
