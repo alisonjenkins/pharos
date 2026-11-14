@@ -41,17 +41,6 @@ impl<'a> Emission<'a> {
         self.classes
     }
 
-    /// Frames `lo..hi`, clamped to the emission.
-    pub fn frames_between(&self, lo: usize, hi: usize) -> Emission<'a> {
-        let hi = hi.min(self.frames);
-        let lo = lo.min(hi);
-        Emission {
-            data: &self.data[lo * self.classes..hi * self.classes],
-            frames: hi - lo,
-            classes: self.classes,
-        }
-    }
-
     pub(crate) fn at(&self, t: usize, c: u32) -> f32 {
         self.data[t * self.classes + c as usize]
     }
@@ -260,15 +249,6 @@ mod tests {
                 repeats: 1
             }
         ));
-    }
-
-    #[test]
-    fn a_band_of_frames_keeps_its_rows() {
-        let e = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        let em = Emission::new(&e, 3, 2).unwrap();
-        let band = em.frames_between(1, 9);
-        assert_eq!((band.frames(), band.at(0, 1), band.at(1, 0)), (2, 3.0, 4.0));
-        assert_eq!(em.frames_between(5, 2).frames(), 0);
     }
 
     #[test]
