@@ -767,8 +767,8 @@ pub fn buffered_to_ms(id: &str) -> u64 {
     media(id).map_or(0, |(m, _)| m.buffered_to_ms())
 }
 
-pub fn element_width(_id: &str) -> f64 {
-    0.0
+pub fn element_width(id: &str) -> f64 {
+    lock(&WIDTHS).get(id).copied().unwrap_or(0.0)
 }
 
 pub fn element_size(_id: &str) -> (f64, f64) {
@@ -2102,6 +2102,9 @@ static PATHS: LazyLock<Mutex<Paths>> = LazyLock::new(|| Mutex::new(Paths::new())
 /// The CSS viewport; a TV's WebView is 960 x 540 (spike 0) until the
 /// bridge says otherwise.
 static VIEWPORT: Mutex<(f64, f64)> = Mutex::new((960.0, 540.0));
+/// The width of each element that carries `tv_page::MEASURE_ATTR`, as the
+/// page last reported it.
+static WIDTHS: LazyLock<Mutex<HashMap<String, f64>>> = LazyLock::new(Mutex::default);
 static SESSION: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
 /// A registered listener, called outside the registry's lock.
 type SharedListener = Arc<Mutex<Owned<Listener>>>;
@@ -2455,6 +2458,7 @@ const gridPlace = () => {
 addEventListener("scroll", gridPlace, { passive: true });
 addEventListener("focusin", gridPlace);
 __GRID_VIEW__
+__MEASURE__
 // Back closes an open dialog or menu before it goes back a page (FR-607),
 // with the Escape each of them already closes on. One that is still open
 // at the next Back, with no key pressed between, does not close on Escape:
@@ -2731,6 +2735,9 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Width { id, w } => {
+            lock(&WIDTHS).insert(id, w);
+        }
         Bridge::Place { path, tile, top } => {
             if path != current_path() {
                 return;
