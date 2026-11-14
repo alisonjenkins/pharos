@@ -311,7 +311,7 @@ fn metaphone(word: &str) -> String {
                 }
             }
             'v' => Some("F"),
-            'w' | 'y' => is_vowel(next).then(|| if c == 'w' { "W" } else { "Y" }),
+            'w' | 'y' => is_vowel(next).then_some(if c == 'w' { "W" } else { "Y" }),
             'x' => Some("KS"),
             'z' => Some("S"),
             'f' => Some("F"),
