@@ -5,6 +5,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod decode;
+pub mod engine;
 #[cfg(test)]
 mod fixture;
 pub mod frame;
