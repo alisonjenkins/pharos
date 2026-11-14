@@ -319,3 +319,23 @@ fn the_album_offers_a_way_back_to_the_player() {
     let commands = runner.action(ActionId::BACK);
     assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("First Album"));
 }
+
+#[test]
+fn a_later_block_of_tracks_failing_leaves_the_player_alone() {
+    let (mut runner, commands) = started(Some(&account()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
+    let commands = runner.task_outcome(
+        first,
+        ok(r#"{"Items":[{"Id":"t0","Name":"Track 0"}],"TotalRecordCount":2}"#),
+    );
+    let (rest, _) = asked(&commands, "StartIndex=1&").expect("the rest");
+    let _ = runner.action(action_id("row-0"));
+    let commands = runner.task_outcome(rest, TaskOutcome::Failed(TaskError::Offline));
+    assert!(
+        last_screen(&commands).is_none_or(|screen| !screen_text(&screen).contains("offline")),
+        "the player stays up"
+    );
+}
