@@ -22,6 +22,9 @@ use crate::metadata::{
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
     // Media — handed to the prober.
     "mkv", "mp4", "mov", "avi", "webm", "m4v", "flac", "mp3", "opus", "m4a", "ogg", "wav",
+    // 046-audiobooks — an audiobook container, read as a book under a Books
+    // root and as a song anywhere else.
+    "m4b",
     // 004-books — books, which must be WALKED but never probed. `probe_one`
     // branches on `book::is_book_path` before touching the prober: an epub is
     // not a media container, ffprobe/libav fails on it, and V6 makes a probe
@@ -522,6 +525,30 @@ impl<P: Prober> FsScanner<P> {
             metrics::counter!("pharos_scan_match_reset_total", "reason" => reason).increment(1);
         }
         Ok(())
+    }
+
+    /// What the audio file `path` is under this scanner's Books roots
+    /// (ADR-0132); `None` outside them. The book folder is listed off the
+    /// reactor (V5).
+    async fn audiobook(
+        &self,
+        path: &Path,
+        probe: &pharos_core::MediaProbe,
+    ) -> Option<crate::audiobook::Classified> {
+        self.course_roots.root_of(path)?;
+        let (path, probe, roots) = (path.to_path_buf(), probe.clone(), self.course_roots.clone());
+        let shown = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::audiobook::classify(&path, &probe, &roots, crate::audiobook::folder_tracks)
+        })
+        .await
+        {
+            Ok(got) => got,
+            Err(e) => {
+                tracing::warn!(path = %shown.display(), error = %e, "audiobook: the classify task failed; stored as a song");
+                None
+            }
+        }
     }
 
     /// The lesson `path` is, under this scanner's Books roots.
@@ -2037,6 +2064,27 @@ impl<P: Prober> FsScanner<P> {
                         probe.size_bytes = Some(meta.len());
                     }
                 }
+                // ADR-0132 — audio under a Books root is an audiobook, or
+                // left out when it is a loose file without chapters.
+                let book = match info.kind {
+                    MediaKind::Audio => self.audiobook(&path, &probe).await,
+                    _ => None,
+                };
+                if let Some(got) = &book {
+                    crate::audiobook::record(&path, &probe, got);
+                }
+                let book = match book {
+                    Some(got) if got.verdict == crate::audiobook::Verdict::Skipped => return None,
+                    Some(got) => got.book,
+                    None => None,
+                };
+                let title = match &book {
+                    Some(book) => {
+                        book.apply(&mut probe);
+                        book.track_title.clone()
+                    }
+                    None => title,
+                };
                 // ADR-0126 — a video under a Books root is a course lesson,
                 // whatever its name looks like.
                 let lesson = matches!(info.kind, MediaKind::Movie)
@@ -6763,6 +6811,8 @@ mod tests {
         rewrite_during: Option<(String, Vec<u8>)>,
         // Every probe reports this duration.
         duration_ms: Option<u64>,
+        // Every probe of a path holding the needle carries these chapters.
+        chapters_for: Option<(String, Vec<pharos_core::MediaChapter>)>,
     }
 
     impl Prober for FakeProber {
@@ -6787,9 +6837,15 @@ mod tests {
                 }
             }
             let kind = match path.extension().and_then(|s| s.to_str()) {
-                Some("flac") | Some("mp3") | Some("opus") | Some("m4a") | Some("ogg")
-                | Some("wav") => MediaKind::Audio,
+                Some("flac") | Some("mp3") | Some("opus") | Some("m4a") | Some("m4b")
+                | Some("ogg") | Some("wav") => MediaKind::Audio,
                 _ => MediaKind::Movie,
+            };
+            let chapters = match &self.chapters_for {
+                Some((needle, chapters)) if path.to_string_lossy().contains(needle.as_str()) => {
+                    chapters.clone()
+                }
+                _ => Vec::new(),
             };
             Ok(ProbeInfo {
                 kind,
@@ -6802,6 +6858,7 @@ mod tests {
                     },
                     synopsis: self.synopsis.clone(),
                     duration_ms: self.duration_ms,
+                    chapters,
                     ..Default::default()
                 },
             })
@@ -12413,6 +12470,112 @@ mod tests {
             .unwrap();
         let item = store.get(stable_id(&td.path().join(f))).await.unwrap();
         assert_eq!(item.kind, MediaKind::Movie);
+    }
+
+    /// ADR-0132 — under a Books root, a single file with chapters and a
+    /// folder of tracks are stored as audiobooks (a folder's tracks numbered
+    /// in natural order), a loose file without chapters is left out, and
+    /// each decision is counted with its reason.
+    #[tokio::test]
+    async fn audio_under_a_books_root_is_stored_as_audiobooks() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        for f in [
+            "Ada Field/Gadget Tales.m4b",
+            "Ada Field/Widget Days/10 Ending.mp3",
+            "Ada Field/Widget Days/2 Middle.mp3",
+            "Ada Field/Widget Days/1 Opening.mp3",
+            "Sprocket Notes.m4a",
+            "Stray Hum.mp3",
+        ] {
+            touch(&books, f).await;
+        }
+        touch(td.path(), "Music/Band/Album/1 Song.mp3").await;
+        let chapters = vec![pharos_core::MediaChapter {
+            start_ms: 0,
+            end_ms: 1000,
+            title: "One".into(),
+        }];
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber {
+            chapters_for: Some(("Sprocket".into(), chapters)),
+            ..FakeProber::default()
+        })
+        .with_course_roots(crate::course::CourseRoots::new([
+            (books.clone(), true),
+            (td.path().join("Music"), false),
+        ]));
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let get = |f: &str| {
+            let id = stable_id(&books.join(f));
+            let store = &store;
+            async move { store.get(id).await.ok() }
+        };
+        let m4b = get("Ada Field/Gadget Tales.m4b")
+            .await
+            .expect("the m4b is stored");
+        assert_eq!(m4b.kind, MediaKind::Audio);
+        assert_eq!(m4b.probe.album.as_deref(), Some("Gadget Tales"));
+        assert_eq!(m4b.probe.album_artist.as_deref(), Some("Ada Field"));
+        for (f, n, title) in [
+            ("Ada Field/Widget Days/1 Opening.mp3", 1, "Opening"),
+            ("Ada Field/Widget Days/2 Middle.mp3", 2, "Middle"),
+            ("Ada Field/Widget Days/10 Ending.mp3", 3, "Ending"),
+        ] {
+            let t = get(f).await.expect(f);
+            assert_eq!(t.probe.album.as_deref(), Some("Widget Days"), "{f}");
+            assert_eq!(t.probe.track_number, Some(n), "{f}");
+            assert_eq!(t.title, title, "{f}");
+        }
+        let single = get("Sprocket Notes.m4a")
+            .await
+            .expect("chapters make a book");
+        assert_eq!(single.probe.album.as_deref(), Some("Sprocket Notes"));
+        assert!(
+            get("Stray Hum.mp3").await.is_none(),
+            "a loose file is left out"
+        );
+        let song = store
+            .get(stable_id(&td.path().join("Music/Band/Album/1 Song.mp3")))
+            .await
+            .unwrap();
+        assert_eq!(
+            song.probe.album, None,
+            "a music library's song is untouched"
+        );
+
+        let count = |verdict: &str, reason: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(ck, _, _, v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(n)
+                        if ck.key().name() == "pharos_scan_audiobook_total"
+                            && ck
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "verdict" && l.value() == verdict)
+                            && ck
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "reason" && l.value() == reason) =>
+                    {
+                        Some(n)
+                    }
+                    _ => None,
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(count("single_file", "m4b"), 1);
+        assert_eq!(count("single_file", "chapters"), 1);
+        assert_eq!(count("folder_track", "in_folder"), 3);
+        assert_eq!(count("skipped", "loose_without_chapters"), 1);
     }
 
     #[test]
