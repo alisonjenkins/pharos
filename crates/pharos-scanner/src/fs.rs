@@ -5259,7 +5259,7 @@ static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::La
 /// stays off the shelves until it is sorted.
 pub const IGNORE_MARKER: &str = ".ignore";
 
-fn is_ignored_dir(dir: &Path) -> bool {
+pub(crate) fn is_ignored_dir(dir: &Path) -> bool {
     dir.join(IGNORE_MARKER).is_file()
 }
 
