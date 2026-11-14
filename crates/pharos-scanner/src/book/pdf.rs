@@ -45,6 +45,9 @@ pub struct PdfMetadata {
     pub description: Option<String>,
     /// `/CreationDate`, verbatim (`D:19650801000000Z` and friends).
     pub date: Option<String>,
+    /// `/Keywords`, verbatim. Only a list of short entries counts as subjects
+    /// (`book::shelf::pdf_keyword_list`, spec 043 FR-003).
+    pub keywords: Option<String>,
 }
 
 impl PdfMetadata {
@@ -101,6 +104,7 @@ pub fn read_pdf(path: &Path) -> Result<PdfMetadata, PdfError> {
         out.producer = text_field(&doc, info, b"Producer");
         out.description = text_field(&doc, info, b"Subject");
         out.date = text_field(&doc, info, b"CreationDate");
+        out.keywords = text_field(&doc, info, b"Keywords");
     }
     Ok(out)
 }
@@ -391,6 +395,7 @@ mod tests {
                 "Producer" => Object::string_literal("Basic Books"),
                 "Subject" => Object::string_literal("An Eternal Golden Braid."),
                 "CreationDate" => Object::string_literal("D:19790101000000Z"),
+                "Keywords" => Object::string_literal("Logic; Mathematics, Music"),
             });
             doc.trailer.set("Info", info_id);
         }
@@ -418,6 +423,7 @@ mod tests {
             meta.description.as_deref(),
             Some("An Eternal Golden Braid.")
         );
+        assert_eq!(meta.keywords.as_deref(), Some("Logic; Mathematics, Music"));
         assert_eq!(meta.date.as_deref(), Some("D:19790101000000Z"));
 
         let bm = meta.to_book_meta();
