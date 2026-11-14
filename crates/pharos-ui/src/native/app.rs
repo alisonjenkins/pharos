@@ -6588,6 +6588,22 @@ fn Player(
         }
     };
 
+    // The host reported it is on `to` already: follow it without asking it to
+    // skip, which would move it a song further.
+    let host_moved = move |to: ItemRef| {
+        if queued && to == playing_id {
+            let mut queue = queue;
+            queue.write().started(to, None, seed());
+            platform::info(&format!("pharos: queue replay item={to} host_moved=true"));
+        } else {
+            if queued {
+                let mut stage = stage;
+                stage.write().hand_off(playing_id, 0);
+            }
+            replace.0.call(Route::Watch(to));
+        }
+    };
+
     let lyrics = use_resource({
         let (id, kind) = (p.detail.item.id, p.kind);
         move || {
@@ -7717,7 +7733,7 @@ fn Player(
                                     platform::info(&format!(
                                         "pharos: host moved item={playing_id} to={to}"
                                     ));
-                                    go(to);
+                                    host_moved(to);
                                 }
                                 Step::Failed(reason) => {
                                     platform::info(&format!(
