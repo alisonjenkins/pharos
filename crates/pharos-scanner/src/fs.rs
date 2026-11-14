@@ -562,7 +562,13 @@ impl<P: Prober> FsScanner<P> {
     /// removed or renamed beside it renumbers it without touching its
     /// bytes (ADR-0132). Read from the stored probe, so only the folder
     /// is listed; a row or folder that cannot be read is left as it is.
-    async fn book_drift<S: MediaStore>(&self, store: &S, row: MediaId, primary: &Path) -> bool {
+    async fn book_drift<S: MediaStore>(
+        &self,
+        store: &S,
+        row: MediaId,
+        primary: &Path,
+        inventories: &Arc<crate::audiobook::BookInventories>,
+    ) -> bool {
         if !crate::audiobook::is_book_container(primary)
             || self.course_roots.root_of(primary).is_none()
         {
@@ -581,8 +587,11 @@ impl<P: Prober> FsScanner<P> {
             stored.probe.clone(),
             self.course_roots.clone(),
         );
+        let inventories = Arc::clone(inventories);
         let got = tokio::task::spawn_blocking(move || {
-            crate::audiobook::classify(&path, &probe, &roots, crate::audiobook::folder_tracks)
+            crate::audiobook::classify(&path, &probe, &roots, |folder| {
+                inventories.tracks(folder, crate::audiobook::folder_tracks)
+            })
         })
         .await;
         let now = match got {
@@ -869,6 +878,8 @@ impl<P: Prober> FsScanner<P> {
         store: &S,
     ) -> DomainResult<ScanOutcome> {
         let scan_id = store.begin_scan(root).await?;
+        // Book folders listed once per scan, dropped with it.
+        let inventories = Arc::new(crate::audiobook::BookInventories::default());
         let WalkOutcome {
             files: paths,
             errors: walk_errors,
@@ -1096,7 +1107,9 @@ impl<P: Prober> FsScanner<P> {
                                 )
                                 .await
                                     && !nfo_drift(&nfos, row, &primary, state.last_scanned)
-                                    && !self.book_drift(store, row, &primary).await =>
+                                    && !self
+                                        .book_drift(store, row, &primary, &inventories)
+                                        .await =>
                                 {
                                     seen_batch.push((row, mtime, size));
                                     seen += 1;
