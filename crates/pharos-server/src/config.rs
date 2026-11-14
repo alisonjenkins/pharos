@@ -373,9 +373,9 @@ impl MusicBrainzConfig {
 /// `[books]` — where books' subjects come from beyond their own files.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct BooksConfig {
-    /// Look a book with no usable subjects up on Open Library (ADR-0129).
-    /// Off by default: each lookup sends the book's title, author and ISBN
-    /// to that service. Env: `PHAROS_BOOKS_ONLINE`.
+    /// Look a book with no usable subjects, or no description, up on Open
+    /// Library (ADR-0129, ADR-0135). Off by default: each lookup sends the
+    /// book's title, author and ISBN to that service. Env: `PHAROS_BOOKS_ONLINE`.
     #[serde(default)]
     pub online_subjects: bool,
 }
