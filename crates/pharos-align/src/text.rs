@@ -15,7 +15,7 @@ pub struct Word {
 
 /// Python's `\s` for str patterns: `str.isspace`, which is Rust's White_Space
 /// plus the four ASCII information separators U+001C..U+001F.
-fn is_py_space(c: char) -> bool {
+pub(crate) fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
