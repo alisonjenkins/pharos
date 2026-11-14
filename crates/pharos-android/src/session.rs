@@ -172,26 +172,23 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
     if method == "stop" {
         supersede();
     }
-    let guard = state_lock()?;
-    let st = guard.as_ref().ok_or("transport before onCreate")?;
+    let mut guard = state_lock()?;
+    let st = guard.as_mut().ok_or("transport before onCreate")?;
     let session = st.session.clone();
     let Some(player) = st.player.clone() else {
         log(&format!("{method}: nothing loaded, ignored"));
         return Ok(());
     };
-    if !st.prepared {
-        if method != "stop" {
-            log(&format!("{method}: player still preparing, ignored"));
-            return Ok(());
-        }
+    if method == "stop" {
+        let prepared = st.prepared;
+        st.player = None;
+        st.prepared = false;
         drop(guard);
-        if let Some(st) = state_lock()?.as_mut() {
-            st.player = None;
-        }
-        env.call_method(player.as_obj(), "release", "()V", &[])
-            .map_err(jerr("release"))?;
-        log("stop: released a player still preparing");
-        return set_playback_state(env, session.as_obj(), state, 0);
+        return stop_player(env, &session, &player, prepared);
+    }
+    if !st.prepared {
+        log(&format!("{method}: player still preparing, ignored"));
+        return Ok(());
     }
     drop(guard);
     if method == "start" && !focus::request(env)? {
@@ -200,9 +197,6 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
     }
     env.call_method(player.as_obj(), method, "()V", &[])
         .map_err(jerr(method))?;
-    if method == "stop" {
-        focus::abandon(env)?;
-    }
     let pos = env
         .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
         .and_then(|v| v.i())
@@ -210,10 +204,39 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
     if method != "start" {
         resume::note(i64::from(pos), method)?;
     }
-    if method == "stop" {
-        resume::drop_current(false)?;
-    }
     set_playback_state(env, session.as_obj(), state, i64::from(pos))
+}
+
+/// Stops and releases `player`, already taken out of the state, so a later
+/// play creates a fresh one. Its position is saved first when it was
+/// prepared.
+fn stop_player(env: &mut JNIEnv, session: &GlobalRef, player: &GlobalRef, prepared: bool) -> R<()> {
+    let saved = (|| -> R<i32> {
+        if !prepared {
+            return Ok(0);
+        }
+        env.call_method(player.as_obj(), "stop", "()V", &[])
+            .map_err(jerr("stop"))?;
+        let pos = env
+            .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
+            .and_then(|v| v.i())
+            .map_err(jerr("getCurrentPosition"))?;
+        resume::note(i64::from(pos), "stop")?;
+        Ok(pos)
+    })();
+    if saved.is_err() {
+        // A pending Java exception would fail the release below.
+        let _ = take_exception(env);
+    }
+    resume::drop_current(false)?;
+    let released = env
+        .call_method(player.as_obj(), "release", "()V", &[])
+        .map_err(jerr("release"));
+    focus::abandon(env)?;
+    let pos = saved?;
+    released?;
+    log(&format!("stop: released the player, prepared={prepared}"));
+    set_playback_state(env, session.as_obj(), STATE_STOPPED, i64::from(pos))
 }
 
 /// Moves `step` through the queue; past either end it wraps when `wrap`,
