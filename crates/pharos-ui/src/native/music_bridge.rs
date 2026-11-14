@@ -188,11 +188,12 @@ impl Music {
         if current_of(&self.snapshot()) == Some(playing) {
             return false;
         }
-        self.play_from(playing, upcoming);
+        self.restart(playing, upcoming);
         true
     }
 
-    fn play_from(&self, playing: ItemRef, upcoming: &[ItemRef]) {
+    /// Play `playing` and what follows it from the start.
+    pub fn restart(&self, playing: ItemRef, upcoming: &[ItemRef]) {
         let ids: Vec<String> = std::iter::once(playing)
             .chain(after(playing, upcoming))
             .map(|id| id.to_string())
@@ -204,7 +205,7 @@ impl Music {
     /// Give the host the queue the player now has, keeping the playhead.
     pub fn resync(&self, playing: ItemRef, upcoming: &[ItemRef]) {
         let at = self.snapshot().position_ms;
-        self.play_from(playing, upcoming);
+        self.restart(playing, upcoming);
         if at > RESYNC_KEEPS_POSITION_AFTER_MS {
             self.port.seek(at);
         }
@@ -214,7 +215,7 @@ impl Music {
         match self.snapshot().state {
             PlayState::Playing | PlayState::Buffering => self.port.pause(),
             PlayState::Paused => self.port.resume(),
-            PlayState::Idle | PlayState::Ended => self.play_from(playing, upcoming),
+            PlayState::Idle | PlayState::Ended => self.restart(playing, upcoming),
         }
     }
 
@@ -589,6 +590,23 @@ mod tests {
             follow(&fake, &mut f, 1).is_empty(),
             "told once; this song has nothing more to follow"
         );
+    }
+
+    /// The host advances on its own; the player that takes over the stage
+    /// finds it already on its song and neither restarts nor resyncs it.
+    #[test]
+    fn a_song_the_host_moved_to_is_taken_over_without_a_restart() {
+        let (fake, first) = music();
+        let mut f = Follow::default();
+        first.begin(id(1), &ids(&[2, 3]));
+        follow(&fake, &mut f, 1);
+        fake.seek(20_000);
+        fake.next();
+        assert_eq!(follow(&fake, &mut f, 1), vec![Step::Moved(id(2))]);
+        let second = Music::new(fake.clone());
+        assert!(!second.begin(id(2), &ids(&[3])));
+        assert!(!needs_resync(&fake.snapshot(), id(2), &ids(&[3])));
+        assert_eq!(fake.snapshot().queue, vec!["1", "2", "3"]);
     }
 
     #[test]
