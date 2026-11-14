@@ -17,7 +17,7 @@ struct Watch {
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
 /// Registers the default-network callback. The platform calls `onAvailable`
-/// at once when a network is up.
+/// at once when a network is up; until then the library is offline.
 pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     let mut guard = WATCH
         .lock()
@@ -48,13 +48,18 @@ pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
             &[],
         )
         .map_err(jerr("PharosNetworkCallback"))?;
-    env.call_method(
+    // With no default network the platform calls nothing, and the library
+    // starts online: assume offline until `onAvailable` says otherwise.
+    set_online(false);
+    if let Err(e) = env.call_method(
         &manager,
         "registerDefaultNetworkCallback",
         "(Landroid/net/ConnectivityManager$NetworkCallback;)V",
         &[JValue::Object(&callback)],
-    )
-    .map_err(jerr("registerDefaultNetworkCallback"))?;
+    ) {
+        set_online(true);
+        return Err(jerr("registerDefaultNetworkCallback")(e));
+    }
     *guard = Some(Watch {
         manager: env
             .new_global_ref(&manager)
