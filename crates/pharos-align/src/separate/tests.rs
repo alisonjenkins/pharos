@@ -171,14 +171,11 @@ fn outcome_labels_are_distinct() {
     assert_eq!(l.len(), Outcome::ALL.len());
 }
 
-fn gpu() -> Choice {
-    Choice {
-        device: Device::Vulkan(Adapter {
-            name: "Test GPU".into(),
-            kind: AdapterKind::Discrete,
-            ordinal: 0,
-        }),
-        reason: "adapter_found".into(),
+fn gpu() -> Adapter {
+    Adapter {
+        name: "Test GPU".into(),
+        kind: AdapterKind::Discrete,
+        ordinal: 0,
     }
 }
 
@@ -212,34 +209,10 @@ fn counted(f: impl FnOnce()) -> Vec<(String, Option<u64>, bool)> {
 }
 
 #[test]
-fn without_a_gpu_the_recogniser_hears_the_mix() {
-    let mix = song(1_000, 2);
-    let choice = Choice {
-        device: Device::Cpu,
-        reason: "no_adapter".into(),
-    };
-    let mut got = None;
-    let seen = counted(|| {
-        got = Some(vocals_or_mix(mix.clone(), &choice, |_, _| {
-            panic!("separated without a GPU")
-        }));
-    });
-    let (audio, s) = got.unwrap();
-    assert_eq!(audio, Some(mix));
-    assert_eq!(
-        (s.outcome, s.reason.as_str()),
-        (Outcome::NoGpu, "no_adapter")
-    );
-    assert_eq!(seen[1], ("no_gpu".into(), Some(1), false));
-    assert_eq!(seen[0].1, None);
-    assert_eq!(seen[2].1, None);
-}
-
-#[test]
 fn on_a_gpu_the_recogniser_hears_the_vocals() {
     let mut got = None;
     let seen = counted(|| {
-        got = Some(vocals_or_mix(song(1_000, 2), &gpu(), |a, _| {
+        got = Some(separate_on(&gpu(), &song(1_000, 2), |a, _| {
             assert_eq!(a.name, "Test GPU");
             Ok([vec![1.0], vec![2.0]])
         }));
@@ -254,7 +227,7 @@ fn on_a_gpu_the_recogniser_hears_the_vocals() {
 fn a_failed_separation_hears_nothing_and_says_why() {
     let mut got = None;
     let seen = counted(|| {
-        got = Some(vocals_or_mix(song(1_000, 2), &gpu(), |_, _| {
+        got = Some(separate_on(&gpu(), &song(1_000, 2), |_, _| {
             Err(SeparateError::Network {
                 offset: 0,
                 message: "out of memory".into(),
@@ -265,7 +238,7 @@ fn a_failed_separation_hears_nothing_and_says_why() {
     assert_eq!(audio, None);
     assert_eq!(s.outcome, Outcome::Failed);
     assert!(s.reason.contains("out of memory"), "{}", s.reason);
-    assert_eq!(seen[2], ("failed".into(), Some(1), true));
+    assert_eq!(seen[1], ("failed".into(), Some(1), true));
 }
 
 #[test]
