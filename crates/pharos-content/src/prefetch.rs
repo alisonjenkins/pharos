@@ -101,6 +101,9 @@ struct Gate {
     /// Bumped each time the network comes back, so backoff restarts at once.
     online_epoch: AtomicU64,
     closed: AtomicBool,
+    /// Test signal: pins that yielded to playback.
+    #[cfg(test)]
+    yields: AtomicU64,
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
@@ -151,6 +154,8 @@ impl Downloader {
             online: AtomicBool::new(true),
             online_epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            yields: AtomicU64::new(0),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -275,6 +280,12 @@ impl Downloader {
     #[cfg(test)]
     pub fn is_online(&self) -> bool {
         self.gate.online.load(Ordering::SeqCst)
+    }
+
+    /// How many times a pin has yielded to playback.
+    #[cfg(test)]
+    pub fn yields(&self) -> u64 {
+        self.gate.yields.load(Ordering::SeqCst)
     }
 
     /// Jobs queued or running.
@@ -422,6 +433,8 @@ impl Gate {
             q.pinned.push_back(id.to_owned());
         }
         q.deferred.insert(id.to_owned(), st.clone());
+        #[cfg(test)]
+        self.yields.fetch_add(1, Ordering::SeqCst);
         true
     }
 
@@ -1112,31 +1125,55 @@ mod tests {
             1 << 20,
             &["t"],
             Tuning {
-                backoff_min: Duration::from_millis(300),
-                backoff_max: Duration::from_millis(300),
+                // Long enough that the ordinary retry cannot fire in the
+                // test: only playback's wake can end the pin's backoff.
+                backoff_min: Duration::from_secs(30),
+                backoff_max: Duration::from_secs(30),
                 ..fast()
             },
         );
+        let wait = |what: &str, mut ok: Box<dyn FnMut() -> bool>| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         r.cache.pin("album/1", &ids(&["track/1"]));
         r.dl.enqueue(&ids(&["track/1"]));
-        // The first body drops after 300 bytes; playback asks while the pin backs off.
-        let until = Instant::now() + Duration::from_secs(5);
-        while r.srv.seen().is_empty() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The first body drops after 300 bytes and the pin backs off with a
+        // partial file on disk.
+        let part = r.cache.part_path("track/1");
+        wait(
+            "the partial file",
+            Box::new(move || std::fs::metadata(&part).is_ok_and(|m| m.len() == 300)),
+        );
+        // Playback asks: the pin must yield (its state is parked) before track/2 runs.
         r.dl.prefetch(&ids(&["track/2"]));
+        let dl = &r.dl;
+        wait("the pin to yield", Box::new(|| dl.yields() == 1));
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/2"));
         assert!(r.cache.is_complete("track/1"));
-        let resumed: Vec<_> = r
-            .srv
-            .seen()
-            .into_iter()
-            .filter(|s| s.path == "/audio/1" && s.range.is_some())
-            .collect();
-        assert!(!resumed.is_empty(), "the pin resumed with a range");
+        let seen = r.srv.seen();
+        let at = |path: &str, n: usize| {
+            seen.iter()
+                .enumerate()
+                .filter(|(_, s)| s.path == path)
+                .nth(n)
+                .map(|(i, _)| i)
+        };
+        let (two, resumed) = (at("/audio/2", 0).unwrap(), at("/audio/1", 1).unwrap());
         assert!(
-            resumed.iter().all(|s| s.if_range.is_some()),
-            "a resumed range carries If-Range so a changed file restarts: {resumed:?}"
+            two < resumed,
+            "playback ran before the pin resumed: {seen:?}"
+        );
+        let second = seen.get(resumed).unwrap();
+        assert_eq!(second.range.as_deref(), Some("bytes=300-"));
+        assert_eq!(
+            second.if_range.as_deref(),
+            Some("\"v1\""),
+            "the resume carries the fixture ETag so a changed file restarts"
         );
     }
 
