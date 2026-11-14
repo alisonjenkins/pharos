@@ -237,6 +237,15 @@ impl Downloader {
         added
     }
 
+    /// Queue every pinned track still missing, in container order, after a
+    /// restart. Call once the online state is set: downloads wait for it.
+    pub fn resume_pins(&self) -> usize {
+        let missing = self.gate.cache.pending_pins();
+        let n = self.enqueue(&missing);
+        log::info!("cache resume pins missing={} queued={n}", missing.len());
+        n
+    }
+
     /// Pause (`false`) or resume (`true`) downloading, from the network
     /// callback. Resuming skips any backoff wait.
     pub fn set_online(&self, online: bool) {
@@ -960,6 +969,21 @@ mod tests {
         for id in &all {
             assert!(r.cache.is_complete(id), "{id}");
         }
+    }
+
+    #[test]
+    fn unfinished_pins_are_queued_again_in_container_order() {
+        let r = pin_rig("pin-resume", fast(), 3, 1000);
+        r.dl.set_online(false);
+        r.cache.pin("album/b", &ids(&["track/3"]));
+        r.cache.pin("album/a", &ids(&["track/1", "track/2"]));
+        assert_eq!(r.dl.resume_pins(), 3);
+        assert_eq!(r.dl.resume_pins(), 0, "already queued");
+        assert!(r.srv.seen().is_empty(), "nothing before the network is up");
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
     }
 
     #[test]

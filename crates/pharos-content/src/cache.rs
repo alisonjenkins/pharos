@@ -671,6 +671,19 @@ impl Cache {
         self.lock().pins.contains_key(container)
     }
 
+    /// Pinned tracks not yet on disk, in container order, each once.
+    pub fn pending_pins(&self) -> Vec<String> {
+        let s = self.lock();
+        let mut seen = HashSet::new();
+        s.pins
+            .values()
+            .flatten()
+            .filter(|id| !s.entries.get(*id).is_some_and(|e| e.complete))
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect()
+    }
+
     /// Every pinned container with its tracks' state, ordered by container id.
     pub fn downloads(&self) -> Vec<Download> {
         let pins: Vec<(String, Vec<DownloadTrack>)> = {
