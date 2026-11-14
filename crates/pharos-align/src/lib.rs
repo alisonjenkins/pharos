@@ -23,6 +23,8 @@ pub mod recognise;
 pub mod refine;
 pub mod separate;
 pub mod service;
+#[cfg(all(feature = "recognise", feature = "separate"))]
+pub mod stages;
 pub mod stitch;
 pub mod text;
 pub mod tokens;
