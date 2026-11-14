@@ -307,6 +307,10 @@ pub fn prepared(
 /// The player paused or stopped at `pos` ms.
 pub fn note(pos: i64, why: &str) -> R<()> {
     let guard = now()?;
+    note_held(&guard, pos, why)
+}
+
+fn note_held(guard: &Option<Now>, pos: i64, why: &str) -> R<()> {
     let Some(n) = guard.as_ref() else {
         return Ok(());
     };
@@ -316,25 +320,30 @@ pub fn note(pos: i64, why: &str) -> R<()> {
 }
 
 /// As [`note`], only while `player` is the one being tracked: a newer
-/// player's progress is not another's to record.
+/// player's progress is not another's to record. One guard spans the check
+/// and the record, so a new player cannot take over between them.
 pub fn note_for(env: &mut JNIEnv, player: &GlobalRef, pos: i64, why: &str) -> R<()> {
-    if !tracks(env, player)? {
+    let guard = now()?;
+    if !tracks(env, &guard, player)? {
         log(&format!("resume: {why} for a replaced player, not saved"));
         return Ok(());
     }
-    note(pos, why)
+    note_held(&guard, pos, why)
 }
 
-/// As [`drop_current`], only while `player` is the one being tracked.
+/// As [`drop_current`], only while `player` is the one being tracked, under
+/// one guard for the check and the take.
 pub fn drop_for(env: &mut JNIEnv, player: &GlobalRef) -> R<()> {
-    if !tracks(env, player)? {
+    let mut guard = now()?;
+    if !tracks(env, &guard, player)? {
         return Ok(());
     }
-    drop_current(false)
+    // Not finished: nothing to record, only forget the player.
+    guard.take();
+    Ok(())
 }
 
-fn tracks(env: &mut JNIEnv, player: &GlobalRef) -> R<bool> {
-    let guard = now()?;
+fn tracks(env: &mut JNIEnv, guard: &Option<Now>, player: &GlobalRef) -> R<bool> {
     let Some(n) = guard.as_ref() else {
         return Ok(false);
     };
