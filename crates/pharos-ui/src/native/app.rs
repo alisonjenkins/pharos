@@ -5227,6 +5227,9 @@ struct Playing {
     image: Option<String>,
     url: String,
     start_ms: u64,
+    /// Asked to play from the start (start over, or Previous): the host
+    /// restarts a song it is already on rather than leaving it.
+    from_start: bool,
     engine: Engine,
     /// The server's play session; a new one remounts the player.
     session: String,
@@ -5631,6 +5634,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         image: detail.item.image.clone(),
                         url: decision.stream_url,
                         start_ms,
+                        from_start: start_ms == 0 && from_start,
                         engine,
                         session: decision.play_session,
                         grant: RefCell::new(grant),
@@ -7045,22 +7049,35 @@ fn Player(
             spawn(fade(VIDEO_ID, 0.0, to, fade_in_ms, Rc::clone(&cancel)));
         }
     });
+    let restarted = use_hook(|| Rc::new(Cell::new(false)));
     use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
+        let restarted = Rc::clone(&restarted);
         move || {
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
             let (watch, assess) = (watch.clone(), Rc::clone(&assess));
             let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
             if let Some(music) = io.read().music().cloned() {
                 // The host plays it; there is no stream to attach.
-                if current && music.begin(playing_id, &host_upcoming(queue, playing_id, mounted_at))
-                {
-                    platform::info(&format!(
-                        "pharos: host play item={playing_id} queued={}",
-                        music.sent().len()
-                    ));
+                if current {
+                    let upcoming = host_upcoming(queue, playing_id, mounted_at);
+                    // Start over reaches the host once: `begin` leaves a host
+                    // that is already on the song where it is.
+                    let began = if p.from_start && !restarted.replace(true) {
+                        music.restart(playing_id, &upcoming);
+                        true
+                    } else {
+                        music.begin(playing_id, &upcoming)
+                    };
+                    if began {
+                        platform::info(&format!(
+                            "pharos: host play item={playing_id} queued={} from_start={}",
+                            music.sent().len(),
+                            p.from_start
+                        ));
+                    }
                 }
                 return;
             }
