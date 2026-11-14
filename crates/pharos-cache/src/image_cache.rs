@@ -31,6 +31,7 @@ pub struct ImageCache {
     /// namespace the three fill sites (`fetch:`/`scale:`/`attach:`).
     locks: std::sync::Arc<crate::single_flight::KeyedLocks<String>>,
     encodes: std::sync::Arc<Encodes>,
+    widths: std::sync::Arc<SourceWidths>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -442,6 +443,7 @@ impl ImageCache {
             pool: None,
             locks: std::sync::Arc::new(crate::single_flight::KeyedLocks::new()),
             encodes: std::sync::Arc::new(Encodes::default()),
+            widths: std::sync::Arc::new(SourceWidths::default()),
         }
     }
 
@@ -702,6 +704,26 @@ impl ImageCache {
     /// Cached under `{root}/scaled/{hash(path,mtime)}-w{width}.jpg`, keyed on
     /// the source path + mtime so re-downloaded art invalidates. Falls back to
     /// the original path on any scale failure (never fails a public image).
+    /// The source's intrinsic width, read from its header once per
+    /// `(path, mtime)` key and remembered: the header read is an open + read
+    /// on the media share, and every poster request asks it again.
+    async fn source_width(&self, source: &Path, key: u64) -> Option<u32> {
+        let (width, lookup) = match self.widths.get(key) {
+            Some(width) => (width, WidthLookup::Hit),
+            None => {
+                let width = intrinsic_width(source)
+                    .instrument(tracing::info_span!("image.header_read"))
+                    .await;
+                self.widths.insert(key, width);
+                (width, WidthLookup::Miss)
+            }
+        };
+        metrics::counter!("pharos_image_source_width_total", "outcome" => lookup.label())
+            .increment(1);
+        tracing::debug!(?width, outcome = lookup.label(), "image source width");
+        width
+    }
+
     pub async fn scaled_artwork(&self, source: &Path, width: u32) -> PathBuf {
         let Ok(meta) = tokio::fs::metadata(source).await else {
             return source.to_path_buf();
@@ -720,21 +742,6 @@ impl ImageCache {
         // threshold survives only as the fallback for a format whose header we
         // cannot read, where guessing wrong by scaling risks upscaling.
         const SCALE_THRESHOLD_BYTES: u64 = 256 * 1024;
-        match intrinsic_width(source)
-            .instrument(tracing::info_span!("image.header_read"))
-            .await
-        {
-            // Already at or near the requested size: re-encoding would cost
-            // latency and quality for nothing, and scaling UP is always wrong.
-            // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
-            Some(w) if w <= width.saturating_add(width / 5) => {
-                return source.to_path_buf();
-            }
-            // Genuinely wider than the target — scale it whatever it weighs.
-            Some(_) => {}
-            None if meta.len() < SCALE_THRESHOLD_BYTES => return source.to_path_buf(),
-            None => {}
-        }
         let mtime = meta
             .modified()
             .ok()
@@ -746,6 +753,18 @@ impl ImageCache {
         source.hash(&mut h);
         mtime.hash(&mut h);
         let key = h.finish();
+        match self.source_width(source, key).await {
+            // Already at or near the requested size: re-encoding would cost
+            // latency and quality for nothing, and scaling UP is always wrong.
+            // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
+            Some(w) if w <= width.saturating_add(width / 5) => {
+                return source.to_path_buf();
+            }
+            // Genuinely wider than the target — scale it whatever it weighs.
+            Some(_) => {}
+            None if meta.len() < SCALE_THRESHOLD_BYTES => return source.to_path_buf(),
+            None => {}
+        }
         let dir = self.root.join("scaled");
         let out = dir.join(format!("{key:016x}-w{width}.jpg"));
         if tokio::fs::try_exists(&out).await.unwrap_or(false) {
@@ -1606,6 +1625,86 @@ mod tests {
 
     use super::*;
 
+    fn png_header(width: u32) -> Vec<u8> {
+        let mut b = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&width.to_be_bytes());
+        b.extend_from_slice(&width.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn a_source_width_is_read_once_until_the_file_changes() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        let src = dir.path().join("poster.png");
+        std::fs::write(&src, png_header(300)).unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let count = |value: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .iter()
+                .find(|(k, ..)| {
+                    k.key().name() == "pharos_image_source_width_total"
+                        && k.key()
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == value)
+                })
+                .map_or(0, |(.., v)| match v {
+                    DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                assert_eq!(cache.scaled_artwork(&src, 480).await, src);
+                assert_eq!(cache.scaled_artwork(&src, 480).await, src);
+            })
+        });
+        assert_eq!((count("miss"), count("hit")), (1, 1));
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                cache.scaled_artwork(&src, 480).await;
+            })
+        });
+        assert_eq!(
+            (count("miss"), count("hit")),
+            (2, 1),
+            "a new mtime re-reads the header"
+        );
+    }
+
+    #[test]
+    fn source_width_labels_are_distinct() {
+        assert_ne!(WidthLookup::Hit.label(), WidthLookup::Miss.label());
+    }
+
+    #[test]
+    fn the_width_memory_stays_bounded() {
+        let widths = SourceWidths::default();
+        for key in 0..=SourceWidths::MAX_ENTRIES as u64 {
+            widths.insert(key, Some(1));
+        }
+        assert!(widths.map.len() <= SourceWidths::MAX_ENTRIES);
+        assert_eq!(widths.get(SourceWidths::MAX_ENTRIES as u64), Some(Some(1)));
+    }
+
     #[tokio::test]
     async fn small_sidecar_is_served_verbatim_not_scaled() {
         let dir = tempfile::tempdir().unwrap();
@@ -2204,6 +2303,47 @@ mod tests {
 /// signature, so one short read answers it. `None` means "not a format we can
 /// read cheaply", and the caller falls back to its byte heuristic rather than
 /// risk upscaling.
+/// Whether [`ImageCache::source_width`] answered from memory or read the
+/// source's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidthLookup {
+    Hit,
+    Miss,
+}
+
+impl WidthLookup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+/// Remembered source widths, keyed by a hash of `(path, mtime)` so an edited
+/// file is re-read. `None` (an unreadable header) is remembered too.
+#[derive(Debug, Default)]
+struct SourceWidths {
+    map: dashmap::DashMap<u64, Option<u32>>,
+}
+
+impl SourceWidths {
+    /// About 16 bytes an entry, so the cap holds the map well under 1 MiB
+    /// while covering a large library's posters and backdrops.
+    const MAX_ENTRIES: usize = 32_768;
+
+    fn get(&self, key: u64) -> Option<Option<u32>> {
+        self.map.get(&key).map(|w| *w)
+    }
+
+    fn insert(&self, key: u64, width: Option<u32>) {
+        if self.map.len() >= Self::MAX_ENTRIES {
+            self.map.clear();
+        }
+        self.map.insert(key, width);
+    }
+}
+
 async fn intrinsic_width(source: &Path) -> Option<u32> {
     use tokio::io::AsyncReadExt;
     let mut f = tokio::fs::File::open(source).await.ok()?;
