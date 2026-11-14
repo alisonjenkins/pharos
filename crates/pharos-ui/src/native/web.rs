@@ -1739,6 +1739,78 @@ pub fn watch_sentinel(
     })
 }
 
+/// How far past the viewport a lazy artwork image starts loading, so a
+/// scrolled-to poster is already on its way. Chromium's own lazy loading
+/// reaches about this far; Firefox's stops about one tile row below the fold.
+const ART_LEAD_MARGIN: &str = "1500px 0px";
+
+type ArtLead = (
+    web_sys::IntersectionObserver,
+    Closure<dyn FnMut(js_sys::Array)>,
+);
+
+thread_local! {
+    static ART_LEAD: Option<ArtLead> = art_lead();
+}
+
+fn art_lead() -> Option<ArtLead> {
+    let callback = Closure::<dyn FnMut(js_sys::Array)>::new(|entries: js_sys::Array| {
+        for entry in entries.iter() {
+            let entry = entry.unchecked_into::<web_sys::IntersectionObserverEntry>();
+            if !entry.is_intersecting() {
+                continue;
+            }
+            let target = entry.target();
+            if let Err(e) = target.set_attribute("loading", "eager") {
+                warn(&format!("pharos: art lead load not started: {e:?}"));
+            }
+            ART_LEAD.with(|lead| {
+                if let Some((observer, _)) = lead {
+                    observer.unobserve(&target);
+                }
+            });
+        }
+    });
+    let init = web_sys::IntersectionObserverInit::new();
+    init.set_root_margin(ART_LEAD_MARGIN);
+    match web_sys::IntersectionObserver::new_with_options(callback.as_ref().unchecked_ref(), &init)
+    {
+        Ok(observer) => Some((observer, callback)),
+        Err(e) => {
+            warn(&format!(
+                "pharos: art lead observer unavailable, lazy art waits on the browser: {e:?}"
+            ));
+            None
+        }
+    }
+}
+
+/// Start loading each lazy artwork `<img>` in the page once it is within
+/// [`ART_LEAD_MARGIN`] of the viewport, rather than at the browser's own
+/// distance (B1443). Safe to call after every render: observing an image
+/// twice is a no-op, and a loaded one is no longer lazy.
+pub fn lead_lazy_art() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(images) = document.query_selector_all(".pharos-art img[loading=lazy]") else {
+        return;
+    };
+    ART_LEAD.with(|lead| {
+        let Some((observer, _)) = lead else {
+            return;
+        };
+        for i in 0..images.length() {
+            if let Some(img) = images
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                observer.observe(&img);
+            }
+        }
+    });
+}
+
 /// A `wheel` listener that steps through letters while Shift is held;
 /// removed on drop.
 pub struct ShiftWheel(Closure<dyn FnMut(web_sys::WheelEvent)>);
