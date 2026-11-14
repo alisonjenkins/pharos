@@ -295,6 +295,32 @@ fn track_state(complete: bool, failed: bool) -> TrackState {
     }
 }
 
+fn pin_now(
+    lib: &content::Library,
+    id: &str,
+    kind: ContainerKind,
+    ui_id: &str,
+) -> Result<(), OfflineError> {
+    match lib.pin(id) {
+        Ok(tracks) => {
+            log::info!("pharos: offline pin id={id} tracks={tracks} verdict=pinned");
+            Ok(())
+        }
+        Err(content::ContentError::BadId(_)) => {
+            log::warn!("pharos: offline pin id={id} verdict=failed reason=bad_id");
+            Err(OfflineError::UnknownContainer {
+                kind,
+                id: ui_id.to_owned(),
+            })
+        }
+        Err(e) => {
+            let why = e.redacted();
+            log::warn!("pharos: offline pin id={id} verdict=failed reason={why}");
+            Err(OfflineError::Host(why))
+        }
+    }
+}
+
 impl OfflineStore for PhoneOffline {
     fn cache_cap_bytes(&self) -> u64 {
         pharos_android::library()
@@ -326,21 +352,25 @@ impl OfflineStore for PhoneOffline {
     fn pin(&self, container: &ContainerRef) -> Result<(), OfflineError> {
         let id = library_id(container)?;
         let lib = library("pin")?;
-        match lib.pin(&id) {
-            Ok(tracks) => {
-                log::info!("pharos: offline pin id={id} tracks={tracks} verdict=pinned");
-                Ok(())
-            }
-            Err(content::ContentError::BadId(_)) => Err(OfflineError::UnknownContainer {
-                kind: container.kind,
-                id: container.id.clone(),
-            }),
-            Err(e) => {
-                let why = e.redacted();
-                log::warn!("pharos: offline pin id={id} verdict=failed reason={why}");
-                Err(OfflineError::Host(why))
-            }
+        // Online, pinning fetches the listing from the server, and the Keep
+        // toggle calls this from its click handler: run it on a worker. The
+        // toggle polls the downloads, so the pin shows when it lands.
+        // Offline it only reads the saved listing, so it stays in line and
+        // its error reaches the toggle.
+        if lib.is_online() {
+            let kind = container.kind;
+            let ui_id = container.id.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pharos-pin".into())
+                .spawn(move || {
+                    let _ = pin_now(lib, &id, kind, &ui_id);
+                });
+            return match spawned {
+                Ok(_) => Ok(()),
+                Err(e) => Err(OfflineError::Host(format!("pin worker: {e}"))),
+            };
         }
+        pin_now(lib, &id, container.kind, &container.id)
     }
 
     fn unpin(&self, container: &ContainerRef) -> Result<(), OfflineError> {
