@@ -3370,7 +3370,11 @@ pub const PROBE_SCHEMA_VERSION: i64 = 9;
 /// v2: a stem-derived title is cleaned, a book is no longer tagged with video
 /// release tags, and a PDF's `/Producer` is no longer stored as its publisher
 /// (B1421), so every book row must be re-read to lose them.
-pub const BOOK_SCHEMA_VERSION: i64 = 2;
+///
+/// v3: a book's subjects (`dc:subject`, EXTH 105, PDF `/Keywords`) are read
+/// and mapped to shelves stored as its genres (spec 043), so every book row
+/// must be re-read to gain them.
+pub const BOOK_SCHEMA_VERSION: i64 = 3;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
