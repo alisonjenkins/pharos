@@ -8347,6 +8347,7 @@ dependencies = [
  "pharos-core",
  "pharos-test-metrics",
  "pharos-transcode",
+ "proptest",
  "quick-xml",
  "regex",
  "serde",
