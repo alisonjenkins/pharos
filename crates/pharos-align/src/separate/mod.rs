@@ -223,7 +223,7 @@ impl Separation {
             outcome = self.outcome.label(),
             reason = %self.reason,
             seconds = self.seconds,
-            "vocals separated"
+            "vocal separation"
         );
         metrics::counter!(SEPARATION_TOTAL, "outcome" => self.outcome.label()).increment(1);
         if self.outcome != Outcome::NoGpu {
