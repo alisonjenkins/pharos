@@ -353,6 +353,10 @@ impl Pharos {
             }
             // A lost report only costs the server a moment of the listener's place.
             (Work::Report(_) | Work::ReportTimer, _) => {}
+            // A later block of tracks fails in the background, maybe while the
+            // listener is in the player: keep what loaded, and opening the
+            // album again fetches the rest.
+            (Work::Tracks { start, .. }, _) if start > 0 => {}
             // A code nobody approved expires; ask for a fresh one.
             (Work::Poll { .. }, TaskError::NotFound) => self.sign_in(context),
             (_, TaskError::Offline) => {
