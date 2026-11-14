@@ -31,6 +31,13 @@ impl Method {
     }
 }
 
+/// A line's `placement` in the answer: its label.
+impl serde::Serialize for Method {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.label())
+    }
+}
+
 /// Why a whole song kept today's per-line answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
@@ -42,14 +49,20 @@ pub enum Fallback {
     SeparateFailed,
     /// Recognising the vocals failed.
     RecogniseFailed,
+    /// Decoding the whole song, or resampling its vocals, failed.
+    DecodeFailed,
+    /// The letter model gave no emission for the whole song.
+    EmissionFailed,
 }
 
 impl Fallback {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Off,
         Self::LowAnchorShare,
         Self::SeparateFailed,
         Self::RecogniseFailed,
+        Self::DecodeFailed,
+        Self::EmissionFailed,
     ];
 
     /// The `reason` label of `pharos_aligner_song_fallback_total`.
@@ -59,6 +72,8 @@ impl Fallback {
             Self::LowAnchorShare => "low_anchor_share",
             Self::SeparateFailed => "separate_failed",
             Self::RecogniseFailed => "recognise_failed",
+            Self::DecodeFailed => "decode_failed",
+            Self::EmissionFailed => "emission_failed",
         }
     }
 }
