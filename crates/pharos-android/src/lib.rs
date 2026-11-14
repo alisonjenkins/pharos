@@ -152,6 +152,9 @@ struct State {
     player: Option<GlobalRef>,
     /// False while `player` is still preparing; transport calls wait for it.
     prepared: bool,
+    /// `start` was called on the prepared player. Android rejects `pause` on
+    /// one that is prepared but never started.
+    started: bool,
     current: Option<Item>,
     /// What skip next/previous moves through; holds `current`.
     queue: Vec<Item>,

@@ -186,6 +186,7 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         let prepared = st.prepared;
         st.player = None;
         st.prepared = false;
+        st.started = false;
         drop(guard);
         return stop_player(env, &session, &player, prepared);
     }
@@ -199,13 +200,25 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         log(&format!("{method}: player still preparing, ignored"));
         return Ok(());
     }
+    let started = st.started;
     drop(guard);
     if method == "start" && !focus::request(env)? {
         log("start: audio focus refused, not started");
         return Ok(());
     }
-    env.call_method(player.as_obj(), method, "()V", &[])
-        .map_err(jerr(method))?;
+    if player_call_valid(method, started) {
+        env.call_method(player.as_obj(), method, "()V", &[])
+            .map_err(jerr(method))?;
+        if method == "start" {
+            if let Some(st) = state_lock()?.as_mut() {
+                st.started = true;
+            }
+        }
+    } else {
+        log(&format!(
+            "{method}: player was prepared but never started, no call needed"
+        ));
+    }
     let pos = env
         .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
         .and_then(|v| v.i())
@@ -214,6 +227,12 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         resume::note(i64::from(pos), method)?;
     }
     set_playback_state(env, session.as_obj(), state, i64::from(pos))
+}
+
+/// Whether `method` may be called on a prepared player. Android rejects
+/// `pause` before the first `start`; the item is already not playing.
+fn player_call_valid(method: &str, started: bool) -> bool {
+    method != "pause" || started
 }
 
 /// Stops and releases `player`, already taken out of the state, so a later
@@ -367,6 +386,7 @@ pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen
             let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
         }
         st.prepared = false;
+        st.started = false;
         if !queue.iter().any(|i| i.id == item.id) {
             queue = vec![item.clone()];
         }
@@ -501,6 +521,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pause_is_not_called_on_a_player_that_never_started() {
+        assert!(!player_call_valid("pause", false));
+        assert!(player_call_valid("pause", true));
+        assert!(player_call_valid("start", false));
+    }
+
     use super::*;
     use pharos_content as content;
 
