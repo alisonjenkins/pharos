@@ -120,6 +120,9 @@ pharos-subs = { path = "../pharos-subs" }
 serde_json = "1"
 # Breaks a table under the stop-path failure tests (spec 038 FR-108).
 sqlx = { workspace = true }
+# Parses the OPDS feeds back in the it_books tests (045). Already in the
+# graph via pharos-scanner.
+quick-xml = { workspace = true }
 
 [lints]
 workspace = true
