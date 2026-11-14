@@ -86,7 +86,7 @@ As the operator, I can tell from logs and metrics, per song and in aggregate, ho
 - Instrumental tracks or songs where the recogniser hears nothing: every line falls back; the result must be no worse than today's.
 - Outro vocals or ad-libs after the last lyric line: they must not pull the last lines (seen: +22 to +42 s).
 - Recogniser hallucinations in gaps ("thank you", captions, other languages): ignored unless they match lyric words in order.
-- Short repeated lines ("oh", "high speed") that the recogniser mishears.
+- Short repeated lines ("oh", a two-word hook) that the recogniser mishears.
 - Lyrics in a language or script the letter model cannot spell: placement falls back to today's behaviour for those lines.
 - The GPU runs out of memory or is busy with another workload: the song falls back to CPU or to today's pipeline, and says which.
 - A very long track (over the 500-line or duration limits): rejected or degraded as today, not crashed.
