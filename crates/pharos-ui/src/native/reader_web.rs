@@ -1284,7 +1284,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                 auto,
                             );
                             platform::info(&format!(
-                                "pharos: reader opened item={id} format=pdf version={} from={from} bytes={length} ms={:.0} resumed={} at={}",
+                                "pharos: reader opened item={id} format=pdf from={from} version={} bytes={length} ms={:.0} resumed={} at={}",
                                 version_log,
                                 platform::now_ms() - began,
                                 saved.is_some(),
@@ -1385,7 +1385,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             auto,
                         );
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub version={} from={from} bytes={length} ms={:.0} resumed={} at={}",
+                            "pharos: reader opened item={id} format=epub from={from} version={} bytes={length} ms={:.0} resumed={} at={}",
                             version_log,
                             platform::now_ms() - began,
                             saved.is_some(),
