@@ -421,6 +421,7 @@ dependencies = [
  "futures",
  "httparse",
  "jni",
+ "libc",
  "log",
  "pharos-api",
  "pharos-client",

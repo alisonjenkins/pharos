@@ -25,6 +25,12 @@ use super::node::Node;
 
 /// How much music the phone keeps unless the caller says otherwise.
 pub const DEFAULT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Free space a download must leave on the phone's storage, so the cache
+/// never starves the system or other apps of room.
+pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Bytes free to this app on the filesystem holding a directory.
+pub type FreeProbe = Box<dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync>;
 
 const INDEX_VERSION: u32 = 1;
 const AUDIO_EXT: &str = ".audio";
@@ -113,6 +119,24 @@ pub struct Cache {
     dir: PathBuf,
     cap: u64,
     state: Mutex<State>,
+    free: FreeProbe,
+}
+
+/// Space available to an unprivileged writer, as `df` reports it.
+pub fn statvfs_free(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c` is a NUL-terminated path and `st` is a valid out-pointer
+    // that statvfs fully initialises when it returns 0.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: rc == 0, so statvfs initialised `st`.
+    let st = unsafe { st.assume_init() };
+    #[allow(clippy::useless_conversion)]
+    Ok(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
 }
 
 fn err(op: &str, path: &Path, e: impl std::fmt::Display) -> ContentError {
@@ -180,6 +204,15 @@ impl Cache {
     /// files the index disagrees with are dropped or adopted, and the cache is
     /// trimmed to `cap_bytes`.
     pub fn open(dir: &Path, cap_bytes: u64) -> Result<Self, ContentError> {
+        Self::open_with_probe(dir, cap_bytes, Box::new(statvfs_free))
+    }
+
+    /// [`Cache::open`] with the free-space reading supplied by the caller.
+    pub fn open_with_probe(
+        dir: &Path,
+        cap_bytes: u64,
+        free: FreeProbe,
+    ) -> Result<Self, ContentError> {
         std::fs::create_dir_all(dir.join("listings")).map_err(|e| err("create dir", dir, e))?;
         let index_path = dir.join("index.json");
         let mut index = match std::fs::read(&index_path) {
@@ -275,6 +308,7 @@ impl Cache {
                 clock,
                 ..State::default()
             }),
+            free,
         };
         {
             let mut s = cache.lock();
@@ -505,37 +539,90 @@ impl Cache {
             if used <= self.cap {
                 break;
             }
-            let victim = s
-                .entries
-                .iter()
-                .filter(|(id, e)| {
-                    e.complete
-                        && !e.pinned
-                        && !s.protected.contains(*id)
-                        && s.current.as_deref() != Some(id.as_str())
-                })
-                .min_by(|a, b| (a.1.last_played_ms, a.0).cmp(&(b.1.last_played_ms, b.0)))
-                .map(|(id, e)| (id.clone(), e.size));
-            let Some((id, bytes)) = victim else {
+            let Some((id, bytes)) = Self::victim(s, None) else {
                 log::warn!(
                     "cache over cap used={used} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap
                 );
                 break;
             };
-            match std::fs::remove_file(self.final_path(&id)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    log::warn!("cache evict id={id} failed: {e}; keeping it indexed");
-                    break;
-                }
+            if !self.remove_locked(s, &id) {
+                break;
             }
-            s.entries.remove(&id);
             log::info!("cache evict id={id} bytes={bytes} reason=over_cap");
             evicted.push(id);
         }
         evicted
+    }
+
+    /// The least recently played finished track that may go: not pinned,
+    /// queued, playing, or `keep`.
+    fn victim(s: &State, keep: Option<&str>) -> Option<(String, u64)> {
+        s.entries
+            .iter()
+            .filter(|(id, e)| {
+                e.complete
+                    && !e.pinned
+                    && !s.protected.contains(*id)
+                    && s.current.as_deref() != Some(id.as_str())
+                    && keep != Some(id.as_str())
+            })
+            .min_by(|a, b| (a.1.last_played_ms, a.0).cmp(&(b.1.last_played_ms, b.0)))
+            .map(|(id, e)| (id.clone(), e.size))
+    }
+
+    /// Delete `id`'s file and forget it. False when the file would not go.
+    fn remove_locked(&self, s: &mut State, id: &str) -> bool {
+        match std::fs::remove_file(self.final_path(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("cache evict id={id} failed: {e}; keeping it indexed");
+                return false;
+            }
+        }
+        s.entries.remove(id);
+        true
+    }
+
+    /// Make room to write `need` more bytes for `downloading` and still leave
+    /// [`MIN_FREE_BYTES`] free, evicting least recently played tracks first.
+    /// `Ok(free)` when there is room, `Err(free)` when even eviction cannot
+    /// make it. An unreadable free-space figure does not block a download.
+    pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
+        let free = match (self.free)(&self.dir) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
+                return Ok(u64::MAX);
+            }
+        };
+        let want = MIN_FREE_BYTES.saturating_add(need);
+        if free >= want {
+            return Ok(free);
+        }
+        let mut s = self.lock();
+        let mut now = free;
+        let mut evicted = false;
+        while now < want {
+            let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
+                break;
+            };
+            if !self.remove_locked(&mut s, &id) {
+                break;
+            }
+            now = now.saturating_add(bytes);
+            evicted = true;
+            log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
+        }
+        if evicted {
+            self.persist_locked(&s);
+        }
+        if now >= want {
+            Ok(now)
+        } else {
+            Err(now)
+        }
     }
 
     fn persist_locked(&self, s: &State) {
@@ -622,6 +709,61 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn fixed_free(bytes: u64) -> FreeProbe {
+        Box::new(move |_| Ok(bytes))
+    }
+
+    #[test]
+    fn low_disk_evicts_the_oldest_tracks_until_two_gib_are_free() {
+        let d = tmp("lowdisk");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES - 150)).unwrap();
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 100);
+        put(&c, "track/c", 100);
+        c.protect(&[]);
+        assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
+        assert!(
+            !c.is_complete("track/a") && !c.is_complete("track/b"),
+            "the two oldest went"
+        );
+        assert!(c.is_complete("track/c"));
+        assert!(!c.final_path("track/a").exists());
+        let reopened = Cache::open(&d, 1000).unwrap();
+        assert!(!reopened.is_complete("track/a"), "the eviction was saved");
+    }
+
+    #[test]
+    fn low_disk_with_nothing_to_evict_refuses_and_keeps_pins() {
+        let d = tmp("lowdisk-pinned");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES - 1)).unwrap();
+        c.pin("album/1", &ids(&["track/a"]));
+        put(&c, "track/a", 100);
+        put(&c, "track/x", 100);
+        c.protect(&[]);
+        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 1));
+        assert!(c.is_complete("track/a") && c.is_complete("track/x"));
+    }
+
+    #[test]
+    fn room_counts_the_bytes_still_to_write() {
+        let c = Cache::open_with_probe(&tmp("lowdisk-need"), 1000, fixed_free(MIN_FREE_BYTES + 10))
+            .unwrap();
+        assert_eq!(c.ensure_free("track/x", 10), Ok(MIN_FREE_BYTES + 10));
+        assert_eq!(c.ensure_free("track/x", 11), Err(MIN_FREE_BYTES + 10));
+    }
+
+    #[test]
+    fn an_unreadable_free_space_figure_does_not_block() {
+        let probe: FreeProbe = Box::new(|_| Err(std::io::Error::other("no statvfs")));
+        let c = Cache::open_with_probe(&tmp("lowdisk-unknown"), 1000, probe).unwrap();
+        assert!(c.ensure_free("track/x", 1 << 40).is_ok());
+    }
+
+    #[test]
+    fn statvfs_reads_the_temp_dir() {
+        assert!(statvfs_free(&std::env::temp_dir()).unwrap() > 0);
     }
 
     #[test]
