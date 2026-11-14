@@ -52,7 +52,6 @@ echo "build-apk: 6/6 aligning and signing" >&2
 "$bt/zipalign" -p -f 4 "$out/base.apk" "$out/aligned.apk"
 "$bt/apksigner" sign --ks "$PHAROS_ANDROID_KEYSTORE" \
   --ks-pass "file:$PHAROS_ANDROID_KEYSTORE_PASS_FILE" \
-  --key-pass "file:$PHAROS_ANDROID_KEYSTORE_PASS_FILE" \
   --ks-key-alias "$PHAROS_ANDROID_KEY_ALIAS" \
   --out "$out/pharos-auto-spike.apk" "$out/aligned.apk"
 "$bt/apksigner" verify "$out/pharos-auto-spike.apk"
