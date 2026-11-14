@@ -92,10 +92,6 @@ impl Url {
             target,
         })
     }
-
-    pub fn host(&self) -> &str {
-        &self.host
-    }
 }
 
 /// `host[:port]` or `[v6][:port]`.
@@ -369,15 +365,6 @@ fn parse_content_range(v: &str) -> Option<ContentRange> {
 }
 
 impl Response {
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// Body bytes delivered so far.
-    pub fn received(&self) -> u64 {
-        self.got
-    }
-
     fn io_err(&self, e: std::io::Error) -> HttpError {
         HttpError::Io {
             host: self.host.clone(),
@@ -530,7 +517,7 @@ mod tests {
     #[test]
     fn urls_parse_and_cleartext_is_loopback_only() {
         let u = Url::parse("https://pharos.example/audio/ab?x=1&api_key=s3cret").unwrap();
-        assert_eq!(u.host(), "pharos.example");
+        assert_eq!(u.host, "pharos.example");
         assert_eq!(u.port, 443);
         assert_eq!(u.target, "/audio/ab?x=1&api_key=s3cret");
         let u = Url::parse("http://127.0.0.1:8080/a").unwrap();

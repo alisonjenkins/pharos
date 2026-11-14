@@ -2,6 +2,8 @@
 //! support and can drop a connection mid-body, answer chunked, cap range
 //! windows, or 401 a stale `api_key`. Test scaffolding only.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,11 +44,6 @@ impl Script {
         self
     }
 
-    pub fn ignore_range(mut self) -> Self {
-        self.ignore_range = true;
-        self
-    }
-
     pub fn window(mut self, bytes: u64) -> Self {
         self.window = Some(bytes);
         self
@@ -54,11 +51,6 @@ impl Script {
 
     pub fn drop_first_after(mut self, bytes: usize) -> Self {
         self.drops.push_back(bytes);
-        self
-    }
-
-    pub fn drops(mut self, after: &[usize]) -> Self {
-        self.drops.extend(after);
         self
     }
 
@@ -123,14 +115,6 @@ impl TestServer {
 
     pub fn url_with_token(&self, path: &str, token: &str) -> String {
         format!("http://{}{path}?api_key={token}", self.addr)
-    }
-
-    pub fn set_valid_token(&self, token: &str) {
-        self.edit(|s| s.valid_token = Some(token.to_owned()));
-    }
-
-    pub fn edit(&self, f: impl FnOnce(&mut Script)) {
-        f(&mut self.state.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     pub fn seen(&self) -> Vec<Seen> {
