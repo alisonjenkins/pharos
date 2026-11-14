@@ -1,7 +1,8 @@
 package android.content;
 public class Context {
   public java.io.File getCacheDir() { return new java.io.File(System.getProperty("java.io.tmpdir")); }
-  public Object getSystemService(String name) { if ("connectivity".equals(name)) return android.net.ConnectivityManager.last != null ? android.net.ConnectivityManager.last : new android.net.ConnectivityManager(); return "audio".equals(name) ? (android.media.AudioManager.last != null ? android.media.AudioManager.last : new android.media.AudioManager()) : null; }
+  public ComponentName startForegroundService(Intent i) { if (this instanceof android.app.Service) ((android.app.Service) this).startedService = i; return null; }
+  public Object getSystemService(String name) { if ("notification".equals(name)) return android.app.NotificationManager.last != null ? android.app.NotificationManager.last : new android.app.NotificationManager(); if ("connectivity".equals(name)) return android.net.ConnectivityManager.last != null ? android.net.ConnectivityManager.last : new android.net.ConnectivityManager(); return "audio".equals(name) ? (android.media.AudioManager.last != null ? android.media.AudioManager.last : new android.media.AudioManager()) : null; }
   /** Registered receivers by filter action; flags by action; receivers unregistered since. */
   public static final java.util.Map<String, BroadcastReceiver> receivers = new java.util.HashMap<>();
   public static final java.util.Map<String, Integer> receiverFlags = new java.util.HashMap<>();
