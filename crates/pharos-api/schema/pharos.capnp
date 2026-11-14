@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 45;
+const schemaVersion :UInt32 = 46;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -199,8 +199,11 @@ struct ItemQuery {
   stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both. Since schemaVersion 29.
   collapseCollections @10 :Bool; # fold each box set's films into one tile for the set
                                  # (B1086). Stored-row lists only. Since schemaVersion 37.
+  unreadable @11 :UnreadableFilter; # books no client can open (DRM): kept, left out, or the
+                                    # only ones (B1420). Other kinds are untouched. Since schemaVersion 46.
 }
 enum StereoFilter { any @0; only3d @1; only2d @2; }
+enum UnreadableFilter { show @0; hide @1; only @2; }
 
 # Where each section starts in a listing, in the listing's own order: a
 # section's `start` is the offset of its first item, so a client can page

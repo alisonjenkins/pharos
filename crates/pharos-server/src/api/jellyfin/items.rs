@@ -3293,6 +3293,8 @@ impl From<&ListQuery> for ItemQuery {
             is_4k: q.is_4k,
             is_hd: q.is_hd,
             is_3d: q.is_3d,
+            // /Items never filters by it (B1420).
+            book_readable: None,
             min_width: q.min_width,
             max_width: q.max_width,
             collapse_collections: false,
@@ -4773,6 +4775,7 @@ pub(crate) fn build_media_query(
     f.is_4k = q.is_4k;
     f.is_hd = q.is_hd;
     f.is_3d = q.is_3d;
+    f.book_readable = q.book_readable;
     f.min_width = q.min_width;
     f.max_width = q.max_width;
     f.min_index_number = q.min_index_number;

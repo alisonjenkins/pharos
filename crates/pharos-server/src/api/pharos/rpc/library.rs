@@ -7,6 +7,7 @@ use pharos_api::pharos_capnp::{
     credit, home_result, item_detail, item_id, item_summary, items_result, library as wire,
     person_credit, person_result, track, user_state, version, CreditKind, Kind,
     LibraryKind as WireKind, SegmentKind, Stereo3d, StereoFilter, SubtitleDelivery,
+    UnreadableFilter,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{
@@ -867,6 +868,12 @@ fn read_query(
             Ok(StereoFilter::Only3d) => Some(true),
             Ok(StereoFilter::Only2d) => Some(false),
             Ok(StereoFilter::Any) | Err(_) => None,
+        },
+        // An enum value this build does not know narrows nothing.
+        book_readable: match q.get_unreadable() {
+            Ok(UnreadableFilter::Hide) => Some(true),
+            Ok(UnreadableFilter::Only) => Some(false),
+            Ok(UnreadableFilter::Show) | Err(_) => None,
         },
         collapse_collections: q.get_collapse_collections(),
         ..ItemQuery::default()
