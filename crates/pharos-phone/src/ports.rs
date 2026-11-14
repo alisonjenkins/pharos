@@ -62,6 +62,11 @@ impl NativeAudio for PhoneAudio {
         self.with("play", |p| p.play(ids, start_index));
     }
 
+    fn play_from_start(&self, ids: Vec<String>, start_index: usize) {
+        crate::activity::ask_notifications_on_first_play();
+        self.with("play_from_start", |p| p.play_from_start(ids, start_index));
+    }
+
     fn set_queue(&self, ids: Vec<String>, current_index: usize) {
         self.with("set_queue", |p| p.set_queue(ids, current_index));
     }
