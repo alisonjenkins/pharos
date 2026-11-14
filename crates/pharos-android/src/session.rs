@@ -84,13 +84,20 @@ pub(crate) fn publish_state(
 }
 
 /// Title, artist and album for the car's now-playing screen. A book's part
-/// shows the book, its author and "Part N of M" rather than the file's own
+/// shows the book, then "Part N of M · author", rather than the file's own
 /// chapter title.
-fn now_playing(e: &Item) -> (&str, &str, &str) {
+fn now_playing(e: &Item) -> (&str, String, &str) {
     if e.book.is_empty() {
-        (&e.title, &e.subtitle, &e.album)
+        (&e.title, e.subtitle.clone(), &e.album)
     } else {
-        (&e.book, &e.subtitle, &e.album)
+        // The car shows only the title and artist lines, so the part goes on
+        // the artist line.
+        let artist = [e.album.as_str(), e.subtitle.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        (&e.book, artist, &e.album)
     }
 }
 
@@ -101,7 +108,7 @@ pub(crate) fn set_metadata(
     duration_ms: i64,
 ) -> R<()> {
     let (title, artist, album) = now_playing(e);
-    foreground::describe(title, artist)?;
+    foreground::describe(title, &artist)?;
     const B: &str = "Landroid/media/MediaMetadata$Builder;";
     let b = env
         .new_object("android/media/MediaMetadata$Builder", "()V", &[])
@@ -109,7 +116,7 @@ pub(crate) fn set_metadata(
     let mut fields = vec![
         ("android.media.metadata.MEDIA_ID", e.id.clone()),
         ("android.media.metadata.TITLE", title.to_owned()),
-        ("android.media.metadata.ARTIST", artist.to_owned()),
+        ("android.media.metadata.ARTIST", artist),
     ];
     if !album.is_empty() {
         fields.push(("android.media.metadata.ALBUM", album.to_owned()));
@@ -469,11 +476,15 @@ mod tests {
     fn a_books_part_shows_the_book_its_author_and_which_part() {
         assert_eq!(
             now_playing(&row("A Book")),
-            ("A Book", "An Author", "Part 2 of 9")
+            (
+                "A Book",
+                "Part 2 of 9 · An Author".to_owned(),
+                "Part 2 of 9"
+            )
         );
         assert_eq!(
             now_playing(&row("")),
-            ("Chapter One", "An Author", "Part 2 of 9"),
+            ("Chapter One", "An Author".to_owned(), "Part 2 of 9"),
             "anything else keeps its own title"
         );
     }
