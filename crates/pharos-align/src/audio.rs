@@ -76,9 +76,84 @@ fn decode_with(
     end_ms: i64,
     timeout: Duration,
 ) -> Result<Vec<f32>, DecodeError> {
+    let bytes = run(
+        ffmpeg,
+        ffmpeg_args(path, start_ms, end_ms, RATE),
+        None,
+        timeout,
+        (start_ms, end_ms),
+    )?;
+    Ok(f32s(&bytes))
+}
+
+/// The longest song decoded whole for the recogniser: an hour.
+pub const SONG_MS: i64 = 3_600_000;
+
+/// The first [`SONG_MS`] of `path` at `rate` in stereo, as the separator
+/// takes it.
+pub fn decode_stereo(ffmpeg: &str, path: &Path, rate: u32) -> Result<[Vec<f32>; 2], DecodeError> {
+    let mut args = ffmpeg_args(path, 0, SONG_MS, rate);
+    if let Some(ac) = args.iter().position(|a| a == "-ac") {
+        args[ac + 1] = "2".into();
+    }
+    let bytes = run(ffmpeg, args, None, TIMEOUT, (0, SONG_MS))?;
+    let mut out = [Vec::new(), Vec::new()];
+    for frame in f32s(&bytes).chunks_exact(2) {
+        out[0].push(frame[0]);
+        out[1].push(frame[1]);
+    }
+    Ok(out)
+}
+
+/// `stereo` at `from` Hz down to [`RATE`] mono with ffmpeg's resampler: the
+/// recogniser and the letter model hear separated vocals as they hear a file.
+pub fn resample_mono(
+    ffmpeg: &str,
+    stereo: &[Vec<f32>; 2],
+    from: u32,
+) -> Result<Vec<f32>, DecodeError> {
+    let mut input = Vec::with_capacity(stereo[0].len() * 8);
+    for (l, r) in stereo[0].iter().zip(&stereo[1]) {
+        input.extend_from_slice(&l.to_le_bytes());
+        input.extend_from_slice(&r.to_le_bytes());
+    }
+    let len_ms =
+        i64::try_from(stereo[0].len() as u64 * 1000 / u64::from(from.max(1))).unwrap_or(i64::MAX);
+    let args: Vec<OsString> = ["-nostdin", "-v", "error", "-f", "f32le", "-ac", "2", "-ar"]
+        .into_iter()
+        .map(OsString::from)
+        .chain([from.to_string().into()])
+        .chain(["-i", "-", "-ac", "1", "-ar"].map(OsString::from))
+        .chain([RATE.to_string().into()])
+        .chain(["-f", "f32le", "-"].map(OsString::from))
+        .collect();
+    let bytes = run(ffmpeg, args, Some(input), TIMEOUT, (0, len_ms))?;
+    Ok(f32s(&bytes))
+}
+
+fn f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// ffmpeg's stdout for `args`, `stdin` fed to it; `window` names the audio
+/// in errors.
+fn run(
+    ffmpeg: &str,
+    args: Vec<OsString>,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    (start_ms, end_ms): (i64, i64),
+) -> Result<Vec<u8>, DecodeError> {
     let mut child = Command::new(ffmpeg)
-        .args(ffmpeg_args(path, start_ms, end_ms, RATE))
-        .stdin(Stdio::null())
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -86,8 +161,16 @@ fn decode_with(
             program: ffmpeg.to_owned(),
             source,
         })?;
-    // Both pipes drain on their own threads: a window's PCM outgrows the
+    // Every pipe drains on its own thread: a window's PCM outgrows the
     // pipe buffer, and ffmpeg blocks until it is read.
+    let feed = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || {
+            use std::io::Write;
+            // A broken pipe means ffmpeg stopped reading; its status says why.
+            let _ = pipe.write_all(&bytes);
+        })),
+        _ => None,
+    };
     let mut stdout = child
         .stdout
         .take()
@@ -114,6 +197,9 @@ fn decode_with(
             end_ms,
         });
     };
+    if let Some(feed) = feed {
+        let _ = feed.join();
+    }
     let bytes = out
         .join()
         .map_err(|_| std::io::Error::other("stdout reader panicked"))??;
@@ -126,10 +212,7 @@ fn decode_with(
             stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         });
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect())
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -194,6 +277,34 @@ mod tests {
         assert!(matches!(missing, DecodeError::Failed { .. }), "{missing}");
         let spawn = decode("pharos-no-such-ffmpeg", &wav, 0, 1000).unwrap_err();
         assert!(matches!(spawn, DecodeError::Spawn { .. }), "{spawn}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_song_decodes_in_stereo_and_resamples_to_mono_at_the_model_rate() {
+        let Some(ffmpeg) = ffmpeg() else {
+            eprintln!("ffmpeg not on PATH; skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("pharos-align-stereo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        let made = Command::new(ffmpeg)
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=2:sample_rate=44100")
+            .args(["-ac", "2"])
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let stereo = decode_stereo(ffmpeg, &wav, 44_100).unwrap();
+        assert_eq!(stereo[0].len(), 88_200);
+        assert_eq!(stereo[0], stereo[1], "the tone is the same both sides");
+        let mono = resample_mono(ffmpeg, &stereo, 44_100).unwrap();
+        assert!((mono.len() as i64 - 32_000).abs() <= 16, "{}", mono.len());
+        assert!(mono.iter().any(|s| s.abs() > 0.05));
+        let missing = decode_stereo(ffmpeg, &dir.join("missing.wav"), 44_100).unwrap_err();
+        assert!(matches!(missing, DecodeError::Failed { .. }), "{missing}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
