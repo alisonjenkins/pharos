@@ -328,6 +328,7 @@ pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen
         }
         let st = guard.as_mut().ok_or("prepare before onCreate")?;
         if let Some(old) = st.player.take() {
+            resume::leave(env, "track_change")?;
             let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
         }
         st.prepared = false;
