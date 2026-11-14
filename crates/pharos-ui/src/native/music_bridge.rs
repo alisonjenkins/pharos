@@ -173,7 +173,9 @@ impl Follow {
         // Only forward: a restart or resync puts the song back at entry 0.
         if before.index.zip(snapshot.index).is_some_and(|(b, n)| n > b) {
             self.seen = None;
-            return vec![Step::Moved(playing)];
+            let mut steps = vec![Step::Moved(playing)];
+            steps.extend(failure);
+            return steps;
         }
         let mut steps = Vec::new();
         if snapshot.duration_ms != before.duration_ms {
@@ -694,6 +696,22 @@ mod tests {
         fake.next();
         assert_eq!(fake.snapshot().current_id.as_deref(), Some("1"));
         assert_eq!(follow(&fake, &mut f, 1), vec![Step::Moved(id(1))]);
+    }
+
+    #[test]
+    fn a_failure_reported_with_the_step_to_a_repeat_is_not_lost() {
+        let (fake, m) = music();
+        let mut f = Follow::default();
+        m.begin(id(1), &ids(&[1]));
+        follow(&fake, &mut f, 1);
+        fake.next();
+        let mut snap = fake.snapshot();
+        snap.error = Some("decoder died".into());
+        let steps = f.step(id(1), &snap);
+        assert_eq!(
+            steps,
+            vec![Step::Moved(id(1)), Step::Failed("decoder died".into())]
+        );
     }
 
     #[test]
