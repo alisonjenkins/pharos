@@ -3,8 +3,8 @@
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use super::{
-    retry_windows, wants_retry, words, Decode, Outcome, Retry, Segment, Token, RETRY_MIN_DISTINCT,
-    RETRY_MIN_WORDS,
+    retry_windows, segment_words, wants_retry, words, Decode, Outcome, Retry, Segment, Token,
+    RETRY_MIN_DISTINCT, RETRY_MIN_WORDS,
 };
 use crate::obs::RECOGNISE_RETRY_TOTAL;
 
@@ -76,6 +76,16 @@ fn a_word_after_a_clamped_end_starts_where_that_word_ends() {
     // b is clamped to end at 2.0; c starting at b's raw 1.9 would overlap it.
     assert_eq!(w[1].end_s, 2.0);
     assert_eq!((w[2].start_s, w[2].end_s), (2.0, 2.6));
+}
+
+#[test]
+fn each_segments_first_word_starts_at_its_own_t0() {
+    let w = segment_words(&[
+        seg(1.0, 2.0, vec![tok(" a", 1.0, 1.5)]),
+        seg(30.0, 31.0, vec![tok(" b", 30.0, 30.6)]),
+    ]);
+    // Not at 1.5, where the segment before the gap ended.
+    assert_eq!((w[1].start_s, w[1].end_s), (30.0, 30.6));
 }
 
 #[test]
