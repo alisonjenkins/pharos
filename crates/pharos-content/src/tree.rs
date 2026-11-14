@@ -15,6 +15,9 @@ use super::node::{Node, Urls};
 /// Most children one node returns; a car list is not a place to scroll
 /// thousands of rows.
 pub const MAX_CHILDREN: u32 = 200;
+/// Most parts one audiobook lists or plays: the server's own list cap, so
+/// no part is cut off below it.
+pub const BOOK_PARTS_MAX: u32 = 1000;
 /// Songs in one mix batch.
 pub const MIX_LEN: u32 = 30;
 /// Most search hits returned for a voice request.
@@ -101,6 +104,110 @@ fn not_books(items: Vec<Item>) -> Vec<Item> {
     items.into_iter().filter(|i| !i.audiobook).collect()
 }
 
+/// Which part of a book to start: the last one begun and not played, else
+/// the first not played, else the first (as `pharos-ui`'s `resume_track`,
+/// V1403). `None` only for a book with no parts.
+pub fn resume_part(parts: &[Item]) -> Option<usize> {
+    let parts = || {
+        parts
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == ItemKind::Audio)
+    };
+    parts()
+        .rfind(|(_, t)| t.position_ms > 0 && !t.played)
+        .or_else(|| parts().find(|(_, t)| !t.played))
+        .or_else(|| parts().next())
+        .map(|(i, _)| i)
+}
+
+/// Marks `parts` (listed under `book`, in order) as parts of that book:
+/// the book's title, an author when the part names none, and "Part N of M".
+fn as_parts(parts: &mut [Node], book: &Item) {
+    let total = parts.len();
+    for (n, part) in parts.iter_mut().enumerate() {
+        part.book.clone_from(&book.name);
+        if part.subtitle.is_empty() {
+            part.subtitle = book.series_name.clone().unwrap_or_default();
+        }
+        part.album = format!("Part {} of {total}", n + 1);
+    }
+}
+
+/// The row heading a book's parts that plays it as [`book`] does, so the
+/// book continues even where the car only opens a browsable row.
+fn continue_row(a: ItemRef, items: &[Item], parts: &[Node]) -> Option<Node> {
+    let at = parts.get(resume_part(items)?)?;
+    let begun = items.iter().any(|i| i.played || i.position_ms > 0);
+    let verb = if begun { "Continue" } else { "Start" };
+    Some(Node {
+        title: format!("{verb}: {}", at.album),
+        subtitle: at.title.clone(),
+        browsable: false,
+        playable: true,
+        art_url: at.art_url.clone(),
+        stream_url: None,
+        duration_ms: 0,
+        album: String::new(),
+        position_ms: 0,
+        ..Node::folder(NodeId::Album(a), "")
+    })
+}
+
+/// An album's tracks, all of them when it is a book.
+async fn album_tracks<C: Catalogue>(cat: &C, a: ItemRef) -> Result<Vec<Item>, ContentError> {
+    let tracks = cat.list(a, None, TRACK_ORDER, MAX_CHILDREN).await?;
+    if tracks.len() >= MAX_CHILDREN as usize && tracks.iter().any(|t| t.audiobook) {
+        return cat.list(a, None, TRACK_ORDER, BOOK_PARTS_MAX).await;
+    }
+    Ok(tracks)
+}
+
+/// A book to play from its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Book {
+    pub parts: Vec<Node>,
+    /// Where in `parts` to start; see [`resume_part`].
+    pub start: usize,
+}
+
+/// Every part of the book `a`, in order, and the one to continue from.
+pub async fn book<C: Catalogue>(cat: &C, urls: &Urls, a: ItemRef) -> Result<Book, ContentError> {
+    let listed = cat.list(a, None, TRACK_ORDER, BOOK_PARTS_MAX).await?;
+    let items: Vec<Item> = listed
+        .into_iter()
+        .filter(|i| i.kind == ItemKind::Audio)
+        .collect();
+    let (album, _) = cat.item(a).await?;
+    let mut parts = nodes(urls, &items);
+    if parts.len() != items.len() {
+        return Err(ContentError::Rpc {
+            op: format!("book {a}"),
+            why: format!(
+                "{} of {} parts have no node",
+                items.len() - parts.len(),
+                items.len()
+            ),
+        });
+    }
+    as_parts(&mut parts, &album);
+    let start = resume_part(&items).ok_or_else(|| ContentError::Rpc {
+        op: format!("book {a}"),
+        why: "the book has no parts".into(),
+    })?;
+    let begun = items
+        .iter()
+        .filter(|i| i.position_ms > 0 && !i.played)
+        .count();
+    let played = items.iter().filter(|i| i.played).count();
+    log::info!(
+        "car book {a} parts={} begun={begun} played={played} start={start} at_ms={}",
+        parts.len(),
+        parts[start].position_ms
+    );
+    Ok(Book { parts, start })
+}
+
 /// What a node holds. A track holds nothing; the sign-in row is not browsable.
 pub async fn children<C: Catalogue>(
     cat: &C,
@@ -148,8 +255,16 @@ pub async fn children<C: Catalogue>(
                 .await?,
         ),
         NodeId::Album(a) => {
-            let mut tracks = nodes(urls, &cat.list(a, None, TRACK_ORDER, MAX_CHILDREN).await?);
+            let items = album_tracks(cat, a).await?;
+            let is_book = items.iter().any(|t| t.audiobook);
+            let mut tracks = nodes(urls, &items);
             match cat.item(a).await {
+                Ok((album, _)) if is_book => {
+                    as_parts(&mut tracks, &album);
+                    if let Some(row) = continue_row(a, &items, &tracks) {
+                        tracks.insert(0, row);
+                    }
+                }
                 Ok((album, _)) => tracks
                     .iter_mut()
                     .filter(|t| t.playable)
@@ -383,6 +498,8 @@ mod tests {
         calls: RefCell<Vec<String>>,
         no_music: bool,
         books: bool,
+        /// When set, an album lists these and is a book.
+        parts: Vec<Item>,
     }
 
     impl Catalogue for Fake {
@@ -422,6 +539,7 @@ mod tests {
                 .borrow_mut()
                 .push(format!("list {parent} {group:?} {sort_by} {limit}"));
             Ok(match group {
+                None if !self.parts.is_empty() => self.parts.clone(),
                 None => vec![item(ItemRef::Real(30), ItemKind::Audio, "Tr")],
                 Some(_) => vec![item(ItemRef::Synth(3), ItemKind::Album, "Al")],
             })
@@ -442,6 +560,11 @@ mod tests {
             Ok(vec![item(ItemRef::Real(7), ItemKind::Audio, "M"), part])
         }
         async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError> {
+            if !self.parts.is_empty() {
+                let mut book = item(id, ItemKind::Album, "A Book");
+                book.series_name = Some("An Author".into());
+                return Ok((book, None));
+            }
             let song = matches!(id, ItemRef::Real(_));
             let kind = if song {
                 ItemKind::Audio
@@ -508,6 +631,112 @@ mod tests {
             *f.calls.borrow(),
             [format!("list 200 Some(Album) SortName {MAX_CHILDREN}")]
         );
+    }
+
+    /// A book part: `position` ms in, `played` or not.
+    fn part(n: u64, position: u64, played: bool) -> Item {
+        let mut p = item(ItemRef::Real(n), ItemKind::Audio, &format!("Chapter {n}"));
+        p.audiobook = true;
+        p.position_ms = position;
+        p.played = played;
+        p
+    }
+
+    #[test]
+    fn a_book_resumes_its_last_begun_part_else_its_first_unplayed() {
+        let at = |parts: &[Item]| resume_part(parts);
+        assert_eq!(
+            at(&[part(1, 0, true), part(2, 5_000, false), part(3, 0, false)]),
+            Some(1),
+            "begun and not played"
+        );
+        assert_eq!(
+            at(&[
+                part(1, 9_000, false),
+                part(2, 0, true),
+                part(3, 4_000, false)
+            ]),
+            Some(2),
+            "the last begun, not the first"
+        );
+        assert_eq!(
+            at(&[part(1, 0, true), part(2, 0, false), part(3, 0, false)]),
+            Some(1),
+            "none begun: the first not played"
+        );
+        assert_eq!(
+            at(&[part(1, 0, true), part(2, 0, true)]),
+            Some(0),
+            "all played: from the start"
+        );
+        assert_eq!(
+            at(&[part(1, 7_000, true), part(2, 0, true)]),
+            Some(0),
+            "a played part's position does not count"
+        );
+        assert_eq!(at(&[]), None);
+    }
+
+    #[test]
+    fn playing_a_book_queues_every_part_and_starts_where_it_stopped() {
+        let f = Fake {
+            parts: vec![part(1, 0, true), part(2, 61_000, false), part(3, 0, false)],
+            ..Fake::default()
+        };
+        let b = block_on(book(&f, &urls(), ItemRef::Synth(3))).unwrap();
+        assert_eq!(
+            *f.calls.borrow(),
+            [format!("list s3 None {TRACK_ORDER} {BOOK_PARTS_MAX}")],
+            "all parts, not a car list's worth"
+        );
+        assert_eq!(ids(&b.parts), ["track/1", "track/2", "track/3"]);
+        assert_eq!(b.start, 1);
+        let p = &b.parts[1];
+        assert_eq!(
+            (
+                p.title.as_str(),
+                p.book.as_str(),
+                p.subtitle.as_str(),
+                p.album.as_str()
+            ),
+            ("Chapter 2", "A Book", "An Author", "Part 2 of 3")
+        );
+        assert_eq!(p.position_ms, 61_000);
+        assert!(p.playable && p.stream_url.is_some());
+    }
+
+    #[test]
+    fn a_book_with_no_parts_is_an_error_not_an_empty_queue() {
+        let f = Fake {
+            parts: vec![item(ItemRef::Real(1), ItemKind::Movie, "not a part")],
+            ..Fake::default()
+        };
+        let e = block_on(book(&f, &urls(), ItemRef::Synth(3))).unwrap_err();
+        assert!(e.to_string().contains("no parts"), "{e}");
+    }
+
+    #[test]
+    fn a_books_parts_open_under_a_row_that_continues_it() {
+        let f = Fake {
+            parts: vec![part(1, 0, true), part(2, 61_000, false)],
+            ..Fake::default()
+        };
+        let got = block_on(children(&f, &urls(), NodeId::Album(ItemRef::Synth(3)))).unwrap();
+        assert_eq!(ids(&got), ["album/s3", "track/1", "track/2"]);
+        let row = &got[0];
+        assert!(row.playable && !row.browsable);
+        assert_eq!(row.title, "Continue: Part 2 of 2");
+        assert_eq!(
+            (got[1].album.as_str(), got[1].book.as_str()),
+            ("Part 1 of 2", "A Book")
+        );
+        assert_eq!(got[1].position_ms, 0, "played: starts from the top");
+        let fresh = Fake {
+            parts: vec![part(1, 0, false)],
+            ..Fake::default()
+        };
+        let got = block_on(children(&fresh, &urls(), NodeId::Album(ItemRef::Synth(3)))).unwrap();
+        assert_eq!(got[0].title, "Start: Part 1 of 1");
     }
 
     #[test]
