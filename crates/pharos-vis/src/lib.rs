@@ -8,4 +8,6 @@ pub mod decode;
 #[cfg(test)]
 mod fixture;
 pub mod frame;
+pub mod pipeline;
+pub mod ring;
 pub mod spectrum;
