@@ -528,6 +528,24 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         }
     }
     let anchored: Vec<usize> = (0..lines.len()).filter(|&i| bands[i].is_some()).collect();
+    // An anchored line with no band keeps its times, so it fences the parts
+    // around it: none may run into it from either side.
+    let fixed: Vec<Option<(f64, f64)>> = (0..lines.len())
+        .map(|i| {
+            let fixed = bands[i].is_none() && methods[i] == Some(Method::Anchored);
+            let (first, end) = (out[i].words.first()?, out[i].words.last()?);
+            fixed.then_some((first.start_ms as f64, end.start_ms as f64))
+        })
+        .collect();
+    let fence = |i: usize, mut part: Part| -> Part {
+        if let Some((_, end)) = (0..i).rev().find_map(|j| fixed[j]) {
+            part.lo_ms = part.lo_ms.max(end);
+        }
+        if let Some((first, _)) = (i + 1..lines.len()).find_map(|j| fixed[j]) {
+            part.hi_ms = part.hi_ms.min(first);
+        }
+        part
+    };
     if let (Some(&from), Some(&to)) = (anchored.first(), anchored.last()) {
         let mut parts: Vec<(usize, Part)> = Vec::new();
         let (mut prev, mut shift) = (from, 0.0);
@@ -536,12 +554,15 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
             if let Some((lo, hi, expect)) = bands[i] {
                 parts.push((
                     i,
-                    Part {
-                        words: t,
-                        lo_ms: lo,
-                        hi_ms: hi,
-                        expect_ms: expect,
-                    },
+                    fence(
+                        i,
+                        Part {
+                            words: t,
+                            lo_ms: lo,
+                            hi_ms: hi,
+                            expect_ms: expect,
+                        },
+                    ),
                 ));
                 prev = i;
                 shift = expect - lines[i].start_ms as f64;
@@ -563,7 +584,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
                 if (part.hi_ms - part.lo_ms) / song.ms_per_frame() < part.min_frames() as f64 {
                     (part.lo_ms, part.hi_ms) = gap;
                 }
-                parts.push((i, part));
+                parts.push((i, fence(i, part)));
             }
         }
         let shift_at = |i: usize| bands[i].map_or(0.0, |b| b.2 - lines[i].start_ms as f64);
@@ -593,17 +614,20 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
             // nearest line with words past it.
             let outside_before = (0..lo_i).rev().find(|&i| tokens[i].is_some());
             let outside_after = (hi_i + 1..lines.len()).find(|&i| tokens[i].is_some());
+            // A line keeping its anchor's times ends the growth.
+            let outside_before = outside_before.filter(|&i| fixed[i].is_none());
+            let outside_after = outside_after.filter(|&i| fixed[i].is_none());
             if let (Some(&(s, _)), Some(i)) = (start, outside_before) {
                 let edge = song.ms(s) as f64;
                 if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(from), edge, true) {
-                    before.push((i, p));
+                    before.push((i, fence(i, p)));
                     grew = true;
                 }
             }
             if let (Some(&(_, e)), Some(i)) = (end, outside_after) {
                 let edge = song.ms(e) as f64;
                 if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(to), edge, false) {
-                    after.push((i, p));
+                    after.push((i, fence(i, p)));
                     grew = true;
                 }
             }
@@ -1190,6 +1214,42 @@ mod tests {
         );
         sung_at(&r.lines[2], &[7_000, 7_400, 7_900]);
         assert_eq!(r.lines[3], t[3]);
+    }
+
+    #[test]
+    fn a_line_after_an_anchor_too_long_for_its_band_is_not_placed_over_it() {
+        let long = ["wheel"; 50].join(" ");
+        let lines = [
+            line(1_000, 3_000, "grey gulls wheel"),
+            line(3_000, 5_000, &long),
+            line(5_000, 8_000, "low tide hums"),
+        ];
+        // The last line's letters are sung inside its band but while the
+        // middle line's recognised words still run.
+        let mut sung = sing("grey gulls wheel", 1_000);
+        sung.extend(sing("low tide hums", 3_700));
+        let frames = 500;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("grey gulls wheel", 1.0);
+        h.extend((0..50).map(|k| Heard {
+            text: " wheel".into(),
+            start_s: 3.5 + 0.02 * k as f64,
+            end_s: 3.5 + 0.02 * k as f64 + 0.015,
+            prob: 0.9,
+        }));
+        h.extend(heard("low tide hums", 5.0));
+        let m = match_lines(&lines, &h, Options::default());
+        let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(r.methods[1], Some(Method::Anchored));
+        assert_eq!(r.methods[2], Some(Method::Refined));
+        let end = *starts(&r.lines[1]).last().unwrap();
+        assert!(starts(&r.lines[2])[0] >= end);
+        ordered(&r);
     }
 
     fn ordered(r: &Refined) {
