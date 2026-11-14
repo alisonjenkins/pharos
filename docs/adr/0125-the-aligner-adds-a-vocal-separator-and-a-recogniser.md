@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-14T07:55:00Z
-- **Deciders:** Alison (approach chosen 2026-11-14T06:15Z); runtime choice open until the spikes in plan slices 2 and 3
+- **Deciders:** Alison (approach chosen 2026-11-14T06:15Z); recogniser runtime chosen by the slice 2 spike; separator runtime open until slice 3
 
 ## Context
 
@@ -14,14 +14,14 @@ Measured in Python on the desktop GPU: htdemucs 6-16 s a song, +1.3 GB VRAM; Whi
 
 We will use htdemucs and Whisper large-v3-turbo, loaded in stages and released between stages so one song holds under 6 GiB of GPU memory, with a CPU path for both.
 
-- Recogniser runtime: whisper.cpp through `whisper-rs` with its Vulkan backend, if a one-day spike shows word times within 100 ms of the Python prototype and no new hallucination classes. Otherwise a hand port in Burn (Vulkan f32), like the letter model.
+- Recogniser runtime: whisper.cpp through `whisper-rs` with its Vulkan backend, chosen after a spike on the private set (2026-11-14): DTW word starts within 100 ms of the Python prototype for 81% of matched words (median 20 ms), final placements within 300 ms on 91% of lines, about 4x faster, RSS 0.3 GB against 4.0 GB, VRAM +2.3 GB. Settings it needs: DTW word times (a word starts at the previous token's DTW time), `n_max_text_ctx = 0` (text otherwise carries between windows), flash attention off, whisper.cpp's own seeking (no external windows). One song lost whole windows to "Thank you." decodes; the anchor-share gate keeps it at today's answer, and the cause must be found before cutover. A hand port in Burn stays the fallback.
 - Separator runtime: the htdemucs ONNX export imported into Burn, if a half-day spike matches the Python stems. Otherwise a hand port in Burn from demucs.cpp.
 - Weights are fetched and converted in the flake, as the letter model's are; the image has no Python.
 
 ## Consequences
 
 - Two more model weights in the image and on disk, and up to ~6 GiB GPU memory per song.
-- If whisper.cpp is chosen, the build gains C++ and the process gains a second GPU runtime beside Burn.
+- The build gains C++ and a second GPU runtime beside Burn: cmake, shaderc, vulkan-headers and vulkan-loader in the devShell and the package, a ~74 s first compile, a ~40 MB binary increase and a 1.6 GB ggml model file.
 - ROCm attention kernels gave wrong stems in Python on this card; the Rust paths must be checked against CPU output.
 
 ## Alternatives considered
