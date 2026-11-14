@@ -151,6 +151,7 @@ pub enum TrackState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackDownload {
     pub id: String,
+    pub title: String,
     pub state: TrackState,
     pub bytes: u64,
 }
@@ -159,6 +160,9 @@ pub struct TrackDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Download {
     pub container: ContainerRef,
+    pub title: String,
+    /// The artist for an album; `None` for a mix.
+    pub subtitle: Option<String>,
     pub tracks: Vec<TrackDownload>,
 }
 
@@ -260,6 +264,7 @@ mod tests {
     fn cached_bytes_counts_only_cached_tracks() {
         let track = |id: &str, state, bytes| TrackDownload {
             id: id.into(),
+            title: format!("Track {id}"),
             state,
             bytes,
         };
@@ -268,6 +273,8 @@ mod tests {
                 kind: ContainerKind::Album,
                 id: "a".into(),
             },
+            title: "Album One".into(),
+            subtitle: Some("Artist One".into()),
             tracks: vec![
                 track("1", TrackState::Cached, 10),
                 track("2", TrackState::Queued, 20),
