@@ -1136,6 +1136,9 @@ mod tests {
             stream_url: Some("https://h/x?api_key=SECRET".into()),
             duration_ms: 1000,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
+            group: String::new(),
         }
     }
 
