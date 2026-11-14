@@ -168,6 +168,13 @@ impl Follow {
             };
         }
         let before = self.seen.replace(snapshot.clone()).unwrap_or_default();
+        // The host stepped to the next entry of the queue and it is this same
+        // song again (queued twice): the id did not change, the entry did.
+        // Only forward: a restart or resync puts the song back at entry 0.
+        if before.index.zip(snapshot.index).is_some_and(|(b, n)| n > b) {
+            self.seen = None;
+            return vec![Step::Moved(playing)];
+        }
         let mut steps = Vec::new();
         if snapshot.duration_ms != before.duration_ms {
             steps.push(Step::Event(MediaEvent::Changed));
@@ -676,6 +683,29 @@ mod tests {
         assert!(!second.begin(id(2), &ids(&[3])));
         assert!(!needs_resync(&fake.snapshot(), id(2), &ids(&[3])));
         assert_eq!(fake.snapshot().queue, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn the_host_stepping_to_a_repeat_of_the_same_song_is_followed() {
+        let (fake, m) = music();
+        let mut f = Follow::default();
+        m.begin(id(1), &ids(&[1, 2]));
+        follow(&fake, &mut f, 1);
+        fake.next();
+        assert_eq!(fake.snapshot().current_id.as_deref(), Some("1"));
+        assert_eq!(follow(&fake, &mut f, 1), vec![Step::Moved(id(1))]);
+    }
+
+    #[test]
+    fn putting_the_song_back_at_the_start_of_the_host_queue_is_not_a_move() {
+        let (fake, m) = music();
+        let mut f = Follow::default();
+        m.begin(id(1), &ids(&[1]));
+        follow(&fake, &mut f, 1);
+        fake.next();
+        follow(&fake, &mut f, 1);
+        m.restart(id(1), &ids(&[]));
+        assert!(!follow(&fake, &mut f, 1).contains(&Step::Moved(id(1))));
     }
 
     #[test]
