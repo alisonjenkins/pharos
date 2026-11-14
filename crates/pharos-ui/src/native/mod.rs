@@ -92,6 +92,7 @@ pub mod quality;
 pub mod queue;
 pub mod rails;
 pub mod reader;
+pub mod reader_passwords;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod reader_web;
 pub mod report;
