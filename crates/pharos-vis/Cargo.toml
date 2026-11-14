@@ -1,0 +1,16 @@
+[package]
+name = "pharos-vis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Decodes a song just ahead of the playhead into visualiser frames (ADR-0133)"
+
+[dependencies]
+log = "0.4"
+realfft = "3"
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "aac", "isomp4", "ogg", "vorbis", "wav", "alac", "pcm"] }
+
+[lints]
+workspace = true

@@ -23,6 +23,7 @@ members = [
     "crates/pharos-sync",
     "crates/pharos-test-metrics",
     "crates/pharos-transcode",
+    "crates/pharos-vis",
     "crates/pharos-ui",
     "crates/quire",
     "crates/quire-pdf",
