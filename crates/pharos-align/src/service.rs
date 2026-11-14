@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::audio::DecodeError;
 use crate::line::LineSpans;
 use crate::offset::{estimate, probe_windows, shift};
+use crate::placement::{Fallback, Placement};
 use crate::plan::{stamps, window, Line, Stamp};
 use crate::text::words;
 
@@ -225,6 +226,8 @@ pub struct Aligned {
     pub probes: Vec<Option<i64>>,
     pub reason: String,
     pub phases: Phases,
+    /// How the lines with words were placed.
+    pub placement: Placement,
 }
 
 struct Slot {
@@ -507,6 +510,7 @@ fn run_song(
     let mut out = Vec::with_capacity(lines.len());
     let mut words_aligned = 0;
     let mut prev_end_ms = 0;
+    let mut with_words = 0;
     for (index, line) in lines.iter().enumerate() {
         let w_list = words(&line.text);
         if w_list.is_empty() {
@@ -518,6 +522,7 @@ fn run_song(
             out.push(done);
             continue;
         }
+        with_words += 1;
         let (w_start, w_end) = window(line, w_list.len(), prev_end_ms);
         let span = tracing::info_span!(
             "aligner.decode",
@@ -582,6 +587,7 @@ fn run_song(
         probes: found.probes,
         reason: found.reason,
         phases,
+        placement: Placement::kept(with_words, Fallback::Off),
     })
 }
 

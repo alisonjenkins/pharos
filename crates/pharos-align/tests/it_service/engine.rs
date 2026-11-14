@@ -97,6 +97,24 @@ fn two_lines_one_without_words() {
 }
 
 #[test]
+fn todays_path_keeps_every_line_with_words_and_says_the_recogniser_is_off() {
+    use pharos_align::placement::{Fallback, Method};
+    let lines = vec![
+        line(1000, 2000, "Hello world"),
+        line(2500, 3000, "\u{266a}\u{266a}"),
+        line(3500, 4500, "and again"),
+    ];
+    let got = engine(silent())
+        .align_song("a", Path::new("/a"), lines)
+        .unwrap();
+    assert_eq!(got.placement.count(Method::Kept), 2);
+    for m in [Method::Anchored, Method::Refined, Method::Between] {
+        assert_eq!(got.placement.count(m), 0);
+    }
+    assert_eq!(got.placement.fallback, Some(Fallback::Off));
+}
+
+#[test]
 fn a_line_sung_straight_after_another_cannot_take_its_last_word() {
     let lines = vec![
         line(1000, 1100, "Hello world"),
