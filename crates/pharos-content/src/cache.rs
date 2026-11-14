@@ -282,8 +282,10 @@ fn now_ms() -> u64 {
 
 /// Write `bytes` to `path` whole: temp file, fsync, rename.
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Unique per call: two writers to one destination must not share a temp file.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", SEQ.fetch_add(1, Ordering::Relaxed)));
     let tmp = PathBuf::from(tmp);
     let res = (|| {
         let mut f = std::fs::File::create(&tmp)?;
@@ -1129,6 +1131,37 @@ mod tests {
         put(&c, "track/d", 100);
         assert!(!c.is_complete("track/b") && !c.is_complete("track/c"));
         assert!(c.is_complete("track/a"), "still current");
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_path_each_land_whole() {
+        let d = tmp("atomic-race");
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("shared.json");
+        let handles: Vec<_> = (0..8u8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let body = vec![b'a' + n; 256 * 1024];
+                    (0..25).all(|_| write_atomic(&path, &body).is_ok())
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(h.join().unwrap(), "every writer's rename succeeds");
+        }
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), 256 * 1024);
+        assert!(
+            got.iter().all(|b| *b == got[0]),
+            "one writer's bytes, whole"
+        );
+        let strays: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != "shared.json")
+            .collect();
+        assert!(strays.is_empty(), "no temp file is left behind");
     }
 
     #[test]
