@@ -10,6 +10,7 @@
 
 mod art;
 mod compat;
+mod focus;
 pub mod content;
 
 use std::path::Path;
@@ -616,6 +617,9 @@ fn play(env: &mut JNIEnv, item: Item, source: &str, mut queue: Vec<Item>, gen: u
         env.call_method(&player, setter, format!("(Landroid/media/MediaPlayer${iface};)V"), &[JValue::Object(&listener)])
             .map_err(jerr(setter))?;
     }
+    if let Err(e) = focus::apply(env, &player) {
+        log(&format!("play id={}: no audio attributes: {e}", item.id));
+    }
     let src = JObject::from(env.new_string(source).map_err(jerr("source"))?);
     env.call_method(&player, "setDataSource", "(Ljava/lang/String;)V", &[JValue::Object(&src)])
         .map_err(jerr("setDataSource"))?;
@@ -702,7 +706,14 @@ fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         return set_playback_state(env, session.as_obj(), state, 0);
     }
     drop(guard);
+    if method == "start" && !focus::request(env)? {
+        log("start: audio focus refused, not started");
+        return Ok(());
+    }
     env.call_method(player.as_obj(), method, "()V", &[]).map_err(jerr(method))?;
+    if method == "stop" {
+        focus::abandon(env)?;
+    }
     let pos = env
         .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
         .and_then(|v| v.i())
@@ -887,6 +898,10 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         env.call_method(&session, "setCallback", "(Landroid/media/session/MediaSession$Callback;)V", &[JValue::Object(&cb)])
             .map_err(jerr("setCallback"))?;
         set_playback_state(env, &session, STATE_STOPPED, 0)?;
+        let listener_class: &JClass = CLASSES.get().ok_or("classes not cached")?.listener.as_obj().into();
+        if let Err(e) = focus::create(env, &this, &session, listener_class) {
+            log(&format!("onCreate: audio focus unavailable: {e}"));
+        }
         // FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS:
         // deprecated no-ops since API 26, set in case the assistant reads them.
         env.call_method(&session, "setFlags", "(I)V", &[JValue::Int(3)]).map_err(jerr("setFlags"))?;
@@ -922,6 +937,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
 ) {
     guarded(&mut env, "onDestroy", (), |env| {
         let Some(st) = state_lock()?.take() else { return Ok(()) };
+        focus::destroy(env)?;
         if let Some(p) = st.player {
             env.call_method(p.as_obj(), "release", "()V", &[]).map_err(jerr("player.release"))?;
         }
@@ -1143,13 +1159,18 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             .call_method(player.as_obj(), "getDuration", "()I", &[])
             .and_then(|v| v.i())
             .map_err(jerr("getDuration"))?;
-        env.call_method(player.as_obj(), "start", "()V", &[]).map_err(jerr("start"))?;
         if let Some(st) = state_lock()?.as_mut() {
             st.prepared = true;
         }
         // getDuration is -1 for a live stream: fall back to the server's length.
         let length = if duration > 0 { i64::from(duration) } else { entry.duration_ms };
         set_metadata(env, session.as_obj(), &entry, length)?;
+        if !focus::request(env)? {
+            set_playback_state(env, session.as_obj(), STATE_PAUSED, 0)?;
+            log(&format!("player onPrepared id={}: audio focus refused, paused", entry.id));
+            return Ok(());
+        }
+        env.call_method(player.as_obj(), "start", "()V", &[]).map_err(jerr("start"))?;
         set_playback_state(env, session.as_obj(), STATE_PLAYING, 0)?;
         log(&format!("player onPrepared id={} duration_ms={length}: started", entry.id));
         Ok(())
