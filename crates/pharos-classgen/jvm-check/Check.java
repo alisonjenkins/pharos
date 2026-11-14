@@ -152,9 +152,11 @@ public class Check {
         && session.activity.flags == 67108864, "session activity is an immutable intent for PharosSearchActivity");
     expect((session.state.actions & (16384 | 32768 | 65536)) == (16384 | 32768 | 65536), "PREPARE actions advertised");
     cb.onPause();
-    expect(session.state.state == 6, "pause while preparing is ignored: " + session.state);
+    expect(session.state.state == 2, "a pause while preparing is kept: " + session.state);
     MediaPlayer.last.firePrepared();
-    expect(session.state.state == 3, "onPrepared starts playback: " + session.state);
+    expect(session.state.state == 2 && !MediaPlayer.last.playing, "onPrepared honours a pause made while preparing: " + session.state);
+    cb.onPlay();
+    expect(session.state.state == 3, "play after that starts playback: " + session.state);
     android.app.NotificationManager nm = android.app.NotificationManager.last;
     expect(nm != null && nm.channel != null && nm.channel.id.equals("playback") && nm.channel.importance == 2,
         "service creates a silent playback notification channel");

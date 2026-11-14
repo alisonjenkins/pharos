@@ -187,6 +187,12 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         return stop_player(env, &session, &player, prepared);
     }
     if !st.prepared {
+        if method == "pause" {
+            cancel_start();
+            drop(guard);
+            log("pause: player still preparing, will not start when ready");
+            return set_playback_state(env, session.as_obj(), state, 0);
+        }
         log(&format!("{method}: player still preparing, ignored"));
         return Ok(());
     }
