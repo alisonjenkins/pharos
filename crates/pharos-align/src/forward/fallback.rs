@@ -182,6 +182,23 @@ impl Model for Fallback {
         }
         self.cpu()?.emission(pcm)
     }
+
+    /// The GPU's emission or an error: the CPU pass is never built for it.
+    /// A GPU failure still counts towards the latch and moves the rest of
+    /// the song's windows to the CPU.
+    fn emission_gpu_only(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        if let Some(why) = self.song_on_cpu {
+            return Err(ModelError::Device(format!("the song is on the CPU: {why}")));
+        }
+        let gpu = &mut self.gpu;
+        let error = match catch_unwind(AssertUnwindSafe(|| gpu.emission(pcm))) {
+            Ok(Err(ModelError::Device(e))) => e,
+            Ok(other) => return other,
+            Err(panic) => format!("panicked: {}", panic_message(&*panic)),
+        };
+        self.fall_back(&error);
+        Err(ModelError::Device(error))
+    }
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
@@ -492,6 +509,35 @@ mod tests {
             assert_eq!(f.emission(&[0.0]).unwrap(), Some(vec![1.0]));
             assert_eq!(f.emission(&[failing]).unwrap(), Some(vec![2.0]));
             assert_eq!(f.emission(&[0.0]).unwrap(), Some(vec![2.0]));
+            assert_eq!(f.device().device, "cpu");
+        }
+    }
+
+    /// The stages' emission fails on a GPU error or panic and never builds
+    /// the CPU pass.
+    #[test]
+    fn a_gpu_only_emission_fails_without_building_the_cpu_pass() {
+        for failing in [1.0f32, 2.0] {
+            let loads = Arc::new(AtomicUsize::new(0));
+            let l = Arc::clone(&loads);
+            let mut f = Fallback::new(
+                Box::new(Fake("vulkan", Arc::default())),
+                Box::new(move || {
+                    l.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(Fake("cpu", Arc::default())) as Box<dyn Model>)
+                }),
+            );
+            f.begin_song();
+            assert_eq!(f.emission_gpu_only(&[0.0]).unwrap(), Some(vec![1.0]));
+            assert!(matches!(
+                f.emission_gpu_only(&[failing]),
+                Err(ModelError::Device(_))
+            ));
+            assert!(matches!(
+                f.emission_gpu_only(&[0.0]),
+                Err(ModelError::Device(_))
+            ));
+            assert_eq!(loads.load(Ordering::SeqCst), 0);
             assert_eq!(f.device().device, "cpu");
         }
     }
