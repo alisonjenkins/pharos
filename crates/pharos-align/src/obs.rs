@@ -18,6 +18,12 @@ pub const FORWARD_SECONDS: &str = "pharos_aligner_forward_seconds";
 /// song's end (allocations inside one forward pass are not sampled),
 /// `state="kept"` what stayed reserved after its empty pages were handed back.
 pub const GPU_POOL_BYTES: &str = "pharos_aligner_gpu_pool_bytes";
+/// Lyric lines by how they were placed (spec 042): `method` is
+/// [`crate::placement::Method::label`].
+pub const LINE_PLACEMENT_TOTAL: &str = "pharos_aligner_line_placement_total";
+/// Songs that kept today's per-line answer whole, by
+/// [`crate::placement::Fallback::label`] `reason`.
+pub const SONG_FALLBACK_TOTAL: &str = "pharos_aligner_song_fallback_total";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
@@ -141,6 +147,14 @@ impl Metrics {
         metrics::describe_counter!(
             crate::forward::fallback::DEVICE_FALLBACK_TOTAL,
             "Songs moved off the GPU: gpu_error per failed window, latched per song after the latch, reload_failed once when the GPU pass cannot be built again"
+        );
+        metrics::describe_counter!(
+            LINE_PLACEMENT_TOTAL,
+            "Lyric lines by placement: anchored, refined, between anchors, or kept from the per-line pass"
+        );
+        metrics::describe_counter!(
+            SONG_FALLBACK_TOTAL,
+            "Songs that kept the per-line answer whole, by reason"
         );
         metrics::describe_histogram!(
             SONG_SECONDS,
