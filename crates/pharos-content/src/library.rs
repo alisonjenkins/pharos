@@ -166,6 +166,11 @@ pub struct Library {
     online: AtomicBool,
     /// What the platform's network callback last said.
     network_up: AtomicBool,
+    /// The platform has reported the network at least once. Until it has,
+    /// `online` is only a default, so restored pin downloads wait.
+    network_known: AtomicBool,
+    /// Restored pins were queued (once, after the state is known).
+    pins_resumed: AtomicBool,
 }
 
 /// The audio cache and the thread that fills it.
@@ -327,6 +332,8 @@ impl Library {
             queues: Mutex::new(Queues::default()),
             online: AtomicBool::new(true),
             network_up: AtomicBool::new(true),
+            network_known: AtomicBool::new(false),
+            pins_resumed: AtomicBool::new(false),
         })
     }
 
@@ -539,8 +546,8 @@ impl Library {
             }
         }
         downloader.set_online(self.online.load(Ordering::SeqCst));
-        downloader.resume_pins();
         let _ = self.offline.set(Offline { cache, downloader });
+        self.resume_pins_when_known();
         Ok(())
     }
 
@@ -675,7 +682,9 @@ impl Library {
     /// instead of waiting for a timeout.
     pub fn set_online(&self, online: bool) {
         self.network_up.store(online, Ordering::SeqCst);
+        self.network_known.store(true, Ordering::SeqCst);
         self.apply_online();
+        self.resume_pins_when_known();
     }
 
     /// Whether browsing and downloads may use the server now: the network
@@ -691,6 +700,20 @@ impl Library {
         super::fault::set_unreachable(on);
         self.apply_online();
         log::info!("debug offline {}", if on { "on" } else { "off" });
+    }
+
+    /// Queue the pins a restart left unfinished, once the cache is on and the
+    /// platform has said whether the network is up: before that, the default
+    /// "online" would let them start fetching while offline.
+    fn resume_pins_when_known(&self) {
+        let Some(o) = self.offline.get() else {
+            return;
+        };
+        if self.network_known.load(Ordering::SeqCst)
+            && !self.pins_resumed.swap(true, Ordering::SeqCst)
+        {
+            o.downloader.resume_pins();
+        }
     }
 
     fn apply_online(&self) {
@@ -1552,5 +1575,24 @@ mod tests {
         });
         assert!(token::load(&token_path).unwrap().is_none());
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
+    }
+
+    #[test]
+    fn restored_pins_wait_for_the_first_network_report() {
+        let dir = std::env::temp_dir().join(format!("pharos-lib-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let c = Cache::open(&dir.join("cache"), 1 << 20).unwrap();
+            c.pin("album/1", &["track/1".to_owned(), "track/2".to_owned()]);
+        }
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        lib.enable_cache(&dir.join("cache"), 1 << 20).unwrap();
+        let o = lib.offline.get().unwrap();
+        assert_eq!(o.downloader.pending(), 0, "network state not known yet");
+        lib.set_online(false);
+        assert_eq!(o.downloader.pending(), 2, "queued, but held while offline");
+        assert!(!lib.is_online());
+        lib.set_online(false);
+        assert_eq!(o.downloader.pending(), 2, "resumed once, not per report");
     }
 }
