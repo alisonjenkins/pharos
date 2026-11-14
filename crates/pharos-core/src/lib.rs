@@ -3366,7 +3366,11 @@ pub const PROBE_SCHEMA_VERSION: i64 = 9;
 /// v1: initial. Kindle files (`.mobi`/`.azw`/`.azw3`) are read for metadata and
 /// covers and converted to EPUB where DRM-free, so rows previously stored as
 /// `unreadable` with no cover must be re-read.
-pub const BOOK_SCHEMA_VERSION: i64 = 1;
+///
+/// v2: a stem-derived title is cleaned, a book is no longer tagged with video
+/// release tags, and a PDF's `/Producer` is no longer stored as its publisher
+/// (B1421), so every book row must be re-read to lose them.
+pub const BOOK_SCHEMA_VERSION: i64 = 2;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
