@@ -272,6 +272,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             &entry.id,
             u64::try_from(length).unwrap_or(0),
             entry.position_ms,
+            !entry.book.is_empty(),
             &player,
         )?;
         let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);

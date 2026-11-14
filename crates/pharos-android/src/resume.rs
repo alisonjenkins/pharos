@@ -2,6 +2,10 @@
 //! positions). The player notes its position on pause, stop and track
 //! change, and every `RESUME_SAVE_EVERY` while playing, so a killed process
 //! loses at most that much.
+//!
+//! A book's part also tells the server where it is, every
+//! `REPORT_EVERY_TICKS` ticks while playing and on pause, stop and track
+//! change, so the phone's own player and other devices resume there too.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -9,13 +13,20 @@ use std::sync::{Mutex, OnceLock};
 use jni::objects::{GlobalRef, JValue};
 use jni::JNIEnv;
 
-use crate::{jerr, log, R, VM};
-use pharos_content::{Resume, ResumeVerdict, RESUME_MIN_TRACK_MS, RESUME_SAVE_EVERY};
+use crate::{jerr, log, LIBRARY, R, VM};
+use pharos_content::{Progress, Resume, ResumeVerdict, RESUME_MIN_TRACK_MS, RESUME_SAVE_EVERY};
+
+/// Ticks between server reports while a part plays: with the 5 s tick,
+/// about every 10 s, so another device resumes within that of the car.
+const REPORT_EVERY_TICKS: u32 = 2;
 
 struct Now {
     id: String,
     duration_ms: u64,
     player: GlobalRef,
+    /// A book's part: its progress goes to the server as well.
+    report: bool,
+    ticks: u32,
 }
 
 static STORE: OnceLock<Resume> = OnceLock::new();
@@ -67,8 +78,8 @@ fn tick_loop() {
 }
 
 fn note_if_playing(env: &mut JNIEnv) -> R<()> {
-    let guard = now()?;
-    let Some(n) = guard.as_ref() else {
+    let mut guard = now()?;
+    let Some(n) = guard.as_mut() else {
         return Ok(());
     };
     let playing = env
@@ -79,7 +90,39 @@ fn note_if_playing(env: &mut JNIEnv) -> R<()> {
         return Ok(());
     }
     let pos = position(env, &n.player)?;
+    n.ticks += 1;
+    if n.ticks % REPORT_EVERY_TICKS == 0 {
+        tell_server(n, pos, Progress::Playing);
+    }
     record(n, pos, "tick")
+}
+
+/// Sends `p` at `pos` for a book's part; nothing for anything else. The
+/// library logs the outcome; a failure here only means it was not queued.
+fn tell_server(n: &Now, pos: u64, p: Progress) {
+    if !n.report {
+        return;
+    }
+    let Some(lib) = LIBRARY.get() else {
+        return;
+    };
+    if let Err(e) = lib.progress(&n.id, pos, p) {
+        log(&format!(
+            "car progress {} {} at_ms={pos}: outcome=not_sent: {}",
+            p.label(),
+            n.id,
+            e.redacted()
+        ));
+    }
+}
+
+/// What a pause or stop of the player tells the server.
+fn progress_for(why: &str) -> Progress {
+    if why == "pause" {
+        Progress::Paused
+    } else {
+        Progress::Stopped
+    }
 }
 
 fn position(env: &mut JNIEnv, player: &GlobalRef) -> R<u64> {
@@ -125,21 +168,26 @@ fn start_at(server_ms: u64, local: Option<u64>, duration_ms: u64) -> (Option<u64
 }
 
 /// `player` is prepared with `id`. Returns where to seek before starting,
-/// and logs the decision.
+/// and logs the decision. `report` sends its progress to the server too.
 pub fn prepared(
     env: &mut JNIEnv,
     id: &str,
     duration_ms: u64,
     server_ms: u64,
+    report: bool,
     player: &GlobalRef,
 ) -> R<Option<u64>> {
-    *now()? = Some(Now {
+    let local = STORE.get().and_then(|s| s.position(id, duration_ms));
+    let (at, from) = start_at(server_ms, local, duration_ms);
+    let n = Now {
         id: id.to_owned(),
         duration_ms,
         player: player.clone(),
-    });
-    let local = STORE.get().and_then(|s| s.position(id, duration_ms));
-    let (at, from) = start_at(server_ms, local, duration_ms);
+        report,
+        ticks: 0,
+    };
+    tell_server(&n, at.unwrap_or(0), Progress::Playing);
+    *now()? = Some(n);
     match at {
         Some(ms) => {
             env.call_method(
@@ -175,7 +223,9 @@ pub fn note(pos: i64, why: &str) -> R<()> {
     let Some(n) = guard.as_ref() else {
         return Ok(());
     };
-    record(n, u64::try_from(pos).unwrap_or(0), why)
+    let pos = u64::try_from(pos).unwrap_or(0);
+    tell_server(n, pos, progress_for(why));
+    record(n, pos, why)
 }
 
 /// The current player is about to be released: save where it was.
@@ -184,7 +234,10 @@ pub fn leave(env: &mut JNIEnv, why: &str) -> R<()> {
     if let Some(n) = taken {
         // Never stops the caller from releasing the player.
         match position(env, &n.player) {
-            Ok(pos) => record(&n, pos, why)?,
+            Ok(pos) => {
+                tell_server(&n, pos, Progress::Stopped);
+                record(&n, pos, why)?;
+            }
             Err(e) => log(&format!(
                 "resume: id={} why={why} position unreadable, not saved: {e}",
                 n.id
@@ -199,6 +252,7 @@ pub fn leave(env: &mut JNIEnv, why: &str) -> R<()> {
 pub fn drop_current(finished: bool) -> R<()> {
     let taken = now()?.take();
     if let (Some(n), true) = (taken, finished) {
+        tell_server(&n, n.duration_ms, Progress::Stopped);
         record(&n, n.duration_ms, "completed")?;
     }
     Ok(())
@@ -221,5 +275,11 @@ mod tests {
             (None, "phone"),
             "past the end: not a place to seek"
         );
+    }
+
+    #[test]
+    fn a_pause_tells_the_server_paused_and_anything_else_stopped() {
+        assert_eq!(progress_for("pause"), Progress::Paused);
+        assert_eq!(progress_for("stop"), Progress::Stopped);
     }
 }
