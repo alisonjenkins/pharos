@@ -270,17 +270,21 @@ pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen
     on_worker("play", move |env| play_library(env, &id, queue, gen))
 }
 
-/// The state's session and current item when `mp` is still the current
-/// player; `None` for a player `play` has already replaced.
-pub(crate) fn if_current(
+/// Runs `effects` with the state, the player and the current item while
+/// holding the state lock, when `mp` is still the current player; `None`
+/// for a player `play` has already replaced. The identity check and the
+/// effects share one critical section, so a stale callback cannot alter a
+/// newer player's state.
+fn while_current<T>(
     env: &mut JNIEnv,
     mp: &JObject,
-) -> R<Option<(GlobalRef, GlobalRef, Item)>> {
-    let guard = state_lock()?;
-    let Some(st) = guard.as_ref() else {
+    effects: impl FnOnce(&mut JNIEnv, &mut State, GlobalRef, Item) -> R<T>,
+) -> R<Option<T>> {
+    let mut guard = state_lock()?;
+    let Some(st) = guard.as_mut() else {
         return Ok(None);
     };
-    let Some(player) = &st.player else {
+    let Some(player) = st.player.clone() else {
         return Ok(None);
     };
     if !env
@@ -290,7 +294,7 @@ pub(crate) fn if_current(
         return Ok(None);
     }
     let item = st.current.clone().ok_or("player without an item")?;
-    Ok(Some((st.session.clone(), player.clone(), item)))
+    effects(env, st, player, item).map(Some)
 }
 
 /// The length to show and where it came from. getDuration is -1 for a live
@@ -310,34 +314,42 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
     mp: JObject<'l>,
 ) {
     guarded(&mut env, "onPrepared", (), |env| {
-        let Some((session, player, entry)) = if_current(env, &mp)? else {
+        let ready = while_current(env, &mp, |env, st, player, entry| {
+            let duration = env
+                .call_method(player.as_obj(), "getDuration", "()I", &[])
+                .and_then(|v| v.i())
+                .map_err(jerr("getDuration"))?;
+            st.prepared = true;
+            let (length, source) = track_length(duration, entry.duration_ms);
+            log(&format!(
+                "duration source={source} ms={length} player_ms={duration} server_ms={} id={}",
+                entry.duration_ms, entry.id
+            ));
+            snapshot::note_duration(length);
+            let at = resume::prepared(
+                env,
+                &entry.id,
+                u64::try_from(length).unwrap_or(0),
+                entry.position_ms,
+                !entry.book.is_empty(),
+                &player,
+            )?;
+            let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
+            Ok((
+                st.session.clone(),
+                player,
+                entry,
+                length,
+                at,
+                start_wanted(),
+            ))
+        })?;
+        let Some((session, player, entry, length, at, wanted)) = ready else {
             log("player onPrepared: stale player, not started");
             return Ok(());
         };
-        let duration = env
-            .call_method(player.as_obj(), "getDuration", "()I", &[])
-            .and_then(|v| v.i())
-            .map_err(jerr("getDuration"))?;
-        if let Some(st) = state_lock()?.as_mut() {
-            st.prepared = true;
-        }
-        let (length, source) = track_length(duration, entry.duration_ms);
-        log(&format!(
-            "duration source={source} ms={length} player_ms={duration} server_ms={} id={}",
-            entry.duration_ms, entry.id
-        ));
         set_metadata(env, session.as_obj(), &entry, length)?;
-        snapshot::note_duration(length);
-        let at = resume::prepared(
-            env,
-            &entry.id,
-            u64::try_from(length).unwrap_or(0),
-            entry.position_ms,
-            !entry.book.is_empty(),
-            &player,
-        )?;
-        let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
-        if !start_wanted() {
+        if !wanted {
             set_playback_state(env, session.as_obj(), STATE_PAUSED, at)?;
             log(&format!(
                 "player onPrepared id={}: paused while preparing, not started",
@@ -373,17 +385,18 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
     extra: jni::sys::jint,
 ) -> jni::sys::jboolean {
     guarded(&mut env, "onError", (), |env| {
-        let Some((session, _, entry)) = if_current(env, &mp)? else {
+        let gone = while_current(env, &mp, |_, st, _, entry| {
+            st.player = None;
+            st.prepared = false;
+            resume::drop_current(false)?;
+            Ok((st.session.clone(), entry))
+        })?;
+        let Some((session, entry)) = gone else {
             log(&format!(
                 "player onError what={what} extra={extra}: stale player, ignored"
             ));
             return Ok(());
         };
-        if let Some(st) = state_lock()?.as_mut() {
-            st.player = None;
-            st.prepared = false;
-        }
-        resume::drop_current(false)?;
         let _ = env.call_method(&mp, "release", "()V", &[]);
         set_playback_state(env, session.as_obj(), STATE_ERROR, 0)?;
         snapshot::note_error(&format!("player error what={what} extra={extra}"));
@@ -404,7 +417,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
     mp: JObject<'l>,
 ) {
     guarded(&mut env, "onCompletion", (), |env| {
-        let Some((_, _, entry)) = if_current(env, &mp)? else {
+        let done = while_current(env, &mp, |_, _, _, entry| {
+            resume::drop_current(true)?;
+            Ok(entry)
+        })?;
+        let Some(entry) = done else {
             log("player onCompletion: stale player, ignored");
             return Ok(());
         };
@@ -412,7 +429,6 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             "player onCompletion id={}: next in the queue",
             entry.id
         ));
-        resume::drop_current(true)?;
         skip(env, 1, false)
     })
 }
