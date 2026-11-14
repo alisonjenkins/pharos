@@ -41,8 +41,11 @@ pub const MIN_WIDTH_PX: f64 = 240.0;
 /// How a video window's height follows its width: the picture is 16:9.
 const VIDEO_ASPECT: f64 = 9.0 / 16.0;
 
-/// Whether leaving a video's full view stops it (the Android TV app).
-const STOPS_VIDEO: bool = cfg!(target_os = "android");
+/// Whether leaving a video's full view stops it: only on the remote-driven TV.
+/// The phone shell is also Android but keeps its compact player.
+fn stops_video() -> bool {
+    remote_focus()
+}
 
 /// How the player is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +322,10 @@ impl Stage {
     /// it shrinks the player to the compact view. Returns the view change,
     /// if any, for the log.
     pub fn follow(&mut self, route: &Route) -> Option<View> {
+        self.follow_in(route, stops_video())
+    }
+
+    fn follow_in(&mut self, route: &Route, stops_video: bool) -> Option<View> {
         let before = (self.item, self.view);
         self.lift = false;
         match route {
@@ -328,7 +335,7 @@ impl Stage {
             }
             // The TV stops a video there, as TV apps do: a remote cannot
             // watch one in the bar and use the page at once (Alison, 2026-11-08).
-            _ if self.item.is_some() && self.view == View::Full && self.video && STOPS_VIDEO => {
+            _ if self.item.is_some() && self.view == View::Full && self.video && stops_video => {
                 self.close()
             }
             _ if self.item.is_some() && self.view == View::Full => self.view = self.compact,
@@ -1155,6 +1162,22 @@ mod tests {
         stage.show(View::Mini);
         stage.follow(&Route::Home);
         stage
+    }
+
+    #[test]
+    fn only_a_remote_driven_shell_stops_a_video_leaving_its_full_view() {
+        let mut tv = playing_full(7);
+        tv.mounted(true);
+        tv.follow_in(&Route::Home, true);
+        assert!(tv.item.is_none(), "the TV stops it");
+        let mut phone = playing_full(7);
+        phone.mounted(true);
+        phone.follow_in(&Route::Home, false);
+        assert_eq!(phone.item, Some(ItemRef::Real(7)));
+        assert_eq!(
+            phone.view, phone.compact,
+            "the phone keeps the compact player"
+        );
     }
 
     #[test]
