@@ -196,6 +196,12 @@ impl VisFrame {
 pub trait NativeAudio: Send + Sync {
     /// Replace the queue with `ids` and start at `start_index`.
     fn play(&self, ids: Vec<String>, start_index: usize);
+    /// [`NativeAudio::play`] that starts at 0 even when the host has a saved
+    /// position for the song (Start over). A host with no saved positions
+    /// needs no override.
+    fn play_from_start(&self, ids: Vec<String>, start_index: usize) {
+        self.play(ids, start_index);
+    }
     /// Replace the queue with `ids`, with `current_index` as the song now
     /// playing. The current song keeps playing: no restart, no gap.
     fn set_queue(&self, ids: Vec<String>, current_index: usize);

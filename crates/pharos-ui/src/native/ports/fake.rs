@@ -19,6 +19,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct FakeAudio {
     tx: watch::Sender<PlayerSnapshot>,
     volumes: Mutex<Vec<f32>>,
+    from_start: Mutex<Vec<bool>>,
     visualiser: Mutex<FakeVisualiser>,
 }
 
@@ -35,6 +36,7 @@ impl FakeAudio {
         Self {
             tx: watch::Sender::new(PlayerSnapshot::default()),
             volumes: Mutex::new(Vec::new()),
+            from_start: Mutex::new(Vec::new()),
             visualiser: Mutex::new(FakeVisualiser::default()),
         }
     }
@@ -42,6 +44,25 @@ impl FakeAudio {
     /// Every level the UI set, oldest first.
     pub fn volumes(&self) -> Vec<f32> {
         lock(&self.volumes).clone()
+    }
+
+    fn start(&self, ids: Vec<String>, start_index: usize) {
+        self.tx.send_modify(|s| {
+            if start_index >= ids.len() {
+                s.error = Some(format!(
+                    "start index {start_index} is outside a queue of {}",
+                    ids.len()
+                ));
+                return;
+            }
+            s.queue = ids;
+            Self::go_to(s, start_index);
+        });
+    }
+
+    /// Whether each `play` asked to start at 0, oldest first.
+    pub fn plays_from_start(&self) -> Vec<bool> {
+        lock(&self.from_start).clone()
     }
 
     /// The engine learning the current track's length.
@@ -81,17 +102,13 @@ impl Default for FakeAudio {
 
 impl NativeAudio for FakeAudio {
     fn play(&self, ids: Vec<String>, start_index: usize) {
-        self.tx.send_modify(|s| {
-            if start_index >= ids.len() {
-                s.error = Some(format!(
-                    "start index {start_index} is outside a queue of {}",
-                    ids.len()
-                ));
-                return;
-            }
-            s.queue = ids;
-            Self::go_to(s, start_index);
-        });
+        lock(&self.from_start).push(false);
+        self.start(ids, start_index);
+    }
+
+    fn play_from_start(&self, ids: Vec<String>, start_index: usize) {
+        lock(&self.from_start).push(true);
+        self.start(ids, start_index);
     }
 
     fn set_queue(&self, ids: Vec<String>, current_index: usize) {
