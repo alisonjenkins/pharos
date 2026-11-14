@@ -9,6 +9,7 @@ public class Context {
   public static final java.util.Set<BroadcastReceiver> unregistered = new java.util.HashSet<>();
   public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, int flags) { receivers.put(f.action, r); receiverFlags.put(f.action, flags); unregistered.remove(r); return null; }
   public void unregisterReceiver(BroadcastReceiver r) { if (receivers.containsValue(r)) unregistered.add(r); }
+  public android.content.res.Resources getResources() { return new android.content.res.Resources(); }
   public String getPackageName() { return "com.alisonjenkins.pharos.auto"; }
   public java.io.File getFilesDir() { java.io.File d = new java.io.File(getCacheDir(), "pharos-jvm-check-files"); d.mkdirs(); return d; }
 }
