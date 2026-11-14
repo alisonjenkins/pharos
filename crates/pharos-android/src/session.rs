@@ -83,24 +83,36 @@ pub(crate) fn publish_state(
     Ok(())
 }
 
+/// Title, artist and album for the car's now-playing screen. A book's part
+/// shows the book, its author and "Part N of M" rather than the file's own
+/// chapter title.
+fn now_playing(e: &Item) -> (&str, &str, &str) {
+    if e.book.is_empty() {
+        (&e.title, &e.subtitle, &e.album)
+    } else {
+        (&e.book, &e.subtitle, &e.album)
+    }
+}
+
 pub(crate) fn set_metadata(
     env: &mut JNIEnv,
     session: &JObject,
     e: &Item,
     duration_ms: i64,
 ) -> R<()> {
-    foreground::describe(&e.title, &e.subtitle)?;
+    let (title, artist, album) = now_playing(e);
+    foreground::describe(title, artist)?;
     const B: &str = "Landroid/media/MediaMetadata$Builder;";
     let b = env
         .new_object("android/media/MediaMetadata$Builder", "()V", &[])
         .map_err(jerr("MediaMetadata.Builder"))?;
     let mut fields = vec![
         ("android.media.metadata.MEDIA_ID", e.id.clone()),
-        ("android.media.metadata.TITLE", e.title.clone()),
-        ("android.media.metadata.ARTIST", e.subtitle.clone()),
+        ("android.media.metadata.TITLE", title.to_owned()),
+        ("android.media.metadata.ARTIST", artist.to_owned()),
     ];
-    if !e.album.is_empty() {
-        fields.push(("android.media.metadata.ALBUM", e.album.clone()));
+    if !album.is_empty() {
+        fields.push(("android.media.metadata.ALBUM", album.to_owned()));
     }
     if !e.art.is_empty() {
         let uri = art::art_uri(&e.art);
@@ -429,4 +441,40 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         log(&format!("session onPrepareFromMediaId id={id}"));
         prepare_id(env, &id)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pharos_content as content;
+
+    fn row(book: &str) -> Item {
+        Item::of_node(content::Node {
+            id: "track/1".into(),
+            title: "Chapter One".into(),
+            subtitle: "An Author".into(),
+            browsable: false,
+            playable: true,
+            art_url: None,
+            stream_url: None,
+            duration_ms: 1,
+            album: "Part 2 of 9".into(),
+            book: book.into(),
+            position_ms: 0,
+            group: String::new(),
+        })
+    }
+
+    #[test]
+    fn a_books_part_shows_the_book_its_author_and_which_part() {
+        assert_eq!(
+            now_playing(&row("A Book")),
+            ("A Book", "An Author", "Part 2 of 9")
+        );
+        assert_eq!(
+            now_playing(&row("")),
+            ("Chapter One", "An Author", "Part 2 of 9"),
+            "anything else keeps its own title"
+        );
+    }
 }
