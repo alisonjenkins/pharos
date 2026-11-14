@@ -128,6 +128,37 @@ impl KindFilter {
     }
 }
 
+/// V1393 — the kinds a listing under `parent` keeps: `kinds` as asked, or,
+/// when no kind was named under a Books library, its books alone. Its
+/// course lessons are listed by their courses (ADR-0126).
+pub(crate) fn books_default(
+    state: &AppState,
+    parent: &crate::api::jellyfin::items::ParentResolution,
+    kinds: &KindFilter,
+) -> KindFilter {
+    use crate::api::jellyfin::items::ParentResolution;
+    if !matches!(kinds, KindFilter::Unset) {
+        return kinds.clone();
+    }
+    let books = match parent {
+        ParentResolution::Filter(pharos_core::ParentFilter::Library { wire_id }) => state
+            .libraries()
+            .iter()
+            .any(|l| &l.wire_id == wire_id && l.kind == LibraryKind::Books),
+        ParentResolution::PathPrefix(root) => state
+            .libraries()
+            .iter()
+            .any(|l| &l.root_path == root && l.kind == LibraryKind::Books),
+        _ => false,
+    };
+    if books {
+        tracing::debug!("library listing: no kind named under a books library, listing its books");
+        KindFilter::Kinds(vec![MediaKind::Book])
+    } else {
+        KindFilter::Unset
+    }
+}
+
 /// The most a "latest" listing returns, whatever the caller asks for.
 pub const LATEST_MAX: u32 = 100;
 
@@ -209,15 +240,15 @@ async fn newest_items(
         ],
         ..MediaQuery::default()
     };
-    match kinds {
+    let parent = resolve_parent_filter(state, parent_id)
+        .await
+        .map_err(ListError::Store)?;
+    match books_default(state, &parent, kinds) {
         KindFilter::Unset => {}
         KindFilter::MatchesNothing => return Ok(Vec::new()),
-        KindFilter::Kinds(wanted) => mq.kinds.clone_from(wanted),
+        KindFilter::Kinds(wanted) => mq.kinds = wanted,
     }
-    match resolve_parent_filter(state, parent_id)
-        .await
-        .map_err(ListError::Store)?
-    {
+    match parent {
         ParentResolution::Empty => return Ok(Vec::new()),
         ParentResolution::All => {}
         ParentResolution::Filter(pf) => mq.parent = Some(pf),
@@ -1303,6 +1334,14 @@ async fn query_unlocalized(
         });
     }
     let is_random = sort_primary(q.sort_by.as_deref()) == SortPrimary::Random;
+    let defaulted;
+    let q = match books_default(state, &parent, &q.kinds) {
+        kinds if kinds == q.kinds => q,
+        kinds => {
+            defaulted = ItemQuery { kinds, ..q.clone() };
+            &defaulted
+        }
+    };
     let mut mq = build_media_query(user.id, q, &parent, is_random);
     apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
     if !is_random {

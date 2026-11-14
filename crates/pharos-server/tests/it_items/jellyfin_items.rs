@@ -2193,3 +2193,79 @@ async fn a_music_album_advertises_the_primary_image_it_can_serve() {
          jellyfin-web never requests the image it could serve: {album:?}"
     );
 }
+
+/// V1393 — under a Books library, `/Items` with no type named lists its
+/// books, not its course lessons; asking for series lists the courses.
+#[actix_web::test]
+async fn items_under_a_books_library_are_books_only() {
+    use pharos_core::{LibraryKind, LibraryStore as _, SeriesInfo};
+    let (state, token, _) = seed().await;
+    let books = "b".repeat(32);
+    let stores = &state.stores;
+    stores
+        .upsert_library("Reading", "/media/Books", LibraryKind::Books, &books)
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/media/Books/Widget Handbook.epub".into(),
+            title: "Widget Handbook".into(),
+            kind: MediaKind::Book,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 2,
+            path: "/media/Books/Intro to Widgets/01 - Basics/01 - Introduction.mp4".into(),
+            title: "Introduction".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Intro to Widgets".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/media/Books/Intro to Widgets".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    stores.backfill_library_ids().await.unwrap();
+    state.set_libraries(stores.libraries().await.unwrap());
+    let app = test::init_service(build_app(state.clone())).await;
+    let names = |uri: String| {
+        let app = &app;
+        let token = token.clone();
+        async move {
+            let req = test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request();
+            let v: serde_json::Value =
+                serde_json::from_slice(&test::call_and_read_body(app, req).await).unwrap();
+            v["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    (
+                        i["Name"].as_str().unwrap().to_owned(),
+                        i["Type"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        names(format!("/Items?ParentId={books}")).await,
+        [("Widget Handbook".to_owned(), "Book".to_owned())]
+    );
+    assert_eq!(
+        names(format!("/Items?ParentId={books}&IncludeItemTypes=Series")).await,
+        [("Intro to Widgets".to_owned(), "Series".to_owned())]
+    );
+}
