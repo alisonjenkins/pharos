@@ -142,6 +142,16 @@ public class Check {
     expect(session.state.state == 6, "pause while preparing is ignored: " + session.state);
     MediaPlayer.last.firePrepared();
     expect(session.state.state == 3, "onPrepared starts playback: " + session.state);
+    android.app.NotificationManager nm = android.app.NotificationManager.last;
+    expect(nm != null && nm.channel != null && nm.channel.id.equals("playback") && nm.channel.importance == 2,
+        "service creates a silent playback notification channel");
+    expect(s.inForeground && s.foregroundType == 2 && s.startedService != null && s.startedService.target == PharosMediaService.class,
+        "playing starts the service and holds it in the foreground as media playback");
+    android.app.Notification fgn = s.foregroundNotification;
+    expect(fgn != null && "playback".equals(fgn.channel) && fgn.visibility == 1 && fgn.icon == android.R.drawable.ic_media_play
+        && fgn.title != null && fgn.title.length() > 0 && fgn.style instanceof android.app.Notification.MediaStyle
+        && ((android.app.Notification.MediaStyle) fgn.style).token == s.token,
+        "the foreground notification is a public MediaStyle tied to the session, titled with the track");
     android.media.AudioManager am = android.media.AudioManager.last;
     expect(session.local != null && session.local.usage == 1 && session.local.contentType == 2, "session plays locally with media attributes: " + session.local);
     expect(MediaPlayer.last.attrsBeforeSource && MediaPlayer.last.attrs.usage == 1, "the player has media attributes before its source");
@@ -152,8 +162,11 @@ public class Check {
     expect(MediaPlayer.last.volume == 1, "regaining focus restores the volume");
     am.fireChange(-2);
     expect(session.state.state == 2 && !MediaPlayer.last.playing, "a transient loss pauses: " + session.state);
+    expect(!s.inForeground && s.stopForegroundFlags == 2 && nm != null && nm.posted.containsKey(1),
+        "pausing leaves the foreground but keeps the notification");
     am.fireChange(1);
     expect(session.state.state == 3 && MediaPlayer.last.playing, "regaining focus after a transient loss resumes: " + session.state);
+    expect(s.inForeground, "resuming returns to the foreground");
     cb.onPause();
     am.grant = 0;
     cb.onPlay();
@@ -209,6 +222,8 @@ public class Check {
     for (int i = 0; i < 300 && session.state.state != 7; i++) Thread.sleep(100);
     expect(session.state.state == 7 && "Search failed".equals(String.valueOf(session.state.error)),
         "a voice request the library cannot answer is an error the car can say, not a fallback: " + session.state);
+    expect(!s.inForeground && nm != null && !nm.posted.containsKey(1) && s.stopSelfCalls >= 1,
+        "an error removes the notification and lets the service stop");
     cb.onPlayFromSearch("test tone a", hints);
     cb.onPlayFromMediaId("nope", null);
     cb.onStop();
