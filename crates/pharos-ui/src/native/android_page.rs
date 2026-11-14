@@ -68,13 +68,30 @@ pub fn server() -> String {
         .clone()
 }
 
-/// Artwork straight from the server, which serves it without the token
-/// (keyed tags, ADR-0073). Through the proxy each image held one of the
+/// Artwork on the TV straight from the server, which serves it without the
+/// token (keyed tags, ADR-0073). Through the proxy each image held one of the
 /// WebView's request threads for seconds, and the bridge's own calls queued
-/// behind them: a D-pad press took up to 45 s to answer.
+/// behind them: a D-pad press took up to 45 s to answer. The phone's WebView
+/// cannot resolve the server's name, so there artwork goes through the proxy.
 pub fn art_src(src: &str) -> String {
-    tv_page::art_src(&server(), src)
+    let shell = super::shell::current();
+    if tv_page::is_server_art(src) {
+        ART_ROUTE_LOGGED.call_once(|| {
+            log::info!(
+                "pharos: art route shell={} verdict={}",
+                shell.label(),
+                if shell == super::shell::Shell::AndroidPhone {
+                    "proxy"
+                } else {
+                    "direct"
+                }
+            );
+        });
+    }
+    tv_page::art_src_for(shell, &server(), src)
 }
+
+static ART_ROUTE_LOGGED: std::sync::Once = std::sync::Once::new();
 
 /// Connect, then resume with the stored device token. No token, or one the
 /// server refuses, is `NotSignedIn`: the sign-in form shows.
