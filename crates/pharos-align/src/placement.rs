@@ -56,10 +56,13 @@ pub enum Fallback {
     /// The song ran on the CPU, where the stages take longer than the
     /// server waits (B1428).
     NoGpuStages,
+    /// The song passed the stages' time budget, kept under the server's
+    /// request timeout so the streamed answer is not lost (B1428).
+    StageTimeout,
 }
 
 impl Fallback {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Off,
         Self::LowAnchorShare,
         Self::SeparateFailed,
@@ -67,6 +70,7 @@ impl Fallback {
         Self::DecodeFailed,
         Self::EmissionFailed,
         Self::NoGpuStages,
+        Self::StageTimeout,
     ];
 
     /// The `reason` label of `pharos_aligner_song_fallback_total`.
@@ -79,6 +83,7 @@ impl Fallback {
             Self::DecodeFailed => "decode_failed",
             Self::EmissionFailed => "emission_failed",
             Self::NoGpuStages => "no_gpu_stages",
+            Self::StageTimeout => "stage_timeout",
         }
     }
 }

@@ -81,7 +81,7 @@ fn main() -> Result<(), Error> {
         };
         let mix = decode(&ffmpeg, inp)?;
         let (audio, s) = vocals_or_mix(mix, &choice, |_, mix| match &separator {
-            Some(sep) => sep.vocals(mix),
+            Some(sep) => sep.vocals(mix, None),
             None => Err(pharos_align::separate::SeparateError::Model {
                 path: BPK.into(),
                 message: "not loaded".into(),

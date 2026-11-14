@@ -1,6 +1,8 @@
 //! Whisper large-v3-turbo through whisper.cpp (`whisper-rs`) on Vulkan.
 
+use std::ffi::c_void;
 use std::path::Path;
+use std::time::Instant;
 
 use whisper_rs::{
     DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
@@ -66,9 +68,14 @@ impl Recogniser {
     /// Recognises 16 kHz mono audio: the whole song at once, with
     /// whisper.cpp's own seeking (windows cut outside it tripped its DTW
     /// filter on short slices), then each lost window again.
-    pub fn transcribe(&self, audio: &[f32]) -> Result<Heard, RecogniseError> {
+    /// Each decode stops with an error soon after `deadline`.
+    pub fn transcribe(
+        &self,
+        audio: &[f32],
+        deadline: Option<Instant>,
+    ) -> Result<Heard, RecogniseError> {
         let song_s = audio.len() as f64 / f64::from(RATE);
-        let first = self.decode(audio, 0.0, song_s, Decode::FIRST)?;
+        let first = self.decode(audio, 0.0, song_s, Decode::FIRST, deadline)?;
         let (segments, retries) = retry_windows(first, song_s, |start_s, end_s| {
             let at = |s: f64| ((s * f64::from(RATE)) as usize).min(audio.len());
             self.decode(
@@ -76,6 +83,7 @@ impl Recogniser {
                 start_s,
                 end_s,
                 Decode::RETRY,
+                deadline,
             )
         })?;
         for r in &retries {
@@ -98,6 +106,7 @@ impl Recogniser {
         start_s: f64,
         end_s: f64,
         how: Decode,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Segment>, RecogniseError> {
         let err = |message: String| RecogniseError::Decode {
             start_s,
@@ -105,9 +114,18 @@ impl Recogniser {
             message,
         };
         let mut state: WhisperState = self.ctx.create_state().map_err(|e| err(e.to_string()))?;
-        state
-            .full(params(how), audio)
-            .map_err(|e| err(e.to_string()))?;
+        let mut p = params(how);
+        if let Some(deadline) = &deadline {
+            // whisper-rs's `set_abort_callback_safe` casts its boxed closure
+            // back to the wrong type, so the raw callback is set instead.
+            // SAFETY: the callback only reads the `Instant` behind the
+            // pointer, which lives on this frame until `full` returns.
+            unsafe {
+                p.set_abort_callback(Some(past_deadline));
+                p.set_abort_callback_user_data(std::ptr::from_ref(deadline).cast_mut().cast());
+            }
+        }
+        state.full(p, audio).map_err(|e| err(e.to_string()))?;
         let cs = |t: i64| start_s + t as f64 / 100.0;
         let mut out = Vec::new();
         for i in 0..state.full_n_segments() {
@@ -152,6 +170,14 @@ impl Recogniser {
         }
         Ok(out)
     }
+}
+
+/// whisper.cpp's abort check, between graph computations: true once the
+/// `Instant` at `deadline` has passed.
+unsafe extern "C" fn past_deadline(deadline: *mut c_void) -> bool {
+    // SAFETY: `decode` passes a pointer to an `Instant` that outlives `full`.
+    let deadline = unsafe { &*deadline.cast::<Instant>() };
+    Instant::now() >= *deadline
 }
 
 fn params(how: Decode) -> FullParams<'static, 'static> {

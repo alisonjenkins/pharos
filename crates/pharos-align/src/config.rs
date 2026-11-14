@@ -42,6 +42,8 @@ pub struct Config {
     pub recogniser: Option<PathBuf>,
     /// htdemucs's weights, in place of the ones the binary was built with.
     pub separator: Option<PathBuf>,
+    /// How long a song may take before the stages stop (B1428).
+    pub stage_budget: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -121,6 +123,22 @@ impl Config {
             },
         };
 
+        let stage_budget = match set(get("PHAROS_ALIGNER_STAGE_BUDGET_SECS")) {
+            None => crate::service::DEFAULT_STAGE_BUDGET,
+            Some(raw) => match raw.trim().parse::<f64>() {
+                Ok(s) if s > 0.0 => Duration::try_from_secs_f64(s).map_err(|_| {
+                    invalid("PHAROS_ALIGNER_STAGE_BUDGET_SECS", "seconds > 0", &raw)
+                })?,
+                _ => {
+                    return Err(invalid(
+                        "PHAROS_ALIGNER_STAGE_BUDGET_SECS",
+                        "seconds > 0",
+                        &raw,
+                    ))
+                }
+            },
+        };
+
         let pin = match set(get("PHAROS_ALIGNER_PIN")) {
             None => PinMode::Auto,
             Some(raw) => raw
@@ -167,6 +185,7 @@ impl Config {
             ),
             recogniser: set(get("PHAROS_ALIGNER_RECOGNISER_MODEL")).map(PathBuf::from),
             separator: set(get("PHAROS_ALIGNER_SEPARATOR_WEIGHTS")).map(PathBuf::from),
+            stage_budget,
         })
     }
 }
@@ -203,6 +222,7 @@ mod tests {
         assert_eq!(c.cache_dir, PathBuf::from("/var/cache/pharos-aligner"));
         assert_eq!(c.recogniser, None, "the recogniser's stages are off");
         assert_eq!(c.separator, None);
+        assert_eq!(c.stage_budget, Duration::from_secs(300));
     }
 
     #[test]
@@ -220,8 +240,10 @@ mod tests {
             ("PHAROS_ALIGNER_CACHE_DIR", "/var/cache/aligner"),
             ("PHAROS_ALIGNER_RECOGNISER_MODEL", "/r/ggml.bin"),
             ("PHAROS_ALIGNER_SEPARATOR_WEIGHTS", "/s/htdemucs.bpk"),
+            ("PHAROS_ALIGNER_STAGE_BUDGET_SECS", "120.5"),
         ]))
         .unwrap();
+        assert_eq!(c.stage_budget, Duration::from_secs_f64(120.5));
         assert_eq!(c.recogniser, Some(PathBuf::from("/r/ggml.bin")));
         assert_eq!(c.separator, Some(PathBuf::from("/s/htdemucs.bpk")));
         assert_eq!(c.device, DeviceMode::Cpu);
@@ -270,6 +292,16 @@ mod tests {
         assert_eq!(
             e.to_string(),
             r#"PHAROS_ALIGNER_THREADS must be an integer >= 1, got "0""#
+        );
+        let e = Config::from_env(env(&[
+            ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+            ("PHAROS_ALIGNER_STAGE_BUDGET_SECS", "0"),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"PHAROS_ALIGNER_STAGE_BUDGET_SECS must be seconds > 0, got "0""#
         );
         let e = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
