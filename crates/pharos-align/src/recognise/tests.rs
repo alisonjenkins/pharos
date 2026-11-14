@@ -67,6 +67,18 @@ fn a_word_never_ends_before_it_starts() {
 }
 
 #[test]
+fn a_word_after_a_clamped_end_starts_where_that_word_ends() {
+    let w = words(&[
+        tok(" a", 1.0, 2.0),
+        tok(" b", 1.5, 1.9),
+        tok(" c", 2.1, 2.6),
+    ]);
+    // b is clamped to end at 2.0; c starting at b's raw 1.9 would overlap it.
+    assert_eq!(w[1].end_s, 2.0);
+    assert_eq!((w[2].start_s, w[2].end_s), (2.0, 2.6));
+}
+
+#[test]
 fn a_word_carries_its_tokens_mean_probability() {
     let mut a = tok(" ab", 0.0, 0.5);
     a.prob = 0.2;
