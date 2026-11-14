@@ -289,3 +289,15 @@ fn an_album_longer_than_a_page_loads_all_its_tracks() {
         "nothing left to fetch"
     );
 }
+
+#[test]
+fn a_rejected_report_signs_in_again() {
+    let (mut runner, commands) = playing();
+    let (report, _) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let commands = runner.task_outcome(report, TaskOutcome::Failed(TaskError::Unauthorized));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::Store(StoreRequest::Forget { key }) if key == ACCOUNT_KEY
+    )));
+    assert!(asked(&commands, "/QuickConnect/Initiate").is_some());
+}
