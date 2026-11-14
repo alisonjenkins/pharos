@@ -4,6 +4,7 @@ members = [
     "crates/pharos-align",
     "crates/pharos-api",
     "crates/pharos-client",
+    "crates/pharos-content",
     "crates/pharos-cache",
     "crates/pharos-cast",
     "crates/pharos-core",

@@ -8268,6 +8268,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-content"
+version = "0.0.0"
+dependencies = [
+ "capnp",
+ "futures",
+ "httparse",
+ "libc",
+ "log",
+ "pharos-api",
+ "pharos-client",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "webpki-roots 1.0.11",
+]
+
+[[package]]
 name = "pharos-core"
 version = "0.0.0"
 dependencies = [
