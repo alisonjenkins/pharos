@@ -252,15 +252,24 @@ impl Music {
         if live && current_of(&snapshot) == Some(playing) {
             return false;
         }
-        self.restart(playing, upcoming);
+        self.play(playing, upcoming, false);
         true
     }
 
-    /// Play `playing` and what follows it from the start.
+    /// Play `playing` and what follows it from 0, ignoring any position the
+    /// host saved for it (Start over).
     pub fn restart(&self, playing: ItemRef, upcoming: &[ItemRef]) {
+        self.play(playing, upcoming, true);
+    }
+
+    fn play(&self, playing: ItemRef, upcoming: &[ItemRef], from_start: bool) {
         let ids = queue_ids(playing, upcoming);
         self.sent.replace(ids.clone());
-        self.port.play(ids, 0);
+        if from_start {
+            self.port.play_from_start(ids, 0);
+        } else {
+            self.port.play(ids, 0);
+        }
     }
 
     /// Give the host the queue the player now has. The song keeps playing.
@@ -274,7 +283,7 @@ impl Music {
         match self.snapshot().state {
             PlayState::Playing | PlayState::Buffering => self.port.pause(),
             PlayState::Paused => self.port.resume(),
-            PlayState::Idle | PlayState::Ended => self.restart(playing, upcoming),
+            PlayState::Idle | PlayState::Ended => self.play(playing, upcoming, false),
         }
     }
 
@@ -460,6 +469,16 @@ mod tests {
         assert_eq!(after_unstarted(id(1), &ids(&[1, 2, 3])), ids(&[2, 3]));
         assert_eq!(after_unstarted(id(1), &ids(&[2, 3])), ids(&[2, 3]));
         assert_eq!(after_unstarted(id(1), &[]), Vec::new());
+    }
+
+    #[test]
+    fn only_a_restart_asks_the_host_to_ignore_its_saved_position() {
+        let (fake, m) = music();
+        assert!(m.begin(id(1), &[]));
+        m.restart(id(1), &[]);
+        fake.stop();
+        m.toggle(id(1), &[]);
+        assert_eq!(fake.plays_from_start(), vec![false, true, false]);
     }
 
     #[test]
