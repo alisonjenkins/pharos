@@ -8,8 +8,8 @@
 //! - EMISSION: `EMISSION.em` (f32 little-endian, frames x classes) beside
 //!   `EMISSION.meta.json` (`{frames, n_samples, lines: [{i, words}]}`, the
 //!   label ids of each line's words, checked against our own tokenizer).
-//! - TODAY.json: today's answer, last line `{offset_ms, lines: [{i, score,
-//!   words: [start_ms.., end_ms]}]}`.
+//! - TODAY.json: today's answer, last line `{lines: [{i, score, words:
+//!   [start_ms.., end_ms]}]}`.
 //!
 //! Prints `{share, fallback, lines: [{i, method, words, anchor}]}`.
 
@@ -46,7 +46,7 @@ fn lines(req: &Value) -> Result<Vec<Line>, Error> {
 }
 
 /// Today's words per line; a line today left out has no words.
-fn today(lines: &[Line], path: &str) -> Result<(Vec<LineWords>, i64), Error> {
+fn today(lines: &[Line], path: &str) -> Result<Vec<LineWords>, Error> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     let last = s.lines().last().ok_or("today's answer is empty")?;
     let v: Value = serde_json::from_str(last)?;
@@ -91,7 +91,7 @@ fn today(lines: &[Line], path: &str) -> Result<(Vec<LineWords>, i64), Error> {
             score: l["score"].as_f64(),
         };
     }
-    Ok((out, v["offset_ms"].as_i64().unwrap_or_default()))
+    Ok(out)
 }
 
 fn emission(prefix: &str, lines: &[Line]) -> Result<(Vec<f32>, usize, usize), Error> {
@@ -132,13 +132,13 @@ fn main() -> Result<(), Error> {
     let lines = lines(&read_json(req)?)?;
     let t = Transcript::read(std::path::Path::new(tr))?;
     let m = match_lines(&lines, &t.words, opts);
-    let (today, offset_ms) = today(&lines, td)?;
+    let today = today(&lines, td)?;
     let (data, frames, n_samples) = emission(em, &lines)?;
     let song = Song {
         emission: Emission::new(&data, frames, CLASSES)?,
         n_samples,
     };
-    let r = place(&lines, &today, offset_ms, &m, &song);
+    let r = place(&lines, &today, &m, &song);
     let out: Vec<Value> = r
         .lines
         .iter()
