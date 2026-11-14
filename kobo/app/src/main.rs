@@ -346,14 +346,15 @@ impl Pharos {
             format!("pharos: {} failed: {error:?}", work_label(&work)),
         );
         match (work, error) {
-            (Work::Report(_) | Work::ReportTimer, _) => {}
-            // A code nobody approved expires; ask for a fresh one.
-            (Work::Poll { .. }, TaskError::NotFound) => self.sign_in(context),
             (_, TaskError::Unauthorized) if self.account.is_some() => {
                 // Signed out on the server (the device removed, or the
                 // password changed): forget the token and sign in again.
                 self.sign_out(context);
             }
+            // A lost report only costs the server a moment of the listener's place.
+            (Work::Report(_) | Work::ReportTimer, _) => {}
+            // A code nobody approved expires; ask for a fresh one.
+            (Work::Poll { .. }, TaskError::NotFound) => self.sign_in(context),
             (_, TaskError::Offline) => {
                 self.problem("The reader is offline. Turn on Wi-Fi and try again.");
             }
