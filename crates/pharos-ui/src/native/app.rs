@@ -2098,11 +2098,13 @@ fn NativeApp(route: Route) -> Element {
     let nav = use_context::<Nav>();
     let mut start_over = use_signal(|| None::<ItemRef>);
     use_context_provider(|| StartOver(start_over));
+    let StageCtx(mut start_stage) = use_context::<StageCtx>();
     let play_picks = use_signal(|| None);
     use_context_provider(|| PlayPicks(play_picks));
     use_context_provider(|| {
         PlayFromStart(EventHandler::new(move |id: ItemRef| {
             start_over.set(Some(id));
+            start_stage.write().start_over(id);
             nav.0.call(Route::Watch(id));
         }))
     });

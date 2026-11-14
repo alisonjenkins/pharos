@@ -398,6 +398,16 @@ impl Stage {
         lift
     }
 
+    /// Play from the start was pressed on `id`. When it is already playing
+    /// (in the bar, say) the route change mounts nothing, so the play is made
+    /// a new one and its player mounts again to negotiate from 0.
+    pub fn start_over(&mut self, id: ItemRef) {
+        if self.item == Some(id) {
+            self.handoff = None;
+            self.play = self.play.wrapping_add(1);
+        }
+    }
+
     /// Play `id`. Another item is a new play; a handoff only survives as the
     /// item it was made for leaves.
     fn set_item(&mut self, id: ItemRef) {
@@ -1178,6 +1188,17 @@ mod tests {
             phone.view, phone.compact,
             "the phone keeps the compact player"
         );
+    }
+
+    #[test]
+    fn start_over_on_the_playing_item_makes_a_new_play_and_on_another_does_nothing() {
+        let mut stage = playing_full(7);
+        let key = stage.key();
+        stage.start_over(ItemRef::Real(8));
+        assert_eq!(stage.key(), key);
+        stage.start_over(ItemRef::Real(7));
+        assert_ne!(stage.key(), key, "the player mounts again");
+        assert_eq!(stage.item, Some(ItemRef::Real(7)));
     }
 
     #[test]
