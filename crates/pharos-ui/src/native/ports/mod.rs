@@ -67,6 +67,29 @@ pub fn offline_store() -> Option<Arc<dyn OfflineStore>> {
     OFFLINE_STORE.get()
 }
 
+/// What the host app runs when the user signs in or out, so a second client
+/// in the same process (the car's media service) re-reads the token.
+static ON_CREDENTIALS_CHANGED: OnceLock<fn()> = OnceLock::new();
+
+/// Called once by the host app before the UI launches.
+pub fn register_on_credentials_changed(hook: fn()) -> Result<(), AlreadyRegistered> {
+    ON_CREDENTIALS_CHANGED
+        .set(hook)
+        .map_err(|_| AlreadyRegistered)
+}
+
+/// Runs the host's hook after the stored token changed; returns whether one
+/// was registered.
+pub fn credentials_changed() -> bool {
+    match ON_CREDENTIALS_CHANGED.get() {
+        Some(hook) => {
+            hook();
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayState {
     #[default]
@@ -291,5 +314,23 @@ mod tests {
             ],
         };
         assert_eq!(d.cached_bytes(), 15);
+    }
+
+    #[test]
+    fn a_credentials_change_runs_the_registered_hook_once_per_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(!credentials_changed());
+        assert_eq!(register_on_credentials_changed(hook), Ok(()));
+        assert_eq!(
+            register_on_credentials_changed(hook),
+            Err(AlreadyRegistered)
+        );
+        assert!(credentials_changed());
+        assert!(credentials_changed());
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 }
