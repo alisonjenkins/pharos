@@ -16,6 +16,7 @@ mod debug;
 mod network;
 mod noisy;
 mod receiver;
+mod resume;
 mod voice;
 pub mod content;
 
@@ -674,6 +675,7 @@ fn play(env: &mut JNIEnv, item: Item, source: &str, mut queue: Vec<Item>, gen: u
     }
     let st = guard.as_mut().ok_or("play before onCreate")?;
     if let Some(old) = st.player.take() {
+        resume::leave(env, "track_change")?;
         let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
     }
     st.prepared = false;
@@ -805,6 +807,12 @@ fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
         .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
         .and_then(|v| v.i())
         .map_err(jerr("getCurrentPosition"))?;
+    if method != "start" {
+        resume::note(i64::from(pos), method)?;
+    }
+    if method == "stop" {
+        resume::drop_current(false)?;
+    }
     set_playback_state(env, session.as_obj(), state, i64::from(pos))
 }
 
@@ -1038,6 +1046,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         if let Err(e) = noisy::register(env, &this) {
             log(&format!("onCreate: becoming-noisy receiver unavailable: {e}"));
         }
+        if let Err(e) = files_dir(env, &this).and_then(|dir| resume::open(&dir)) {
+            log(&format!("onCreate: resume positions unavailable: {e}"));
+        }
         Ok(())
     })
 }
@@ -1054,6 +1065,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         network::unwatch(env)?;
         debug::unregister(env)?;
         noisy::unregister(env)?;
+        resume::leave(env, "destroy")?;
+        resume::close();
         if let Some(p) = st.player {
             env.call_method(p.as_obj(), "release", "()V", &[]).map_err(jerr("player.release"))?;
         }
@@ -1298,13 +1311,15 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             entry.duration_ms, entry.id
         ));
         set_metadata(env, session.as_obj(), &entry, length)?;
+        let at = resume::prepared(env, &entry.id, u64::try_from(length).unwrap_or(0), &player)?;
+        let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
         if !focus::request(env)? {
-            set_playback_state(env, session.as_obj(), STATE_PAUSED, 0)?;
+            set_playback_state(env, session.as_obj(), STATE_PAUSED, at)?;
             log(&format!("player onPrepared id={}: audio focus refused, paused", entry.id));
             return Ok(());
         }
         env.call_method(player.as_obj(), "start", "()V", &[]).map_err(jerr("start"))?;
-        set_playback_state(env, session.as_obj(), STATE_PLAYING, 0)?;
+        set_playback_state(env, session.as_obj(), STATE_PLAYING, at)?;
         log(&format!("player onPrepared id={} duration_ms={length}: started", entry.id));
         Ok(())
     })
@@ -1327,6 +1342,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             st.player = None;
             st.prepared = false;
         }
+        resume::drop_current(false)?;
         let _ = env.call_method(&mp, "release", "()V", &[]);
         set_playback_state(env, session.as_obj(), STATE_ERROR, 0)?;
         log(&format!("player onError id={} what={what} extra={extra}: released, state ERROR", entry.id));
@@ -1348,6 +1364,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             return Ok(());
         };
         log(&format!("player onCompletion id={}: next in the queue", entry.id));
+        resume::drop_current(true)?;
         skip(env, 1, false)
     })
 }

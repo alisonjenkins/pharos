@@ -41,5 +41,5 @@ pub use fault::unreachable as server_unreachable;
 pub use id::NodeId;
 pub use library::{AuthState, Library, Timeouts};
 pub use node::{Node, ART_WIDTH};
-pub use resume::{Resume, Verdict as ResumeVerdict, SAVE_EVERY as RESUME_SAVE_EVERY};
+pub use resume::{Resume, Verdict as ResumeVerdict, MIN_TRACK_MS as RESUME_MIN_TRACK_MS, SAVE_EVERY as RESUME_SAVE_EVERY};
 pub use tree::{autoplay, SearchReport};
