@@ -25,6 +25,24 @@ pub fn player() -> Option<&'static Player> {
     runtime::started()
 }
 
+/// How often [`player_within`] looks again.
+const PLAYER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The player, waiting up to `limit` for the service's `onCreate` to start
+/// it after [`start_service`].
+pub fn player_within(limit: std::time::Duration) -> Option<&'static Player> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(p) = runtime::started() {
+            return Some(p);
+        }
+        if started.elapsed() >= limit {
+            return None;
+        }
+        std::thread::sleep(PLAYER_POLL);
+    }
+}
+
 /// The library, once the media service has connected it.
 pub fn library() -> Option<&'static content::Library> {
     LIBRARY.get()
