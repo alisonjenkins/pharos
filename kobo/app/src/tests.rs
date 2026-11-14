@@ -301,3 +301,21 @@ fn a_rejected_report_signs_in_again() {
     )));
     assert!(asked(&commands, "/QuickConnect/Initiate").is_some());
 }
+
+#[test]
+fn the_album_offers_a_way_back_to_the_player() {
+    let (mut runner, _) = playing();
+    let commands = runner.action(ActionId::BACK);
+    let album = last_screen(&commands).expect("a screen");
+    let problems = album.validate(&CLARA_BW_METRICS);
+    assert!(problems.is_empty(), "{problems:?}");
+    let screen = screen_text(&album);
+    assert!(screen.contains("Playing"), "{screen}");
+    let commands = runner.action(action_id("now-playing"));
+    assert!(
+        asked(&commands, "/Sessions/Playing").is_none(),
+        "no restart"
+    );
+    let commands = runner.action(ActionId::BACK);
+    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("First Album"));
+}
