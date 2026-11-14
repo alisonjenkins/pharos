@@ -64,6 +64,7 @@ As a listener, a chorus that repeats lights up on the repeat being sung, not an 
 
 1. **Given** a line repeated four times in the lyrics, **When** aligned, **Then** each copy is placed in order on a different sung occurrence.
 2. **Given** a line the recogniser mishears, **When** aligned, **Then** it is placed between its anchored neighbours, never past them.
+3. **Given** a line after the last anchored line whose time today does not reach that anchor's placed words, **When** aligned, **Then** it keeps today's per-line time.
 
 ### User Story 3 - The first lines still arrive quickly (Priority: P2)
 
@@ -99,7 +100,7 @@ As the operator, I can tell from logs and metrics, per song and in aggregate, ho
 - **FR-002**: The aligner MUST separate the vocals from the music before recognition.
 - **FR-003**: The aligner MUST recognise the sung words with per-word times, and match them to the lyric words in lyric order. A line counts as anchored when at least half of its words (minimum 2) match.
 - **FR-004**: Inside each anchored line, word starts MUST be refined letter by letter against the audio, within a bounded margin of the anchor (prototype: ±1.5 s).
-- **FR-005**: An unanchored line MUST stay between its anchored neighbours. With no usable audio evidence it MUST fall back to its stamp moved by the nearest anchor's offset.
+- **FR-005**: An unanchored line between two anchored neighbours MUST stay between them. With no usable audio evidence it MUST fall back to its stamp moved by the nearest anchor's offset. A line before the first anchor or after the last MUST keep today's per-line time, unless today's time overlaps the placed edge line (then FR-006 applies).
 - **FR-006**: Lines MUST come out in lyric order with non-decreasing word starts (V1373).
 - **FR-007**: Whatever the alignment output looks like today (`POST /align` contract, streamed line events per ADR-0121, `score`) MUST stay compatible; any new per-line field is additive. `aligner_version` MUST rise so the server re-aligns cached songs when the operator chooses.
 - **FR-008**: Each song MUST log and count how each line was placed (anchored / refined / between anchors / fallback), the recogniser's anchor share, and the reason for every fallback, carrying the offending value (constitution III).
