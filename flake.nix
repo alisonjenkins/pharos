@@ -786,6 +786,51 @@
         } ''
           python3 ${./crates/pharos-align/tools/export_weights.py} $out
         '';
+        # Spec 042 slice 3 / ADR-0125: htdemucs, the vocal separator, as Burn
+        # code and weights. torch exports its network to ONNX here, at build
+        # time; burn-onnx's onnx2burn turns that into Rust and a .bpk.
+        separatorCheckpoint = pkgs.fetchurl {
+          url = "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th";
+          hash = "sha256-hybiGpk5eMe6CG04cudgjX1b/KZGykrKRZ/9qET6qLQ=";
+        };
+        # Only its model classes are imported (to unpickle the checkpoint),
+        # so the wheel goes on PYTHONPATH as is, without its I/O deps.
+        demucsSrc = pkgs.runCommand "demucs-4.1.0-src" {
+          nativeBuildInputs = [ pkgs.unzip ];
+          wheel = pkgs.fetchurl {
+            url = "https://files.pythonhosted.org/packages/py3/d/demucs/demucs-4.1.0-py3-none-any.whl";
+            hash = "sha256-SRaoBHAgM86TSmzfp+ON3gP3p6boX0HQEg7v6eKWZ1g=";
+          };
+        } ''
+          mkdir -p $out
+          unzip -q $wheel 'demucs/*' -d $out
+        '';
+        separatorOnnx = pkgs.runCommand "pharos-separator-onnx" {
+          nativeBuildInputs = [
+            (pkgs.python3.withPackages (ps: [
+              ps.torch ps.einops ps.julius ps.numpy ps.onnx ps.onnxruntime
+            ]))
+          ];
+          PYTHONPATH = demucsSrc;
+        } ''
+          python3 ${./crates/pharos-align/tools/export_separator.py} ${separatorCheckpoint} $out
+        '';
+        onnx2burn = craneLib.buildPackage {
+          src = pkgs.fetchCrate {
+            pname = "burn-onnx";
+            version = "0.22.0";
+            hash = "sha256-kiZqIQYO7gnURweiTZepXM15eTgVTFoOlnOitUmN3OQ=";
+          };
+          cargoExtraArgs = "--bin onnx2burn";
+          doCheck = false;
+        };
+        # htdemucs.rs (included by pharos-align's `separate` feature) and
+        # htdemucs.bpk (read at run time).
+        separatorModel = pkgs.runCommand "pharos-separator-model" {
+          nativeBuildInputs = [ onnx2burn ];
+        } ''
+          onnx2burn ${separatorOnnx}/htdemucs.onnx $out --no-development
+        '';
         aligner = pkgs.python3Packages.buildPythonApplication {
           pname = "pharos-aligner";
           version = "0.1.0";
@@ -1378,7 +1423,7 @@
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
           pharosUiOci = pharosUiImage;
-          inherit aligner alignerWeights;
+          inherit aligner alignerWeights separatorOnnx separatorModel;
           alignerOci = alignerImage;
           inherit alignerRs;
           alignerRsOci = alignerRsImage;
