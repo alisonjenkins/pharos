@@ -52,7 +52,11 @@ let
       esac
       index=$((index + 1))
     done
-    exec ${zig}/bin/zig cc -target arm-linux-musleabihf -fno-sanitize=undefined "$@"
+    # -fno-function-sections goes last to override cc-rs: with per-function
+    # sections, zig 0.16 leaves some section symbols in sqlite3.o and ring's
+    # curve25519.o undefined, and rust-lld fails linking kobod with
+    # "undefined symbol: " (no name) from .ARM.exidx.
+    exec ${zig}/bin/zig cc -target arm-linux-musleabihf -fno-sanitize=undefined "$@" -fno-function-sections
   '';
   armAr = writeShellScript "armv7-musl-ar" ''exec ${zig}/bin/zig ar "$@"'';
 in
