@@ -642,6 +642,23 @@ mod tests {
         );
     }
 
+    /// A copy whose junk suffix outnumbers its separators still folds with
+    /// the file it copies.
+    #[test]
+    fn a_hyphenated_stem_and_its_copy_fold() {
+        let groups = lone(&["/b/learn-rust-fast.epub", "/b/learn-rust-fast - Copy.epub"]);
+        assert_eq!(candidates(&groups).len(), 2, "both files share a title");
+        let f = table(&[
+            ("/b/learn-rust-fast.epub", facts(FormatRank::Epub, None)),
+            (
+                "/b/learn-rust-fast - Copy.epub",
+                facts(FormatRank::Epub, None),
+            ),
+        ]);
+        let (out, _) = fold(groups, &f);
+        assert_eq!(out.len(), 1, "{out:?}");
+    }
+
     /// A DRM-locked Kindle file names its author from the clear EXTH header,
     /// so it cannot fold into another author's book of the same title.
     #[test]
