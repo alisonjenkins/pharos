@@ -1,18 +1,25 @@
 //! One song's alignment, as `server.py`'s `_align` runs it once the request
 //! is parsed: the offset estimate, then each line in turn, one song at a time.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::anchor::{match_lines, Options};
 use crate::audio::DecodeError;
+use crate::ctc::Emission;
 use crate::line::LineSpans;
 use crate::offset::{estimate, probe_windows, shift};
-use crate::placement::{Fallback, Placement};
+use crate::placement::{Fallback, Method, Placement};
 use crate::plan::{stamps, window, Line, Stamp};
+use crate::refine::{place, Song};
+use crate::stitch::stitched;
 use crate::text::words;
+use crate::tokens::CLASSES;
+use crate::transcript;
 
 /// Sent with every answer. The server keeps only answers at or above its
 /// minimum, so an aligner deployed after the server cannot pin old times.
@@ -20,7 +27,9 @@ use crate::text::words;
 /// 3: the Rust service (spec 039).
 /// 5: each line carries its `score`. Python's aligner went to 4 with the
 ///    same field, so the shadow comparison can tell the two apart.
-pub const ALIGNER_VERSION: u32 = 5;
+/// 6: lines are placed by what the recogniser heard (spec 042, ADR-0124);
+///    each line with words says how, in `placement`.
+pub const ALIGNER_VERSION: u32 = 6;
 
 /// Why the model gave a window no spans.
 #[derive(Debug, thiserror::Error)]
@@ -126,12 +135,36 @@ pub type Loader = Box<dyn Fn() -> Result<Box<dyn Model>, String> + Send + Sync>;
 /// One window of a file to samples; `audio::decode` outside tests.
 pub type Decoder = Box<dyn Fn(&Path, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync>;
 
+/// Why a stage after today's pass failed: the reason the song keeps
+/// today's answer, and the error that caused it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageError {
+    pub fallback: Fallback,
+    pub reason: String,
+}
+
+/// The stages after today's per-line pass (spec 042, ADR-0124/0125). Each
+/// loads its model, runs it and drops it before returning, so the letter
+/// model is the only one still on the GPU when the next stage loads.
+pub trait Stages: Send + Sync {
+    /// The whole song's vocals at `audio::RATE` mono: decoded, separated
+    /// (the mix itself without a GPU), resampled.
+    fn vocals(&self, path: &Path) -> Result<Vec<f32>, StageError>;
+
+    /// The words the recogniser heard in `vocals`.
+    fn recognise(&self, vocals: &[f32]) -> Result<Vec<transcript::Word>, StageError>;
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LineWords {
     pub words: Vec<Stamp>,
     /// How well the words matched the singing, 0 to 1 to three places as
     /// server.py sends it; `null` for a line with no words or no times.
     pub score: Option<f64>,
+    /// How the line was placed, in the final answer and a corrected line
+    /// only: a line streamed from today's pass leaves it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Method>,
 }
 
 impl LineWords {
@@ -140,7 +173,13 @@ impl LineWords {
         Self {
             words: Vec::new(),
             score: None,
+            placement: None,
         }
+    }
+
+    /// The same words and score: a corrected line is one that differs.
+    fn same_times(&self, other: &Self) -> bool {
+        self.words == other.words && self.score == other.score
     }
 }
 
@@ -156,9 +195,9 @@ pub fn round_score(score: f64) -> Option<f64> {
 }
 
 /// What a song can show before it is done (ADR-0121), in the order it
-/// happens: its offset once found, then each line as it is timed. A line's
-/// words never change after it is reported; only the next line reads where
-/// it ended.
+/// happens: its offset once found, then each line as today's pass times
+/// it, then each line the recogniser placed differently, again (ADR-0124).
+/// A line's last report is what the final answer holds.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Progress<'a> {
@@ -168,7 +207,7 @@ pub enum Progress<'a> {
         aligner_version: u32,
         lines: usize,
     },
-    /// Line `index` is timed, as it will be in the final answer.
+    /// Line `index` is timed; a later report of the same line replaces it.
     Line {
         index: usize,
         #[serde(flatten)]
@@ -225,6 +264,16 @@ impl Phases {
     }
 }
 
+/// Wall time of each stage after today's pass, for the song's log line;
+/// zero for a stage that did not run.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StageTimes {
+    pub vocals_ms: u64,
+    pub recognise_ms: u64,
+    pub emission_ms: u64,
+    pub place_ms: u64,
+}
+
 /// A finished song: the answer plus what the log line and span report.
 #[derive(Debug)]
 pub struct Aligned {
@@ -235,6 +284,11 @@ pub struct Aligned {
     pub phases: Phases,
     /// How the lines with words were placed.
     pub placement: Placement,
+    /// Why the song fell back, naming the value; empty when it did not.
+    pub fallback_reason: String,
+    pub stages: StageTimes,
+    /// Lines reported again because the recogniser moved them.
+    pub corrected: usize,
 }
 
 struct Slot {
@@ -248,6 +302,7 @@ pub struct Engine {
     loader: Loader,
     decoder: Decoder,
     idle_unload: Option<Duration>,
+    stages: Option<Box<dyn Stages>>,
 }
 
 impl Engine {
@@ -260,7 +315,16 @@ impl Engine {
             loader,
             decoder,
             idle_unload,
+            stages: None,
         }
+    }
+
+    /// Runs `stages` after today's pass; without them every song keeps
+    /// today's answer with [`Fallback::Off`].
+    #[must_use]
+    pub fn with_stages(mut self, stages: Box<dyn Stages>) -> Self {
+        self.stages = Some(stages);
+        self
     }
 
     /// Drops the model when it has sat unused for the idle timeout; true if
@@ -359,7 +423,12 @@ impl Engine {
         let result = match slot.model.as_deref_mut() {
             Some(model) => {
                 model.begin_song();
-                let r = run_song(model, &self.decoder, rel_path, full_path, lines, probes, on);
+                let r = run_song(model, &self.decoder, rel_path, full_path, lines, probes, on).map(
+                    |today| match self.stages.as_deref() {
+                        Some(stages) => improve(model, stages, rel_path, full_path, today, on),
+                        None => today.kept(Fallback::Off, String::new()),
+                    },
+                );
                 let used = model.device();
                 (r, Some(used), model.end_song())
             }
@@ -427,6 +496,186 @@ fn decode_probes<'scope>(
         .collect()
 }
 
+/// Today's per-line answer, before the recogniser's stages.
+struct Today {
+    /// The request's lines, before the offset moved them: the recogniser's
+    /// placement reads their stamps as sent.
+    request: Vec<Line>,
+    answer: Answer,
+    words_aligned: usize,
+    probes: Vec<Option<i64>>,
+    reason: String,
+    phases: Phases,
+    with_words: usize,
+}
+
+impl Today {
+    /// The song with today's answer and every line with words kept, because of `why`.
+    fn kept(self, why: Fallback, reason: String) -> Aligned {
+        let placement = Placement::kept(self.with_words, why);
+        self.into_aligned(placement, reason, StageTimes::default(), 0)
+    }
+
+    fn into_aligned(
+        mut self,
+        placement: Placement,
+        fallback_reason: String,
+        stages: StageTimes,
+        corrected: usize,
+    ) -> Aligned {
+        for (line, req) in self.answer.lines.iter_mut().zip(&self.request) {
+            if line.placement.is_none() && !words(&req.text).is_empty() {
+                line.placement = Some(Method::Kept);
+            }
+        }
+        Aligned {
+            answer: self.answer,
+            words_aligned: self.words_aligned,
+            probes: self.probes,
+            reason: self.reason,
+            phases: self.phases,
+            placement,
+            fallback_reason,
+            stages,
+            corrected,
+        }
+    }
+}
+
+/// `f`'s answer, or its panic as an error.
+fn caught<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_else(|| "a panic without a message".into());
+        Err(format!("panicked: {message}"))
+    })
+}
+
+fn ms_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Stages 2 to 7 of plan 042 after today's pass: the vocals, what the
+/// recogniser heard in them, the letter model's emission over them, then
+/// every line placed. A line placed differently from today is reported
+/// again. Any stage that fails, or panics, leaves today's answer, with the
+/// reason.
+fn improve(
+    model: &mut dyn Model,
+    stages: &dyn Stages,
+    rel_path: &str,
+    full_path: &Path,
+    today: Today,
+    on: &mut dyn FnMut(Progress<'_>),
+) -> Aligned {
+    let mut times = StageTimes::default();
+    let fail = |today: Today, times: StageTimes, e: StageError| {
+        tracing::warn!(
+            path = %rel_path,
+            fallback = e.fallback.label(),
+            reason = %e.reason,
+            "recogniser stages fell back to today's answer"
+        );
+        let placement = Placement::kept(today.with_words, e.fallback);
+        today.into_aligned(placement, e.reason, times, 0)
+    };
+    let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
+
+    let t = Instant::now();
+    let vocals = tracing::info_span!("aligner.stage", stage = "vocals").in_scope(|| {
+        catch_unwind(AssertUnwindSafe(|| stages.vocals(full_path)))
+            .unwrap_or_else(|_| Err(stage(Fallback::SeparateFailed)("vocals panicked".into())))
+    });
+    times.vocals_ms = ms_since(t);
+    let vocals = match vocals {
+        Ok(v) => v,
+        Err(e) => return fail(today, times, e),
+    };
+
+    let t = Instant::now();
+    let heard = tracing::info_span!("aligner.stage", stage = "recognise").in_scope(|| {
+        catch_unwind(AssertUnwindSafe(|| stages.recognise(&vocals))).unwrap_or_else(|_| {
+            Err(stage(Fallback::RecogniseFailed)(
+                "recogniser panicked".into(),
+            ))
+        })
+    });
+    times.recognise_ms = ms_since(t);
+    let heard = match heard {
+        Ok(h) => h,
+        Err(e) => return fail(today, times, e),
+    };
+
+    let t = Instant::now();
+    let emission = tracing::info_span!("aligner.stage", stage = "emission").in_scope(|| {
+        caught(|| {
+            stitched(&vocals, |chunk| model.emission(chunk))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the letter model gives no emission".to_owned())
+        })
+        .map_err(stage(Fallback::EmissionFailed))
+    });
+    times.emission_ms = ms_since(t);
+    let data = match emission {
+        Ok(d) => d,
+        Err(e) => return fail(today, times, e),
+    };
+
+    let t = Instant::now();
+    let placed = tracing::info_span!("aligner.stage", stage = "place").in_scope(|| {
+        let frames = data.len() / CLASSES;
+        let emission = Emission::new(&data, frames, CLASSES)
+            .map_err(|e| stage(Fallback::EmissionFailed)(e.to_string()))?;
+        let matched = match_lines(&today.request, &heard, Options { slot_cap: true });
+        let song = Song {
+            emission,
+            n_samples: vocals.len(),
+        };
+        caught(|| Ok(place(&today.request, &today.answer.lines, &matched, &song)))
+            .map_err(stage(Fallback::EmissionFailed))
+    });
+    times.place_ms = ms_since(t);
+    let refined = match placed {
+        Ok(r) => r,
+        Err(e) => return fail(today, times, e),
+    };
+    if let Some(why) = refined.placement.fallback {
+        let reason = format!(
+            "{}: anchor share {:.3}",
+            why.label(),
+            refined.placement.anchor_share.unwrap_or(0.0)
+        );
+        return today.into_aligned(refined.placement, reason, times, 0);
+    }
+
+    let mut today = today;
+    let mut corrected = 0;
+    for (index, ((line, was), method)) in refined
+        .lines
+        .into_iter()
+        .zip(today.answer.lines.iter_mut())
+        .zip(refined.methods)
+        .enumerate()
+    {
+        let line = LineWords {
+            placement: method,
+            ..line
+        };
+        if !line.same_times(was) {
+            corrected += 1;
+            on(Progress::Line {
+                index,
+                words: &line,
+            });
+        }
+        *was = line;
+    }
+    today.into_aligned(refined.placement, String::new(), times, corrected)
+}
+
 fn run_song(
     model: &mut dyn Model,
     decoder: &Decoder,
@@ -435,7 +684,8 @@ fn run_song(
     lines: Vec<Line>,
     probes: Vec<Probe>,
     on: &mut dyn FnMut(Progress<'_>),
-) -> Result<Aligned, SongError> {
+) -> Result<Today, SongError> {
+    let request = lines.clone();
     let mut phases = Phases::default();
     let path: PathBuf = full_path.to_owned();
     // Summed over the probes, as the line decodes are, though they ran at once.
@@ -577,6 +827,7 @@ fn run_song(
         let done = LineWords {
             words: line_stamps,
             score: spans.score.and_then(round_score),
+            placement: None,
         };
         on(Progress::Line {
             index,
@@ -584,7 +835,8 @@ fn run_song(
         });
         out.push(done);
     }
-    Ok(Aligned {
+    Ok(Today {
+        request,
         answer: Answer {
             lines: out,
             offset_ms: found.offset_ms,
@@ -594,7 +846,7 @@ fn run_song(
         probes: found.probes,
         reason: found.reason,
         phases,
-        placement: Placement::kept(with_words, Fallback::Off),
+        with_words,
     })
 }
 
