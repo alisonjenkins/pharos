@@ -32,6 +32,8 @@ pub enum ContentError {
     TokenFile { path: PathBuf, why: String },
     #[error("audio cache {op}: {why}")]
     Cache { op: String, why: String },
+    #[error("resume file {op}: {why}")]
+    Resume { op: String, why: String },
     #[error("the content worker thread is gone")]
     WorkerGone,
 }
