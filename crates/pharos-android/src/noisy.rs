@@ -7,7 +7,7 @@ use jni::objects::JObject;
 use jni::JNIEnv;
 
 use crate::receiver::{self, Registered};
-use crate::{focus, guarded, log, transport, R, STATE_PAUSED};
+use crate::{focus, guarded, is_starting, log, transport, R, STATE_PAUSED};
 
 pub const ACTION: &str = "android.media.AUDIO_BECOMING_NOISY";
 /// `Context.RECEIVER_NOT_EXPORTED` (API 33): system broadcasts still arrive.
@@ -54,7 +54,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNoisyReceiver_on
 ) {
     guarded(&mut env, "noisy onReceive", (), |env| {
         focus::clear_resume_on_gain();
-        let action = if focus::is_playing(env)? {
+        let action = if focus::is_playing(env)? || is_starting()? {
             transport(env, "pause", STATE_PAUSED)?;
             "pause"
         } else {
