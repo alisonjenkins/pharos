@@ -4232,3 +4232,87 @@ async fn postgres_started_items_conformance() {
         .expect("connect postgres");
     run_started_items_conformance(p).await;
 }
+
+/// V1392 — a course lesson's row, and a course made only of them, are
+/// never asked to match online; a show beside them still is.
+async fn run_course_rows_are_never_asked_to_match<S>(store: S)
+where
+    S: MediaStore + SeriesMetadataStore,
+{
+    let episode = |id: u64, show: &str| {
+        let mut ep = media_item(MediaId::from(id), &format!("{show} 1"));
+        ep.kind = MediaKind::Episode;
+        ep.path = format!("/media/{show}/01 - Start.mp4").into();
+        ep.series = Some(SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            series_folder: Some(format!("/media/{show}")),
+            series_year: None,
+            series_key: None,
+        });
+        ep
+    };
+    MediaStore::put(&store, episode(1, "Intro to Widgets"))
+        .await
+        .unwrap();
+    MediaStore::put(&store, episode(2, "Show A")).await.unwrap();
+    store
+        .set_item_match(1, "local", "", "course", None, 0)
+        .await
+        .unwrap();
+    for show in ["Intro to Widgets", "Show A"] {
+        SeriesMetadataStore::upsert_series_metadata(
+            &store,
+            SeriesMetadata {
+                series_key: format!("/media/{show}"),
+                series_name: show.into(),
+                match_source: Some("search".into()),
+                metadata_refreshed_at: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let shows: Vec<String> = SeriesMetadataStore::series_needing_match(&store, 10, i64::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.series_key)
+        .collect();
+    assert_eq!(shows, ["/media/Show A"], "a course is never matched");
+    let items: Vec<MediaId> = MediaStore::items_needing_match(&store, 10, i64::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(items, [2], "a lesson is never matched");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_course_rows_are_never_asked_to_match() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_course_rows_are_never_asked_to_match(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_course_rows_are_never_asked_to_match() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "SKIP postgres_course_rows_are_never_asked_to_match: PHAROS_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let url = fresh_postgres_url(&url, "course_rows").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_course_rows_are_never_asked_to_match(p).await;
+}
