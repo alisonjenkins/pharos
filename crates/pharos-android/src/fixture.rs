@@ -98,6 +98,7 @@ mod imp {
             album: String::new(),
             book: String::new(),
             position_ms: 0,
+            group: String::new(),
         }
     }
 
