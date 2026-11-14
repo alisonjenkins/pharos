@@ -82,16 +82,28 @@ pub(crate) fn play(
     Ok(())
 }
 
+/// `id` as listed in `queue` when it is a book's part: the listing carries
+/// the book, "Part N of M" and the server's position, which a fresh node
+/// does not.
+fn book_part(queue: &[Item], id: &str) -> Option<Item> {
+    queue
+        .iter()
+        .find(|i| i.id == id && !i.book.is_empty())
+        .cloned()
+}
+
 /// Asks the library for `id`'s fresh stream URL (blocking) and plays it.
 pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
     let queue_ids: Vec<String> = queue.iter().map(|i| i.id.clone()).collect();
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         if let Some(path) = lib.local_path(id) {
-            let listed = queue
-                .iter()
-                .find(|i| i.id == id && !i.title.is_empty())
-                .cloned();
+            let listed = book_part(&queue, id).or_else(|| {
+                queue
+                    .iter()
+                    .find(|i| i.id == id && !i.title.is_empty())
+                    .cloned()
+            });
             let item = match listed {
                 Some(i) => i,
                 None => Item::of_node(
@@ -121,7 +133,13 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
         log(&format!(
             "play id={id} verdict=stream prefetch_queued={ahead}"
         ));
-        play(env, Item::of_node(node), &url, queue, gen)
+        play(
+            env,
+            book_part(&queue, id).unwrap_or(Item::of_node(node)),
+            &url,
+            queue,
+            gen,
+        )
     })();
     if let Err(e) = &outcome {
         if PLAY_GEN.load(Ordering::SeqCst) == gen {
@@ -133,6 +151,43 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
         log(&format!("play id={id} failed: {e}"));
     }
     Ok(())
+}
+
+/// Plays the book `id` (an `album/` id) from the part and place it stopped,
+/// with every part queued, from a worker thread.
+pub(crate) fn play_book(id: &str) -> R<()> {
+    let id = id.to_owned();
+    on_worker("book", move |env| {
+        let lib = LIBRARY.get().ok_or("library not connected")?;
+        let book = match lib.book(&id) {
+            Ok(b) => b,
+            Err(e) => {
+                let why = format!("book {id}: {}", e.redacted());
+                log(&format!("play {why}"));
+                snapshot::note_error(&why);
+                if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
+                    set_error(env, session.as_obj(), "Couldn't play that")?;
+                }
+                return Ok(());
+            }
+        };
+        let queue: Vec<Item> = book.parts.into_iter().map(Item::of_node).collect();
+        remember(&queue);
+        let ids = ids(&queue);
+        log(&format!(
+            "book id={id} parts={} start={}",
+            ids.len(),
+            book.start
+        ));
+        apply(
+            env,
+            Command::Play {
+                ids,
+                index: book.start,
+            },
+            Source::Car,
+        )
+    })
 }
 
 /// Plays `id` with `queue` (or the remembered list holding it): a test
@@ -212,7 +267,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         ));
         set_metadata(env, session.as_obj(), &entry, length)?;
         snapshot::note_duration(length);
-        let at = resume::prepared(env, &entry.id, u64::try_from(length).unwrap_or(0), &player)?;
+        let at = resume::prepared(
+            env,
+            &entry.id,
+            u64::try_from(length).unwrap_or(0),
+            entry.position_ms,
+            &player,
+        )?;
         let at = at.and_then(|ms| i64::try_from(ms).ok()).unwrap_or(0);
         if !focus::request(env)? {
             set_playback_state(env, session.as_obj(), STATE_PAUSED, at)?;
