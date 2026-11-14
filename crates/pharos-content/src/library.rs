@@ -245,8 +245,8 @@ fn resolve_stream(
             .stream_url
             .ok_or_else(|| ResolveError::Permanent(format!("{id} has no stream url"))),
         Ok(_) => Err(ResolveError::Permanent("unexpected reply".into())),
-        Err(e) if is_unreachable(&e) => Err(ResolveError::Transient(e.to_string())),
-        Err(e) => Err(ResolveError::Permanent(e.to_string())),
+        Err(e) if is_unreachable(&e) => Err(ResolveError::Transient(e.redacted())),
+        Err(e) => Err(ResolveError::Permanent(e.redacted())),
     }
 }
 
@@ -723,7 +723,7 @@ impl Worker {
                         Err(_) => Err(ContentError::Timeout { op: name.clone(), secs: self.limit.as_secs() }),
                     };
                     if let Err(e) = &result {
-                        log::warn!("{name}: {e}");
+                        log::warn!("{name}: {}", e.redacted());
                     }
                     let _ = reply.send(result);
                 }
@@ -744,7 +744,10 @@ impl Worker {
             } => {
                 self.qc = None;
                 if let Err(e) = token::store(&self.token_path, &token) {
-                    log::warn!("device token not kept, signing in again next start: {e}");
+                    log::warn!(
+                        "device token not kept, signing in again next start: {}",
+                        e.redacted()
+                    );
                 }
                 let cat = NativeCatalogue::new(bootstrap, closed, &session);
                 match cat.media_token().await {
@@ -753,8 +756,8 @@ impl Worker {
                         self.shared.set_auth(AuthState::SignedIn);
                     }
                     Err(e) => {
-                        log::warn!("signed in but no media token: {e}");
-                        self.shared.set_error(e.to_string());
+                        log::warn!("signed in but no media token: {}", e.redacted());
+                        self.shared.set_error(e.redacted());
                     }
                 }
             }
@@ -793,7 +796,7 @@ impl Worker {
                     log::warn!("{}: device token revoked; starting QuickConnect", op.name());
                     self.link = None;
                     if let Err(e) = token::forget(&self.token_path) {
-                        log::warn!("{e}");
+                        log::warn!("{}", e.redacted());
                     }
                     self.shared.set_auth(AuthState::SignedOut);
                     self.start_sign_in(events);
@@ -839,16 +842,19 @@ impl Worker {
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
             Err(e) if e.is_revoked() => {
-                log::warn!("stored device token refused ({e}); starting QuickConnect");
+                log::warn!(
+                    "stored device token refused ({}); starting QuickConnect",
+                    e.redacted()
+                );
                 if let Err(e) = token::forget(&self.token_path) {
-                    log::warn!("{e}");
+                    log::warn!("{}", e.redacted());
                 }
                 self.shared.set_auth(AuthState::SignedOut);
                 self.start_sign_in(events);
                 return Err(ContentError::NeedsSignIn);
             }
             Err(e) => {
-                self.shared.set_error(e.to_string());
+                self.shared.set_error(e.redacted());
                 return Err(e);
             }
         };
@@ -915,8 +921,8 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
                 }
                 Err(e) => {
                     let wait = qc.retry_delay();
-                    log::warn!("{e}; retrying in {wait:?}");
-                    let _ = events.send(Event::Failed(e.to_string()));
+                    log::warn!("{}; retrying in {wait:?}", e.redacted());
+                    let _ = events.send(Event::Failed(e.redacted()));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -931,8 +937,8 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
                 }
                 Err(e) => {
                     let wait = qc.retry_delay();
-                    log::warn!("{e}; retrying in {wait:?}");
-                    let _ = events.send(Event::Failed(e.to_string()));
+                    log::warn!("{}; retrying in {wait:?}", e.redacted());
+                    let _ = events.send(Event::Failed(e.redacted()));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -1004,7 +1010,8 @@ mod tests {
         let e = lib.children("root").expect_err("nothing is listening");
         let text = e.to_string();
         assert!(matches!(e, ContentError::NoCode { .. }), "{text}");
-        assert!(text.contains(&base.replace("http", "ws")), "{text}");
+        assert!(text.contains(&base), "{text}");
+        assert!(text.ends_with(": connect"), "the reason is a class: {text}");
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
     }
 

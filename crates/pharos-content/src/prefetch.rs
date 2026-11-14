@@ -488,7 +488,7 @@ impl Gate {
         st: &mut JobState,
         generation: &mut u64,
     ) -> Result<(), Fail> {
-        let parsed = Url::parse(url).map_err(|e| Fail::Permanent(e.to_string()))?;
+        let parsed = Url::parse(url).map_err(|e| Fail::Permanent(e.redacted()))?;
         let part = self.cache.part_path(id);
         loop {
             if !self.still_wanted(id, generation) {
@@ -506,7 +506,7 @@ impl Gate {
                 self.tuning.read_timeout,
             )
             .await
-            .map_err(|e| Fail::Transient(e.to_string()))?;
+            .map_err(|e| Fail::Transient(e.redacted()))?;
             let append = match resp.status {
                 200 => {
                     if pos > 0 {
@@ -564,7 +564,7 @@ impl Gate {
             while let Some(chunk) = resp
                 .next_chunk()
                 .await
-                .map_err(|e| Fail::Transient(e.to_string()))?
+                .map_err(|e| Fail::Transient(e.redacted()))?
             {
                 file.write_all(&chunk)
                     .map_err(|e| Fail::Permanent(format!("write part: {e}")))?;

@@ -46,6 +46,25 @@ pub enum HttpError {
     Truncated { host: String, got: u64, want: u64 },
 }
 
+impl HttpError {
+    /// The error for a log line: `Display` minus the host and any TLS or
+    /// socket reason, which can name the server.
+    pub fn redacted(&self) -> String {
+        match self {
+            HttpError::BadUrl(_) => "not a usable url".into(),
+            HttpError::Connect { .. } => "connect failed".into(),
+            HttpError::Stalled { step, secs, .. } => {
+                format!("no answer within {secs} s while {step}")
+            }
+            HttpError::Io { .. } => "read failed".into(),
+            HttpError::BadResponse { .. } => "bad response".into(),
+            HttpError::Truncated { got, want, .. } => {
+                format!("body ended after {got} of {want} bytes")
+            }
+        }
+    }
+}
+
 /// A parsed `http(s)://host[:port]/path?query`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Url {
@@ -518,6 +537,39 @@ mod tests {
             out.extend_from_slice(&c);
         }
         Ok(out)
+    }
+
+    #[test]
+    fn redacted_never_names_the_host_or_the_tls_reason() {
+        let host = "pharos.example".to_owned();
+        for e in [
+            HttpError::BadUrl(format!("bad scheme: ftp://{host}")),
+            HttpError::Connect {
+                host: host.clone(),
+                why: "invalid peer certificate: UnknownIssuer".into(),
+            },
+            HttpError::Stalled {
+                host: host.clone(),
+                step: "reading the head",
+                secs: 10,
+            },
+            HttpError::Io {
+                host: host.clone(),
+                why: format!("reset by {host}"),
+            },
+            HttpError::BadResponse {
+                host: host.clone(),
+                why: format!("head from {host}"),
+            },
+            HttpError::Truncated {
+                host: host.clone(),
+                got: 1,
+                want: 2,
+            },
+        ] {
+            let r = e.redacted();
+            assert!(!r.contains(&host) && !r.contains("certificate"), "{r}");
+        }
     }
 
     #[test]

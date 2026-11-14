@@ -125,7 +125,7 @@ pub async fn children<C: Catalogue>(
                     .iter_mut()
                     .filter(|t| t.playable)
                     .for_each(|t| t.album.clone_from(&album.name)),
-                Err(e) => log::warn!("album {a} name unknown, tracks show none: {e}"),
+                Err(e) => log::warn!("album {a} name unknown, tracks show none: {}", e.redacted()),
             }
             tracks
         }
@@ -294,7 +294,7 @@ pub async fn search_reported<C: Catalogue>(
             match cat.search(&word, SEARCH_LIMIT).await {
                 Ok(items) => add_candidates(urls, &heard, &items, &mut found),
                 Err(e) if e.is_revoked() => return Err(e),
-                Err(e) => log::warn!("search word {word:?}: {e}"),
+                Err(e) => log::warn!("search word {word:?}: {}", e.redacted()),
             }
         }
         rank(&mut found);
