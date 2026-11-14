@@ -114,6 +114,13 @@ pub fn words(tokens: &[Token]) -> Vec<Word> {
         .collect()
 }
 
+/// The words of every segment, in order. Each segment's first word starts
+/// at its own `t0`: a segment after a gap would otherwise open on a word
+/// stretched back to the end of the segment before it.
+pub fn segment_words(segments: &[Segment]) -> Vec<Word> {
+    segments.iter().flat_map(|s| words(&s.tokens)).collect()
+}
+
 /// Whether whisper put one caption over a whole window.
 pub fn wants_retry(seg: &Segment) -> bool {
     seg.end_s - seg.start_s >= RETRY_MIN_SPAN_S && groups(&seg.tokens).len() <= RETRY_MAX_WORDS

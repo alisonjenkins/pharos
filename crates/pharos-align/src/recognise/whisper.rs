@@ -9,7 +9,7 @@ use whisper_rs::{
     WhisperContextParameters, WhisperState,
 };
 
-use super::{retry_windows, words, Decode, Retry, Segment, Token};
+use super::{retry_windows, segment_words, Decode, Retry, Segment, Token};
 use crate::audio::RATE;
 use crate::transcript::Transcript;
 
@@ -89,10 +89,9 @@ impl Recogniser {
         for r in &retries {
             r.record();
         }
-        let tokens: Vec<Token> = segments.iter().flat_map(|s| s.tokens.clone()).collect();
         Ok(Heard {
             transcript: Transcript {
-                words: words(&tokens),
+                words: segment_words(&segments),
             },
             segments,
             retries,
