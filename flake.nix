@@ -1468,6 +1468,8 @@
           testMediaOci = testMediaImage;
           testMediaTree = pharosTestMedia;
           composeFile = composeFile;
+          # Cobalt with the Pharos app built in, for the Kobo reader (ADR-0136).
+          kobo = pkgs.callPackage ./kobo { };
         };
 
         apps.default = {
