@@ -269,6 +269,15 @@ pub trait CoverSink: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<std::path::PathBuf>> + Send + 'a>,
     >;
+
+    /// Remove the cached `role` image held for this item as a `kind`, whose
+    /// artwork row was deleted. Absent already is not an error.
+    fn forget<'a>(
+        &'a self,
+        item_id: MediaId,
+        role: &'a str,
+        kind: MediaKind,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
 }
 
 impl<P: Prober> std::fmt::Debug for FsScanner<P> {
@@ -445,6 +454,72 @@ impl<P: Prober> FsScanner<P> {
     pub fn with_course_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
         self.course_roots = roots.into_iter().collect();
         self
+    }
+
+    /// V1392 — mark a lesson's row as a course's, once: its earlier online
+    /// match is replaced by the mark, and the artwork a provider gave it is
+    /// removed with its cached images, so the old film's poster goes too.
+    async fn stamp_course_lesson<S: MediaStore + pharos_core::SeriesIdentityStore>(
+        &self,
+        store: &S,
+        id: MediaId,
+        path: &Path,
+        prior: CoursePrior,
+    ) -> DomainResult<()> {
+        use crate::course::{COURSE_MATCH_PROVIDER, COURSE_MATCH_SOURCE};
+        if prior.source.as_deref() == Some(COURSE_MATCH_SOURCE) {
+            return Ok(());
+        }
+        store
+            .set_item_match(
+                id,
+                COURSE_MATCH_PROVIDER,
+                "",
+                COURSE_MATCH_SOURCE,
+                None,
+                unix_now(),
+            )
+            .await?;
+        let art = store.delete_provider_artwork(id).await?;
+        if !art.is_empty() {
+            let mut kinds = vec![MediaKind::Episode];
+            kinds.extend(prior.kind.filter(|k| *k != MediaKind::Episode));
+            if let Some(sink) = self.cover_sink.as_ref() {
+                for (role, _) in &art {
+                    for kind in &kinds {
+                        if let Err(e) = sink.forget(id, role, *kind).await {
+                            tracing::warn!(
+                                media.id = id,
+                                path = %path.display(),
+                                role = %role,
+                                kind = kind.as_str(),
+                                error = %e,
+                                "a course lesson's cached provider image could not be removed",
+                            );
+                        }
+                    }
+                }
+            }
+            store.bump_art_version(id).await?;
+        }
+        if let Some(provider) = prior
+            .provider
+            .filter(|p| !p.is_empty() && p != COURSE_MATCH_PROVIDER)
+        {
+            let reason = ReprobeReason::CourseLesson.label();
+            tracing::info!(
+                media.id = %id,
+                path = %path.display(),
+                reason,
+                provider,
+                prior_source = prior.source.as_deref().unwrap_or(""),
+                prior_kind = prior.kind.map_or("", MediaKind::as_str),
+                artwork_removed = art.len(),
+                "reset a row's online match that no longer fits it",
+            );
+            metrics::counter!("pharos_scan_match_reset_total", "reason" => reason).increment(1);
+        }
+        Ok(())
     }
 
     /// The lesson `path` is, under this scanner's Books roots.
@@ -891,7 +966,13 @@ impl<P: Prober> FsScanner<P> {
                             // or resized edition must re-put the row, or its
                             // alternate_sources and has_3d go stale.
                             match edition_drift_for(store, row, state.has_editions, &alts).await? {
-                                None if !kind_drift(store, row, &primary).await
+                                None if !kind_drift(
+                                    store,
+                                    row,
+                                    &primary,
+                                    self.course_lesson(&primary).is_some(),
+                                )
+                                .await
                                     && !nfo_drift(&nfos, row, &primary, state.last_scanned) =>
                                 {
                                     seen_batch.push((row, mtime, size));
@@ -1165,6 +1246,9 @@ impl<P: Prober> FsScanner<P> {
                 // Captured before `put` consumes the item; the cover write below
                 // needs them and must run AFTER the row exists.
                 let (item_kind, item_path) = (item.kind, item.path.clone());
+                let course = (item_kind == MediaKind::Episode
+                    && self.course_lesson(&item_path).is_some())
+                .then(CoursePrior::default);
                 batch_items.push(item);
                 batch_followups.push(WrittenItem {
                     item_id,
@@ -1180,6 +1264,7 @@ impl<P: Prober> FsScanner<P> {
                     fp,
                     existed,
                     stale_match: None,
+                    course,
                 });
                 if batch_items.len() >= self.put_batch_size {
                     self.flush_probe_writes(
@@ -1537,7 +1622,10 @@ impl<P: Prober> FsScanner<P> {
         for (item, written) in items.iter().zip(followups.iter_mut()) {
             if written.existed {
                 if let Ok(prior) = store.get(item.id).await {
-                    written.stale_match = stale_match(&prior, item);
+                    match written.course.as_mut() {
+                        Some(course) => *course = CoursePrior::of(&prior),
+                        None => written.stale_match = stale_match(&prior, item),
+                    }
                 }
             }
         }
@@ -1596,8 +1684,15 @@ impl<P: Prober> FsScanner<P> {
             fp,
             existed,
             stale_match,
+            course,
         } = written;
-        reset_stale_match(store, item_id, &item_path, stale_match).await?;
+        match course {
+            Some(prior) => {
+                self.stamp_course_lesson(store, item_id, &item_path, prior)
+                    .await?
+            }
+            None => reset_stale_match(store, item_id, &item_path, stale_match).await?,
+        }
         // 004-books — a book's cover lives inside the file, so it has no
         // sidecar path to record and is extracted + cached here instead.
         self.store_book_cover(store, item_id, item_kind, &item_path)
@@ -1709,16 +1804,24 @@ impl<P: Prober> FsScanner<P> {
         } = merge_metadata_into_item(&mut item, meta);
         self.keep_lesson_title(&mut item);
         let item_kind = item.kind;
-        let stale = match existing {
-            Some(_) => store
-                .get(item_id)
-                .await
-                .ok()
-                .and_then(|prior| stale_match(&prior, &item)),
+        let prior = match existing {
+            Some(_) => store.get(item_id).await.ok(),
             None => None,
         };
+        let course = (item_kind == MediaKind::Episode && self.course_lesson(path).is_some())
+            .then(|| prior.as_ref().map(CoursePrior::of).unwrap_or_default());
+        let stale = match (&course, &prior) {
+            (None, Some(prior)) => stale_match(prior, &item),
+            _ => None,
+        };
         store.put(item).await?;
-        reset_stale_match(store, item_id, path, stale).await?;
+        match course {
+            Some(prior) => {
+                self.stamp_course_lesson(store, item_id, path, prior)
+                    .await?
+            }
+            None => reset_stale_match(store, item_id, path, stale).await?,
+        }
         // 004-books — the watched create/modify path extracts + caches a book
         // cover the same way a full scan does, or a book added by the watcher
         // would be the only one without a tile.
@@ -2070,6 +2173,27 @@ struct WrittenItem {
     existed: bool,
     /// Why the row's online match no longer fits it ([`stale_match`]).
     stale_match: Option<(&'static str, String)>,
+    /// A course lesson's row, with what it held before this write.
+    course: Option<CoursePrior>,
+}
+
+/// What a course lesson's row held before it was re-written: the mark is
+/// written, and an old match cleared, only when it is not already a lesson's.
+#[derive(Debug, Clone, Default)]
+struct CoursePrior {
+    kind: Option<MediaKind>,
+    provider: Option<String>,
+    source: Option<String>,
+}
+
+impl CoursePrior {
+    fn of(prior: &MediaItem) -> Self {
+        Self {
+            kind: Some(prior.kind),
+            provider: prior.match_provider.clone(),
+            source: prior.match_source.clone(),
+        }
+    }
 }
 
 /// Clear a row's online match that [`stale_match`] found no longer fits it,
@@ -2473,17 +2597,25 @@ pub(crate) enum ReprobeReason {
     Added,
     /// A stored edition's file is still there but its size differs.
     Changed,
+    /// A course lesson's row is not yet stored as one (V1392).
+    CourseLesson,
 }
 
 impl ReprobeReason {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::Removed, Self::Added, Self::Changed];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Removed,
+        Self::Added,
+        Self::Changed,
+        Self::CourseLesson,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Removed => "edition_removed",
             Self::Added => "edition_added",
             Self::Changed => "edition_changed",
+            Self::CourseLesson => "course_lesson",
         }
     }
 }
@@ -2567,7 +2699,14 @@ fn record_edition_drift(
 /// otherwise have to re-probe the whole library to apply). Asked only of a
 /// video that [`is_episode_path`] does not already call an episode, so the
 /// row read happens only for the few files the rule changed.
-async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> bool {
+///
+/// V1392 — a `course` lesson (a video under a Books root) drifts while its
+/// row is not an episode marked as a course's, so a film match stored before
+/// the rule is cleared on the next pass.
+async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path, course: bool) -> bool {
+    if course {
+        return course_drift(store, row, primary).await;
+    }
     if is_episode_path(primary) || !is_show_folder_video(primary) {
         return false;
     }
@@ -2587,6 +2726,31 @@ async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> b
             "a film row sits under a show folder; re-probing it as an episode",
         );
         metrics::counter!("pharos_scan_reprobe_total", "reason" => "kind_changed").increment(1);
+    }
+    drifted
+}
+
+async fn course_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> bool {
+    let stored = match store.get(row).await {
+        Ok(item) => item,
+        Err(err) => {
+            tracing::warn!(media.id = %row, path = %primary.display(), error = %err, "could not read a row to check it is a course lesson");
+            return false;
+        }
+    };
+    let drifted = stored.kind != MediaKind::Episode
+        || stored.match_source.as_deref() != Some(crate::course::COURSE_MATCH_SOURCE);
+    if drifted {
+        let reason = ReprobeReason::CourseLesson.label();
+        tracing::info!(
+            media.id = %row,
+            path = %primary.display(),
+            stored = stored.kind.as_str(),
+            match_source = stored.match_source.as_deref().unwrap_or(""),
+            reason,
+            "a video in a books library is not yet stored as a course lesson; re-probing it",
+        );
+        metrics::counter!("pharos_scan_reprobe_total", "reason" => reason).increment(1);
     }
     drifted
 }
@@ -6157,6 +6321,25 @@ mod tests {
     }
 
     impl pharos_core::SeriesIdentityStore for MemStore {
+        async fn delete_provider_artwork(
+            &self,
+            id: MediaId,
+        ) -> DomainResult<Vec<(String, String)>> {
+            let mut art = self
+                .artwork
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let gone: Vec<(MediaId, String)> = art
+                .iter()
+                .filter(|((iid, _), (source, _))| *iid == id && source != "local")
+                .map(|(k, _)| k.clone())
+                .collect();
+            Ok(gone
+                .into_iter()
+                .filter_map(|k| art.remove(&k).map(|(_, locator)| (k.1, locator)))
+                .collect())
+        }
+
         async fn series_overrides(
             &self,
             folders: &[String],
@@ -12097,5 +12280,85 @@ mod tests {
     fn course_lesson_outcome_labels_are_distinct() {
         let labels: HashSet<&str> = CourseLessonOutcome::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(labels.len(), CourseLessonOutcome::ALL.len());
+    }
+
+    /// B1423 / V1392 — an unchanged lesson stored as a film with a TMDB match
+    /// is re-probed once as a lesson: the match gives way to the course mark
+    /// and the provider's artwork goes, a sidecar's stays; the next pass
+    /// skips it.
+    #[tokio::test]
+    async fn an_unchanged_film_in_a_books_root_becomes_a_course_lesson() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let file = "Intro to Widgets/02 - Assembly/03_-_0201_Fitting_the_Base.mp4";
+        touch(td.path(), file).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let id = stable_id(&td.path().join(file));
+        assert_eq!(store.get(id).await.unwrap().kind, MediaKind::Movie);
+        store
+            .set_item_match(id, "tmdb", "1234", "search", Some(0.9), 100)
+            .await
+            .unwrap();
+        store
+            .set_artwork(id, "Primary", "tmdb", "/cache/primary/movie/1.jpg")
+            .await
+            .unwrap();
+        store
+            .set_artwork(id, "Backdrop", "local", "/media/fanart.jpg")
+            .await
+            .unwrap();
+        let art_before = store.get(id).await.unwrap().art_version;
+
+        let s = FsScanner::new(FakeProber::default()).with_course_roots([td.path().to_path_buf()]);
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let item = store.get(id).await.unwrap();
+        assert_eq!(item.kind, MediaKind::Episode);
+        assert_eq!(item.title, "Fitting the Base");
+        assert_eq!(item.match_source.as_deref(), Some("course"));
+        assert_eq!(item.match_provider.as_deref(), Some("local"));
+        assert_eq!(item.match_external_id.as_deref(), Some(""));
+        assert!(item.art_version > art_before, "cached images are refetched");
+        let art = store.artwork_for(id).await.unwrap();
+        assert_eq!(
+            art,
+            [(
+                "Backdrop".to_owned(),
+                "local".to_owned(),
+                "/media/fanart.jpg".to_owned()
+            )]
+        );
+        let count = |name: &str| counter_labelled(&snapshotter, name, "reason", "course_lesson");
+        assert_eq!(count("pharos_scan_reprobe_total"), 1);
+        assert_eq!(count("pharos_scan_match_reset_total"), 1);
+
+        let again = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(again.skipped, 1, "a stamped lesson is skipped: {again:?}");
+        assert_eq!(count("pharos_scan_reprobe_total"), 1);
+        assert_eq!(count("pharos_scan_match_reset_total"), 1);
+    }
+
+    /// V1392 — a new lesson is marked on its first write, by the watcher too.
+    #[tokio::test]
+    async fn a_new_lesson_is_marked_a_course_lesson() {
+        let td = TempDir::new().unwrap();
+        let file = "Widget Basics/01 - Getting Started.mp4";
+        touch(td.path(), file).await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default()).with_course_roots([td.path().to_path_buf()]);
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&td.path().join(file), &store, scan_id)
+            .await
+            .unwrap();
+        let item = store.get(stable_id(&td.path().join(file))).await.unwrap();
+        assert_eq!(item.kind, MediaKind::Episode);
+        assert_eq!(item.match_source.as_deref(), Some("course"));
     }
 }
