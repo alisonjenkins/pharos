@@ -255,7 +255,7 @@ const BRAND_PLAY: &str = "M26 16.5V35.5L42 26Z";
 
 /// The mark and the name, as the page heading.
 #[component]
-fn Brand() -> Element {
+pub(super) fn Brand() -> Element {
     rsx! {
         h1 { class: "pharos-lockup", BrandMark {} span { "pharos" } }
     }
