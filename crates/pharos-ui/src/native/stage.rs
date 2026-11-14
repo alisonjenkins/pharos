@@ -808,6 +808,7 @@ pub fn StageBar(
             div {
                 id: STAGE_PROGRESS_ID,
                 class: "pharos-stage-progress",
+                "data-measure": "true",
                 aria_hidden: "true",
                 onclick: move |evt: MouseEvent| {
                     let width = platform::element_width(STAGE_PROGRESS_ID);
