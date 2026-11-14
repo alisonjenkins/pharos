@@ -159,7 +159,8 @@ fn main() -> Result<(), Error> {
         .collect();
     println!(
         "{}",
-        json!({"share": m.share(), "fallback": r.placement.fallback_label(), "lines": out})
+        json!({"share": m.share(), "fallback": r.placement.fallback_label(),
+            "dropped": r.placement.dropped_anchors, "lines": out})
     );
     Ok(())
 }

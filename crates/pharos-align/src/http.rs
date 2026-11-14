@@ -326,6 +326,7 @@ fn run_song(
                 placed_between = p.count(Method::Between),
                 placed_kept = p.count(Method::Kept),
                 anchor_share = p.anchor_share,
+                anchors_dropped = p.dropped_anchors,
                 fallback = p.fallback_label(),
                 words_aligned = a.words_aligned,
                 offset_ms = a.answer.offset_ms,
