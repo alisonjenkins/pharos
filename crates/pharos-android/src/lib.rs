@@ -100,8 +100,12 @@ struct Item {
     art: String,
     /// 0 when unknown.
     duration_ms: i64,
-    /// Empty when unknown or not a track.
+    /// Empty when unknown or not a track. "Part N of M" for a book's part.
     album: String,
+    /// A book's title for one of its parts; empty for anything else.
+    book: String,
+    /// Where the server says a book's part stopped; 0 for none.
+    position_ms: u64,
 }
 
 impl Item {
@@ -115,6 +119,8 @@ impl Item {
             art: n.art_url.unwrap_or_default(),
             duration_ms: i64::try_from(n.duration_ms).unwrap_or(0),
             album: n.album,
+            book: n.book,
+            position_ms: n.position_ms,
         }
     }
 
@@ -130,6 +136,8 @@ impl Item {
             art: String::new(),
             duration_ms: 0,
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
         }
     }
 }

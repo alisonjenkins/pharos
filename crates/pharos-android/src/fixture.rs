@@ -96,6 +96,8 @@ mod imp {
                 0
             },
             album: String::new(),
+            book: String::new(),
+            position_ms: 0,
         }
     }
 

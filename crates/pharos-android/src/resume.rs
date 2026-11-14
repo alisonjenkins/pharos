@@ -113,12 +113,24 @@ fn record(n: &Now, pos: u64, why: &str) -> R<()> {
     Ok(())
 }
 
+/// Where to start: the server's position for a book's part (`server_ms`,
+/// 0 for none) while it is inside the track, else the one kept on the
+/// phone, the offline fallback.
+fn start_at(server_ms: u64, local: Option<u64>, duration_ms: u64) -> (Option<u64>, &'static str) {
+    if server_ms > 0 && server_ms < duration_ms {
+        (Some(server_ms), "server")
+    } else {
+        (local, "phone")
+    }
+}
+
 /// `player` is prepared with `id`. Returns where to seek before starting,
 /// and logs the decision.
 pub fn prepared(
     env: &mut JNIEnv,
     id: &str,
     duration_ms: u64,
+    server_ms: u64,
     player: &GlobalRef,
 ) -> R<Option<u64>> {
     *now()? = Some(Now {
@@ -126,10 +138,8 @@ pub fn prepared(
         duration_ms,
         player: player.clone(),
     });
-    let Some(store) = STORE.get() else {
-        return Ok(None);
-    };
-    let at = store.position(id, duration_ms);
+    let local = STORE.get().and_then(|s| s.position(id, duration_ms));
+    let (at, from) = start_at(server_ms, local, duration_ms);
     match at {
         Some(ms) => {
             env.call_method(
@@ -140,11 +150,13 @@ pub fn prepared(
             )
             .map_err(jerr("seekTo(resume)"))?;
             log(&format!(
-                "resume: id={id} verdict=seek at_ms={ms} duration_ms={duration_ms}"
+                "resume: id={id} verdict=seek from={from} at_ms={ms} duration_ms={duration_ms}"
             ));
         }
         None => {
-            let reason = if duration_ms <= RESUME_MIN_TRACK_MS {
+            let reason = if server_ms > 0 {
+                "server_past_end"
+            } else if duration_ms <= RESUME_MIN_TRACK_MS {
                 "short"
             } else {
                 "none_saved"
@@ -190,4 +202,24 @@ pub fn drop_current(finished: bool) -> R<()> {
         record(&n, n.duration_ms, "completed")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_servers_position_wins_and_the_phones_is_the_fallback() {
+        assert_eq!(
+            start_at(61_000, Some(5_000), 600_000),
+            (Some(61_000), "server")
+        );
+        assert_eq!(start_at(0, Some(5_000), 600_000), (Some(5_000), "phone"));
+        assert_eq!(start_at(0, None, 600_000), (None, "phone"));
+        assert_eq!(
+            start_at(700_000, None, 600_000),
+            (None, "phone"),
+            "past the end: not a place to seek"
+        );
+    }
 }
