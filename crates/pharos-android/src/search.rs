@@ -103,7 +103,7 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
             prepare_id(env, &id)
         };
     }
-    let gen = PLAY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let gen = supersede();
     let what = what.to_owned();
     on_worker("voice search", move |env| {
         let hits = find(&query);
@@ -116,7 +116,7 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
         let queue = playable_queue(hits, children);
         let Some(first) = queue.first().cloned() else {
             log(&format!("{what} verdict=None reason=no_playable_hit"));
-            if PLAY_GEN.load(Ordering::SeqCst) == gen {
+            if is_current(gen) {
                 if let Some(session) = state_lock()?.as_ref().map(|s| s.session.clone()) {
                     let message = notice.unwrap_or_else(|| format!("Nothing matched {query}"));
                     set_error(env, session.as_obj(), &message)?;
@@ -132,7 +132,7 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
         if then_play {
             play_library(env, &first.id, queue, gen)
         } else {
-            prepare(env, first, queue)
+            prepare_at(env, first, queue, gen)
         }
     })
 }
