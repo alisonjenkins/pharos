@@ -96,6 +96,13 @@ const IMAGE_CUES_POLL_MS: u32 = 3_000;
 /// Fetch failures with no HTTP answer an image subtitle survives before it
 /// gives up; an HTTP error (the extraction failed) ends it at once.
 const IMAGE_CUES_RETRIES: u32 = 3;
+/// Loads of one cue image that may fail before it is left blank. The app's
+/// server proxy answers 503 when the server does not answer in time; one
+/// lost answer would otherwise blank the cue for its whole duration.
+const CUE_IMAGE_RETRIES: u32 = 3;
+/// The wait before a failed cue image is fetched again: the proxy's
+/// `retry-after: 1`.
+const CUE_IMAGE_RETRY_MS: u32 = 1_000;
 
 #[cfg(test)]
 thread_local! {
@@ -2004,15 +2011,49 @@ fn ImageSubtitles(
                     );
                     (cue, at)
                 }) {
-                    img {
+                    CueImage {
                         key: "{cue.url}",
-                        class: "pharos-image-sub",
-                        src: "{cue.url}",
-                        alt: "",
-                        style: "left: {at.x * 100.0}%; top: {at.y * 100.0}%; width: {at.w * 100.0}%; height: {at.h * 100.0}%;",
+                        url: cue.url.clone(),
+                        style: format!(
+                            "left: {}%; top: {}%; width: {}%; height: {}%;",
+                            at.x * 100.0,
+                            at.y * 100.0,
+                            at.w * 100.0,
+                            at.h * 100.0,
+                        ),
                     }
                 }
             }
+        }
+    }
+}
+
+/// One image subtitle, loaded again after a failed load, at most
+/// `CUE_IMAGE_RETRIES` times.
+#[component]
+fn CueImage(url: String, style: String) -> Element {
+    let mut attempt = use_signal(|| 0_u32);
+    let src = super::playback::cue_image_src(&url, attempt());
+    rsx! {
+        img {
+            class: "pharos-image-sub",
+            src: "{src}",
+            alt: "",
+            style: "{style}",
+            onerror: move |_| {
+                let tried = attempt();
+                let again = tried < CUE_IMAGE_RETRIES;
+                platform::warn(&format!(
+                    "pharos: image subtitle cue load failed attempt={} retry={again}",
+                    tried + 1
+                ));
+                if again {
+                    spawn(async move {
+                        platform::sleep_ms(CUE_IMAGE_RETRY_MS).await;
+                        attempt.set(tried + 1);
+                    });
+                }
+            },
         }
     }
 }

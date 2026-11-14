@@ -1168,6 +1168,17 @@ pub fn cues_at(cues: &ImageCues, ms: u64) -> impl Iterator<Item = &ImageCue> {
         .filter(move |c| c.start_ms <= ms && ms < c.end_ms)
 }
 
+/// The `src` of an image cue on its `attempt`th load: the cue's own url
+/// first, then the url with a `retry` query so the WebView fetches it again
+/// instead of reusing the failed answer.
+pub fn cue_image_src(url: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        return url.to_owned();
+    }
+    let join = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{join}retry={attempt}")
+}
+
 /// The font size in px pharos.css gives a cue in a player `width_px` wide
 /// in a viewport `viewport_h_px` tall at size `scale` (V455): `scale x
 /// max(14px, min(2.8cqw, 5vh))`, without the 14px floor in the `mini` player.
@@ -4303,6 +4314,13 @@ mod tests {
         assert_eq!(at(2_499), [500]);
         assert_eq!(at(2_500), Vec::<u64>::new());
         assert_eq!(at(5_000), [4_000]);
+    }
+
+    #[test]
+    fn a_failed_cue_image_is_fetched_again_under_a_new_url() {
+        assert_eq!(cue_image_src("/a/9.png?v=7-1", 0), "/a/9.png?v=7-1");
+        assert_eq!(cue_image_src("/a/9.png?v=7-1", 1), "/a/9.png?v=7-1&retry=1");
+        assert_eq!(cue_image_src("/a/9.png", 2), "/a/9.png?retry=2");
     }
 
     #[test]
