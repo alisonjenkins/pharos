@@ -3,6 +3,9 @@
 //! The model itself runs in [`whisper`], behind the `recognise` feature;
 //! everything here is plain data so it is tested without the model.
 
+#[cfg(feature = "recognise")]
+pub mod whisper;
+
 use crate::obs::RECOGNISE_RETRY_TOTAL;
 use crate::transcript::Word;
 
