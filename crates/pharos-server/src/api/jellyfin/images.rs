@@ -362,6 +362,32 @@ async fn get_image(
     .await
 }
 
+/// A book's cover for the OPDS catalogue (045): its Primary image as JPEG,
+/// at most `width` wide, for a user the catalogue has already signed in, so
+/// their library access applies (V189).
+pub(crate) async fn serve_opds_cover(
+    state: &AppState,
+    user: &pharos_core::User,
+    req: &HttpRequest,
+    id: pharos_core::MediaId,
+    width: u32,
+) -> Result<HttpResponse, actix_web::Error> {
+    serve_image(
+        state,
+        Some(user),
+        &pharos_jellyfin_api::dto::wire_item_id(id),
+        "Primary",
+        0,
+        req.method() == actix_web::http::Method::HEAD,
+        ImageFormat::Jpeg,
+        Some(width),
+        if_none_match_of(req),
+        None,
+        ImageClient::of(req),
+    )
+    .await
+}
+
 async fn head_image(
     state: web::Data<AppState>,
     req: HttpRequest,
