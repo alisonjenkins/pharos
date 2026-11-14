@@ -4459,6 +4459,8 @@ impl MediaRow {
                     file_size: self.file_size_seen,
                 },
             ),
+            // Not a column: the artwork row is the record (B1437).
+            has_embedded_cover: false,
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,
