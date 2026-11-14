@@ -13,8 +13,13 @@ public class Check {
   /** Records the one transaction the app sends to a search's result receiver. */
   static final class Receiver implements android.os.IBinder {
     android.os.Parcel data; int code, flags;
-    public boolean transact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
-      this.code = code; this.data = data; this.flags = flags; return true;
+    public synchronized boolean transact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+      this.code = code; this.data = data; this.flags = flags; notifyAll(); return true;
+    }
+    synchronized android.os.Parcel await() throws InterruptedException {
+      long end = System.currentTimeMillis() + 30_000;
+      while (data == null && System.currentTimeMillis() < end) wait(end - System.currentTimeMillis());
+      return data;
     }
   }
   /** Stands in for androidx's ResultReceiver: its parcel is just its binder. */
@@ -24,7 +29,7 @@ public class Check {
   }
 
   /** Android Auto's search: MSG_SEARCH to the Messenger in the root extras. */
-  static void compatSearch(android.os.Bundle extras) {
+  static void compatSearch(android.os.Bundle extras) throws InterruptedException {
     Object binder = extras.m.get("extra_messenger");
     expect(binder instanceof android.os.Messenger.Binder, "root extras carry a compat Messenger binder: " + binder);
     expect(Integer.valueOf(1).equals(extras.m.get("extra_service_version")), "compat service version 1, so browsing stays on the framework");
@@ -38,7 +43,7 @@ public class Check {
     msg.getData().putParcelable("data_result_receiver", new ReceiverParcelable(recv));
     msg.getData().putInt("data_calling_pid", 1234);
     ((android.os.Messenger.Binder) binder).messenger.handler.handleMessage(msg);
-    android.os.Parcel p = recv.data;
+    android.os.Parcel p = recv.await();
     expect(p != null && recv.code == 1 && recv.flags == 1, "search replies with a oneway send() to the receiver");
     if (p == null) return;
     p.setDataPosition(0);
@@ -58,6 +63,10 @@ public class Check {
   }
 
   public static void main(String[] a) throws Exception {
+    // A closed port: library calls fail fast, and the Test folder must still work.
+    java.nio.file.Files.write(new java.io.File(new android.content.Context().getFilesDir(), "server_url").toPath(),
+        "http://127.0.0.1:9\n".getBytes());
+    new java.io.File(new android.content.Context().getFilesDir(), "device_token").delete();
     PharosMediaService s = new PharosMediaService();
     s.onCreate();
     expect(s.superCreated, "onCreate ran the framework's onCreate first");
@@ -68,10 +77,14 @@ public class Check {
     compatSearch(root.extras);
     MediaBrowserService.Result<List<MediaBrowser.MediaItem>> r = new MediaBrowserService.Result<>();
     s.onLoadChildren("root", r);
-    expect(r.sent && r.value.size() == 2, "root has Music and Audiobooks: " + r.value);
+    expect(r.detached, "root is answered off the main thread");
+    r.await();
+    expect(r.sent && r.value.size() == 2 && r.value.get(0).flags == 0 && "test".equals(r.value.get(1).d.getMediaId())
+        && r.value.get(1).flags == 1, "offline root is a notice row and the Test folder: " + r.value);
     r = new MediaBrowserService.Result<>();
-    s.onLoadChildren("music", r);
-    expect(r.sent && r.value.size() == 3 && r.value.get(0).flags == 2, "music has two tones and a stream: " + r.value);
+    s.onLoadChildren("test", r);
+    r.await();
+    expect(r.sent && r.value.size() == 4 && r.value.get(0).flags == 2, "Test has three tones and a stream: " + r.value);
     android.net.Uri icon = r.value.get(2).d.icon;
     expect(icon != null && icon.toString().startsWith("content://com.alisonjenkins.pharos.auto.art/"), "the stream has a content:// icon: " + icon);
 
@@ -98,6 +111,7 @@ public class Check {
 
     r = new MediaBrowserService.Result<>();
     s.onSearch("chapter", null, r);
+    r.await();
     expect(r.sent && r.value.size() == 1, "voice search finds the chapter: " + r.value);
 
     // Rust state is global, so a fresh callback drives the same session.
@@ -139,6 +153,10 @@ public class Check {
     cb.onPrepareFromSearch("test chapter", hints);
     expect(session.state.state == 2 && "tone:330".equals(session.md.m.get("android.media.metadata.MEDIA_ID")),
         "onPrepareFromSearch loads the match paused: " + session.state);
+    cb.onPlayFromSearch("qqq nothing like this", hints);
+    for (int i = 0; i < 300 && session.state.state != 7; i++) Thread.sleep(100);
+    expect(session.state.state == 7 && "Search failed".equals(String.valueOf(session.state.error)),
+        "a voice request the library cannot answer is an error the car can say, not a fallback: " + session.state);
     cb.onPlayFromSearch("test tone a", hints);
     cb.onPlayFromMediaId("nope", null);
     cb.onStop();

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::JNIEnv;
 
-use crate::{guarded, jerr, log, string, Entry, R};
+use crate::{guarded, jerr, log, string, Item, R};
 
 const EXTRA_MESSENGER: &str = "extra_messenger";
 const EXTRA_SERVICE_VERSION: &str = "extra_service_version";
@@ -44,7 +44,7 @@ fn length_prefixed(tag: i32) -> bool {
     matches!(tag, 2 | 4 | 11 | 12 | 16 | 17 | 21)
 }
 
-const ITEM_CLASS: &str = "android/support/v4/media/MediaBrowserCompat$MediaItem";
+pub const ITEM_CLASS: &str = "android/support/v4/media/MediaBrowserCompat$MediaItem";
 
 /// Keeps the Messenger (and so its Handler) alive for the process.
 static MESSENGER: Mutex<Option<GlobalRef>> = Mutex::new(None);
@@ -178,13 +178,13 @@ fn obtain<'l>(env: &mut JNIEnv<'l>) -> R<JObject<'l>> {
 }
 
 /// Sends `items` to the client's receiver as `search_results`.
-fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[&Entry]) -> R<()> {
+fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[Item]) -> R<()> {
     let len = i32::try_from(items.len()).map_err(|_| "too many results")?;
     let arr = env
         .new_object_array(len, "android/os/Parcelable", JObject::null())
         .map_err(jerr("Parcelable[]"))?;
     for (i, e) in items.iter().enumerate() {
-        let item = crate::media_item_of(env, ITEM_CLASS, e)?;
+        let item = crate::media_item(env, e, true)?;
         let i = i32::try_from(i).map_err(|_| "too many results")?;
         env.set_object_array_element(&arr, i, item).map_err(jerr("set result"))?;
     }
@@ -237,13 +237,15 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_ha
         let req = read_search(env, &data, &p);
         let _ = env.call_method(&p, "recycle", "()V", &[]);
         let req = req?;
-        let hits = crate::search(&req.query);
-        log(&format!(
-            "compat onSearch query={:?} receiver={} hits={}",
-            req.query,
-            req.receiver_class,
-            hits.len()
-        ));
-        reply(env, &req.receiver, &hits)
+        let receiver = env.new_global_ref(&req.receiver).map_err(jerr("global receiver"))?;
+        let (query, class) = (req.query, req.receiver_class);
+        log(&format!("compat onSearch query={query:?} receiver={class}"));
+        // The library search blocks on the network; the main thread must not.
+        crate::on_worker("compat search", move |env| {
+            let hits = crate::find(&query);
+            log(&format!("compat onSearch query={query:?} hits={}", hits.len()));
+            crate::remember(&hits);
+            reply(env, receiver.as_obj(), &hits)
+        })
     })
 }
