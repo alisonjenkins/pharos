@@ -144,6 +144,9 @@ pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()>
                     return Ok(());
                 }
             };
+            // A new item is the user playing: an earlier pause no longer
+            // blocks a focus gain from resuming it.
+            focus::note_user_play();
             let queue: Vec<Item> = ids
                 .iter()
                 .map(|id| item_for(&snapshot::car_id(id)))
