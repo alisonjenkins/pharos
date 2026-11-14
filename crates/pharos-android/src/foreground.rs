@@ -114,7 +114,7 @@ pub fn describe(title: &str, text: &str) -> R<()> {
 /// carries on as before.
 pub fn sync(env: &mut JNIEnv, state: i32) {
     if let Err(e) = apply(env, state) {
-        let exception = take_exception(env);
+        let exception = crate::take_exception(env);
         log(&format!("notify: state={state} failed: {e}{exception}"));
     }
 }
@@ -282,28 +282,6 @@ fn build<'l>(env: &mut JNIEnv<'l>, f: &Fg) -> R<JObject<'l>> {
     env.call_method(&b, "build", "()Landroid/app/Notification;", &[])
         .and_then(|v| v.l())
         .map_err(jerr("Notification.build"))
-}
-
-/// Clears a pending Java exception and names its class for the log.
-fn take_exception(env: &mut JNIEnv) -> String {
-    let Ok(throwable) = env.exception_occurred() else {
-        return String::new();
-    };
-    if throwable.is_null() {
-        return String::new();
-    }
-    let _ = env.exception_clear();
-    let name = env
-        .call_method(&throwable, "getClass", "()Ljava/lang/Class;", &[])
-        .and_then(|v| v.l())
-        .and_then(|c| env.call_method(&c, "getName", "()Ljava/lang/String;", &[]))
-        .and_then(|v| v.l())
-        .map(jni::objects::JString::from)
-        .and_then(|s| env.get_string(&s).map(String::from));
-    match name {
-        Ok(n) => format!(" exception={n}"),
-        Err(_) => " exception=unknown".to_owned(),
-    }
 }
 
 /// Leaves the foreground and removes the notification.
