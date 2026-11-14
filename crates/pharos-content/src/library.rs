@@ -308,6 +308,7 @@ impl Library {
                     shared: for_worker,
                     link: None,
                     qc: None,
+                    qc_gen: 0,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -776,6 +777,9 @@ struct Worker {
     link: Option<Link>,
     /// The QuickConnect poller, while one runs.
     qc: Option<tokio::task::JoinHandle<()>>,
+    /// Names the current poller. Its events carry it, so one queued before a
+    /// sign-out or reload (which an abort cannot recall) is ignored.
+    qc_gen: u64,
     limit: Duration,
 }
 
@@ -810,7 +814,7 @@ impl Worker {
     }
 
     async fn run(mut self, mut rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>) {
-        let (events_tx, mut events) = unbounded_channel::<Event>();
+        let (events_tx, mut events) = unbounded_channel::<(u64, Event)>();
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
@@ -832,8 +836,20 @@ impl Worker {
                     }
                     let _ = reply.send(result);
                 }
-                Some(ev) = events.recv() => self.on_event(ev).await,
+                Some((gen, ev)) = events.recv() => self.on_event_if_current(gen, ev).await,
             }
+        }
+    }
+
+    /// Apply an event from the poller named `gen`, unless it has been disowned.
+    async fn on_event_if_current(&mut self, gen: u64, ev: Event) {
+        if gen == self.qc_gen {
+            self.on_event(ev).await;
+        } else {
+            log::info!(
+                "quickconnect event from poller {gen} ignored; current is {}",
+                self.qc_gen
+            );
         }
     }
 
@@ -873,10 +889,11 @@ impl Worker {
     async fn execute(
         &mut self,
         op: &Op,
-        events: &UnboundedSender<Event>,
+        events: &UnboundedSender<(u64, Event)>,
     ) -> Result<Out, ContentError> {
         if matches!(op, Op::SignOut) {
             self.link = None;
+            self.stop_sign_in();
             token::forget(&self.token_path)?;
             self.shared.set_auth(AuthState::SignedOut);
             return Ok(Out::Done);
@@ -903,13 +920,7 @@ impl Worker {
             match r {
                 Err(e) if e.is_revoked() => {
                     log::warn!("{}: device token revoked; starting QuickConnect", op.name());
-                    self.link = None;
-                    if let Err(e) = token::forget(&self.token_path) {
-                        log::warn!("{}", e.redacted());
-                    }
-                    self.shared.set_auth(AuthState::SignedOut);
-                    self.start_sign_in(events);
-                    return Err(ContentError::NeedsSignIn);
+                    return Err(self.revoked(events));
                 }
                 Err(e @ ContentError::Closed { .. }) => {
                     log::warn!("{} (attempt {}): {e}; reconnecting", op.name(), attempt + 1);
@@ -924,7 +935,7 @@ impl Worker {
 
     /// A live link: the open one (media token refreshed if near expiry), or
     /// one resumed from the stored device token. No token starts QuickConnect.
-    async fn link(&mut self, events: &UnboundedSender<Event>) -> Result<Link, ContentError> {
+    async fn link(&mut self, events: &UnboundedSender<(u64, Event)>) -> Result<Link, ContentError> {
         if super::fault::unreachable() {
             self.link = None;
             return Err(ContentError::Connect {
@@ -938,7 +949,17 @@ impl Worker {
                 self.link = None;
             } else {
                 if l.media.expires_at_ms <= now_ms().saturating_add(TOKEN_REFRESH_MARGIN_MS) {
-                    l.media = l.cat.media_token().await?;
+                    match l.cat.media_token().await {
+                        Ok(m) => l.media = m,
+                        Err(e) if e.is_revoked() => {
+                            log::warn!(
+                                "media token refresh refused ({}); starting QuickConnect",
+                                e.redacted()
+                            );
+                            return Err(self.revoked(events));
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 return Ok(l.clone());
             }
@@ -955,12 +976,7 @@ impl Worker {
                     "stored device token refused ({}); starting QuickConnect",
                     e.redacted()
                 );
-                if let Err(e) = token::forget(&self.token_path) {
-                    log::warn!("{}", e.redacted());
-                }
-                self.shared.set_auth(AuthState::SignedOut);
-                self.start_sign_in(events);
-                return Err(ContentError::NeedsSignIn);
+                return Err(self.revoked(events));
             }
             Err(e) => {
                 self.shared.set_error(e.redacted());
@@ -968,7 +984,17 @@ impl Worker {
             }
         };
         let cat = NativeCatalogue::new(bootstrap, closed, &session);
-        let media = cat.media_token().await?;
+        let media = match cat.media_token().await {
+            Ok(m) => m,
+            Err(e) if e.is_revoked() => {
+                log::warn!(
+                    "media token refused ({}); starting QuickConnect",
+                    e.redacted()
+                );
+                return Err(self.revoked(events));
+            }
+            Err(e) => return Err(e),
+        };
         let link = Link { cat, media };
         self.link = Some(link.clone());
         self.shared.set_auth(AuthState::SignedIn);
@@ -977,9 +1003,12 @@ impl Worker {
 
     /// Drop the connection and any QuickConnect, then resume from the token
     /// file as it is now: another part of the app signed in or out.
-    async fn reload(&mut self, events: &UnboundedSender<Event>) -> Result<Out, ContentError> {
+    async fn reload(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+    ) -> Result<Out, ContentError> {
         self.link = None;
-        let polling = self.qc.take().inspect(|h| h.abort()).is_some();
+        let polling = self.stop_sign_in();
         let token = token::load(&self.token_path)?.is_some();
         let (verdict, result) = if token {
             match self.link(events).await {
@@ -1001,12 +1030,33 @@ impl Worker {
         result
     }
 
-    fn start_sign_in(&mut self, events: &UnboundedSender<Event>) {
+    /// Abort the QuickConnect poller and disown whatever it already queued.
+    /// True when one was running.
+    fn stop_sign_in(&mut self) -> bool {
+        self.qc_gen = self.qc_gen.wrapping_add(1);
+        self.qc.take().inspect(|h| h.abort()).is_some()
+    }
+
+    /// The server refused our credentials: forget them, drop the link and
+    /// start QuickConnect.
+    fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
+        self.link = None;
+        if let Err(e) = token::forget(&self.token_path) {
+            log::warn!("{}", e.redacted());
+        }
+        self.shared.set_auth(AuthState::SignedOut);
+        self.start_sign_in(events);
+        ContentError::NeedsSignIn
+    }
+
+    fn start_sign_in(&mut self, events: &UnboundedSender<(u64, Event)>) {
         if self.qc.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
+        self.qc_gen = self.qc_gen.wrapping_add(1);
         self.qc = Some(tokio::task::spawn_local(quick_connect(
             self.base.clone(),
+            self.qc_gen,
             events.clone(),
         )));
     }
@@ -1014,7 +1064,7 @@ impl Worker {
 
 /// Mint a code, report it, and poll until someone approves it. Reconnect and
 /// re-mint decisions are `tv_auth`'s (see its module comment for why).
-async fn quick_connect(base: String, events: UnboundedSender<Event>) {
+async fn quick_connect(base: String, gen: u64, events: UnboundedSender<(u64, Event)>) {
     let mut qc = QuickConnect::new();
     let mut link: Option<(bootstrap::Client, Closed)> = None;
     loop {
@@ -1031,7 +1081,7 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
                 Err(e) => {
                     let wait = qc.retry_delay();
                     log::warn!("{}; retrying in {wait:?}", e.redacted());
-                    let _ = events.send(Event::Failed(e.redacted()));
+                    let _ = events.send((gen, Event::Failed(e.redacted())));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -1041,13 +1091,13 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
             match net::quick_connect_initiate(&client, &closed).await {
                 Ok((code, secret)) => {
                     log::info!("quickconnect code: {code}");
-                    let _ = events.send(Event::Code(code));
+                    let _ = events.send((gen, Event::Code(code)));
                     qc.on_minted(secret);
                 }
                 Err(e) => {
                     let wait = qc.retry_delay();
                     log::warn!("{}; retrying in {wait:?}", e.redacted());
-                    let _ = events.send(Event::Failed(e.redacted()));
+                    let _ = events.send((gen, Event::Failed(e.redacted())));
                     tokio::time::sleep(wait).await;
                     continue;
                 }
@@ -1060,12 +1110,15 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
         match qc.on_poll(&polled) {
             Action::Finish => {
                 if let Polled::Approved((session, token)) = polled {
-                    let _ = events.send(Event::Approved {
-                        bootstrap: client,
-                        closed,
-                        session,
-                        token,
-                    });
+                    let _ = events.send((
+                        gen,
+                        Event::Approved {
+                            bootstrap: client,
+                            closed,
+                            session,
+                            token,
+                        },
+                    ));
                     return;
                 }
                 log::warn!("quickconnect: finished without an approval; polling again");
@@ -1074,7 +1127,7 @@ async fn quick_connect(base: String, events: UnboundedSender<Event>) {
             Action::PollAfter(wait) => {
                 if let Polled::Failed(e) = &polled {
                     log::warn!("quickconnect poll: {e}");
-                    let _ = events.send(Event::Failed(e.clone()));
+                    let _ = events.send((gen, Event::Failed(e.clone())));
                 }
                 tokio::time::sleep(wait).await;
             }
@@ -1419,5 +1472,85 @@ mod tests {
             matches!(&e, ContentError::BadId(s) if s == "track/x"),
             "{e}"
         );
+    }
+
+    fn worker(name: &str) -> (Worker, Arc<Shared>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pharos-lib-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                auth: AuthState::SignedOut,
+                last_error: String::new(),
+                hook: None,
+            }),
+            changed: Condvar::new(),
+            progress_queued: AtomicBool::new(false),
+        });
+        let token_path = dir.join("device.token");
+        let w = Worker {
+            base: dead_server(),
+            token_path: token_path.clone(),
+            shared: shared.clone(),
+            link: None,
+            qc: None,
+            qc_gen: 0,
+            limit: Duration::from_secs(5),
+        };
+        (w, shared, token_path)
+    }
+
+    fn local_rt() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        (rt, tokio::task::LocalSet::new())
+    }
+
+    #[test]
+    fn a_sign_out_disowns_the_pending_quickconnect_poller() {
+        let (mut w, shared, _) = worker("signout-qc");
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.start_sign_in(&events);
+            let polling_as = w.qc_gen;
+            assert!(w.qc.is_some());
+            w.execute(&Op::SignOut, &events).await.unwrap();
+            assert!(w.qc.is_none(), "poller aborted");
+            assert_ne!(w.qc_gen, polling_as, "its queued events no longer match");
+            w.on_event_if_current(polling_as, Event::Code("stale".into()))
+                .await;
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+    }
+
+    #[test]
+    fn a_reload_disowns_the_pending_quickconnect_poller() {
+        let (mut w, _, _) = worker("reload-qc");
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.start_sign_in(&events);
+            let before = w.qc_gen;
+            w.execute(&Op::Reload, &events).await.unwrap();
+            assert_ne!(w.qc_gen, before);
+        });
+    }
+
+    #[test]
+    fn a_revoked_session_forgets_the_token_and_starts_quickconnect() {
+        let (mut w, shared, token_path) = worker("revoked");
+        token::store(&token_path, "stale-token").unwrap();
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            let e = w.revoked(&events);
+            assert!(matches!(e, ContentError::NeedsSignIn), "{e}");
+            assert!(w.qc.is_some(), "QuickConnect started");
+        });
+        assert!(token::load(&token_path).unwrap().is_none());
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
     }
 }
