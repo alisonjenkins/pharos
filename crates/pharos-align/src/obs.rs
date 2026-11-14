@@ -24,6 +24,9 @@ pub const LINE_PLACEMENT_TOTAL: &str = "pharos_aligner_line_placement_total";
 /// Songs that kept today's per-line answer whole, by
 /// [`crate::placement::Fallback::label`] `reason`.
 pub const SONG_FALLBACK_TOTAL: &str = "pharos_aligner_song_fallback_total";
+/// Recogniser windows decoded a second time (spec 042), by
+/// [`crate::recognise::Outcome::label`] `outcome`.
+pub const RECOGNISE_RETRY_TOTAL: &str = "pharos_aligner_recognise_retry_total";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
@@ -155,6 +158,10 @@ impl Metrics {
         metrics::describe_counter!(
             SONG_FALLBACK_TOTAL,
             "Songs that kept the per-line answer whole, by reason"
+        );
+        metrics::describe_counter!(
+            RECOGNISE_RETRY_TOTAL,
+            "Recogniser windows decoded again with beam search after one short segment covered them, by outcome"
         );
         metrics::describe_histogram!(
             SONG_SECONDS,
