@@ -29,6 +29,7 @@ use actix_web::{error, http::header, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::MediaStore;
 
 use super::auth_extractor::MediaUser;
+use super::media_source;
 use crate::state::AppState;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -108,6 +109,10 @@ async fn download(
         // reporting it as 404 would send a reader hunting for the wrong thing.
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    // V1391 — `mediaSourceId` names a version of a book (another format), as
+    // it names an edition on the video routes; the item's own file otherwise.
+    let requested = media_source::requested_id(req.query_string());
+    let item = media_source::select(media_source::Route::Download, item, requested.as_deref());
 
     // 005-kindle-conversion — a Kindle book was stored as `Epub` because it
     // converts, so this route must hand over the EPUB and not the `.azw3` the
@@ -122,7 +127,10 @@ async fn download(
         (Some(cache), Some(book))
             if pharos_scanner::book::kindle::is_converted_kindle(&item.path, book.format) =>
         {
-            match cache.get_or_convert(id, &item.path).await {
+            match cache
+                .get_or_convert(id, item.edition.as_deref(), &item.path)
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
