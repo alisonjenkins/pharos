@@ -105,13 +105,27 @@ pub fn credentials_changed() -> bool {
     let Some(hook) = ON_CREDENTIALS_CHANGED.get() else {
         return false;
     };
-    match notifier() {
-        Some(tx) if tx.send(*hook).is_ok() => {}
-        _ => {
-            hook();
+    queue_hook(notifier(), *hook);
+    true
+}
+
+/// Hands the hook to the notifier thread. It is never run on the caller's
+/// thread: the hook can block on the content worker, and the caller is the UI.
+/// A missing thread or a closed channel drops this call with a warning.
+fn queue_hook(tx: Option<&std::sync::mpsc::Sender<fn()>>, hook: fn()) -> bool {
+    match tx {
+        Some(tx) => match tx.send(hook) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("warn: credentials hook not queued, notifier thread is gone: {e}");
+                false
+            }
+        },
+        None => {
+            eprintln!("warn: credentials hook not queued, notifier thread did not start");
+            false
         }
     }
-    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,6 +306,30 @@ pub trait OfflineStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn count() {
+        RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_hook_with_no_notifier_is_dropped_not_run_on_the_caller() {
+        let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
+        assert!(!queue_hook(None, count));
+        drop(rx);
+        assert!(!queue_hook(Some(&tx), count));
+        assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn a_hook_is_queued_not_run_inline() {
+        let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
+        assert!(queue_hook(Some(&tx), count));
+        assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
+        assert!(rx.try_recv().is_ok());
+    }
 
     struct Stub(watch::Sender<PlayerSnapshot>);
 
