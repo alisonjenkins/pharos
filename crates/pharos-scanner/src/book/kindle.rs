@@ -161,6 +161,10 @@ pub enum ConvertReason {
     Ok,
     /// Amazon DRM.
     Drm,
+    /// Amazon DRM, but the unencrypted EXTH header still gave metadata
+    /// (B1419). The outcome stays `drm_protected`; this reason says how many
+    /// of the locked books are nonetheless described.
+    DrmMetadata,
     /// Could not be opened (permissions, dead mount).
     Unopenable,
     /// Not the structure its extension claims.
@@ -179,6 +183,7 @@ impl ConvertReason {
         match self {
             ConvertReason::Ok => "ok",
             ConvertReason::Drm => "drm",
+            ConvertReason::DrmMetadata => "drm_metadata",
             ConvertReason::Unopenable => "unopenable",
             ConvertReason::Malformed => "malformed",
             ConvertReason::ExportFailed => "export_failed",
@@ -314,7 +319,7 @@ pub fn read_kindle(path: &Path) -> Result<EpubMetadata, KindleError> {
 /// than an ISBN, and one library file carries the placeholder `0000000000000`,
 /// which passes a pure digit count. Storing either as an ISBN would be a lie
 /// the UI displays and an online-metadata lookup would then act on.
-fn isbn_of(identifier: &str) -> Option<String> {
+pub(super) fn isbn_of(identifier: &str) -> Option<String> {
     let digits: String = identifier.chars().filter(char::is_ascii_digit).collect();
     if (digits.len() == 10 || digits.len() == 13) && digits.bytes().any(|b| b != b'0') {
         Some(identifier.to_string())
@@ -762,6 +767,7 @@ mod tests {
         let reasons = [
             ConvertReason::Ok,
             ConvertReason::Drm,
+            ConvertReason::DrmMetadata,
             ConvertReason::Unopenable,
             ConvertReason::Malformed,
             ConvertReason::ExportFailed,
@@ -773,6 +779,7 @@ mod tests {
             [
                 "ok",
                 "drm",
+                "drm_metadata",
                 "unopenable",
                 "malformed",
                 "export_failed",

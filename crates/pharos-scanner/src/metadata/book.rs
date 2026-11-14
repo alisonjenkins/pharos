@@ -97,14 +97,28 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
         // one. DRM-protected and malformed files still fall through to `None`,
         // so the filename provider supplies a title (FR-007) exactly as before.
         pharos_core::BookFormat::Unreadable => {
-            let m = crate::book::kindle::read_kindle(path).ok()?;
-            Some(BookDescriptive {
-                title: m.title,
-                author: m.author,
-                publisher: m.publisher,
-                description: m.description,
-                date: m.date,
-            })
+            match crate::book::kindle::read_kindle(path) {
+                Ok(m) => Some(BookDescriptive {
+                    title: m.title,
+                    author: m.author,
+                    publisher: m.publisher,
+                    description: m.description,
+                    date: m.date,
+                }),
+                // B1419 — DRM encrypts the text records only; the header's
+                // EXTH block still describes the book.
+                Err(crate::book::kindle::KindleError::Drm(_)) => {
+                    let m = crate::book::mobi_exth::read_exth(path).ok()?;
+                    Some(BookDescriptive {
+                        title: m.title,
+                        author: m.author,
+                        publisher: m.publisher,
+                        description: m.description,
+                        date: m.date,
+                    })
+                }
+                Err(_) => None,
+            }
         }
     }
 }
@@ -215,6 +229,27 @@ impl MetadataProvider for BookMetadataProvider {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// B1419: a DRM-protected Kindle file still supplies its title and blurb.
+    #[test]
+    fn a_drm_kindle_files_title_and_description_come_from_its_header() {
+        let bytes = crate::book::mobi_exth::tests::drm_azw(
+            65001,
+            &[
+                (103, b"A synthetic blurb.".to_vec()),
+                (106, b"2001-02-03".to_vec()),
+            ],
+            b"Synthetic Title",
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.azw3");
+        std::fs::write(&path, bytes).unwrap();
+        let d = read_descriptive(&path).expect("the header is readable");
+        assert_eq!(d.title.as_deref(), Some("Synthetic Title"));
+        assert_eq!(d.description.as_deref(), Some("A synthetic blurb."));
+        assert_eq!(d.date.as_deref(), Some("2001-02-03"));
+    }
 
     fn req<'a>(
         path: &'a std::path::Path,
