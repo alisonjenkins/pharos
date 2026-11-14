@@ -17,7 +17,7 @@ We will place each karaoke line from the singing:
 1. Run today's per-line pass first and keep it as every line's fallback; stream it as today (ADR-0121).
 2. Separate the vocals, recognise them with word times, and match transcript words to lyric words in lyric order. A line with at least half its words matched (minimum 2), inside a span capped by its stamp slot, is an anchor.
 3. Refine each anchor's word starts letter by letter with the existing CTC model within ±1.5 s.
-4. Place lines between two anchors with today's per-line window clamped to that gap. Lines not bounded by anchors keep today's times.
+4. Time anchored and between lines together in one banded joint pass over the anchored span. Drop an anchor that is more than 5 s off both neighbours and leaps a sung line. Take in a kept edge line that would overlap the span, keeping the last feasible answer if that fails. Lines not bounded by anchors keep today's times.
 5. Send a corrected event for each changed line, and the whole answer last, with an additive `placement` per line. `aligner_version` becomes 6.
 6. Any stage failure keeps today's answer and records why.
 
@@ -31,6 +31,7 @@ We will place each karaoke line from the singing:
 ## Alternatives considered
 
 - Re-search low-scoring runs between confident lines: moved a correctly stamped line 8 s.
+- Per-line windows clamped between anchors (first plan): a line slid inside its band and the clamp spread the error to the next line.
 - Whole-song letter alignment with a gap penalty and stamp band: repeated choruses landed anywhere in a 30 s range.
 - The same on separated vocals: more confident, no better placement.
 
