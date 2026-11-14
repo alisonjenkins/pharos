@@ -239,3 +239,53 @@ fn every_screen_fits_the_smallest_reader() {
         assert!(problems.is_empty(), "screen {index}: {problems:?}");
     }
 }
+
+#[test]
+fn tracks_for_an_album_already_left_are_ignored() {
+    let (mut runner, commands) = started(Some(&account()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (first, _) = asked(&commands, "ParentId=al1").expect("first album's tracks");
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-1"));
+    let (second, _) = asked(&commands, "ParentId=al2").expect("second album's tracks");
+    let _ = runner.task_outcome(
+        second,
+        ok(r#"{"Items":[{"Id":"b1","Name":"Second's track"}],"TotalRecordCount":1}"#),
+    );
+    let _ = runner.task_outcome(first, ok(TRACKS));
+    // The stale reply changed nothing: the first row is still the second album's.
+    let commands = runner.action(action_id("row-0"));
+    let (_, task) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let Task::Post { body, .. } = task else {
+        panic!("a report is a POST");
+    };
+    assert!(body.contains("\"ItemId\":\"b1\""), "{body}");
+}
+
+#[test]
+fn an_album_longer_than_a_page_loads_all_its_tracks() {
+    let (mut runner, commands) = started(Some(&account()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
+    let items: String = (0..50)
+        .map(|index| format!(r#"{{"Id":"t{index}","Name":"Track {index}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let commands = runner.task_outcome(
+        first,
+        ok(&format!(r#"{{"Items":[{items}],"TotalRecordCount":51}}"#)),
+    );
+    let (rest, _) = asked(&commands, "StartIndex=50&").expect("the rest");
+    let commands = runner.task_outcome(
+        rest,
+        ok(r#"{"Items":[{"Id":"t50","Name":"Track 50"}],"TotalRecordCount":51}"#),
+    );
+    assert!(
+        asked(&commands, "ParentId=al1").is_none(),
+        "nothing left to fetch"
+    );
+}
