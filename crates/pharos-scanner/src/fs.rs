@@ -1814,6 +1814,11 @@ impl<P: Prober> FsScanner<P> {
             (None, Some(prior)) => stale_match(prior, &item),
             _ => None,
         };
+        // V1391 — a book's versions are grouped by the scan's fold, which a
+        // single watched path cannot rerun; keep the stored ones still on disk.
+        if let (MediaKind::Book, Some(row)) = (item_kind, existing) {
+            item.probe.alternate_sources = book_versions_on_disk(store, row).await?;
+        }
         store.put(item).await?;
         match course {
             Some(prior) => {
@@ -2569,6 +2574,26 @@ async fn book_alternate(
         probe: Some(Box::new(probe)),
         part: None,
     })
+}
+
+/// The versions stored on book `row` whose files are still on disk.
+async fn book_versions_on_disk<S: MediaStore>(
+    store: &S,
+    row: MediaId,
+) -> DomainResult<Vec<AlternateMediaSource>> {
+    let mut kept = Vec::new();
+    for alt in store.alternate_sources(row).await? {
+        if tokio::fs::try_exists(&alt.path).await.unwrap_or(false) {
+            kept.push(alt);
+        } else {
+            tracing::info!(
+                media.id = %row,
+                version = %alt.path.display(),
+                "book version's file is gone; dropping it from the watched row",
+            );
+        }
+    }
+    Ok(kept)
 }
 
 /// P41 — slugify an edition label into a URL-stable identifier suffix
@@ -12081,6 +12106,47 @@ mod tests {
         assert_eq!(item.kind, MediaKind::Episode);
         assert_eq!(item.match_source.as_deref(), Some("none"));
         assert_eq!(item.match_external_id.as_deref(), Some(""));
+    }
+
+    /// V1391 — a watched write to a book's primary keeps the versions the
+    /// last scan grouped under it, less any whose file has gone.
+    #[tokio::test]
+    async fn a_watched_book_primary_keeps_its_versions() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Gardening.epub", b"not really an epub").await;
+        write_file(td.path(), "Gardening.pdf", b"not really a pdf").await;
+        write_file(td.path(), "Gardening.cbz", b"not really a comic").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let primary = td.path().join("Gardening.epub");
+        let id = stable_id(&primary);
+        let versions = |item: &MediaItem| {
+            item.probe
+                .alternate_sources
+                .iter()
+                .map(|a| a.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&store.get(id).await.unwrap()).len(), 2);
+
+        tokio::fs::remove_file(td.path().join("Gardening.cbz"))
+            .await
+            .unwrap();
+        write_file(
+            td.path(),
+            "Gardening.epub",
+            b"not really an epub, rewritten",
+        )
+        .await;
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&primary, &store, scan_id).await.unwrap();
+
+        assert_eq!(
+            versions(&store.get(id).await.unwrap()),
+            vec![td.path().join("Gardening.pdf")],
+            "a watched write must keep the versions still on disk"
+        );
     }
 
     /// B1024 / V983 — which stored matches a re-probe resets.
