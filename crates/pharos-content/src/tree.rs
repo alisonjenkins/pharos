@@ -71,6 +71,36 @@ async fn music_library<C: Catalogue>(cat: &C) -> Result<ItemRef, ContentError> {
         })
 }
 
+/// Every Books library's audiobooks, which the server stores as albums
+/// (ADR-0132). No Books library is an empty list, not an error.
+async fn audiobooks<C: Catalogue>(cat: &C) -> Result<Vec<Item>, ContentError> {
+    let views = cat.views().await?;
+    let libs: Vec<ItemRef> = views
+        .iter()
+        .filter(|v| v.library_kind == Some(LibraryKind::Books))
+        .map(|v| v.id)
+        .collect();
+    let mut books = Vec::new();
+    for lib in &libs {
+        books.extend(
+            cat.list(*lib, Some(ItemKind::Album), NAME_ORDER, MAX_CHILDREN)
+                .await?,
+        );
+    }
+    books.truncate(MAX_CHILDREN as usize);
+    log::info!(
+        "car audiobooks libraries={} albums={}",
+        libs.len(),
+        books.len()
+    );
+    Ok(books)
+}
+
+/// Music lists without audiobook parts: a book's chapter is not a song.
+fn not_books(items: Vec<Item>) -> Vec<Item> {
+    items.into_iter().filter(|i| !i.audiobook).collect()
+}
+
 /// What a node holds. A track holds nothing; the sign-in row is not browsable.
 pub async fn children<C: Catalogue>(
     cat: &C,
@@ -88,10 +118,9 @@ pub async fn children<C: Catalogue>(
             Node::folder(NodeId::Artists, "Artists"),
             Node::folder(NodeId::Mixes, "Mixes"),
         ],
-        // Pharos has no audiobook kind yet (specs/004-books are epub, pdf and
-        // comics only), so the node exists and is empty.
-        NodeId::Audiobooks | NodeId::Track(_) | NodeId::SignIn => Vec::new(),
-        NodeId::Recent => nodes(urls, &cat.recent_music().await?),
+        NodeId::Audiobooks => nodes(urls, &audiobooks(cat).await?),
+        NodeId::Track(_) | NodeId::SignIn => Vec::new(),
+        NodeId::Recent => nodes(urls, &not_books(cat.recent_music().await?)),
         NodeId::Albums => {
             let lib = music_library(cat).await?;
             nodes(
@@ -138,7 +167,7 @@ pub async fn children<C: Catalogue>(
                     all.len()
                 ))
             })?;
-            nodes(urls, &cat.mix(&mix.spec, MIX_LEN).await?)
+            nodes(urls, &not_books(cat.mix(&mix.spec, MIX_LEN).await?))
         }
     })
 }
@@ -353,6 +382,7 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<String>>,
         no_music: bool,
+        books: bool,
     }
 
     impl Catalogue for Fake {
@@ -363,16 +393,22 @@ mod tests {
             } else {
                 LibraryKind::Music
             });
-            Ok(vec![
-                item(ItemRef::Real(99), ItemKind::Library, "Other"),
-                lib,
-            ])
+            let mut views = vec![item(ItemRef::Real(99), ItemKind::Library, "Other"), lib];
+            if self.books {
+                let mut books = item(ItemRef::Real(200), ItemKind::Library, "Books");
+                books.library_kind = Some(LibraryKind::Books);
+                views.push(books);
+            }
+            Ok(views)
         }
         async fn recent_music(&self) -> Result<Vec<Item>, ContentError> {
             self.calls.borrow_mut().push("recent".into());
+            let mut part = item(ItemRef::Real(3), ItemKind::Audio, "Chapter 1");
+            part.audiobook = true;
             Ok(vec![
                 item(ItemRef::Real(1), ItemKind::Audio, "T"),
                 item(ItemRef::Real(2), ItemKind::Movie, "dropped"),
+                part,
             ])
         }
         async fn list(
@@ -401,7 +437,9 @@ mod tests {
         }
         async fn mix(&self, _: &MixSpec, count: u32) -> Result<Vec<Item>, ContentError> {
             self.calls.borrow_mut().push(format!("mix {count}"));
-            Ok(vec![item(ItemRef::Real(7), ItemKind::Audio, "M")])
+            let mut part = item(ItemRef::Real(8), ItemKind::Audio, "Chapter 2");
+            part.audiobook = true;
+            Ok(vec![item(ItemRef::Real(7), ItemKind::Audio, "M"), part])
         }
         async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError> {
             let song = matches!(id, ItemRef::Real(_));
@@ -448,11 +486,37 @@ mod tests {
     }
 
     #[test]
-    fn audiobooks_are_empty_until_the_server_has_them() {
+    fn audiobooks_are_empty_without_a_books_library() {
         let f = Fake::default();
         assert!(block_on(children(&f, &urls(), NodeId::Audiobooks))
             .unwrap()
             .is_empty());
+        assert!(f.calls.borrow().is_empty(), "{:?}", f.calls.borrow());
+    }
+
+    /// ADR-0132: an audiobook is an album under a Books library.
+    #[test]
+    fn audiobooks_list_the_books_librarys_albums() {
+        let f = Fake {
+            books: true,
+            ..Fake::default()
+        };
+        let books = block_on(children(&f, &urls(), NodeId::Audiobooks)).unwrap();
+        assert_eq!(ids(&books), ["album/s3"]);
+        assert!(books.iter().all(|b| b.browsable && !b.playable));
+        assert_eq!(
+            *f.calls.borrow(),
+            [format!("list 200 Some(Album) SortName {MAX_CHILDREN}")]
+        );
+    }
+
+    #[test]
+    fn music_lists_leave_out_audiobook_parts() {
+        let f = Fake::default();
+        let recent = block_on(children(&f, &urls(), NodeId::Recent)).unwrap();
+        assert_eq!(ids(&recent), ["track/1"]);
+        let mix = block_on(children(&f, &urls(), NodeId::Mix(0))).unwrap();
+        assert_eq!(ids(&mix), ["track/7"]);
     }
 
     #[test]
