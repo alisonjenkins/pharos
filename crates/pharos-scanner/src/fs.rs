@@ -1174,8 +1174,8 @@ impl<P: Prober> FsScanner<P> {
                     // skips a provider that errors. Only resolve for an item
                     // we actually probed — a probe miss writes nothing.
                     let meta = match &item {
-                        Some(it) => self.resolve_metadata(it).await,
-                        None => MetadataResult::default(),
+                        Ok(it) => self.resolve_metadata(it).await,
+                        Err(_) => MetadataResult::default(),
                     };
                     (p.id, p.row, p.sig, p.existed, kept, fp, item, meta)
                 }
@@ -1234,9 +1234,7 @@ impl<P: Prober> FsScanner<P> {
                 // item is not reported until its batch lands.
                 probed_done += 1;
                 emit(
-                    phase1_done + probed_done
-                        - batch_items.len() as u64
-                        - u64::from(item.is_some()),
+                    phase1_done + probed_done - batch_items.len() as u64 - u64::from(item.is_ok()),
                 );
                 // Record the outcome either way, so the next pass can skip a file
                 // that cannot be probed and re-try one that has been replaced. This
@@ -1244,17 +1242,22 @@ impl<P: Prober> FsScanner<P> {
                 // no row (V6), which is what made it repeat forever.
                 if let Some(memo) = self.probe_memo.as_ref() {
                     match &item {
-                        Some(_) => memo.forget(probed_id),
-                        None => memo.record(probed_id, sig),
+                        Ok(_) | Err(ProbeMiss::Excluded) => memo.forget(probed_id),
+                        Err(ProbeMiss::Unreadable) => memo.record(probed_id, sig),
                     }
                 }
-                let Some(mut item) = item else {
-                    if let Some((path, mtime, size)) = kept {
-                        store.mark_seen(row, scan_id, mtime, size).await?;
-                        seen += 1;
-                        keep_unreadable_row(row, &path, "reprobe_failed");
+                let mut item = match item {
+                    Ok(item) => item,
+                    Err(ProbeMiss::Unreadable) => {
+                        if let Some((path, mtime, size)) = kept {
+                            store.mark_seen(row, scan_id, mtime, size).await?;
+                            seen += 1;
+                            keep_unreadable_row(row, &path, "reprobe_failed");
+                        }
+                        continue;
                     }
-                    continue;
+                    // Left unseen, so the sweep takes a row the file had.
+                    Err(ProbeMiss::Excluded) => continue,
                 };
                 item.id = row;
                 let item_id = item.id;
@@ -1809,7 +1812,7 @@ impl<P: Prober> FsScanner<P> {
             Some(fp) => Some(fp),
             None => crate::fingerprint::fingerprint_async(path, None).await.ok(),
         };
-        let Some(mut item) = self.probe_one(path.to_path_buf()).await else {
+        let Ok(mut item) = self.probe_one(path.to_path_buf()).await else {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
@@ -1899,14 +1902,14 @@ impl<P: Prober> FsScanner<P> {
         &self,
         primary: PathBuf,
         alts: Vec<(String, PathBuf)>,
-    ) -> Option<MediaItem> {
+    ) -> Result<MediaItem, ProbeMiss> {
         let mut item = self.probe_one(primary).await?;
         if item.kind == MediaKind::Book {
             for (label, alt_path) in alts {
                 let alt = book_alternate(&item.probe.alternate_sources, &label, alt_path).await;
                 item.probe.alternate_sources.extend(alt);
             }
-            return Some(item);
+            return Ok(item);
         }
         for (edition, alt_path) in alts {
             match self.prober.probe(&alt_path).await {
@@ -1953,7 +1956,7 @@ impl<P: Prober> FsScanner<P> {
                 }
             }
         }
-        Some(item)
+        Ok(item)
     }
 
     /// LIB-D7 — resolve local-first metadata for a freshly-probed `item`.
@@ -2020,13 +2023,13 @@ impl<P: Prober> FsScanner<P> {
     }
 
     #[tracing::instrument(skip(self), fields(media.path = %path.display()))]
-    async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
+    async fn probe_one(&self, path: PathBuf) -> Result<MediaItem, ProbeMiss> {
         // 004-books / FR-001 — classify BEFORE the prober is reached. This is
         // not an optimisation: `self.prober.probe` fails on an epub, the `Err`
         // arm below writes nothing (V6), and the item would never exist. The
         // ordering IS the feature.
         if let Some(item) = self.book_item(&path) {
-            return Some(item);
+            return Ok(item);
         }
         match self.prober.probe(&path).await {
             Ok(info) => {
@@ -2074,7 +2077,9 @@ impl<P: Prober> FsScanner<P> {
                     crate::audiobook::record(&path, &probe, got);
                 }
                 let book = match book {
-                    Some(got) if got.verdict == crate::audiobook::Verdict::Skipped => return None,
+                    Some(got) if got.verdict == crate::audiobook::Verdict::Skipped => {
+                        return Err(ProbeMiss::Excluded)
+                    }
                     Some(got) => got.book,
                     None => None,
                 };
@@ -2126,7 +2131,7 @@ impl<P: Prober> FsScanner<P> {
                 } else {
                     None
                 };
-                Some(MediaItem {
+                Ok(MediaItem {
                     locked: Default::default(),
                     id: stable_id(&path),
                     path,
@@ -2161,10 +2166,22 @@ impl<P: Prober> FsScanner<P> {
             }
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "probe failed, skipping");
-                None
+                Err(ProbeMiss::Unreadable)
             }
         }
     }
+}
+
+/// Why [`FsScanner::probe_one`] produced no row for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeMiss {
+    /// The file could not be read: a row already there is kept as it was,
+    /// and the probe memo remembers the failure (B1286).
+    Unreadable,
+    /// The file was read and is not part of the library (a loose audio file
+    /// without chapters in a Books root, ADR-0132): a row already there is
+    /// swept, and the memo forgets the file.
+    Excluded,
 }
 
 /// What became of a video read as a course lesson: the
@@ -2501,7 +2518,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         groups.extend(lessons.into_iter().map(|p| (p, Vec::new())));
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
-            if let Some(item) = self.probe_with_alternates(primary, alts).await {
+            if let Ok(item) = self.probe_with_alternates(primary, alts).await {
                 items.push(item);
             }
             if !self.rate_limit.is_zero() {
@@ -12576,6 +12593,55 @@ mod tests {
         assert_eq!(count("single_file", "chapters"), 1);
         assert_eq!(count("folder_track", "in_folder"), 3);
         assert_eq!(count("skipped", "loose_without_chapters"), 1);
+    }
+
+    /// ADR-0132 — a book at a Books root that loses its chapters is left
+    /// out: its row is swept, not kept as unreadable, and the probe memo
+    /// does not hold it as a file that cannot be read.
+    #[tokio::test]
+    async fn a_root_file_that_loses_its_chapters_is_swept() {
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        let path = books.join("Sprocket Notes.m4a");
+        write_file(&books, "Sprocket Notes.m4a", b"book-bytes").await;
+        let roots = || crate::course::CourseRoots::new([(books.clone(), true)]);
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        let store = MemStore::default();
+        let chapters = vec![pharos_core::MediaChapter {
+            start_ms: 0,
+            end_ms: 1000,
+            title: "One".into(),
+        }];
+        FsScanner::new(FakeProber {
+            chapters_for: Some(("Sprocket".into(), chapters)),
+            ..FakeProber::default()
+        })
+        .with_course_roots(roots())
+        .with_probe_memo(memo.clone())
+        .scan_into(td.path(), &store)
+        .await
+        .unwrap();
+        let id = stable_id(&path);
+        assert!(store.get(id).await.is_ok(), "chapters make it a book");
+
+        write_file(&books, "Sprocket Notes.m4a", b"book-bytes, re-cut").await;
+        let out = FsScanner::new(FakeProber::default())
+            .with_course_roots(roots())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out.removed, vec![id], "the excluded file's row is swept");
+        assert!(store.get(id).await.is_err());
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            !memo.is_known_bad(id, Some((mtime_secs(&meta), meta.len()))),
+            "an excluded file is not a probe failure"
+        );
     }
 
     #[test]
