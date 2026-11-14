@@ -3898,6 +3898,113 @@ where
     );
 }
 
+/// Spec 043 FR-011/FR-012: an admin's genre list on an item is written,
+/// locked, and kept by every later relink until it is unlocked.
+async fn run_item_genre_lock_conformance<S>(store: S)
+where
+    S: MediaStore + GenreStore + MetadataEditStore,
+{
+    const ID: MediaId = 8_871_001;
+    MediaStore::put(&store, media_item(ID, "Book One"))
+        .await
+        .unwrap();
+    store.link_item_genres(ID, &["Other".into()]).await.unwrap();
+
+    let edit = MetadataEdit {
+        genres: Some(vec!["Programming".into(), "Web".into()]),
+        ..Default::default()
+    };
+    let locked = store
+        .edit_metadata(&EditTarget::Item(ID), &edit)
+        .await
+        .unwrap();
+    assert!(locked.contains(EditableField::Genres));
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Programming".to_string(), "Web".to_string()]
+    );
+
+    // A rescan or an online fill relinks: the locked list stays.
+    store
+        .link_item_genres(ID, &["Fiction".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Programming".to_string(), "Web".to_string()],
+        "a locked genre list is written only by an admin edit"
+    );
+    MediaStore::put(&store, media_item(ID, "Book One"))
+        .await
+        .unwrap();
+    assert!(
+        MediaStore::get(&store, ID)
+            .await
+            .unwrap()
+            .locked
+            .contains(EditableField::Genres),
+        "a put keeps the genre lock"
+    );
+
+    // An empty edit clears them, still locked.
+    store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                genres: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store.item_genre_names(ID).await.unwrap().is_empty());
+
+    // Unlocked, the next relink writes again.
+    let unlock: LockedFields = [EditableField::Genres].into_iter().collect();
+    let locked = store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                unlock,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!locked.contains(EditableField::Genres));
+    store
+        .link_item_genres(ID, &["Fiction".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Fiction".to_string()]
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_item_genre_lock_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_item_genre_lock_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_item_genre_lock_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_item_genre_lock_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "item_genre_lock").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_item_genre_lock_conformance(p).await;
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_read_position_conformance() {
