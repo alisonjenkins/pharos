@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pharos_api::pharos_capnp::{bootstrap, session};
-use pharos_client::api::MediaToken;
+use pharos_client::api::{ItemRef, MediaToken};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::cache::{self, Cache, Download, OfflineSummary, MIN_FREE_BYTES};
@@ -115,6 +115,7 @@ fn describe(a: &AuthState) -> String {
 enum Op {
     Children(NodeId),
     Node(NodeId),
+    Book(ItemRef),
     Search(String),
     SignOut,
     Reload,
@@ -125,6 +126,7 @@ impl Op {
         match self {
             Op::Children(id) => format!("browse {id}"),
             Op::Node(id) => format!("node {id}"),
+            Op::Book(a) => format!("book {a}"),
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
             Op::Reload => "reload credentials".into(),
@@ -136,6 +138,7 @@ enum Out {
     Nodes(Vec<Node>),
     Ranked(Vec<Node>, tree::SearchReport),
     One(Node),
+    Book(tree::Book),
     Done,
 }
 
@@ -360,6 +363,43 @@ impl Library {
             Out::One(n) => Ok(n),
             _ => Err(ContentError::WorkerGone),
         }
+    }
+
+    /// Every part of the book `media_id` (an `album/` id) and the one to
+    /// continue from. Offline, the parts last listed, from the first.
+    pub fn book(&self, media_id: &str) -> Result<tree::Book, ContentError> {
+        let id = NodeId::parse(media_id)?;
+        let NodeId::Album(a) = id else {
+            return Err(ContentError::BadId(format!("{media_id} is not a book")));
+        };
+        let why = if self.online.load(Ordering::SeqCst) {
+            match self.call(Op::Book(a)) {
+                Ok(Out::Book(b)) => return Ok(b),
+                Ok(_) => return Err(ContentError::WorkerGone),
+                Err(e) if is_unreachable(&e) => e,
+                Err(e) => return Err(e),
+            }
+        } else {
+            ContentError::Cache {
+                op: format!("book {media_id}"),
+                why: "offline".into(),
+            }
+        };
+        let parts: Vec<Node> = self
+            .offline_children(media_id, id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n.playable && is_track_id(&n.id))
+            .collect();
+        log::info!(
+            "car book {a} offline parts={} start=0: {}",
+            parts.len(),
+            why.redacted()
+        );
+        if parts.is_empty() {
+            return Err(why);
+        }
+        Ok(tree::Book { parts, start: 0 })
     }
 
     /// Songs, albums and artists matching a spoken request.
@@ -798,6 +838,7 @@ impl Worker {
             let r = match op {
                 Op::Children(id) => tree::children(&link.cat, &urls, *id).await.map(Out::Nodes),
                 Op::Node(id) => tree::node(&link.cat, &urls, *id).await.map(Out::One),
+                Op::Book(a) => tree::book(&link.cat, &urls, *a).await.map(Out::Book),
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
@@ -1225,6 +1266,34 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(lib.children("album/7").unwrap().len(), 1);
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_book_offline_plays_its_parts_on_the_phone_from_the_first() {
+        let (lib, _) = offline_lib("book");
+        let book = NodeId::parse("album/7").unwrap();
+        let mut resume = track(9);
+        resume.id = "album/7".into();
+        lib.note_listing("album/7", book, &[resume, track(1), track(2), track(3)]);
+        keep(&lib, "track/2");
+        keep(&lib, "track/3");
+        lib.set_online(false);
+        let b = lib.book("album/7").unwrap();
+        assert_eq!(
+            b.parts.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["track/2", "track/3"]
+        );
+        assert_eq!(b.start, 0);
+        assert_eq!(
+            lib.play_queue("track/2"),
+            ["track/3"],
+            "the row is not queued"
+        );
+        assert!(
+            lib.book("album/8").is_err(),
+            "nothing kept: the error stands"
+        );
+        assert!(lib.book("track/2").is_err(), "not a book");
     }
 
     #[test]
