@@ -64,7 +64,7 @@ As a listener, a chorus that repeats lights up on the repeat being sung, not an 
 
 1. **Given** a line repeated four times in the lyrics, **When** aligned, **Then** each copy is placed in order on a different sung occurrence.
 2. **Given** a line the recogniser mishears, **When** aligned, **Then** it is placed between its anchored neighbours, never past them.
-3. **Given** a line after the last anchored line whose time today does not reach that anchor's placed words, **When** aligned, **Then** it keeps today's per-line time.
+3. **Given** a line after the last anchored line whose time today does not reach that anchor's placed words, **When** aligned, **Then** it keeps today's per-line time, except for any word start the order pass holds to keep FR-006.
 
 ### User Story 3 - The first lines still arrive quickly (Priority: P2)
 
