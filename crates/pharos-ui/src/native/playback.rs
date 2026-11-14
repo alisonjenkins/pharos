@@ -1669,15 +1669,19 @@ const TV_AGENT_TOKENS: [&str; 6] = [
     "Tizen",
 ];
 
-/// The device class: a TV user agent or the Android shell is a TV, a coarse
+/// The device class: the Android phone app is a phone whatever its size or
+/// orientation; a TV user agent or the Android TV app is a TV; a coarse
 /// pointer on a narrow screen is a phone, anything else a desktop.
 pub fn device_class(
     user_agent: &str,
     coarse_pointer: bool,
     narrow_screen: bool,
-    android_shell: bool,
+    shell: super::shell::Shell,
 ) -> DeviceClass {
-    if android_shell
+    use super::shell::Shell;
+    if shell == Shell::AndroidPhone {
+        DeviceClass::Phone
+    } else if shell == Shell::AndroidTv
         || TV_AGENT_TOKENS
             .iter()
             .any(|t| has_word_start(user_agent, t))
@@ -3246,8 +3250,9 @@ pub fn rust_subtitle_url(track: &Track) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
 
+    #![allow(clippy::unwrap_used)]
+    use super::super::shell::Shell;
     use super::*;
 
     #[test]
@@ -3646,6 +3651,24 @@ mod tests {
     }
 
     #[test]
+    fn the_phone_app_is_a_phone_in_any_orientation_and_user_agent() {
+        let wide = "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/130 Mobile";
+        let tv_ua = "Mozilla/5.0 (Linux; Android 12; Android TV) Chrome/110";
+        for (agent, coarse, narrow) in [
+            (wide, true, true),
+            (wide, true, false),
+            (wide, false, false),
+            (tv_ua, false, false),
+        ] {
+            assert_eq!(
+                device_class(agent, coarse, narrow, Shell::AndroidPhone),
+                DeviceClass::Phone,
+                "{agent} {coarse} {narrow}"
+            );
+        }
+    }
+
+    #[test]
     fn device_class_follows_the_user_agent_pointer_and_shell() {
         let chrome = "Mozilla/5.0 (X11; Linux x86_64) Chrome/130 Safari/537.36";
         let cases = [
@@ -3713,11 +3736,16 @@ mod tests {
             ),
             ("", false, false, false, DeviceClass::Desktop),
         ];
-        for (agent, coarse, narrow, shell, want) in cases {
+        for (agent, coarse, narrow, tv_shell, want) in cases {
+            let shell = if tv_shell {
+                Shell::AndroidTv
+            } else {
+                Shell::Browser
+            };
             assert_eq!(
                 device_class(agent, coarse, narrow, shell),
                 want,
-                "{agent} {coarse} {narrow} {shell}"
+                "{agent} {coarse} {narrow} {tv_shell}"
             );
         }
         assert_eq!(
