@@ -17,7 +17,7 @@ Three failure classes found, each designed out below:
 |---|---|---|
 | Repeat stealing | a line takes the words of another repeat of the same text, spread over up to 29 s; the refine band then has no path | anchor span capped against the line's stamp slot in every matching pass; stamp distance as a tie-break; an infeasible band falls back |
 | Pile-up | unanchored lines after the last anchor squeezed into a few seconds | a line not bounded by anchors on both sides keeps today's per-line time |
-| Thin anchoring | very repetitive lyrics (chants, "na na") get under 40% of lines anchored | lines between anchors use today's per-line window clamped between the anchors; a song under a minimum anchor share keeps today's answer whole |
+| Thin anchoring | very repetitive lyrics (chants, "na na") get under 40% of lines anchored | lines between anchors are placed by the joint pass between their anchors; a song under a minimum anchor share (0.4) keeps today's answer whole |
 
 ## Pipeline per song
 
@@ -26,7 +26,10 @@ Three failure classes found, each designed out below:
 3. **Recognise** the vocals (Whisper large-v3-turbo) with word times.
 4. **Match** transcript words to lyric words in lyric order (monotonic DP over normalised words; near-miss spellings scored by letter similarity; a second letter-level pass for lines the first missed). Anchor = at least half the line's words, minimum 2, with its span inside the stamp slot cap.
 5. **Refine** each anchored line letter by letter (MMS_FA CTC on the vocals' emission) within the anchor ±1.5 s, with no gap penalty inside the anchor and a small cost for leaving it. An infeasible band keeps the anchor's recogniser times.
-6. **Place** the rest: a line between two anchors is aligned by today's per-line window clamped to the gap between them; a line outside any anchor pair keeps today's time.
+6. **Place** the rest in one joint pass: a single banded Viterbi over the whole anchored span times anchored and between lines together, so one line's error cannot spread to the next (per-line windows clamped to the gap did, on the private set). Before it:
+   - an anchor whose offset is more than 5 s from both neighbouring anchors' offsets AND that leaps a sung line (a line between it and a neighbour, moved by that neighbour's offset, lands on its far side) is dropped as an outlier;
+   - a kept line just outside the span whose today's time overlaps the placed edge line is taken into the span and the pass runs again; if that makes it infeasible, the last feasible answer stands (V1373).
+   A line outside any anchor pair keeps today's time.
 7. **Emit** a corrected event for every line whose time changed, then the whole answer (ADR-0121 shape, additive `placement` per line).
 
 Models load in stages and are released between them: separator, then recogniser, then the letter model already resident. Peak GPU memory for one song stays under 6 GiB (FR-010).
@@ -59,7 +62,7 @@ Models load in stages and are released between them: separator, then recogniser,
 ## Verification (ODD)
 
 - Signal first: slice 0 ships before any placement change, so the share of `kept` lines today (100%) is the baseline.
-- After deploy: `sum by (method) (increase(pharos_aligner_line_placement_total[1d]))` and `sum by (reason) (increase(pharos_aligner_song_fallback_total[1d]))`, plus LogQL on `{namespace="pharos"} |= "aligner: song placed"` for per-song anchor share. Report the output (SC-006).
+- After deploy: `sum by (method) (increase(pharos_aligner_line_placement_total[1d]))` and `sum by (reason) (increase(pharos_aligner_song_fallback_total[1d]))`, plus LogQL on `{namespace="pharos"} |= "song aligned" | logfmt | anchor_share != ""` for per-song anchor share. Report the output (SC-006).
 - Accuracy: the ear-checked points from the owner, kept privately on the desktop, rerun after each slice that changes placement.
 
 ## Risks
