@@ -31,7 +31,7 @@ fn failed(fallback: Fallback) -> impl Fn(String) -> StageError {
 
 impl Stages for Live {
     fn vocals(&self, path: &Path, deadline: Instant) -> Result<Vec<f32>, StageError> {
-        let mix = decode_stereo(&self.ffmpeg, path, separate::RATE)
+        let mix = decode_stereo(&self.ffmpeg, path, separate::RATE, deadline)
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))?;
         let Device::Vulkan(adapter) = &self.choice.device else {
             return Err(failed(Fallback::NoGpuStages)(format!(
@@ -46,7 +46,7 @@ impl Stages for Live {
             vocals
         });
         let vocals = vocals.ok_or_else(|| failed(Fallback::SeparateFailed)(separation.reason))?;
-        resample_mono(&self.ffmpeg, &vocals, separate::RATE)
+        resample_mono(&self.ffmpeg, &vocals, separate::RATE, deadline)
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))
     }
 
