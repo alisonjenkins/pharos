@@ -16,6 +16,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, SONGS_TOTAL, SONG_SECONDS};
+use crate::placement::Method;
 use crate::plan::{parse_request, resolve, Line};
 use crate::service::{Aligned, Answer, Engine, Progress, SongError};
 
@@ -315,9 +316,17 @@ fn run_song(
             span.record("aligner.model_ms", a.phases.model_ms());
             span.record("aligner.device", device);
             span.record("aligner.device_reason", device_reason.as_str());
+            a.placement.record();
+            let p = &a.placement;
             tracing::info!(
                 path = %rel_path,
                 lines = n_lines,
+                placed_anchored = p.count(Method::Anchored),
+                placed_refined = p.count(Method::Refined),
+                placed_between = p.count(Method::Between),
+                placed_kept = p.count(Method::Kept),
+                anchor_share = p.anchor_share,
+                fallback = p.fallback_label(),
                 words_aligned = a.words_aligned,
                 offset_ms = a.answer.offset_ms,
                 duration_ms,
