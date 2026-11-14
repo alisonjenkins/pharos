@@ -30,7 +30,9 @@ impl Player {
     fn send(&self, command: Command) {
         let name = format!("{command:?}");
         let attempt = match &command {
-            Command::Play { ids, index } => ids.get(*index).cloned().map(|id| (id, ids.clone())),
+            Command::Play { ids, index, .. } => {
+                ids.get(*index).cloned().map(|id| (id, ids.clone()))
+            }
             _ => None,
         };
         if self.tx.send(command).is_err() {
@@ -53,6 +55,17 @@ impl Player {
         self.send(Command::Play {
             ids,
             index: start_index,
+            from_start: false,
+        });
+    }
+
+    /// As [`Player::play`], from 0 rather than the position saved for the
+    /// track (a start over).
+    pub fn play_from_start(&self, ids: Vec<String>, start_index: usize) {
+        self.send(Command::Play {
+            ids,
+            index: start_index,
+            from_start: true,
         });
     }
 
@@ -291,7 +304,8 @@ mod tests {
             [
                 Command::Play {
                     ids: vec!["1".into(), "2".into()],
-                    index: 1
+                    index: 1,
+                    from_start: false,
                 },
                 Command::Pause,
                 Command::Seek(5_000),
