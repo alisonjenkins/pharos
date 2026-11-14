@@ -52,7 +52,7 @@ Branch `feat/karaoke-service`, head `a8f4cfe24`. Ids V1401, B1427, B1428, B1435,
 - [x] T042-24 Crash-loop guard: a song that aborted the process skips the stages, `stage_crashed`, counted (B1435, V1409, `af4b46a5e`).
 - [x] T042-25 One cubecl stream shared by every thread, so the kept pool stops growing per worker thread (B1427, `bef22b2b3`).
 - [x] T042-26 B1427, B1428, B1435 and V1409 recorded (`a8f4cfe24`).
-- [ ] T042-30 Boundary hold: when taking an edge line into the span makes the joint pass infeasible, hold that line's word starts at the placed edge, then walk the hold outward through the kept lines beyond it until one already keeps order, so word starts never decrease (V1373, plan step 6).
+- [ ] T042-30 Boundary hold: when taking an edge line into the span makes the joint pass infeasible, hold that line's word starts at the placed edge, then walk the hold outward through every kept line on that side (running min before the span, running max after), so word starts never decrease anywhere in the song (V1373, plan step 6).
 - [ ] T042-31 Mark V1400 superseded by V1409 in `invariants.md`; remove the mix path if nothing reaches it.
 
 ## Slice 5: deploy and verify
