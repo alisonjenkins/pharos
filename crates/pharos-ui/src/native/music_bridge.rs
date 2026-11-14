@@ -24,10 +24,6 @@ use super::watch_view::VIDEO_ID;
 /// about once a second, so ordinary steps stay well under it.
 const SEEK_JUMP_MS: u64 = 4_000;
 
-/// A resync this soon after the start does not seek back: the restart costs
-/// less than the seek.
-const RESYNC_KEEPS_POSITION_AFTER_MS: u64 = 1_500;
-
 thread_local! {
     /// The volume and mute last given to the host, for the controls to show:
     /// the snapshot carries no volume.
@@ -70,6 +66,13 @@ pub fn after(playing: ItemRef, upcoming: &[ItemRef]) -> Vec<ItemRef> {
         Some((head, rest)) if *head == playing => rest.to_vec(),
         _ => upcoming.to_vec(),
     }
+}
+
+fn queue_ids(playing: ItemRef, upcoming: &[ItemRef]) -> Vec<String> {
+    std::iter::once(playing)
+        .chain(after(playing, upcoming))
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn current_of(snapshot: &PlayerSnapshot) -> Option<ItemRef> {
@@ -214,21 +217,16 @@ impl Music {
 
     /// Play `playing` and what follows it from the start.
     pub fn restart(&self, playing: ItemRef, upcoming: &[ItemRef]) {
-        let ids: Vec<String> = std::iter::once(playing)
-            .chain(after(playing, upcoming))
-            .map(|id| id.to_string())
-            .collect();
+        let ids = queue_ids(playing, upcoming);
         self.sent.replace(ids.clone());
         self.port.play(ids, 0);
     }
 
-    /// Give the host the queue the player now has, keeping the playhead.
+    /// Give the host the queue the player now has. The song keeps playing.
     pub fn resync(&self, playing: ItemRef, upcoming: &[ItemRef]) {
-        let at = self.snapshot().position_ms;
-        self.restart(playing, upcoming);
-        if at > RESYNC_KEEPS_POSITION_AFTER_MS {
-            self.port.seek(at);
-        }
+        let ids = queue_ids(playing, upcoming);
+        self.sent.replace(ids.clone());
+        self.port.set_queue(ids, 0);
     }
 
     pub fn toggle(&self, playing: ItemRef, upcoming: &[ItemRef]) {
@@ -507,12 +505,17 @@ mod tests {
     }
 
     #[test]
-    fn a_resync_right_after_the_start_does_not_seek() {
+    fn a_resync_does_not_restart_or_pause_the_song() {
         let (fake, m) = music();
         m.begin(id(1), &ids(&[2]));
         fake.seek(500);
         m.resync(id(1), &ids(&[3]));
-        assert_eq!(fake.snapshot().position_ms, 0);
+        let s = fake.snapshot();
+        assert_eq!((s.position_ms, s.state), (500, PlayState::Playing));
+        assert_eq!(s.queue, vec!["1", "3"]);
+        m.pause();
+        m.resync(id(1), &ids(&[2]));
+        assert_eq!(fake.snapshot().state, PlayState::Paused);
     }
 
     #[test]
