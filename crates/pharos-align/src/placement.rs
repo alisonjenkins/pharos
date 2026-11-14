@@ -53,16 +53,20 @@ pub enum Fallback {
     DecodeFailed,
     /// The letter model gave no emission for the whole song.
     EmissionFailed,
+    /// The song ran on the CPU, where the stages take longer than the
+    /// server waits (B1428).
+    NoGpuStages,
 }
 
 impl Fallback {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Off,
         Self::LowAnchorShare,
         Self::SeparateFailed,
         Self::RecogniseFailed,
         Self::DecodeFailed,
         Self::EmissionFailed,
+        Self::NoGpuStages,
     ];
 
     /// The `reason` label of `pharos_aligner_song_fallback_total`.
@@ -74,6 +78,7 @@ impl Fallback {
             Self::RecogniseFailed => "recognise_failed",
             Self::DecodeFailed => "decode_failed",
             Self::EmissionFailed => "emission_failed",
+            Self::NoGpuStages => "no_gpu_stages",
         }
     }
 }
