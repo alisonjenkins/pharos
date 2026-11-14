@@ -22,6 +22,8 @@ pub struct ClassSpec {
     pub superclass: String,
     /// Library loaded in `<clinit>`, e.g. `pharos_auto` for `libpharos_auto.so`.
     pub load_library: Option<String>,
+    /// Interfaces the class declares it implements, e.g. a listener.
+    pub interfaces: Vec<String>,
     pub methods: Vec<Method>,
 }
 
@@ -197,6 +199,11 @@ pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
     let mut pool = Pool::default();
     let this = pool.class(&spec.name)?;
     let sup = pool.class(&spec.superclass)?;
+    let interfaces = spec
+        .interfaces
+        .iter()
+        .map(|i| pool.class(i))
+        .collect::<Result<Vec<_>, _>>()?;
     let code_attr = pool.utf8("Code")?;
     let mut methods = Vec::new();
 
@@ -293,7 +300,10 @@ pub fn generate(spec: &ClassSpec) -> Result<Vec<u8>, GenError> {
     push_u16(&mut out, ACC_PUBLIC | ACC_SUPER);
     push_u16(&mut out, this);
     push_u16(&mut out, sup);
-    push_u16(&mut out, 0); // interfaces
+    push_u16(&mut out, u16::try_from(interfaces.len()).map_err(|_| GenError::TooBig("interfaces"))?);
+    for i in interfaces {
+        push_u16(&mut out, i);
+    }
     push_u16(&mut out, 0); // fields
     push_u16(&mut out, u16::try_from(methods.len()).map_err(|_| GenError::TooBig("methods"))?);
     for m in methods {
@@ -333,6 +343,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
             name: format!("{PKG}/PharosMediaService"),
             superclass: "android/service/media/MediaBrowserService".into(),
             load_library: Some("pharos_auto".into()),
+            interfaces: Vec::new(),
             methods: vec![
                 Method::SuperThenNative {
                     name: "onCreate".into(),
@@ -362,6 +373,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
             name: format!("{PKG}/PharosSessionCallback"),
             superclass: "android/media/session/MediaSession$Callback".into(),
             load_library: None,
+            interfaces: Vec::new(),
             methods: vec![
                 native("onPlay", "()V"),
                 native("onPause", "()V"),
@@ -382,6 +394,7 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
             name: format!("{PKG}/PharosSearchActivity"),
             superclass: "android/app/Activity".into(),
             load_library: Some("pharos_auto".into()),
+            interfaces: Vec::new(),
             methods: vec![Method::SuperThenNative {
                 name: "onCreate".into(),
                 descriptor: "(Landroid/os/Bundle;)V".into(),
@@ -411,6 +424,7 @@ mod tests {
             name: "a/B".into(),
             superclass: "java/lang/Object".into(),
             load_library: None,
+            interfaces: Vec::new(),
             methods: vec![Method::SuperThenNative {
                 name: "x".into(),
                 descriptor: "()I".into(),
