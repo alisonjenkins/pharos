@@ -1,0 +1,13 @@
+[package]
+name = "pharos-classgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Writes the Java entry-point classes the Android app needs, from Rust, with no Java source (spec 044)"
+
+[dependencies]
+
+[lints]
+workspace = true
