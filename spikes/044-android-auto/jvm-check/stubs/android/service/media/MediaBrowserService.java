@@ -13,7 +13,8 @@ public abstract class MediaBrowserService extends android.app.Service {
   public void setSessionToken(MediaSession.Token token) { this.token = token; }
   public static final class BrowserRoot {
     public final String id;
-    public BrowserRoot(String rootId, Bundle extras) { id = rootId; }
+    public final Bundle extras;
+    public BrowserRoot(String rootId, Bundle extras) { id = rootId; this.extras = extras; }
     public String getRootId() { return id; }
   }
   public static class Result<T> {
