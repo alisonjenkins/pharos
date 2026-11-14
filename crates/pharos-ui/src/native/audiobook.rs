@@ -179,16 +179,28 @@ pub fn AudiobookControls(
     let mut tracks = use_signal(Vec::<Item>::new);
     let folder = book.chapters.is_empty();
 
+    // The element this instance drives now: a crossfade moves a part to
+    // the outgoing element and gives the playing one to the next part.
+    let owned = use_hook(|| Rc::new(Cell::new(media_id)));
+    owned.set(media_id);
+
     // A new source starts at the element's default rate, which `set_speed`
     // also sets; a song after the book plays at normal speed again.
     let want = speed();
-    use_effect(move || {
-        let want = speed();
-        if platform::speed(media_id) != want {
-            platform::set_speed(media_id, want);
+    use_effect({
+        let owned = Rc::clone(&owned);
+        move || {
+            let want = speed();
+            let media_id = owned.get();
+            if platform::speed(media_id) != want {
+                platform::set_speed(media_id, want);
+            }
         }
     });
-    use_drop(move || platform::set_speed(media_id, 1.0));
+    use_drop({
+        let owned = Rc::clone(&owned);
+        move || platform::set_speed(owned.get(), 1.0)
+    });
 
     // A folder book's chapters are its tracks.
     let album = book.book;
@@ -415,6 +427,65 @@ mod tests {
             "a folder book's file is the chapter"
         );
         assert!(!ends_with_track(None, 90_000));
+    }
+
+    /// A part handed to the outgoing element by a crossfade resets that
+    /// element's speed when it goes, not the next part's.
+    #[test]
+    fn leaving_resets_only_the_element_still_driven() {
+        use super::super::watch_view::{OUTGOING_ID, VIDEO_ID};
+        use dioxus::dioxus_core::{NoOpMutations, ScopeId};
+        #[derive(Clone)]
+        struct Props {
+            id: Rc<Cell<&'static str>>,
+            shown: Rc<Cell<bool>>,
+        }
+        impl PartialEq for Props {
+            fn eq(&self, _: &Self) -> bool {
+                false
+            }
+        }
+        let props = Props {
+            id: Rc::new(Cell::new(VIDEO_ID)),
+            shown: Rc::new(Cell::new(true)),
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |p: Props| {
+                let media_id = p.id.get();
+                rsx! {
+                    if p.shown.get() {
+                        AudiobookControls {
+                            book: Audiobook {
+                                chapters: Vec::new(),
+                                book: None,
+                                playing: ItemRef::Real(1),
+                                stop_at_end: StopAtEnd::default(),
+                            },
+                            media: MediaState::default(),
+                            runtime_ms: 60_000,
+                            media_id,
+                            on_control: |_| {},
+                        }
+                    }
+                }
+            },
+            props.clone(),
+        );
+        dom.rebuild_in_place();
+        let mut render = || {
+            dom.mark_dirty(ScopeId::APP);
+            dom.render_immediate(&mut NoOpMutations);
+        };
+        props.id.set(OUTGOING_ID);
+        render();
+        platform::take_speed_sets();
+        props.shown.set(false);
+        render();
+        assert_eq!(
+            platform::take_speed_sets(),
+            [(OUTGOING_ID.to_owned(), 1.0)],
+            "the next part's element keeps its speed"
+        );
     }
 
     #[test]
