@@ -175,16 +175,20 @@ fn to_ui_download(d: content::Download) -> Option<Download> {
         );
         return None;
     };
+    let subtitle = match container.kind {
+        ContainerKind::Album => d.subtitle,
+        _ => None,
+    };
     Some(Download {
         container,
         title: d.title.unwrap_or_default(),
-        subtitle: None,
+        subtitle,
         tracks: d
             .tracks
             .into_iter()
             .map(|t| TrackDownload {
                 id: snapshot::ui_id(&t.id),
-                title: String::new(),
+                title: t.title.unwrap_or_default(),
                 state: if t.complete {
                     TrackState::Cached
                 } else {
