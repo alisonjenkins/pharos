@@ -1068,8 +1068,19 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     (&held, &api, stored.as_deref().filter(|p| !p.is_empty()))
                 {
                     if !kept_web::is_offline() {
-                        match api.detail(&call("read", "load"), id).await {
-                            Ok(d) => {
+                        // Bounded: a slow server must not hold up a book
+                        // this device already has.
+                        let checked = kept_web::within(
+                            kept_web::SERVER_CHECK_MS,
+                            api.detail(&call("read", "load"), id),
+                        )
+                        .await;
+                        match checked {
+                            None => platform::warn(&format!(
+                                "pharos: reader kept copy used item={id} why=no answer on the picked format in {} ms",
+                                kept_web::SERVER_CHECK_MS
+                            )),
+                            Some(Ok(d)) => {
                                 let kept = book.format.book_format();
                                 let passed_over = d.book.as_ref().is_some_and(|b| {
                                     !kept_copy_serves(kept, b, &d.versions, pick)
@@ -1083,7 +1094,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                     detail = Some(d);
                                 }
                             }
-                            Err(e) => platform::warn(&format!(
+                            Some(Err(e)) => platform::warn(&format!(
                                 "pharos: reader kept copy used item={id} why=could not check the picked format: {e}"
                             )),
                         }
