@@ -3046,7 +3046,7 @@ fn PaletteScreen() -> Element {
     let on_key = move |evt: KeyboardEvent| match evt.key() {
         // A TV moves the real focus onto the results instead: OK on the
         // input opens the remote's keyboard, never picks (B1331).
-        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) if !TV_SEARCH_BUTTON => {
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) if !tv_search_button() => {
             evt.prevent_default();
             let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), rows.peek().len(), down);
@@ -3112,7 +3112,9 @@ fn app_outdated_line(app: u32, server: u32) -> String {
 
 /// Whether the top bar offers a Search button in place of the search box:
 /// on the Android TV app (FR-602).
-const TV_SEARCH_BUTTON: bool = cfg!(target_os = "android");
+fn tv_search_button() -> bool {
+    super::shell::current().remote_driven()
+}
 
 /// The top bar's search box: the shared search's first matches in a list
 /// under it, walked with the arrow keys. Enter opens the match the arrows
@@ -3137,7 +3139,7 @@ fn TopSearch() -> Element {
     // A TV has no keyboard to type into the box from and no Ctrl+K: the bar
     // holds a Search button that opens the palette, its input focused, where
     // the remote's keyboard comes up (FR-602).
-    if TV_SEARCH_BUTTON {
+    if tv_search_button() {
         return rsx! {
             button {
                 class: "pharos-search-open",
