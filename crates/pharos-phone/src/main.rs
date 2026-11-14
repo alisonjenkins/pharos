@@ -30,6 +30,8 @@ fn main() {
     // The generated classes call into this library by name; without a use
     // from here the linker drops every `Java_` export.
     pharos_android::link();
+    // The shared UI runs on Android for the TV too; say this one is the phone.
+    pharos_ui::native::shell::register_phone();
     log::info!("pharos: start app=phone");
     ports::register();
     let hook = pharos_ui::native::ports::register_on_credentials_changed(
