@@ -146,6 +146,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
                 .map_err(jerr("global session"))?,
             player: None,
             prepared: false,
+            started: false,
             current: None,
             queue: Vec::new(),
         });

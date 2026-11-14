@@ -68,6 +68,7 @@ pub(crate) fn play(
         let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
     }
     st.prepared = false;
+    st.started = false;
     want_start();
     let classes = CLASSES.get().ok_or("play before onCreate")?;
     let player = env
@@ -411,6 +412,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         }
         env.call_method(player.as_obj(), "start", "()V", &[])
             .map_err(jerr("start"))?;
+        if let Some(st) = state_lock()?.as_mut() {
+            st.started = true;
+        }
         set_playback_state(env, session.as_obj(), STATE_PLAYING, at)?;
         log(&format!(
             "player onPrepared id={} duration_ms={length}: started",
@@ -432,6 +436,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         let gone = while_current(env, &mp, |_, st, _, entry| {
             st.player = None;
             st.prepared = false;
+            st.started = false;
             resume::drop_current(false)?;
             Ok((st.session.clone(), entry))
         })?;
