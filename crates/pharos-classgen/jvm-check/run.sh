@@ -32,7 +32,7 @@ while IFS= read -r -d '' f; do stub_sources+=("$f"); done < <(find "$here/stubs"
 javac -d "$work/stubs" "${stub_sources[@]}"
 javac -cp "$work/stubs:$work/gen" -d "$work/main" "$here/Check.java"
 # The library logs to stderr on a desktop; keep a copy to check below.
-java -Xverify:all -Djava.library.path="$lib_dir" \
+java -Xverify:all -Djava.io.tmpdir="$work" -Djava.library.path="$lib_dir" \
   -cp "$work/stubs:$work/gen:$work/main" Check 2>"$work/rust.log" || java_status=$?
 cat "$work/rust.log" >&2
 [ "${java_status:-0}" -eq 0 ] || exit "$java_status"
