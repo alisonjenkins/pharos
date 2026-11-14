@@ -4138,6 +4138,7 @@ mod tests {
             stereo: None,
             damaged: false,
             new_children: 0,
+            audiobook: false,
         }
     }
 

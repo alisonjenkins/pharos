@@ -2251,6 +2251,7 @@ mod tests {
     fn a_latest_group_says_how_many_children_are_new() {
         let with = |kind, n| Item {
             new_children: n,
+            audiobook: false,
             ..item(kind)
         };
         assert_eq!(
@@ -2288,6 +2289,7 @@ mod tests {
             stereo: None,
             damaged: false,
             new_children: 0,
+            audiobook: false,
         }
     }
 
