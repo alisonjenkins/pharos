@@ -247,6 +247,12 @@ pub(crate) fn play_book(id: &str) -> R<()> {
     })
 }
 
+/// Whether `id` is a playable book (an `album/` row), which plays through
+/// its parts rather than as one track.
+pub(crate) fn is_book_id(id: &str) -> bool {
+    id.starts_with("album/")
+}
+
 /// Plays `id` with `queue` (or the remembered list holding it): a test
 /// entry at once, a library node from a worker thread.
 pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
@@ -255,6 +261,10 @@ pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<(
 
 /// [`start`] for a request that already holds its generation `gen`.
 pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
+    if is_book_id(id) {
+        log(&format!("start id={id}: a book, resolving its parts"));
+        return play_book(id);
+    }
     if let Some(item) = fixture::playable(id) {
         let source = fixture::source(env, id)?;
         return play(
@@ -444,6 +454,13 @@ mod tests {
         let second = supersede();
         assert!(!is_current(first), "the older request is dropped");
         assert!(is_current(second));
+    }
+
+    #[test]
+    fn an_album_id_is_a_book_and_a_track_is_not() {
+        assert!(is_book_id("album/b1"));
+        assert!(!is_book_id("track/1"));
+        assert!(!is_book_id("tone:440"));
     }
 
     #[test]
