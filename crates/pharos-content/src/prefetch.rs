@@ -267,6 +267,12 @@ impl Downloader {
         self.gate.wake.notify_one();
     }
 
+    /// Whether downloading is allowed now.
+    #[cfg(test)]
+    pub fn is_online(&self) -> bool {
+        self.gate.online.load(Ordering::SeqCst)
+    }
+
     /// Jobs queued or running.
     #[cfg(test)]
     pub fn pending(&self) -> usize {
