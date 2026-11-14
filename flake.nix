@@ -1394,6 +1394,32 @@
             "${script}/bin/pharos-android-apk";
         };
 
+        # `nix run .#android-phone-apk [-- --release]` builds the Pharos
+        # phone APK (spec 044): the shared UI and the car's media service in
+        # one libmain.so, signed like the TV APK. See
+        # specs/044-android-auto/spec.md.
+        apps.android-phone-apk = {
+          type = "app";
+          program =
+            let
+              script = pkgs.writeShellApplication {
+                name = "pharos-android-phone-apk";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.findutils
+                  pkgs.git
+                  pkgs.gnugrep
+                  pkgs.gnused
+                  pkgs.nix
+                  pkgs.unzip
+                  pkgs.zip
+                ];
+                text = builtins.readFile ./scripts/android-phone-apk.sh;
+              };
+            in
+            "${script}/bin/pharos-android-phone-apk";
+        };
+
         # `nix run .#dev-stack` boots pharos + jellyfin-web as
         # distroless OCI containers built reproducibly via nix
         # dockerTools. On darwin the pharos image build dispatches to
