@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use super::{
     ContainerRef, Download, NativeAudio, OfflineError, OfflineStore, PlayState, PlayerSnapshot,
-    TrackDownload, TrackState,
+    TrackDownload, TrackState, VisFrame,
 };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -19,6 +19,15 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct FakeAudio {
     tx: watch::Sender<PlayerSnapshot>,
     volumes: Mutex<Vec<f32>>,
+    visualiser: Mutex<FakeVisualiser>,
+}
+
+#[derive(Default)]
+struct FakeVisualiser {
+    shown: bool,
+    /// Every `visualiser_enable` call, oldest first.
+    calls: Vec<bool>,
+    frame: Option<VisFrame>,
 }
 
 impl FakeAudio {
@@ -26,6 +35,7 @@ impl FakeAudio {
         Self {
             tx: watch::Sender::new(PlayerSnapshot::default()),
             volumes: Mutex::new(Vec::new()),
+            visualiser: Mutex::new(FakeVisualiser::default()),
         }
     }
 
@@ -37,6 +47,16 @@ impl FakeAudio {
     /// The engine learning the current track's length.
     pub fn set_duration(&self, duration_ms: u64) {
         self.tx.send_modify(|s| s.duration_ms = Some(duration_ms));
+    }
+
+    /// Every `visualiser_enable` call, oldest first.
+    pub fn visualiser_calls(&self) -> Vec<bool> {
+        lock(&self.visualiser).calls.clone()
+    }
+
+    /// What the analyser would produce now; only a shown visualiser pulls it.
+    pub fn set_visualiser_frame(&self, frame: Option<VisFrame>) {
+        lock(&self.visualiser).frame = frame;
     }
 
     pub fn snapshot(&self) -> PlayerSnapshot {
@@ -147,6 +167,20 @@ impl NativeAudio for FakeAudio {
 
     fn state(&self) -> watch::Receiver<PlayerSnapshot> {
         self.tx.subscribe()
+    }
+
+    fn visualiser_enable(&self, on: bool) {
+        let mut v = lock(&self.visualiser);
+        v.shown = on;
+        v.calls.push(on);
+    }
+
+    fn visualiser_frame(&self) -> Option<VisFrame> {
+        let v = lock(&self.visualiser);
+        if !v.shown || self.tx.borrow().state != PlayState::Playing {
+            return None;
+        }
+        v.frame.clone()
     }
 }
 
@@ -562,6 +596,30 @@ mod tests {
         s.fail_track("t2");
         assert!(!s.is_cached("t2"));
         assert_eq!(s.used_bytes(), 100);
+    }
+
+    fn vis_frame() -> VisFrame {
+        VisFrame {
+            sample_rate: 44_100,
+            bins: vec![40; 4],
+            wave: vec![0; 8],
+        }
+    }
+
+    #[test]
+    fn a_frame_comes_only_while_shown_and_playing() {
+        let a = FakeAudio::new();
+        a.set_visualiser_frame(Some(vis_frame()));
+        a.play(ids(&["a"]), 0);
+        assert_eq!(a.visualiser_frame(), None, "not shown");
+        a.visualiser_enable(true);
+        assert_eq!(a.visualiser_frame(), Some(vis_frame()));
+        a.pause();
+        assert_eq!(a.visualiser_frame(), None, "paused");
+        a.resume();
+        a.visualiser_enable(false);
+        assert_eq!(a.visualiser_frame(), None, "hidden");
+        assert_eq!(a.visualiser_calls(), vec![true, false]);
     }
 
     #[test]
