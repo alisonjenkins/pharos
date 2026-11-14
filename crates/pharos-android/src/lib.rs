@@ -48,6 +48,7 @@ use browse::*;
 use command::*;
 pub use pharos_content as content;
 use player::*;
+pub use resume::saved_ms as saved_resume_ms;
 pub use runtime::{runtime, Player};
 use search::*;
 use service::*;
