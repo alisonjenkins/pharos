@@ -201,6 +201,12 @@ pub fn destroy(env: &mut JNIEnv) -> R<()> {
     Ok(())
 }
 
+/// Forgets a pending resume-on-gain: the user paused, or the output went
+/// away, so regaining focus must not start playback again.
+pub(crate) fn clear_resume_on_gain() {
+    RESUME_ON_GAIN.store(false, Ordering::SeqCst);
+}
+
 /// The share of the app's level that plays now: lower while ducked.
 pub(crate) fn duck_factor() -> f32 {
     if DUCKED.load(Ordering::SeqCst) {
@@ -287,4 +293,16 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         log(&format!("focus change={change} action={action}"));
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_forgets_a_pending_resume_on_gain() {
+        RESUME_ON_GAIN.store(true, Ordering::SeqCst);
+        clear_resume_on_gain();
+        assert!(!RESUME_ON_GAIN.swap(false, Ordering::SeqCst));
+    }
 }
