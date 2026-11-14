@@ -202,6 +202,7 @@ pub fn resume_part(parts: &[Item]) -> Option<usize> {
 fn as_parts(parts: &mut [Node], book: &Item) {
     let total = parts.len();
     for (n, part) in parts.iter_mut().enumerate() {
+        part.title = part_name(&part.title, &book.name, n + 1);
         part.book.clone_from(&book.name);
         if part.subtitle.is_empty() {
             part.subtitle = book.series_name.clone().unwrap_or_default();
@@ -210,6 +211,55 @@ fn as_parts(parts: &mut [Node], book: &Item) {
             part.album = format!("Part {} of {total}", n + 1);
         }
     }
+}
+
+/// A part's name as the car lists it: a file-style name such as
+/// "3 - A Book: Chapter Name" loses its leading number and the book's title,
+/// so the row reads "Chapter Name"; a name left empty is "Part `n`" (V1412).
+fn part_name(name: &str, book: &str, n: usize) -> String {
+    let rest = name.trim();
+    let rest = strip_number(rest, book).unwrap_or(rest);
+    let rest = strip_title(rest, book).unwrap_or(rest);
+    if rest.is_empty() {
+        format!("Part {n}")
+    } else {
+        rest.to_owned()
+    }
+}
+
+fn is_sep(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}' | '.' | ':' | '_')
+}
+
+fn trim_seps(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_whitespace() || is_sep(c))
+}
+
+/// `name` past a leading track number, when a separator or the book's title
+/// follows it; `None` when the number is part of the name ("1984 ...").
+fn strip_number<'a>(name: &'a str, book: &str) -> Option<&'a str> {
+    let after = name.trim_start_matches(|c: char| c.is_ascii_digit());
+    if after.len() == name.len() {
+        return None;
+    }
+    let spaced = after.trim_start();
+    if spaced.starts_with(is_sep) {
+        return Some(trim_seps(spaced));
+    }
+    strip_title(spaced, book).map(|_| spaced)
+}
+
+/// `name` past the book's title and any separator, when the title is a
+/// whole-word prefix.
+fn strip_title<'a>(name: &'a str, book: &str) -> Option<&'a str> {
+    let book = book.trim();
+    if book.is_empty() {
+        return None;
+    }
+    let head = name.get(..book.len())?;
+    let tail = &name[book.len()..];
+    let whole = tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || is_sep(c));
+    (head.eq_ignore_ascii_case(book) && whole).then(|| trim_seps(tail))
 }
 
 /// The row heading a book's parts that plays it as [`book`] does, so the
@@ -594,6 +644,34 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
+
+    /// V1412: a part lists by its own name, not the file-style one.
+    #[test]
+    fn a_part_lists_without_its_number_or_the_book_title() {
+        assert_eq!(
+            part_name("1 - A Book: Opening Credits", "A Book", 1),
+            "Opening Credits"
+        );
+        assert_eq!(
+            part_name("07. A Book - Chapter Seven", "a book", 7),
+            "Chapter Seven"
+        );
+        assert_eq!(part_name("12 A Book", "A Book", 12), "Part 12");
+        assert_eq!(part_name("A Book", "A Book", 2), "Part 2");
+        assert_eq!(part_name("4 - Chapter Four", "A Book", 4), "Chapter Four");
+        assert_eq!(part_name("", "A Book", 3), "Part 3");
+    }
+
+    /// A name that only starts like a number or the title keeps its words.
+    #[test]
+    fn a_part_name_of_its_own_keeps_its_words() {
+        assert_eq!(part_name("Chapter 2", "A Book", 2), "Chapter 2");
+        assert_eq!(part_name("1984 Revisited", "A Book", 1), "1984 Revisited");
+        assert_eq!(
+            part_name("3 - A Bookish Aside", "A Book", 3),
+            "A Bookish Aside"
+        );
+    }
     use crate::node::tests::item;
 
     /// Records each call; answers fixed items.
