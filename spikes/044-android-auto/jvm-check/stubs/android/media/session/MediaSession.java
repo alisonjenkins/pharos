@@ -4,6 +4,8 @@ public final class MediaSession {
   public Callback cb; public boolean active; public int flags; public android.app.PendingIntent activity; public PlaybackState state; public android.media.MediaMetadata md;
   public static MediaSession last;
   public MediaSession(android.content.Context context, String tag) { last = this; System.out.println("stub: MediaSession(" + tag + ")"); }
+  public android.media.AudioAttributes local;
+  public void setPlaybackToLocal(android.media.AudioAttributes a) { local = a; }
   public void setCallback(Callback callback) { cb = callback; }
   public void setActive(boolean a) { active = a; }
   public void setFlags(int f) { flags = f; }
