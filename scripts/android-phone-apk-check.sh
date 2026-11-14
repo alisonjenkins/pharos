@@ -98,13 +98,21 @@ for class in PharosMediaService PharosArtProvider PharosSearchActivity PharosPla
   fi
 done
 if [ -f "$tmp/lib/arm64-v8a/libmain.so" ]; then
-  exports=$("$LLVM_NM" -D --defined-only "$tmp/lib/arm64-v8a/libmain.so" | awk '$3 ~ /^Java_com_alisonjenkins_pharos_auto_/ {print $3}' | sort -u)
-  count=$(printf '%s\n' "$exports" | grep -c . || true)
-  if [ "$count" -gt 0 ]; then pass "libmain.so exports $count car entry points"; else fail "libmain.so exports no Java_com_alisonjenkins_pharos_auto_ symbol"; fi
-  if printf '%s\n' "$exports" | grep -q "PharosMediaService_nativeOnCreate"; then
-    pass "libmain.so exports PharosMediaService.nativeOnCreate"
-  else
-    fail "libmain.so lacks PharosMediaService.nativeOnCreate"
+  # The JVM resolves a native method on its first call, so a missing export
+  # only shows up in the car. Every Java_ function the crate defines must be
+  # exported; the source is the list of truth, as run.sh uses it.
+  want=$(grep -rhoE '\bJava_[A-Za-z0-9_]+' "$root/crates/pharos-android/src" | sort -u)
+  if [ -z "$want" ]; then
+    fail "no Java_ symbols found under crates/pharos-android/src"
+  fi
+  have=$("$LLVM_NM" -D --defined-only "$tmp/lib/arm64-v8a/libmain.so" | awk '$NF ~ /^Java_/ {print $NF}' | sort -u)
+  missing=$(comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$have"))
+  while IFS= read -r sym; do
+    [ -n "$sym" ] || continue
+    fail "libmain.so lacks $sym"
+  done <<< "$missing"
+  if [ -n "$want" ] && [ -z "$missing" ]; then
+    pass "libmain.so exports all $(printf '%s\n' "$want" | grep -c .) Java_ symbols of pharos-android"
   fi
 fi
 
