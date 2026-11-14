@@ -217,13 +217,16 @@
         # Spec 042 slice 2 / ADR-0125: whisper.cpp under `whisper-rs`, behind
         # pharos-align's `recognise` feature. Its build runs cmake and compiles
         # the Vulkan shaders with glslc, then links the Vulkan loader.
-        recogniseBuildInputs = [ pkgs.cmake pkgs.shaderc pkgs.vulkan-headers pkgs.vulkan-loader ];
+        recogniseTools = [ pkgs.cmake pkgs.shaderc ];
+        # Host libraries: cmake's find_package searches buildInputs only.
+        recogniseLibs = [ pkgs.vulkan-headers pkgs.vulkan-loader ];
         # The workspace checks never enable `recognise`, so lint it here.
         # Own deps artifact: the C++ build stays out of every other check.
         alignerRecogniseArgs = ciArgs // {
           pname = "pharos-align-recognise";
           cargoExtraArgs = "--package pharos-align --features recognise";
-          nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ recogniseBuildInputs;
+          nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ recogniseTools;
+          buildInputs = pharosCommonArgs.buildInputs ++ recogniseLibs;
           # cmake's setup hook would take over the build phase.
           dontUseCmakeConfigure = true;
         };
@@ -1474,7 +1477,7 @@
             # spec 039: pharos-align links OpenBLAS for its CPU forward pass.
             pkgs.openblas
             # spec 042: whisper.cpp for pharos-align's `recognise` feature.
-          ] ++ recogniseBuildInputs ++ [
+          ] ++ recogniseTools ++ recogniseLibs ++ [
             pkgs.git
             pkgs.just
             pkgs.curl
