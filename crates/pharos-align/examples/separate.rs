@@ -69,7 +69,7 @@ fn main() -> Result<(), Error> {
     let choice = device::choose(mode, &device::probe())?;
     if let Some(dir) = std::env::var_os("KERNEL_CACHE") {
         std::fs::create_dir_all(&dir)?;
-        pharos_align::forward::vulkan::use_kernel_cache(Path::new(&dir));
+        pharos_align::forward::vulkan::configure_runtime(Some(Path::new(&dir)));
     }
     let separator = match &choice.device {
         Device::Vulkan(a) => Some(Separator::load(Path::new(BPK), a)?),

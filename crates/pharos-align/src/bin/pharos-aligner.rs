@@ -139,12 +139,17 @@ fn check_gpu(
 /// R14: compiled kernels persist under `PHAROS_ALIGNER_CACHE_DIR`. cubecl
 /// does not create it, and without it keeps kernels in memory only, so a
 /// directory that cannot be made says so here rather than in its warnings.
+/// cubecl's other settings (one stream, B1427) apply either way.
 #[cfg(feature = "vulkan")]
 fn kernel_cache(dir: &Path) -> String {
+    use pharos_align::forward::vulkan::configure_runtime;
     if let Err(e) = std::fs::create_dir_all(dir) {
+        if !configure_runtime(None) {
+            return format!("off_already_configured:{}: {e}", dir.display());
+        }
         return format!("off_unwritable:{}: {e}", dir.display());
     }
-    if pharos_align::forward::vulkan::use_kernel_cache(dir) {
+    if configure_runtime(Some(dir)) {
         dir.display().to_string()
     } else {
         "off_already_configured".into()
@@ -175,10 +180,16 @@ fn choose_device(config: &Config) -> Result<(device::Choice, Warmed), String> {
     let (choice, warmed) = match &choice.device {
         device::Device::Vulkan(a) => {
             let cache = kernel_cache(&config.cache_dir);
-            if cache.starts_with("off_") {
-                tracing::warn!(kernel_cache = %cache, "GPU kernels compile afresh in every process");
+            // B1427: per-thread streams leave a stream's pages behind per song.
+            let streams = if cache.starts_with("off_already_configured") {
+                "per_thread"
             } else {
-                tracing::info!(kernel_cache = %cache, "GPU kernel cache");
+                "single"
+            };
+            if cache.starts_with("off_") {
+                tracing::warn!(kernel_cache = %cache, streams, "GPU kernels compile afresh in every process");
+            } else {
+                tracing::info!(kernel_cache = %cache, streams, "GPU kernel cache");
             }
             let (checked, warmed) = match check_gpu(&config.weights, a) {
                 Ok(m) => (Ok(()), Some(m)),
