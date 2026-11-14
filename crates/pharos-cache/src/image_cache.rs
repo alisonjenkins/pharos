@@ -1791,6 +1791,23 @@ mod tests {
     }
 
     #[test]
+    fn a_written_width_file_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("w");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(write_width_file(&file, Some(2000)));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("w")]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "2000");
+    }
+
+    #[test]
     fn source_width_labels_are_distinct() {
         let labels =
             [WidthLookup::Hit, WidthLookup::Disk, WidthLookup::Miss].map(WidthLookup::label);
@@ -2472,8 +2489,18 @@ async fn write_width_file(file: &Path, width: Option<u32>) {
             return;
         }
     }
-    if let Err(e) = tokio::fs::write(file, text).await {
+    // Written beside and renamed into place, so a reader never sees a torn
+    // "200" from "2000".
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = file.with_extension(format!("tmp{}-{n}", std::process::id()));
+    let kept = match tokio::fs::write(&tmp, text).await {
+        Ok(()) => tokio::fs::rename(&tmp, file).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = kept {
         tracing::warn!(error = %e, file = %file.display(), "image width not kept on disk");
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 }
 
