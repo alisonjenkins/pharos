@@ -377,11 +377,17 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
         let pkg = string(env, &package)?;
         log(&format!("onGetRoot package={pkg} uid={uid} verdict=allow reason=spike_allows_all"));
         let root = JObject::from(env.new_string(ROOT).map_err(jerr("root"))?);
+        // Without this extra the car hides its search button (DHU check,
+        // 2026-11-14): voice still binds, but typed search never reaches onSearch.
+        let extras = env.new_object("android/os/Bundle", "()V", &[]).map_err(jerr("Bundle"))?;
+        let key = JObject::from(env.new_string("android.media.browse.SEARCH_SUPPORTED").map_err(jerr("key"))?);
+        env.call_method(&extras, "putBoolean", "(Ljava/lang/String;Z)V", &[JValue::Object(&key), JValue::Bool(1)])
+            .map_err(jerr("putBoolean"))?;
         let r = env
             .new_object(
                 "android/service/media/MediaBrowserService$BrowserRoot",
                 "(Ljava/lang/String;Landroid/os/Bundle;)V",
-                &[JValue::Object(&root), JValue::Object(&JObject::null())],
+                &[JValue::Object(&root), JValue::Object(&extras)],
             )
             .map_err(jerr("BrowserRoot"))?;
         Ok(r.into_raw())

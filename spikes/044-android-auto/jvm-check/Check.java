@@ -16,6 +16,7 @@ public class Check {
     expect(s.token != null, "Rust set the session token");
     MediaBrowserService.BrowserRoot root = s.onGetRoot("com.google.android.projection.gearhead", 10123, null);
     expect(root != null && root.getRootId().equals("root"), "onGetRoot returned root");
+    expect(root.extras != null && Boolean.TRUE.equals(root.extras.m.get("android.media.browse.SEARCH_SUPPORTED")), "root says search is supported");
     MediaBrowserService.Result<List<MediaBrowser.MediaItem>> r = new MediaBrowserService.Result<>();
     s.onLoadChildren("root", r);
     expect(r.sent && r.value.size() == 2, "root has Music and Audiobooks: " + r.value);
