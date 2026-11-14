@@ -179,7 +179,9 @@ pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explici
         supersede();
     }
     if cancels_resume_on_gain(method, explicit) {
-        focus::clear_resume_on_gain();
+        focus::note_user_pause();
+    } else if method == "start" && explicit {
+        focus::note_user_play();
     }
     let mut guard = state_lock()?;
     let st = guard.as_mut().ok_or("transport before onCreate")?;
