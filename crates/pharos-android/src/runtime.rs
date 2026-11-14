@@ -64,6 +64,23 @@ impl Player {
         self.send(Command::Stop);
     }
 
+    /// Replace the queue with `ids`, where `current_index` is the track now
+    /// playing. It keeps playing; when `ids[current_index]` is not that track
+    /// nothing changes and the verdict is logged.
+    pub fn set_queue(&self, ids: Vec<String>, current_index: usize) {
+        self.send(Command::SetQueue {
+            ids,
+            index: current_index,
+        });
+    }
+
+    /// The output level, 0.0 (silent) to 1.0 (full), for this track and the
+    /// ones after it. Out-of-range values are clamped.
+    pub fn set_volume(&self, level: f32) {
+        set_volume(level);
+        self.send(Command::Volume);
+    }
+
     /// A receiver that always holds the latest snapshot.
     pub fn state(&self) -> tokio::sync::watch::Receiver<snapshot::Snapshot> {
         snapshot::subscribe()

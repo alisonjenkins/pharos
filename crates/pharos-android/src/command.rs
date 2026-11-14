@@ -35,6 +35,14 @@ pub(crate) enum Command {
     Next,
     Previous,
     Stop,
+    /// Replace the queue with `ids`, where `index` is the track now playing;
+    /// it keeps playing.
+    SetQueue {
+        ids: Vec<String>,
+        index: usize,
+    },
+    /// Apply the level last stored by [`set_volume`] to the current player.
+    Volume,
 }
 
 impl Command {
@@ -47,6 +55,8 @@ impl Command {
             Command::Next => "next",
             Command::Previous => "previous",
             Command::Stop => "stop",
+            Command::SetQueue { .. } => "set_queue",
+            Command::Volume => "volume",
         }
     }
 }
@@ -173,7 +183,81 @@ pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()>
             snapshot::clear();
             Ok(())
         }
+        Command::SetQueue { ids, index } => {
+            let car: Vec<String> = ids.iter().map(|id| snapshot::car_id(id)).collect();
+            let mut guard = state_lock()?;
+            let st = guard.as_mut().ok_or("set_queue before onCreate")?;
+            let current = st.current.as_ref().map(|i| i.id.clone());
+            let verdict = queue_verdict(current.as_deref(), &car, index);
+            log(&format!(
+                "command {name} source={from} verdict={verdict} index={index} queue_len={}",
+                car.len()
+            ));
+            if verdict != "replaced" {
+                return Ok(());
+            }
+            st.queue = car.iter().map(|id| item_for(id)).collect();
+            drop(guard);
+            snapshot::note_queue(&car, index);
+            Ok(())
+        }
+        Command::Volume => {
+            let level = volume();
+            let player = state_lock()?.as_ref().and_then(|s| s.player.clone());
+            log(&format!(
+                "command {name} source={from} level={level:.2} loaded={}",
+                player.is_some()
+            ));
+            match player {
+                Some(p) => apply_volume(env, p.as_obj()),
+                None => Ok(()),
+            }
+        }
     }
+}
+
+/// Whether a new queue can replace the current one without a restart: only
+/// when its `index` names the track now playing.
+pub(crate) fn queue_verdict(current: Option<&str>, ids: &[String], index: usize) -> &'static str {
+    match (current, ids.get(index)) {
+        (_, None) => "rejected_index",
+        (None, Some(_)) => "rejected_nothing_playing",
+        (Some(cur), Some(id)) if cur != id => "rejected_not_current",
+        _ => "replaced",
+    }
+}
+
+/// The output level, as `f32` bits; 1.0 until the app sets one.
+static VOLUME: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+pub(crate) fn volume() -> f32 {
+    f32::from_bits(VOLUME.load(Ordering::SeqCst))
+}
+
+/// Stores `level`, clamped to 0.0..=1.0 (NaN is silent), for the current
+/// player and every later one.
+pub(crate) fn set_volume(level: f32) -> f32 {
+    let level = if level.is_nan() {
+        0.0
+    } else {
+        level.clamp(0.0, 1.0)
+    };
+    VOLUME.store(level.to_bits(), Ordering::SeqCst);
+    level
+}
+
+/// `MediaPlayer.setVolume` with the stored level on both channels, lowered
+/// while another app has ducked us.
+pub(crate) fn apply_volume(env: &mut JNIEnv, player: &JObject) -> R<()> {
+    let level = volume() * focus::duck_factor();
+    env.call_method(
+        player,
+        "setVolume",
+        "(FF)V",
+        &[JValue::Float(level), JValue::Float(level)],
+    )
+    .map_err(jerr("setVolume"))?;
+    Ok(())
 }
 
 /// Seeks the prepared player to `ms`; a seek while paused stays paused, as
@@ -230,6 +314,37 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_replaces_only_around_the_current_track() {
+        let q = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            queue_verdict(Some("track/2"), &q(&["track/1", "track/2"]), 1),
+            "replaced"
+        );
+        assert_eq!(
+            queue_verdict(Some("track/2"), &q(&["track/1", "track/2"]), 0),
+            "rejected_not_current"
+        );
+        assert_eq!(
+            queue_verdict(Some("track/2"), &q(&["track/2"]), 3),
+            "rejected_index"
+        );
+        assert_eq!(
+            queue_verdict(None, &q(&["track/2"]), 0),
+            "rejected_nothing_playing"
+        );
+    }
+
+    #[test]
+    fn the_volume_is_clamped_and_kept() {
+        assert_eq!(volume(), 1.0);
+        assert_eq!(set_volume(0.25), 0.25);
+        assert_eq!(volume(), 0.25);
+        assert_eq!(set_volume(3.0), 1.0);
+        assert_eq!(set_volume(-1.0), 0.0);
+        assert_eq!(set_volume(f32::NAN), 0.0);
+    }
+
+    #[test]
     fn an_unlisted_id_becomes_a_bare_playable_row() {
         let item = item_for("track/987654");
         assert_eq!(item.id, "track/987654");
@@ -250,6 +365,11 @@ mod tests {
             Command::Next,
             Command::Previous,
             Command::Stop,
+            Command::SetQueue {
+                ids: Vec::new(),
+                index: 0,
+            },
+            Command::Volume,
         ]
         .map(|c| c.label());
         labels.sort_unstable();

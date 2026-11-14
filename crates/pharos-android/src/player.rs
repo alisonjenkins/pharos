@@ -47,6 +47,9 @@ pub(crate) fn play(
         )
         .map_err(jerr(setter))?;
     }
+    if let Err(e) = apply_volume(env, &player) {
+        log(&format!("play id={}: volume not set: {e}", item.id));
+    }
     if let Err(e) = focus::apply(env, &player) {
         log(&format!("play id={}: no audio attributes: {e}", item.id));
     }
