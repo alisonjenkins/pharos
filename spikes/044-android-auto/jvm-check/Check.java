@@ -10,6 +10,53 @@ public class Check {
   static int failures = 0;
   static void expect(boolean ok, String what) { System.out.println((ok ? "PASS " : "FAIL ") + what); if (!ok) failures++; }
 
+  /** Records the one transaction the app sends to a search's result receiver. */
+  static final class Receiver implements android.os.IBinder {
+    android.os.Parcel data; int code, flags;
+    public boolean transact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
+      this.code = code; this.data = data; this.flags = flags; return true;
+    }
+  }
+  /** Stands in for androidx's ResultReceiver: its parcel is just its binder. */
+  static final class ReceiverParcelable implements android.os.Parcelable {
+    final Receiver r; ReceiverParcelable(Receiver r) { this.r = r; }
+    public void writeToParcel(android.os.Parcel p, int f) { p.writeStrongBinder(r); }
+  }
+
+  /** Android Auto's search: MSG_SEARCH to the Messenger in the root extras. */
+  static void compatSearch(android.os.Bundle extras) {
+    Object binder = extras.m.get("extra_messenger");
+    expect(binder instanceof android.os.Messenger.Binder, "root extras carry a compat Messenger binder: " + binder);
+    expect(Integer.valueOf(1).equals(extras.m.get("extra_service_version")), "compat service version 1, so browsing stays on the framework");
+    android.os.Message msg = new android.os.Message();
+    msg.what = 8;
+    Receiver recv = new Receiver();
+    android.os.Bundle searchExtras = new android.os.Bundle();
+    searchExtras.putString("android.intent.extra.focus", "vnd.android.cursor.item/audio");
+    msg.getData().putString("data_search_query", "test tone c");
+    msg.getData().putBundle("data_search_extras", searchExtras);
+    msg.getData().putParcelable("data_result_receiver", new ReceiverParcelable(recv));
+    msg.getData().putInt("data_calling_pid", 1234);
+    ((android.os.Messenger.Binder) binder).messenger.handler.handleMessage(msg);
+    android.os.Parcel p = recv.data;
+    expect(p != null && recv.code == 1 && recv.flags == 1, "search replies with a oneway send() to the receiver");
+    if (p == null) return;
+    p.setDataPosition(0);
+    expect("android.support.v4.os.IResultReceiver".equals(p.readString()) && p.readInt() == 0 && p.readInt() == 1,
+        "reply is IResultReceiver.send(RESULT_OK, bundle)");
+    p.readInt(); p.readInt();
+    expect(p.readInt() == 1 && "search_results".equals(p.readString()) && p.readInt() == 16, "reply bundle holds search_results");
+    p.readInt();
+    Object[] items = (Object[]) p.readRaw();
+    expect(items.length == 1 && items[0].getClass().getName().equals("android.support.v4.media.MediaBrowserCompat$MediaItem"),
+        "results parcel under androidx's MediaItem name: " + java.util.Arrays.toString(items));
+    MediaBrowser.MediaItem hit = (MediaBrowser.MediaItem) items[0];
+    expect(hit.flags == 2 && "tone:523".equals(hit.d.getMediaId()), "compat search finds tone C: " + hit);
+    android.os.Message other = new android.os.Message();
+    other.what = 6;
+    ((android.os.Messenger.Binder) binder).messenger.handler.handleMessage(other);
+  }
+
   public static void main(String[] a) throws Exception {
     PharosMediaService s = new PharosMediaService();
     s.onCreate();
@@ -18,6 +65,7 @@ public class Check {
     MediaBrowserService.BrowserRoot root = s.onGetRoot("com.google.android.projection.gearhead", 10123, null);
     expect(root != null && root.getRootId().equals("root"), "onGetRoot returned root");
     expect(root.extras != null && Boolean.TRUE.equals(root.extras.m.get("android.media.browse.SEARCH_SUPPORTED")), "root says search is supported");
+    compatSearch(root.extras);
     MediaBrowserService.Result<List<MediaBrowser.MediaItem>> r = new MediaBrowserService.Result<>();
     s.onLoadChildren("root", r);
     expect(r.sent && r.value.size() == 2, "root has Music and Audiobooks: " + r.value);

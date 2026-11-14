@@ -8,6 +8,7 @@
 //! inputs so a logcat line proves each hop reached Rust.
 
 mod art;
+mod compat;
 pub mod content;
 
 use std::sync::Mutex;
@@ -125,7 +126,7 @@ fn state_lock() -> R<std::sync::MutexGuard<'static, Option<State>>> {
     STATE.lock().map_err(|_| "state mutex poisoned".to_owned())
 }
 
-fn media_item<'l>(env: &mut JNIEnv<'l>, e: &Entry) -> R<JObject<'l>> {
+fn description<'l>(env: &mut JNIEnv<'l>, e: &Entry) -> R<JObject<'l>> {
     let b = env
         .new_object("android/media/MediaDescription$Builder", "()V", &[])
         .map_err(jerr("MediaDescription.Builder"))?;
@@ -144,17 +145,22 @@ fn media_item<'l>(env: &mut JNIEnv<'l>, e: &Entry) -> R<JObject<'l>> {
         env.call_method(&b, "setIconUri", format!("(Landroid/net/Uri;){B}"), &[JValue::Object(&icon)])
             .map_err(jerr("setIconUri"))?;
     }
-    let desc = env
-        .call_method(&b, "build", "()Landroid/media/MediaDescription;", &[])
+    env.call_method(&b, "build", "()Landroid/media/MediaDescription;", &[])
         .and_then(|v| v.l())
-        .map_err(jerr("MediaDescription.build"))?;
+        .map_err(jerr("MediaDescription.build"))
+}
+
+/// A `MediaItem` of `class`: the framework's, or the androidx-named
+/// subclass the compat search reply needs.
+fn media_item_of<'l>(env: &mut JNIEnv<'l>, class: &str, e: &Entry) -> R<JObject<'l>> {
+    let desc = description(env, e)?;
     let flags = if e.playable { FLAG_PLAYABLE } else { FLAG_BROWSABLE };
-    env.new_object(
-        "android/media/browse/MediaBrowser$MediaItem",
-        "(Landroid/media/MediaDescription;I)V",
-        &[JValue::Object(&desc), JValue::Int(flags)],
-    )
-    .map_err(jerr("MediaItem"))
+    env.new_object(class, "(Landroid/media/MediaDescription;I)V", &[JValue::Object(&desc), JValue::Int(flags)])
+        .map_err(jerr("MediaItem"))
+}
+
+fn media_item<'l>(env: &mut JNIEnv<'l>, e: &Entry) -> R<JObject<'l>> {
+    media_item_of(env, "android/media/browse/MediaBrowser$MediaItem", e)
 }
 
 fn item_list<'l>(env: &mut JNIEnv<'l>, entries: &[&Entry]) -> R<JObject<'l>> {
@@ -522,6 +528,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
         let key = JObject::from(env.new_string("android.media.browse.SEARCH_SUPPORTED").map_err(jerr("key"))?);
         env.call_method(&extras, "putBoolean", "(Ljava/lang/String;Z)V", &[JValue::Object(&key), JValue::Bool(1)])
             .map_err(jerr("putBoolean"))?;
+        compat::advertise(env, &extras)?;
         let r = env
             .new_object(
                 "android/service/media/MediaBrowserService$BrowserRoot",
