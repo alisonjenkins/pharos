@@ -147,8 +147,12 @@ public class Check {
     am.fireChange(-1);
     expect(am.holder == null, "a permanent loss gives focus back");
     cb.onPause();
-    cb.onPlay();
     cb.onSeekTo(4000);
+    expect(session.state.state == 2 && session.state.pos == 4000 && session.state.speed == 0, "a seek while paused stays paused at the new position: " + session.state);
+    cb.onPlay();
+    expect(session.state.state == 3 && session.state.pos == 4000 && session.state.speed == 1, "play resumes from the seek position: " + session.state);
+    cb.onSeekTo(6000);
+    expect(session.state.state == 3 && session.state.pos == 6000, "a seek while playing keeps playing: " + session.state);
     cb.onSkipToNext();
     cb.onPlayFromSearch("test tone c", null);
 

@@ -1066,7 +1066,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         drop(guard);
         let ms = i32::try_from(pos).unwrap_or(i32::MAX);
         env.call_method(player.as_obj(), "seekTo", "(I)V", &[JValue::Int(ms)]).map_err(jerr("seekTo"))?;
-        set_playback_state(env, session.as_obj(), STATE_PLAYING, pos)
+        // A seek while paused stays paused: the car's progress bar runs only at PLAYING.
+        let playing = env.call_method(player.as_obj(), "isPlaying", "()Z", &[]).and_then(|v| v.z()).map_err(jerr("isPlaying"))?;
+        let state = if playing { STATE_PLAYING } else { STATE_PAUSED };
+        log(&format!("onSeekTo pos_ms={pos} state={state}"));
+        set_playback_state(env, session.as_obj(), state, pos)
     })
 }
 
