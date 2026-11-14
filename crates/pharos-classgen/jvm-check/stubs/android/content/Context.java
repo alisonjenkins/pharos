@@ -7,7 +7,9 @@ public class Context {
   public static final java.util.Map<String, BroadcastReceiver> receivers = new java.util.HashMap<>();
   public static final java.util.Map<String, Integer> receiverFlags = new java.util.HashMap<>();
   public static final java.util.Set<BroadcastReceiver> unregistered = new java.util.HashSet<>();
+  public static final java.util.Map<String, String> receiverPermissions = new java.util.HashMap<>();
   public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, int flags) { receivers.put(f.action, r); receiverFlags.put(f.action, flags); unregistered.remove(r); return null; }
+  public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String permission, android.os.Handler h, int flags) { receiverPermissions.put(f.action, permission); return registerReceiver(r, f, flags); }
   public void unregisterReceiver(BroadcastReceiver r) { if (receivers.containsValue(r)) unregistered.add(r); }
   public android.content.res.Resources getResources() { return new android.content.res.Resources(); }
   public String getPackageName() { return "com.alisonjenkins.pharos.auto"; }
