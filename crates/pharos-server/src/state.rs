@@ -1356,6 +1356,13 @@ impl AppState {
         }))
     }
 
+    /// ADR-0132 — whether `item` is an audiobook's track: a song whose
+    /// innermost library is a Books library.
+    pub fn is_audiobook(&self, item: &pharos_core::MediaItem) -> bool {
+        item.kind == pharos_core::MediaKind::Audio
+            && self.course_roots().root_of(&item.path).is_some()
+    }
+
     /// Replace the typed-library set at runtime (dashboard Add/Remove).
     pub fn set_libraries(&self, libraries: Vec<pharos_core::Library>) {
         *self

@@ -3460,6 +3460,8 @@ struct AlbumAgg {
     /// Newest track `created_at`, so a freshly added track surfaces its album.
     created_at: Option<i64>,
     runtime_ms: u64,
+    /// One of its tracks, which says what library the album is in.
+    sample_path: std::path::PathBuf,
 }
 
 impl AlbumAgg {
@@ -3523,6 +3525,7 @@ fn aggregate_albums<'a>(
             premiere_date: None,
             created_at: None,
             runtime_ms: 0,
+            sample_path: i.path.clone(),
         });
         e.child_count += 1;
         e.premiere_date = match (e.premiere_date, i.metadata.premiere_date) {
@@ -3564,7 +3567,7 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     let album_id = album_id_for(&a.name);
     let image_tags = crate::api::jellyfin::images::synth_primary_tag(state, &album_id).await;
     // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
-    serde_json::to_value(SynthItemDto {
+    let mut dto = serde_json::to_value(SynthItemDto {
         child_count: Some(a.child_count),
         production_year: a.year.map(|y| y as i32),
         album_artist: a.album_artist.clone(),
@@ -3591,7 +3594,25 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
             ItemType::MusicAlbum.as_wire(),
         )
     })
-    .unwrap_or(serde_json::Value::Null)
+    .unwrap_or(serde_json::Value::Null);
+    let audiobook = state.course_roots().root_of(&a.sample_path).is_some();
+    mark_album(&mut dto, a.runtime_ms, audiobook);
+    dto
+}
+
+/// An album DTO's length and, when it is an audiobook (ADR-0132), the
+/// Pharos-only `PharosAudiobook` mark the native API reads.
+fn mark_album(dto: &mut serde_json::Value, runtime_ms: u64, audiobook: bool) {
+    let Some(obj) = dto.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "RunTimeTicks".into(),
+        serde_json::Value::from(runtime_ms.saturating_mul(10_000)),
+    );
+    if audiobook {
+        obj.insert("PharosAudiobook".into(), serde_json::Value::Bool(true));
+    }
 }
 
 /// The tiles a latest rail shows for `folds`, each several newly added
@@ -5390,9 +5411,13 @@ async fn synth_album_or_artist(
             }]);
             it.album_artist = Some(a);
         }
-        return Ok(Some(
-            serde_json::to_value(it).unwrap_or(serde_json::Value::Null),
-        ));
+        let mut dto = serde_json::to_value(it).unwrap_or(serde_json::Value::Null);
+        let runtime_ms = tracks.iter().fold(0u64, |sum, t| {
+            sum.saturating_add(t.probe.duration_ms.unwrap_or(0))
+        });
+        let audiobook = tracks.iter().any(|t| state.is_audiobook(t));
+        mark_album(&mut dto, runtime_ms, audiobook);
+        return Ok(Some(dto));
     }
     let artists = state
         .stores
