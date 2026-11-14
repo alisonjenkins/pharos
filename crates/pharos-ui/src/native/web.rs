@@ -2790,11 +2790,6 @@ pub fn user_agent() -> String {
         .unwrap_or_default()
 }
 
-/// The web build is never the Android app's shell; that one is the host build.
-pub fn android_shell() -> bool {
-    false
-}
-
 /// How the palette's shortcut is written on this device: Cmd on Apple's.
 pub fn palette_keys() -> &'static str {
     let apple = web_sys::window()
