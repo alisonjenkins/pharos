@@ -27,7 +27,9 @@ fi
 echo "ok exports: $(echo "$have" | wc -l) Java_ symbols in lib$jni_lib.so"
 
 (cd "$root" && cargo run -q -p pharos-classgen -- --lib "$jni_lib" "$work/gen" >/dev/null)
-javac -d "$work/stubs" $(find "$here/stubs" -name '*.java')
+stub_sources=()
+while IFS= read -r -d '' f; do stub_sources+=("$f"); done < <(find "$here/stubs" -name '*.java' -print0)
+javac -d "$work/stubs" "${stub_sources[@]}"
 javac -cp "$work/stubs:$work/gen" -d "$work/main" "$here/Check.java"
 # The library logs to stderr on a desktop; keep a copy to check below.
 java -Xverify:all -Djava.library.path="$lib_dir" \
