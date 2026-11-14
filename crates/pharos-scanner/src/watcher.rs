@@ -694,6 +694,18 @@ mod tests {
         async fn item_ids_for_genre(&self, _wire_id: &str) -> DomainResult<Vec<MediaId>> {
             Ok(Vec::new())
         }
+        async fn item_genre_names(&self, item: MediaId) -> DomainResult<Vec<String>> {
+            let mut names = self
+                .0
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&item)
+                .cloned()
+                .unwrap_or_default();
+            names.sort();
+            Ok(names)
+        }
         async fn backfill_genres(&self) -> DomainResult<u64> {
             Ok(0)
         }

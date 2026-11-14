@@ -627,6 +627,13 @@ pub trait GenreStore: Send + Sync {
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
 
+    /// The genre names linked to `item`, by name. Empty for an item with
+    /// none, or no such item. What an admin edits (spec 043).
+    fn item_genre_names(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send;
+
     /// One-time backfill: read every `media_items.genre` string, split on
     /// comma/pipe, and populate `genres` + `item_genres` for rows scanned
     /// before C4. Idempotent (upsert + INSERT-OR-IGNORE join), so it is

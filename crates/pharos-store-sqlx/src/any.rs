@@ -618,6 +618,13 @@ impl GenreStore for AnyStore {
         }
     }
 
+    async fn item_genre_names(&self, item: MediaId) -> DomainResult<Vec<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.item_genre_names(item).await,
+            AnyStore::Postgres(p) => p.item_genre_names(item).await,
+        }
+    }
+
     async fn backfill_genres(&self) -> DomainResult<u64> {
         match self {
             AnyStore::Sqlite(s) => s.backfill_genres().await,

@@ -5957,6 +5957,17 @@ mod tests {
                 })
                 .collect())
         }
+        async fn item_genre_names(&self, item: MediaId) -> DomainResult<Vec<String>> {
+            let mut names = self
+                .item_genres
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&item)
+                .cloned()
+                .unwrap_or_default();
+            names.sort();
+            Ok(names)
+        }
         async fn item_ids_for_genre(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
             let links = self
                 .item_genres
