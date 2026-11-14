@@ -651,6 +651,11 @@ pub fn audio_tap(_media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>
     Err(NO_BROWSER.into())
 }
 
+/// Only the page itself reads the host's pushed frames.
+pub fn host_frame_fresh() -> bool {
+    false
+}
+
 pub fn media_playing(_id: &str) -> bool {
     false
 }
