@@ -37,9 +37,9 @@ pub struct PdfMetadata {
     pub page_count: Option<u32>,
     pub title: Option<String>,
     pub author: Option<String>,
-    /// `/Producer` — the closest thing a PDF has to a publisher, and usually
-    /// the software that made it. Kept because it is occasionally a real
-    /// imprint; the provider decides whether to surface it.
+    /// `/Producer` — the software that made the PDF ("Antenna House", "calibre",
+    /// "Microsoft Word"). Read for diagnosis only: it is not a publisher and
+    /// reaches neither `BookMeta` nor the studio facet (V1390).
     pub producer: Option<String>,
     /// `/Subject`, the info dictionary's blurb field.
     pub description: Option<String>,
@@ -55,7 +55,8 @@ impl PdfMetadata {
             // epub's reflowed pagination.
             page_count: self.page_count,
             author: self.author.clone(),
-            publisher: self.producer.clone(),
+            // Producer is software, not an imprint; see `producer`.
+            publisher: None,
             series_name: None,
             series_index: None,
             isbn: None,
@@ -423,6 +424,10 @@ mod tests {
         assert_eq!(bm.format, BookFormat::Pdf);
         assert_eq!(bm.page_count, Some(1));
         assert_eq!(bm.author.as_deref(), Some("Douglas Hofstadter"));
+        assert_eq!(
+            bm.publisher, None,
+            "/Producer names the software that wrote the PDF, never the publisher"
+        );
     }
 
     /// An info dictionary is optional. A PDF without one is a normal PDF.
