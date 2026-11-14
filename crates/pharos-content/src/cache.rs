@@ -891,6 +891,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cap_change_logs_the_new_cap_and_what_it_evicted() {
+        let d = tmp("cap-log");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 100);
+        c.protect(&[]);
+        crate::testlog::start();
+        c.set_cap(150).unwrap();
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "cache cap bytes=150 source=set tracks=1 used=100 evicted=1"),
+            "{lines:?}"
+        );
+    }
+
     fn fixed_free(bytes: u64) -> FreeProbe {
         Box::new(move |_| Ok(bytes))
     }
