@@ -38,13 +38,15 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 }
 
 /// Extension → `Content-Type` for the formats a client actually opens.
+/// Also what the OPDS feed advertises, so a link's type is what its download
+/// sends (045).
 ///
 /// The book MIME types matter: `comicsPlayer` and `bookPlayer` fetch these
 /// bytes as an `ArrayBuffer` and sniff content themselves, but a browser that
 /// sees `application/octet-stream` on a same-origin navigation may offer a
 /// download dialog instead. Everything unrecognised stays
 /// `application/octet-stream` rather than guessing.
-fn content_type_for(path: &std::path::Path) -> &'static str {
+pub(crate) fn content_type_for(path: &std::path::Path) -> &'static str {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -113,7 +115,19 @@ async fn download(
     // it names an edition on the video routes; the item's own file otherwise.
     let requested = media_source::requested_id(req.query_string());
     let item = media_source::select(media_source::Route::Download, item, requested.as_deref());
+    serve_item_file(&state, &req, &item).await
+}
 
+/// `item`'s bytes as a streamed `NamedFile` response, a converted Kindle
+/// book as its EPUB, with the `Content-Type` and `Content-Disposition` of
+/// what is sent. The caller has already checked the requester may reach it.
+/// Shared by this route and the OPDS acquisition link (045).
+pub(crate) async fn serve_item_file(
+    state: &AppState,
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = item.id;
     // 005-kindle-conversion — a Kindle book was stored as `Epub` because it
     // converts, so this route must hand over the EPUB and not the `.azw3` the
     // item still points at. Converting here rather than at scan keeps the
@@ -162,7 +176,7 @@ async fn download(
     let mut resp = file
         .use_etag(true)
         .use_last_modified(true)
-        .into_response(&req);
+        .into_response(req);
 
     // Both derived from what is actually being SENT, not from the item's
     // stored path: a converted book must arrive as `application/epub+zip`,
@@ -174,5 +188,5 @@ async fn download(
     if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path, &serve_path)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
-    Ok::<HttpResponse, actix_web::Error>(resp)
+    Ok(resp)
 }
