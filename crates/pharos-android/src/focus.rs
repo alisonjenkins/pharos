@@ -9,7 +9,9 @@ use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::sys::jint;
 use jni::JNIEnv;
 
-use crate::{guarded, jerr, log, state_lock, transport, R, STATE_PAUSED, STATE_PLAYING};
+use crate::{
+    guarded, jerr, log, state_lock, transport, transport_with, R, STATE_PAUSED, STATE_PLAYING,
+};
 
 const USAGE_MEDIA: i32 = 1;
 const CONTENT_TYPE_MUSIC: i32 = 2;
@@ -276,8 +278,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             }
             AUDIOFOCUS_LOSS_TRANSIENT => {
                 if is_playing(env)? {
-                    transport(env, "pause", STATE_PAUSED)?;
+                    // Set before pausing: a phone Pause that lands meanwhile
+                    // clears it, and nothing sets it again afterwards.
                     RESUME_ON_GAIN.store(true, Ordering::SeqCst);
+                    if let Err(e) = transport_with(env, "pause", STATE_PAUSED, false) {
+                        clear_resume_on_gain();
+                        return Err(e);
+                    }
                     "pause".to_owned()
                 } else {
                     "none".to_owned()
