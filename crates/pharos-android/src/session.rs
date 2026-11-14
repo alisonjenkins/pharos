@@ -455,7 +455,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
     guarded(&mut env, "onPlayFromMediaId", (), |env| {
         let id = string(env, &id)?;
         log(&format!("session onPlayFromMediaId id={id}"));
-        if id.starts_with("album/") {
+        if is_book_id(&id) {
             return play_book(&id);
         }
         apply(env, play_from(&id), Source::Car)
