@@ -16,10 +16,13 @@
 
 mod error;
 mod fuzzy;
+mod http;
 mod id;
 mod library;
 mod net;
 mod node;
+#[cfg(test)]
+mod testserver;
 mod token;
 mod tree;
 // The Android TV app's sign-in state machine, shared rather than copied: it
