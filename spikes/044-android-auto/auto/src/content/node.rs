@@ -32,6 +32,9 @@ pub struct Node {
     pub stream_url: Option<String>,
     /// 0 when unknown or not a track.
     pub duration_ms: u64,
+    /// A track's album name; empty when none, not a track, or not known
+    /// (a summary does not carry it: see [`super::tree::node`]).
+    pub album: String,
 }
 
 impl Node {
@@ -45,6 +48,7 @@ impl Node {
             art_url: None,
             stream_url: None,
             duration_ms: 0,
+            album: String::new(),
         }
     }
 
@@ -60,6 +64,7 @@ impl Node {
             art_url: None,
             stream_url: None,
             duration_ms: 0,
+            album: String::new(),
         }
     }
 }
@@ -124,6 +129,7 @@ impl Urls {
             art_url: item.image.as_deref().and_then(|i| self.art(i)),
             stream_url: playable.then(|| self.stream(item.id)).flatten(),
             duration_ms: item.runtime_ms,
+            album: String::new(),
         })
     }
 }

@@ -309,11 +309,10 @@ impl Catalogue for NativeCatalogue {
         Ok(batch.picks.into_iter().map(|p| p.item).collect())
     }
 
-    async fn item(&self, id: ItemRef) -> Result<Item, ContentError> {
+    async fn item(&self, id: ItemRef) -> Result<(Item, Option<String>), ContentError> {
         let op = format!("detail {id}");
-        Ok(bounded(&op, &self.closed, self.api.detail(&self.info, id))
-            .await?
-            .item)
+        let d = bounded(&op, &self.closed, self.api.detail(&self.info, id)).await?;
+        Ok((d.item, d.album))
     }
 }
 
