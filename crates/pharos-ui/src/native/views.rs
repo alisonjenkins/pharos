@@ -54,6 +54,15 @@ pub struct MarkFavorite(pub EventHandler<(ItemRef, bool, String)>);
 /// A button that marks `id` a favourite, or takes the mark off when
 /// `favorite`. `aria-pressed` carries the state, so the label stays put and
 /// nothing names the opposite action.
+/// The word on a played tile's badge: a song is played, a book is read.
+fn played_badge(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Audio => "Played",
+        ItemKind::Book => "Read",
+        _ => "Watched",
+    }
+}
+
 #[component]
 pub fn FavoriteToggle(
     id: ItemRef,
@@ -1509,7 +1518,7 @@ pub fn PosterTile(
                         None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                     }
                     if item.played {
-                        span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
+                        span { class: "pharos-badge", {played_badge(item.kind)} }
                     }
                     if item.stereo.is_some() {
                         span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }

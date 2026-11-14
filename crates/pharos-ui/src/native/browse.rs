@@ -94,6 +94,15 @@ impl Order {
         }
     }
 
+    /// Its words on a Books library's grid, where a release is a
+    /// publication.
+    pub fn label_in(self, books: bool) -> &'static str {
+        match (self, books) {
+            (Order::Released, true) => "Published",
+            _ => self.label(),
+        }
+    }
+
     /// The `<option>` value naming it.
     pub fn token(self) -> &'static str {
         match self {
@@ -1202,12 +1211,15 @@ pub fn direction_label(order: Order, descending: bool) -> &'static str {
     }
 }
 
-/// The words for a play state.
-fn watched_label(watched: Watched) -> &'static str {
-    match watched {
-        Watched::Unwatched => "Unwatched",
-        Watched::InProgress => "In progress",
-        Watched::Watched => "Watched",
+/// The words for a play state; a book is read, not watched.
+fn watched_label(watched: Watched, books: bool) -> &'static str {
+    match (watched, books) {
+        (Watched::Unwatched, false) => "Unwatched",
+        (Watched::InProgress, false) => "In progress",
+        (Watched::Watched, false) => "Watched",
+        (Watched::Unwatched, true) => "Unread",
+        (Watched::InProgress, true) => "Reading",
+        (Watched::Watched, true) => "Read",
     }
 }
 
@@ -1255,11 +1267,11 @@ impl Facet {
 
 /// The filters `narrow` has on, each with the words its pill shows, in
 /// the order the sheet lists them (B1311). The order is not one: it is
-/// on the Sort pill.
-pub fn active_filters(narrow: &Narrow) -> Vec<(Facet, String)> {
+/// on the Sort pill. A Books library's pills use a book's words.
+pub fn active_filters(narrow: &Narrow, books: bool) -> Vec<(Facet, String)> {
     let mut on = Vec::new();
     if let Some(watched) = narrow.watched {
-        on.push((Facet::Watched, watched_label(watched).to_owned()));
+        on.push((Facet::Watched, watched_label(watched, books).to_owned()));
     }
     if let Some(genre) = &narrow.genre {
         on.push((Facet::Genre, genre.clone()));
@@ -1352,7 +1364,7 @@ fn FilterBar(
 ) -> Element {
     let now = narrow.read().clone();
     let direction = direction_label(now.order, now.descending);
-    let on = active_filters(&now);
+    let on = active_filters(&now, books);
     let count = on.len();
     let mut open = use_signal(|| None::<Opened>);
     use_focus_back(open);
@@ -1367,10 +1379,10 @@ fn FilterBar(
                 aria_haspopup: "dialog",
                 aria_expanded: "{expanded}",
                 aria_controls: FILTER_SHEET_ID,
-                aria_label: "Sort: {now.order.label()}, {direction}",
+                aria_label: "Sort: {now.order.label_in(books)}, {direction}",
                 onclick: move |_| open.set(Some(Opened::Sort)),
                 Icon { path: ICON_SORT }
-                span { "{now.order.label()} · {direction}" }
+                span { "{now.order.label_in(books)} · {direction}" }
             }
             button {
                 id: FILTERS_BUTTON_ID,
@@ -1461,14 +1473,21 @@ fn FilterSheet(
     let directions = [false, true].map(|d| (d, direction_label(now.order, d)));
     let watched: [(Option<Watched>, &str); 4] = [
         (None, "All"),
-        (Some(Watched::Unwatched), watched_label(Watched::Unwatched)),
+        (
+            Some(Watched::Unwatched),
+            watched_label(Watched::Unwatched, books),
+        ),
         (
             Some(Watched::InProgress),
-            watched_label(Watched::InProgress),
+            watched_label(Watched::InProgress, books),
         ),
-        (Some(Watched::Watched), watched_label(Watched::Watched)),
+        (
+            Some(Watched::Watched),
+            watched_label(Watched::Watched, books),
+        ),
     ];
     let stereo = [None, Some(true), Some(false)];
+    let played_title = if books { "Read" } else { "Watched" };
     // The chosen pill of the group the sheet opened on takes the focus once
     // the sheet is in the page, so a remote starts on what is chosen.
     use_hook(|| super::focus_after_render(FILTER_SHEET_START.to_owned()));
@@ -1509,7 +1528,7 @@ fn FilterSheet(
                                         narrow.set(next);
                                     }
                                 },
-                                "{order.label()}"
+                                "{order.label_in(books)}"
                             }
                         }
                     }
@@ -1526,7 +1545,7 @@ fn FilterSheet(
                         }
                     }
                     if !sort_only {
-                        SheetGroup { title: "Watched",
+                        SheetGroup { title: played_title,
                             for (state, label) in watched {
                                 button {
                                     key: "{label}",
@@ -1564,15 +1583,18 @@ fn FilterSheet(
                                 }
                             }
                         }
-                        SheetGroup { title: "3D",
-                            for choice in stereo {
-                                button {
-                                    key: "{choice:?}",
-                                    class: "pharos-chip",
-                                    r#type: "button",
-                                    aria_pressed: "{choice == now.stereo}",
-                                    onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
-                                    "{stereo_label(choice)}"
+                        // A book has no 3D version to filter on.
+                        if !books {
+                            SheetGroup { title: "3D",
+                                for choice in stereo {
+                                    button {
+                                        key: "{choice:?}",
+                                        class: "pharos-chip",
+                                        r#type: "button",
+                                        aria_pressed: "{choice == now.stereo}",
+                                        onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
+                                        "{stereo_label(choice)}"
+                                    }
                                 }
                             }
                         }
@@ -5940,8 +5962,8 @@ mod tests {
             Unreadable::Show,
             "a library without the facet never filters"
         );
-        assert!(active_filters(&Narrow::default()).is_empty());
-        let on = active_filters(&show);
+        assert!(active_filters(&Narrow::default(), false).is_empty());
+        let on = active_filters(&show, false);
         assert_eq!(on, [(Facet::Unreadable, "Can't open: Only".to_owned())]);
         assert_eq!(Facet::Unreadable.cleared(&show), Narrow::default());
     }
@@ -6722,6 +6744,52 @@ mod tests {
         assert!(!films.contains(">Only<"), "{films}");
     }
 
+    /// B1432 (V1406): a Books library's sheet speaks of books: read, not watched; published,
+    /// not released; and no 3D group. A film library's is unchanged.
+    #[test]
+    fn a_books_librarys_filter_sheet_uses_a_books_words() {
+        let sheet = |books: bool| {
+            render(move || {
+                let narrow = use_signal(Narrow::default);
+                let genres = use_signal(Vec::<String>::new);
+                let open = use_signal(|| Some(Opened::Filters));
+                rsx! { FilterSheet { narrow, genres, opened: Opened::Filters, open, books } }
+            })
+        };
+        let books = sheet(true);
+        for word in [">Read<", ">Unread<", ">Reading<", ">Published<"] {
+            assert!(books.contains(word), "{word} in {books}");
+        }
+        for word in [
+            ">Watched<",
+            ">Unwatched<",
+            ">In progress<",
+            ">Release date<",
+            ">3D<",
+            "3D only",
+        ] {
+            assert!(!books.contains(word), "{word} in {books}");
+        }
+        let films = sheet(false);
+        for word in [">Watched<", ">Unwatched<", ">Release date<", ">3D<"] {
+            assert!(films.contains(word), "{word} in {films}");
+        }
+        assert!(!films.contains(">Unread<"), "{films}");
+
+        let reading = Narrow {
+            watched: Some(Watched::InProgress),
+            ..Narrow::default()
+        };
+        assert_eq!(
+            active_filters(&reading, true),
+            vec![(Facet::Watched, "Reading".to_owned())]
+        );
+        assert_eq!(
+            active_filters(&reading, false),
+            vec![(Facet::Watched, "In progress".to_owned())]
+        );
+    }
+
     /// B1311/V1283: the sheet is a modal dialog of pills, the chosen one
     /// in each group pressed, so a D-pad walks it and stays inside it;
     /// Collections is offered only on a library that groups box sets.
@@ -6786,7 +6854,7 @@ mod tests {
             unreadable: Unreadable::Hide,
         };
         assert_eq!(
-            active_filters(&narrow),
+            active_filters(&narrow, false),
             [
                 (Facet::Watched, "Watched".to_owned()),
                 (Facet::Genre, "Drama".to_owned()),
@@ -6802,7 +6870,7 @@ mod tests {
             },
             narrow
         );
-        assert!(active_filters(&Narrow::default()).is_empty());
+        assert!(active_filters(&Narrow::default(), false).is_empty());
         assert_eq!(direction_label(Order::Released, false), "Oldest first");
         assert_eq!(direction_label(Order::Name, true), "Z to A");
     }
