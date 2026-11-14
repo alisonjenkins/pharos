@@ -35,7 +35,7 @@ Branch `feat/karaoke-separate`, head `df0b5d1c3`. Id V1400.
 
 - [x] T042-13 Spike: htdemucs's ONNX export imported into Burn at build time (ADR-0125, `9afba31a6`).
 - [x] T042-14 Spectrogram and its inverse; segment-by-segment separation as demucs does (`6e5af96e7`, `7e3dbba37`).
-- [x] T042-15 With no GPU the recogniser hears the mix (V1400, `60626b57b`).
+- [x] T042-15 With no GPU the recogniser hears the mix (V1400, `60626b57b`). Superseded by T042-23: without the Vulkan GPU the stages do not run and the song keeps today's answer.
 - [x] T042-16 htdemucs on the GPU behind the `separate` feature, a `separate` example, one neutral outcome log (`656e38524` to `b0f9ac750`).
 - [x] T042-17 Reproducible weights: no ONNX copy in the closure, random param ids stripped (`47fb7ab10`, `df0b5d1c3`).
 
@@ -52,6 +52,7 @@ Branch `feat/karaoke-service`, head `a8f4cfe24`. Ids V1401, B1427, B1428, B1435,
 - [x] T042-24 Crash-loop guard: a song that aborted the process skips the stages, `stage_crashed`, counted (B1435, V1409, `af4b46a5e`).
 - [x] T042-25 One cubecl stream shared by every thread, so the kept pool stops growing per worker thread (B1427, `bef22b2b3`).
 - [x] T042-26 B1427, B1428, B1435 and V1409 recorded (`a8f4cfe24`).
+- [ ] T042-31 Mark V1400 superseded by V1409 in `invariants.md`; remove the mix path if nothing reaches it.
 
 ## Slice 5: deploy and verify
 
