@@ -33,6 +33,7 @@ use super::group_session::{GroupPlayer, GroupView, Ui};
 use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
+use super::music_bridge::{self, Follow, MediaIo, Step};
 use super::palette::{self, Row};
 use super::person::PersonView;
 use super::platform::{self, OpenError};
@@ -51,6 +52,7 @@ use super::playback::{
     SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
+use super::ports::native_audio;
 use super::preplay::{self, PlayPicks, TrackChoices};
 use super::privacy;
 use super::quality::{self, QualityView, Watch};
@@ -5947,6 +5949,11 @@ fn now_ms_u64() -> u64 {
     u64::try_from(platform::unix_ms()).unwrap_or(0)
 }
 
+/// The songs the queue has lined up, for the host's engine.
+fn upcoming_ids(queue: Signal<Queue>) -> Vec<ItemRef> {
+    queue.peek().upcoming().iter().map(|e| e.id).collect()
+}
+
 /// A shuffle seed: a play order needs no more randomness than the clock.
 fn seed() -> u64 {
     platform::now_ms().to_bits()
@@ -6052,6 +6059,15 @@ fn Player(
     let together = use_context::<Together>();
     let group_view = together.view;
     let group = (together.view)();
+    // Music plays in the host's engine where one is registered, unless a
+    // group drives it: the group's play, pause and seek act on an element.
+    let io = use_hook(|| {
+        CopyValue::new(MediaIo::new(
+            p.kind == ItemKind::Audio && !group.drives(p.detail.item.id),
+            native_audio(),
+        ))
+    });
+    let host = io.read().music().cloned();
     let watch_seen = use_group_seen(vec![p.detail.item.id]);
     // The session is read when used: a join can make it after this mounted.
     let session = {
@@ -6141,12 +6157,12 @@ fn Player(
     // it filling (B1386). Only the bar reads the signal, and only a change
     // sets it. The host's `sleep_ms` does not wait, so it never loops there.
     use_future(move || async move {
-        if !BUFFER_POLLS {
+        if !BUFFER_POLLS || io.read().music().is_some() {
             return;
         }
         loop {
             platform::sleep_ms(BUFFER_POLL_MS).await;
-            let to = platform::buffered_to_ms(VIDEO_ID);
+            let to = io.read().buffered_to_ms(VIDEO_ID);
             if *buffered.peek() != to {
                 buffered.set(to);
             }
@@ -6348,8 +6364,22 @@ fn Player(
             let mut queue = queue;
             queue.write().started(to, None, seed());
             platform::info(&format!("pharos: queue replay item={to}"));
-            platform::seek_ms(VIDEO_ID, 0);
-            platform::play(VIDEO_ID);
+            match io.read().music() {
+                Some(m) => m.restart(playing_id, &upcoming_ids(queue)),
+                None => {
+                    io.read().seek_ms(VIDEO_ID, 0);
+                    io.read().play(VIDEO_ID);
+                }
+            }
+        } else if queued
+            && io
+                .read()
+                .music()
+                .is_some_and(|m| m.next_if(to) || m.previous_if(to))
+        {
+            // The host's snapshot moves the stage on, as it does when the
+            // song ends or the car asks for the next one.
+            platform::info(&format!("pharos: host skip item={playing_id} to={to}"));
         } else {
             if queued {
                 // A copy, so `go` stays `Fn`. A cut: the song stops once the
@@ -6561,7 +6591,7 @@ fn Player(
                     if retiring.get() {
                         return;
                     }
-                    let here = platform::position_ms(VIDEO_ID);
+                    let here = io.read().position_ms(VIDEO_ID);
                     if here > 0 {
                         last_ms.set(here);
                     }
@@ -6673,7 +6703,15 @@ fn Player(
         let (engine, stop) = (Rc::clone(&engine), stop.clone());
         let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
         let (rust, rust_for) = (Rc::clone(&rust), Rc::clone(&rust_for));
+        let host = host.clone();
         move || {
+            // The stage closed: the song ends, as an element's would on
+            // unmounting. A song replaced by another keeps the host playing.
+            if let Some(m) = &host {
+                if stage.try_peek().map_or(true, |s| s.item.is_none()) {
+                    m.stop();
+                }
+            }
             // A renderer still loading must not attach once the player is gone.
             styled_for.set(styled_for.get().wrapping_add(1));
             styled.borrow_mut().take();
@@ -6736,7 +6774,7 @@ fn Player(
                     // Where the element stopped; a failure before the first
                     // position tick has not reached `last_ms` yet, and one
                     // before the start seek is at the start.
-                    let at = [platform::position_ms(VIDEO_ID), last_ms.get(), p.start_ms]
+                    let at = [io.read().position_ms(VIDEO_ID), last_ms.get(), p.start_ms]
                         .into_iter()
                         .find(|&ms| ms > 0)
                         .unwrap_or(0);
@@ -6771,18 +6809,22 @@ fn Player(
         }
     });
     // Before the stream attaches, so autoplay never starts at full volume.
-    use_effect(move || restore_volume(saved_volume));
+    use_effect(move || {
+        if io.read().music().is_none() {
+            restore_volume(saved_volume);
+        }
+    });
     use_effect({
         let cancel = Rc::clone(&fade_in_cancel);
         move || {
             if fade_in_ms == 0 {
                 return;
             }
-            let to = platform::media_state(VIDEO_ID).volume;
+            let to = io.read().state(VIDEO_ID).volume;
             platform::info(&format!(
                 "pharos: crossfade in item={playing_id} fade_ms={fade_in_ms} volume={to:.3}"
             ));
-            platform::set_volume(VIDEO_ID, 0.0, platform::media_state(VIDEO_ID).muted);
+            platform::set_volume(VIDEO_ID, 0.0, io.read().state(VIDEO_ID).muted);
             spawn(fade(VIDEO_ID, 0.0, to, fade_in_ms, Rc::clone(&cancel)));
         }
     });
@@ -6794,6 +6836,22 @@ fn Player(
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
             let (watch, assess) = (watch.clone(), Rc::clone(&assess));
             let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
+            if let Some(music) = io.read().music().cloned() {
+                // The host plays it; there is no stream to attach.
+                if current && music.begin(playing_id, &upcoming_ids(queue)) {
+                    platform::info(&format!(
+                        "pharos: host play item={playing_id} queued={}",
+                        music.sent().len()
+                    ));
+                }
+                return;
+            }
+            // A video starting ends the music the host is playing.
+            if !audio {
+                if let Some(port) = native_audio() {
+                    port.stop();
+                }
+            }
             spawn(async move {
                 let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
                 let adapts = p.engine.adapts_quality();
@@ -7153,9 +7211,9 @@ fn Player(
                 && autoplays
                 && !*started.peek()
                 && !autoplay_checked.replace(true)
-                && platform::media_state(VIDEO_ID).paused
+                && io.read().state(VIDEO_ID).paused
             {
-                platform::play(VIDEO_ID);
+                io.read().play(VIDEO_ID);
             }
             let resumed = match event {
                 MediaEvent::Playing => {
@@ -7180,7 +7238,7 @@ fn Player(
                     // and stands down.
                     slot.paused_at = Some(now);
                     // Only a song is tapped; a video has no context to rest.
-                    if music {
+                    if music && io.read().music().is_none() {
                         spawn(rest_after_pause(Rc::clone(&resume), now));
                     }
                     slot.probe.as_mut().and_then(ResumeProbe::paused)
@@ -7220,8 +7278,13 @@ fn Player(
             }
             // Near the end, with a crossfade chosen, the next song starts
             // under this one as it fades.
-            if event == MediaEvent::TimeUpdate && queued && !crossfading.get() {
-                let state = platform::media_state(VIDEO_ID);
+            // The host's engine has one stream, so a song there cuts over.
+            if event == MediaEvent::TimeUpdate
+                && queued
+                && !crossfading.get()
+                && io.read().music().is_none()
+            {
+                let state = io.read().state(VIDEO_ID);
                 let fade = crossfade_ms(crossfade_seconds(), state.duration_ms);
                 if let (false, Some(fade)) = (state.paused, fade) {
                     if state.position_ms.saturating_add(fade) >= state.duration_ms {
@@ -7265,12 +7328,12 @@ fn Player(
                     go(to);
                 }
             }
-            let state = platform::media_state(VIDEO_ID);
+            let state = io.read().state(VIDEO_ID);
             media.set(state);
             if *position.peek() != state.position_ms {
                 position.set(state.position_ms);
             }
-            let to = platform::buffered_to_ms(VIDEO_ID);
+            let to = io.read().buffered_to_ms(VIDEO_ID);
             if *buffered.peek() != to {
                 buffered.set(to);
             }
@@ -7356,7 +7419,7 @@ fn Player(
                     (id, _) => platform::show_text_track(VIDEO_ID, id.as_deref()),
                 }
             }
-            let at = platform::position_ms(VIDEO_ID);
+            let at = io.read().position_ms(VIDEO_ID);
             if at > 0 {
                 last_ms.set(at);
             }
@@ -7408,6 +7471,75 @@ fn Player(
         }
     });
 
+    // The host's engine plays the song and tells the player what it does;
+    // the player's own handlers do the rest, as they do for an element's
+    // events. A song handing over stops following it, since the host is on
+    // the next one by then.
+    let following = use_hook(|| Rc::new(Cell::new(true)));
+    following.set(current);
+    use_future({
+        let (ticks, following) = (Rc::clone(&ticks), Rc::clone(&following));
+        move || {
+            let (ticks, following) = (Rc::clone(&ticks), Rc::clone(&following));
+            async move {
+                let Some(music) = io.read().music().cloned() else {
+                    return;
+                };
+                let mut rx = music.receiver();
+                let mut follow = Follow::default();
+                loop {
+                    let snapshot = rx.borrow_and_update().clone();
+                    if following.get() {
+                        for step in follow.step(playing_id, &snapshot) {
+                            match step {
+                                Step::Event(event) => {
+                                    if let Some(on_media) = ticks.on_media.borrow_mut().as_mut() {
+                                        on_media(event);
+                                    }
+                                }
+                                Step::Moved(to) => {
+                                    platform::info(&format!(
+                                        "pharos: host moved item={playing_id} to={to}"
+                                    ));
+                                    go(to);
+                                }
+                                Step::Failed(reason) => fatal.send(Fatal {
+                                    reason,
+                                    kind: FailureKind::Unplayable,
+                                }),
+                            }
+                        }
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    // The host plays what it was last given: when the queue changes under it
+    // (a song moved, removed, shuffled, or the album's rest read in), it is
+    // given the new one.
+    use_effect({
+        let following = Rc::clone(&following);
+        move || {
+            let upcoming: Vec<ItemRef> = queue.read().upcoming().iter().map(|e| e.id).collect();
+            if !following.get() {
+                return;
+            }
+            let Some(music) = io.read().music().cloned() else {
+                return;
+            };
+            if music_bridge::needs_resync(&music.snapshot(), playing_id, &upcoming) {
+                platform::info(&format!(
+                    "pharos: host queue resync item={playing_id} upcoming={}",
+                    upcoming.len()
+                ));
+                music.resync(playing_id, &upcoming);
+            }
+        }
+    });
+
     let on_control = {
         let p = Rc::clone(&p);
         let session = session.clone();
@@ -7443,7 +7575,7 @@ fn Player(
                     let earlier = *seek_wait.peek();
                     let at = *position.peek();
                     seek_wait.set(Some(SeekWait::begin(earlier, at, ms, now_ms_u64())));
-                    platform::seek_ms(VIDEO_ID, ms);
+                    io.read().seek_ms(VIDEO_ID, ms);
                 }
             };
             let state = *media.peek();
@@ -7455,27 +7587,33 @@ fn Player(
                 Control::TogglePlay => {
                     // A group's play waits on the group, and a first play
                     // on a load; neither is a resume of a paused song.
-                    let state = platform::media_state(VIDEO_ID);
+                    let state = io.read().state(VIDEO_ID);
                     let in_group = session().is_some_and(|s| s.drives());
-                    let resuming =
-                        (state.paused && state.position_ms > 0 && !in_group).then(|| {
-                            let item = match p.kind {
-                                ItemKind::Audio => ResumeItem::Music,
-                                _ => ResumeItem::Video,
-                            };
-                            start_resume(VIDEO_ID, item, &resume)
-                        });
+                    let resuming = (state.paused
+                        && state.position_ms > 0
+                        && !in_group
+                        && io.read().music().is_none())
+                    .then(|| {
+                        let item = match p.kind {
+                            ItemKind::Audio => ResumeItem::Music,
+                            _ => ResumeItem::Video,
+                        };
+                        start_resume(VIDEO_ID, item, &resume)
+                    });
                     // Read before the group acts: the browser's own flag
                     // lifts on pointerdown, before this click arrives.
                     let refused = *autoplay_refused.peek();
                     if !session().is_some_and(|s| s.toggle_play()) {
-                        platform::toggle_play(VIDEO_ID);
+                        match io.read().music() {
+                            Some(m) => m.toggle(playing_id, &upcoming_ids(queue)),
+                            None => platform::toggle_play(VIDEO_ID),
+                        }
                     } else if refused {
                         // The group's unpause lands after this gesture ends,
                         // and some browsers (WebKit) only let a play() made
                         // inside the gesture through; start the local player
                         // now (038 FR-407, V1223).
-                        platform::play(VIDEO_ID);
+                        io.read().play(VIDEO_ID);
                     }
                     if let Some(n) = resuming {
                         spawn(watch_resume(VIDEO_ID, Rc::clone(&resume), n));
@@ -7486,8 +7624,10 @@ fn Player(
                 Control::Seek(ms) => seek(ms),
                 Control::Hover(x) => hover_ms
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
-                // Without a volume control the device's own volume rules.
+                // Without a volume control the device's own volume rules, and
+                // the host's engine has no volume of its own.
                 Control::Volume { .. } if !platform::owns_volume() => {}
+                Control::Volume { .. } if io.read().music().is_some() => {}
                 Control::Volume { volume, muted } => {
                     fade_in_cancel.set(true);
                     platform::set_volume(VIDEO_ID, volume, muted);
@@ -7561,7 +7701,7 @@ fn Player(
                     platform::info(&format!("pharos: seek wait: going back to={ms}"));
                     seek_wait.set(None);
                     watch.0.borrow_mut().seeking(now_ms_u64());
-                    platform::seek_ms(VIDEO_ID, ms);
+                    io.read().seek_ms(VIDEO_ID, ms);
                 }
                 Control::CancelNext => {
                     let shared = session().is_some_and(|s| s.hold_next());
@@ -7582,7 +7722,7 @@ fn Player(
                     }
                     let id = p.detail.item.id;
                     let session = together.session(&api);
-                    let from_ms = platform::position_ms(VIDEO_ID);
+                    let from_ms = io.read().position_ms(VIDEO_ID);
                     let mut group_error = together.error;
                     group_error.set(None);
                     platform::info(&format!(
@@ -8118,7 +8258,7 @@ fn Player(
             let mut stage = stage;
             let runtime_ms = p.detail.item.runtime_ms;
             spawn(async move {
-                let state = platform::media_state(OUTGOING_ID);
+                let state = io.read().state(OUTGOING_ID);
                 if handoff.fade_ms > 0 {
                     // It plays out under the next song, so it counts as heard.
                     last_ms.set(match state.duration_ms {
@@ -8128,12 +8268,12 @@ fn Player(
                 }
                 stop();
                 if handoff.fade_ms == 0 {
-                    platform::pause(OUTGOING_ID);
+                    io.read().pause(OUTGOING_ID);
                     return;
                 }
                 let never = Rc::new(Cell::new(false));
                 fade(OUTGOING_ID, state.volume, 0.0, handoff.fade_ms, never).await;
-                platform::pause(OUTGOING_ID);
+                io.read().pause(OUTGOING_ID);
                 platform::info(&format!(
                     "pharos: crossfade out item={playing_id} fade_ms={}",
                     handoff.fade_ms
@@ -8241,6 +8381,7 @@ fn Player(
                 compact: compact || matches!(slot, Slot::Outgoing(Handoff { ready: true, .. })),
                 in_sight,
                 media_id: slot.media_id(),
+                on_host: io.read().music().is_some(),
                 title: p.title.clone(),
                 image: p.image.clone(),
                 artists: p.detail.artists.clone(),
