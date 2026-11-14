@@ -2103,9 +2103,14 @@ fn has_season_episode_token(name: &str) -> bool {
 /// The lines under a poster's name: an episode's series, then its numbers,
 /// each on its own line so a long series name cannot hide the numbers. A
 /// song names its artist, or its year when the file has no artist tag (V750).
+/// An audiobook names its author and how long it is (ADR-0132).
 fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
         ItemKind::Episode => [item.series_name.clone(), episode_label(item)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        ItemKind::Album if item.audiobook => [item.artist.clone(), runtime(item.runtime_ms)]
             .into_iter()
             .flatten()
             .collect(),
@@ -4692,6 +4697,29 @@ mod tests {
         let html = render(move || rsx! { PosterTile { item: film.clone() } });
         assert!(
             html.contains(r#"title="2001""#) && !html.contains("Ignored"),
+            "{html}"
+        );
+    }
+
+    /// ADR-0132: an audiobook's tile names its author and its length; a
+    /// music album's keeps its year.
+    #[test]
+    fn an_audiobook_tile_names_its_author_and_length() {
+        let mut book = item(ItemKind::Album);
+        book.name = "Gadget Tales".into();
+        book.artist = Some("Ada Field".into());
+        book.runtime_ms = (7 * 60 + 5) * 60_000;
+        book.audiobook = true;
+        let html = render(move || rsx! { PosterTile { item: book.clone() } });
+        assert!(html.contains(r#"title="Ada Field""#), "{html}");
+        assert!(html.contains(r#"title="7h 5m""#), "{html}");
+
+        let mut album = item(ItemKind::Album);
+        album.artist = Some("Band A".into());
+        album.runtime_ms = 40 * 60_000;
+        let html = render(move || rsx! { PosterTile { item: album.clone() } });
+        assert!(
+            html.contains(r#"title="2001""#) && !html.contains("40m"),
             "{html}"
         );
     }
