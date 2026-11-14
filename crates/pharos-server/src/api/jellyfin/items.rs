@@ -3463,9 +3463,36 @@ struct AlbumAgg {
     /// Whether any of its tracks is an audiobook's (ADR-0132), the rule the
     /// album's detail uses too.
     audiobook: bool,
+    /// An audiobook's track descriptions with how many tracks carry each
+    /// (B1441). Music albums leave it empty.
+    overview_votes: Vec<(String, u32)>,
 }
 
 impl AlbumAgg {
+    /// The description most of an audiobook's tracks carry, as plain text;
+    /// a tie goes to the longer text. `None` for music.
+    fn overview(&self) -> Option<String> {
+        if !self.audiobook {
+            return None;
+        }
+        self.overview_votes
+            .iter()
+            .max_by_key(|(text, n)| (*n, text.len()))
+            .and_then(|(text, _)| pharos_scanner::book::description::clean_description(text))
+            .and_then(|(text, _)| text)
+    }
+
+    fn vote_overview(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        match self.overview_votes.iter_mut().find(|(t, _)| t == text) {
+            Some((_, n)) => *n += 1,
+            None => self.overview_votes.push((text.to_owned(), 1)),
+        }
+    }
+
     fn supports(key: pharos_core::SortKey) -> bool {
         use pharos_core::SortKey;
         matches!(
@@ -3529,9 +3556,15 @@ fn aggregate_albums<'a>(
             created_at: None,
             runtime_ms: 0,
             audiobook: false,
+            overview_votes: Vec::new(),
         });
         e.child_count += 1;
-        e.audiobook = e.audiobook || is_book(i);
+        if is_book(i) {
+            e.audiobook = true;
+            if let Some(text) = i.metadata.overview.as_deref() {
+                e.vote_overview(text);
+            }
+        }
         e.premiere_date = match (e.premiere_date, i.metadata.premiere_date) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3591,6 +3624,7 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
         backdrop_image_tags: Some(Vec::new()),
         genres: Some(Vec::new()),
         tags: Some(Vec::new()),
+        overview: a.overview(),
         ..SynthItemDto::folder(
             album_id,
             a.name.clone(),
@@ -8474,6 +8508,44 @@ mod filed_artist_tests {
             albums.first().is_some_and(|a| a.audiobook),
             "the second track is a book's"
         );
+    }
+
+    /// B1441 — an audiobook's page shows the description its chapters carry,
+    /// as plain text; a music album shows none.
+    #[test]
+    fn an_audiobook_album_takes_its_chapters_description() {
+        const BLURB: &str =
+            "A clockmaker repairs one last clock and finds it keeps another town's time.";
+        let at = |path: &str, overview: Option<&str>| MediaItem {
+            path: path.into(),
+            probe: pharos_core::MediaProbe {
+                album: Some("Widget Days".into()),
+                ..pharos_core::MediaProbe::default()
+            },
+            metadata: pharos_core::MediaMetadata {
+                overview: overview.map(Into::into),
+                ..pharos_core::MediaMetadata::default()
+            },
+            ..track(Some("Ada Field"), None)
+        };
+        let marked = format!("<p>{BLURB}</p>");
+        let tracks = [
+            at("/libBooks/Widget Days/1.m4b", Some(&marked)),
+            at("/libBooks/Widget Days/2.m4b", Some(&marked)),
+            at(
+                "/libBooks/Widget Days/3.m4b",
+                Some("Chapter three of a longer book, a stray tag."),
+            ),
+            at("/libBooks/Widget Days/4.m4b", None),
+        ];
+        let books = aggregate_albums(&tracks, |_| true, |i| i.path.starts_with("/libBooks"));
+        assert_eq!(
+            books.first().and_then(AlbumAgg::overview).as_deref(),
+            Some(BLURB),
+            "most chapters' text, without its markup"
+        );
+        let music = aggregate_albums(&tracks, |_| true, |_| false);
+        assert_eq!(music.first().and_then(AlbumAgg::overview), None);
     }
 }
 
