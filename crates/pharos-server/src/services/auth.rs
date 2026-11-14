@@ -82,7 +82,7 @@ pub async fn user_for_token_id(stores: &Stores, id: &str) -> Result<User, TokenR
     live_user(stores, uid).await
 }
 
-async fn live_user(stores: &Stores, uid: UserId) -> Result<User, TokenRefusal> {
+pub(crate) async fn live_user(stores: &Stores, uid: UserId) -> Result<User, TokenRefusal> {
     let record = stores
         .get(uid)
         .await

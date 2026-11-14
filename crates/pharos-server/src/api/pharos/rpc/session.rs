@@ -816,6 +816,144 @@ impl server::session::Handler for Session {
         }
         Ok(())
     }
+
+    async fn reader_passwords(
+        self: Rc<Self>,
+        _params: wire::ReaderPasswordsParams,
+        results: &mut wire::ReaderPasswordsResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let listed = match crate::services::reader_password::list(&self.state, &user).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(user = %user.name, error = %e, "native reader password list failed");
+                Denial::Unavailable {
+                    dependency: "reader password store",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let len = u32::try_from(listed.len()).unwrap_or(u32::MAX);
+        let mut list = results.get().init_result().init_passwords(len);
+        for (i, p) in listed.iter().enumerate().take(len as usize) {
+            write_reader_password(list.reborrow().get(i as u32), p);
+        }
+        Ok(())
+    }
+
+    async fn create_reader_password(
+        self: Rc<Self>,
+        params: wire::CreateReaderPasswordParams,
+        results: &mut wire::CreateReaderPasswordResults,
+    ) -> Result<(), capnp::Error> {
+        use crate::services::reader_password::{CreateError, MAX_LIVE_PER_USER};
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let Some(label) = params
+            .get()?
+            .get_label()
+            .ok()
+            .and_then(|r| r.to_str().ok())
+            .map(str::to_owned)
+        else {
+            Denial::Invalid { field: "label" }.write(results.get().init_result().init_error());
+            return Ok(());
+        };
+        let created =
+            match crate::services::reader_password::create(&self.state, &user, &label).await {
+                Ok(created) => created,
+                Err(e) => {
+                    let denial = match &e {
+                        CreateError::Label(_) => Denial::Invalid { field: "label" },
+                        CreateError::Limit { held } => Denial::Limit {
+                            name: "readerPasswords",
+                            value: u64::try_from(*held).unwrap_or(u64::MAX),
+                            max: u64::try_from(MAX_LIVE_PER_USER).unwrap_or(u64::MAX),
+                        },
+                        CreateError::Store(_) => Denial::Unavailable {
+                            dependency: "reader password store",
+                        },
+                        CreateError::Rng(_) | CreateError::Hash(_) | CreateError::NoFreeId => {
+                            Denial::Unavailable {
+                                dependency: "password hasher",
+                            }
+                        }
+                    };
+                    denial.write(results.get().init_result().init_error());
+                    return Ok(());
+                }
+            };
+        let mut out = results.get().init_result().init_created();
+        write_reader_password(out.reborrow().init_listed(), &created.listed);
+        out.set_password(created.password.expose());
+        out.set_opds_path(format!("{}/", crate::api::opds::PREFIX).as_str());
+        Ok(())
+    }
+
+    async fn revoke_reader_password(
+        self: Rc<Self>,
+        params: wire::RevokeReaderPasswordParams,
+        results: &mut wire::RevokeReaderPasswordResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let id = params
+            .get()?
+            .get_id()
+            .ok()
+            .and_then(|r| r.to_str().ok())
+            .and_then(pharos_core::ReaderPasswordId::parse);
+        let mut done = results.get().init_result();
+        // An id that cannot be one is held by nobody: the same answer as an
+        // unknown one, so the call reveals nothing about the alphabet.
+        let Some(id) = id else {
+            Denial::NotFound {
+                what: "reader password",
+            }
+            .write(done.init_error());
+            return Ok(());
+        };
+        match crate::services::reader_password::revoke(&self.state, &user, &id).await {
+            Ok(true) => done.set_ok(()),
+            Ok(false) => Denial::NotFound {
+                what: "reader password",
+            }
+            .write(done.init_error()),
+            Err(_) => Denial::Unavailable {
+                dependency: "reader password store",
+            }
+            .write(done.init_error()),
+        }
+        Ok(())
+    }
+}
+
+/// One listed e-reader password on the wire; never the hash or the secret.
+fn write_reader_password(
+    mut b: pharos_api::pharos_capnp::reader_password::Builder<'_>,
+    p: &pharos_core::ReaderPassword,
+) {
+    b.set_id(p.id.as_str());
+    b.set_label(p.label.as_str());
+    b.set_created_at_ms(p.created_at.saturating_mul(1000));
+    b.set_last_used_at_ms(p.last_used_at.unwrap_or(0).saturating_mul(1000));
 }
 
 /// The device id a media token is stored under: the session's own device

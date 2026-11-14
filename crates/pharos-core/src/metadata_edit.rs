@@ -7,7 +7,7 @@
 //! survives a rescan, an NFO change and an online refresh. Unlocking a field
 //! hands it back: the next scan or refresh writes it again.
 
-use crate::{DomainResult, MediaId};
+use crate::{DomainResult, MediaId, MediaKind};
 
 /// A field an admin can edit and lock. The discriminant is the field's bit
 /// position in the stored mask, so a variant's number never changes; a new
@@ -86,10 +86,16 @@ impl EditableField {
     }
 
     /// Whether a film, episode, song or book row can carry this field.
-    /// Genres there are a join the scanner relinks, not a column, so they
-    /// wait for a later slice.
+    /// Genres there are a join the scanner relinks, not a column; only a
+    /// book's can be edited (spec 043), see [`Self::on_item_of`].
     pub const fn on_item(self) -> bool {
         !matches!(self, Self::Genres)
+    }
+
+    /// Whether an item of `kind` can carry this field: [`Self::on_item`], and
+    /// Genres on a book, whose genres are its shelves (spec 043 FR-011).
+    pub fn on_item_of(self, kind: MediaKind) -> bool {
+        self.on_item() || (self == Self::Genres && kind == MediaKind::Book)
     }
 
     /// Whether a show's `series_metadata` row can carry this field. A show's
@@ -278,10 +284,11 @@ impl EditTarget {
         }
     }
 
-    fn allows(&self, f: EditableField) -> bool {
-        match self {
-            Self::Item(_) => f.on_item(),
-            Self::Series { .. } => f.on_series(),
+    fn allows(&self, f: EditableField, kind: Option<MediaKind>) -> bool {
+        match (self, kind) {
+            (Self::Item(_), Some(kind)) => f.on_item_of(kind),
+            (Self::Item(_), None) => f.on_item(),
+            (Self::Series { .. }, _) => f.on_series(),
         }
     }
 }
@@ -343,9 +350,19 @@ impl MetadataEdit {
     /// The edit with text trimmed, blank text cleared and genres de-duplicated,
     /// checked against the limits above and against what `target` can carry.
     pub fn normalised(&self, target: &EditTarget) -> Result<Self, EditRejected> {
+        self.normalised_for(target, None)
+    }
+
+    /// As [`Self::normalised`], for an item whose kind is known, so a book's
+    /// genres are editable (spec 043).
+    pub fn normalised_for(
+        &self,
+        target: &EditTarget,
+        kind: Option<MediaKind>,
+    ) -> Result<Self, EditRejected> {
         use EditableField as F;
         for f in self.fields().union(self.unlock).iter() {
-            if !target.allows(f) {
+            if !target.allows(f, kind) {
                 return Err(EditRejected::NotEditable {
                     field: f.wire(),
                     target: target.noun(),
@@ -575,6 +592,35 @@ mod tests {
         .normalised(&show)
         .unwrap_err();
         assert_eq!(err.field(), "Title");
+    }
+
+    #[test]
+    fn only_a_books_genres_are_editable_on_an_item() {
+        let edit = MetadataEdit {
+            genres: Some(vec![" Web ".into(), "web".into()]),
+            ..Default::default()
+        };
+        let book = edit
+            .normalised_for(&EditTarget::Item(1), Some(MediaKind::Book))
+            .unwrap();
+        assert_eq!(book.genres, Some(vec!["Web".to_string()]));
+        for kind in [MediaKind::Movie, MediaKind::Episode, MediaKind::Audio] {
+            let err = edit
+                .normalised_for(&EditTarget::Item(1), Some(kind))
+                .unwrap_err();
+            assert_eq!(err.label(), "not_editable", "{kind:?}");
+        }
+        let mut unlock = LockedFields::NONE;
+        unlock.insert(EditableField::Genres);
+        assert!(MetadataEdit {
+            unlock,
+            ..Default::default()
+        }
+        .normalised_for(&EditTarget::Item(1), Some(MediaKind::Book))
+        .is_ok());
+        assert!(EditableField::Genres.on_item_of(MediaKind::Book));
+        assert!(!EditableField::Genres.on_item_of(MediaKind::Movie));
+        assert!(EditableField::Title.on_item_of(MediaKind::Book));
     }
 
     #[test]

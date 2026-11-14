@@ -161,6 +161,10 @@ pub enum ConvertReason {
     Ok,
     /// Amazon DRM.
     Drm,
+    /// Amazon DRM, but the unencrypted EXTH header still gave metadata
+    /// (B1419). The outcome stays `drm_protected`; this reason says how many
+    /// of the locked books are nonetheless described.
+    DrmMetadata,
     /// Could not be opened (permissions, dead mount).
     Unopenable,
     /// Not the structure its extension claims.
@@ -179,6 +183,7 @@ impl ConvertReason {
         match self {
             ConvertReason::Ok => "ok",
             ConvertReason::Drm => "drm",
+            ConvertReason::DrmMetadata => "drm_metadata",
             ConvertReason::Unopenable => "unopenable",
             ConvertReason::Malformed => "malformed",
             ConvertReason::ExportFailed => "export_failed",
@@ -303,6 +308,13 @@ pub fn read_kindle(path: &Path) -> Result<EpubMetadata, KindleError> {
             .and_then(|c| c.position)
             .filter(|p| p.fract() == 0.0 && *p >= 0.0 && *p <= f64::from(u32::MAX))
             .map(|p| p as u32),
+        subjects: m
+            .subjects
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
         cover_href: m.cover_image.clone(),
     })
 }
@@ -314,9 +326,26 @@ pub fn read_kindle(path: &Path) -> Result<EpubMetadata, KindleError> {
 /// than an ISBN, and one library file carries the placeholder `0000000000000`,
 /// which passes a pure digit count. Storing either as an ISBN would be a lie
 /// the UI displays and an online-metadata lookup would then act on.
-fn isbn_of(identifier: &str) -> Option<String> {
+///
+/// An ISBN-10's check character may be `X` (ten), and only as its last one.
+pub(super) fn isbn_of(identifier: &str) -> Option<String> {
     let digits: String = identifier.chars().filter(char::is_ascii_digit).collect();
-    if (digits.len() == 10 || digits.len() == 13) && digits.bytes().any(|b| b != b'0') {
+    let check_x = identifier
+        .chars()
+        .rev()
+        .find(char::is_ascii_alphanumeric)
+        .is_some_and(|c| c.eq_ignore_ascii_case(&'x'));
+    let len = digits.len() + usize::from(check_x);
+    let only_digits_and_x = !check_x
+        || identifier
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .count()
+            == len;
+    if only_digits_and_x
+        && (len == 10 || (len == 13 && !check_x))
+        && digits.bytes().any(|b| b != b'0')
+    {
         Some(identifier.to_string())
     } else {
         None
@@ -402,6 +431,7 @@ mod tests {
     <dc:language>en</dc:language>
     <dc:identifier id="uid">9789300000002</dc:identifier>
     <dc:publisher>No Starch Press</dc:publisher>
+    <dc:subject>Synthetic Subject</dc:subject>
   </metadata>
   <manifest>
     <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
@@ -514,6 +544,8 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Book A"));
         assert_eq!(meta.author.as_deref(), Some("Gjengset, Jon"));
         assert_eq!(meta.publisher.as_deref(), Some("No Starch Press"));
+        // Spec 043 FR-002: the subject survives the AZW3 round trip (EXTH 105).
+        assert_eq!(meta.subjects, vec!["Synthetic Subject".to_owned()]);
         // NOT asserted here: `isbn`. The fixture is made by boko's own AZW3
         // WRITER, and that writer does not carry `dc:identifier` through — so
         // a round-trip cannot prove anything about ISBN either way.
@@ -762,6 +794,7 @@ mod tests {
         let reasons = [
             ConvertReason::Ok,
             ConvertReason::Drm,
+            ConvertReason::DrmMetadata,
             ConvertReason::Unopenable,
             ConvertReason::Malformed,
             ConvertReason::ExportFailed,
@@ -773,6 +806,7 @@ mod tests {
             [
                 "ok",
                 "drm",
+                "drm_metadata",
                 "unopenable",
                 "malformed",
                 "export_failed",
@@ -811,6 +845,9 @@ mod tests {
             isbn_of("978-0-9888202-0-4").as_deref(),
             Some("978-0-9888202-0-4")
         );
+        assert_eq!(isbn_of("1-23456-789-X").as_deref(), Some("1-23456-789-X"));
+        assert_eq!(isbn_of("123456789x").as_deref(), Some("123456789x"));
+        assert_eq!(isbn_of("12345X6789"), None);
         assert_eq!(isbn_of("B002N3M6RW"), None);
         assert_eq!(isbn_of("0000000000000"), None);
         assert_eq!(isbn_of(""), None);

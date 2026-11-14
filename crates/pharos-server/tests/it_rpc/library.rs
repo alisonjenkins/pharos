@@ -4263,3 +4263,312 @@ async fn home_rails_and_jellyfin_latest_carry_the_fold() {
         .count();
     assert_eq!(flat_eps, 3);
 }
+
+/// Adds a Books library at /libBooks with a book and a course ("Intro to
+/// Widgets": module "01 - Basics" with two lessons, a "03" module with one),
+/// and returns its wire id.
+async fn seed_books_library(fx: &crate::common::Fixture) -> String {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    let wire = "d".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("Reading", "/libBooks", LibraryKind::Books, &wire)
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 701,
+            path: "/libBooks/Widget Handbook.epub".into(),
+            title: "Widget Handbook".into(),
+            kind: MediaKind::Book,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let lessons = [
+        (
+            702,
+            "01 - Basics/01 - Introduction.mp4",
+            1,
+            1,
+            "Introduction",
+        ),
+        (703, "01 - Basics/02 - Parts.mp4", 1, 2, "Parts"),
+        (704, "03/001 Fitting.mp4", 3, 1, "Fitting"),
+    ];
+    for (id, rel, season, ep, title) in lessons {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libBooks/Intro to Widgets/{rel}").into(),
+                title: title.into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Intro to Widgets".into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                    series_folder: Some("/libBooks/Intro to Widgets".into()),
+                    series_year: None,
+                    series_key: None,
+                }),
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    wire
+}
+
+/// V1393 — a Books library lists its books, its courses as series, a
+/// course's seasons by their module folders; a TV library lists no course.
+/// Disarm check: with `books_default` keeping `Unset`, the first listing
+/// holds the lessons too; with `season_name` always "Season N", the module
+/// name is missing.
+#[actix_web::test]
+async fn a_books_library_lists_books_and_its_courses_apart() {
+    use pharos_jellyfin_api::dto::series_id_for_key;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let books = seed_books_library(&fx).await;
+
+    assert_eq!(
+        listed(&session, &books, &[], "SortName").await,
+        [("Widget Handbook".to_owned(), None)]
+    );
+    assert_eq!(
+        listed(&session, &books, &[Kind::Series], "SortName").await,
+        [("Intro to Widgets".to_owned(), None)]
+    );
+    let course = series_id_for_key(Some("/libBooks/Intro to Widgets"), "Intro to Widgets");
+    assert_eq!(
+        listed(&session, &course, &[Kind::Season], "").await,
+        [
+            ("Basics".to_owned(), Some(1)),
+            ("Season 3".to_owned(), Some(3))
+        ]
+    );
+    assert_eq!(
+        listed(&session, &tv, &[Kind::Series], "SortName").await,
+        [("Mature".to_owned(), None), ("Show".to_owned(), None)],
+        "a course is never a TV library's show"
+    );
+}
+
+/// One listing's name, author line, length and audiobook mark per item.
+async fn audiobook_rows(
+    session: &session::Client,
+    parent: Option<&str>,
+    kinds: &[Kind],
+) -> Vec<(String, String, u64, bool)> {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    if let Some(parent) = parent {
+        let mut id = q.reborrow().init_parent_id();
+        match WireId::parse(parent).unwrap() {
+            WireId::Real(n) => id.set_real(n),
+            WireId::Synth(n) => id.set_synth(n),
+        }
+    }
+    let mut list = q.reborrow().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    q.set_sort_by("SortName");
+    let reply = req.send().promise.await.unwrap();
+    let items_result::Page(page) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("the listing answered an error");
+    };
+    page.unwrap()
+        .get_items()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i.get_name().unwrap().to_str().unwrap().to_owned(),
+                i.get_artist().unwrap().to_str().unwrap().to_owned(),
+                i.get_runtime_ms(),
+                i.get_audiobook(),
+            )
+        })
+        .collect()
+}
+
+/// ADR-0132 — a Books library's default listing keeps its books alone; its
+/// audiobooks list as albums marked as audiobooks, each naming its author
+/// and its whole length, and their tracks are marked too. A music album is
+/// not marked. Disarm check: with `mark_album` never setting the mark, the
+/// albums under the Books library answer `false` and no author.
+#[actix_web::test]
+async fn a_books_library_lists_its_audiobooks_as_albums() {
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tracks = [
+        (
+            710,
+            "/libBooks/Ada Field/Gadget Tales.m4b",
+            "Gadget Tales",
+            "Gadget Tales",
+            3_600_000,
+            Some(1),
+        ),
+        (
+            711,
+            "/libBooks/Ada Field/Widget Days/1 Opening.mp3",
+            "Opening",
+            "Widget Days",
+            600_000,
+            Some(1),
+        ),
+        (
+            712,
+            "/libBooks/Ada Field/Widget Days/2 Ending.mp3",
+            "Ending",
+            "Widget Days",
+            900_000,
+            Some(2),
+        ),
+        (
+            713,
+            "/elsewhere/Band A/Loud Songs/1 Song.mp3",
+            "Song",
+            "Loud Songs",
+            200_000,
+            Some(1),
+        ),
+    ];
+    for (id, path, title, album, ms, track) in tracks {
+        let author = if album == "Loud Songs" {
+            "Band A"
+        } else {
+            "Ada Field"
+        };
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: path.into(),
+                title: title.into(),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    album: Some(album.into()),
+                    album_artist: Some(author.into()),
+                    duration_ms: Some(ms),
+                    track_number: track,
+                    ..MediaProbe::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    let books = seed_books_library(&fx).await;
+
+    assert_eq!(
+        listed(&session, &books, &[], "SortName").await,
+        [("Widget Handbook".to_owned(), None)],
+        "the books default keeps audiobooks out"
+    );
+    let book = |name: &str, ms| (name.to_owned(), "Ada Field".to_owned(), ms, true);
+    assert_eq!(
+        audiobook_rows(&session, Some(&books), &[Kind::Album]).await,
+        [
+            book("Gadget Tales", 3_600_000),
+            book("Widget Days", 1_500_000)
+        ]
+    );
+    let all = audiobook_rows(&session, None, &[Kind::Album]).await;
+    let song = all.iter().find(|r| r.0 == "Loud Songs").unwrap();
+    assert!(!song.3, "a music album is no audiobook");
+    assert_eq!(song.1, "", "a music album's tile is unchanged");
+    let chapters = audiobook_rows(&session, Some(&books), &[Kind::Audio]).await;
+    assert_eq!(chapters.len(), 3, "{chapters:?}");
+    assert!(chapters.iter().all(|c| c.3), "{chapters:?}");
+}
+
+/// Spec 043 SC-002 — a Books library's genre filter offers the shelves its
+/// books carry and nothing else: not a film's genres from another library,
+/// not a course lesson's; and picking a shelf lists its books.
+/// Disarm check: with `index` building its facet query without the Books
+/// library's books-only default, the lesson's "Drama" is offered too.
+#[actix_web::test]
+async fn a_books_library_offers_only_its_books_shelves() {
+    use pharos_core::{GenreStore as _, MediaItem, MediaKind, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    fx.state
+        .stores
+        .link_item_genres(101, &["Action".to_owned()])
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 705,
+            path: "/libBooks/Gadget Locks.pdf".into(),
+            title: "Gadget Locks".into(),
+            kind: MediaKind::Book,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let books = seed_books_library(&fx).await;
+    for (id, shelves) in [
+        (701, vec!["Programming", "Web"]),
+        (705, vec!["Security"]),
+        (702, vec!["Drama"]),
+    ] {
+        let names: Vec<String> = shelves.into_iter().map(str::to_owned).collect();
+        fx.state.stores.link_item_genres(id, &names).await.unwrap();
+    }
+
+    let (_, genres) = wire_index(&session, &books, &[], "").await;
+    assert_eq!(genres, ["Programming", "Security", "Web"]);
+    assert_eq!(
+        listed_in(&session, &books, &[], "Security", &[]).await,
+        ["Gadget Locks"]
+    );
+    assert_eq!(
+        listed_in(&session, &books, &[], "Web", &[]).await,
+        ["Widget Handbook"]
+    );
+}
+
+/// V1393 — a Books library's genre picker offers its books' genres, not its
+/// course lessons'. Disarm check: building the facet query from the listing
+/// as asked (no `books_default`) offers "Widgetry" too.
+#[actix_web::test]
+async fn a_books_librarys_genres_are_its_books_genres() {
+    use pharos_core::GenreStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let books = seed_books_library(&fx).await;
+    for (id, genre) in [(701, "Gardening"), (702, "Widgetry")] {
+        fx.state
+            .stores
+            .link_item_genres(id, &[genre.to_owned()])
+            .await
+            .unwrap();
+    }
+    let (_, genres) = wire_index(&session, &books, &[], "").await;
+    assert_eq!(genres, ["Gardening"]);
+}

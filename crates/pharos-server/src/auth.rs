@@ -330,38 +330,17 @@ impl<U: UserStore> BuiltinAuth<U> {
             });
         }
         let typed = name;
-        let name = typed.trim();
-        let mut found = self
-            .users
-            .lookup_by_name_ignore_case(name)
-            .await
-            .map_err(Denial::Backend)?;
-        // Matches arrive exact-first. Several accounts differing only by case
-        // are ambiguous unless one is exactly what was typed.
-        let ambiguous = found.len() > 1 && found.first().is_some_and(|r| r.name != name);
-        let record = if ambiguous {
-            None
-        } else {
-            found.drain(..).next()
-        };
-        let Some(record) = record else {
-            self.dummy_verify(password, slots, wait)
-                .await
-                .map_err(Denial::Backend)?;
-            let reason = if ambiguous {
-                tracing::warn!(
-                    reason = LoginFailure::AmbiguousName.label(),
-                    name_len = name.chars().count(),
-                    "login refused: the name matches several accounts that differ only by case"
-                );
-                LoginFailure::AmbiguousName
-            } else {
-                LoginFailure::UnknownUser
-            };
-            return Err(Denial::Refused {
-                reason,
-                name_mismatch: NameMismatch::None,
-            });
+        let record = match self.account_named(typed).await.map_err(Denial::Backend)? {
+            Ok(record) => record,
+            Err(reason) => {
+                self.dummy_verify(password, slots, wait)
+                    .await
+                    .map_err(Denial::Backend)?;
+                return Err(Denial::Refused {
+                    reason,
+                    name_mismatch: NameMismatch::None,
+                });
+            }
         };
         let name_mismatch = NameMismatch::between(typed, &record.name);
         let matched = match self
@@ -406,6 +385,50 @@ impl<U: UserStore> BuiltinAuth<U> {
             }
         }
         Ok(record.into_user())
+    }
+
+    /// The account a typed sign-in name names: matched ignoring case and
+    /// surrounding space, exact match first. `Err(UnknownUser)` when there is
+    /// none, `Err(AmbiguousName)` when several accounts differ only by case
+    /// and none is exactly what was typed. Every credential check that starts
+    /// from a typed name asks here, so they all read a name alike.
+    pub async fn account_named(&self, typed: &str) -> AuthResult<Result<UserRecord, LoginFailure>> {
+        let name = typed.trim();
+        let mut found = self.users.lookup_by_name_ignore_case(name).await?;
+        // Matches arrive exact-first. Several accounts differing only by case
+        // are ambiguous unless one is exactly what was typed.
+        let ambiguous = found.len() > 1 && found.first().is_some_and(|r| r.name != name);
+        if ambiguous {
+            tracing::warn!(
+                reason = LoginFailure::AmbiguousName.label(),
+                name_len = name.chars().count(),
+                "login refused: the name matches several accounts that differ only by case"
+            );
+            return Ok(Err(LoginFailure::AmbiguousName));
+        }
+        let first = found.drain(..).next();
+        Ok(first.ok_or(LoginFailure::UnknownUser))
+    }
+
+    /// Whether `password` matches `hash`, checked on a blocking thread under
+    /// the same slot bound as every sign-in. For credentials that are not the
+    /// account password (an e-reader password's secret, ADR-0128); callers
+    /// reach it only through [`LoginThrottle::verify_with`].
+    pub async fn verify_secret(&self, hash: &str, password: &SecretString) -> AuthResult<bool> {
+        match self
+            .verify_off_worker(hash, password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
+            .await?
+        {
+            Bounded::Busy => Err(busy_refusal()),
+            Bounded::Done(verdict) => verdict,
+        }
+    }
+
+    /// One wasted verify, so a check that found nothing to verify against
+    /// costs what a real one does (V177).
+    pub async fn verify_nothing(&self, password: &SecretString) -> AuthResult<()> {
+        self.dummy_verify(password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
+            .await
     }
 
     /// Jellyfin `UserManager.AuthenticateUser`: add one to the user's failed
@@ -781,7 +804,7 @@ impl LoginThrottle {
     /// Dropping the attempt otherwise leaves it counted and logs
     /// "login failed" with both running counts.
     ///
-    /// Private: callers go through [`verify`](Self::verify), so no path can
+    /// Private: callers go through [`verify`](Self::verify) or [`verify_with`](Self::verify_with), so no path can
     /// check a password without the throttle (V174).
     fn begin(&self, user: &str, ip: IpAddr, now: Instant) -> Result<Attempt<'_>, RetryAfter> {
         let uk = user_key(user);
@@ -883,14 +906,30 @@ impl LoginThrottle {
         ip: IpAddr,
         purpose: Purpose,
     ) -> Result<User, LoginRefusal> {
+        self.verify_with(user, ip, async {
+            match purpose {
+                Purpose::SignIn => auth.judge(user, password).await,
+                Purpose::Recheck => auth.judge_recheck(user, password).await,
+            }
+        })
+        .await
+    }
+
+    /// Admit one attempt for `user` from `ip`, run `judge`, and settle the
+    /// attempt by its verdict, as [`Self::verify`] does for the account
+    /// password. For a credential that is not the account password (an
+    /// e-reader password, ADR-0128), which brings its own judge; the judge is
+    /// not run at all when the attempt is throttled.
+    pub async fn verify_with<T>(
+        &self,
+        user: &str,
+        ip: IpAddr,
+        judge: impl std::future::Future<Output = Result<T, Denial>>,
+    ) -> Result<T, LoginRefusal> {
         let attempt = self
             .begin(user, ip, Instant::now())
             .map_err(LoginRefusal::Throttled)?;
-        let verdict = match purpose {
-            Purpose::SignIn => auth.judge(user, password).await,
-            Purpose::Recheck => auth.judge_recheck(user, password).await,
-        };
-        match verdict {
+        match judge.await {
             Ok(u) => {
                 attempt.succeeded();
                 Ok(u)

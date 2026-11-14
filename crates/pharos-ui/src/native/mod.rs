@@ -11,6 +11,7 @@ pub mod app;
 pub mod appearance;
 pub mod approve_device;
 pub mod art;
+pub mod audiobook;
 pub mod backdrop;
 pub mod bars;
 pub mod browse;
@@ -96,6 +97,7 @@ pub mod quality;
 pub mod queue;
 pub mod rails;
 pub mod reader;
+pub mod reader_passwords;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod reader_web;
 pub mod report;

@@ -35,6 +35,7 @@ mod playback;
 mod prefs;
 mod quick_connect;
 mod read_position;
+mod reader_passwords;
 mod report;
 mod revocation;
 mod revocation_sites;

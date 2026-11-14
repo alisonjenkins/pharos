@@ -656,6 +656,85 @@ pub fn download_href(id: ItemRef) -> String {
     format!("/Items/{id}/Download")
 }
 
+/// Where version `version` of a book has its bytes (V1391); `""` is the
+/// book's own file.
+pub fn version_href(id: ItemRef, version: &str) -> String {
+    if version.is_empty() {
+        return download_href(id);
+    }
+    let version: String = url_safe(version);
+    format!("/Items/{id}/Download?mediaSourceId={id}-{version}")
+}
+
+/// A version id as it goes in a URL: the server issues ASCII letters, digits
+/// and `-`, and nothing else is let through.
+fn url_safe(version: &str) -> String {
+    version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
+}
+
+/// The book as version `version` reads (V1391): another format of it may be
+/// one the reader opens, or one it cannot. The primary (`""`), or a version
+/// the detail does not list, is `book` as the server sent it.
+pub fn version_book(book: &Book, versions: &[pharos_client::api::Version], version: &str) -> Book {
+    let chosen = versions
+        .iter()
+        .find(|v| !version.is_empty() && v.id == version);
+    match chosen {
+        Some(v) => Book {
+            format: format_of_container(&v.container),
+            ..book.clone()
+        },
+        None => book.clone(),
+    }
+}
+
+/// Whether a copy kept offline as `kept` serves an open of `book` with
+/// `picked` chosen on the title page (V1391): yes when nothing is picked, or
+/// the pick is gone, or it reads as the kept format; a pick of another format
+/// is fetched instead.
+pub fn kept_copy_serves(
+    kept: BookFormat,
+    book: &Book,
+    versions: &[pharos_client::api::Version],
+    picked: &str,
+) -> bool {
+    version_book(book, versions, picked).format == kept
+        || !versions
+            .iter()
+            .any(|v| !picked.is_empty() && v.id == picked)
+}
+
+/// The version to fetch in place of a copy kept as `kept` that this device
+/// lost: the book's own file (`""`) when it reads as `kept`, else the first
+/// version that does; `None` when the server offers the format no longer.
+pub fn version_for_format(
+    book: &Book,
+    versions: &[pharos_client::api::Version],
+    kept: BookFormat,
+) -> Option<String> {
+    if book.format == kept {
+        return Some(String::new());
+    }
+    versions
+        .iter()
+        .find(|v| !v.id.is_empty() && format_of_container(&v.container) == kept)
+        .map(|v| v.id.clone())
+}
+
+/// The format a version's container reads as; a container the reader does
+/// not know is unreadable.
+fn format_of_container(container: &str) -> BookFormat {
+    match container.to_ascii_lowercase().as_str() {
+        "epub" => BookFormat::Epub,
+        "pdf" => BookFormat::Pdf,
+        "cbz" | "cbr" | "cbt" | "cb7" => BookFormat::Comic,
+        _ => BookFormat::Unreadable,
+    }
+}
+
 /// What a book's title page offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BookAction {
@@ -673,7 +752,7 @@ pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
                 .unwrap_or_else(|| "Read".to_owned()),
         ),
         BookFormat::Unreadable => {
-            BookAction::Closed("This book is locked to a Kindle device and cannot be opened here.")
+            BookAction::Closed("Locked to a Kindle (DRM). Pharos can't open it.")
         }
         BookFormat::Comic => BookAction::Closed("Comic reading is coming."),
     }
@@ -1283,6 +1362,84 @@ mod tests {
         assert!((saved_fraction(f64::NAN, false)).abs() < f32::EPSILON);
     }
 
+    /// V1391: a picked version opens as its own format; a locked one is
+    /// closed even when the primary reads.
+    #[test]
+    fn a_picked_version_reads_as_its_own_format() {
+        use pharos_client::api::Version;
+        let epub = Book {
+            format: BookFormat::Epub,
+            author: "A".into(),
+            page_count: 0,
+        };
+        let version = |id: &str, container: &str| Version {
+            id: id.into(),
+            container: container.into(),
+            ..Version::default()
+        };
+        let versions = [
+            version("", "epub"),
+            version("pdf", "pdf"),
+            version("kindle-locked", "azw3"),
+            version("kindle", "epub"),
+        ];
+        let format = |v: &str| version_book(&epub, &versions, v).format;
+        assert_eq!(format(""), BookFormat::Epub);
+        assert_eq!(format("pdf"), BookFormat::Pdf);
+        assert_eq!(format("kindle-locked"), BookFormat::Unreadable);
+        assert_eq!(format("kindle"), BookFormat::Epub);
+        assert_eq!(format("gone"), BookFormat::Epub);
+        assert_eq!(version_book(&epub, &versions, "pdf").author, "A");
+    }
+
+    /// A kept EPUB opens offline-first unless the title page picked a
+    /// version of another format, which is fetched instead.
+    #[test]
+    fn a_pick_of_another_format_passes_over_the_kept_copy() {
+        use pharos_client::api::Version;
+        let epub = Book {
+            format: BookFormat::Epub,
+            author: String::new(),
+            page_count: 0,
+        };
+        let versions = [Version {
+            id: "pdf".into(),
+            container: "pdf".into(),
+            ..Version::default()
+        }];
+        let serves = |kept, picked| kept_copy_serves(kept, &epub, &versions, picked);
+        assert!(serves(BookFormat::Epub, ""), "nothing picked: kept first");
+        assert!(serves(BookFormat::Epub, "gone"), "a gone pick: kept first");
+        assert!(!serves(BookFormat::Epub, "pdf"), "a PDF pick is fetched");
+        assert!(serves(BookFormat::Pdf, "pdf"), "the kept format picked");
+    }
+
+    /// A kept PDF of a book whose own file is an EPUB is fetched again as
+    /// its PDF version, never as the EPUB.
+    #[test]
+    fn a_lost_kept_copy_is_fetched_in_its_own_format() {
+        use pharos_client::api::Version;
+        let book = Book {
+            format: BookFormat::Epub,
+            author: String::new(),
+            page_count: 0,
+        };
+        let version = |id: &str, container: &str| Version {
+            id: id.into(),
+            container: container.into(),
+            ..Version::default()
+        };
+        let versions = [version("", "epub"), version("pdf", "pdf")];
+        let pick = |kept| version_for_format(&book, &versions, kept);
+        assert_eq!(pick(BookFormat::Epub).as_deref(), Some(""));
+        assert_eq!(pick(BookFormat::Pdf).as_deref(), Some("pdf"));
+        assert_eq!(
+            version_for_format(&book, &versions[..1], BookFormat::Pdf),
+            None,
+            "a format the server no longer offers is not the primary"
+        );
+    }
+
     #[test]
     fn the_title_page_offers_what_the_format_allows() {
         let book = |format| Book {
@@ -1329,6 +1486,15 @@ mod tests {
             BookAction::Closed(line) if line.contains("Kindle")
         ));
         assert_eq!(download_href(ItemRef::Real(9)), "/Items/9/Download");
+        assert_eq!(version_href(ItemRef::Real(9), ""), "/Items/9/Download");
+        assert_eq!(
+            version_href(ItemRef::Real(9), "pdf"),
+            "/Items/9/Download?mediaSourceId=9-pdf"
+        );
+        assert_eq!(
+            version_href(ItemRef::Real(9), "a&b=c"),
+            "/Items/9/Download?mediaSourceId=9-abc"
+        );
     }
 
     #[test]

@@ -3170,7 +3170,7 @@ fn utc_label(secs: i64) -> String {
     )
 }
 
-fn date_label(secs: i64) -> String {
+pub(crate) fn date_label(secs: i64) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
 }

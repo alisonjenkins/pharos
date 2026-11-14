@@ -118,6 +118,44 @@ async fn my_devices_read_and_set_their_converted_sound() {
     );
 }
 
+/// 045: the account screen's e-reader section, through the client: make
+/// one, see it listed without its password, revoke it.
+#[actix_web::test]
+async fn reader_passwords_round_trip_through_the_client() {
+    let (api, _fx, _server) = api().await;
+    let call = CallInfo::default();
+    let created = api
+        .create_reader_password(&call, "Tablet")
+        .await
+        .expect("made");
+    assert_eq!(created.opds_path, "/opds/");
+    assert!(
+        !format!("{created:?}").contains(&created.password),
+        "Debug never shows the password"
+    );
+    let listed = api.reader_passwords(&call).await.unwrap();
+    assert_eq!(listed, std::slice::from_ref(&created.listed));
+    assert_eq!(listed[0].last_used_at_ms, None);
+    api.revoke_reader_password(&call, &listed[0].id)
+        .await
+        .expect("revoked");
+    assert!(api.reader_passwords(&call).await.unwrap().is_empty());
+    let err = api
+        .revoke_reader_password(&call, &listed[0].id)
+        .await
+        .expect_err("already revoked");
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "notFound",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// The watched toggle as the UI drives it: a title, then a whole season,
 /// and the detail read afterwards agrees.
 #[actix_web::test]
@@ -588,6 +626,93 @@ async fn a_3d_edition_is_badged_listed_filtered_and_played() {
     }
 }
 
+/// V1391: a book's other formats are its versions, each named by format,
+/// and a detail of one version reads as that version's format.
+#[actix_web::test]
+async fn a_books_formats_are_listed_as_its_versions() {
+    use pharos_client::api::BookFormat as WireFormat;
+    use pharos_core::{
+        AlternateMediaSource, BookFormat, BookMeta, MediaItem, MediaKind, MediaProbe,
+    };
+
+    const BOOK: u64 = 330;
+    let (api, fx, _server) = api().await;
+    let version = |id: &str, ext: &str, container: &str| AlternateMediaSource {
+        id: id.into(),
+        path: format!("/libA/Widget Cookbook.{ext}").into(),
+        name: Some(id.to_uppercase()),
+        container: Some(container.into()),
+        size_bytes: Some(2_000),
+        probe: Some(Box::new(MediaProbe {
+            container: Some(container.into()),
+            size_bytes: Some(2_000),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let mut locked = version("kindle-locked", "azw3", "azw3");
+    locked.name = Some("Kindle (locked)".into());
+    pharos_core::MediaStore::put(
+        &fx.state.stores,
+        MediaItem {
+            id: BOOK,
+            path: "/libA/Widget Cookbook.epub".into(),
+            title: "Widget Cookbook".into(),
+            kind: MediaKind::Book,
+            book: Some(BookMeta {
+                format: BookFormat::Epub,
+                ..Default::default()
+            }),
+            probe: MediaProbe {
+                size_bytes: Some(1_000),
+                alternate_sources: vec![version("pdf", "pdf", "pdf"), locked],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let call = CallInfo::default();
+
+    let detail = api
+        .detail(&call, ItemRef::Real(BOOK))
+        .await
+        .expect("detail");
+    let versions: Vec<_> = detail
+        .versions
+        .iter()
+        .map(|v| {
+            (
+                v.id.as_str(),
+                v.name.as_str(),
+                v.container.as_str(),
+                v.primary,
+            )
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            ("", "EPUB", "epub", true),
+            ("pdf", "PDF", "pdf", false),
+            ("kindle-locked", "Kindle (locked)", "azw3", false),
+        ]
+    );
+    let format = |d: &pharos_client::api::Detail| d.book.as_ref().map(|b| b.format);
+    assert_eq!(format(&detail), Some(WireFormat::Epub));
+    let pdf = api
+        .detail_version(&call, ItemRef::Real(BOOK), "pdf")
+        .await
+        .expect("the pdf version");
+    assert_eq!(format(&pdf), Some(WireFormat::Pdf));
+    let locked = api
+        .detail_version(&call, ItemRef::Real(BOOK), "kindle-locked")
+        .await
+        .expect("the locked version");
+    assert_eq!(format(&locked), Some(WireFormat::Unreadable));
+}
+
 /// V721: each version carries what tells it apart (resolution, HDR, codecs,
 /// audio, size), and its path on disk only when an admin asks; a detail of
 /// one copy lists that file's subtitles, read through its own source.
@@ -966,4 +1091,60 @@ async fn a_collapsed_listing_shows_a_box_set_as_one_tile() {
         [("The Parts".to_owned(), ItemKind::Collection)]
     );
     assert_eq!(grouped.total, films.total - 1);
+}
+
+/// B1420: a listing that hides unopenable books leaves out the DRM ones and
+/// counts what is kept; `Only` keeps just them; `Show` keeps all.
+/// Disarm check: with the client's query writer not sending `unreadable`, the
+/// hidden listing still holds the locked book.
+#[actix_web::test]
+async fn a_listing_can_hide_or_keep_only_books_no_client_can_open() {
+    use pharos_client::api::{Listing, Unreadable};
+    use pharos_core::{BookFormat, BookMeta, MediaItem, MediaKind};
+
+    let (api, fx, _server) = api().await;
+    for (id, title, format) in [
+        (331, "Open Book", BookFormat::Epub),
+        (332, "Locked Book", BookFormat::Unreadable),
+    ] {
+        pharos_core::MediaStore::put(
+            &fx.state.stores,
+            MediaItem {
+                id,
+                path: format!("/libA/{title}.epub").into(),
+                title: title.into(),
+                kind: MediaKind::Book,
+                book: Some(BookMeta {
+                    format,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
+        .await
+        .unwrap();
+    let call = CallInfo::default();
+    let library = api.home(&call).await.expect("home").rails[0].library.id;
+    let mut listing = Listing::of(library, None, "SortName");
+    let names = |page: &pharos_client::api::Page| -> Vec<String> {
+        page.items
+            .iter()
+            .filter(|i| i.name == "Open Book" || i.name == "Locked Book")
+            .map(|i| i.name.clone())
+            .collect()
+    };
+    let all = api.query(&call, &listing, 0, 50).await.expect("all");
+    assert_eq!(names(&all), ["Locked Book", "Open Book"]);
+    listing.unreadable = Unreadable::Hide;
+    let hidden = api.query(&call, &listing, 0, 50).await.expect("hidden");
+    assert_eq!(names(&hidden), ["Open Book"]);
+    assert_eq!(hidden.total, all.total - 1);
+    listing.unreadable = Unreadable::Only;
+    let only = api.query(&call, &listing, 0, 50).await.expect("only");
+    assert_eq!(names(&only), ["Locked Book"]);
+    assert_eq!(only.total, 1);
 }

@@ -3642,6 +3642,60 @@ where
             .last_played_position_ticks,
         0
     );
+
+    // V1391 — a book's other format folded into it as a version hands its
+    // reading place over when it is the newer save, and only with its resume.
+    let (kept, folded): (MediaId, MediaId) = (8_104, 8_105);
+    for (id, title) in [(kept, "Book D"), (folded, "Book D copy")] {
+        MediaStore::put(&store, media_item(id, title))
+            .await
+            .unwrap();
+    }
+    store
+        .set_read_position(uid, kept, pos("epub1:2:0", 0.2, 1_700_000_100))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, folded, pos("pdf1:9", 0.6, 1_700_000_200))
+        .await
+        .unwrap();
+    store
+        .set_read_position(other, folded, pos("pdf1:1", 0.1, 1_700_000_050))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Drop)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("epub1:2:0", 0.2, 1_700_000_100)),
+        "a dropped resume leaves the place alone"
+    );
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Carry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("pdf1:9", 0.6, 1_700_000_200)),
+        "the newer save wins"
+    );
+    assert_eq!(
+        store.get_read_position(other, kept).await.unwrap(),
+        Some(pos("pdf1:1", 0.1, 1_700_000_050)),
+        "a reader with no place on the item gets the folded one"
+    );
+    store
+        .set_read_position(uid, kept, pos("epub1:7:0", 0.7, 1_700_000_300))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, folded, kept, pharos_core::FoldResume::Carry)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, kept).await.unwrap(),
+        Some(pos("epub1:7:0", 0.7, 1_700_000_300)),
+        "an older save never overwrites a newer one"
+    );
 }
 
 /// A database of its own for one postgres conformance arm, dropped and
@@ -3842,6 +3896,113 @@ where
         series_edit.fields(),
         "the upsert never touches the locks"
     );
+}
+
+/// Spec 043 FR-011/FR-012: an admin's genre list on an item is written,
+/// locked, and kept by every later relink until it is unlocked.
+async fn run_item_genre_lock_conformance<S>(store: S)
+where
+    S: MediaStore + GenreStore + MetadataEditStore,
+{
+    const ID: MediaId = 8_871_001;
+    MediaStore::put(&store, media_item(ID, "Book One"))
+        .await
+        .unwrap();
+    store.link_item_genres(ID, &["Other".into()]).await.unwrap();
+
+    let edit = MetadataEdit {
+        genres: Some(vec!["Programming".into(), "Web".into()]),
+        ..Default::default()
+    };
+    let locked = store
+        .edit_metadata(&EditTarget::Item(ID), &edit)
+        .await
+        .unwrap();
+    assert!(locked.contains(EditableField::Genres));
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Programming".to_string(), "Web".to_string()]
+    );
+
+    // A rescan or an online fill relinks: the locked list stays.
+    store
+        .link_item_genres(ID, &["Fiction".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Programming".to_string(), "Web".to_string()],
+        "a locked genre list is written only by an admin edit"
+    );
+    MediaStore::put(&store, media_item(ID, "Book One"))
+        .await
+        .unwrap();
+    assert!(
+        MediaStore::get(&store, ID)
+            .await
+            .unwrap()
+            .locked
+            .contains(EditableField::Genres),
+        "a put keeps the genre lock"
+    );
+
+    // An empty edit clears them, still locked.
+    store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                genres: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(store.item_genre_names(ID).await.unwrap().is_empty());
+
+    // Unlocked, the next relink writes again.
+    let unlock: LockedFields = [EditableField::Genres].into_iter().collect();
+    let locked = store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                unlock,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!locked.contains(EditableField::Genres));
+    store
+        .link_item_genres(ID, &["Fiction".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.item_genre_names(ID).await.unwrap(),
+        vec!["Fiction".to_string()]
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_item_genre_lock_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_item_genre_lock_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_item_genre_lock_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_item_genre_lock_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "item_genre_lock").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_item_genre_lock_conformance(p).await;
 }
 
 #[cfg(feature = "sqlite")]
@@ -4177,4 +4338,240 @@ async fn postgres_started_items_conformance() {
         .await
         .expect("connect postgres");
     run_started_items_conformance(p).await;
+}
+
+/// V1392 — a course lesson's row, and a course made only of them, are
+/// never asked to match online; a show beside them still is.
+async fn run_course_rows_are_never_asked_to_match<S>(store: S)
+where
+    S: MediaStore + SeriesMetadataStore,
+{
+    let episode = |id: u64, show: &str| {
+        let mut ep = media_item(MediaId::from(id), &format!("{show} 1"));
+        ep.kind = MediaKind::Episode;
+        ep.path = format!("/media/{show}/01 - Start.mp4").into();
+        ep.series = Some(SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            series_folder: Some(format!("/media/{show}")),
+            series_year: None,
+            series_key: None,
+        });
+        ep
+    };
+    MediaStore::put(&store, episode(1, "Intro to Widgets"))
+        .await
+        .unwrap();
+    MediaStore::put(&store, episode(2, "Show A")).await.unwrap();
+    store
+        .set_item_match(1, "local", "", "course", None, 0)
+        .await
+        .unwrap();
+    for show in ["Intro to Widgets", "Show A"] {
+        SeriesMetadataStore::upsert_series_metadata(
+            &store,
+            SeriesMetadata {
+                series_key: format!("/media/{show}"),
+                series_name: show.into(),
+                match_source: Some("search".into()),
+                metadata_refreshed_at: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let shows: Vec<String> = SeriesMetadataStore::series_needing_match(&store, 10, i64::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.series_key)
+        .collect();
+    assert_eq!(shows, ["/media/Show A"], "a course is never matched");
+    let items: Vec<MediaId> = MediaStore::items_needing_match(&store, 10, i64::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(items, [2], "a lesson is never matched");
+}
+
+/// 045 (ADR-0128): reader passwords round-trip, list only their owner's live
+/// rows, refuse a taken id, revoke once, and prune only old revoked rows.
+async fn run_reader_password_conformance<S>(store: S)
+where
+    S: pharos_core::UserStore + pharos_core::ReaderPasswordStore + Send + Sync,
+{
+    use pharos_core::{ReaderPasswordId, ReaderPasswordRecord};
+    let owner = user_record("kobo-owner");
+    let uid = owner.id;
+    UserStore::create(&store, owner).await.unwrap();
+    let other = user_record("someone-else");
+    let other_id = other.id;
+    UserStore::create(&store, other).await.unwrap();
+    let id = |s: &str| ReaderPasswordId::parse(s).unwrap();
+    let record = |rid: &str, user, created_at| ReaderPasswordRecord {
+        id: id(rid),
+        user,
+        label: format!("label {rid}"),
+        hash: SecretString::new(format!("$argon2id$hash-of-{rid}")),
+        created_at,
+        last_used_at: None,
+        revoked_at: None,
+    };
+
+    assert!(store
+        .create_reader_password(record("abcdef", uid, 100))
+        .await
+        .unwrap());
+    assert!(store
+        .create_reader_password(record("bcdefg", uid, 200))
+        .await
+        .unwrap());
+    assert!(store
+        .create_reader_password(record("cdefgh", other_id, 150))
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .create_reader_password(record("abcdef", other_id, 300))
+            .await
+            .unwrap(),
+        "a taken id is refused, not overwritten"
+    );
+
+    let listed = store.reader_passwords_for(uid).await.unwrap();
+    let ids: Vec<&str> = listed.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["bcdefg", "abcdef"], "newest first, owner's rows only");
+    assert_eq!(listed[1].label, "label abcdef");
+
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(got.user, uid);
+    assert_eq!(got.hash.expose(), "$argon2id$hash-of-abcdef");
+    assert_eq!(got.revoked_at, None);
+    assert!(store
+        .reader_password(&id("zzzzzz"))
+        .await
+        .unwrap()
+        .is_none());
+
+    store
+        .touch_reader_password(&id("abcdef"), 500)
+        .await
+        .unwrap();
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(got.last_used_at, Some(500));
+
+    assert!(
+        !store
+            .revoke_reader_password(other_id, &id("abcdef"), 600)
+            .await
+            .unwrap(),
+        "another user cannot revoke it"
+    );
+    assert!(store
+        .revoke_reader_password(uid, &id("abcdef"), 600)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .revoke_reader_password(uid, &id("abcdef"), 700)
+            .await
+            .unwrap(),
+        "revoking twice changes nothing"
+    );
+    let got = store.reader_password(&id("abcdef")).await.unwrap().unwrap();
+    assert_eq!(
+        got.revoked_at,
+        Some(600),
+        "the first revocation's time stands"
+    );
+    let ids: Vec<String> = store
+        .reader_passwords_for(uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id.to_string())
+        .collect();
+    assert_eq!(ids, ["bcdefg"], "a revoked password is not listed");
+
+    assert_eq!(
+        store
+            .prune_revoked_reader_passwords(uid, 600)
+            .await
+            .unwrap(),
+        0,
+        "revoked at the cutoff is kept"
+    );
+    assert_eq!(
+        store
+            .prune_revoked_reader_passwords(uid, 601)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(store
+        .reader_password(&id("abcdef"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store
+            .reader_password(&id("bcdefg"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a live password is never pruned"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_course_rows_are_never_asked_to_match() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_course_rows_are_never_asked_to_match(s).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_reader_password_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_reader_password_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_course_rows_are_never_asked_to_match() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "SKIP postgres_course_rows_are_never_asked_to_match: PHAROS_TEST_POSTGRES_URL unset"
+        );
+        return;
+    };
+    let url = fresh_postgres_url(&url, "course_rows").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_course_rows_are_never_asked_to_match(p).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_reader_password_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_reader_password_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "reader_password").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_reader_password_conformance(p).await;
 }

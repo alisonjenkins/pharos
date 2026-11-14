@@ -105,6 +105,10 @@ mod metadata_edit;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod subtitle_styling;
 
+/// E-reader passwords for the OPDS catalogue (045, ADR-0128).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod reader_password;
+
 /// Per-language provider text for shows and episodes (ADR-0062).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod translations;

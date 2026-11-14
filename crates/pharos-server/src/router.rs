@@ -108,6 +108,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .configure(crate::health::configure)
         .configure(crate::api::jellyfin::configure)
         .configure(crate::api::pharos::remote_items::routes)
+        .configure(crate::api::opds::configure)
         .configure(crate::dlna::register)
         .configure(pharos_sync::ws::register);
 }

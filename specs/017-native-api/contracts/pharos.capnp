@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 45;
+const schemaVersion :UInt32 = 48;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -89,6 +89,8 @@ struct ItemSummary {
   stereo @15 :Stereo3d;        # the primary's packing, else the first 3D version's. Since schemaVersion 29.
   damaged @16 :Bool;           # the integrity check found this file damaged; Library.detail says where. Since schemaVersion 30.
   newChildren @17 :UInt32;     # a latest rail's series or album tile: how many of its children are newly added; 0 otherwise. Since schemaVersion 42.
+  audiobook @18 :Bool;         # a song or album that is an audiobook or one of its tracks: audio in a Books library (ADR-0132).
+                               # An audiobook album's `artist` is its author and its `runtimeMs` the whole book's. Since schemaVersion 48.
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
@@ -165,6 +167,18 @@ interface Session {
   # on answers notPermitted, a malformed codec name or `aac` (what every
   # conversion produces) invalid on `codecs`. Since schemaVersion 38.
   setDeviceConvertedAudio @17 (ctx :CallContext, deviceId :Text, codecs :List(Text)) -> (result :Done);
+  # The user's live e-reader passwords, which open only the OPDS catalogue at
+  # /opds/ over HTTP Basic auth (045, ADR 0128); newest first, never the
+  # password itself. Since schemaVersion 47.
+  readerPasswords @18 (ctx :CallContext) -> (result :ReaderPasswordsResult);
+  # Makes an e-reader password labelled `label`. The password is in this
+  # result and nowhere else, ever. A blank label, one over 64 characters or one
+  # with a control character answers invalid on `label`; holding 10 live
+  # passwords answers limit. Since schemaVersion 47.
+  createReaderPassword @19 (ctx :CallContext, label :Text) -> (result :CreatedReaderPasswordResult);
+  # Revokes one of the user's e-reader passwords at once; an id they hold no
+  # live password by answers notFound. Since schemaVersion 47.
+  revokeReaderPassword @20 (ctx :CallContext, id :Text) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
@@ -175,6 +189,13 @@ struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
 struct MyDevice { id @0 :Text; name @1 :Text; current @2 :Bool; convertedAudio @3 :List(Text); }
 struct MyDevicesResult { union { devices @0 :List(MyDevice); error @1 :Error; } }
 struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
+# An e-reader password as listed; `lastUsedAtMs` 0 = never used. Since
+# schemaVersion 47.
+struct ReaderPassword { id @0 :Text; label @1 :Text; createdAtMs @2 :Int64; lastUsedAtMs @3 :Int64; }
+struct ReaderPasswordsResult { union { passwords @0 :List(ReaderPassword); error @1 :Error; } }
+# `opdsPath` is the catalogue's path on this server, for the reader's URL.
+struct CreatedReaderPassword { listed @0 :ReaderPassword; password @1 :Text $secret; opdsPath @2 :Text; }
+struct CreatedReaderPasswordResult { union { created @0 :CreatedReaderPassword; error @1 :Error; } }
 struct MediaToken {
   token       @0 :Text $secret;
   expiresAtMs @1 :UInt64;
@@ -199,8 +220,11 @@ struct ItemQuery {
   stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both. Since schemaVersion 29.
   collapseCollections @10 :Bool; # fold each box set's films into one tile for the set
                                  # (B1086). Stored-row lists only. Since schemaVersion 37.
+  unreadable @11 :UnreadableFilter; # books no client can open (DRM): kept, left out, or the
+                                    # only ones (B1420). Other kinds are untouched. Since schemaVersion 46.
 }
 enum StereoFilter { any @0; only3d @1; only2d @2; }
+enum UnreadableFilter { show @0; hide @1; only @2; }
 
 # Where each section starts in a listing, in the listing's own order: a
 # section's `start` is the offset of its first item, so a client can page

@@ -24,6 +24,7 @@ const QC_SECRET: &str = "qc-poll-secret-abcdef";
 const FIELD_SECRET: &str = "clientfield-secret-xyz";
 const MEDIA_TOKEN: &str = "mediatok-9876543210-secret";
 const MANAGE_TOKEN: &str = "managetok-1357924680-secret";
+const READER_PASSWORD: &str = "readerpw-abcdef-ghjk-secret";
 const REPORT_NOTE: &str = "reportnote-secret-subtitles-vanished";
 const REPORT_BUNDLE: &str = "{\"breadcrumbs\":[\"reportbundle-secret\"]}";
 
@@ -38,7 +39,8 @@ struct TelemetryBoot;
 struct GrantBoot;
 
 /// Answers `Session.changePassword` ok and `Session.mediaToken` and
-/// `Session.manageToken` with a token, so every call's payload is logged.
+/// `Session.manageToken` with a token, and `Session.createReaderPassword`
+/// with a password, so every call's payload is logged.
 struct SessionBoot;
 
 impl server::session::Handler for SessionBoot {
@@ -70,6 +72,18 @@ impl server::session::Handler for SessionBoot {
         let mut token = results.get().init_result().init_token();
         token.set_token(MANAGE_TOKEN);
         token.set_expires_at_ms(1);
+        std::future::ready(Ok(()))
+    }
+
+    fn create_reader_password(
+        self: Rc<Self>,
+        _params: session::CreateReaderPasswordParams,
+        results: &mut session::CreateReaderPasswordResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        let mut created = results.get().init_result().init_created();
+        created.reborrow().init_listed().set_id("abcdef");
+        created.set_password(READER_PASSWORD);
+        created.set_opds_path("/opds/");
         std::future::ready(Ok(()))
     }
 }
@@ -257,6 +271,11 @@ fn call_all() -> Observed {
             let mut r = sess.manage_token_request();
             fill_ctx(r.get().init_ctx());
             r.send().promise.await.unwrap();
+
+            let mut r = sess.create_reader_password_request();
+            fill_ctx(r.get().init_ctx());
+            r.get().set_label("tablet");
+            r.send().promise.await.unwrap();
         });
     });
     o
@@ -264,7 +283,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 12] = [
+const COVERED: [(&str, &str); 13] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -277,6 +296,7 @@ const COVERED: [(&str, &str); 12] = [
     ("session", "change_password"),
     ("session", "media_token"),
     ("session", "manage_token"),
+    ("session", "create_reader_password"),
 ];
 
 #[test]
@@ -297,6 +317,7 @@ fn secrets_never_reach_logs_or_spans() {
         FIELD_SECRET,
         MEDIA_TOKEN,
         MANAGE_TOKEN,
+        READER_PASSWORD,
         REPORT_NOTE,
         "reportbundle-secret",
     ] {
@@ -315,7 +336,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        24,
+        26,
         "a request and a response per call:\n{}",
         o.logs
     );

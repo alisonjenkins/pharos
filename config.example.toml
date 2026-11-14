@@ -83,3 +83,10 @@ url = "sqlite:./pharos.db?mode=rwc"
 # # the item's folder, or dropped so online art can replace it (daily sweep).
 # # `false` only logs the dead rows and changes nothing. Default true.
 # repair_stale_artwork = true
+
+# [books]
+# # Look a book whose file names no usable subject up on Open Library, by ISBN
+# # or by title and author, to put it on a shelf (ADR-0129). Sends the book's
+# # title, author and ISBN to openlibrary.org. Default false.
+# # Env: PHAROS_BOOKS_ONLINE.
+# online_subjects = true

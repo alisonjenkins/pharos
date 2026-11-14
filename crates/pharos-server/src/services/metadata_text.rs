@@ -198,16 +198,22 @@ pub async fn localize_series_in<S: MetadataTranslationStore>(
     }
 }
 
+/// Whether `item` can have a provider's description in another language: an
+/// episode, but not a course lesson, whose rows a film match may have left
+/// behind (ADR-0126).
+fn has_provider_text(item: &MediaItem) -> bool {
+    item.kind == MediaKind::Episode
+        && item.match_source.as_deref() != Some(pharos_scanner::course::COURSE_MATCH_SOURCE)
+}
+
 /// [`localize_items_in`] for `user`'s language.
 pub async fn localize_items<'a>(
     state: &AppState,
     user: UserId,
     items: impl IntoIterator<Item = &'a mut MediaItem>,
 ) {
-    let episodes: Vec<&mut MediaItem> = items
-        .into_iter()
-        .filter(|i| i.kind == MediaKind::Episode)
-        .collect();
+    let episodes: Vec<&mut MediaItem> =
+        items.into_iter().filter(|i| has_provider_text(i)).collect();
     if episodes.is_empty() {
         return;
     }
@@ -222,10 +228,7 @@ pub async fn episode_overviews<'a>(
     user: UserId,
     items: impl IntoIterator<Item = &'a MediaItem>,
 ) -> HashMap<MediaId, String> {
-    let episodes: Vec<&MediaItem> = items
-        .into_iter()
-        .filter(|i| i.kind == MediaKind::Episode)
-        .collect();
+    let episodes: Vec<&MediaItem> = items.into_iter().filter(|i| has_provider_text(i)).collect();
     if episodes.is_empty() {
         return HashMap::new();
     }
@@ -250,6 +253,21 @@ pub async fn localize_series(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// V1392 — a course lesson shows its own text, never a provider's.
+    #[test]
+    fn a_course_lesson_has_no_provider_text() {
+        let episode = MediaItem {
+            kind: MediaKind::Episode,
+            ..Default::default()
+        };
+        assert!(super::has_provider_text(&episode));
+        let lesson = MediaItem {
+            match_source: Some("course".into()),
+            ..episode
+        };
+        assert!(!super::has_provider_text(&lesson));
+    }
     use pharos_store_sqlx::sqlite::SqliteStore;
 
     async fn store() -> SqliteStore {

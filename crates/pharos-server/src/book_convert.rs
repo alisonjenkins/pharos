@@ -40,7 +40,22 @@ impl ConvertedBookCache {
     /// the filesystem allows, and building a cache filename out of one is how
     /// a traversal gets in. The id is an integer pharos issued.
     pub fn path_for(&self, id: MediaId) -> PathBuf {
-        self.dir.join(format!("{id}.epub"))
+        self.path_for_version(id, None)
+    }
+
+    /// Where version `edition` of item `id` has its converted EPUB; `None`
+    /// is the item's own file. The edition id is pharos-issued, and anything
+    /// but an ASCII letter, digit or `-` is dropped from it all the same.
+    pub fn path_for_version(&self, id: MediaId, edition: Option<&str>) -> PathBuf {
+        let slug: String = edition
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        match slug.as_str() {
+            "" => self.dir.join(format!("{id}.epub")),
+            slug => self.dir.join(format!("{id}-{slug}.epub")),
+        }
     }
 
     /// The converted EPUB for `id`, converting `src` if it is not cached yet.
@@ -52,8 +67,13 @@ impl ConvertedBookCache {
     /// atomic and last-writer-wins on identical bytes, and the duplicated work
     /// is tens of milliseconds. A single-flight lock here would add a shared
     /// map and a lock lifetime to save less than one segment's decode.
-    pub async fn get_or_convert(&self, id: MediaId, src: &Path) -> std::io::Result<PathBuf> {
-        let dest = self.path_for(id);
+    pub async fn get_or_convert(
+        &self,
+        id: MediaId,
+        edition: Option<&str>,
+        src: &Path,
+    ) -> std::io::Result<PathBuf> {
+        let dest = self.path_for_version(id, edition);
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return Ok(dest);
         }
@@ -113,9 +133,7 @@ impl ConvertedBookCache {
         // Write-then-rename: a reader that arrives mid-write must never see a
         // truncated zip. epub.js fails opaquely on one, which would look like
         // a conversion bug rather than a half-written file.
-        let tmp = self
-            .dir
-            .join(format!("{id}.epub.tmp{}", std::process::id()));
+        let tmp = dest.with_extension(format!("epub.tmp{}", std::process::id()));
         tokio::fs::write(&tmp, &bytes).await?;
         tokio::fs::rename(&tmp, &dest).await?;
         tracing::info!(
@@ -143,7 +161,8 @@ pub fn converted_book_path(
 ) -> Option<PathBuf> {
     let cache = cache?;
     let book = item.book.as_ref()?;
-    kindle::is_converted_kindle(&item.path, book.format).then(|| cache.path_for(item.id))
+    kindle::is_converted_kindle(&item.path, book.format)
+        .then(|| cache.path_for_version(item.id, item.edition.as_deref()))
 }
 
 #[cfg(test)]
@@ -161,6 +180,54 @@ mod tests {
         assert_eq!(p.parent().unwrap(), Path::new("/cache/books"));
     }
 
+    /// V1391 — each version of a book converts to its own file, so a Kindle
+    /// version never serves the primary's bytes, and its id cannot climb out
+    /// of the cache directory.
+    #[test]
+    fn a_version_converts_to_its_own_file() {
+        let c = ConvertedBookCache::new(PathBuf::from("/cache/books"));
+        let id = MediaId::from(42u64);
+        assert_eq!(c.path_for_version(id, None), c.path_for(id));
+        assert_eq!(
+            c.path_for_version(id, Some("kindle")),
+            PathBuf::from("/cache/books/42-kindle.epub")
+        );
+        assert_eq!(
+            c.path_for_version(id, Some("../x/y")),
+            PathBuf::from("/cache/books/42-xy.epub")
+        );
+    }
+
+    /// The advertised path is the one the download route writes: a selected
+    /// version converts to its own file, never the primary's.
+    #[test]
+    fn a_selected_version_advertises_its_own_converted_file() {
+        let c = ConvertedBookCache::new(PathBuf::from("/cache/books"));
+        let item = pharos_core::MediaItem {
+            id: MediaId::from(42u64),
+            path: "/b/Widget Cookbook.azw3".into(),
+            kind: pharos_core::MediaKind::Book,
+            book: Some(pharos_core::BookMeta {
+                format: pharos_core::BookFormat::Epub,
+                ..Default::default()
+            }),
+            edition: Some("azw3".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            converted_book_path(Some(&c), &item),
+            Some(c.path_for_version(item.id, Some("azw3")))
+        );
+        let primary = pharos_core::MediaItem {
+            edition: None,
+            ..item
+        };
+        assert_eq!(
+            converted_book_path(Some(&c), &primary),
+            Some(c.path_for(primary.id))
+        );
+    }
+
     /// A source that does not exist must fail rather than cache an empty file
     /// — a zero-byte `.epub` left behind would be served forever, because the
     /// cache treats presence as success.
@@ -170,7 +237,7 @@ mod tests {
         let cache = ConvertedBookCache::new(dir.path().join("books"));
         let id = MediaId::from(7u64);
         let err = cache
-            .get_or_convert(id, Path::new("/nonexistent/book.azw3"))
+            .get_or_convert(id, None, Path::new("/nonexistent/book.azw3"))
             .await
             .expect_err("a missing source must not convert");
         assert!(!err.to_string().is_empty(), "the cause must be carried");

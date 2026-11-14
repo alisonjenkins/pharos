@@ -3768,6 +3768,65 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   width: 1.2rem;
   height: 1.2rem;
 }
+/* ADR-0132: an audiobook's speed, sleep timer and chapters, a full row
+   under the controls. Rows wrap, so a phone in portrait keeps every pill. */
+.pharos-audiobook {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  min-width: 0;
+}
+.pharos-audiobook-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+}
+.pharos-audiobook-label {
+  min-width: 3.25rem;
+  font-size: 0.8rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-audiobook-chapters summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.pharos-audiobook-chapters ol {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+.pharos-audiobook-chapter {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.35rem 0.25rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pharos-audiobook-chapter[aria-current="true"] {
+  color: var(--px-color-accent);
+  font-weight: 600;
+}
+.pharos-audiobook-chapter:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+.pharos-audiobook-chapter-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .pharos-listen .pharos-lyrics-toggle {
   border: 1px solid color-mix(in srgb, var(--px-color-fg) 10%, transparent);
   background: color-mix(in srgb, var(--px-color-bg) 45%, transparent);
@@ -4634,11 +4693,12 @@ label.pharos-setting {
   border-bottom-color: var(--px-color-accent);
   font-weight: 600;
 }
-/* B1334/V1305: a music library's tabs and its Albums order share one row,
+/* B1334/V1305, B1424: a music or books library's tabs and its Albums order share one row,
    the size of the library filter row (B1311): a segmented row of pill tabs
    and, on Albums, the Sort pill at the far end. The row scrolls sideways
    on a narrow phone, with room kept for the TV's focus ring (B1312). */
-.pharos-music-bar {
+.pharos-music-bar,
+.pharos-books-bar {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -4647,10 +4707,12 @@ label.pharos-setting {
   overflow-x: auto;
   scrollbar-width: none;
 }
-.pharos-music-bar::-webkit-scrollbar {
+.pharos-music-bar::-webkit-scrollbar,
+.pharos-books-bar::-webkit-scrollbar {
   display: none;
 }
-.pharos-music-bar .pharos-tabs {
+.pharos-music-bar .pharos-tabs,
+.pharos-books-bar .pharos-tabs {
   flex: none;
   gap: 0.15rem;
   margin: 0;
@@ -4660,7 +4722,8 @@ label.pharos-setting {
   border-radius: 999px;
   background: var(--px-color-surface);
 }
-.pharos-music-bar .pharos-tab {
+.pharos-music-bar .pharos-tab,
+.pharos-books-bar .pharos-tab {
   display: inline-flex;
   align-items: center;
   min-height: 2rem;
@@ -4670,7 +4733,8 @@ label.pharos-setting {
   font-size: 0.9rem;
   white-space: nowrap;
 }
-.pharos-music-bar .pharos-tab-active {
+.pharos-music-bar .pharos-tab-active,
+.pharos-books-bar .pharos-tab-active {
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
 }
@@ -4680,7 +4744,8 @@ label.pharos-setting {
 /* A phone has no room for both: the Sort pill goes under the tabs rather
    than off the edge, where it would hide the order it names. */
 @media (max-width: 40rem) {
-  .pharos-music-bar {
+  .pharos-music-bar,
+  .pharos-books-bar {
     flex-wrap: wrap;
   }
   .pharos-music-bar .pharos-sort-pill {
@@ -7155,6 +7220,84 @@ body:has(.pharos-stage.is-mini) .pharos-letters {
   font-weight: 400;
 }
 
+/* Settings → Account, "E-readers" (045). Every row wraps, so a phone held
+   upright keeps the copy and revoke buttons on screen. */
+.pharos-settings-page + .pharos-reader-passwords {
+  margin-top: 2.5rem;
+}
+.pharos-reader-password-form,
+.pharos-reader-password-new {
+  gap: 0.9rem;
+  margin-bottom: 1.25rem;
+  padding: 1.1rem 1.4rem;
+}
+.pharos-reader-password-form h3,
+.pharos-reader-password-new h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.pharos-reader-password-form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.6rem 1rem;
+}
+.pharos-reader-password-form label {
+  display: grid;
+  flex: 1 1 14rem;
+  gap: 0.3rem;
+  max-width: 24rem;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-reader-password-details {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.4rem 1rem;
+  margin: 0;
+}
+.pharos-reader-password-details dt {
+  color: var(--px-color-fg-muted);
+}
+.pharos-reader-password-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.pharos-reader-password-secret {
+  font-size: 1.15rem;
+  letter-spacing: 0.04em;
+  user-select: all;
+}
+.pharos-reader-password-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-reader-password-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-reader-password {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem 1.5rem;
+  padding: 0.9rem 1.4rem;
+}
+.pharos-reader-password + .pharos-reader-password {
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-reader-password-text {
+  display: grid;
+  flex: 1 1 14rem;
+  gap: 0.2rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Paths and rows. */
 .pharos-manage-paths {
   display: grid;
@@ -8221,10 +8364,12 @@ body:has(.pharos-reader) {
   --pharos-button-font-small: 0.72rem;
 }
 /* B1334: the music tab row at the TV filter row's size. */
-:root[data-device="tv"] .pharos-music-bar {
+:root[data-device="tv"] .pharos-music-bar,
+:root[data-device="tv"] .pharos-books-bar {
   margin-bottom: calc(0.5rem - 12px);
 }
-:root[data-device="tv"] .pharos-music-bar .pharos-tab {
+:root[data-device="tv"] .pharos-music-bar .pharos-tab,
+:root[data-device="tv"] .pharos-books-bar .pharos-tab {
   min-height: 1.65rem;
   font-size: 0.8rem;
 }

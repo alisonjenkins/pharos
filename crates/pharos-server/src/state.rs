@@ -483,6 +483,13 @@ pub struct AppState {
     /// with the default policy so fixtures need no wiring; boot replaces it
     /// from `[server].login_throttle` via [`AppState::with_login_throttle`].
     pub login_throttle: crate::auth::LoginThrottle,
+    /// The same throttle for e-reader passwords on `/opds/` (ADR-0128): its
+    /// own budget, so a Kobo holding a revoked password cannot hold back its
+    /// owner's sign-in on the web.
+    pub reader_throttle: crate::auth::LoginThrottle,
+    /// Reader passwords verified lately, so a catalogue page's covers do not
+    /// each cost an argon2 verify (ADR-0128).
+    pub reader_passwords: crate::services::reader_password::VerifiedCache,
     /// Tells open native connections a user's tokens may have been revoked
     /// (T025).
     pub revocations: crate::services::auth::Revocations,
@@ -858,6 +865,8 @@ impl AppState {
             opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_passwords: crate::services::reader_password::VerifiedCache::new(),
             revocations: Default::default(),
             session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
@@ -1005,6 +1014,8 @@ impl AppState {
             opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            reader_passwords: crate::services::reader_password::VerifiedCache::new(),
             revocations: Default::default(),
             session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
@@ -1116,6 +1127,8 @@ impl AppState {
         trusted_proxies: crate::client_ip::TrustedProxies,
     ) -> Self {
         self.login_throttle =
+            crate::auth::LoginThrottle::new(policy).with_per_ip(!trusted_proxies.is_empty());
+        self.reader_throttle =
             crate::auth::LoginThrottle::new(policy).with_per_ip(!trusted_proxies.is_empty());
         self.trusted_proxies = trusted_proxies;
         self
@@ -1330,6 +1343,24 @@ impl AppState {
         self.library_set
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The libraries' roots, under which a video is a course lesson when
+    /// the innermost library holding it is a Books library (ADR-0126).
+    pub fn course_roots(&self) -> pharos_scanner::course::CourseRoots {
+        pharos_scanner::course::CourseRoots::new(self.libraries().iter().map(|l| {
+            (
+                std::path::PathBuf::from(&l.root_path),
+                l.kind == pharos_core::LibraryKind::Books,
+            )
+        }))
+    }
+
+    /// ADR-0132 — whether `item` is an audiobook's track: a song whose
+    /// innermost library is a Books library.
+    pub fn is_audiobook(&self, item: &pharos_core::MediaItem) -> bool {
+        item.kind == pharos_core::MediaKind::Audio
+            && self.course_roots().root_of(&item.path).is_some()
     }
 
     /// Replace the typed-library set at runtime (dashboard Add/Remove).

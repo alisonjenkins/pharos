@@ -16,6 +16,7 @@ pub mod mix;
 pub mod person;
 pub mod play_state;
 pub mod playback;
+pub mod reader_password;
 pub mod search;
 pub mod segments;
 pub mod track_settings;

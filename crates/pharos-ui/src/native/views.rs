@@ -55,6 +55,15 @@ pub struct MarkFavorite(pub EventHandler<(ItemRef, bool, String)>);
 /// A button that marks `id` a favourite, or takes the mark off when
 /// `favorite`. `aria-pressed` carries the state, so the label stays put and
 /// nothing names the opposite action.
+/// The word on a played tile's badge: a song is played, a book is read.
+fn played_badge(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Audio => "Played",
+        ItemKind::Book => "Read",
+        _ => "Watched",
+    }
+}
+
 #[component]
 pub fn FavoriteToggle(
     id: ItemRef,
@@ -1513,7 +1522,7 @@ pub fn PosterTile(
                         None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                     }
                     if item.played {
-                        span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
+                        span { class: "pharos-badge", {played_badge(item.kind)} }
                     }
                     if item.stereo.is_some() {
                         span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
@@ -1714,7 +1723,27 @@ pub fn TitleView(
             }
         }
     });
-    let pick_version = item.kind.playable() && detail.versions.len() > 1;
+    // A book's versions are its formats (V1391): picked the same way, named
+    // by format, and its file facts already shown as the book's.
+    let pick_version = (item.kind.playable() || detail.book.is_some()) && detail.versions.len() > 1;
+    let version_list = version_list.filter(|_| detail.book.is_none());
+    let pick_name = if detail.book.is_some() {
+        "Format"
+    } else {
+        "Version"
+    };
+    let is_book = detail.book.is_some();
+    let pick_label = move |v: &pharos_client::api::Version| {
+        if is_book {
+            versions::book_version_label(v)
+        } else {
+            versions::version_label(v)
+        }
+    };
+    let book = detail
+        .book
+        .as_ref()
+        .map(|b| reader::version_book(b, &detail.versions, &version));
     rsx! {
         article { class: "pharos-title", "data-kind": title_kind(item.kind),
             div { class: "pharos-title-art",
@@ -1757,7 +1786,7 @@ pub fn TitleView(
                             if resume { "Resume" } else { "Play" }
                         }
                     }
-                    if let Some(book) = detail.book.as_ref() {
+                    if let Some(book) = book.as_ref() {
                         match reader::book_action(book, detail.read_position.as_ref()) {
                             reader::BookAction::Read(label) => rsx! {
                                 Link {
@@ -1774,7 +1803,7 @@ pub fn TitleView(
                         }
                         a {
                             class: "pharos-button pharos-button-secondary",
-                            href: reader::download_href(item.id),
+                            href: reader::version_href(item.id, &version),
                             download: "",
                             "Download"
                         }
@@ -1841,9 +1870,9 @@ pub fn TitleView(
                     div { class: "pharos-title-picks",
                         if pick_version {
                             label { class: "pharos-filter pharos-version-pick",
-                                span { aria_hidden: "true", "Version" }
+                                span { aria_hidden: "true", "{pick_name}" }
                                 select {
-                                    aria_label: "Version",
+                                    aria_label: "{pick_name}",
                                     value: "{version}",
                                     onchange: move |e| {
                                         if let Some(h) = on_version {
@@ -1851,7 +1880,11 @@ pub fn TitleView(
                                         }
                                     },
                                     for v in detail.versions.iter() {
-                                        option { value: "{v.id}", selected: v.id == version, {versions::version_label(v)} }
+                                        option {
+                                            value: "{v.id}",
+                                            selected: v.id == version,
+                                            {pick_label(v)}
+                                        }
                                     }
                                 }
                             }
@@ -2083,9 +2116,14 @@ fn has_season_episode_token(name: &str) -> bool {
 /// The lines under a poster's name: an episode's series, then its numbers,
 /// each on its own line so a long series name cannot hide the numbers. A
 /// song names its artist, or its year when the file has no artist tag (V750).
+/// An audiobook names its author and how long it is (ADR-0132).
 fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
         ItemKind::Episode => [item.series_name.clone(), episode_label(item)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        ItemKind::Album if item.audiobook => [item.artist.clone(), runtime(item.runtime_ms)]
             .into_iter()
             .flatten()
             .collect(),
@@ -2231,6 +2269,7 @@ mod tests {
     fn a_latest_group_says_how_many_children_are_new() {
         let with = |kind, n| Item {
             new_children: n,
+            audiobook: false,
             ..item(kind)
         };
         assert_eq!(
@@ -2268,6 +2307,7 @@ mod tests {
             stereo: None,
             damaged: false,
             new_children: 0,
+            audiobook: false,
         }
     }
 
@@ -4147,8 +4187,86 @@ mod tests {
     fn a_locked_book_has_no_read_action_and_says_why() {
         let html = book_page(BookFormat::Unreadable, Some(0.5));
         assert!(!html.contains("/read/") && !html.contains("Read"), "{html}");
-        assert!(html.contains("locked to a Kindle device"), "{html}");
+        assert!(
+            html.contains("Locked to a Kindle (DRM). Pharos can&#39;t open it.")
+                || html.contains("Locked to a Kindle (DRM). Pharos can't open it."),
+            "{html}"
+        );
         assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
+    }
+
+    fn book_with_formats(version: &str) -> String {
+        use pharos_client::api::Version;
+        let v = |id: &str, name: &str, container: &str| Version {
+            id: id.into(),
+            name: name.into(),
+            container: container.into(),
+            primary: id.is_empty(),
+            size_bytes: 3_000_000,
+            ..Version::default()
+        };
+        let mut detail = Detail {
+            book: Some(Book {
+                format: BookFormat::Epub,
+                author: "Ada".into(),
+                page_count: 0,
+            }),
+            read_position: None,
+            item: item(ItemKind::Book),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: Vec::new(),
+            versions: Vec::new(),
+            damage: None,
+        };
+        detail.versions = vec![
+            v("", "EPUB", "epub"),
+            v("pdf", "PDF", "pdf"),
+            v("kindle-locked", "Kindle (locked)", "azw3"),
+        ];
+        let version = version.to_owned();
+        render(move || {
+            rsx! { TitleView { detail: detail.clone(), version: version.clone() } }
+        })
+    }
+
+    /// V1391: a book held in several formats offers a Format picker named by
+    /// format, and the picked format decides Read and Download.
+    #[test]
+    fn a_book_in_several_formats_offers_a_format_picker() {
+        let html = book_with_formats("");
+        assert!(html.contains(r#"aria-label="Format""#), "{html}");
+        for label in ["EPUB · 3 MB", "PDF · 3 MB", "Kindle (locked) · 3 MB"] {
+            assert!(html.contains(label), "{label}: {html}");
+        }
+        assert!(html.contains(">Read<"), "{html}");
+        assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
+        assert!(!html.contains("pharos-version-facts"), "{html}");
+
+        let html = book_with_formats("pdf");
+        assert!(html.contains(">Read<"), "{html}");
+        assert!(
+            html.contains(r#"href="/Items/1/Download?mediaSourceId=1-pdf""#),
+            "{html}"
+        );
+
+        let html = book_with_formats("kindle-locked");
+        assert!(!html.contains(">Read<"), "{html}");
+        assert!(html.contains("Locked to a Kindle (DRM)"), "{html}");
+    }
+
+    #[test]
+    fn a_book_in_one_format_has_no_picker() {
+        let html = book_page(BookFormat::Epub, None);
+        assert!(!html.contains(r#"aria-label="Format""#), "{html}");
     }
 
     #[test]
@@ -4592,6 +4710,29 @@ mod tests {
         let html = render(move || rsx! { PosterTile { item: film.clone() } });
         assert!(
             html.contains(r#"title="2001""#) && !html.contains("Ignored"),
+            "{html}"
+        );
+    }
+
+    /// ADR-0132: an audiobook's tile names its author and its length; a
+    /// music album's keeps its year.
+    #[test]
+    fn an_audiobook_tile_names_its_author_and_length() {
+        let mut book = item(ItemKind::Album);
+        book.name = "Gadget Tales".into();
+        book.artist = Some("Ada Field".into());
+        book.runtime_ms = (7 * 60 + 5) * 60_000;
+        book.audiobook = true;
+        let html = render(move || rsx! { PosterTile { item: book.clone() } });
+        assert!(html.contains(r#"title="Ada Field""#), "{html}");
+        assert!(html.contains(r#"title="7h 5m""#), "{html}");
+
+        let mut album = item(ItemKind::Album);
+        album.artist = Some("Band A".into());
+        album.runtime_ms = 40 * 60_000;
+        let html = render(move || rsx! { PosterTile { item: album.clone() } });
+        assert!(
+            html.contains(r#"title="2001""#) && !html.contains("40m"),
             "{html}"
         );
     }

@@ -23,9 +23,13 @@
 
 pub mod comic;
 pub mod epub;
+pub mod fold;
 pub mod integrity;
 pub mod kindle;
+pub mod mobi_exth;
 pub mod pdf;
+pub mod shelf;
+pub mod title;
 
 use std::path::Path;
 
@@ -104,6 +108,10 @@ pub(crate) enum ClassifyReason {
     /// hostile file would stop every later file being indexed. Caught, it is
     /// one skipped book with a name in the log.
     ParserPanic,
+    /// A DRM-protected Kindle file whose unencrypted header (EXTH) still gave
+    /// a cover or metadata (B1419). The verdict stays what it was; this says
+    /// the locked book is nonetheless described.
+    DrmExth,
 }
 
 impl ClassifyReason {
@@ -117,6 +125,7 @@ impl ClassifyReason {
             ClassifyReason::MalformedContainer => "malformed_container",
             ClassifyReason::Unopenable => "unopenable",
             ClassifyReason::ParserPanic => "parser_panic",
+            ClassifyReason::DrmExth => "drm_exth",
         }
     }
 }
@@ -228,11 +237,13 @@ pub const BOOK_EXTENSIONS: &[&str] = &[
 /// Known client limitations — pharos does not misreport a path to work around
 /// a client-side compare).
 pub fn format_for_path(path: &Path) -> Option<BookFormat> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)?;
-    match ext.as_str() {
+    format_for_extension(path.extension()?.to_str()?)
+}
+
+/// The [`BookFormat`] for a file extension (or a book version's container),
+/// case-insensitive; `None` if it is not a book.
+pub fn format_for_extension(ext: &str) -> Option<BookFormat> {
+    match ext.to_ascii_lowercase().as_str() {
         "epub" => Some(BookFormat::Epub),
         "pdf" => Some(BookFormat::Pdf),
         "cbz" | "cbr" | "cbt" | "cb7" => Some(BookFormat::Comic),
@@ -265,22 +276,32 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
         // DRM converts to an epub the client can open, so the format it is
         // readable AS is epub, and that is what gets stored. Only DRM and
         // genuine corruption still land on `Unreadable`.
-        if let Some(meta) = try_kindle_meta(path) {
-            return Some(meta);
-        }
-        record_classify(
-            format,
-            ClassifyVerdict::Unreadable,
-            ClassifyReason::FormatUnreadable,
-        );
-        tracing::debug!(
-            path = %path.display(),
-            "book: indexed but no client can read this format"
-        );
-        return Some(BookMeta {
+        let mut meta = BookMeta {
             format,
             ..Default::default()
-        });
+        };
+        let mut reason = ClassifyReason::FormatUnreadable;
+        match try_kindle_meta(path) {
+            KindleScan::Convertible(meta) => return Some(meta),
+            // B1419 — DRM encrypts the text records only; the header's EXTH
+            // block is clear. The book stays unreadable but keeps what it says.
+            KindleScan::Drm(exth) => {
+                if let Some(exth) = exth {
+                    meta.author = exth.author;
+                    meta.publisher = exth.publisher;
+                    meta.isbn = exth.isbn;
+                    reason = ClassifyReason::DrmExth;
+                }
+            }
+            KindleScan::Other => {}
+        }
+        record_classify(format, ClassifyVerdict::Unreadable, reason);
+        tracing::debug!(
+            path = %path.display(),
+            reason = reason.label(),
+            "book: indexed but no client can read this format"
+        );
+        return Some(meta);
     }
 
     // Every arm runs behind `guard_parser`: a panic in a third-party parser
@@ -329,9 +350,9 @@ pub fn read_book_meta(path: &Path) -> Option<BookMeta> {
 /// wants the metadata and the cover, which are the parts a scan persists.
 /// Delivery converts on demand and caches, so a scan does not pay to
 /// materialise an EPUB nobody has asked for.
-fn try_kindle_meta(path: &Path) -> Option<BookMeta> {
+fn try_kindle_meta(path: &Path) -> KindleScan {
     if !kindle::is_kindle_path(path) {
-        return None;
+        return KindleScan::Other;
     }
     let ext = kindle::source_ext(path);
     // A panic inside the converter is one skipped book, not a dead scan
@@ -346,7 +367,7 @@ fn try_kindle_meta(path: &Path) -> Option<BookMeta> {
             kindle::ConvertOutcome::Failed,
             kindle::ConvertReason::ParserPanic,
         );
-        return None;
+        return KindleScan::Other;
     };
 
     match parsed {
@@ -366,10 +387,22 @@ fn try_kindle_meta(path: &Path) -> Option<BookMeta> {
             // `to_book_meta` stamps `BookFormat::Epub` — the honest answer to
             // "what can a client read this as", and the fact the delivery path
             // reads back to know this item needs converting.
-            Some(meta.to_book_meta())
+            KindleScan::Convertible(meta.to_book_meta())
         }
         Err(err) => {
-            let (outcome, reason) = err.outcome();
+            let (outcome, mut reason) = err.outcome();
+            // B1419 — a locked book whose header still describes it is counted
+            // under its own reason, so `reason="drm_metadata"` over `="drm"`
+            // is the share of the locked shelf that got metadata.
+            let exth = if matches!(err, kindle::KindleError::Drm(_)) {
+                let exth = drm_exth_meta(path);
+                if exth.is_some() {
+                    reason = kindle::ConvertReason::DrmMetadata;
+                }
+                Some(exth)
+            } else {
+                None
+            };
             kindle::record_convert(kindle::ConvertStage::Scan, ext, outcome, reason);
             // DRM is not a defect and must not be logged as one: it is a
             // permanent property of the file, and 58 of the deployed library's
@@ -389,9 +422,59 @@ fn try_kindle_meta(path: &Path) -> Option<BookMeta> {
                     "kindle: conversion failed; stays unreadable"
                 );
             }
+            match exth {
+                Some(exth) => KindleScan::Drm(exth),
+                None => KindleScan::Other,
+            }
+        }
+    }
+}
+
+/// What the scan learned from trying to convert a Kindle file.
+enum KindleScan {
+    /// Converts to EPUB; stored as a readable book.
+    Convertible(BookMeta),
+    /// Amazon DRM: unreadable by design, but the header may still describe it.
+    Drm(Option<BookMeta>),
+    /// Not Kindle, corrupt, or the parser panicked.
+    Other,
+}
+
+/// The unencrypted-header metadata of a DRM-protected Kindle file (B1419),
+/// behind the same panic guard as every other parser. `None` when the header
+/// gave nothing descriptive.
+fn drm_exth_meta(path: &Path) -> Option<BookMeta> {
+    let read = guard_parser(path, BookFormat::Unreadable, "kindle exth", || {
+        mobi_exth::read_exth(path)
+    })?;
+    match read {
+        Ok(m) if m.has_descriptive() => Some(BookMeta {
+            format: BookFormat::Unreadable,
+            author: m.author,
+            publisher: m.publisher,
+            isbn: m.isbn.as_deref().and_then(kindle::isbn_of),
+            ..Default::default()
+        }),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "kindle: DRM header unreadable; keeping the file name as title"
+            );
             None
         }
     }
+}
+
+/// The cover of a DRM-protected Kindle file, read from its unencrypted image
+/// record (B1419), behind the panic guard.
+fn drm_exth_cover(path: &Path) -> Option<Vec<u8>> {
+    guard_parser(path, BookFormat::Unreadable, "kindle exth cover", || {
+        mobi_exth::read_exth_cover(path)
+    })?
+    .ok()
+    .flatten()
 }
 
 /// Read a book's cover image bytes, and RECORD what happened.
@@ -547,6 +630,26 @@ pub fn read_book_cover(path: &Path) -> Option<Vec<u8>> {
                 // worth looking at. `read_book_meta` already recorded this
                 // file's convert outcome, so nothing is counted twice; only
                 // the cover verdict is added.
+                // B1419 — the cover record is not encrypted.
+                Err(kindle::KindleError::Drm(_)) => {
+                    let cover = drm_exth_cover(path);
+                    // Filed under the format the book is stored as: a
+                    // locked book stays unreadable even with a cover.
+                    if cover.is_some() {
+                        record_classify(
+                            format,
+                            ClassifyVerdict::CoverFound,
+                            ClassifyReason::DrmExth,
+                        );
+                    } else {
+                        record_classify(
+                            format,
+                            ClassifyVerdict::Unreadable,
+                            ClassifyReason::FormatUnreadable,
+                        );
+                    }
+                    cover
+                }
                 Err(err) => {
                     let drm = matches!(err, kindle::KindleError::Drm(_));
                     record_classify(
@@ -609,6 +712,7 @@ mod tests {
             ClassifyReason::MalformedContainer,
             ClassifyReason::Unopenable,
             ClassifyReason::ParserPanic,
+            ClassifyReason::DrmExth,
         ];
 
         let v: std::collections::HashSet<_> = verdicts.iter().map(|v| v.label()).collect();
@@ -621,15 +725,137 @@ mod tests {
         assert_eq!(ClassifyVerdict::CoverAbsent.label(), "cover_absent");
         assert_eq!(ClassifyReason::RarUnsupported.label(), "rar_unsupported");
         assert_eq!(ClassifyReason::ParserPanic.label(), "parser_panic");
+        assert_eq!(ClassifyReason::DrmExth.label(), "drm_exth");
         assert_eq!(
             ClassifyReason::UnsupportedImageEncoding.label(),
             "unsupported_image_encoding"
         );
 
-        // Bounded cardinality: 4 formats × 4 verdicts × 7 reasons is the
+        // Bounded cardinality: 4 formats × 4 verdicts × 9 reasons is the
         // absolute ceiling, and the reachable set is far smaller. No label
         // carries a path, a filename or an error message.
-        assert!(v.len() * r.len() <= 32);
+        assert!(v.len() * r.len() <= 36);
+    }
+
+    fn counter_labels(
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+    ) -> Vec<std::collections::HashMap<String, String>> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(k, _, _, _)| {
+                let key = k.key();
+                (key.name() == name).then(|| {
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    fn write_drm_azw(dir: &Path) -> std::path::PathBuf {
+        let bytes = mobi_exth::tests::drm_azw(
+            65001,
+            &[
+                (100, b"Test Author".to_vec()),
+                (101, b"Test House".to_vec()),
+                (104, b"9789300000002".to_vec()),
+            ],
+            b"Synthetic Title",
+            Some(0),
+        );
+        let path = dir.join("locked.azw");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// B1419 / V1388 — a DRM-protected Kindle file stays unreadable but keeps
+    /// the author, publisher, ISBN and cover its unencrypted header holds, and
+    /// the counters say it was described from EXTH.
+    #[test]
+    fn a_drm_book_keeps_its_exth_metadata_and_cover() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_drm_azw(dir.path());
+
+        let meta = read_book_meta(&path).expect("a kindle path is a book");
+        assert_eq!(meta.format, BookFormat::Unreadable);
+        assert_eq!(meta.author.as_deref(), Some("Test Author"));
+        assert_eq!(meta.publisher.as_deref(), Some("Test House"));
+        assert_eq!(meta.isbn.as_deref(), Some("9789300000002"));
+
+        let cover = read_book_cover(&path).expect("the image record is clear");
+        assert_eq!(cover, mobi_exth::tests::TINY_JPEG);
+
+        let convert = counter_labels(&snapshotter, "pharos_book_convert_total");
+        assert!(
+            convert.iter().any(
+                |l| l.get("outcome").map(String::as_str) == Some("drm_protected")
+                    && l.get("reason").map(String::as_str) == Some("drm_metadata")
+            ),
+            "a described DRM book must be counted as drm_metadata: {convert:?}"
+        );
+        let classify = counter_labels(&snapshotter, "pharos_book_classify_total");
+        for verdict in ["unreadable", "cover_found"] {
+            assert!(
+                classify
+                    .iter()
+                    .any(|l| l.get("verdict").map(String::as_str) == Some(verdict)
+                        && l.get("reason").map(String::as_str) == Some("drm_exth")
+                        && l.get("format").map(String::as_str) == Some("unreadable")),
+                "{verdict} from EXTH must carry reason drm_exth on the unreadable format: {classify:?}"
+            );
+        }
+    }
+
+    /// An ISBN-10 whose check character is `X` is still an ISBN.
+    #[test]
+    fn a_drm_books_isbn_10_may_end_in_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = mobi_exth::tests::drm_azw(
+            65001,
+            &[
+                (100, b"Test Author".to_vec()),
+                (104, b"1-23456-789-X".to_vec()),
+            ],
+            b"Synthetic Title",
+            None,
+        );
+        let path = dir.path().join("locked.azw");
+        std::fs::write(&path, bytes).unwrap();
+        let meta = read_book_meta(&path).expect("a kindle path is a book");
+        assert_eq!(meta.isbn.as_deref(), Some("1-23456-789-X"));
+    }
+
+    /// The counterweight: a DRM file whose header is unusable stays on the
+    /// plain `drm` reason, so the two counts never merge.
+    #[test]
+    fn a_drm_book_with_an_unreadable_header_is_counted_plain_drm() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbled.azw");
+        std::fs::write(&path, b"not a mobi container").unwrap();
+        let meta = read_book_meta(&path).unwrap();
+        assert_eq!(meta.format, BookFormat::Unreadable);
+        assert_eq!(meta.author, None);
+        let classify = counter_labels(&snapshotter, "pharos_book_classify_total");
+        assert!(
+            classify
+                .iter()
+                .all(|l| l.get("reason").map(String::as_str) != Some("drm_exth")),
+            "{classify:?}"
+        );
     }
 
     /// B173 follow-up — a panicking parser must cost ONE file, not the scan.

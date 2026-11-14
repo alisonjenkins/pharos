@@ -136,6 +136,8 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
+    // An audiobook's minute sleep timer outlives the per-part player.
+    use_context_provider(|| super::audiobook::SleepTimer(Signal::new(None)));
     // The TV remote's Back at the first page closes the player still
     // floating there before it leaves the app.
     use_hook(move || {
@@ -2531,7 +2533,12 @@ fn Screen(route: Route) -> Element {
         Route::Appearance => {
             rsx! { SettingsLayout { current: Section::Appearance, AppearanceScreen {} } }
         }
-        Route::Account => rsx! { SettingsLayout { current: Section::Account, AccountScreen {} } },
+        Route::Account => rsx! {
+            SettingsLayout { current: Section::Account,
+                AccountScreen {}
+                ReaderPasswordsScreen {}
+            }
+        },
         Route::ApproveDevice => {
             rsx! {
                 SettingsLayout { current: Section::Devices,
@@ -2699,6 +2706,23 @@ impl Slot {
 }
 
 type OnMedia = Box<dyn FnMut(MediaEvent)>;
+
+/// The `reason` a queue move held for an audiobook's sleep timer logs.
+const SLEEP_TIMER_HOLD: &str = "sleep_timer";
+
+/// Why a queued song's end does not move the queue on, if it does not: it
+/// already handed over under a crossfade, or an audiobook's sleep timer
+/// stops at its end (which this disarms, the timer having fired).
+fn ended_holds(handed_off: bool, book_stop: &super::audiobook::StopAtEnd) -> Option<&'static str> {
+    if handed_off {
+        return Some("handed_off");
+    }
+    if book_stop.armed() {
+        book_stop.arm(false);
+        return Some(SLEEP_TIMER_HOLD);
+    }
+    None
+}
 
 /// The player's media handler, for `timeupdate`s that arrive outside
 /// Dioxus events (`platform::on_time_update`).
@@ -3703,6 +3727,150 @@ fn MyDevicesScreen() -> Element {
                         }
                     }
                     saving.write().remove(&device_id);
+                });
+            },
+        }
+    }
+}
+
+/// Settings → Account, "E-readers" (045): loads the user's e-reader
+/// passwords, makes one and shows it once, and revokes one. One call at a
+/// time; a new connection loads the list again and drops a password still
+/// shown, which belongs to the session that made it.
+#[component]
+fn ReaderPasswordsScreen() -> Element {
+    use super::reader_passwords::{
+        opds_url, ReaderPasswordsState, ReaderPasswordsView, ShownPassword,
+    };
+    let ctx = use_context::<Ctx>();
+    let account = use_context::<AccountMe>();
+    let mut state = use_signal(|| ReaderPasswordsState::Loading);
+    let mut busy = use_signal(|| false);
+    let mut shown = use_signal(|| None::<ShownPassword>);
+    let mut copied = use_signal(|| None::<bool>);
+    let mut problem = use_signal(|| None::<String>);
+    let mut opds_path = use_signal(|| "/opds/".to_owned());
+    let mut connection = use_signal(|| 0u64);
+    let username = account.0.read().clone().flatten().map(|me| me.name);
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("reader_passwords: {what} failed: {e}"));
+    };
+    let load = move |api: NativeApi| {
+        let loaded_on = *connection.peek();
+        spawn(async move {
+            let result = api
+                .reader_passwords(&call("reader_passwords", "reader_passwords"))
+                .await;
+            if *connection.peek() != loaded_on {
+                return;
+            }
+            match result {
+                Ok(list) => state.set(ReaderPasswordsState::Loaded(list)),
+                Err(e) => {
+                    report(&e, "list");
+                    state.set(ReaderPasswordsState::Failed(format!(
+                        "Couldn't load your e-reader passwords: {e}"
+                    )));
+                }
+            }
+        });
+    };
+    use_effect(move || {
+        let api = ctx.api.read().clone();
+        *connection.write() += 1;
+        busy.set(false);
+        shown.set(None);
+        copied.set(None);
+        let Some(api) = api else {
+            return;
+        };
+        state.set(ReaderPasswordsState::Loading);
+        load(api);
+    });
+    rsx! {
+        ReaderPasswordsView {
+            state: state(),
+            busy: busy(),
+            shown: shown(),
+            copied: copied(),
+            problem: problem(),
+            opds_url: opds_url(&platform::page_origin(), &opds_path()),
+            username,
+            on_create: move |label: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                problem.set(None);
+                copied.set(None);
+                let started_on = *connection.peek();
+                spawn(async move {
+                    let result = api
+                        .create_reader_password(&call("reader_passwords", "create_reader_password"), &label)
+                        .await;
+                    if *connection.peek() != started_on {
+                        return;
+                    }
+                    match result {
+                        Ok(created) => {
+                            opds_path.set(created.opds_path.clone());
+                            shown.set(Some(ShownPassword {
+                                label: created.listed.label.clone(),
+                                password: created.password,
+                            }));
+                            load(api);
+                        }
+                        Err(e) => {
+                            report(&e, "create");
+                            problem.set(Some(super::reader_passwords::create_problem(&e)));
+                        }
+                    }
+                    busy.set(false);
+                });
+            },
+            on_copy: move |password: String| {
+                spawn(async move {
+                    let ok = platform::copy_text(&password).await;
+                    if !ok {
+                        platform::select_field("reader-password-secret");
+                    }
+                    copied.set(Some(ok));
+                });
+            },
+            on_done: move |()| {
+                shown.set(None);
+                copied.set(None);
+            },
+            on_revoke: move |id: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                problem.set(None);
+                let started_on = *connection.peek();
+                spawn(async move {
+                    let result = api
+                        .revoke_reader_password(&call("reader_passwords", "revoke_reader_password"), &id)
+                        .await;
+                    if *connection.peek() != started_on {
+                        return;
+                    }
+                    if let Err(e) = &result {
+                        report(e, "revoke");
+                        problem.set(Some(format!("Couldn't revoke the password: {e}")));
+                    }
+                    load(api);
+                    busy.set(false);
                 });
             },
         }
@@ -6059,6 +6227,8 @@ fn Player(
     // This song has handed the stage to the next under a crossfade: it plays
     // out until the next is ready, but its end no longer moves the queue.
     let handed_off = use_hook(|| Rc::new(Cell::new(false)));
+    // An audiobook's sleep timer pauses at this file's end: the queue holds.
+    let book_stop = use_hook(super::audiobook::StopAtEnd::default);
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
     let resume: ResumeSlot = use_hook(ResumeSlot::default);
     let fade_in_ms = use_hook(|| fade_in.0.take());
@@ -7208,6 +7378,7 @@ fn Player(
         let session = session.clone();
         let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
         let handed_off = Rc::clone(&handed_off);
+        let book_stop = book_stop.clone();
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let resume = Rc::clone(&resume);
         let music = p.kind == ItemKind::Audio;
@@ -7304,6 +7475,15 @@ fn Player(
                     if state.position_ms.saturating_add(fade) >= state.duration_ms {
                         crossfading.set(true);
                         let (to, line) = queue.peek().advance(playing_id, near.next);
+                        let to = match to {
+                            Some(_) if book_stop.armed() => {
+                                platform::info(&format!(
+                                    "pharos: crossfade skipped item={playing_id} reason={SLEEP_TIMER_HOLD}"
+                                ));
+                                None
+                            }
+                            to => to,
+                        };
                         match to {
                             Some(to) if to != playing_id => {
                                 platform::info(&format!(
@@ -7322,6 +7502,7 @@ fn Player(
                             Some(same) => platform::info(&format!(
                                 "pharos: crossfade skipped item={playing_id} reason=same_song next={same}"
                             )),
+                            None if book_stop.armed() => {}
                             None => platform::info(&format!(
                                 "pharos: crossfade skipped item={playing_id} reason=no_next"
                             )),
@@ -7331,9 +7512,12 @@ fn Player(
             }
             // A song that ends plays what is next; in a group the group
             // decides what plays.
-            if event == MediaEvent::Ended && queued && handed_off.get() {
+            let held = (event == MediaEvent::Ended && queued)
+                .then(|| ended_holds(handed_off.get(), &book_stop))
+                .flatten();
+            if let Some(reason) = held {
                 platform::info(&format!(
-                    "pharos: queue advance skipped item={playing_id} reason=handed_off"
+                    "pharos: queue advance skipped item={playing_id} reason={reason}"
                 ));
             } else if event == MediaEvent::Ended && queued {
                 let (to, line) = queue.peek().advance(playing_id, near.next);
@@ -8440,6 +8624,12 @@ fn Player(
                 on_queue,
                 on_media,
                 on_control,
+                audiobook: p.detail.item.audiobook.then(|| super::audiobook::Audiobook {
+                    chapters: p.detail.chapters.clone(),
+                    book: p.detail.item.parent,
+                    playing: p.detail.item.id,
+                    stop_at_end: book_stop.clone(),
+                }),
             }
         } else {
             WatchView {
@@ -8709,6 +8899,19 @@ mod tests {
         props.mounts.get()
     }
 
+    /// ADR-0132: an audiobook's sleep timer set to end with the file holds
+    /// the queue at its end, once; a crossfade's hand-over still holds it.
+    #[test]
+    fn a_sleep_timer_at_the_file_end_holds_the_queue_once() {
+        let stop = super::super::audiobook::StopAtEnd::default();
+        assert_eq!(ended_holds(false, &stop), None);
+        assert_eq!(ended_holds(true, &stop), Some("handed_off"));
+        stop.arm(true);
+        assert_eq!(ended_holds(false, &stop), Some(SLEEP_TIMER_HOLD));
+        assert!(!stop.armed(), "the timer has fired");
+        assert_eq!(ended_holds(false, &stop), None);
+    }
+
     #[test]
     fn a_new_play_session_mounts_a_new_player() {
         assert_eq!(mounts_across(&["a", "b", "c"]), 3);
@@ -8923,6 +9126,7 @@ mod tests {
                     stereo: None,
                     damaged: false,
                     new_children: 0,
+                    audiobook: false,
                 };
                 let mut home = revisit.home;
                 home.set(Some(Home {

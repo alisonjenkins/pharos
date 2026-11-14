@@ -37,14 +37,17 @@ pub struct PdfMetadata {
     pub page_count: Option<u32>,
     pub title: Option<String>,
     pub author: Option<String>,
-    /// `/Producer` — the closest thing a PDF has to a publisher, and usually
-    /// the software that made it. Kept because it is occasionally a real
-    /// imprint; the provider decides whether to surface it.
+    /// `/Producer` — the software that made the PDF ("Antenna House", "calibre",
+    /// "Microsoft Word"). Read for diagnosis only: it is not a publisher and
+    /// reaches neither `BookMeta` nor the studio facet (V1390).
     pub producer: Option<String>,
     /// `/Subject`, the info dictionary's blurb field.
     pub description: Option<String>,
     /// `/CreationDate`, verbatim (`D:19650801000000Z` and friends).
     pub date: Option<String>,
+    /// `/Keywords`, verbatim. Only a list of short entries counts as subjects
+    /// (`book::shelf::pdf_keyword_list`, spec 043 FR-003).
+    pub keywords: Option<String>,
 }
 
 impl PdfMetadata {
@@ -55,7 +58,8 @@ impl PdfMetadata {
             // epub's reflowed pagination.
             page_count: self.page_count,
             author: self.author.clone(),
-            publisher: self.producer.clone(),
+            // Producer is software, not an imprint; see `producer`.
+            publisher: None,
             series_name: None,
             series_index: None,
             isbn: None,
@@ -100,6 +104,7 @@ pub fn read_pdf(path: &Path) -> Result<PdfMetadata, PdfError> {
         out.producer = text_field(&doc, info, b"Producer");
         out.description = text_field(&doc, info, b"Subject");
         out.date = text_field(&doc, info, b"CreationDate");
+        out.keywords = text_field(&doc, info, b"Keywords");
     }
     Ok(out)
 }
@@ -390,6 +395,7 @@ mod tests {
                 "Producer" => Object::string_literal("Basic Books"),
                 "Subject" => Object::string_literal("An Eternal Golden Braid."),
                 "CreationDate" => Object::string_literal("D:19790101000000Z"),
+                "Keywords" => Object::string_literal("Logic; Mathematics, Music"),
             });
             doc.trailer.set("Info", info_id);
         }
@@ -417,12 +423,17 @@ mod tests {
             meta.description.as_deref(),
             Some("An Eternal Golden Braid.")
         );
+        assert_eq!(meta.keywords.as_deref(), Some("Logic; Mathematics, Music"));
         assert_eq!(meta.date.as_deref(), Some("D:19790101000000Z"));
 
         let bm = meta.to_book_meta();
         assert_eq!(bm.format, BookFormat::Pdf);
         assert_eq!(bm.page_count, Some(1));
         assert_eq!(bm.author.as_deref(), Some("Douglas Hofstadter"));
+        assert_eq!(
+            bm.publisher, None,
+            "/Producer names the software that wrote the PDF, never the publisher"
+        );
     }
 
     /// An info dictionary is optional. A PDF without one is a normal PDF.

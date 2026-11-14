@@ -400,7 +400,8 @@ async fn build_facet_base(
         ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t.clone()),
         ParentResolution::All | ParentResolution::Empty => {}
     }
-    match parse_kind_filter(q.include_item_types.as_deref()) {
+    let kinds = parse_kind_filter(q.include_item_types.as_deref());
+    match crate::services::library::books_default(state, &parent, &kinds) {
         KindFilter::Unset => {}
         KindFilter::Kinds(wanted) => mq.kinds = wanted,
         // "You asked for nothing" — the same shape an empty-but-present `Ids=`
@@ -705,7 +706,7 @@ async fn music_similar(
         }
         let excluded = id_set(q.exclude_artist_ids.as_deref());
         // Keep every track; the exclusions below are ALBUM-level.
-        let mut aggs = aggregate_albums(all.iter(), |_| true);
+        let mut aggs = aggregate_albums(all.iter(), |_| true, |i| state.is_audiobook(i));
         aggs.retain(|a| !a.name.eq_ignore_ascii_case(&album_name));
         if !excluded.is_empty() {
             aggs.retain(|a| {
@@ -2022,7 +2023,7 @@ async fn shows_seasons(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::BTreeMap;
     // B85 — canonicalise the dashed synth id the kotlin SDK sends (else the
     // season list is empty and the show won't open on Android TV).
@@ -2045,23 +2046,27 @@ async fn shows_seasons(
     crate::services::access::retain_visible(&state, &user.0, &mut episodes, |e| e.id, "series")
         .await
         .map_err(crate::api::jellyfin::access_error)?;
-    let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
+    let mut seasons: BTreeMap<u32, (&MediaItem, &pharos_core::SeriesInfo)> = BTreeMap::new();
     let mut episode_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    for series in episodes.iter().filter_map(|e| e.series.as_ref()) {
+    for (episode, series) in episodes
+        .iter()
+        .filter_map(|e| e.series.as_ref().map(|s| (*e, s)))
+    {
         let Some(n) = series.season_number else {
             continue;
         };
-        seasons.entry(n).or_insert(series);
+        seasons.entry(n).or_insert((episode, series));
         *episode_counts.entry(n).or_insert(0) += 1;
     }
+    let course_roots = state.course_roots();
     let items: Vec<serde_json::Value> = seasons
         .iter()
-        .map(|(n, series)| {
+        .map(|(n, (episode, series))| {
             season_dto(
                 &state.server_id,
                 series,
                 *n,
-                &season_display_name(*n),
+                &season_name(episode, *n, &course_roots),
                 episode_counts.get(n).copied().unwrap_or(0),
             )
         })
@@ -3293,6 +3298,8 @@ impl From<&ListQuery> for ItemQuery {
             is_4k: q.is_4k,
             is_hd: q.is_hd,
             is_3d: q.is_3d,
+            // /Items never filters by it (B1420).
+            book_readable: None,
             min_width: q.min_width,
             max_width: q.max_width,
             collapse_collections: false,
@@ -3453,6 +3460,9 @@ struct AlbumAgg {
     /// Newest track `created_at`, so a freshly added track surfaces its album.
     created_at: Option<i64>,
     runtime_ms: u64,
+    /// Whether any of its tracks is an audiobook's (ADR-0132), the rule the
+    /// album's detail uses too.
+    audiobook: bool,
 }
 
 impl AlbumAgg {
@@ -3494,10 +3504,12 @@ impl AlbumAgg {
 }
 
 /// Group audio rows into albums. `keep` decides which TRACKS participate
-/// (artist-role filters); an album aggregates only its kept tracks.
+/// (artist-role filters); an album aggregates only its kept tracks, and is
+/// an audiobook when `is_book` holds for any of them.
 fn aggregate_albums<'a>(
     items: impl IntoIterator<Item = &'a MediaItem>,
     keep: impl Fn(&MediaItem) -> bool,
+    is_book: impl Fn(&MediaItem) -> bool,
 ) -> Vec<AlbumAgg> {
     use std::collections::HashMap;
     let mut map: HashMap<String, AlbumAgg> = HashMap::new();
@@ -3516,8 +3528,10 @@ fn aggregate_albums<'a>(
             premiere_date: None,
             created_at: None,
             runtime_ms: 0,
+            audiobook: false,
         });
         e.child_count += 1;
+        e.audiobook = e.audiobook || is_book(i);
         e.premiere_date = match (e.premiere_date, i.metadata.premiere_date) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3557,7 +3571,7 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     let album_id = album_id_for(&a.name);
     let image_tags = crate::api::jellyfin::images::synth_primary_tag(state, &album_id).await;
     // B78/V38 — typed SynthItemDto, serialized to keep the Value return.
-    serde_json::to_value(SynthItemDto {
+    let mut dto = serde_json::to_value(SynthItemDto {
         child_count: Some(a.child_count),
         production_year: a.year.map(|y| y as i32),
         album_artist: a.album_artist.clone(),
@@ -3584,7 +3598,24 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
             ItemType::MusicAlbum.as_wire(),
         )
     })
-    .unwrap_or(serde_json::Value::Null)
+    .unwrap_or(serde_json::Value::Null);
+    mark_album(&mut dto, a.runtime_ms, a.audiobook);
+    dto
+}
+
+/// An album DTO's length and, when it is an audiobook (ADR-0132), the
+/// Pharos-only `PharosAudiobook` mark the native API reads.
+fn mark_album(dto: &mut serde_json::Value, runtime_ms: u64, audiobook: bool) {
+    let Some(obj) = dto.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "RunTimeTicks".into(),
+        serde_json::Value::from(runtime_ms.saturating_mul(10_000)),
+    );
+    if audiobook {
+        obj.insert("PharosAudiobook".into(), serde_json::Value::Bool(true));
+    }
 }
 
 /// The tiles a latest rail shows for `folds`, each several newly added
@@ -3637,9 +3668,13 @@ pub(crate) async fn latest_group_dtos(
                 }
                 Some(dto)
             }
-            (MediaKind::Audio, _) => match aggregate_albums(children.iter().copied(), |_| true)
-                .into_iter()
-                .next()
+            (MediaKind::Audio, _) => match aggregate_albums(
+                children.iter().copied(),
+                |_| true,
+                |i| state.is_audiobook(i),
+            )
+            .into_iter()
+            .next()
             {
                 Some(album) => Some(synth_album_dto(state, &album).await),
                 None => None,
@@ -3707,7 +3742,7 @@ async fn album_dtos(
     sort_by: Option<&str>,
     orders: &[bool],
 ) -> Vec<serde_json::Value> {
-    let mut aggs = aggregate_albums(items, keep);
+    let mut aggs = aggregate_albums(items, keep, |i| state.is_audiobook(i));
     sort_album_aggs(&mut aggs, sort_by, orders);
     let mut dtos = Vec::with_capacity(aggs.len());
     for a in &aggs {
@@ -3907,7 +3942,7 @@ async fn maybe_list_music(
         }
         true
     };
-    let mut aggs = aggregate_albums(all.iter(), keep);
+    let mut aggs = aggregate_albums(all.iter(), keep, |i| state.is_audiobook(i));
     if !exclude_ids.is_empty() {
         aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
     }
@@ -4773,6 +4808,7 @@ pub(crate) fn build_media_query(
     f.is_4k = q.is_4k;
     f.is_hd = q.is_hd;
     f.is_3d = q.is_3d;
+    f.book_readable = q.book_readable;
     f.min_width = q.min_width;
     f.max_width = q.max_width;
     f.min_index_number = q.min_index_number;
@@ -5382,9 +5418,13 @@ async fn synth_album_or_artist(
             }]);
             it.album_artist = Some(a);
         }
-        return Ok(Some(
-            serde_json::to_value(it).unwrap_or(serde_json::Value::Null),
-        ));
+        let mut dto = serde_json::to_value(it).unwrap_or(serde_json::Value::Null);
+        let runtime_ms = tracks.iter().fold(0u64, |sum, t| {
+            sum.saturating_add(t.probe.duration_ms.unwrap_or(0))
+        });
+        let audiobook = tracks.iter().any(|t| state.is_audiobook(t));
+        mark_album(&mut dto, runtime_ms, audiobook);
+        return Ok(Some(dto));
     }
     let artists = state
         .stores
@@ -6093,10 +6133,14 @@ pub(crate) async fn music_groups_named(
         .filter(|(rank, _)| rank.is_exact())
         .map(|(rank, name)| (*rank, *name))
         .collect();
-    let mut own = aggregate_albums(&tracks, |i| exact.iter().any(|(_, a)| on_artist_page(i, a)));
+    let mut own = aggregate_albums(
+        &tracks,
+        |i| exact.iter().any(|(_, a)| on_artist_page(i, a)),
+        |i| state.is_audiobook(i),
+    );
     own.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
     let own_rank = exact.first().map(|(rank, _)| *rank);
-    let mut named: Vec<_> = aggregate_albums(&tracks, |_| true)
+    let mut named: Vec<_> = aggregate_albums(&tracks, |_| true, |i| state.is_audiobook(i))
         .into_iter()
         .filter(|a| !own.iter().any(|o| o.name == a.name))
         .filter_map(|a| {
@@ -6164,8 +6208,11 @@ pub(crate) async fn music_groups_page(
     // returned is built into DTOs, each of which looks up an image tag.
     match grouping {
         MusicGrouping::Album => {
-            let mut aggs =
-                aggregate_albums(&tracks, |i| artist.map_or(true, |a| on_artist_page(i, a)));
+            let mut aggs = aggregate_albums(
+                &tracks,
+                |i| artist.map_or(true, |a| on_artist_page(i, a)),
+                |i| state.is_audiobook(i),
+            );
             sort_album_aggs(
                 &mut aggs,
                 q.sort_by.as_deref(),
@@ -6294,7 +6341,7 @@ pub(crate) async fn virtual_shows_page(
     mode: ShowFolderKind,
     q: &ItemQuery,
 ) -> Result<SynthPage, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     // Reuse the full parent/search scoping the media query already implements:
@@ -6481,6 +6528,7 @@ pub(crate) async fn virtual_shows_page(
             }
         }
         ShowFolderKind::Season => {
+            let course_roots = state.course_roots();
             for ep in &episodes {
                 let Some(series) = ep.series.as_ref() else {
                     continue;
@@ -6498,7 +6546,7 @@ pub(crate) async fn virtual_shows_page(
                             &state.server_id,
                             series,
                             season_n,
-                            &season_display_name(season_n),
+                            &season_name(ep, season_n, &course_roots),
                             episode_count,
                         ),
                     )
@@ -6550,7 +6598,6 @@ async fn synth_series_or_season(
     user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
-    use crate::api::jellyfin::dto::season_display_name;
     use pharos_core::ParentFilter;
     let internal = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
     let filter = match synth_parent_filter(state, id_str).await.map_err(internal)? {
@@ -6580,7 +6627,7 @@ async fn synth_series_or_season(
             &state.server_id,
             series,
             season_n,
-            &season_display_name(season_n),
+            &season_name(item, season_n, &state.course_roots()),
             episode_count,
         )));
     }
@@ -6692,6 +6739,20 @@ fn series_dto(
         id,
     })
     .unwrap_or(serde_json::Value::Null)
+}
+
+/// A season's name: a course's module folder where it has a named one
+/// (ADR-0126), else the show's "Season N".
+fn season_name(
+    episode: &MediaItem,
+    season_n: u32,
+    course_roots: &pharos_scanner::course::CourseRoots,
+) -> String {
+    use pharos_scanner::course;
+    course::lesson(&episode.path, course_roots)
+        .and_then(|lesson| lesson.series.series_folder)
+        .and_then(|folder| course::module_title(&episode.path, std::path::Path::new(&folder)))
+        .unwrap_or_else(|| crate::api::jellyfin::dto::season_display_name(season_n))
 }
 
 fn season_dto(
@@ -7755,6 +7816,7 @@ pub(crate) fn spawn_scan_tracked(
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
                 .with_series_identity_repair(state.series_identity_repair)
+                .with_course_roots(state.course_roots())
                 .with_force(force)
                 .with_progress(sink.clone())
                 .with_cancel(cancel_flag.clone());
@@ -7764,6 +7826,7 @@ pub(crate) fn spawn_scan_tracked(
                     .with_probe_concurrency_opt(state.scan_probe_concurrency)
                     .with_io_gate(state.bg_io.clone())
                     .with_series_identity_repair(state.series_identity_repair)
+                    .with_course_roots(state.course_roots())
                     .with_force(force)
                     .with_progress(sink.clone())
                     .with_cancel(cancel_flag.clone());
@@ -8387,6 +8450,30 @@ mod filed_artist_tests {
         ];
         assert_eq!(filed_artist_names(&tracks), ["ABBA", "Foo"]);
         assert!(on_artist_page(&tracks[2], "foo"));
+    }
+
+    /// ADR-0132 — an album is an audiobook when any of its tracks is, as
+    /// its detail decides, whichever track the listing meets first.
+    #[test]
+    fn an_album_is_an_audiobook_when_any_track_is() {
+        let at = |path: &str| MediaItem {
+            path: path.into(),
+            probe: pharos_core::MediaProbe {
+                album: Some("Widget Days".into()),
+                ..pharos_core::MediaProbe::default()
+            },
+            ..track(Some("Ada Field"), None)
+        };
+        let tracks = [
+            at("/elsewhere/Widget Days/1.mp3"),
+            at("/libBooks/Widget Days/2.mp3"),
+        ];
+        let albums = aggregate_albums(&tracks, |_| true, |i| i.path.starts_with("/libBooks"));
+        assert_eq!(albums.len(), 1);
+        assert!(
+            albums.first().is_some_and(|a| a.audiobook),
+            "the second track is a book's"
+        );
     }
 }
 

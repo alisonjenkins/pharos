@@ -428,6 +428,8 @@ enum EnrichOutcome {
     SkippedManual,
     /// No provider configured for the kind, or an audio item — nothing tried.
     Skipped,
+    /// A course lesson (ADR-0126): never matched online.
+    SkippedCourse,
 }
 
 impl EnrichOutcome {
@@ -441,6 +443,7 @@ impl EnrichOutcome {
             Self::NoMatch => "no_match",
             Self::SkippedManual => "skipped_manual",
             Self::Skipped => "skipped",
+            Self::SkippedCourse => "skipped_course",
         }
     }
 }
@@ -528,6 +531,17 @@ where
     Tv: OnlineEnricher,
     S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
+    // V1392 — the match queries leave lessons out; one that reaches here
+    // anyway (marked between the read and this call) is still not searched.
+    if item.match_source.as_deref() == Some(pharos_scanner::course::COURSE_MATCH_SOURCE) {
+        tracing::debug!(
+            media.id = item.id,
+            path = %item.path.display(),
+            "metadata enrich: course lesson skipped, never matched online"
+        );
+        record_enrich(item.kind, EnrichOutcome::SkippedCourse);
+        return Ok(false);
+    }
     let stem = search_stem(&item);
     let name = episode_name(&item);
 
@@ -1263,6 +1277,16 @@ where
     // one; this covers an Identify that landed after the mark).
     if item.match_source.as_deref() == Some("manual") {
         store.clear_series_reconcile(id, marked_at).await?;
+        return Ok(false);
+    }
+    // V1392 — nor is a course lesson's: its metadata is its own files', and
+    // no provider is asked about it.
+    if item.match_source.as_deref() == Some(pharos_scanner::course::COURSE_MATCH_SOURCE) {
+        store.clear_series_reconcile(id, marked_at).await?;
+        tracing::debug!(
+            media.id = id,
+            "series identity repair: course lesson's mark cleared, nothing rebuilt"
+        );
         return Ok(false);
     }
     // A row the scanner moved to a key with no match row yet waits, behind
@@ -4577,6 +4601,7 @@ mod tests {
             EnrichOutcome::NoMatch,
             EnrichOutcome::SkippedManual,
             EnrichOutcome::Skipped,
+            EnrichOutcome::SkippedCourse,
         ];
         // The label strings are a metric contract — bounded and all distinct.
         let labels: BTreeSet<&str> = all.iter().map(|o| o.label()).collect();
@@ -5688,6 +5713,51 @@ mod tests {
         // record's metadata.
         assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
         assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
+    }
+
+    /// V1392 — a course lesson that reaches the enricher is not searched:
+    /// its mark stays, and the skip is counted.
+    #[tokio::test]
+    async fn enrich_one_never_searches_a_course_lesson() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_bare_episode(&s, 1, "Intro to Widgets", "/books/Intro to Widgets").await;
+        s.set_item_match(1, "local", "", "course", None, 1)
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("900001", "Intro to Widgets", Some(2003))])
+            .with_detail(enriched_overview("A film about something else."));
+
+        let item = s.get(1).await.unwrap();
+        let hit = enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert!(!hit);
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("course"));
+        assert_eq!(got.metadata.overview, None);
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_metadata_enrich_total",
+                &[("outcome", "skipped_course")]
+            ),
+            1
+        );
     }
 
     #[tokio::test]
@@ -7930,6 +8000,60 @@ mod tests {
             .expect("new still recorded");
         assert_eq!(source, "tvdb");
         assert_eq!(std::fs::read(locator).unwrap(), b"new still");
+    }
+
+    /// V1392 — a course lesson's mark is cleared without a rebuild, whether
+    /// or not its course is pinned to a show: its metadata is its own files',
+    /// and no provider is asked about it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_course_lesson_is_never_rebuilt() {
+        use pharos_scanner::course::{COURSE_MATCH_PROVIDER, COURSE_MATCH_SOURCE};
+        let s = store().await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Wellspring".into()),
+            ..EnrichedMetadata::default()
+        });
+        for (id, pinned) in [(1, false), (2, true)] {
+            let show = if pinned { SHOW_B } else { "/tv/Show C" };
+            put_titled_episode(&s, id, show, (1, 1), "Opening").await;
+            s.set_item_match(
+                id,
+                COURSE_MATCH_PROVIDER,
+                "",
+                COURSE_MATCH_SOURCE,
+                None,
+                NOW,
+            )
+            .await
+            .unwrap();
+            if pinned {
+                pin(&s, SHOW_B, "900002", NOW).await;
+            }
+            s.mark_reconcile_items(&[id], NOW).await.unwrap();
+            let rebuilt = reconcile_one(
+                &s,
+                &sem(4),
+                &cache,
+                None::<&FakeEnricher>,
+                Some(&tvdb),
+                &apply_cfg(),
+                id,
+                NOW,
+                NOW + 1,
+            )
+            .await
+            .unwrap();
+            assert!(!rebuilt, "pinned={pinned}");
+            let item = s.get(id).await.unwrap();
+            assert_eq!(item.match_source.as_deref(), Some(COURSE_MATCH_SOURCE));
+            assert_eq!(item.title, "Opening", "pinned={pinned}");
+            assert!(
+                s.series_reconcile_pending(10).await.unwrap().is_empty(),
+                "pinned={pinned}: the mark must be cleared"
+            );
+        }
+        assert!(tvdb.fetched().is_empty(), "no provider is asked");
     }
 
     /// A dry run rebuilds nothing and keeps the mark; a transient miss under

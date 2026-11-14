@@ -25,6 +25,8 @@ pub(crate) enum Route {
     NativeDetail,
     /// A native player's `Playback.negotiate` naming a version.
     Negotiate,
+    /// A book's bytes, from `/Items/{id}/Download` (V1391).
+    Download,
 }
 
 impl Route {
@@ -37,6 +39,7 @@ impl Route {
             Self::Prewarm => "prewarm",
             Self::NativeDetail => "native_detail",
             Self::Negotiate => "negotiate",
+            Self::Download => "download",
         }
     }
 }
@@ -191,6 +194,18 @@ pub(crate) fn select(route: Route, mut item: MediaItem, raw: Option<&str>) -> Me
     };
     let edition = alt.id.clone();
     item.path = alt.path.clone();
+    // A book's version is another format: it reads as what its container says
+    // (V1391), so a converting Kindle version converts and a locked one is
+    // offered as a download only.
+    if let (Some(book), Some(format)) = (
+        item.book.as_mut(),
+        probe
+            .container
+            .as_deref()
+            .and_then(pharos_scanner::book::format_for_extension),
+    ) {
+        book.format = format;
+    }
     item.probe = probe;
     item.edition = Some(edition);
     record(route, &item, raw, requested, Served::Alternate);
@@ -284,6 +299,49 @@ mod tests {
         assert_eq!(got.path, std::path::PathBuf::from("/m/Film - 3D.HSBS.mkv"));
         assert_eq!(got.probe.duration_ms, Some(5_000));
         assert_eq!(got.edition.as_deref(), Some("3d-hsbs"));
+    }
+
+    /// V1391 — a book's version reads as its own format: a locked Kindle
+    /// version of an epub is no epub.
+    #[test]
+    fn a_book_version_reads_as_its_own_format() {
+        let mut item = MediaItem {
+            id: 0x2a,
+            path: "/b/Widget Cookbook.epub".into(),
+            kind: pharos_core::MediaKind::Book,
+            book: Some(pharos_core::BookMeta {
+                format: pharos_core::BookFormat::Epub,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        item.probe.alternate_sources = ["pdf", "azw3"]
+            .map(|container| AlternateMediaSource {
+                id: container.into(),
+                path: format!("/b/Widget Cookbook.{container}").into(),
+                container: Some(container.into()),
+                probe: Some(Box::new(pharos_core::MediaProbe {
+                    container: Some(container.into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .into();
+        let wire = pharos_jellyfin_api::dto::wire_item_id(item.id);
+        let format = |raw: String| {
+            select(Route::Download, item.clone(), Some(&raw))
+                .book
+                .map(|b| b.format)
+        };
+        assert_eq!(
+            format(format!("{wire}-pdf")),
+            Some(pharos_core::BookFormat::Pdf)
+        );
+        assert_eq!(
+            format(format!("{wire}-azw3")),
+            Some(pharos_core::BookFormat::Unreadable)
+        );
+        assert_eq!(format(wire), Some(pharos_core::BookFormat::Epub));
     }
 
     /// V1154, V1155 — a part is its film's file on the HLS routes only;
@@ -389,10 +447,11 @@ mod tests {
             Route::Prewarm,
             Route::NativeDetail,
             Route::Negotiate,
+            Route::Download,
         ]
         .map(Route::label)
         .into();
-        assert_eq!(rt.len(), 7);
+        assert_eq!(rt.len(), 8);
     }
 
     #[test]

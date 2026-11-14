@@ -10,6 +10,7 @@ pub mod language;
 pub mod metadata_edit;
 pub mod origin;
 pub mod parental_rank;
+pub mod reader_password;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
@@ -32,6 +33,10 @@ pub use metadata_edit::{
     EditRejected, EditTarget, EditableField, LockedFields, MetadataEdit, MetadataEditStore,
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
+pub use reader_password::{
+    format_reader_password, ReaderPassword, ReaderPasswordId, ReaderPasswordRecord,
+    ReaderPasswordStore, TypedReaderPassword,
+};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
 pub use video_range::{ParseVideoRangeTypeError, VideoRangeType};
@@ -626,6 +631,13 @@ pub trait GenreStore: Send + Sync {
         &self,
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// The genre names linked to `item`, by name. Empty for an item with
+    /// none, or no such item. What an admin edits (spec 043).
+    fn item_genre_names(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send;
 
     /// One-time backfill: read every `media_items.genre` string, split on
     /// comma/pipe, and populate `genres` + `item_genres` for rows scanned
@@ -3366,7 +3378,19 @@ pub const PROBE_SCHEMA_VERSION: i64 = 9;
 /// v1: initial. Kindle files (`.mobi`/`.azw`/`.azw3`) are read for metadata and
 /// covers and converted to EPUB where DRM-free, so rows previously stored as
 /// `unreadable` with no cover must be re-read.
-pub const BOOK_SCHEMA_VERSION: i64 = 1;
+///
+/// v2: a stem-derived title is cleaned, a book is no longer tagged with video
+/// release tags, and a PDF's `/Producer` is no longer stored as its publisher
+/// (B1421), so every book row must be re-read to lose them.
+///
+/// v3: a book's subjects (`dc:subject`, EXTH 105, PDF `/Keywords`) are read
+/// and mapped to shelves stored as its genres (spec 043), so every book row
+/// must be re-read to gain them.
+///
+/// v4: a stem title also loses a bracketed format or edition tag (`[eBook]`,
+/// `[Kindle in Motion]`) and a trailing `-ebook` (B1433), so every book row
+/// must be re-read to lose them.
+pub const BOOK_SCHEMA_VERSION: i64 = 4;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
@@ -3853,6 +3877,10 @@ pub struct MediaFilters {
     /// `Is3D` — `Some(true)` keeps items whose primary file or any grouped
     /// edition is 3D; `Some(false)` keeps only items with no 3D version.
     pub is_3d: Option<bool>,
+    /// Books no client can open (`book_format = 'unreadable'`): `Some(true)`
+    /// keeps every item except those; `Some(false)` keeps only those (B1420).
+    /// Items that are not books are never dropped by `Some(true)`.
+    pub book_readable: Option<bool>,
     /// `MinWidth` — keep only items whose `width >= n`.
     pub min_width: Option<u32>,
     /// `MaxWidth` — keep only items whose `width <= n`.
@@ -3913,6 +3941,7 @@ impl MediaFilters {
             || self.is_4k.is_some()
             || self.is_hd.is_some()
             || self.is_3d.is_some()
+            || self.book_readable.is_some()
             || self.min_width.is_some()
             || self.max_width.is_some()
             || self.min_index_number.is_some()
@@ -4358,8 +4387,10 @@ pub trait MediaStore: Send + Sync {
     /// stays `into`'s own, for files whose timelines differ (a double
     /// episode folded into one of its episodes). Stored audio and subtitle
     /// choices are not copied: their stream indexes name the other file's
-    /// streams. Used when a file's row is folded into another item as one
-    /// of its versions. Idempotent; a no-op when `into` has no row. Stores
+    /// streams. A book's reading place follows its resume point: with
+    /// [`FoldResume::Carry`] the newer save of the two is kept (V1391). Used
+    /// when a file's row is folded into another item as one of its versions.
+    /// Idempotent; a no-op when `into` has no row. Stores
     /// without user data keep the default.
     fn merge_user_data(
         &self,
