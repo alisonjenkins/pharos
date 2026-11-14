@@ -105,7 +105,7 @@ postgres = ["pharos-store-sqlx/postgres"]
 
 [dev-dependencies]
 # Reads a subset font's cmap and names back in the font_subset tests.
-skrifa = { version = "0.49", default-features = false, features = ["std"] }
+skrifa = { version = "0.50", default-features = false, features = ["std"] }
 actix-test = "0.1"
 awc = "3"
 pharos-client = { path = "../pharos-client" }
