@@ -1,8 +1,9 @@
 //! Audiobooks kept in a Books library (ADR-0132, spec 046).
 //!
-//! An audiobook is a single file with chapters (any `.m4b`, or an `.m4a` /
+//! An audiobook is a single file with chapters (an `.m4b`, or an `.m4a` /
 //! `.mp3` that carries chapter marks) or a folder of audio files under a
-//! Books root. Each file is stored as an `Audio` row whose album is the book:
+//! Books root. A folder of chapterless `.m4b` files, one per chapter, is a
+//! folder book like any other. Each file is stored as an `Audio` row whose album is the book:
 //! a single file is an album of one track, its chapters the file's own; a
 //! folder's files are its tracks, numbered in natural order, and each track
 //! is a chapter. Which library holds a file is read as courses read it
@@ -15,11 +16,11 @@ use pharos_core::MediaProbe;
 
 use crate::course::CourseRoots;
 
-/// Audio containers a folder book's tracks may be. `.m4b` is not among
-/// them: an `.m4b` is always a book of its own.
+/// Audio containers a folder book's tracks may be, besides `.m4b`.
 const TRACK_EXTENSIONS: &[&str] = &["mp3", "m4a", "flac", "ogg", "opus", "wav"];
 
-/// The extension that makes a file a single-file book whatever it holds.
+/// The extension that makes a file a single-file book, unless it has no
+/// chapters and sits beside other `.m4b` files in its folder.
 const BOOK_EXTENSION: &str = "m4b";
 
 /// How a file under a Books root was read: the `verdict` label of
@@ -52,6 +53,9 @@ impl Verdict {
 pub enum Reason {
     /// An `.m4b`, a book by its container.
     M4b,
+    /// A chapterless `.m4b` beside other `.m4b` files in its folder: one
+    /// chapter of a book split into a file per chapter.
+    M4bInFolder,
     /// Alone in its folder (or at the root) and it carries chapter marks.
     Chapters,
     /// One of the audio files in a book folder.
@@ -62,8 +66,9 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::M4b,
+        Self::M4bInFolder,
         Self::Chapters,
         Self::InFolder,
         Self::LooseWithoutChapters,
@@ -72,6 +77,7 @@ impl Reason {
     pub fn label(self) -> &'static str {
         match self {
             Self::M4b => "m4b",
+            Self::M4bInFolder => "m4b_in_folder",
             Self::Chapters => "chapters",
             Self::InFolder => "in_folder",
             Self::LooseWithoutChapters => "loose_without_chapters",
@@ -122,7 +128,9 @@ fn is_track_file(path: &Path) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with('.'));
-    !hidden && extension(path).is_some_and(|e| TRACK_EXTENSIONS.contains(&e.as_str()))
+    !hidden
+        && extension(path)
+            .is_some_and(|e| e == BOOK_EXTENSION || TRACK_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// A folder that only splits a book into discs (`CD1`, `Disc 02`,
@@ -250,7 +258,8 @@ pub fn classify(
             }),
         }
     };
-    if extension(path).as_deref() == Some(BOOK_EXTENSION) {
+    let is_m4b = extension(path).as_deref() == Some(BOOK_EXTENSION);
+    if is_m4b && (has_chapters || parent == root) {
         return Some(single(Reason::M4b));
     }
     if parent == root {
@@ -266,6 +275,16 @@ pub fn classify(
     }
     let folder = book_folder(parent, root);
     let listed = tracks(&folder);
+    if is_m4b {
+        let split = listed
+            .iter()
+            .filter(|p| p.parent() == Some(parent))
+            .filter(|p| extension(p).as_deref() == Some(BOOK_EXTENSION))
+            .count();
+        if split <= 1 {
+            return Some(single(Reason::M4b));
+        }
+    }
     if has_chapters && listed.len() <= 1 {
         return Some(single(Reason::Chapters));
     }
@@ -273,7 +292,11 @@ pub fn classify(
     let count = u32::try_from(listed.len().max(1)).unwrap_or(u32::MAX);
     Some(Classified {
         verdict: Verdict::FolderTrack,
-        reason: Reason::InFolder,
+        reason: if is_m4b {
+            Reason::M4bInFolder
+        } else {
+            Reason::InFolder
+        },
         book: Some(BookTrack {
             title: folder_name(&folder).unwrap_or_else(|| stem_title(&folder)),
             author: author(probe, &folder, root),
@@ -368,7 +391,7 @@ mod tests {
             Path::new("/lib/Books/Ada Field/Gadget Tales.m4b"),
             &probe,
             &roots(),
-            never,
+            listed(&["Gadget Tales.m4b", "Widget Days/1 Opening.mp3"]),
         )
         .unwrap();
         assert_eq!(
@@ -379,6 +402,52 @@ mod tests {
         assert_eq!(book.title, "Gadget Tales");
         assert_eq!(book.author.as_deref(), Some("Ada Field"));
         assert_eq!((book.track, book.tracks), (None, 1));
+
+        let chaptered = MediaProbe {
+            chapters: chapters(2),
+            ..probe
+        };
+        for (path, lister) in [
+            (
+                "/lib/Books/Gadget Tales.m4b",
+                never as fn(&Path) -> Vec<PathBuf>,
+            ),
+            ("/lib/Books/Ada Field/Gadget Tales.m4b", never),
+        ] {
+            let got = classify(Path::new(path), &chaptered, &roots(), lister).unwrap();
+            assert_eq!(
+                (got.verdict, got.reason),
+                (Verdict::SingleFile, Reason::M4b),
+                "{path}"
+            );
+        }
+    }
+
+    /// B1436 / V1410 — a book split into one chapterless m4b per chapter.
+    #[test]
+    fn a_folder_of_chapterless_m4b_files_is_one_book_in_natural_order() {
+        let names = [
+            "Gadget Tales - 1 - Opening Credits.m4b",
+            "Gadget Tales - 2 - Chapter 1.m4b",
+            "Gadget Tales - 10 - Chapter 9.m4b",
+        ];
+        let probe = MediaProbe {
+            album: Some("Gadget Tales (Unabridged)".into()),
+            album_artist: Some("Ada Field".into()),
+            title: Some("Chapter 9".into()),
+            ..Default::default()
+        };
+        let path = Path::new("/lib/Books/Gadget Tales/Gadget Tales - 10 - Chapter 9.m4b");
+        let got = classify(path, &probe, &roots(), listed(&names)).unwrap();
+        assert_eq!(
+            (got.verdict, got.reason),
+            (Verdict::FolderTrack, Reason::M4bInFolder)
+        );
+        let book = got.book.unwrap();
+        assert_eq!(book.title, "Gadget Tales");
+        assert_eq!(book.author.as_deref(), Some("Ada Field"));
+        assert_eq!(book.track_title, "Chapter 9");
+        assert_eq!((book.track, book.tracks), (Some(3), 3));
     }
 
     #[test]
@@ -580,7 +649,13 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            ["CD1/1 a.mp3", "CD1/2 b.mp3", "CD1/10 c.mp3", "CD2/1 d.mp3"]
+            [
+                "CD1/1 a.mp3",
+                "CD1/2 b.mp3",
+                "CD1/10 c.mp3",
+                "CD2/1 d.mp3",
+                "x.m4b"
+            ]
         );
     }
 
