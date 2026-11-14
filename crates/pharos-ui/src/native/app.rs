@@ -2695,6 +2695,23 @@ impl Slot {
 
 type OnMedia = Box<dyn FnMut(MediaEvent)>;
 
+/// The `reason` a queue move held for an audiobook's sleep timer logs.
+const SLEEP_TIMER_HOLD: &str = "sleep_timer";
+
+/// Why a queued song's end does not move the queue on, if it does not: it
+/// already handed over under a crossfade, or an audiobook's sleep timer
+/// stops at its end (which this disarms, the timer having fired).
+fn ended_holds(handed_off: bool, book_stop: &super::audiobook::StopAtEnd) -> Option<&'static str> {
+    if handed_off {
+        return Some("handed_off");
+    }
+    if book_stop.armed() {
+        book_stop.arm(false);
+        return Some(SLEEP_TIMER_HOLD);
+    }
+    None
+}
+
 /// The player's media handler, for `timeupdate`s that arrive outside
 /// Dioxus events (`platform::on_time_update`).
 #[derive(Default)]
@@ -6191,6 +6208,8 @@ fn Player(
     // This song has handed the stage to the next under a crossfade: it plays
     // out until the next is ready, but its end no longer moves the queue.
     let handed_off = use_hook(|| Rc::new(Cell::new(false)));
+    // An audiobook's sleep timer pauses at this file's end: the queue holds.
+    let book_stop = use_hook(super::audiobook::StopAtEnd::default);
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
     let resume: ResumeSlot = use_hook(ResumeSlot::default);
     let fade_in_ms = use_hook(|| fade_in.0.take());
@@ -7285,6 +7304,7 @@ fn Player(
         let session = session.clone();
         let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
         let handed_off = Rc::clone(&handed_off);
+        let book_stop = book_stop.clone();
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let resume = Rc::clone(&resume);
         let music = p.kind == ItemKind::Audio;
@@ -7376,6 +7396,15 @@ fn Player(
                     if state.position_ms.saturating_add(fade) >= state.duration_ms {
                         crossfading.set(true);
                         let (to, line) = queue.peek().advance(playing_id, near.next);
+                        let to = match to {
+                            Some(_) if book_stop.armed() => {
+                                platform::info(&format!(
+                                    "pharos: crossfade skipped item={playing_id} reason={SLEEP_TIMER_HOLD}"
+                                ));
+                                None
+                            }
+                            to => to,
+                        };
                         match to {
                             Some(to) if to != playing_id => {
                                 platform::info(&format!(
@@ -7394,6 +7423,7 @@ fn Player(
                             Some(same) => platform::info(&format!(
                                 "pharos: crossfade skipped item={playing_id} reason=same_song next={same}"
                             )),
+                            None if book_stop.armed() => {}
                             None => platform::info(&format!(
                                 "pharos: crossfade skipped item={playing_id} reason=no_next"
                             )),
@@ -7403,9 +7433,12 @@ fn Player(
             }
             // A song that ends plays what is next; in a group the group
             // decides what plays.
-            if event == MediaEvent::Ended && queued && handed_off.get() {
+            let held = (event == MediaEvent::Ended && queued)
+                .then(|| ended_holds(handed_off.get(), &book_stop))
+                .flatten();
+            if let Some(reason) = held {
                 platform::info(&format!(
-                    "pharos: queue advance skipped item={playing_id} reason=handed_off"
+                    "pharos: queue advance skipped item={playing_id} reason={reason}"
                 ));
             } else if event == MediaEvent::Ended && queued {
                 let (to, line) = queue.peek().advance(playing_id, near.next);
@@ -8421,6 +8454,7 @@ fn Player(
                     chapters: p.detail.chapters.clone(),
                     book: p.detail.item.parent,
                     playing: p.detail.item.id,
+                    stop_at_end: book_stop.clone(),
                 }),
             }
         } else {
@@ -8689,6 +8723,19 @@ mod tests {
             dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
         }
         props.mounts.get()
+    }
+
+    /// ADR-0132: an audiobook's sleep timer set to end with the file holds
+    /// the queue at its end, once; a crossfade's hand-over still holds it.
+    #[test]
+    fn a_sleep_timer_at_the_file_end_holds_the_queue_once() {
+        let stop = super::super::audiobook::StopAtEnd::default();
+        assert_eq!(ended_holds(false, &stop), None);
+        assert_eq!(ended_holds(true, &stop), Some("handed_off"));
+        stop.arm(true);
+        assert_eq!(ended_holds(false, &stop), Some(SLEEP_TIMER_HOLD));
+        assert!(!stop.armed(), "the timer has fired");
+        assert_eq!(ended_holds(false, &stop), None);
     }
 
     #[test]
