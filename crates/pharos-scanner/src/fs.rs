@@ -250,7 +250,7 @@ pub struct FsScanner<P: Prober> {
     cover_sink: Option<Arc<dyn CoverSink>>,
     /// ADR-0126 — the roots of the Books libraries, under which a video is a
     /// course lesson ([`crate::course`]). Empty: no video is a lesson.
-    course_roots: Vec<PathBuf>,
+    course_roots: crate::course::CourseRoots,
 }
 
 /// 004-books (T063) — destination for a book cover's bytes.
@@ -358,7 +358,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
-            course_roots: Vec::new(),
+            course_roots: crate::course::CourseRoots::default(),
         }
     }
 
@@ -378,7 +378,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
-            course_roots: Vec::new(),
+            course_roots: crate::course::CourseRoots::default(),
         }
     }
 
@@ -451,8 +451,8 @@ impl<P: Prober> FsScanner<P> {
 
     /// ADR-0126 — the Books library roots, under which a video is read as a
     /// course lesson rather than a film.
-    pub fn with_course_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.course_roots = roots.into_iter().collect();
+    pub fn with_course_roots(mut self, roots: impl Into<crate::course::CourseRoots>) -> Self {
+        self.course_roots = roots.into();
         self
     }
 
@@ -2138,8 +2138,12 @@ impl CourseLessonOutcome {
 
 /// ADR-0126 — a probed video read as a course lesson: logged with where it
 /// sits in its course, and counted.
-fn record_course_lesson(path: &Path, lesson: &crate::course::CourseLesson, roots: &[PathBuf]) {
-    let root = roots.iter().find(|r| path.starts_with(r));
+fn record_course_lesson(
+    path: &Path,
+    lesson: &crate::course::CourseLesson,
+    roots: &crate::course::CourseRoots,
+) {
+    let root = roots.root_of(path);
     let module = lesson
         .series
         .series_folder
