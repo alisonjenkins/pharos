@@ -389,6 +389,30 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 native("onPrepareFromSearch", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
             ],
         },
+        // The car host opens artwork as content:// URIs through this
+        // provider. Android creates it before the service, so it loads the
+        // library itself.
+        ClassSpec {
+            name: format!("{PKG}/PharosArtProvider"),
+            superclass: "android/content/ContentProvider".into(),
+            load_library: Some("pharos_auto".into()),
+            interfaces: Vec::new(),
+            methods: vec![
+                native("onCreate", "()Z"),
+                native(
+                    "query",
+                    "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+                ),
+                native("getType", "(Landroid/net/Uri;)Ljava/lang/String;"),
+                native("insert", "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;"),
+                native("delete", "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I"),
+                native(
+                    "update",
+                    "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
+                ),
+                native("openFile", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;"),
+            ],
+        },
         // MediaPlayer reports a stream's progress through listener
         // interfaces. A generated class implementing them keeps each
         // callback a direct native call; a java.lang.reflect.Proxy would
