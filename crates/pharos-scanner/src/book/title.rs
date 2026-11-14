@@ -50,9 +50,7 @@ static TRAILING: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Format and edition tags. They are also removed before the separator
-/// decision, so a tag's own hyphens (`-e-book`) never tip a stem into having
-/// its hyphens read as spaces.
+/// Format and edition tags, among the trailing rules.
 const FORMAT_TAG_PATTERNS: &[&str] = &[
     // A bracketed format or edition tag: `[eBook]`, `(Kindle Edition)`,
     // `[Kindle in Motion]`. Only these words, so `[Part 1]` stays.
@@ -60,9 +58,6 @@ const FORMAT_TAG_PATTERNS: &[&str] = &[
     // A bare format word: `Title-ebook`, `Title e-book`.
     r"(?i)[\s-]+e[-\s]?book$",
 ];
-
-static FORMAT_TAGS: LazyLock<Vec<Regex>> =
-    LazyLock::new(|| FORMAT_TAG_PATTERNS.iter().filter_map(|p| rule(p)).collect());
 
 static WHITESPACE: LazyLock<Option<Regex>> = LazyLock::new(|| rule(r"\s+"));
 
@@ -129,9 +124,13 @@ fn strip_trailing(mut s: String, rules: &[Regex]) -> String {
     s
 }
 
-/// One pass: format tags, then separators, then trailing junk.
+/// One pass: trailing junk, then separators, then trailing junk again.
+///
+/// Junk goes first so its own hyphens (`-e-book`, a counter or stamp after
+/// one) never tip a stem into having its hyphens read as spaces; it goes
+/// again because spacing separators can expose more.
 fn clean_once(stem: &str) -> String {
-    let mut s = strip_trailing(stem.replace('_', " "), &FORMAT_TAGS);
+    let mut s = strip_trailing(collapse(&stem.replace('_', " ")), &TRAILING);
     if hyphens_are_separators(&s) {
         // Only hyphens between two word characters; ` - ` stays.
         let chars: Vec<char> = s.chars().collect();
@@ -211,6 +210,8 @@ mod tests {
             // A hyphenated stem's hyphens become spaces before the rules run.
             ("Some-Title-e-book", "Some-Title"),
             ("making-a-paper-kite-e-book", "making a paper kite"),
+            ("Some-Title-e-book (1)", "Some-Title"),
+            ("Some-Title-e-book www.somesite.se", "Some-Title"),
             ("long-title-here [e-book]", "long title here"),
             ("Some Title [Part 1]", "Some Title [Part 1]"),
             ("Ebook", "Ebook"),
@@ -249,6 +250,7 @@ mod tests {
             "learn-rust-fast - Copy",
             "learn-rust-fast",
             "Some-Title-e-book",
+            "Some-Title-e-book (1)",
         ] {
             let once = clean_stem_title(input);
             assert_eq!(clean_stem_title(&once), once, "for {input:?}");
