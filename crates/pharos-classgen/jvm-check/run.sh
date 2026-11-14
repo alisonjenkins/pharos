@@ -49,6 +49,7 @@ while IFS= read -r line; do
   fi
 done <<'LINES'
 ^pharos-auto: notify: channel created id=
+^pharos-auto: notify: small_icon=app$
 ^pharos-auto: notify: foreground=on state=3$
 ^pharos-auto: notify: foreground=off notification=kept state=2$
 ^pharos-auto: notify: foreground=off notification=removed state=7$
