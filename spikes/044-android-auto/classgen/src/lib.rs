@@ -384,6 +384,9 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 native("onPlayFromMediaId", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
                 // Gemini / Assistant voice requests ("play X on Pharos").
                 native("onPlayFromSearch", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
+                native("onPrepare", "()V"),
+                native("onPrepareFromMediaId", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
+                native("onPrepareFromSearch", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
             ],
         },
         // MediaPlayer reports a stream's progress through listener
