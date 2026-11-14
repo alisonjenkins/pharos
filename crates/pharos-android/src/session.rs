@@ -249,20 +249,28 @@ fn stop_player(env: &mut JNIEnv, session: &GlobalRef, player: &GlobalRef, prepar
             .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
             .and_then(|v| v.i())
             .map_err(jerr("getCurrentPosition"))?;
-        resume::note(i64::from(pos), "stop")?;
+        resume::note_for(env, player, i64::from(pos), "stop")?;
         Ok(pos)
     })();
     if saved.is_err() {
         // A pending Java exception would fail the release below.
         let _ = take_exception(env);
     }
-    resume::drop_current(false)?;
+    resume::drop_for(env, player)?;
     let released = env
         .call_method(player.as_obj(), "release", "()V", &[])
         .map_err(jerr("release"));
-    focus::abandon(env)?;
     let pos = saved?;
     released?;
+    // A play that arrived meanwhile owns focus and the playback state now.
+    let replaced = state_lock()?.as_ref().is_some_and(|s| s.player.is_some());
+    if replaced {
+        log(&format!(
+            "stop: released the player, prepared={prepared}; a newer player owns focus and state"
+        ));
+        return Ok(());
+    }
+    focus::abandon(env)?;
     log(&format!("stop: released the player, prepared={prepared}"));
     set_playback_state(env, session.as_obj(), STATE_STOPPED, i64::from(pos))
 }
