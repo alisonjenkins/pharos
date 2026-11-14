@@ -1214,3 +1214,45 @@ async fn is_3d_matches_primary_or_any_edition_and_format_round_trips() {
         Some(Video3DFormat::HalfSideBySide)
     );
 }
+
+/// B1420: the unreadable-book filter drops only unreadable books on `Hide`,
+/// keeps only them on `Only`, and leaves other kinds alone; the total agrees.
+#[tokio::test]
+async fn book_readable_hides_or_keeps_only_unreadable_books() {
+    use pharos_core::{BookFormat, BookMeta};
+    let s = fresh().await;
+    let book = |id: u64, format| {
+        let mut it = item_with(id, "Book", MediaKind::Book);
+        it.book = Some(BookMeta {
+            format,
+            ..Default::default()
+        });
+        it
+    };
+    for it in [
+        book(1, BookFormat::Epub),
+        book(2, BookFormat::Unreadable),
+        book(3, BookFormat::Pdf),
+        book(4, BookFormat::Unreadable),
+        item_with(5, "Film", MediaKind::Movie),
+    ] {
+        s.put(it).await.unwrap();
+    }
+    let query = |book_readable| MediaQuery {
+        filters: MediaFilters {
+            book_readable,
+            ..Default::default()
+        },
+        sort: vec![(SortKey::Id, SortDir::Asc)],
+        limit: Some(2),
+        ..Default::default()
+    };
+    let (rows, total) = s.query(&query(Some(true))).await.unwrap();
+    assert_eq!(rows.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(total, 3, "the total counts what is kept, not the page");
+    let (rows, total) = s.query(&query(Some(false))).await.unwrap();
+    assert_eq!(rows.iter().map(|i| i.id).collect::<Vec<_>>(), vec![2, 4]);
+    assert_eq!(total, 2);
+    let (_, total) = s.query(&query(None)).await.unwrap();
+    assert_eq!(total, 5);
+}
