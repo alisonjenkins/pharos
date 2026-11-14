@@ -94,6 +94,8 @@ fn item_for(id: &str) -> Item {
         art: String::new(),
         duration_ms: 0,
         album: String::new(),
+        book: String::new(),
+        position_ms: 0,
     })
 }
 
