@@ -7,14 +7,15 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
-    item_id, item_query, item_summary, items_result, library, lyrics, lyrics_result, me_result,
-    media_token_result, my_devices_result, negotiate_result, opt_u16, opt_u32, playback,
-    playback_grant, pref_result, prefs, report_document_result, report_list_result, report_result,
-    session, start_tracks_result, stream_choice, telemetry, track, user_data, user_state_result,
-    BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
-    StereoFilter, SubtitleDelivery, UnreadableFilter,
+    avatar_result, capabilities, created_reader_password_result, decision_result, detail_result,
+    done, home_result, index_result, item_id, item_query, item_summary, items_result, library,
+    lyrics, lyrics_result, me_result, media_token_result, my_devices_result, negotiate_result,
+    opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, reader_passwords_result,
+    report_document_result, report_list_result, report_result, session, start_tracks_result,
+    stream_choice, telemetry, track, user_data, user_state_result, BookFormat as WireBookFormat,
+    CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, Stereo3d as WireStereo, StereoFilter, SubtitleDelivery,
+    UnreadableFilter,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -781,6 +782,52 @@ impl fmt::Debug for MediaToken {
     }
 }
 
+/// An e-reader password as listed, from [`NativeApi::reader_passwords`]:
+/// never the password itself (045).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReaderPassword {
+    pub id: String,
+    pub label: String,
+    /// When it was made, in ms since the Unix epoch.
+    pub created_at_ms: i64,
+    /// When it last opened the catalogue, in ms since the Unix epoch;
+    /// `None` when never.
+    pub last_used_at_ms: Option<i64>,
+}
+
+/// A new e-reader password, from [`NativeApi::create_reader_password`]. The
+/// password is in this value and nowhere else, ever.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CreatedReaderPassword {
+    pub listed: ReaderPassword,
+    /// The secret. Never log it.
+    pub password: String,
+    /// The catalogue's path on the server, `/opds/`.
+    pub opds_path: String,
+}
+
+impl fmt::Debug for CreatedReaderPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreatedReaderPassword")
+            .field("listed", &self.listed)
+            .field("password", &"<redacted>")
+            .field("opds_path", &self.opds_path)
+            .finish()
+    }
+}
+
+fn reader_password(
+    p: pharos_api::pharos_capnp::reader_password::Reader<'_>,
+) -> Result<ReaderPassword, ClientError> {
+    let last = p.get_last_used_at_ms();
+    Ok(ReaderPassword {
+        id: text(p.get_id())?,
+        label: text(p.get_label())?,
+        created_at_ms: p.get_created_at_ms(),
+        last_used_at_ms: (last > 0).then_some(last),
+    })
+}
+
 /// [`PharosApi`] over a signed-in native session.
 #[derive(Clone)]
 pub struct NativeApi {
@@ -1173,6 +1220,72 @@ impl NativeApi {
             for (i, c) in codecs.iter().enumerate().take(len as usize) {
                 list.set(i as u32, c.as_str());
             }
+        }
+        let reply = req.send().promise.await?;
+        crate::read_done(reply.get()?.get_result()?)
+    }
+
+    /// The signed-in user's live e-reader passwords, newest first (045).
+    pub async fn reader_passwords(
+        &self,
+        call: &CallInfo,
+    ) -> Result<Vec<ReaderPassword>, ClientError> {
+        let mut req = self.session.reader_passwords_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            reader_passwords_result::Passwords(list) => list?.iter().map(reader_password).collect(),
+            reader_passwords_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Makes an e-reader password labelled `label` (045).
+    pub async fn create_reader_password(
+        &self,
+        call: &CallInfo,
+        label: &str,
+    ) -> Result<CreatedReaderPassword, ClientError> {
+        let mut req = self.session.create_reader_password_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_label(label);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            created_reader_password_result::Created(c) => {
+                let c = c?;
+                Ok(CreatedReaderPassword {
+                    listed: reader_password(c.get_listed()?)?,
+                    password: text(c.get_password())?,
+                    opds_path: text(c.get_opds_path())?,
+                })
+            }
+            created_reader_password_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Revokes the signed-in user's e-reader password `id` (045).
+    pub async fn revoke_reader_password(
+        &self,
+        call: &CallInfo,
+        id: &str,
+    ) -> Result<(), ClientError> {
+        let mut req = self.session.revoke_reader_password_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_id(id);
         }
         let reply = req.send().promise.await?;
         crate::read_done(reply.get()?.get_result()?)
