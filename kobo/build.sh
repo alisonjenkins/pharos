@@ -6,15 +6,20 @@
 #
 # Usage: kobo/build.sh [work-dir]   (default: kobo/.cobalt, git-ignored)
 # Needs: git, rustup with Cobalt's toolchain (it reads rust-toolchain.toml),
-# and CC_armv7_unknown_linux_musleabihf pointing at a musl C compiler (Cobalt
-# uses `zig cc -target arm-linux-musleabihf`; glibc's armhf gcc does not link
-# bundled SQLite). PHAROS_KOBO_SERVER sets the server the app talks to.
+# and a musl C toolchain for the reader named by CC_armv7_unknown_linux_musleabihf
+# and AR_armv7_unknown_linux_musleabihf. Cobalt uses zig: a CC wrapper running
+# `zig cc -target arm-linux-musleabihf -fno-sanitize=undefined "$@"` with any
+# --target=* argument dropped, and an AR wrapper running `zig ar "$@"`
+# (default.nix has both). glibc's armhf gcc does not link bundled SQLite.
+# PHAROS_KOBO_SERVER sets the server the app talks to.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=cobalt.env
 . "$here/cobalt.env"
 work="${1:-$here/.cobalt}"
+mkdir -p "$work"
+work="$(cd "$work" && pwd)"
 
 if [ ! -d "$work/.git" ]; then
   git init --quiet "$work"
