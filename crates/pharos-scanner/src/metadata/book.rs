@@ -52,6 +52,9 @@ struct BookDescriptive {
     /// Verbatim from the file: an epub's `dc:date` (often a full ISO
     /// timestamp, sometimes a bare year) or a comic's Year/Month/Day joined.
     date: Option<String>,
+    /// Raw subjects (spec 043): `dc:subject`, EXTH 105, a PDF's `/Keywords`
+    /// when it reads as a list. Mapped to shelves in `fetch`.
+    subjects: Vec<String>,
 }
 
 fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
@@ -64,6 +67,7 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                 publisher: m.publisher,
                 description: m.description,
                 date: m.date,
+                subjects: m.subjects,
             })
         }
         pharos_core::BookFormat::Comic => {
@@ -74,6 +78,7 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                 publisher: m.publisher,
                 description: m.description,
                 date: m.date,
+                subjects: Vec::new(),
             })
         }
         pharos_core::BookFormat::Pdf => {
@@ -88,6 +93,11 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                 publisher: None,
                 description: m.description,
                 date: m.date.as_deref().and_then(pdf_date_to_iso),
+                subjects: m
+                    .keywords
+                    .as_deref()
+                    .map(crate::book::shelf::pdf_keyword_list)
+                    .unwrap_or_default(),
             })
         }
         // 005-kindle-conversion — mobi/azw/azw3 DO carry readable metadata:
@@ -104,6 +114,7 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                     publisher: m.publisher,
                     description: m.description,
                     date: m.date,
+                    subjects: m.subjects,
                 }),
                 // B1419 — DRM encrypts the text records only; the header's
                 // EXTH block still describes the book.
@@ -115,6 +126,7 @@ fn read_descriptive(path: &std::path::Path) -> Option<BookDescriptive> {
                         publisher: m.publisher,
                         description: m.description,
                         date: m.date,
+                        subjects: m.subjects,
                     })
                 }
                 Err(_) => None,
@@ -164,6 +176,28 @@ fn leading_year(text: &str) -> Option<u32> {
     (digits.len() == 4).then(|| digits.parse().ok())?
 }
 
+/// A book's shelves (its genres) and its raw subjects (its tags), from what
+/// the file says, counted and logged (spec 043 FR-005, FR-014, FR-015). The
+/// Open Library job fills a book this leaves on no shelf or only `Other`.
+fn categorise(path: &std::path::Path, raw: &[String]) -> (Vec<String>, Vec<String>) {
+    use crate::book::shelf;
+    let subjects = shelf::usable_subjects(raw);
+    let shelves = shelf::shelves_for(&subjects);
+    let outcome = shelf::Outcome::of_shelves(&shelves);
+    shelf::record(shelf::Source::Embedded, outcome);
+    let genres = shelf::names(&shelves);
+    tracing::info!(
+        path = %path.display(),
+        source = shelf::Source::Embedded.label(),
+        outcome = outcome.label(),
+        subjects = ?subjects,
+        shelves = ?genres,
+        "book categorised"
+    );
+    let tags = subjects.into_iter().take(shelf::MAX_TAGS).collect();
+    (genres, tags)
+}
+
 impl MetadataProvider for BookMetadataProvider {
     fn name(&self) -> &'static str {
         "book"
@@ -186,8 +220,10 @@ impl MetadataProvider for BookMetadataProvider {
         // could not be read (V6).
         let path = req.path.to_path_buf();
         let Ok(Some(d)) = tokio::task::spawn_blocking(move || read_descriptive(&path)).await else {
+            categorise(req.path, &[]);
             return Ok(MetadataResult::default());
         };
+        let (genres, tags) = categorise(req.path, &d.subjects);
 
         let clean = |s: Option<String>| {
             s.map(|s| s.trim().to_string())
@@ -207,6 +243,8 @@ impl MetadataProvider for BookMetadataProvider {
             // unset rather than inventing the 1st of January.
             premiere_date: date.as_deref().and_then(parse_date_unix),
             studios: publisher.map(|p| vec![p]).unwrap_or_default(),
+            genres,
+            tags,
             people: clean(d.author)
                 .map(|name| {
                     vec![PersonRef {
@@ -317,6 +355,72 @@ mod tests {
         assert_eq!(out.people.len(), 1);
         assert_eq!(out.people[0].name, "Author A");
         assert_eq!(out.people[0].kind, PersonKind::Writer);
+    }
+
+    /// Spec 043 FR-005: subjects become shelves (genres) and stay as tags,
+    /// and the decision is counted.
+    #[tokio::test]
+    async fn an_epubs_subjects_put_it_on_a_shelf() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("Shelved.epub");
+        write_epub(
+            &p,
+            r#"<package><metadata><dc:title>X</dc:title>
+              <dc:subject>Kubernetes</dc:subject>
+              <dc:subject>Cloud computing</dc:subject>
+              <dc:subject>Accessible book</dc:subject>
+            </metadata><manifest/></package>"#,
+        );
+        let probe = pharos_core::MediaProbe::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            BookMetadataProvider::new()
+                .fetch(&req(&p, &probe))
+                .await
+                .unwrap()
+        };
+        assert_eq!(out.genres, vec!["Cloud & DevOps".to_string()]);
+        assert_eq!(
+            out.tags,
+            vec!["Kubernetes".to_string(), "Cloud computing".to_string()],
+            "the raw subjects are kept, noise dropped"
+        );
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(k, _, _, v)| {
+                let key = k.key();
+                key.name() == "pharos_book_category_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "source" && l.value() == "embedded")
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == "shelved")
+                    && v == DebugValue::Counter(1)
+            });
+        assert!(counted, "the embedded decision must be counted");
+    }
+
+    #[tokio::test]
+    async fn a_book_without_subjects_has_no_shelf() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("Bare.epub");
+        write_epub(
+            &p,
+            r#"<package><metadata><dc:title>X</dc:title></metadata><manifest/></package>"#,
+        );
+        let probe = pharos_core::MediaProbe::default();
+        let out = BookMetadataProvider::new()
+            .fetch(&req(&p, &probe))
+            .await
+            .unwrap();
+        assert!(out.genres.is_empty(), "no subject is no shelf, not Other");
+        assert!(out.tags.is_empty());
     }
 
     /// A bare year must not become the 1st of January. The distinction is
