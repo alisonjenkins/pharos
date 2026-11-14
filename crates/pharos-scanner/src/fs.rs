@@ -12633,7 +12633,8 @@ mod tests {
 
     /// ADR-0132 — under a Books root, a single file with chapters and a
     /// folder of tracks are stored as audiobooks (a folder's tracks numbered
-    /// in natural order), a loose file without chapters is left out, and
+    /// in natural order, a folder of chapterless m4b files included), a
+    /// loose file without chapters is left out, and
     /// each decision is counted with its reason.
     #[tokio::test]
     async fn audio_under_a_books_root_is_stored_as_audiobooks() {
@@ -12648,6 +12649,8 @@ mod tests {
             "Ada Field/Widget Days/10 Ending.mp3",
             "Ada Field/Widget Days/2 Middle.mp3",
             "Ada Field/Widget Days/1 Opening.mp3",
+            "Ada Field/Cog Stories/Cog Stories - 2 - Chapter 2.m4b",
+            "Ada Field/Cog Stories/Cog Stories - 1 - Chapter 1.m4b",
             "Sprocket Notes.m4a",
             "Stray Hum.mp3",
         ] {
@@ -12690,6 +12693,14 @@ mod tests {
             assert_eq!(t.probe.album.as_deref(), Some("Widget Days"), "{f}");
             assert_eq!(t.probe.track_number, Some(n), "{f}");
             assert_eq!(t.title, title, "{f}");
+        }
+        for (f, n) in [
+            ("Ada Field/Cog Stories/Cog Stories - 1 - Chapter 1.m4b", 1),
+            ("Ada Field/Cog Stories/Cog Stories - 2 - Chapter 2.m4b", 2),
+        ] {
+            let t = get(f).await.expect(f);
+            assert_eq!(t.probe.album.as_deref(), Some("Cog Stories"), "{f}");
+            assert_eq!(t.probe.track_number, Some(n), "{f}");
         }
         let single = get("Sprocket Notes.m4a")
             .await
@@ -12734,6 +12745,7 @@ mod tests {
         assert_eq!(count("single_file", "m4b"), 1);
         assert_eq!(count("single_file", "chapters"), 1);
         assert_eq!(count("folder_track", "in_folder"), 3);
+        assert_eq!(count("folder_track", "m4b_in_folder"), 2);
         assert_eq!(count("skipped", "loose_without_chapters"), 1);
     }
 
