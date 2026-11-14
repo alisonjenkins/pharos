@@ -24,11 +24,22 @@ pub struct Player {
 impl Player {
     fn send(&self, command: Command) {
         let name = format!("{command:?}");
+        let attempt = match &command {
+            Command::Play { ids, index } => ids.get(*index).cloned().map(|id| (id, ids.clone())),
+            _ => None,
+        };
         if self.tx.send(command).is_err() {
             log(&format!(
                 "command source=app verdict=dropped reason=command_thread_gone command={name}"
             ));
-            snapshot::note_error("the player's command thread is gone");
+            let cause = "the player's command thread is gone";
+            match attempt {
+                Some((id, ids)) => {
+                    let car: Vec<String> = ids.iter().map(|i| snapshot::car_id(i)).collect();
+                    snapshot::note_failure(&snapshot::car_id(&id), &car, cause);
+                }
+                None => snapshot::note_error(cause),
+            }
         }
     }
 
