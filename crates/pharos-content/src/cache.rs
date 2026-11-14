@@ -595,7 +595,10 @@ impl Cache {
     /// many of them are already on disk.
     pub fn pin(&self, container: &str, ids: &[String]) -> usize {
         let mut s = self.lock();
-        s.pins.insert(container.to_owned(), ids.to_vec());
+        let previous = s.pins.insert(container.to_owned(), ids.to_vec());
+        if let Some(previous) = previous {
+            Self::release_locked(&mut s, previous.iter().filter(|p| !ids.contains(p)));
+        }
         for id in ids {
             s.entries
                 .entry(id.clone())
@@ -619,15 +622,11 @@ impl Cache {
         have
     }
 
-    /// Release `container`'s pins; its tracks become ordinary LRU entries.
-    pub fn unpin(&self, container: &str) {
-        let mut s = self.lock();
-        let Some(ids) = s.pins.remove(container) else {
-            log::info!("cache unpin container={container} was_pinned=false");
-            return;
-        };
+    /// Un-pin each of `ids` that no container owns any more: a finished track
+    /// becomes an ordinary LRU entry, a download placeholder is dropped.
+    fn release_locked<'a>(s: &mut State, ids: impl Iterator<Item = &'a String>) {
         let still: HashSet<String> = s.pins.values().flatten().cloned().collect();
-        for id in &ids {
+        for id in ids {
             if still.contains(id) {
                 continue;
             }
@@ -643,6 +642,16 @@ impl Cache {
                 s.entries.remove(id);
             }
         }
+    }
+
+    /// Release `container`'s pins; its tracks become ordinary LRU entries.
+    pub fn unpin(&self, container: &str) {
+        let mut s = self.lock();
+        let Some(ids) = s.pins.remove(container) else {
+            log::info!("cache unpin container={container} was_pinned=false");
+            return;
+        };
+        Self::release_locked(&mut s, ids.iter());
         log::info!(
             "cache unpin container={container} was_pinned=true tracks={}",
             ids.len()
@@ -1168,6 +1177,37 @@ mod tests {
             .filter(|e| e.file_name() != "shared.json")
             .collect();
         assert!(strays.is_empty(), "no temp file is left behind");
+    }
+
+    #[test]
+    fn replacing_a_pin_releases_the_tracks_it_dropped() {
+        let d = tmp("repin");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/1", 100);
+        put(&c, "track/2", 100);
+        put(&c, "track/3", 100);
+        c.pin("album/a", &ids(&["track/1", "track/2"]));
+        c.pin("album/b", &ids(&["track/2"]));
+        c.pin("album/a", &ids(&["track/2", "track/3"]));
+        assert!(!c.entry("track/1").unwrap().pinned, "dropped by the repin");
+        assert!(c.entry("track/2").unwrap().pinned);
+        assert!(c.entry("track/3").unwrap().pinned);
+        c.unpin("album/a");
+        assert!(
+            c.entry("track/2").unwrap().pinned,
+            "album/b still owns track/2"
+        );
+        assert!(!c.entry("track/3").unwrap().pinned);
+    }
+
+    #[test]
+    fn replacing_a_pin_forgets_the_dropped_tracks_placeholders() {
+        let d = tmp("repin-placeholder");
+        let c = Cache::open(&d, 1000).unwrap();
+        c.pin("album/a", &ids(&["track/1", "track/2"]));
+        c.pin("album/a", &ids(&["track/2"]));
+        assert!(c.entry("track/1").is_none());
+        assert!(c.entry("track/2").is_some());
     }
 
     #[test]
