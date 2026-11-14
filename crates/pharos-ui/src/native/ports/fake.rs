@@ -18,13 +18,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct FakeAudio {
     tx: watch::Sender<PlayerSnapshot>,
+    volumes: Mutex<Vec<f32>>,
 }
 
 impl FakeAudio {
     pub fn new() -> Self {
         Self {
             tx: watch::Sender::new(PlayerSnapshot::default()),
+            volumes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every level the UI set, oldest first.
+    pub fn volumes(&self) -> Vec<f32> {
+        lock(&self.volumes).clone()
     }
 
     /// The engine learning the current track's length.
@@ -117,6 +124,10 @@ impl NativeAudio for FakeAudio {
 
     fn stop(&self) {
         self.tx.send_modify(|s| *s = PlayerSnapshot::default());
+    }
+
+    fn set_volume(&self, level: f32) {
+        lock(&self.volumes).push(level);
     }
 
     fn state(&self) -> watch::Receiver<PlayerSnapshot> {
@@ -411,6 +422,14 @@ mod tests {
         let s = a.snapshot();
         assert_eq!(s.current_id.as_deref(), Some("t1"));
         assert_eq!(s.position_ms, 0);
+    }
+
+    #[test]
+    fn set_volume_is_recorded_in_order() {
+        let a = FakeAudio::new();
+        a.set_volume(0.25);
+        a.set_volume(1.0);
+        assert_eq!(a.volumes(), vec![0.25, 1.0]);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! turns the port's snapshots into the media state and events the player
 //! already understands, and the player's commands into port calls.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -28,9 +28,27 @@ const SEEK_JUMP_MS: u64 = 4_000;
 /// less than the seek.
 const RESYNC_KEEPS_POSITION_AFTER_MS: u64 = 1_500;
 
-/// What the player shows for `snapshot`. Volume is the device's, since the
-/// port has no volume of its own.
+thread_local! {
+    /// The volume and mute last given to the host, for the controls to show:
+    /// the snapshot carries no volume.
+    static HOST_VOLUME: Cell<(f64, bool)> = const { Cell::new((1.0, false)) };
+}
+
+/// The engine level for a slider position: silent when muted, else the volume
+/// clamped to 0.0..=1.0 (a NaN counts as silent).
+pub fn host_level(volume: f64, muted: bool) -> f32 {
+    if muted || volume.is_nan() {
+        return 0.0;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let level = volume.clamp(0.0, 1.0) as f32;
+    level
+}
+
+/// What the player shows for `snapshot`. Volume is the last one given to the
+/// host, since the snapshot has none.
 pub fn media_state(snapshot: &PlayerSnapshot) -> MediaState {
+    let (volume, muted) = HOST_VOLUME.get();
     MediaState {
         position_ms: snapshot.position_ms,
         duration_ms: snapshot.duration_ms.unwrap_or(0),
@@ -39,6 +57,8 @@ pub fn media_state(snapshot: &PlayerSnapshot) -> MediaState {
             PlayState::Idle | PlayState::Paused | PlayState::Ended
         ),
         loading: snapshot.state == PlayState::Buffering,
+        volume,
+        muted,
         ..MediaState::default()
     }
 }
@@ -233,6 +253,12 @@ impl Music {
 
     pub fn stop(&self) {
         self.port.stop();
+    }
+
+    /// Set the host's output level and remember it for the controls.
+    pub fn set_volume(&self, volume: f64, muted: bool) {
+        HOST_VOLUME.set((volume, muted));
+        self.port.set_volume(host_level(volume, muted));
     }
 
     /// Ask the host for the song `to` if it is the one it plays next. `false`
@@ -647,6 +673,26 @@ mod tests {
         io.pause(OUTGOING_ID);
         assert_eq!(fake.snapshot().state, PlayState::Playing);
         assert_eq!(io.state(OUTGOING_ID), MediaState::default());
+    }
+
+    #[test]
+    fn the_volume_reaches_the_host_and_the_controls() {
+        let (fake, m) = music();
+        m.set_volume(0.4, false);
+        m.set_volume(0.9, true);
+        assert_eq!(fake.volumes(), vec![0.4, 0.0]);
+        let io = MediaIo { music: Some(m) };
+        let shown = io.state(VIDEO_ID);
+        assert_eq!((shown.volume, shown.muted), (0.9, true));
+    }
+
+    #[test]
+    fn a_level_is_clamped_and_a_mute_is_silent() {
+        assert_eq!(host_level(0.5, false), 0.5);
+        assert_eq!(host_level(-1.0, false), 0.0);
+        assert_eq!(host_level(2.0, false), 1.0);
+        assert_eq!(host_level(0.5, true), 0.0);
+        assert_eq!(host_level(f64::NAN, false), 0.0);
     }
 
     #[test]
