@@ -1061,6 +1061,28 @@ mod tests {
     }
 
     #[test]
+    fn enabling_the_cache_logs_where_its_cap_came_from() {
+        crate::testlog::start();
+        let (lib, dir) = offline_lib("cap-source");
+        let has = |want: &str| crate::testlog::lines().iter().any(|l| l == want);
+        assert!(
+            has("cache cap bytes=1048576 source=default"),
+            "{:?}",
+            crate::testlog::lines()
+        );
+        lib.set_cache_cap(4096).unwrap();
+        drop(lib);
+        crate::testlog::start();
+        let lib2 = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        lib2.enable_cache(&dir, 1 << 20).unwrap();
+        assert!(
+            has("cache cap bytes=4096 source=saved"),
+            "{:?}",
+            crate::testlog::lines()
+        );
+    }
+
+    #[test]
     fn reloading_with_no_token_file_signs_out_quietly() {
         let tok = cache_dir("reload-none").join("device-token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
