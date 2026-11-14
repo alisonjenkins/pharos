@@ -4143,7 +4143,11 @@ mod tests {
     fn a_locked_book_has_no_read_action_and_says_why() {
         let html = book_page(BookFormat::Unreadable, Some(0.5));
         assert!(!html.contains("/read/") && !html.contains("Read"), "{html}");
-        assert!(html.contains("locked to a Kindle device"), "{html}");
+        assert!(
+            html.contains("Locked to a Kindle (DRM). Pharos can&#39;t open it.")
+                || html.contains("Locked to a Kindle (DRM). Pharos can't open it."),
+            "{html}"
+        );
         assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
     }
 
