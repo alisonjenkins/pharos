@@ -51,7 +51,7 @@ use session::*;
 
 use std::path::Path;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use std::sync::{Mutex, OnceLock};
 

@@ -201,6 +201,15 @@ pub fn destroy(env: &mut JNIEnv) -> R<()> {
     Ok(())
 }
 
+/// The share of the app's level that plays now: lower while ducked.
+pub(crate) fn duck_factor() -> f32 {
+    if DUCKED.load(Ordering::SeqCst) {
+        DUCK_VOLUME
+    } else {
+        1.0
+    }
+}
+
 fn set_volume(env: &mut JNIEnv, v: f32) -> R<()> {
     let player = state_lock()?.as_ref().and_then(|s| s.player.clone());
     if let Some(p) = player {
@@ -239,7 +248,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             AUDIOFOCUS_GAIN => {
                 let mut did = Vec::new();
                 if DUCKED.swap(false, Ordering::SeqCst) {
-                    set_volume(env, 1.0)?;
+                    set_volume(env, crate::command::volume())?;
                     did.push("unduck");
                 }
                 if RESUME_ON_GAIN.swap(false, Ordering::SeqCst) {
@@ -269,7 +278,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
                 }
             }
             AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK => {
-                set_volume(env, DUCK_VOLUME)?;
+                set_volume(env, crate::command::volume() * DUCK_VOLUME)?;
                 DUCKED.store(true, Ordering::SeqCst);
                 "duck".to_owned()
             }
