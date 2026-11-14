@@ -7,6 +7,8 @@
 //! search (`onSearch`, `onPlayFromSearch`), and logs every call with its
 //! inputs so a logcat line proves each hop reached Rust.
 
+pub mod content;
+
 use std::sync::Mutex;
 
 use jni::objects::{GlobalRef, JObject, JString, JValue};
