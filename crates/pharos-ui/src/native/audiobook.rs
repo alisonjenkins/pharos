@@ -563,6 +563,8 @@ mod tests {
 
     /// A part handed to the outgoing element by a crossfade resets that
     /// element's speed when it goes, not the next part's.
+    // `take_speed_sets` is the host platform's test hook; Android tests build the WebView platform.
+    #[cfg(not(all(feature = "mobile", target_os = "android")))]
     #[test]
     fn leaving_resets_only_the_element_still_driven() {
         use super::super::watch_view::{OUTGOING_ID, VIDEO_ID};
