@@ -25,6 +25,7 @@ pub mod comic;
 pub mod epub;
 pub mod integrity;
 pub mod kindle;
+pub mod mobi_exth;
 pub mod pdf;
 
 use std::path::Path;
