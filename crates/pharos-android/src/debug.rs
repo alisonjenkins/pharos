@@ -6,8 +6,9 @@
 //! `--ez on false` restores it. `--el cap_bytes N` sets the cache cap (see
 //! `content::Library::set_cache_cap`). Registered in code, for the
 //! service's life only. Exported, because the shell is another app, but
-//! guarded by `DUMP`: the shell holds it and an ordinary installed app
-//! cannot, so no other app can turn the server off or shrink the cache.
+//! guarded by `DUMP`: only the shell and platform-signed or privileged apps
+//! hold it, so an ordinary installed app cannot turn the server off or
+//! shrink the cache.
 
 use std::sync::Mutex;
 
