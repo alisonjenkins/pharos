@@ -15,7 +15,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod error;
-#[allow(dead_code)]
 mod fuzzy;
 mod id;
 mod library;
