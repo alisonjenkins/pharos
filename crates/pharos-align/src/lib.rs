@@ -21,6 +21,7 @@ pub mod placement;
 pub mod plan;
 pub mod recognise;
 pub mod refine;
+pub mod separate;
 pub mod service;
 pub mod text;
 pub mod tokens;
