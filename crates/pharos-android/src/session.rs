@@ -310,10 +310,22 @@ pub(crate) fn bundle_keys(env: &mut JNIEnv, extras: &JObject) -> R<String> {
 
 /// Loads `item` without starting it, as the PREPARE actions ask: its
 /// metadata and PAUSED. A later onPlay plays it.
-pub(crate) fn prepare(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>) -> R<()> {
-    PLAY_GEN.fetch_add(1, Ordering::SeqCst);
+pub(crate) fn prepare(env: &mut JNIEnv, item: Item, queue: Vec<Item>) -> R<()> {
+    prepare_at(env, item, queue, supersede())
+}
+
+/// [`prepare`] for a request that already holds its generation `gen`; a
+/// newer request made meanwhile drops it.
+pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen: u64) -> R<()> {
     let session = {
         let mut guard = state_lock()?;
+        if !is_current(gen) {
+            log(&format!(
+                "prepare id={}: a newer request superseded it, dropped",
+                item.id
+            ));
+            return Ok(());
+        }
         let st = guard.as_mut().ok_or("prepare before onCreate")?;
         if let Some(old) = st.player.take() {
             let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
@@ -335,8 +347,9 @@ pub(crate) fn prepare(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>) -> R<(
 
 /// Prepares `id`: a test entry at once, a library node from a worker.
 pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
+    let gen = supersede();
     if let Some(item) = fixture::playable(id) {
-        return prepare(env, item, fixture::playables());
+        return prepare_at(env, item, fixture::playables(), gen);
     }
     let id = id.to_owned();
     on_worker("prepare", move |env| {
@@ -344,7 +357,7 @@ pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
         let node = lib
             .node(&id)
             .map_err(|e| format!("node {id}: {}", e.redacted()))?;
-        prepare(env, Item::of_node(node), queue_for(&id))
+        prepare_at(env, Item::of_node(node), queue_for(&id), gen)
     })
 }
 
