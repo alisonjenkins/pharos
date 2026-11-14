@@ -449,11 +449,13 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 "android/media/MediaPlayer$OnPreparedListener".into(),
                 "android/media/MediaPlayer$OnErrorListener".into(),
                 "android/media/MediaPlayer$OnCompletionListener".into(),
+                "android/media/AudioManager$OnAudioFocusChangeListener".into(),
             ],
             methods: vec![
                 native("onPrepared", "(Landroid/media/MediaPlayer;)V"),
                 native("onError", "(Landroid/media/MediaPlayer;II)Z"),
                 native("onCompletion", "(Landroid/media/MediaPlayer;)V"),
+                native("onAudioFocusChange", "(I)V"),
             ],
         },
         // Android Auto searches over androidx's compat protocol: a Messenger
