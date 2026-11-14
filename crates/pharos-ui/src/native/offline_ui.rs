@@ -5,7 +5,7 @@
 
 use pharos_client::api::ItemRef;
 
-use super::ports::{ContainerKind, ContainerRef, Download, TrackState};
+use super::ports::{ContainerKind, ContainerRef, Download, TrackDownload, TrackState};
 use super::route::Route;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -144,12 +144,22 @@ pub fn track_label(state: TrackState) -> &'static str {
     }
 }
 
-/// What a Downloads row calls a container. A mix is named by its id; the
-/// port carries no album titles, so an album shows its id.
-pub fn container_title(container: &ContainerRef) -> String {
-    match container.kind {
-        ContainerKind::Mix => container.id.clone(),
-        ContainerKind::Album => format!("Album {}", container.id),
+/// What a Downloads row calls a container: the title the host reports, or
+/// its id when the host gave none.
+pub fn container_title(d: &Download) -> String {
+    if d.title.trim().is_empty() {
+        d.container.id.clone()
+    } else {
+        d.title.clone()
+    }
+}
+
+/// A track's name in the list, or its id when the host gave none.
+pub fn track_title(t: &TrackDownload) -> String {
+    if t.title.trim().is_empty() {
+        t.id.clone()
+    } else {
+        t.title.clone()
     }
 }
 
@@ -188,11 +198,14 @@ mod tests {
     fn pinned(id: &str, states: &[TrackState]) -> Download {
         Download {
             container: album(id),
+            title: format!("Album {id}"),
+            subtitle: None,
             tracks: states
                 .iter()
                 .enumerate()
                 .map(|(i, s)| TrackDownload {
                     id: format!("t{i}"),
+                    title: format!("Song {i}"),
                     state: *s,
                     bytes: 100,
                 })
@@ -296,8 +309,19 @@ mod tests {
             id: "Morning".into(),
         };
         assert_eq!(container_route(&mix), None);
-        assert_eq!(container_title(&mix), "Morning");
-        assert_eq!(container_title(&album("42")), "Album 42");
+    }
+
+    #[test]
+    fn a_row_uses_the_host_titles_and_falls_back_to_ids() {
+        let mut d = pinned("42", &[TrackState::Cached]);
+        assert_eq!(container_title(&d), "Album 42");
+        d.title = "  ".into();
+        assert_eq!(container_title(&d), "42");
+        assert_eq!(d.tracks.first().map(track_title).as_deref(), Some("Song 0"));
+        if let Some(t) = d.tracks.first_mut() {
+            t.title = String::new();
+        }
+        assert_eq!(d.tracks.first().map(track_title).as_deref(), Some("t0"));
     }
 
     #[test]
