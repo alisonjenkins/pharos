@@ -1849,6 +1849,7 @@ fn PagedGrid(
     // `SENTINEL_LEAD` from the end (it reports a tile already in view).
     use_effect(move || {
         let armed = pager.read().sentinel().is_some();
+        platform::lead_lazy_art();
         watch.set(if armed {
             platform::watch_sentinel(&[SENTINEL_ID, END_ID], move || {
                 requests.send(Ask::Next(Trigger::Scroll))

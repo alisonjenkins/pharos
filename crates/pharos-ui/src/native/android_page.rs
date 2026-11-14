@@ -1161,6 +1161,10 @@ impl Drop for SentinelWatch {
     }
 }
 
+/// The Android app keeps the WebView's own lazy loading: a TV's RAM is too
+/// tight to decode posters further ahead.
+pub fn lead_lazy_art() {}
+
 /// Call `on_visible` each time one of the elements with `ids` comes into
 /// view, as the browser's observer does, so a grid loads its next page on
 /// scroll instead of only from "Show more".

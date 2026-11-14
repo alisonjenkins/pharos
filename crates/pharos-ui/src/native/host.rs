@@ -464,6 +464,9 @@ pub fn spawn_detached(_fut: impl std::future::Future<Output = ()> + 'static) {}
 /// The host has no DOM to observe.
 pub struct SentinelWatch;
 
+/// The host has no DOM; lazy art is left to the browser.
+pub fn lead_lazy_art() {}
+
 pub fn watch_sentinel(_ids: &[&str], _on_visible: impl FnMut() + 'static) -> Option<SentinelWatch> {
     None
 }
