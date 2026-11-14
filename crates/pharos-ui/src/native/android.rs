@@ -192,7 +192,10 @@ pub fn store_token(token: &str) -> Result<(), String> {
         std::fs::rename(&tmp, &path)
     };
     write()
-        .inspect(|()| set_cached(Some(token.to_owned())))
+        .inspect(|()| {
+            set_cached(Some(token.to_owned()));
+            note_credentials_changed("stored");
+        })
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("{}: {e}", path.display())
@@ -207,6 +210,14 @@ pub fn forget_token() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::warn!("forget token: {e}"),
     }
+    note_credentials_changed("forgotten");
+}
+
+/// Tells the host app the token file changed, so the car's media service in
+/// the same process re-reads it (spec 044).
+fn note_credentials_changed(change: &str) {
+    let hook = super::ports::credentials_changed();
+    log::info!("pharos: credentials change={change} host_hook={hook}");
 }
 
 /// Connect and spawn the driver, retrying with backoff until it works.
