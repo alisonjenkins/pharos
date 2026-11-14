@@ -26,6 +26,7 @@ serde_json = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
 httparse = "1"
+libc = "0.2"
 pharos-api = { path = "../../../crates/pharos-api" }
 pharos-client = { path = "../../../crates/pharos-client" }
 
