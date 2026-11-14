@@ -192,6 +192,9 @@ pub trait OfflineStore: Send + Sync {
     fn unpin(&self, container: &ContainerRef) -> Result<(), OfflineError>;
     fn downloads(&self) -> Vec<Download>;
     fn is_cached(&self, track_id: &str) -> bool;
+    /// Whether the phone can reach the server now. Offline, only cached
+    /// tracks play.
+    fn is_online(&self) -> bool;
 }
 
 #[cfg(test)]
