@@ -63,3 +63,7 @@ metrics-util.workspace = true
 [[example]]
 name = "recognise"
 required-features = ["recognise"]
+
+[[example]]
+name = "separate"
+required-features = ["separate"]
