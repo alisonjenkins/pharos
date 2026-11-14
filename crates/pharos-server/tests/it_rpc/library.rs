@@ -4362,6 +4362,144 @@ async fn a_books_library_lists_books_and_its_courses_apart() {
     );
 }
 
+/// One listing's name, author line, length and audiobook mark per item.
+async fn audiobook_rows(
+    session: &session::Client,
+    parent: Option<&str>,
+    kinds: &[Kind],
+) -> Vec<(String, String, u64, bool)> {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    if let Some(parent) = parent {
+        let mut id = q.reborrow().init_parent_id();
+        match WireId::parse(parent).unwrap() {
+            WireId::Real(n) => id.set_real(n),
+            WireId::Synth(n) => id.set_synth(n),
+        }
+    }
+    let mut list = q.reborrow().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    q.set_sort_by("SortName");
+    let reply = req.send().promise.await.unwrap();
+    let items_result::Page(page) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("the listing answered an error");
+    };
+    page.unwrap()
+        .get_items()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i.get_name().unwrap().to_str().unwrap().to_owned(),
+                i.get_artist().unwrap().to_str().unwrap().to_owned(),
+                i.get_runtime_ms(),
+                i.get_audiobook(),
+            )
+        })
+        .collect()
+}
+
+/// ADR-0132 — a Books library's default listing keeps its books alone; its
+/// audiobooks list as albums marked as audiobooks, each naming its author
+/// and its whole length, and their tracks are marked too. A music album is
+/// not marked. Disarm check: with `mark_album` never setting the mark, the
+/// albums under the Books library answer `false` and no author.
+#[actix_web::test]
+async fn a_books_library_lists_its_audiobooks_as_albums() {
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tracks = [
+        (
+            710,
+            "/libBooks/Ada Field/Gadget Tales.m4b",
+            "Gadget Tales",
+            "Gadget Tales",
+            3_600_000,
+            Some(1),
+        ),
+        (
+            711,
+            "/libBooks/Ada Field/Widget Days/1 Opening.mp3",
+            "Opening",
+            "Widget Days",
+            600_000,
+            Some(1),
+        ),
+        (
+            712,
+            "/libBooks/Ada Field/Widget Days/2 Ending.mp3",
+            "Ending",
+            "Widget Days",
+            900_000,
+            Some(2),
+        ),
+        (
+            713,
+            "/elsewhere/Band A/Loud Songs/1 Song.mp3",
+            "Song",
+            "Loud Songs",
+            200_000,
+            Some(1),
+        ),
+    ];
+    for (id, path, title, album, ms, track) in tracks {
+        let author = if album == "Loud Songs" {
+            "Band A"
+        } else {
+            "Ada Field"
+        };
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: path.into(),
+                title: title.into(),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    album: Some(album.into()),
+                    album_artist: Some(author.into()),
+                    duration_ms: Some(ms),
+                    track_number: track,
+                    ..MediaProbe::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    let books = seed_books_library(&fx).await;
+
+    assert_eq!(
+        listed(&session, &books, &[], "SortName").await,
+        [("Widget Handbook".to_owned(), None)],
+        "the books default keeps audiobooks out"
+    );
+    let book = |name: &str, ms| (name.to_owned(), "Ada Field".to_owned(), ms, true);
+    assert_eq!(
+        audiobook_rows(&session, Some(&books), &[Kind::Album]).await,
+        [
+            book("Gadget Tales", 3_600_000),
+            book("Widget Days", 1_500_000)
+        ]
+    );
+    let all = audiobook_rows(&session, None, &[Kind::Album]).await;
+    let song = all.iter().find(|r| r.0 == "Loud Songs").unwrap();
+    assert!(!song.3, "a music album is no audiobook");
+    assert_eq!(song.1, "", "a music album's tile is unchanged");
+    let chapters = audiobook_rows(&session, Some(&books), &[Kind::Audio]).await;
+    assert_eq!(chapters.len(), 3, "{chapters:?}");
+    assert!(chapters.iter().all(|c| c.3), "{chapters:?}");
+}
+
 /// Spec 043 SC-002 — a Books library's genre filter offers the shelves its
 /// books carry and nothing else: not a film's genres from another library,
 /// not a course lesson's; and picking a shelf lists its books.
