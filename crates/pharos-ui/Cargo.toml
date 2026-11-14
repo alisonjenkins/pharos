@@ -144,6 +144,8 @@ js-sys = { version = "0.3", optional = true }
 # the transitive copy.
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
 pharos-client = { path = "../pharos-client" }
+# 044: the watch channel behind the NativeAudio port; `sync` only, so it builds for wasm32.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 # 026: the pure-Rust subtitle renderer behind the SubtitleRenderer port.
 pharos-subs = { path = "../pharos-subs" }
 pharos-hls = { path = "../pharos-hls" }
@@ -177,6 +179,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 log = "0.4"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside
 # `#[test]`s so we can assert structural landmarks (input #ids,
 # button text, expected error branches) without a browser. Lives at

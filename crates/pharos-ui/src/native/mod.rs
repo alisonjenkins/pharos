@@ -66,6 +66,7 @@ pub use platform::use_server_proxy;
 mod platform;
 pub mod playback;
 pub mod playback_settings;
+pub mod ports;
 /// For the non-native player's `<video>` (V455).
 pub use platform::lift_cues_as_shown;
 
