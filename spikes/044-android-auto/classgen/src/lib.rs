@@ -374,6 +374,20 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
                 native("onPlayFromSearch", "(Ljava/lang/String;Landroid/os/Bundle;)V"),
             ],
         },
+        // The phone-side voice entry point: the assistant lists an app as
+        // able to take "play X on <app>" only if an activity handles
+        // MEDIA_PLAY_FROM_SEARCH. It has no UI; Rust reads the query and
+        // finishes it.
+        ClassSpec {
+            name: format!("{PKG}/PharosSearchActivity"),
+            superclass: "android/app/Activity".into(),
+            load_library: Some("pharos_auto".into()),
+            methods: vec![Method::SuperThenNative {
+                name: "onCreate".into(),
+                descriptor: "(Landroid/os/Bundle;)V".into(),
+                hook: "nativeOnCreate".into(),
+            }],
+        },
     ]
 }
 

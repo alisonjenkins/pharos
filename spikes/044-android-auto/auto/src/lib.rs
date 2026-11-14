@@ -513,3 +513,44 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
         }
     })
 }
+
+// ---- PharosSearchActivity --------------------------------------------------
+
+/// The assistant's "play X on <app>" from the phone side arrives as a
+/// MEDIA_PLAY_FROM_SEARCH intent to this invisible activity. It plays the
+/// best match if the media service is running, and finishes either way.
+#[no_mangle]
+pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_nativeOnCreate<'l>(
+    mut env: JNIEnv<'l>,
+    this: JObject<'l>,
+    _saved: JObject<'l>,
+) {
+    guarded(&mut env, "search activity", (), |env| {
+        let intent = env
+            .call_method(&this, "getIntent", "()Landroid/content/Intent;", &[])
+            .and_then(|v| v.l())
+            .map_err(jerr("getIntent"))?;
+        let action = env
+            .call_method(&intent, "getAction", "()Ljava/lang/String;", &[])
+            .and_then(|v| v.l())
+            .map_err(jerr("getAction"))?;
+        let action = string(env, &JString::from(action))?;
+        let key = JObject::from(env.new_string("query").map_err(jerr("key"))?);
+        let q = env
+            .call_method(&intent, "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;", &[JValue::Object(&key)])
+            .and_then(|v| v.l())
+            .map_err(jerr("getStringExtra"))?;
+        let q = string(env, &JString::from(q))?;
+        let hit = search(&q).first().map(|e| e.id);
+        let service_up = state_lock()?.is_some();
+        log(&format!(
+            "search activity action={action} query={q:?} verdict={hit:?} service_up={service_up}"
+        ));
+        let played = match (hit, service_up) {
+            (Some(id), true) => play(env, id),
+            _ => Ok(()),
+        };
+        env.call_method(&this, "finish", "()V", &[]).map_err(jerr("finish"))?;
+        played
+    })
+}
