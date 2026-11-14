@@ -24,8 +24,12 @@ public abstract class MediaBrowserService extends android.app.Service {
     public synchronized void sendResult(T result) { value = result; sent = true; notifyAll(); }
     /** Waits for a result sent from another thread, as the framework would. */
     public synchronized Result<T> await() throws InterruptedException {
-      long end = System.currentTimeMillis() + 30_000;
-      while (!sent && System.currentTimeMillis() < end) wait(end - System.currentTimeMillis());
+      long end = System.nanoTime() + 30_000_000_000L;
+      while (!sent) {
+        long left = (end - System.nanoTime()) / 1_000_000;
+        if (left <= 0) break;
+        wait(left);
+      }
       return this;
     }
   }
