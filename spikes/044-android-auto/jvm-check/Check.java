@@ -171,6 +171,9 @@ public class Check {
     MediaPlayer.last.firePrepared();
     MediaPlayer.last.fireCompletion();
     expect("tone:523".equals(session.md.m.get("android.media.metadata.MEDIA_ID")), "completion skips to the next item: " + session.md);
+    MediaPlayer.last.firePrepared();
+    cb.onPlayFromSearch("Next song", null);
+    expect("stream:example".equals(session.md.m.get("android.media.metadata.MEDIA_ID")), "a spoken \"next song\" skips instead of searching: " + session.md);
     android.os.Bundle hints = new android.os.Bundle();
     hints.putString("android.intent.extra.focus", "vnd.android.cursor.item/audio");
     cb.onPrepareFromSearch("test chapter", hints);

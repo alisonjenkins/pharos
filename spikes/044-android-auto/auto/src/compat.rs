@@ -240,6 +240,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_ha
         let receiver = env.new_global_ref(&req.receiver).map_err(jerr("global receiver"))?;
         let (query, class) = (req.query, req.receiver_class);
         log(&format!("compat onSearch query={query:?} receiver={class}"));
+        if let Some(cmd) = crate::voice::command(&query) {
+            log(&format!("compat onSearch query={query:?} verdict={cmd:?} reason=voice_command"));
+            crate::voice::run(env, cmd)?;
+            return reply(env, receiver.as_obj(), &[Item::notice(cmd.done(), "Voice command")]);
+        }
         // The library search blocks on the network; the main thread must not.
         crate::on_worker("compat search", move |env| {
             let hits = crate::find(&query);
