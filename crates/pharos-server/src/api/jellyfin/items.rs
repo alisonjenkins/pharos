@@ -5452,6 +5452,11 @@ async fn synth_album_or_artist(
             }]);
             it.album_artist = Some(a);
         }
+        // B1441 — the same description the album's tile carries.
+        it.overview = aggregate_albums(tracks.iter().copied(), |_| true, |i| state.is_audiobook(i))
+            .into_iter()
+            .next()
+            .and_then(|a| a.overview());
         let mut dto = serde_json::to_value(it).unwrap_or(serde_json::Value::Null);
         let runtime_ms = tracks.iter().fold(0u64, |sum, t| {
             sum.saturating_add(t.probe.duration_ms.unwrap_or(0))
