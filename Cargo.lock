@@ -8646,6 +8646,7 @@ name = "pharos-vis"
 version = "0.0.0"
 dependencies = [
  "log",
+ "pharos-ui",
  "realfft",
  "symphonia",
  "thiserror 2.0.21",

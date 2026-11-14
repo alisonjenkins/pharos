@@ -13,5 +13,9 @@ realfft = "3"
 thiserror = { workspace = true }
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "aac", "isomp4", "ogg", "vorbis", "wav", "alac", "pcm"] }
 
+[dev-dependencies]
+# Holds the wire constants the page decodes with to this crate's own.
+pharos-ui = { path = "../pharos-ui" }
+
 [lints]
 workspace = true
