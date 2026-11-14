@@ -534,8 +534,10 @@ impl<P: Prober> FsScanner<P> {
         &self,
         path: &Path,
         probe: &pharos_core::MediaProbe,
-    ) -> Option<crate::audiobook::Classified> {
-        self.course_roots.root_of(path)?;
+    ) -> Result<Option<crate::audiobook::Classified>, ProbeMiss> {
+        if self.course_roots.root_of(path).is_none() {
+            return Ok(None);
+        }
         let (path, probe, roots) = (path.to_path_buf(), probe.clone(), self.course_roots.clone());
         let shown = path.clone();
         match tokio::task::spawn_blocking(move || {
@@ -543,12 +545,103 @@ impl<P: Prober> FsScanner<P> {
         })
         .await
         {
-            Ok(got) => got,
+            Ok(Ok(got)) => Ok(got),
+            Ok(Err(e)) => {
+                tracing::warn!(path = %shown.display(), error = %e, "audiobook: its book folder could not be listed whole; trying again next pass");
+                Err(ProbeMiss::Incomplete)
+            }
             Err(e) => {
                 tracing::warn!(path = %shown.display(), error = %e, "audiobook: the classify task failed; stored as a song");
-                None
+                Ok(None)
             }
         }
+    }
+
+    /// Whether the unchanged audio file `primary` is stored with another
+    /// place in its book than its folder now gives it: a part added,
+    /// removed or renamed beside it renumbers it without touching its
+    /// bytes (ADR-0132). Read from the stored probe, so only the folder
+    /// is listed; a row or folder that cannot be read is left as it is.
+    async fn book_drift<S: MediaStore>(&self, store: &S, row: MediaId, primary: &Path) -> bool {
+        if !crate::audiobook::is_book_container(primary)
+            || self.course_roots.root_of(primary).is_none()
+        {
+            return false;
+        }
+        let stored = match store.get(row).await {
+            Ok(item) if item.kind == MediaKind::Audio => item,
+            Ok(_) => return false,
+            Err(err) => {
+                tracing::warn!(media.id = %row, path = %primary.display(), error = %err, "could not read a row to check its place in its book");
+                return false;
+            }
+        };
+        let (path, probe, roots) = (
+            primary.to_path_buf(),
+            stored.probe.clone(),
+            self.course_roots.clone(),
+        );
+        let got = tokio::task::spawn_blocking(move || {
+            crate::audiobook::classify(&path, &probe, &roots, crate::audiobook::folder_tracks)
+        })
+        .await;
+        let now = match got {
+            Ok(Ok(Some(got))) => got,
+            Ok(Ok(None)) => return false,
+            Ok(Err(err)) => {
+                tracing::warn!(media.id = %row, path = %primary.display(), error = %err, "could not list a book folder to check its numbering");
+                return false;
+            }
+            Err(err) => {
+                tracing::warn!(media.id = %row, path = %primary.display(), error = %err, "the book numbering check failed");
+                return false;
+            }
+        };
+        let (album, track) = match &now.book {
+            Some(book) => (Some(book.title.as_str()), book.track.or(Some(1))),
+            None => (None, None),
+        };
+        let drifted = now.book.is_none()
+            || stored.probe.album.as_deref() != album
+            || stored.probe.track_number != track;
+        if drifted {
+            let reason = ReprobeReason::BookChanged.label();
+            tracing::info!(
+                media.id = %row,
+                path = %primary.display(),
+                stored_album = stored.probe.album.as_deref().unwrap_or(""),
+                stored_track = stored.probe.track_number,
+                album = album.unwrap_or(""),
+                track,
+                verdict = now.verdict.label(),
+                reason,
+                "an unchanged file's place in its book moved; re-probing it",
+            );
+            metrics::counter!("pharos_scan_reprobe_total", "reason" => reason).increment(1);
+        }
+        drifted
+    }
+
+    /// Whether a file moved from `from` to `to` with the same bytes must be
+    /// re-probed after its row is rebound: an audiobook's album and track
+    /// number come from its folder, so a move into, out of or within a
+    /// Books root changes them though the bytes did not (ADR-0132).
+    fn moved_book(&self, row: MediaId, from: &Path, to: &Path) -> bool {
+        let book = |p: &Path| {
+            crate::audiobook::is_book_container(p) && self.course_roots.root_of(p).is_some()
+        };
+        let moved = book(from) || book(to);
+        if moved {
+            tracing::info!(
+                media.id = %row,
+                from = %from.display(),
+                to = %to.display(),
+                "an audiobook file moved; re-probing it for its new book",
+            );
+            metrics::counter!("pharos_scan_reprobe_total", "reason" => ReprobeReason::BookChanged.label())
+                .increment(1);
+        }
+        moved
     }
 
     /// The lesson `path` is, under this scanner's Books roots.
@@ -1002,7 +1095,8 @@ impl<P: Prober> FsScanner<P> {
                                     self.course_lesson(&primary).is_some(),
                                 )
                                 .await
-                                    && !nfo_drift(&nfos, row, &primary, state.last_scanned) =>
+                                    && !nfo_drift(&nfos, row, &primary, state.last_scanned)
+                                    && !self.book_drift(store, row, &primary).await =>
                                 {
                                     seen_batch.push((row, mtime, size));
                                     seen += 1;
@@ -1078,11 +1172,24 @@ impl<P: Prober> FsScanner<P> {
                     // falls through to a fresh insert under `id`.
                     Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
                         store.rebind_path(c.id, &primary).await?;
-                        if let Some((mtime, size)) = sig {
-                            seen_batch.push((c.id, mtime, size));
-                        }
                         if let Some(fp) = fp {
                             store.set_fingerprint(c.id, fp).await?;
+                        }
+                        if self.moved_book(c.id, &c.path, &primary) {
+                            pending.push(Pending {
+                                primary,
+                                alts,
+                                id,
+                                row: c.id,
+                                sig,
+                                fp,
+                                existed: true,
+                                kept: sig,
+                            });
+                            continue;
+                        }
+                        if let Some((mtime, size)) = sig {
+                            seen_batch.push((c.id, mtime, size));
                         }
                         seen += 1;
                         outcome.updated.push(c.id);
@@ -1174,8 +1281,8 @@ impl<P: Prober> FsScanner<P> {
                     // skips a provider that errors. Only resolve for an item
                     // we actually probed — a probe miss writes nothing.
                     let meta = match &item {
-                        Some(it) => self.resolve_metadata(it).await,
-                        None => MetadataResult::default(),
+                        Ok(it) => self.resolve_metadata(it).await,
+                        Err(_) => MetadataResult::default(),
                     };
                     (p.id, p.row, p.sig, p.existed, kept, fp, item, meta)
                 }
@@ -1234,9 +1341,7 @@ impl<P: Prober> FsScanner<P> {
                 // item is not reported until its batch lands.
                 probed_done += 1;
                 emit(
-                    phase1_done + probed_done
-                        - batch_items.len() as u64
-                        - u64::from(item.is_some()),
+                    phase1_done + probed_done - batch_items.len() as u64 - u64::from(item.is_ok()),
                 );
                 // Record the outcome either way, so the next pass can skip a file
                 // that cannot be probed and re-try one that has been replaced. This
@@ -1244,17 +1349,31 @@ impl<P: Prober> FsScanner<P> {
                 // no row (V6), which is what made it repeat forever.
                 if let Some(memo) = self.probe_memo.as_ref() {
                     match &item {
-                        Some(_) => memo.forget(probed_id),
-                        None => memo.record(probed_id, sig),
+                        Ok(_) | Err(ProbeMiss::Excluded) => memo.forget(probed_id),
+                        Err(ProbeMiss::Unreadable) => memo.record(probed_id, sig),
+                        Err(ProbeMiss::Incomplete) => {}
                     }
                 }
-                let Some(mut item) = item else {
-                    if let Some((path, mtime, size)) = kept {
-                        store.mark_seen(row, scan_id, mtime, size).await?;
-                        seen += 1;
-                        keep_unreadable_row(row, &path, "reprobe_failed");
+                let mut item = match item {
+                    Ok(item) => item,
+                    Err(ProbeMiss::Unreadable) => {
+                        if let Some((path, mtime, size)) = kept {
+                            store.mark_seen(row, scan_id, mtime, size).await?;
+                            seen += 1;
+                            keep_unreadable_row(row, &path, "reprobe_failed");
+                        }
+                        continue;
                     }
-                    continue;
+                    // Left unseen, so the sweep takes a row the file had.
+                    Err(ProbeMiss::Excluded) => continue,
+                    Err(ProbeMiss::Incomplete) => {
+                        if let Some((path, mtime, size)) = kept {
+                            store.mark_seen(row, scan_id, mtime, size).await?;
+                            seen += 1;
+                            keep_unreadable_row(row, &path, "book_inventory_incomplete");
+                        }
+                        continue;
+                    }
                 };
                 item.id = row;
                 let item_id = item.id;
@@ -1584,6 +1703,10 @@ impl<P: Prober> FsScanner<P> {
                 if let Some(fp) = fp {
                     store.set_fingerprint(c.id, fp).await?;
                 }
+                if self.moved_book(c.id, &c.path, path) {
+                    self.probe_put_one(path, store, scan_id, sig, fp, Some(c.id))
+                        .await?;
+                }
                 Ok(PathUpdate::Updated(c.id))
             }
             // New file or genuine duplicate (old path still on disk) — probe + insert.
@@ -1809,7 +1932,7 @@ impl<P: Prober> FsScanner<P> {
             Some(fp) => Some(fp),
             None => crate::fingerprint::fingerprint_async(path, None).await.ok(),
         };
-        let Some(mut item) = self.probe_one(path.to_path_buf()).await else {
+        let Ok(mut item) = self.probe_one(path.to_path_buf()).await else {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
@@ -1899,14 +2022,14 @@ impl<P: Prober> FsScanner<P> {
         &self,
         primary: PathBuf,
         alts: Vec<(String, PathBuf)>,
-    ) -> Option<MediaItem> {
+    ) -> Result<MediaItem, ProbeMiss> {
         let mut item = self.probe_one(primary).await?;
         if item.kind == MediaKind::Book {
             for (label, alt_path) in alts {
                 let alt = book_alternate(&item.probe.alternate_sources, &label, alt_path).await;
                 item.probe.alternate_sources.extend(alt);
             }
-            return Some(item);
+            return Ok(item);
         }
         for (edition, alt_path) in alts {
             match self.prober.probe(&alt_path).await {
@@ -1953,7 +2076,7 @@ impl<P: Prober> FsScanner<P> {
                 }
             }
         }
-        Some(item)
+        Ok(item)
     }
 
     /// LIB-D7 — resolve local-first metadata for a freshly-probed `item`.
@@ -2020,13 +2143,13 @@ impl<P: Prober> FsScanner<P> {
     }
 
     #[tracing::instrument(skip(self), fields(media.path = %path.display()))]
-    async fn probe_one(&self, path: PathBuf) -> Option<MediaItem> {
+    async fn probe_one(&self, path: PathBuf) -> Result<MediaItem, ProbeMiss> {
         // 004-books / FR-001 — classify BEFORE the prober is reached. This is
         // not an optimisation: `self.prober.probe` fails on an epub, the `Err`
         // arm below writes nothing (V6), and the item would never exist. The
         // ordering IS the feature.
         if let Some(item) = self.book_item(&path) {
-            return Some(item);
+            return Ok(item);
         }
         match self.prober.probe(&path).await {
             Ok(info) => {
@@ -2067,14 +2190,16 @@ impl<P: Prober> FsScanner<P> {
                 // ADR-0132 — audio under a Books root is an audiobook, or
                 // left out when it is a loose file without chapters.
                 let book = match info.kind {
-                    MediaKind::Audio => self.audiobook(&path, &probe).await,
+                    MediaKind::Audio => self.audiobook(&path, &probe).await?,
                     _ => None,
                 };
                 if let Some(got) = &book {
                     crate::audiobook::record(&path, &probe, got);
                 }
                 let book = match book {
-                    Some(got) if got.verdict == crate::audiobook::Verdict::Skipped => return None,
+                    Some(got) if got.verdict == crate::audiobook::Verdict::Skipped => {
+                        return Err(ProbeMiss::Excluded)
+                    }
                     Some(got) => got.book,
                     None => None,
                 };
@@ -2126,7 +2251,7 @@ impl<P: Prober> FsScanner<P> {
                 } else {
                     None
                 };
-                Some(MediaItem {
+                Ok(MediaItem {
                     locked: Default::default(),
                     id: stable_id(&path),
                     path,
@@ -2161,10 +2286,26 @@ impl<P: Prober> FsScanner<P> {
             }
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "probe failed, skipping");
-                None
+                Err(ProbeMiss::Unreadable)
             }
         }
     }
+}
+
+/// Why [`FsScanner::probe_one`] produced no row for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeMiss {
+    /// The file could not be read: a row already there is kept as it was,
+    /// and the probe memo remembers the failure (B1286).
+    Unreadable,
+    /// The file was read and is not part of the library (a loose audio file
+    /// without chapters in a Books root, ADR-0132): a row already there is
+    /// swept, and the memo forgets the file.
+    Excluded,
+    /// What the file is could not be told this pass (its book folder could
+    /// not be listed whole): a row already there is kept as it was, and the
+    /// memo does not hold it, so the next pass tries again.
+    Incomplete,
 }
 
 /// What became of a video read as a course lesson: the
@@ -2501,7 +2642,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         groups.extend(lessons.into_iter().map(|p| (p, Vec::new())));
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
-            if let Some(item) = self.probe_with_alternates(primary, alts).await {
+            if let Ok(item) = self.probe_with_alternates(primary, alts).await {
                 items.push(item);
             }
             if !self.rate_limit.is_zero() {
@@ -2684,15 +2825,19 @@ pub(crate) enum ReprobeReason {
     Changed,
     /// A course lesson's row is not yet stored as one (V1392).
     CourseLesson,
+    /// An audiobook file's stored album or track number is not what its
+    /// folder now gives it (ADR-0132).
+    BookChanged,
 }
 
 impl ReprobeReason {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Removed,
         Self::Added,
         Self::Changed,
         Self::CourseLesson,
+        Self::BookChanged,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -2701,6 +2846,7 @@ impl ReprobeReason {
             Self::Added => "edition_added",
             Self::Changed => "edition_changed",
             Self::CourseLesson => "course_lesson",
+            Self::BookChanged => "audiobook_changed",
         }
     }
 }
@@ -5223,7 +5369,7 @@ static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::La
 /// stays off the shelves until it is sorted.
 pub const IGNORE_MARKER: &str = ".ignore";
 
-fn is_ignored_dir(dir: &Path) -> bool {
+pub(crate) fn is_ignored_dir(dir: &Path) -> bool {
     dir.join(IGNORE_MARKER).is_file()
 }
 
@@ -12588,6 +12734,152 @@ mod tests {
         assert_eq!(count("folder_track", "in_folder"), 3);
         assert_eq!(count("folder_track", "m4b_in_folder"), 2);
         assert_eq!(count("skipped", "loose_without_chapters"), 1);
+    }
+
+    /// ADR-0132 — a book at a Books root that loses its chapters is left
+    /// out: its row is swept, not kept as unreadable, and the probe memo
+    /// does not hold it as a file that cannot be read.
+    #[tokio::test]
+    async fn a_root_file_that_loses_its_chapters_is_swept() {
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        let path = books.join("Sprocket Notes.m4a");
+        write_file(&books, "Sprocket Notes.m4a", b"book-bytes").await;
+        let roots = || crate::course::CourseRoots::new([(books.clone(), true)]);
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        let store = MemStore::default();
+        let chapters = vec![pharos_core::MediaChapter {
+            start_ms: 0,
+            end_ms: 1000,
+            title: "One".into(),
+        }];
+        FsScanner::new(FakeProber {
+            chapters_for: Some(("Sprocket".into(), chapters)),
+            ..FakeProber::default()
+        })
+        .with_course_roots(roots())
+        .with_probe_memo(memo.clone())
+        .scan_into(td.path(), &store)
+        .await
+        .unwrap();
+        let id = stable_id(&path);
+        assert!(store.get(id).await.is_ok(), "chapters make it a book");
+
+        write_file(&books, "Sprocket Notes.m4a", b"book-bytes, re-cut").await;
+        let out = FsScanner::new(FakeProber::default())
+            .with_course_roots(roots())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out.removed, vec![id], "the excluded file's row is swept");
+        assert!(store.get(id).await.is_err());
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(
+            !memo.is_known_bad(id, Some((mtime_secs(&meta), meta.len()))),
+            "an excluded file is not a probe failure"
+        );
+    }
+
+    /// ADR-0132 — parts added between a folder book's parts renumber the
+    /// unchanged parts after them, though their bytes did not change.
+    #[tokio::test]
+    async fn parts_added_between_renumber_the_unchanged_parts() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        let scanner = || {
+            FsScanner::new(FakeProber::default())
+                .with_course_roots(crate::course::CourseRoots::new([(books.clone(), true)]))
+        };
+        let store = MemStore::default();
+        for n in ["01", "04"] {
+            write_file(&books, &format!("Widget Days/{n}.mp3"), n.as_bytes()).await;
+        }
+        scanner().scan_into(td.path(), &store).await.unwrap();
+        let track = |n: &str| {
+            let id = stable_id(&books.join(format!("Widget Days/{n}.mp3")));
+            let store = &store;
+            async move { store.get(id).await.unwrap().probe.track_number }
+        };
+        assert_eq!(track("04").await, Some(2));
+
+        for n in ["02", "03"] {
+            write_file(&books, &format!("Widget Days/{n}.mp3"), n.as_bytes()).await;
+        }
+        scanner().scan_into(td.path(), &store).await.unwrap();
+        for (n, want) in [("01", 1), ("02", 2), ("03", 3), ("04", 4)] {
+            assert_eq!(track(n).await, Some(want), "{n}.mp3");
+        }
+        let renumbered: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_reprobe_total"
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == "audiobook_changed") =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(renumbered, 1, "only 04.mp3 moved");
+    }
+
+    /// ADR-0132 — an audiobook file moved to another book folder, bytes
+    /// unchanged, keeps its row and takes the new book's album and place,
+    /// in a full scan and from the watcher.
+    #[tokio::test]
+    async fn a_moved_audiobook_file_joins_its_new_book() {
+        let td = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        let s = FsScanner::new(FakeProber::default())
+            .with_course_roots(crate::course::CourseRoots::new([(books.clone(), true)]));
+        let store = MemStore::default();
+        for (f, bytes) in [
+            ("Widget Days/01.mp3", b"part one".as_slice()),
+            ("Widget Days/02.mp3", b"part two"),
+            ("Gadget Tales/01.mp3", b"tale one"),
+        ] {
+            write_file(&books, f, bytes).await;
+        }
+        s.scan_into(td.path(), &store).await.unwrap();
+        let moved = stable_id(&books.join("Widget Days/02.mp3"));
+
+        let to = books.join("Gadget Tales/02.mp3");
+        tokio::fs::rename(books.join("Widget Days/02.mp3"), &to)
+            .await
+            .unwrap();
+        s.scan_into(td.path(), &store).await.unwrap();
+        let row = store.get(moved).await.unwrap();
+        assert_eq!(row.path, to, "the move keeps the row");
+        assert_eq!(row.probe.album.as_deref(), Some("Gadget Tales"));
+        assert_eq!(row.probe.track_number, Some(2));
+
+        let back = books.join("Widget Days/03.mp3");
+        tokio::fs::rename(&to, &back).await.unwrap();
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&back, &store, scan_id).await.unwrap();
+        let row = store.get(moved).await.unwrap();
+        assert_eq!(row.path, back);
+        assert_eq!(
+            row.probe.album.as_deref(),
+            Some("Widget Days"),
+            "watched move"
+        );
+        assert_eq!(row.probe.track_number, Some(2), "watched move");
     }
 
     #[test]

@@ -2,6 +2,9 @@
 //! timer and the chapter list. They show only while an audiobook plays; the
 //! music player beside them is unchanged.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Item, ItemKind, ItemRef};
 
@@ -106,6 +109,34 @@ pub fn sleep_at(
     }
 }
 
+/// Whether a sleep timer pausing at `at` stops the book at the end of the
+/// file playing, where the player would otherwise move on to the next part.
+pub fn ends_with_track(at: Option<u64>, runtime_ms: u64) -> bool {
+    at.is_some_and(|at| at.saturating_add(TRACK_END_MARGIN_MS) >= runtime_ms)
+}
+
+/// Set while an armed sleep timer ends with the file playing. The player
+/// reads it before a crossfade or a file's end moves the queue on: a
+/// crossfade starts the next part seconds before the timer's pause.
+#[derive(Debug, Clone, Default)]
+pub struct StopAtEnd(Rc<Cell<bool>>);
+
+impl PartialEq for StopAtEnd {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl StopAtEnd {
+    pub fn arm(&self, on: bool) {
+        self.0.set(on);
+    }
+
+    pub fn armed(&self) -> bool {
+        self.0.get()
+    }
+}
+
 /// The track an audiobook's Play starts on: the last one begun and not
 /// finished, else the first not finished, else the first (V1403).
 pub fn resume_track(tracks: &[Item]) -> Option<&Item> {
@@ -125,6 +156,8 @@ pub struct Audiobook {
     pub book: Option<ItemRef>,
     /// The track playing.
     pub playing: ItemRef,
+    /// Shared with the player playing it.
+    pub stop_at_end: StopAtEnd,
 }
 
 /// Speed, sleep timer and chapters, under the music controls.
@@ -146,16 +179,28 @@ pub fn AudiobookControls(
     let mut tracks = use_signal(Vec::<Item>::new);
     let folder = book.chapters.is_empty();
 
+    // The element this instance drives now: a crossfade moves a part to
+    // the outgoing element and gives the playing one to the next part.
+    let owned = use_hook(|| Rc::new(Cell::new(media_id)));
+    owned.set(media_id);
+
     // A new source starts at the element's default rate, which `set_speed`
     // also sets; a song after the book plays at normal speed again.
     let want = speed();
-    use_effect(move || {
-        let want = speed();
-        if platform::speed(media_id) != want {
-            platform::set_speed(media_id, want);
+    use_effect({
+        let owned = Rc::clone(&owned);
+        move || {
+            let want = speed();
+            let media_id = owned.get();
+            if platform::speed(media_id) != want {
+                platform::set_speed(media_id, want);
+            }
         }
     });
-    use_drop(move || platform::set_speed(media_id, 1.0));
+    use_drop({
+        let owned = Rc::clone(&owned);
+        move || platform::set_speed(owned.get(), 1.0)
+    });
 
     // A folder book's chapters are its tracks.
     let album = book.book;
@@ -185,6 +230,8 @@ pub fn AudiobookControls(
     });
 
     // "End of chapter" pauses once the playhead reaches the armed end.
+    // A signal only so the click handlers stay `Copy`.
+    let stop_at_end = use_signal(|| book.stop_at_end.clone());
     use_effect(use_reactive!(|(media,)| {
         let Some(at) = *sleep_pos.peek() else {
             return;
@@ -197,6 +244,7 @@ pub fn AudiobookControls(
             platform::pause(media_id);
             sleep_pos.set(None);
             sleep.set(Sleep::Off);
+            stop_at_end.peek().arm(false);
         }
     }));
 
@@ -205,8 +253,10 @@ pub fn AudiobookControls(
         sleep_gen.set(gen);
         sleep.set(next);
         sleep_pos.set(pos);
+        let holds = ends_with_track(pos, runtime_ms);
+        stop_at_end.peek().arm(holds);
         platform::info(&format!(
-            "pharos: audiobook sleep set timer={} position_ms={} end_ms={pos:?}",
+            "pharos: audiobook sleep set timer={} position_ms={} end_ms={pos:?} holds_queue={holds}",
             next.token(),
             media.position_ms
         ));
@@ -357,6 +407,85 @@ mod tests {
             None
         );
         assert_eq!(sleep_at(Sleep::Off, &chapters, 10_000, 90_000), None);
+    }
+
+    #[test]
+    fn a_timer_at_the_file_end_holds_the_queue() {
+        let chapters = [ch("One", 0), ch("Two", 60_000)];
+        let at = |pos| sleep_at(Sleep::EndOfChapter, &chapters, pos, 90_000);
+        assert!(
+            !ends_with_track(at(10_000), 90_000),
+            "chapter one ends mid-file"
+        );
+        assert!(
+            ends_with_track(at(70_000), 90_000),
+            "the last chapter ends the file"
+        );
+        let folder = sleep_at(Sleep::EndOfChapter, &[], 10_000, 90_000);
+        assert!(
+            ends_with_track(folder, 90_000),
+            "a folder book's file is the chapter"
+        );
+        assert!(!ends_with_track(None, 90_000));
+    }
+
+    /// A part handed to the outgoing element by a crossfade resets that
+    /// element's speed when it goes, not the next part's.
+    #[test]
+    fn leaving_resets_only_the_element_still_driven() {
+        use super::super::watch_view::{OUTGOING_ID, VIDEO_ID};
+        use dioxus::dioxus_core::{NoOpMutations, ScopeId};
+        #[derive(Clone)]
+        struct Props {
+            id: Rc<Cell<&'static str>>,
+            shown: Rc<Cell<bool>>,
+        }
+        impl PartialEq for Props {
+            fn eq(&self, _: &Self) -> bool {
+                false
+            }
+        }
+        let props = Props {
+            id: Rc::new(Cell::new(VIDEO_ID)),
+            shown: Rc::new(Cell::new(true)),
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |p: Props| {
+                let media_id = p.id.get();
+                rsx! {
+                    if p.shown.get() {
+                        AudiobookControls {
+                            book: Audiobook {
+                                chapters: Vec::new(),
+                                book: None,
+                                playing: ItemRef::Real(1),
+                                stop_at_end: StopAtEnd::default(),
+                            },
+                            media: MediaState::default(),
+                            runtime_ms: 60_000,
+                            media_id,
+                            on_control: |_| {},
+                        }
+                    }
+                }
+            },
+            props.clone(),
+        );
+        dom.rebuild_in_place();
+        let mut render = || {
+            dom.mark_dirty(ScopeId::APP);
+            dom.render_immediate(&mut NoOpMutations);
+        };
+        props.id.set(OUTGOING_ID);
+        render();
+        platform::take_speed_sets();
+        props.shown.set(false);
+        render();
+        assert_eq!(
+            platform::take_speed_sets(),
+            [(OUTGOING_ID.to_owned(), 1.0)],
+            "the next part's element keeps its speed"
+        );
     }
 
     #[test]

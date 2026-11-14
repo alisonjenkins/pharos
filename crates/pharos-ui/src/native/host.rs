@@ -179,7 +179,22 @@ pub fn pause(_video_id: &str) {}
 
 pub fn set_rate(_video_id: &str, _rate: f64) {}
 
-pub fn set_speed(_video_id: &str, _rate: f64) {}
+#[cfg(test)]
+thread_local! {
+    /// Every `set_speed` call on this thread, for tests to read.
+    static SPEED_SETS: std::cell::RefCell<Vec<(String, f64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn set_speed(_video_id: &str, _rate: f64) {
+    #[cfg(test)]
+    SPEED_SETS.with(|s| s.borrow_mut().push((_video_id.to_owned(), _rate)));
+}
+
+/// The `set_speed` calls made on this thread since the last take.
+#[cfg(test)]
+pub fn take_speed_sets() -> Vec<(String, f64)> {
+    SPEED_SETS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
 
 pub fn speed(_video_id: &str) -> f64 {
     1.0

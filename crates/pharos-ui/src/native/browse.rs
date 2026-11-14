@@ -935,6 +935,19 @@ pub async fn load<A: PharosApi>(
             albums: list(id, Some(ItemKind::Album), ARTIST_ALBUM_ORDER).await?,
             detail,
         },
+        // An audiobook's Play resumes on the part last begun, which can lie
+        // past the first page, so its parts are read whole (V1403).
+        (Plan::Album, Some(detail)) if detail.item.audiobook => {
+            let items = list_all(api, info, id, None, INDEX_ORDER).await?;
+            Browse::Album {
+                tracks: Page {
+                    total: u32::try_from(items.len()).unwrap_or(u32::MAX),
+                    items,
+                    start: 0,
+                },
+                detail,
+            }
+        }
         (Plan::Album, Some(detail)) => Browse::Album {
             tracks: list(id, None, INDEX_ORDER).await?,
             detail,
@@ -3138,6 +3151,16 @@ impl BooksTab {
             .collect()
     }
 
+    /// The tab shown when this one is chosen: itself while `tabs` offers
+    /// it, else Books, as a list can empty while its tab is open.
+    pub fn within(self, tabs: &[Self]) -> Self {
+        if tabs.contains(&self) {
+            self
+        } else {
+            Self::Books
+        }
+    }
+
     /// Its `tab=` value in the URL.
     pub fn token(self) -> &'static str {
         match self {
@@ -3278,18 +3301,14 @@ fn BooksTabs(
 ) -> Element {
     let tabs = BooksTab::shown(courses.total, audiobooks.total);
     let opened = use_hook(|| {
-        let asked = if Route::parse(&platform::current_path()) == Route::Browse(library) {
+        if Route::parse(&platform::current_path()) == Route::Browse(library) {
             books_choice(&platform::current_search())
-        } else {
-            BooksTab::Books
-        };
-        if BooksTab::shown(courses.total, audiobooks.total).contains(&asked) {
-            asked
         } else {
             BooksTab::Books
         }
     });
     let tab = use_signal(|| opened);
+    let current = tab().within(&tabs);
     use_effect(move || {
         let tab = tab();
         let here = Route::parse(&platform::current_path()) == Route::Browse(library);
@@ -3318,7 +3337,7 @@ fn BooksTabs(
                     aria_label: "{title}",
                     "data-key-tabs": "books",
                     onkeydown: move |e: KeyboardEvent| {
-                        if let Some(next) = tab().stepped(&tabs, &e.key()) {
+                        if let Some(next) = current.stepped(&tabs, &e.key()) {
                             e.prevent_default();
                             switch_books_tab(library, tab, next);
                             platform::focus_by_id(next.id());
@@ -3330,16 +3349,16 @@ fn BooksTabs(
                             r#type: "button",
                             role: "tab",
                             id: t.id(),
-                            class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
-                            aria_selected: tab() == t,
-                            tabindex: if tab() == t { "0" } else { "-1" },
+                            class: if current == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                            aria_selected: current == t,
+                            tabindex: if current == t { "0" } else { "-1" },
                             onclick: move |_| switch_books_tab(library, tab, t),
                             "{t.label()}"
                         }
                     }
                 }
             }
-            match tab() {
+            match current {
                 BooksTab::Books => remount_on(
                     &format!("books {library}"),
                     rsx! {
@@ -5467,8 +5486,57 @@ mod tests {
         assert_eq!(books_query(BooksTab::Audiobooks), "?tab=audiobooks");
     }
 
+    /// ADR-0132: a tab whose list emptied while it was open gives way to
+    /// Books, so no hidden panel stays drawn and the arrows step from Books.
+    #[test]
+    fn a_tab_no_longer_shown_falls_back_to_books() {
+        let left = BooksTab::shown(1, 0);
+        assert_eq!(BooksTab::Audiobooks.within(&left), BooksTab::Books);
+        assert_eq!(BooksTab::Courses.within(&left), BooksTab::Courses);
+        assert_eq!(
+            BooksTab::Audiobooks
+                .within(&left)
+                .stepped(&left, &Key::Named(NamedKey::ArrowRight)),
+            Some(BooksTab::Courses)
+        );
+    }
+
     /// ADR-0132: a Books library lists its audiobooks as albums beside its
     /// books, and a listing that fails leaves the books shown.
+    /// V1403: an audiobook longer than one page resumes on a part begun
+    /// past the first page.
+    #[test]
+    fn an_audiobook_resumes_past_its_first_page() {
+        let book = ItemRef::Synth(62);
+        let mut fake = Fake::default();
+        let mut album = item(book, ItemKind::Album, "Gadget Tales");
+        album.audiobook = true;
+        fake.details.insert(book, detail(album));
+        let parts: Vec<Item> = (1..=u64::from(BROWSE_PAGE) + 5)
+            .map(|n| {
+                let mut part = item(ItemRef::Real(n), ItemKind::Audio, &format!("Part {n}"));
+                part.played = n <= u64::from(BROWSE_PAGE) + 2;
+                part.position_ms = if n == u64::from(BROWSE_PAGE) + 3 {
+                    5_000
+                } else {
+                    0
+                };
+                part
+            })
+            .collect();
+        fake.lists.insert((book, None), parts);
+        let Browse::Album { tracks, .. } =
+            run(load(&fake, &CallInfo::default(), book, |_| {})).unwrap()
+        else {
+            panic!("not an album");
+        };
+        assert_eq!(tracks.items.len(), BROWSE_PAGE as usize + 5);
+        assert_eq!(
+            super::super::audiobook::resume_track(&tracks.items).map(|t| t.id),
+            Some(ItemRef::Real(u64::from(BROWSE_PAGE) + 3))
+        );
+    }
+
     #[test]
     fn a_books_library_loads_its_audiobooks() {
         let lib = ItemRef::Synth(61);

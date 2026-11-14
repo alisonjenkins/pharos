@@ -706,7 +706,7 @@ async fn music_similar(
         }
         let excluded = id_set(q.exclude_artist_ids.as_deref());
         // Keep every track; the exclusions below are ALBUM-level.
-        let mut aggs = aggregate_albums(all.iter(), |_| true);
+        let mut aggs = aggregate_albums(all.iter(), |_| true, |i| state.is_audiobook(i));
         aggs.retain(|a| !a.name.eq_ignore_ascii_case(&album_name));
         if !excluded.is_empty() {
             aggs.retain(|a| {
@@ -3460,8 +3460,9 @@ struct AlbumAgg {
     /// Newest track `created_at`, so a freshly added track surfaces its album.
     created_at: Option<i64>,
     runtime_ms: u64,
-    /// One of its tracks, which says what library the album is in.
-    sample_path: std::path::PathBuf,
+    /// Whether any of its tracks is an audiobook's (ADR-0132), the rule the
+    /// album's detail uses too.
+    audiobook: bool,
 }
 
 impl AlbumAgg {
@@ -3503,10 +3504,12 @@ impl AlbumAgg {
 }
 
 /// Group audio rows into albums. `keep` decides which TRACKS participate
-/// (artist-role filters); an album aggregates only its kept tracks.
+/// (artist-role filters); an album aggregates only its kept tracks, and is
+/// an audiobook when `is_book` holds for any of them.
 fn aggregate_albums<'a>(
     items: impl IntoIterator<Item = &'a MediaItem>,
     keep: impl Fn(&MediaItem) -> bool,
+    is_book: impl Fn(&MediaItem) -> bool,
 ) -> Vec<AlbumAgg> {
     use std::collections::HashMap;
     let mut map: HashMap<String, AlbumAgg> = HashMap::new();
@@ -3525,9 +3528,10 @@ fn aggregate_albums<'a>(
             premiere_date: None,
             created_at: None,
             runtime_ms: 0,
-            sample_path: i.path.clone(),
+            audiobook: false,
         });
         e.child_count += 1;
+        e.audiobook = e.audiobook || is_book(i);
         e.premiere_date = match (e.premiere_date, i.metadata.premiere_date) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3595,8 +3599,7 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
         )
     })
     .unwrap_or(serde_json::Value::Null);
-    let audiobook = state.course_roots().root_of(&a.sample_path).is_some();
-    mark_album(&mut dto, a.runtime_ms, audiobook);
+    mark_album(&mut dto, a.runtime_ms, a.audiobook);
     dto
 }
 
@@ -3665,9 +3668,13 @@ pub(crate) async fn latest_group_dtos(
                 }
                 Some(dto)
             }
-            (MediaKind::Audio, _) => match aggregate_albums(children.iter().copied(), |_| true)
-                .into_iter()
-                .next()
+            (MediaKind::Audio, _) => match aggregate_albums(
+                children.iter().copied(),
+                |_| true,
+                |i| state.is_audiobook(i),
+            )
+            .into_iter()
+            .next()
             {
                 Some(album) => Some(synth_album_dto(state, &album).await),
                 None => None,
@@ -3735,7 +3742,7 @@ async fn album_dtos(
     sort_by: Option<&str>,
     orders: &[bool],
 ) -> Vec<serde_json::Value> {
-    let mut aggs = aggregate_albums(items, keep);
+    let mut aggs = aggregate_albums(items, keep, |i| state.is_audiobook(i));
     sort_album_aggs(&mut aggs, sort_by, orders);
     let mut dtos = Vec::with_capacity(aggs.len());
     for a in &aggs {
@@ -3935,7 +3942,7 @@ async fn maybe_list_music(
         }
         true
     };
-    let mut aggs = aggregate_albums(all.iter(), keep);
+    let mut aggs = aggregate_albums(all.iter(), keep, |i| state.is_audiobook(i));
     if !exclude_ids.is_empty() {
         aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
     }
@@ -6126,10 +6133,14 @@ pub(crate) async fn music_groups_named(
         .filter(|(rank, _)| rank.is_exact())
         .map(|(rank, name)| (*rank, *name))
         .collect();
-    let mut own = aggregate_albums(&tracks, |i| exact.iter().any(|(_, a)| on_artist_page(i, a)));
+    let mut own = aggregate_albums(
+        &tracks,
+        |i| exact.iter().any(|(_, a)| on_artist_page(i, a)),
+        |i| state.is_audiobook(i),
+    );
     own.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
     let own_rank = exact.first().map(|(rank, _)| *rank);
-    let mut named: Vec<_> = aggregate_albums(&tracks, |_| true)
+    let mut named: Vec<_> = aggregate_albums(&tracks, |_| true, |i| state.is_audiobook(i))
         .into_iter()
         .filter(|a| !own.iter().any(|o| o.name == a.name))
         .filter_map(|a| {
@@ -6197,8 +6208,11 @@ pub(crate) async fn music_groups_page(
     // returned is built into DTOs, each of which looks up an image tag.
     match grouping {
         MusicGrouping::Album => {
-            let mut aggs =
-                aggregate_albums(&tracks, |i| artist.map_or(true, |a| on_artist_page(i, a)));
+            let mut aggs = aggregate_albums(
+                &tracks,
+                |i| artist.map_or(true, |a| on_artist_page(i, a)),
+                |i| state.is_audiobook(i),
+            );
             sort_album_aggs(
                 &mut aggs,
                 q.sort_by.as_deref(),
@@ -8436,6 +8450,30 @@ mod filed_artist_tests {
         ];
         assert_eq!(filed_artist_names(&tracks), ["ABBA", "Foo"]);
         assert!(on_artist_page(&tracks[2], "foo"));
+    }
+
+    /// ADR-0132 — an album is an audiobook when any of its tracks is, as
+    /// its detail decides, whichever track the listing meets first.
+    #[test]
+    fn an_album_is_an_audiobook_when_any_track_is() {
+        let at = |path: &str| MediaItem {
+            path: path.into(),
+            probe: pharos_core::MediaProbe {
+                album: Some("Widget Days".into()),
+                ..pharos_core::MediaProbe::default()
+            },
+            ..track(Some("Ada Field"), None)
+        };
+        let tracks = [
+            at("/elsewhere/Widget Days/1.mp3"),
+            at("/libBooks/Widget Days/2.mp3"),
+        ];
+        let albums = aggregate_albums(&tracks, |_| true, |i| i.path.starts_with("/libBooks"));
+        assert_eq!(albums.len(), 1);
+        assert!(
+            albums.first().is_some_and(|a| a.audiobook),
+            "the second track is a book's"
+        );
     }
 }
 

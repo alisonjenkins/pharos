@@ -23,5 +23,5 @@
 
 - [ ] T046-09 Read a narrator tag into the probe (needs a column or a JSON field).
 - [ ] T046-10 Key albums by folder so books of one title stay apart.
-- [ ] T046-11 Renumber a folder book's later tracks when the watcher adds a file between them.
+- [ ] T046-11 Renumber a folder book's later tracks when the watcher adds a file between them. A full scan renumbers them (`pharos_scan_reprobe_total{reason="audiobook_changed"}`); the watcher still leaves them to the next scan.
 - [ ] T046-12 Verify on a deployed server: `sum by (verdict, reason) (increase(pharos_scan_audiobook_total[1d]))` after the first real audiobook lands.

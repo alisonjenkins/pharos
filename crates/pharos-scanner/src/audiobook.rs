@@ -160,25 +160,62 @@ fn book_folder(parent: &Path, root: &Path) -> PathBuf {
     }
 }
 
-/// The track files of the book in `folder`, every folder below it
-/// included, in natural order of their paths under it.
-pub fn folder_tracks(folder: &Path) -> Vec<PathBuf> {
+/// Why a book folder's tracks could not all be listed. A partial list
+/// would number the tracks wrongly, so none is returned.
+#[derive(Debug, thiserror::Error)]
+pub enum InventoryError {
+    #[error("could not list book folder {folder}: {source}")]
+    ListFolder {
+        folder: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not read an entry of book folder {folder}: {source}")]
+    ReadEntry {
+        folder: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not tell what {path} is: {source}")]
+    FileType {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// The track files of the book in `folder`, in natural order of their
+/// paths under it: its own files and those of its disc folders, the only
+/// files whose [`book_folder`] is `folder`. Any other folder below is a
+/// book of its own, and a disc folder holding `.ignore` is left out, as
+/// the scan's walk leaves it out.
+pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
     let mut found = Vec::new();
-    let mut dirs = vec![folder.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(folder = %dir.display(), error = %e, "audiobook: a book folder could not be listed");
-                continue;
-            }
-        };
-        for entry in entries.flatten() {
+    let mut dirs = vec![(folder.to_path_buf(), true)];
+    while let Some((dir, top)) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|source| InventoryError::ListFolder {
+            folder: dir.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| InventoryError::ReadEntry {
+                folder: dir.clone(),
+                source,
+            })?;
             let path = entry.path();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => dirs.push(path),
-                Ok(_) if is_track_file(&path) => found.push(path),
-                _ => {}
+            let kind = entry
+                .file_type()
+                .map_err(|source| InventoryError::FileType {
+                    path: path.clone(),
+                    source,
+                })?;
+            if kind.is_dir() {
+                let disc = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_disc_folder);
+                if top && disc && !crate::fs::is_ignored_dir(&path) {
+                    dirs.push((path, false));
+                }
+            } else if is_track_file(&path) {
+                found.push(path);
             }
         }
     }
@@ -191,7 +228,7 @@ pub fn folder_tracks(folder: &Path) -> Vec<PathBuf> {
         };
         crate::book::comic::natural_cmp(&key(a), &key(b))
     });
-    found
+    Ok(found)
 }
 
 fn tag(value: Option<&String>) -> Option<String> {
@@ -228,18 +265,23 @@ fn stem_title(path: &Path) -> String {
 /// What the audio file `path`, probed as `probe`, is under `roots`; `None`
 /// when it is not an audio file a book can be, or no Books library is the
 /// innermost one holding it. `tracks` lists a book folder's tracks
-/// ([`folder_tracks`]); it is asked only for a file in a folder.
+/// ([`folder_tracks`]); it is asked only for a file in a folder, and its
+/// error is returned, as a file cannot be numbered from part of a folder.
 pub fn classify(
     path: &Path,
     probe: &MediaProbe,
     roots: &CourseRoots,
-    tracks: impl FnOnce(&Path) -> Vec<PathBuf>,
-) -> Option<Classified> {
+    tracks: impl FnOnce(&Path) -> Result<Vec<PathBuf>, InventoryError>,
+) -> Result<Option<Classified>, InventoryError> {
     if !is_book_container(path) {
-        return None;
+        return Ok(None);
     }
-    let root = roots.root_of(path)?;
-    let parent = path.parent()?;
+    let Some(root) = roots.root_of(path) else {
+        return Ok(None);
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
     let has_chapters = !probe.chapters.is_empty();
     let single = |reason| {
         let title = tag(probe.album.as_ref())
@@ -260,10 +302,10 @@ pub fn classify(
     };
     let is_m4b = extension(path).as_deref() == Some(BOOK_EXTENSION);
     if is_m4b && (has_chapters || parent == root) {
-        return Some(single(Reason::M4b));
+        return Ok(Some(single(Reason::M4b)));
     }
     if parent == root {
-        return Some(if has_chapters {
+        return Ok(Some(if has_chapters {
             single(Reason::Chapters)
         } else {
             Classified {
@@ -271,26 +313,25 @@ pub fn classify(
                 reason: Reason::LooseWithoutChapters,
                 book: None,
             }
-        });
+        }));
     }
     let folder = book_folder(parent, root);
-    let listed = tracks(&folder);
+    let listed = tracks(&folder)?;
     if is_m4b {
         let split = listed
             .iter()
-            .filter(|p| p.parent() == Some(parent))
             .filter(|p| extension(p).as_deref() == Some(BOOK_EXTENSION))
             .count();
         if split <= 1 {
-            return Some(single(Reason::M4b));
+            return Ok(Some(single(Reason::M4b)));
         }
     }
     if has_chapters && listed.len() <= 1 {
-        return Some(single(Reason::Chapters));
+        return Ok(Some(single(Reason::Chapters)));
     }
     let at = listed.iter().position(|p| p == path);
     let count = u32::try_from(listed.len().max(1)).unwrap_or(u32::MAX);
-    Some(Classified {
+    Ok(Some(Classified {
         verdict: Verdict::FolderTrack,
         reason: if is_m4b {
             Reason::M4bInFolder
@@ -307,7 +348,7 @@ pub fn classify(
             tracks: count,
             folder,
         }),
-    })
+    }))
 }
 
 impl BookTrack {
@@ -372,11 +413,13 @@ mod tests {
             .collect()
     }
 
-    fn listed<'a>(names: &'a [&'a str]) -> impl FnOnce(&Path) -> Vec<PathBuf> + 'a {
-        move |folder| names.iter().map(|n| folder.join(n)).collect()
+    fn listed<'a>(
+        names: &'a [&'a str],
+    ) -> impl FnOnce(&Path) -> Result<Vec<PathBuf>, InventoryError> + 'a {
+        move |folder| Ok(names.iter().map(|n| folder.join(n)).collect())
     }
 
-    fn never(_: &Path) -> Vec<PathBuf> {
+    fn never(_: &Path) -> Result<Vec<PathBuf>, InventoryError> {
         panic!("a single file's folder is not listed")
     }
 
@@ -393,6 +436,7 @@ mod tests {
             &roots(),
             listed(&["Gadget Tales.m4b", "Widget Days/1 Opening.mp3"]),
         )
+        .unwrap()
         .unwrap();
         assert_eq!(
             (got.verdict, got.reason),
@@ -410,11 +454,13 @@ mod tests {
         for (path, lister) in [
             (
                 "/lib/Books/Gadget Tales.m4b",
-                never as fn(&Path) -> Vec<PathBuf>,
+                never as fn(&Path) -> Result<Vec<PathBuf>, InventoryError>,
             ),
             ("/lib/Books/Ada Field/Gadget Tales.m4b", never),
         ] {
-            let got = classify(Path::new(path), &chaptered, &roots(), lister).unwrap();
+            let got = classify(Path::new(path), &chaptered, &roots(), lister)
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 (got.verdict, got.reason),
                 (Verdict::SingleFile, Reason::M4b),
@@ -438,7 +484,9 @@ mod tests {
             ..Default::default()
         };
         let path = Path::new("/lib/Books/Gadget Tales/Gadget Tales - 10 - Chapter 9.m4b");
-        let got = classify(path, &probe, &roots(), listed(&names)).unwrap();
+        let got = classify(path, &probe, &roots(), listed(&names))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (got.verdict, got.reason),
             (Verdict::FolderTrack, Reason::M4bInFolder)
@@ -462,6 +510,7 @@ mod tests {
             &roots(),
             listed(&["02 - Gadget Tales.mp3"]),
         )
+        .unwrap()
         .unwrap();
         assert_eq!(
             (got.verdict, got.reason),
@@ -481,6 +530,7 @@ mod tests {
             &roots(),
             never,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(at_root.verdict, Verdict::SingleFile);
         assert_eq!(at_root.book.unwrap().author, None);
@@ -494,6 +544,7 @@ mod tests {
             &roots(),
             never,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(
             (got.verdict, got.reason),
@@ -509,7 +560,9 @@ mod tests {
         sorted.sort_by(|a, b| crate::book::comic::natural_cmp(a, b));
         assert_eq!(sorted, names, "natural order puts 10 after 2");
         let path = Path::new("/lib/Books/Ada Field/Gadget Tales/10 Ending.mp3");
-        let got = classify(path, &MediaProbe::default(), &roots(), listed(&names)).unwrap();
+        let got = classify(path, &MediaProbe::default(), &roots(), listed(&names))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (got.verdict, got.reason),
             (Verdict::FolderTrack, Reason::InFolder)
@@ -528,8 +581,9 @@ mod tests {
         let mut asked = None;
         let got = classify(path, &MediaProbe::default(), &roots(), |f: &Path| {
             asked = Some(f.to_path_buf());
-            vec![f.join("CD1/01.mp3"), f.join("CD2/01.mp3")]
+            Ok(vec![f.join("CD1/01.mp3"), f.join("CD2/01.mp3")])
         })
+        .unwrap()
         .unwrap();
         assert_eq!(asked.as_deref(), Some(Path::new("/lib/Books/Gadget Tales")));
         let book = got.book.unwrap();
@@ -560,6 +614,7 @@ mod tests {
             &roots(),
             listed(&["01.mp3", "02.mp3"]),
         )
+        .unwrap()
         .unwrap();
         assert_eq!(got.verdict, Verdict::FolderTrack);
     }
@@ -578,6 +633,7 @@ mod tests {
             listed(&["01.mp3"]),
         )
         .unwrap()
+        .unwrap()
         .book
         .unwrap();
         assert_eq!(book.author.as_deref(), Some("Ada Field"));
@@ -593,7 +649,7 @@ mod tests {
             "/lib/Books/Gadget Tales.epub",
         ] {
             assert_eq!(
-                classify(Path::new(path), &MediaProbe::default(), &roots(), never),
+                classify(Path::new(path), &MediaProbe::default(), &roots(), never).unwrap(),
                 None,
                 "{path}"
             );
@@ -639,6 +695,7 @@ mod tests {
             std::fs::write(p, b"").unwrap();
         }
         let got: Vec<String> = folder_tracks(td.path())
+            .unwrap()
             .iter()
             .map(|p| {
                 p.strip_prefix(td.path())
@@ -656,6 +713,79 @@ mod tests {
                 "CD2/1 d.mp3",
                 "x.m4b"
             ]
+        );
+    }
+
+    #[test]
+    fn folder_tracks_leaves_out_books_in_folders_below() {
+        let td = tempfile::TempDir::new().unwrap();
+        let author = td.path().join("Ada Field");
+        for f in [
+            "Gadget Tales.m4a",
+            "Widget Days/01.mp3",
+            "CD1/01.mp3",
+            "CD1/Extras/01.mp3",
+        ] {
+            let p = author.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        }
+        let got: Vec<PathBuf> = folder_tracks(&author)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.strip_prefix(&author).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                PathBuf::from("CD1/01.mp3"),
+                PathBuf::from("Gadget Tales.m4a")
+            ],
+            "a nested book folder is not this book's track"
+        );
+        for p in &got {
+            let parent = author.join(p);
+            assert_eq!(book_folder(parent.parent().unwrap(), td.path()), author);
+        }
+    }
+
+    #[test]
+    fn folder_tracks_leaves_out_an_ignored_disc_folder() {
+        let td = tempfile::TempDir::new().unwrap();
+        for f in ["CD1/01.mp3", "CD2/01.mp3", "CD2/.ignore"] {
+            let p = td.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"").unwrap();
+        }
+        assert_eq!(
+            folder_tracks(td.path()).unwrap(),
+            [td.path().join("CD1/01.mp3")],
+            "the walk does not see CD2, so it does not number this book"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_listed_whole_is_not_classified() {
+        let td = tempfile::TempDir::new().unwrap();
+        let gone = td.path().join("Gadget Tales");
+        assert!(matches!(
+            folder_tracks(&gone),
+            Err(InventoryError::ListFolder { folder, .. }) if folder == gone
+        ));
+        let got = classify(
+            Path::new("/lib/Books/Gadget Tales/01.mp3"),
+            &MediaProbe::default(),
+            &roots(),
+            |f: &Path| {
+                Err(InventoryError::ReadEntry {
+                    folder: f.to_path_buf(),
+                    source: std::io::Error::other("stale handle"),
+                })
+            },
+        );
+        assert!(
+            matches!(got, Err(InventoryError::ReadEntry { .. })),
+            "a partial list must not number the track: {got:?}"
         );
     }
 
