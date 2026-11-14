@@ -30,6 +30,18 @@ pub(crate) fn find_ranked(query: &str) -> (Vec<Item>, Option<content::SearchRepo
     (hits, report)
 }
 
+/// The playable hits; when there are none, the tracks of the first
+/// browsable hit (an album or mix), listed by `expand`.
+fn playable_queue(hits: Vec<Item>, expand: impl FnOnce(&str) -> Vec<Item>) -> Vec<Item> {
+    if hits.iter().any(|i| i.playable) {
+        return hits.into_iter().filter(|i| i.playable).collect();
+    }
+    hits.iter()
+        .find(|i| i.browsable)
+        .map(|b| expand(&b.id).into_iter().filter(|i| i.playable).collect())
+        .unwrap_or_default()
+}
+
 /// Plays a search's top result unasked when it clearly beats the rest: a
 /// track alone, an album or mix from its first track with the rest queued.
 /// Blocks on the network to list an album; run it on a worker.
@@ -101,7 +113,7 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
             .iter()
             .find(|i| !i.playable && !i.browsable)
             .map(|i| i.title.clone());
-        let queue: Vec<Item> = hits.into_iter().filter(|i| i.playable).collect();
+        let queue = playable_queue(hits, children);
         let Some(first) = queue.first().cloned() else {
             log(&format!("{what} verdict=None reason=no_playable_hit"));
             if PLAY_GEN.load(Ordering::SeqCst) == gen {
@@ -234,4 +246,54 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_n
             .map_err(jerr("finish"))?;
         played
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, browsable: bool, playable: bool) -> Item {
+        Item {
+            id: id.into(),
+            browsable,
+            playable,
+            ..Item::notice("", "")
+        }
+    }
+
+    fn ids(items: &[Item]) -> Vec<&str> {
+        items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    #[test]
+    fn an_album_alone_becomes_its_tracks() {
+        let hits = vec![item("album/a", true, false)];
+        let queue = playable_queue(hits, |id| {
+            assert_eq!(id, "album/a");
+            vec![item("track/1", false, true), item("track/2", false, true)]
+        });
+        assert_eq!(ids(&queue), ["track/1", "track/2"]);
+    }
+
+    #[test]
+    fn playable_hits_are_kept_without_listing_anything() {
+        let hits = vec![item("album/a", true, false), item("track/9", false, true)];
+        let listed = std::cell::Cell::new(false);
+        let queue = playable_queue(hits, |_| {
+            listed.set(true);
+            Vec::new()
+        });
+        assert_eq!(ids(&queue), ["track/9"]);
+        assert!(!listed.get());
+    }
+
+    #[test]
+    fn a_notice_alone_stays_empty() {
+        let listed = std::cell::Cell::new(false);
+        let queue = playable_queue(vec![Item::notice("Search failed", "x")], |_| {
+            listed.set(true);
+            Vec::new()
+        });
+        assert!(queue.is_empty() && !listed.get());
+    }
 }
