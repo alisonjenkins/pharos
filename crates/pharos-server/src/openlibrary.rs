@@ -394,6 +394,12 @@ impl<F: Fetch> OpenLibrary<F> {
         })
     }
 
+    /// The fake behind a test client.
+    #[cfg(test)]
+    pub(crate) fn fetch_for_tests(&self) -> &F {
+        &self.fetch
+    }
+
     /// The ISBN rung: `Ok(None)` when Open Library has no such edition or it
     /// names no usable work.
     async fn by_isbn(&self, isbn: &str) -> Result<Option<Lookup>, LookupError> {
