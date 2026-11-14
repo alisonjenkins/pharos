@@ -8,7 +8,8 @@
 # Needs: git, rustup with Cobalt's toolchain (it reads rust-toolchain.toml),
 # and a musl C toolchain for the reader named by CC_armv7_unknown_linux_musleabihf
 # and AR_armv7_unknown_linux_musleabihf. Cobalt uses zig: a CC wrapper running
-# `zig cc -target arm-linux-musleabihf -fno-sanitize=undefined "$@"` with any
+# `zig cc -target arm-linux-musleabihf -fno-sanitize=undefined "$@"
+# -fno-function-sections` with any
 # --target=* argument dropped, and an AR wrapper running `zig ar "$@"`
 # (default.nix has both). glibc's armhf gcc does not link bundled SQLite.
 # PHAROS_KOBO_SERVER sets the server the app talks to.
