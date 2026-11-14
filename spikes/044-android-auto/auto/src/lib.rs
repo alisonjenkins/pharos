@@ -751,6 +751,15 @@ fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
         let first = test_playables().into_iter().next().ok_or("no test entries")?;
         return start(env, &first.id, None);
     }
+    // A track played alone (from search, or offline) still has an album.
+    if queue.len() == 1 && step == 1 {
+        if let (Some(cur), Some(lib)) = (current.as_deref(), LIBRARY.get()) {
+            if let Some(next) = lib.play_queue(cur).into_iter().next() {
+                log("skip: next from the library's play queue");
+                return start(env, &next, None);
+            }
+        }
+    }
     let at = current.and_then(|c| queue.iter().position(|i| i.id == c)).unwrap_or(0);
     let len = queue.len() as isize;
     let next = at as isize + step;
