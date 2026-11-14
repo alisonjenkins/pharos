@@ -31,6 +31,8 @@ pub struct Script {
 pub struct Seen {
     pub path: String,
     pub range: Option<String>,
+    /// The `If-Range` header, when sent.
+    pub if_range: Option<String>,
     pub status: u16,
 }
 
@@ -164,6 +166,9 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     let range = lines
         .clone()
         .find_map(|l| l.strip_prefix("Range: ").map(str::to_owned));
+    let if_range = lines
+        .clone()
+        .find_map(|l| l.strip_prefix("If-Range: ").map(str::to_owned));
     let token = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("api_key="))
@@ -175,6 +180,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         s.log.push(Seen {
             path: path.to_owned(),
             range: range.clone(),
+            if_range,
             status: r.0.status,
         });
         r
