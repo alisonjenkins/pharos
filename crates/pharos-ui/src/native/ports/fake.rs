@@ -74,6 +74,21 @@ impl NativeAudio for FakeAudio {
         });
     }
 
+    fn set_queue(&self, ids: Vec<String>, current_index: usize) {
+        self.tx.send_modify(|s| {
+            if current_index >= ids.len() {
+                s.error = Some(format!(
+                    "current index {current_index} is outside a queue of {}",
+                    ids.len()
+                ));
+                return;
+            }
+            s.current_id = ids.get(current_index).cloned();
+            s.index = Some(current_index);
+            s.queue = ids;
+        });
+    }
+
     fn pause(&self) {
         self.tx.send_modify(|s| {
             if s.state == PlayState::Playing {
@@ -422,6 +437,39 @@ mod tests {
         let s = a.snapshot();
         assert_eq!(s.current_id.as_deref(), Some("t1"));
         assert_eq!(s.position_ms, 0);
+    }
+
+    #[test]
+    fn set_queue_keeps_the_song_playing_where_it_was() {
+        let a = FakeAudio::new();
+        a.play(ids(&["1", "2", "3"]), 0);
+        a.set_duration(200_000);
+        a.seek(30_000);
+        a.set_queue(ids(&["1", "3", "2"]), 0);
+        let s = a.snapshot();
+        assert_eq!(s.queue, ids(&["1", "3", "2"]));
+        assert_eq!(s.state, PlayState::Playing);
+        assert_eq!(s.position_ms, 30_000);
+        assert_eq!(s.duration_ms, Some(200_000));
+        assert_eq!(s.current_id.as_deref(), Some("1"));
+        a.pause();
+        a.set_queue(ids(&["3", "1"]), 1);
+        let s = a.snapshot();
+        assert_eq!((s.state, s.index), (PlayState::Paused, Some(1)));
+        assert_eq!(s.current_id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_set_queue_index_outside_the_queue_reports_its_value() {
+        let a = FakeAudio::new();
+        a.play(ids(&["1"]), 0);
+        a.set_queue(ids(&["1", "2"]), 5);
+        let s = a.snapshot();
+        assert_eq!(s.queue, ids(&["1"]), "unchanged");
+        assert_eq!(
+            s.error.as_deref(),
+            Some("current index 5 is outside a queue of 2")
+        );
     }
 
     #[test]

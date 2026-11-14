@@ -109,6 +109,9 @@ pub struct PlayerSnapshot {
 pub trait NativeAudio: Send + Sync {
     /// Replace the queue with `ids` and start at `start_index`.
     fn play(&self, ids: Vec<String>, start_index: usize);
+    /// Replace the queue with `ids`, with `current_index` as the song now
+    /// playing. The current song keeps playing: no restart, no gap.
+    fn set_queue(&self, ids: Vec<String>, current_index: usize);
     fn pause(&self);
     fn resume(&self);
     fn seek(&self, position_ms: u64);
@@ -218,6 +221,7 @@ mod tests {
 
     impl NativeAudio for Stub {
         fn play(&self, _: Vec<String>, _: usize) {}
+        fn set_queue(&self, _: Vec<String>, _: usize) {}
         fn pause(&self) {}
         fn resume(&self) {}
         fn seek(&self, _: u64) {}
