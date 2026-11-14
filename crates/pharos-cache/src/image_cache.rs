@@ -719,14 +719,21 @@ impl ImageCache {
                         self.widths.insert(key, width);
                         (width, WidthLookup::Disk)
                     }
-                    None => {
-                        let width = intrinsic_width(source)
-                            .instrument(tracing::info_span!("image.header_read"))
-                            .await;
-                        self.widths.insert(key, width);
-                        write_width_file(&file, width).await;
-                        (width, WidthLookup::Miss)
-                    }
+                    None => match intrinsic_width(source)
+                        .instrument(tracing::info_span!("image.header_read"))
+                        .await
+                    {
+                        Ok(width) => {
+                            self.widths.insert(key, width);
+                            write_width_file(&file, width).await;
+                            (width, WidthLookup::Miss)
+                        }
+                        // Not remembered: the share may be back next time.
+                        Err(e) => {
+                            tracing::warn!(error = %e, source = %source.display(), "image source header unreadable");
+                            (None, WidthLookup::Failed)
+                        }
+                    },
                 }
             }
         };
@@ -1791,6 +1798,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_source_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        let src = dir.path().join("gone.png");
+        let key = width_key(&src, None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(cache.source_width(&src, key).await, None);
+            assert_eq!(cache.widths.get(key), None, "no memory entry");
+            let file = dir.path().join("cache/widths").join(format!("{key:016x}"));
+            assert!(!file.exists(), "no width file");
+            std::fs::write(&src, png_header(300)).unwrap();
+            assert_eq!(
+                cache.source_width(&src, key).await,
+                Some(300),
+                "the next lookup reads the source again"
+            );
+        });
+    }
+
+    #[test]
     fn a_written_width_file_leaves_no_temporary_behind() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("w");
@@ -2435,6 +2466,7 @@ enum WidthLookup {
     Hit,
     Disk,
     Miss,
+    Failed,
 }
 
 impl WidthLookup {
@@ -2443,6 +2475,7 @@ impl WidthLookup {
             Self::Hit => "hit",
             Self::Disk => "disk",
             Self::Miss => "miss",
+            Self::Failed => "failed",
         }
     }
 }
@@ -2528,15 +2561,17 @@ impl SourceWidths {
     }
 }
 
-async fn intrinsic_width(source: &Path) -> Option<u32> {
+/// `Ok(None)` is a header this parser does not know; `Err` is a source that
+/// could not be opened or read.
+async fn intrinsic_width(source: &Path) -> std::io::Result<Option<u32>> {
     use tokio::io::AsyncReadExt;
-    let mut f = tokio::fs::File::open(source).await.ok()?;
+    let mut f = tokio::fs::File::open(source).await?;
     // Enough for a PNG/WebP header and for the SOF marker of essentially every
     // JPEG (EXIF thumbnails push it back, but not this far).
     let mut buf = vec![0u8; 64 * 1024];
-    let n = f.read(&mut buf).await.ok()?;
+    let n = f.read(&mut buf).await?;
     buf.truncate(n);
-    width_from_header(&buf)
+    Ok(width_from_header(&buf))
 }
 
 /// Header-only width parse, split out so it can be tested on byte literals.
