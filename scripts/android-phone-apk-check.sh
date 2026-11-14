@@ -75,6 +75,12 @@ else
   fail "service has no MediaBrowserService intent filter"
 fi
 
+# The notification's small icon and the themed launcher layer (crates/pharos-ui/android/res).
+resources=$("$AAPT2" dump resources "$apk" 2>&1)
+for res in drawable/ic_stat_pharos drawable/ic_launcher_monochrome; do
+  if printf '%s\n' "$resources" | grep -q "resource 0x[0-9a-f]* $res\b"; then pass "APK has $res"; else fail "APK lacks $res"; fi
+done
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 if unzip -q -o "$apk" 'classes*.dex' lib/arm64-v8a/libmain.so -d "$tmp" 2>/dev/null &&
