@@ -30,12 +30,12 @@ fn failed(fallback: Fallback) -> impl Fn(String) -> StageError {
 }
 
 impl Stages for Live {
-    fn vocals(&self, path: &Path) -> Result<Vec<f32>, StageError> {
+    fn vocals(&self, path: &Path, deadline: Instant) -> Result<Vec<f32>, StageError> {
         let mix = decode_stereo(&self.ffmpeg, path, separate::RATE)
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))?;
         let (vocals, separation) = vocals_or_mix(mix, &self.choice, |adapter, mix| {
             let separator = Separator::load(&self.separator, adapter)?;
-            let vocals = separator.vocals(mix);
+            let vocals = separator.vocals(mix, Some(deadline));
             separator.release();
             vocals
         });
@@ -44,7 +44,7 @@ impl Stages for Live {
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))
     }
 
-    fn recognise(&self, vocals: &[f32]) -> Result<Vec<Word>, StageError> {
+    fn recognise(&self, vocals: &[f32], deadline: Instant) -> Result<Vec<Word>, StageError> {
         let fail = |e: crate::recognise::whisper::RecogniseError| {
             failed(Fallback::RecogniseFailed)(e.to_string())
         };
@@ -52,7 +52,9 @@ impl Stages for Live {
         let started = Instant::now();
         let recogniser = Recogniser::load(&self.recogniser, gpu).map_err(fail)?;
         let load_ms = started.elapsed().as_millis() as u64;
-        let heard = recogniser.transcribe(vocals).map_err(fail)?;
+        let heard = recogniser
+            .transcribe(vocals, Some(deadline))
+            .map_err(fail)?;
         drop(recogniser);
         tracing::info!(
             gpu,

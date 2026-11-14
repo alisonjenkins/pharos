@@ -40,7 +40,7 @@ fn main() -> Result<(), Error> {
         };
         let audio = read_f32(inp)?;
         let t = Instant::now();
-        let heard = r.transcribe(&audio)?;
+        let heard = r.transcribe(&audio, None)?;
         let sec = t.elapsed().as_secs_f64();
         let words: Vec<_> = heard
             .transcript

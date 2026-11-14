@@ -151,16 +151,27 @@ pub struct StageError {
     pub reason: String,
 }
 
+/// How long a song may take, from its request, before the stages stop and
+/// it keeps today's answer (B1428): half the server's 600 s request
+/// timeout, so the slowest stage overrunning still answers in time.
+pub const DEFAULT_STAGE_BUDGET: Duration = Duration::from_secs(300);
+
 /// The stages after today's per-line pass (spec 042, ADR-0124/0125). Each
 /// loads its model, runs it and drops it before returning, so the letter
-/// model is the only one still on the GPU when the next stage loads.
+/// model is the only one still on the GPU when the next stage loads. Each
+/// stops soon after `deadline`, with an error; the song then keeps
+/// today's answer with [`Fallback::StageTimeout`].
 pub trait Stages: Send + Sync {
     /// The whole song's vocals at `audio::RATE` mono: decoded, separated
     /// (the mix itself without a GPU), resampled.
-    fn vocals(&self, path: &Path) -> Result<Vec<f32>, StageError>;
+    fn vocals(&self, path: &Path, deadline: Instant) -> Result<Vec<f32>, StageError>;
 
     /// The words the recogniser heard in `vocals`.
-    fn recognise(&self, vocals: &[f32]) -> Result<Vec<transcript::Word>, StageError>;
+    fn recognise(
+        &self,
+        vocals: &[f32],
+        deadline: Instant,
+    ) -> Result<Vec<transcript::Word>, StageError>;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -311,6 +322,7 @@ pub struct Engine {
     decoder: Decoder,
     idle_unload: Option<Duration>,
     stages: Option<Box<dyn Stages>>,
+    stage_budget: Duration,
 }
 
 impl Engine {
@@ -324,6 +336,7 @@ impl Engine {
             decoder,
             idle_unload,
             stages: None,
+            stage_budget: DEFAULT_STAGE_BUDGET,
         }
     }
 
@@ -332,6 +345,14 @@ impl Engine {
     #[must_use]
     pub fn with_stages(mut self, stages: Box<dyn Stages>) -> Self {
         self.stages = Some(stages);
+        self
+    }
+
+    /// Stops the stages once a song has taken `budget` since its request,
+    /// [`DEFAULT_STAGE_BUDGET`] unless set.
+    #[must_use]
+    pub fn with_stage_budget(mut self, budget: Duration) -> Self {
+        self.stage_budget = budget;
         self
     }
 
@@ -385,6 +406,11 @@ impl Engine {
         Option<DeviceUsed>,
         Option<GpuMemory>,
     ) {
+        // The server's timeout runs from its request, so the wait counts.
+        let budget = Budget {
+            started: Instant::now(),
+            budget: self.stage_budget,
+        };
         let mut slot = tracing::info_span!("aligner.wait").in_scope(|| {
             // A song that panicked mid-way leaves nothing half-written that the
             // next one reads: the model is reloaded below if it was dropped.
@@ -436,7 +462,7 @@ impl Engine {
                         Some(stages) => {
                             let used = model.device();
                             if used.on_gpu() {
-                                improve(model, stages, rel_path, full_path, today, on)
+                                improve(model, stages, &budget, rel_path, full_path, today, on)
                             } else {
                                 skip_stages(
                                     rel_path,
@@ -585,6 +611,51 @@ fn skip_stages(rel_path: &str, today: Today, why: Fallback, reason: String) -> A
     today.kept(why, reason)
 }
 
+/// A song's time for the stages: `budget` from `started`.
+struct Budget {
+    started: Instant,
+    budget: Duration,
+}
+
+impl Budget {
+    fn deadline(&self) -> Instant {
+        self.started + self.budget
+    }
+
+    /// A timeout naming `stage` when the budget has passed.
+    fn passed(&self, stage: &str) -> Option<StageError> {
+        let took = self.started.elapsed();
+        (took >= self.budget).then(|| StageError {
+            fallback: Fallback::StageTimeout,
+            reason: format!(
+                "stage budget {} s passed at {:.1} s, in {stage}",
+                self.budget.as_secs_f64(),
+                took.as_secs_f64()
+            ),
+        })
+    }
+
+    /// `f`, the stage named `stage`, unless the budget has passed; its
+    /// error is a timeout when the budget passed while it ran, as a stage
+    /// stopped at its deadline fails with its own error.
+    fn run<T>(
+        &self,
+        stage: &str,
+        f: impl FnOnce() -> Result<T, StageError>,
+    ) -> Result<T, StageError> {
+        if let Some(e) = self.passed(stage) {
+            return Err(e);
+        }
+        f().map_err(|e| match self.passed(stage) {
+            Some(t) => StageError {
+                reason: format!("{}: {}", t.reason, e.reason),
+                ..t
+            },
+            None => e,
+        })
+    }
+}
+
 fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -597,6 +668,7 @@ fn ms_since(t: Instant) -> u64 {
 fn improve(
     model: &mut dyn Model,
     stages: &dyn Stages,
+    budget: &Budget,
     rel_path: &str,
     full_path: &Path,
     today: Today,
@@ -614,11 +686,14 @@ fn improve(
         today.into_aligned(placement, e.reason, times, 0)
     };
     let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
+    let deadline = budget.deadline();
 
     let t = Instant::now();
     let vocals = tracing::info_span!("aligner.stage", stage = "vocals").in_scope(|| {
-        catch_unwind(AssertUnwindSafe(|| stages.vocals(full_path)))
-            .unwrap_or_else(|_| Err(stage(Fallback::SeparateFailed)("vocals panicked".into())))
+        budget.run("vocals", || {
+            catch_unwind(AssertUnwindSafe(|| stages.vocals(full_path, deadline)))
+                .unwrap_or_else(|_| Err(stage(Fallback::SeparateFailed)("vocals panicked".into())))
+        })
     });
     times.vocals_ms = ms_since(t);
     let vocals = match vocals {
@@ -628,10 +703,14 @@ fn improve(
 
     let t = Instant::now();
     let heard = tracing::info_span!("aligner.stage", stage = "recognise").in_scope(|| {
-        catch_unwind(AssertUnwindSafe(|| stages.recognise(&vocals))).unwrap_or_else(|_| {
-            Err(stage(Fallback::RecogniseFailed)(
-                "recogniser panicked".into(),
-            ))
+        budget.run("recognise", || {
+            catch_unwind(AssertUnwindSafe(|| stages.recognise(&vocals, deadline))).unwrap_or_else(
+                |_| {
+                    Err(stage(Fallback::RecogniseFailed)(
+                        "recogniser panicked".into(),
+                    ))
+                },
+            )
         })
     });
     times.recognise_ms = ms_since(t);
@@ -642,12 +721,18 @@ fn improve(
 
     let t = Instant::now();
     let emission = tracing::info_span!("aligner.stage", stage = "emission").in_scope(|| {
-        caught(|| {
-            stitched(&vocals, |chunk| model.emission(chunk))
-                .map_err(|e| e.to_string())?
+        budget.run("emission", || {
+            caught(|| {
+                stitched(&vocals, |chunk| {
+                    if Instant::now() >= deadline {
+                        return Err("stopped at the deadline".to_owned());
+                    }
+                    model.emission(chunk).map_err(|e| e.to_string())
+                })?
                 .ok_or_else(|| "the letter model gives no emission".to_owned())
+            })
+            .map_err(stage(Fallback::EmissionFailed))
         })
-        .map_err(stage(Fallback::EmissionFailed))
     });
     times.emission_ms = ms_since(t);
     let data = match emission {
@@ -657,6 +742,9 @@ fn improve(
 
     let t = Instant::now();
     let placed = tracing::info_span!("aligner.stage", stage = "place").in_scope(|| {
+        if let Some(e) = budget.passed("place") {
+            return Err(e);
+        }
         let frames = data.len() / CLASSES;
         let emission = Emission::new(&data, frames, CLASSES)
             .map_err(|e| stage(Fallback::EmissionFailed)(e.to_string()))?;

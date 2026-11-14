@@ -2,6 +2,7 @@
 //! (`separatorModel`), with the weights it wrote beside it.
 
 use std::path::Path;
+use std::time::Instant;
 
 use burn::tensor::{Tensor, TensorData};
 use burn_store::{BurnpackStore, ModuleSnapshot};
@@ -81,8 +82,15 @@ impl Separator {
     }
 
     /// The vocals of a whole song at [`super::RATE`].
-    pub fn vocals(&self, mix: &Stereo) -> Result<Stereo, SeparateError> {
-        super::vocals(mix, |m, s| self.segment(m, s))
+    /// The vocals of `mix`, stopping with an error at the first segment
+    /// after `deadline`.
+    pub fn vocals(&self, mix: &Stereo, deadline: Option<Instant>) -> Result<Stereo, SeparateError> {
+        super::vocals(mix, |m, s| {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err("stopped at the deadline".to_owned());
+            }
+            self.segment(m, s)
+        })
     }
 
     /// Drops the weights and hands the device pool's freed pages back: the
