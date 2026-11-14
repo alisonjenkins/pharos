@@ -2032,16 +2032,20 @@ pub struct PageVisualiser {
     listener: u64,
 }
 
-pub fn page_visualiser(style: &str, on_fallback: impl FnMut(String) + 'static) -> PageVisualiser {
+pub fn page_visualiser(
+    style: &str,
+    host: bool,
+    on_fallback: impl FnMut(String) + 'static,
+) -> PageVisualiser {
     let id = NEXT_VISUALISER.fetch_add(1, Ordering::Relaxed);
     let listener = listen(Listener::Visualiser(id, Box::new(on_fallback)));
     let style = style.to_owned();
-    log::info!("pharos: visualiser page run={id} style={style} action=start");
+    log::info!("pharos: visualiser page run={id} style={style} host={host} action=start");
     spawn_detached(async move {
         // A failed load is logged there; the start still runs, as the page
         // holds the truth and reports it (B1036, V996).
         let _ = load_visualiser().await;
-        run(tv_page::visualiser_start_js(id, &style));
+        run(tv_page::visualiser_start_for_js(id, &style, host));
     });
     PageVisualiser { id, listener }
 }
@@ -2051,6 +2055,40 @@ impl Drop for PageVisualiser {
         unlisten(self.listener);
         log::info!("pharos: visualiser page run={} action=stop", self.id);
         run(tv_page::visualiser_stop_js(self.id));
+    }
+}
+
+/// The host's visualiser analysis, pushed into the page while this lives
+/// (ADR-0133). The host decodes only while it is asked to; dropping this
+/// tells it to stop.
+pub struct HostFrames {
+    stop: Rc<std::cell::Cell<bool>>,
+    port: Arc<dyn super::ports::NativeAudio>,
+}
+
+pub fn host_frames(port: Arc<dyn super::ports::NativeAudio>) -> HostFrames {
+    port.visualiser_enable(true);
+    log::info!("pharos: visualiser host frames action=start");
+    let stop = Rc::new(std::cell::Cell::new(false));
+    let (flag, source) = (stop.clone(), port.clone());
+    spawn_detached(async move {
+        let mut last_rate = None;
+        while !flag.get() {
+            let (send, wait) = tv_page::next_push(&mut last_rate, source.visualiser_frame());
+            if let Some(frame) = send {
+                run(tv_page::visualiser_frame_js(&frame));
+            }
+            sleep_ms(wait).await;
+        }
+    });
+    HostFrames { stop, port }
+}
+
+impl Drop for HostFrames {
+    fn drop(&mut self) {
+        self.stop.set(true);
+        self.port.visualiser_enable(false);
+        log::info!("pharos: visualiser host frames action=stop");
     }
 }
 
