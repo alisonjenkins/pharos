@@ -112,6 +112,9 @@ struct Tap {
     on_host: Rc<Cell<Option<bool>>>,
     /// Why the last attempt waited, so each new reason is logged once.
     waiting: Rc<Cell<Option<&'static str>>>,
+    /// The page draws a host's pushed frames: `on_host` then follows whether
+    /// a fresh one is there, so a quiet host leaves the loop idle.
+    hosted: Rc<Cell<bool>>,
 }
 
 impl PartialEq for Tap {
@@ -127,6 +130,12 @@ impl Tap {
     /// from the element's `playing` as well as the visualiser's frames, so a
     /// song is tapped with the player shrunk too (B734, V682): the tap's
     /// running context is what keeps the output awake through a pause.
+    fn refresh_hosted(&self) {
+        if self.hosted.get() {
+            self.on_host.set(Some(platform::host_frame_fresh()));
+        }
+    }
+
     fn connect(&self, media_id: &str) {
         if self.tried.get() || self.on_host.get().is_some() {
             return;
@@ -1053,6 +1062,14 @@ pub async fn run_page_visualiser(style_label: &str) -> Result<(), Fallback> {
     let Some(program) = style.program() else {
         return Ok(());
     };
+    // The app marks a page whose song plays in the host's engine: it pushes
+    // the analysis, and there is no element to tap (ADR-0133).
+    let tap = Tap::default();
+    if platform::host_frames() {
+        *tap.tap.borrow_mut() = Some(platform::host_frame_tap());
+        tap.hosted.set(true);
+        tap.on_host.set(Some(false));
+    }
     let outcome = match render::open(
         CANVAS_ID,
         program,
@@ -1060,7 +1077,7 @@ pub async fn run_page_visualiser(style_label: &str) -> Result<(), Fallback> {
     ) {
         Ok(surface) => {
             report(style, None);
-            draw(surface, &Tap::default(), VIDEO_ID).await
+            draw(surface, &tap, VIDEO_ID).await
         }
         Err(f) => Err(f),
     };
@@ -1141,9 +1158,11 @@ async fn draw(
     let mut palette = platform::theme_palette();
     let mut palette_at = start;
     let mut analysis: Option<Analysis> = None;
+    let mut analysed_rate = 0.0;
     let mut drawn = false;
     loop {
         platform::animation_frame().await;
+        tap.refresh_hosted();
         if idle(
             drawn,
             tap.on_host
@@ -1162,7 +1181,12 @@ async fn draw(
         tap.connect(media_id);
         let mut slot = tap.tap.borrow_mut();
         let analysis = slot.as_mut().map(|t| {
-            let a = analysis.get_or_insert_with(|| Analysis::new(t.bins(), t.sample_rate()));
+            // A song at another rate puts each bin at another frequency.
+            if analysis.is_none() || (t.sample_rate() - analysed_rate).abs() > 1.0 {
+                analysed_rate = t.sample_rate();
+                analysis = Some(Analysis::new(t.bins(), analysed_rate));
+            }
+            let a = analysis.get_or_insert_with(|| Analysis::new(t.bins(), analysed_rate));
             a.read(t.as_mut());
             &*a
         });
@@ -1191,6 +1215,24 @@ mod tests {
         assert!(!idle(false, false, false), "the first frame is drawn");
         assert!(!idle(true, true, false), "a playing song draws");
         assert!(!idle(true, false, true), "a recovering surface draws");
+    }
+
+    /// ADR-0133: only a page drawing a host's frames lets the pushed frame
+    /// decide whether the loop draws; the element path is left alone.
+    #[test]
+    fn a_hosted_tap_follows_the_pushed_frame_and_others_do_not() {
+        let plain = Tap::default();
+        plain.refresh_hosted();
+        assert_eq!(plain.on_host.get(), None);
+        let hosted = Tap::default();
+        hosted.hosted.set(true);
+        hosted.on_host.set(Some(true));
+        hosted.refresh_hosted();
+        assert_eq!(
+            hosted.on_host.get(),
+            Some(false),
+            "no fresh frame on the host"
+        );
     }
 
     fn render(title: &str, image: Option<&str>) -> String {

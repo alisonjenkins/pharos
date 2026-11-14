@@ -2076,6 +2076,11 @@ async fn load_visualiser() -> Result<(), String> {
     }
 }
 
+/// Only the page itself reads the host's pushed frames.
+pub fn host_frame_fresh() -> bool {
+    false
+}
+
 pub fn media_playing(id: &str) -> bool {
     media(id).is_some_and(|(m, _)| m.src && !m.paused)
 }

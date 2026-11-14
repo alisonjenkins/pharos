@@ -4451,6 +4451,78 @@ impl super::visualiser::AudioTap for WebAudioTap {
     }
 }
 
+/// The frame the host last pushed into the page (ADR-0133), if any.
+fn pushed_frame() -> Option<JsValue> {
+    let page = js_sys::global();
+    let frame = js_sys::Reflect::get(&page, &JsValue::from_str("__pharosVisFrame")).ok()?;
+    (!frame.is_undefined() && !frame.is_null()).then_some(frame)
+}
+
+/// Whether the host's engine plays the song and pushes its analysis here:
+/// the app marks the page when it starts the visualiser.
+pub fn host_frames() -> bool {
+    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("__pharosVisHost"))
+        .ok()
+        .is_some_and(|v| v.is_truthy())
+}
+
+/// Whether a pushed frame arrived lately enough to be the song now.
+pub fn host_frame_fresh() -> bool {
+    pushed_frame()
+        .and_then(|f| js_sys::Reflect::get(&f, &JsValue::from_str("at")).ok())
+        .and_then(|at| at.as_f64())
+        .is_some_and(|at| super::visualiser::wire::is_fresh(now_ms() - at))
+}
+
+/// The host's analysis as an [`AudioTap`](super::visualiser::AudioTap): the
+/// song plays outside the page, which only draws it.
+struct JsFrameTap;
+
+/// Used until a first frame says the song's rate.
+const DEFAULT_RATE: f32 = 48_000.0;
+
+impl super::visualiser::AudioTap for JsFrameTap {
+    fn read(&mut self, bins: &mut [f32], wave: &mut [f32]) {
+        let field =
+            |f: &JsValue, name: &str| js_sys::Reflect::get(f, &JsValue::from_str(name)).ok();
+        let frame = pushed_frame().filter(|_| host_frame_fresh());
+        let bytes = frame
+            .as_ref()
+            .and_then(|f| field(f, "bins"))
+            .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok())
+            .map(|a| a.to_vec());
+        let samples = frame
+            .as_ref()
+            .and_then(|f| field(f, "wave"))
+            .and_then(|v| v.dyn_into::<js_sys::Int8Array>().ok())
+            .map(|a| a.to_vec());
+        match (bytes, samples) {
+            (Some(b), Some(w)) => super::visualiser::wire::dequantise(&b, &w, bins, wave),
+            _ => super::visualiser::wire::silence(bins, wave),
+        }
+    }
+
+    fn bins(&self) -> usize {
+        1024
+    }
+
+    fn sample_rate(&self) -> f32 {
+        pushed_frame()
+            .and_then(|f| js_sys::Reflect::get(&f, &JsValue::from_str("rate")).ok())
+            .and_then(|r| r.as_f64())
+            .map_or(DEFAULT_RATE, |r| r as f32)
+    }
+
+    /// The host analysed the song before its volume mattered.
+    fn volume(&self) -> f32 {
+        1.0
+    }
+}
+
+pub fn host_frame_tap() -> Box<dyn super::visualiser::AudioTap> {
+    Box::new(JsFrameTap)
+}
+
 /// A routed element's nodes, kept for the element's life: an element is
 /// routed once (a second `MediaElementSourceNode` throws), and closing its
 /// context would silence it, so a dropped tap leaves them for the next one
