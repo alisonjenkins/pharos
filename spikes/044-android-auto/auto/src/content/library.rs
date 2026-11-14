@@ -132,6 +132,7 @@ impl Op {
 
 enum Out {
     Nodes(Vec<Node>),
+    Ranked(Vec<Node>, tree::SearchReport),
     One(Node),
     Done,
 }
@@ -355,6 +356,21 @@ impl Library {
         self.nodes_or_sign_in(Op::Search(query.to_owned()))
     }
 
+    /// [`Library::search`] with how it ranked, for deciding whether to play
+    /// the top result unasked. Signed out, the report is `None` and the
+    /// nodes are the sign-in rows.
+    pub fn search_ranked(
+        &self,
+        query: &str,
+    ) -> Result<(Vec<Node>, Option<tree::SearchReport>), ContentError> {
+        match self.call(Op::Search(query.to_owned())) {
+            Ok(Out::Ranked(n, r)) => Ok((n, Some(r))),
+            Ok(_) => Err(ContentError::WorkerGone),
+            Err(ContentError::NeedsSignIn) => Ok((self.sign_in_rows()?, None)),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Forget the device token and drop the connection.
     pub fn sign_out(&self) -> Result<(), ContentError> {
         self.call(Op::SignOut).map(|_| ())
@@ -521,7 +537,7 @@ impl Library {
             .send(Cmd { op, reply: tx })
             .map_err(|_| ContentError::WorkerGone)?;
         match self.wait(&name, &rx) {
-            Ok(Out::Nodes(n)) => Ok(n),
+            Ok(Out::Nodes(n) | Out::Ranked(n, _)) => Ok(n),
             Ok(_) => Err(ContentError::WorkerGone),
             Err(ContentError::NeedsSignIn) => self.sign_in_rows(),
             Err(other) => Err(other),
@@ -691,7 +707,9 @@ impl Worker {
             let r = match op {
                 Op::Children(id) => tree::children(&link.cat, &urls, *id).await.map(Out::Nodes),
                 Op::Node(id) => tree::node(&link.cat, &urls, *id).await.map(Out::One),
-                Op::Search(q) => tree::search(&link.cat, &urls, q).await.map(Out::Nodes),
+                Op::Search(q) => tree::search(&link.cat, &urls, q)
+                    .await
+                    .map(|(n, r)| Out::Ranked(n, r)),
                 Op::SignOut => Ok(Out::Done),
             };
             match r {
