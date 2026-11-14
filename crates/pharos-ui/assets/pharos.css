@@ -8275,3 +8275,11 @@ body:has(.pharos-reader) {
 :root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] > button {
   opacity: 1;
 }
+
+/* Offline music (spec 044): the confirm row wraps, never hides, on a phone. */
+.pharos-offline-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}

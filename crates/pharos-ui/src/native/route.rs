@@ -32,6 +32,8 @@ pub enum Route {
     Privacy,
     /// The books kept on this device for reading offline, under `/settings`.
     Offline,
+    /// Music kept on the phone: cap, space used, clear. Phone app only; under `/settings`.
+    OfflineMusic,
     /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// The viewer's favourites, a rail per kind, `/favourites` (B1083).
@@ -84,6 +86,7 @@ impl Route {
             ["settings", "playback"] => Route::Playback,
             ["settings", "privacy"] => Route::Privacy,
             ["settings", "offline"] => Route::Offline,
+            ["settings", "offline-music"] => Route::OfflineMusic,
             _ => not_found(path),
         }
     }
@@ -105,6 +108,7 @@ impl Route {
             Route::Playback => format!("{MOUNT}/settings/playback"),
             Route::Privacy => format!("{MOUNT}/settings/privacy"),
             Route::Offline => format!("{MOUNT}/settings/offline"),
+            Route::OfflineMusic => format!("{MOUNT}/settings/offline-music"),
             Route::Find => format!("{MOUNT}/find"),
             Route::Favourites => format!("{MOUNT}/favourites"),
             Route::Together => format!("{MOUNT}/together"),
@@ -142,6 +146,7 @@ impl Route {
             Route::Playback => Some("Playback"),
             Route::Privacy => Some("Privacy"),
             Route::Offline => Some("Offline"),
+            Route::OfflineMusic => Some("Offline music"),
             Route::Find => Some("Search"),
             Route::Favourites => Some("Favourites"),
             Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
@@ -170,6 +175,7 @@ impl Route {
             Route::Playback => "playback",
             Route::Privacy => "privacy",
             Route::Offline => "offline",
+            Route::OfflineMusic => "offline_music",
             Route::Find => "find",
             Route::Favourites => "favourites",
             Route::Together => "together",
@@ -286,6 +292,16 @@ mod tests {
         assert_eq!(Route::Playback.path(), "/ui/settings/playback");
         assert_eq!(Route::Privacy.path(), "/ui/settings/privacy");
         assert_eq!(Route::Offline.path(), "/ui/settings/offline");
+        assert_eq!(Route::OfflineMusic.path(), "/ui/settings/offline-music");
+    }
+
+    #[test]
+    fn offline_music_parses_apart_from_offline_books() {
+        assert_eq!(Route::parse("/ui/settings/offline"), Route::Offline);
+        assert_eq!(
+            Route::parse("/ui/settings/offline-music"),
+            Route::OfflineMusic
+        );
     }
 
     #[test]

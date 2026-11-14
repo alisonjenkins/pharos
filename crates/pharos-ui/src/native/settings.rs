@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 
+use super::ports::offline_store;
 use super::route::Route;
 use super::views::Link;
 
@@ -16,18 +17,30 @@ pub enum Section {
     Devices,
     Privacy,
     Offline,
+    /// Music kept on the phone; listed only where the offline store exists.
+    OfflineMusic,
 }
 
 impl Section {
     /// Sidebar order.
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 7] = [
         Section::Appearance,
         Section::Playback,
         Section::Account,
         Section::Devices,
         Section::Privacy,
         Section::Offline,
+        Section::OfflineMusic,
     ];
+
+    /// The sections the sidebar shows: offline music only with the phone's
+    /// offline store.
+    pub fn listed(has_offline_store: bool) -> Vec<Section> {
+        Section::ALL
+            .into_iter()
+            .filter(|s| has_offline_store || *s != Section::OfflineMusic)
+            .collect()
+    }
 
     /// The section a route shows, if it is a settings page.
     pub fn of(route: &Route) -> Option<Section> {
@@ -38,6 +51,7 @@ impl Section {
             Route::ApproveDevice => Some(Section::Devices),
             Route::Privacy => Some(Section::Privacy),
             Route::Offline => Some(Section::Offline),
+            Route::OfflineMusic => Some(Section::OfflineMusic),
             _ => None,
         }
     }
@@ -50,6 +64,7 @@ impl Section {
             Section::Devices => Route::ApproveDevice,
             Section::Privacy => Route::Privacy,
             Section::Offline => Route::Offline,
+            Section::OfflineMusic => Route::OfflineMusic,
         }
     }
 
@@ -61,6 +76,7 @@ impl Section {
             Section::Devices => "Devices",
             Section::Privacy => "Privacy",
             Section::Offline => "Offline",
+            Section::OfflineMusic => "Offline music",
         }
     }
 
@@ -72,7 +88,7 @@ impl Section {
             Section::Account => "M12 12a4 4 0 1 0 0-8a4 4 0 0 0 0 8zM4 21c1-4 4.5-6 8-6s7 2 8 6",
             Section::Devices => "M3 5h18v12H3zM8 21h8M12 17v4",
             Section::Privacy => "M12 3l8 3v6c0 5-3.5 8-8 9c-4.5-1-8-4-8-9V6z",
-            Section::Offline => "M12 4v11M7 11l5 5l5-5M5 20h14",
+            Section::Offline | Section::OfflineMusic => "M12 4v11M7 11l5 5l5-5M5 20h14",
         }
     }
 }
@@ -87,7 +103,7 @@ pub fn SettingsLayout(current: Section, children: Element) -> Element {
             nav { class: "pharos-settings-nav", aria_label: "Settings",
                 p { class: "pharos-settings-title", "Settings" }
                 ul {
-                    for section in Section::ALL {
+                    for section in Section::listed(offline_store().is_some()) {
                         li { key: "{section.label()}",
                             Link {
                                 to: section.route(),
@@ -160,6 +176,14 @@ mod tests {
     }
 
     #[test]
+    fn offline_music_is_listed_only_with_the_offline_store() {
+        assert!(!Section::listed(false).contains(&Section::OfflineMusic));
+        assert!(Section::listed(true).contains(&Section::OfflineMusic));
+        assert_eq!(Section::listed(true).len(), Section::ALL.len());
+        assert_eq!(Section::listed(false).len(), Section::ALL.len() - 1);
+    }
+
+    #[test]
     fn the_layout_lists_every_section_and_marks_the_current_one() {
         let mut dom = VirtualDom::new(|| {
             use_context_provider(|| super::super::views::Nav(EventHandler::new(|_: Route| {})));
@@ -169,12 +193,13 @@ mod tests {
         });
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
-        for section in Section::ALL {
+        for section in Section::listed(false) {
             assert!(
                 html.contains(&format!("href=\"{}\"", section.route().path())),
                 "{section:?}: {html}"
             );
         }
+        assert!(!html.contains("offline-music"), "{html}");
         assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{html}");
         let current = html
             .split("<a ")

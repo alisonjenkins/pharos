@@ -52,7 +52,7 @@ use super::playback::{
     SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
-use super::ports::native_audio;
+use super::ports::{native_audio, offline_store};
 use super::preplay::{self, PlayPicks, TrackChoices};
 use super::privacy;
 use super::quality::{self, QualityView, Watch};
@@ -2545,6 +2545,10 @@ fn Screen(route: Route) -> Element {
         }
         Route::Privacy => rsx! { SettingsLayout { current: Section::Privacy, PrivacyScreen {} } },
         Route::Offline => rsx! { SettingsLayout { current: Section::Offline, {on_this_device()} } },
+        Route::OfflineMusic if offline_store().is_some() => {
+            rsx! { SettingsLayout { current: Section::OfflineMusic, super::offline_view::OfflineMusicSettings {} } }
+        }
+        Route::OfflineMusic => rsx! { NotFoundView { path: Route::OfflineMusic.path() } },
         Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
