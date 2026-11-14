@@ -1,17 +1,20 @@
-//! Word times from the recogniser's anchors (spec 042, plan steps 5 and 6):
-//! each anchored line refined letter by letter on the vocals' emission
-//! inside its anchor, lines between two anchors aligned in today's window
-//! clamped to the gap between them, and every other line left as today
-//! placed it.
+//! Word times from the recogniser's anchors (spec 042, plan steps 5 and 6).
+//!
+//! The lines from the first anchored line to the last are aligned together,
+//! letter by letter, in one pass over the vocals' emission: each anchored
+//! line inside a band around its anchor, each line between two anchors
+//! inside the gap between them, and every line pulled towards where its
+//! first letter is expected. Aligning them together keeps them in order
+//! and stops one line borrowing the next line's singing. Lines before the
+//! first anchor or after the last keep today's answer.
 
 use crate::anchor::Matched;
-use crate::ctc::{align_words, Emission};
-use crate::line::frame_ms;
+use crate::ctc::Emission;
 use crate::placement::{Fallback, Method, Placement};
 use crate::plan::{self, Line, Stamp};
 use crate::service::LineWords;
 use crate::text::{self, is_py_space};
-use crate::tokens::{tokenize, STAR_TOKEN};
+use crate::tokens::{tokenize, BLANK, STAR};
 
 /// Audio either side of an anchor the letters may move into.
 pub const PAD_MS: i64 = 1_500;
@@ -22,6 +25,10 @@ pub const LAST_WORD_MS: i64 = 400;
 /// the prototype's very repetitive songs (chants, "na na") fell under 40%
 /// and their few anchors were the least trustworthy.
 pub const MIN_ANCHOR_SHARE: f64 = 0.4;
+/// Log-probability a line pays per second its first letter lands away from
+/// where it is expected; the prototype's setting, enough to stop a line
+/// sliding onto a repeat of itself within its band.
+pub const ENTRY_COST_PER_S: f64 = 0.3;
 
 /// The whole song's vocals emission and the samples it came from.
 #[derive(Debug, Clone, Copy)]
@@ -35,10 +42,9 @@ impl Song<'_> {
         self.n_samples as f64 / self.emission.frames() as f64 / crate::line::SAMPLE_RATE * 1000.0
     }
 
-    /// The frame holding `ms`, clamped to the song.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn frame(&self, ms: i64) -> usize {
-        ((ms.max(0) as f64 / self.ms_per_frame()) as usize).min(self.emission.frames())
+    fn ms(&self, frame: usize) -> u64 {
+        (frame as f64 * self.ms_per_frame()) as u64
     }
 }
 
@@ -48,14 +54,6 @@ pub struct Refined {
     pub lines: Vec<LineWords>,
     pub methods: Vec<Option<Method>>,
     pub placement: Placement,
-}
-
-fn first_ms(w: &LineWords) -> Option<i64> {
-    w.words.first().map(|s| s.start_ms)
-}
-
-fn end_ms(w: &LineWords) -> Option<i64> {
-    w.words.last().map(|s| s.start_ms)
 }
 
 /// Char offsets of each whitespace-separated word, as `text::words` counts them.
@@ -96,58 +94,218 @@ fn anchor_words(line: &Line, words: &[text::Word], starts_ms: &[i64], end: i64) 
     }
 }
 
-/// The line's letters aligned within `[lo_ms, hi_ms)` of the song, between
-/// a leading and trailing star; `None` when the band cannot hold them.
-fn align_in(
-    song: &Song<'_>,
-    line: &Line,
-    words: &[text::Word],
-    lo_ms: i64,
-    hi_ms: i64,
-) -> Option<LineWords> {
-    let (lo, hi) = (song.frame(lo_ms), song.frame(hi_ms));
-    if hi <= lo {
-        return None;
-    }
-    let band = song.emission.frames_between(lo, hi);
-    let mut tokens: Vec<&str> = vec![STAR_TOKEN];
-    tokens.extend(words.iter().map(|w| w.token.as_str()));
-    tokens.push(STAR_TOKEN);
-    let tokenized = tokenize(&tokens).ok()?;
-    let spans = align_words(&band, &tokenized).ok()?;
-    let letters = &spans[1..spans.len() - 1];
-    let times: Vec<(u64, u64)> = letters
-        .iter()
-        .map(|w| match (w.first(), w.last()) {
-            (Some(f), Some(l)) => (
-                frame_ms(song.n_samples, song.emission.frames(), lo + f.start),
-                frame_ms(song.n_samples, song.emission.frames(), lo + l.end),
-            ),
-            _ => (0, 0),
-        })
-        .collect();
-    let scores: Vec<f64> = letters
-        .iter()
-        .flatten()
-        .map(|c| f64::from(c.score))
-        .collect();
-    let score = (!scores.is_empty()).then(|| scores.iter().sum::<f64>() / scores.len() as f64);
-    let stamps = plan::stamps(&line.text, words, &times, 0);
-    (!stamps.is_empty()).then(|| LineWords {
-        words: stamps,
-        score: score.and_then(crate::service::round_score),
-    })
+/// One line's part in the joint alignment: its words' label ids, the band
+/// of the song its letters must fall in, and where its first letter is expected.
+#[derive(Debug, Clone)]
+struct Part {
+    words: Vec<Vec<u32>>,
+    lo_ms: f64,
+    hi_ms: f64,
+    expect_ms: f64,
 }
 
-/// Places every line: `today` is today's per-line answer and `offset_ms` the
-/// offset it found, `matched` the recogniser's anchors.
-pub fn place(
-    lines: &[Line],
-    today: &[LineWords],
-    offset_ms: i64,
-    matched: &Matched,
-    song: &Song<'_>,
-) -> Refined {
+impl Part {
+    /// Frames the CTC path needs at the least: a frame per letter, plus a
+    /// blank between two of the same letter.
+    fn min_frames(&self) -> usize {
+        let letters: Vec<u32> = self.words.iter().flatten().copied().collect();
+        letters.len() + letters.windows(2).filter(|w| w[0] == w[1]).count()
+    }
+}
+
+/// One aligned part: each word's first and past-the-last frame, and the
+/// letters' mean probability.
+#[derive(Debug, Clone, PartialEq)]
+struct Placed {
+    words: Vec<(usize, usize)>,
+    score: f64,
+}
+
+/// CTC Viterbi over the whole emission for `* part0 * part1 * ... *`, each
+/// part's letters held inside its band and its first letter charged
+/// `ENTRY_COST_PER_S` for each second it starts away from `expect_ms`.
+/// `None` when no path keeps every part in its band.
+#[allow(clippy::cast_precision_loss)]
+fn joint(song: &Song<'_>, parts: &[Part]) -> Option<Vec<Placed>> {
+    const NEG: f64 = -1e30;
+    let em = &song.emission;
+    let frames = em.frames();
+    if frames == 0 {
+        return None;
+    }
+    let fms = song.ms_per_frame();
+
+    // Targets with their owning part; stars between parts belong to none.
+    let mut tgt: Vec<u32> = vec![STAR];
+    let mut own: Vec<Option<usize>> = vec![None];
+    let mut first: Vec<bool> = vec![false];
+    for (k, p) in parts.iter().enumerate() {
+        for (wi, w) in p.words.iter().enumerate() {
+            for (ci, &c) in w.iter().enumerate() {
+                tgt.push(c);
+                own.push(Some(k));
+                first.push(wi == 0 && ci == 0);
+            }
+        }
+        tgt.push(STAR);
+        own.push(None);
+        first.push(false);
+    }
+    let n = 2 * tgt.len() + 1;
+    let lab = |s: usize| if s % 2 == 1 { tgt[s / 2] } else { BLANK };
+    // A blank between two letters of one part is held to that part's band.
+    let owner = |s: usize| -> Option<usize> {
+        let letter = s % 2 == 1;
+        let inside =
+            s >= 2 && s + 1 < n && own[s / 2 - 1].is_some() && own[s / 2 - 1] == own[s / 2];
+        if letter || inside {
+            own[s / 2]
+        } else {
+            None
+        }
+    };
+    let band: Vec<(f64, f64)> = (0..n)
+        .map(|s| {
+            owner(s).map_or((f64::MIN, f64::MAX), |k| {
+                (parts[k].lo_ms / fms, parts[k].hi_ms / fms)
+            })
+        })
+        .collect();
+    // Every target is visited in order, so a state cannot be reached before
+    // the latest band start behind it nor after the earliest band end ahead.
+    let mut reach_lo = vec![0usize; n];
+    let mut lo = 0.0f64;
+    for s in 0..n {
+        lo = lo.max(band[s].0);
+        reach_lo[s] = if lo <= 0.0 { 0 } else { lo.ceil() as usize };
+    }
+    let mut reach_hi = vec![frames - 1; n];
+    let mut hi = f64::MAX;
+    for s in (0..n).rev() {
+        hi = hi.min(band[s].1);
+        reach_hi[s] = if hi >= (frames - 1) as f64 {
+            frames - 1
+        } else if hi < 0.0 {
+            return None;
+        } else {
+            hi.floor() as usize
+        };
+    }
+    if (0..n).any(|s| reach_lo[s] > reach_hi[s]) {
+        return None;
+    }
+    let skip: Vec<bool> = (0..n)
+        .map(|s| s >= 3 && s % 2 == 1 && tgt[s / 2] != tgt[s / 2 - 1])
+        .collect();
+
+    // Back-pointers only for the states each frame can reach.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(frames);
+    let mut back: Vec<u8> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(frames);
+    let mut a = vec![NEG; n];
+    let mut next = vec![NEG; n];
+    let (mut s_lo, mut s_hi) = (0usize, 0usize);
+    for t in 0..frames {
+        while s_lo < n && reach_hi[s_lo] < t {
+            s_lo += 1;
+        }
+        while s_hi < n && reach_lo[s_hi] <= t {
+            s_hi += 1;
+        }
+        ranges.push((s_lo, s_hi));
+        offsets.push(back.len());
+        let tf = t as f64;
+        for s in s_lo..s_hi {
+            let mut best = if t == 0 {
+                if s < 2 {
+                    0.0
+                } else {
+                    NEG
+                }
+            } else {
+                a[s]
+            };
+            let mut ptr = 0u8;
+            if t > 0 {
+                let entry = if s % 2 == 1 && first[s / 2] {
+                    let k = own[s / 2].unwrap_or_default();
+                    -ENTRY_COST_PER_S * (tf * fms - parts[k].expect_ms).abs() / 1000.0
+                } else {
+                    0.0
+                };
+                if s >= 1 && a[s - 1] + entry > best {
+                    best = a[s - 1] + entry;
+                    ptr = 1;
+                }
+                if skip[s] && a[s - 2] + entry > best {
+                    best = a[s - 2] + entry;
+                    ptr = 2;
+                }
+            }
+            let inside = tf >= band[s].0 && tf <= band[s].1;
+            next[s] = if inside && best > NEG / 2.0 {
+                best + f64::from(em.at(t, lab(s)))
+            } else {
+                NEG
+            };
+            back.push(ptr);
+        }
+        if t > 0 {
+            let (p_lo, p_hi) = ranges[t - 1];
+            a[p_lo..p_hi.min(s_lo)].fill(NEG);
+        }
+        a[s_lo..s_hi].copy_from_slice(&next[s_lo..s_hi]);
+    }
+    let mut s = if a[n - 1] > a[n - 2] { n - 1 } else { n - 2 };
+    if a[s] <= NEG / 2.0 {
+        return None;
+    }
+    let mut path = vec![0usize; frames];
+    for t in (0..frames).rev() {
+        path[t] = s;
+        if t > 0 {
+            let (r_lo, _) = ranges[t];
+            s -= usize::from(back[offsets[t] + s - r_lo]);
+        }
+    }
+
+    // First and past-the-last frame of each target, and its frames' probability.
+    let mut span: Vec<Option<(usize, usize, f64)>> = vec![None; tgt.len()];
+    for (t, &st) in path.iter().enumerate() {
+        if st % 2 == 1 {
+            let p = f64::from(em.at(t, lab(st))).exp();
+            let e = span[st / 2].get_or_insert((t, t, 0.0));
+            e.1 = t + 1;
+            e.2 += p;
+        }
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    let mut j = 1;
+    for p in parts {
+        let mut words = Vec::with_capacity(p.words.len());
+        let mut scores = Vec::new();
+        for w in &p.words {
+            let (s0, _, _) = span[j]?;
+            let (_, e1, _) = span[j + w.len() - 1]?;
+            for letter in &span[j..j + w.len()] {
+                let (a0, a1, sum) = (*letter)?;
+                scores.push(sum / (a1 - a0) as f64);
+            }
+            words.push((s0, e1));
+            j += w.len();
+        }
+        j += 1;
+        out.push(Placed {
+            words,
+            score: scores.iter().sum::<f64>() / scores.len().max(1) as f64,
+        });
+    }
+    Some(out)
+}
+
+/// Places every line: `today` is today's per-line answer, `matched` the
+/// recogniser's anchors.
+pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song<'_>) -> Refined {
     let words: Vec<Vec<text::Word>> = lines.iter().map(|l| text::words(&l.text)).collect();
     let with_words = words.iter().filter(|w| !w.is_empty()).count();
     let share = matched.share().unwrap_or(0.0);
@@ -166,57 +324,105 @@ pub fn place(
         };
     }
 
-    let anchored: Vec<usize> = (0..lines.len())
-        .filter(|&i| {
-            !words[i].is_empty() && matched.lines.get(i).is_some_and(|m| m.anchor.is_some())
+    let tokens: Vec<Option<Vec<Vec<u32>>>> = words
+        .iter()
+        .map(|w| {
+            let t: Vec<&str> = w.iter().map(|w| w.token.as_str()).collect();
+            (!t.is_empty()).then(|| tokenize(&t).ok()).flatten()
         })
         .collect();
-    let mut prev_end = i64::MIN;
-    for &i in &anchored {
-        let Some(a) = matched.lines[i].anchor.as_ref() else {
+    let frames_ms = song.ms(song.emission.frames()) as f64;
+    // Anchored lines with the band around their anchor; a band the song
+    // cannot hold keeps the recogniser's times.
+    let mut bands: Vec<Option<(f64, f64, f64)>> = vec![None; lines.len()];
+    for (i, m) in matched.lines.iter().enumerate() {
+        let (Some(a), Some(t)) = (m.anchor.as_ref(), tokens[i].as_ref()) else {
             continue;
         };
         let first = a.starts_ms.first().copied().unwrap_or(a.end_ms);
         let last = a.starts_ms.last().copied().unwrap_or(a.end_ms);
-        let lo = (first - PAD_MS).max(prev_end);
-        let hi = a.end_ms.max(last + LAST_WORD_MS) + PAD_MS;
-        let (w, m) = match align_in(song, &lines[i], &words[i], lo, hi) {
-            Some(w) => (w, Method::Refined),
-            None => (
-                anchor_words(&lines[i], &words[i], &a.starts_ms, a.end_ms),
-                Method::Anchored,
-            ),
+        let lo = (first - PAD_MS) as f64;
+        let hi = (a.end_ms.max(last + LAST_WORD_MS) + PAD_MS) as f64;
+        let part = Part {
+            words: t.clone(),
+            lo_ms: lo,
+            hi_ms: hi,
+            expect_ms: first as f64,
         };
-        prev_end = end_ms(&w).unwrap_or(prev_end);
-        out[i] = w;
-        methods[i] = Some(m);
+        let room = (hi.min(frames_ms) - lo.max(0.0)) / song.ms_per_frame();
+        if room >= part.min_frames() as f64 {
+            bands[i] = Some((lo, hi, first as f64));
+        } else {
+            out[i] = anchor_words(&lines[i], &words[i], &a.starts_ms, a.end_ms);
+            methods[i] = Some(Method::Anchored);
+        }
     }
-
-    for pair in anchored.windows(2) {
-        let (p, q) = (pair[0], pair[1]);
-        let mut gap_lo = end_ms(&out[p]).unwrap_or(i64::MIN);
-        let gap_hi = first_ms(&out[q]).unwrap_or(i64::MAX);
-        for i in p + 1..q {
-            if words[i].is_empty() {
-                continue;
-            }
-            let inside = first_ms(&out[i]).is_some_and(|s| s >= gap_lo)
-                && end_ms(&out[i]).is_some_and(|e| e <= gap_hi);
-            if !inside {
-                let shifted = Line {
-                    start_ms: lines[i].start_ms + offset_ms,
-                    end_ms: lines[i].end_ms + offset_ms,
-                    text: lines[i].text.clone(),
+    let anchored: Vec<usize> = (0..lines.len()).filter(|&i| bands[i].is_some()).collect();
+    if let (Some(&from), Some(&to)) = (anchored.first(), anchored.last()) {
+        let mut parts: Vec<(usize, Part)> = Vec::new();
+        let (mut prev, mut shift) = (from, 0.0);
+        for i in from..=to {
+            let Some(t) = tokens[i].clone() else { continue };
+            if let Some((lo, hi, expect)) = bands[i] {
+                parts.push((
+                    i,
+                    Part {
+                        words: t,
+                        lo_ms: lo,
+                        hi_ms: hi,
+                        expect_ms: expect,
+                    },
+                ));
+                prev = i;
+                shift = expect - lines[i].start_ms as f64;
+            } else if methods[i] != Some(Method::Anchored) {
+                let next = anchored.iter().find(|&&q| q > i).copied().unwrap_or(to);
+                let (Some(p), Some(q)) = (bands[prev], bands[next]) else {
+                    continue;
                 };
-                let (ws, we) = plan::window(&shifted, words[i].len(), gap_lo);
-                if let Some(w) =
-                    align_in(song, &lines[i], &words[i], ws.max(gap_lo), we.min(gap_hi))
-                {
-                    out[i] = w;
-                    methods[i] = Some(Method::Between);
+                parts.push((
+                    i,
+                    Part {
+                        words: t,
+                        lo_ms: p.1 - 2.0 * PAD_MS as f64,
+                        hi_ms: q.0 + 2.0 * PAD_MS as f64,
+                        expect_ms: lines[i].start_ms as f64 + shift,
+                    },
+                ));
+            }
+        }
+        let only: Vec<Part> = parts.iter().map(|(_, p)| p.clone()).collect();
+        match joint(song, &only) {
+            Some(placed) => {
+                for ((i, _), p) in parts.iter().zip(placed) {
+                    let times: Vec<(u64, u64)> = p
+                        .words
+                        .iter()
+                        .map(|&(a, b)| (song.ms(a), song.ms(b)))
+                        .collect();
+                    let stamps = plan::stamps(&lines[*i].text, &words[*i], &times, 0);
+                    if stamps.is_empty() {
+                        continue;
+                    }
+                    out[*i] = LineWords {
+                        words: stamps,
+                        score: crate::service::round_score(p.score),
+                    };
+                    methods[*i] = Some(if bands[*i].is_some() {
+                        Method::Refined
+                    } else {
+                        Method::Between
+                    });
                 }
             }
-            gap_lo = end_ms(&out[i]).unwrap_or(gap_lo).max(gap_lo);
+            None => {
+                for &i in &anchored {
+                    if let Some(a) = matched.lines[i].anchor.as_ref() {
+                        out[i] = anchor_words(&lines[i], &words[i], &a.starts_ms, a.end_ms);
+                        methods[i] = Some(Method::Anchored);
+                    }
+                }
+            }
         }
     }
 
@@ -346,7 +552,7 @@ mod tests {
         h.extend(heard("low tide hums", 5.9));
         let m = match_lines(&lines, &h, Options::default());
         let t = [today(&lines[0], 1_000), today(&lines[1], 5_000)];
-        let r = place(&lines, &t, 0, &m, &song);
+        let r = place(&lines, &t, &m, &song);
         assert_eq!(
             r.methods,
             vec![Some(Method::Refined), Some(Method::Refined)]
@@ -368,7 +574,7 @@ mod tests {
             n_samples: frames * SAMPLES_PER_FRAME,
         };
         let m = match_lines(&lines, &heard("grey gulls wheel", 3.0), Options::default());
-        let r = place(&lines, &[today(&lines[0], 1_000)], 0, &m, &song);
+        let r = place(&lines, &[today(&lines[0], 1_000)], &m, &song);
         assert_eq!(r.methods, vec![Some(Method::Anchored)]);
         assert_eq!(starts(&r.lines[0]), vec![3_000, 3_500, 4_000, 4_400]);
     }
@@ -402,7 +608,7 @@ mod tests {
             today(&lines[2], 7_000),
             today(&lines[3], 12_000),
         ];
-        let r = place(&lines, &t, 0, &m, &song);
+        let r = place(&lines, &t, &m, &song);
         assert_eq!(
             r.methods,
             vec![
@@ -417,28 +623,64 @@ mod tests {
     }
 
     #[test]
-    fn a_line_today_already_put_inside_its_gap_is_kept() {
+    fn a_line_sung_twice_in_its_band_takes_the_one_nearer_its_anchor() {
+        let lines = [line(1_000, 5_000, "grey gulls wheel")];
+        // Sung at the anchor and again, a little more clearly, 1.3 s later.
+        let near = sing("grey gulls wheel", 2_000);
+        let mut sung = near.clone();
+        sung.extend(sing("grey gulls wheel", 3_300));
+        let frames = 400;
+        let mut e = emission(frames, &sung);
+        for &(c, ms) in &near {
+            let (c, f) = (
+                label(c).unwrap() as usize,
+                usize::try_from(ms / FRAME_MS).unwrap(),
+            );
+            for t in f..f + 3 {
+                e[t * CLASSES + c] = -0.015;
+            }
+        }
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let m = match_lines(&lines, &heard("grey gulls wheel", 2.0), Options::default());
+        let r = place(&lines, &[today(&lines[0], 1_000)], &m, &song);
+        assert_eq!(r.methods, vec![Some(Method::Refined)]);
+        sung_at(&r.lines[0], &[2_000, 2_500, 3_100]);
+    }
+
+    #[test]
+    fn a_gap_too_short_for_its_lines_keeps_the_recognisers_times() {
+        let long = ["grey gulls wheel"; 25].join(" ");
         let lines = [
-            line(1_000, 4_000, "grey gulls wheel"),
-            line(4_000, 7_000, "nets dry slow"),
-            line(7_000, 10_000, "low tide hums"),
+            line(1_000, 3_000, "grey gulls wheel"),
+            line(3_000, 3_200, &long),
+            line(3_200, 6_000, "low tide hums"),
         ];
-        let frames = 600;
-        let e = emission(frames, &sing("grey gulls wheel", 1_000));
+        let frames = 500;
+        let e = emission(frames, &[]);
         let song = Song {
             emission: Emission::new(&e, frames, CLASSES).unwrap(),
             n_samples: frames * SAMPLES_PER_FRAME,
         };
         let mut h = heard("grey gulls wheel", 1.0);
-        h.extend(heard("low tide hums", 7.0));
+        h.extend(heard("low tide hums", 3.5));
         let m = match_lines(&lines, &h, Options::default());
-        let t = [
-            today(&lines[0], 1_000),
-            today(&lines[1], 4_500),
-            today(&lines[2], 7_000),
-        ];
-        let r = place(&lines, &t, 0, &m, &song);
-        assert_eq!(r.methods[1], Some(Method::Kept));
+        let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(
+            r.methods,
+            vec![
+                Some(Method::Anchored),
+                Some(Method::Kept),
+                Some(Method::Anchored)
+            ]
+        );
+        let a = m.lines[0].anchor.as_ref().unwrap();
+        let mut want = a.starts_ms.clone();
+        want.push(a.end_ms);
+        assert_eq!(starts(&r.lines[0]), want);
         assert_eq!(r.lines[1], t[1]);
     }
 
@@ -458,7 +700,7 @@ mod tests {
         };
         let m = match_lines(&lines, &heard("grey gulls wheel", 1.5), Options::default());
         let t: Vec<LineWords> = lines.iter().map(|l| today(l, l.start_ms)).collect();
-        let r = place(&lines, &t, 0, &m, &song);
+        let r = place(&lines, &t, &m, &song);
         assert_eq!(r.lines, t);
         assert_eq!(r.methods[3], None);
         assert_eq!(r.placement.count(Method::Kept), 3);
