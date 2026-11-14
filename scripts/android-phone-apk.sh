@@ -110,8 +110,14 @@ grep -q "versionCode = $version_code" "$gradle_root/app/build.gradle.kts" || {
 echo "android-phone-apk: 4/6 assembling with gradle" >&2
 apk_dir=$gradle_root/app/build/outputs/apk
 rm -rf "$apk_dir"
-(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet assembleDebug) || {
-  echo "android-phone-apk: gradle assembleDebug failed (see its error above)" >&2
+# dx's template marks only the debug build type debuggable, so a release
+# build must assemble the release variant or it ships debuggable.
+case $profile in
+  release) assemble=assembleRelease ;;
+  *) assemble=assembleDebug ;;
+esac
+(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet "$assemble") || {
+  echo "android-phone-apk: gradle $assemble failed (see its error above)" >&2
   exit 1
 }
 built=$(find "$apk_dir" -name '*.apk' | head -n 1)
@@ -119,6 +125,12 @@ built=$(find "$apk_dir" -name '*.apk' | head -n 1)
   echo "android-phone-apk: no APK found under $apk_dir" >&2
   exit 1
 }
+debuggable=$("$build_tools/aapt2" dump xmltree --file AndroidManifest.xml "$built" | grep -c 'android:debuggable.*=true' || true)
+echo "android-phone-apk: gradle $assemble built $(basename "$built") debuggable=$debuggable" >&2
+if [ "$profile" = release ] && [ "$debuggable" != 0 ]; then
+  echo "android-phone-apk: the release APK is debuggable; refusing to sign it" >&2
+  exit 1
+fi
 
 # Gradle may already split its own code over several dex files (a debug
 # build at minSdk 26 does). ART loads classes.dex, classes2.dex, ... up to the
