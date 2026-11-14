@@ -1249,6 +1249,16 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
     })
 }
 
+/// The length to show and where it came from. getDuration is -1 for a live
+/// stream, so the server's length stands in.
+fn track_length(player_ms: i32, server_ms: i64) -> (i64, &'static str) {
+    if player_ms > 0 {
+        (i64::from(player_ms), "player")
+    } else {
+        (server_ms, "server")
+    }
+}
+
 // ---- PharosPlayerListener -------------------------------------------------
 
 #[no_mangle]
@@ -1269,9 +1279,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         if let Some(st) = state_lock()?.as_mut() {
             st.prepared = true;
         }
-        // getDuration is -1 for a live stream: fall back to the server's length.
-        let length = if duration > 0 { i64::from(duration) } else { entry.duration_ms };
-        let source = if duration > 0 { "player" } else { "server" };
+        let (length, source) = track_length(duration, entry.duration_ms);
         log(&format!(
             "duration source={source} ms={length} player_ms={duration} server_ms={} id={}",
             entry.duration_ms, entry.id
@@ -1371,4 +1379,34 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_n
         env.call_method(&this, "finish", "()V", &[]).map_err(jerr("finish"))?;
         played
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_length_prefers_the_player_and_falls_back_to_the_server() {
+        assert_eq!(track_length(57_887, 57_840), (57_887, "player"));
+        assert_eq!(track_length(-1, 316_160), (316_160, "server"));
+        assert_eq!(track_length(0, 0), (0, "server"));
+    }
+
+    #[test]
+    fn a_node_runtime_becomes_the_item_duration() {
+        let track = |ms| content::Node {
+            id: "track/1".into(),
+            title: "A Song".into(),
+            subtitle: String::new(),
+            browsable: false,
+            playable: true,
+            art_url: None,
+            stream_url: None,
+            duration_ms: ms,
+            album: "An Album".into(),
+        };
+        let item = Item::of_node(track(22_253));
+        assert_eq!((item.duration_ms, item.album.as_str()), (22_253, "An Album"));
+        assert_eq!(Item::of_node(track(u64::MAX)).duration_ms, 0);
+    }
 }
