@@ -145,6 +145,8 @@ pub async fn get_text(url: &str) -> Result<String, (Option<u16>, String)> {
     resp.text().await.map_err(|e| (None, e.to_string()))
 }
 
+pub const SLEEP_IS_REAL: bool = true;
+
 pub async fn sleep_ms(ms: u32) {
     let ms = i32::try_from(ms).unwrap_or(i32::MAX);
     let promise = js_sys::Promise::new(&mut |resolve, _| {
