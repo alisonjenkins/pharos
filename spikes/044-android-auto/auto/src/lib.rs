@@ -11,6 +11,7 @@
 mod art;
 mod compat;
 mod focus;
+mod network;
 mod voice;
 pub mod content;
 
@@ -957,6 +958,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         if let Err(e) = connect_library(env, &this) {
             log(&format!("onCreate: library not connected: {e}"));
         }
+        if let Err(e) = network::watch(env, &this) {
+            log(&format!("onCreate: network callback unavailable: {e}"));
+        }
         Ok(())
     })
 }
@@ -969,6 +973,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
     guarded(&mut env, "onDestroy", (), |env| {
         let Some(st) = state_lock()?.take() else { return Ok(()) };
         focus::destroy(env)?;
+        network::unwatch(env)?;
         if let Some(p) = st.player {
             env.call_method(p.as_obj(), "release", "()V", &[]).map_err(jerr("player.release"))?;
         }
