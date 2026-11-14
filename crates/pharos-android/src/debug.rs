@@ -5,8 +5,9 @@
 //! makes the server unreachable (see `content::Library::debug_offline`);
 //! `--ez on false` restores it. `--el cap_bytes N` sets the cache cap (see
 //! `content::Library::set_cache_cap`). Registered in code, for the
-//! service's life only. Exported, because the shell is another app; the
-//! worst a caller can do is make this app act offline or shrink its cache.
+//! service's life only. Exported, because the shell is another app, but
+//! guarded by `DUMP`: the shell holds it and an ordinary installed app
+//! cannot, so no other app can turn the server off or shrink the cache.
 
 use std::sync::Mutex;
 
@@ -19,6 +20,8 @@ use crate::{guarded, jerr, log, LIBRARY, R};
 pub const ACTION: &str = "com.alisonjenkins.pharos.auto.DEBUG_OFFLINE";
 /// `Context.RECEIVER_EXPORTED` (API 33): the shell's broadcasts reach it.
 const RECEIVER_EXPORTED: i32 = 2;
+/// Held by the adb shell; signature|privileged|development for apps.
+pub const SENDER_PERMISSION: &str = "android.permission.DUMP";
 
 static RECEIVER: Mutex<Option<Registered>> = Mutex::new(None);
 
@@ -29,14 +32,17 @@ pub fn register(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     if guard.is_some() {
         return Ok(());
     }
-    *guard = Some(receiver::register(
+    *guard = Some(receiver::register_guarded(
         env,
         ctx,
         "com/alisonjenkins/pharos/auto/PharosDebugReceiver",
         ACTION,
+        Some(SENDER_PERMISSION),
         RECEIVER_EXPORTED,
     )?);
-    log(&format!("debug: receiver registered action={ACTION}"));
+    log(&format!(
+        "debug: receiver registered action={ACTION} permission={SENDER_PERMISSION}"
+    ));
     Ok(())
 }
 

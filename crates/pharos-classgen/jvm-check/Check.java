@@ -79,6 +79,8 @@ public class Check {
     expect(dbg != null && dbg.getClass().getSimpleName().equals("PharosDebugReceiver")
         && Integer.valueOf(2).equals(android.content.Context.receiverFlags.get("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE")),
         "service registers the exported debug receiver");
+    expect("android.permission.DUMP".equals(android.content.Context.receiverPermissions.get("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE")),
+        "only the shell's DUMP permission may send the debug broadcast");
     if (dbg != null) {
       dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", true));
       dbg.onReceive(s, new android.content.Intent("com.alisonjenkins.pharos.auto.DEBUG_OFFLINE").putExtra("on", false));

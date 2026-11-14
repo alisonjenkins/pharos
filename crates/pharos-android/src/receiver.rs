@@ -19,6 +19,19 @@ pub fn register(
     action: &str,
     flags: i32,
 ) -> R<Registered> {
+    register_guarded(env, ctx, class, action, None, flags)
+}
+
+/// As [`register`], but when `permission` is set only senders holding that
+/// permission are delivered.
+pub fn register_guarded(
+    env: &mut JNIEnv,
+    ctx: &JObject,
+    class: &str,
+    action: &str,
+    permission: Option<&str>,
+    flags: i32,
+) -> R<Registered> {
     let receiver = env
         .new_object(class, "()V", &[])
         .map_err(jerr("receiver"))?;
@@ -30,11 +43,21 @@ pub fn register(
             &[JValue::Object(&action_s)],
         )
         .map_err(jerr("IntentFilter"))?;
+    let permission = match permission {
+        Some(p) => JObject::from(env.new_string(p).map_err(jerr("receiver permission"))?),
+        None => JObject::null(),
+    };
     env.call_method(
         ctx,
         "registerReceiver",
-        "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;",
-        &[JValue::Object(&receiver), JValue::Object(&filter), JValue::Int(flags)],
+        "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;Ljava/lang/String;Landroid/os/Handler;I)Landroid/content/Intent;",
+        &[
+            JValue::Object(&receiver),
+            JValue::Object(&filter),
+            JValue::Object(&permission),
+            JValue::Object(&JObject::null()),
+            JValue::Int(flags),
+        ],
     )
     .map_err(|e| format!("registerReceiver({action}): {e}"))?;
     Ok(Registered {
