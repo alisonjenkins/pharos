@@ -2620,8 +2620,8 @@ fn on_this_device() -> Element {
 /// Short, because a phone in a tunnel reports itself online.
 const SLOW_CONNECT_MS: u32 = 3_000;
 
-/// Whether any book is kept on this device: one `localStorage` read, made
-/// only when a connection attempt starts.
+/// Whether anything is kept on this device (a browser's book, a phone's
+/// download): one read, made only when a connection attempt starts.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 fn kept_any() -> bool {
     super::kept_web::read().is_some()
@@ -2629,12 +2629,12 @@ fn kept_any() -> bool {
 
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 fn kept_any() -> bool {
-    false
+    super::offline_start::any_downloaded()
 }
 
 /// The app with no connection and books kept on the device: the list, or
 /// the reader when a kept book was asked for. `None` when nothing is kept,
-/// so the usual waiting page shows. Browser only; the cache is the browser's.
+/// so the usual waiting page shows. Two builds have one: the browser (kept books) and the phone (downloads).
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 fn offline_start(route: &Route) -> Option<Element> {
     let store = super::kept_web::read()?;
@@ -2646,9 +2646,11 @@ fn offline_start(route: &Route) -> Option<Element> {
     })
 }
 
+/// The phone: the music and books downloaded on it, which play without the
+/// server. `None` where no store is registered or nothing is downloaded.
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 fn offline_start(_route: &Route) -> Option<Element> {
-    None
+    super::offline_start::start()
 }
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
