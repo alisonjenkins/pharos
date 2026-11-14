@@ -3417,7 +3417,10 @@ pub const PROBE_SCHEMA_VERSION: i64 = 9;
 /// v4: a stem title also loses a bracketed format or edition tag (`[eBook]`,
 /// `[Kindle in Motion]`) and a trailing `-ebook` (B1433), so every book row
 /// must be re-read to lose them.
-pub const BOOK_SCHEMA_VERSION: i64 = 4;
+///
+/// v5: a description loses its HTML markup and entities, and one too short
+/// to be a synopsis is dropped (B1440), so every book row must be re-read.
+pub const BOOK_SCHEMA_VERSION: i64 = 5;
 
 /// T86/ADR-0018 — bump when the FINGERPRINT changes in a way that invalidates
 /// cached points (a different chromaprint configuration, a different analysis
