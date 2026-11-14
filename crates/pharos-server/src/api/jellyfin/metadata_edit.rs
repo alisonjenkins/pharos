@@ -13,8 +13,8 @@ use crate::services::metadata_edit::{self as service, EditError};
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{
-    EditTarget, EditableField, LockedFields, MediaStore, MetadataEdit, MetadataEditStore,
-    SeriesMetadataStore,
+    EditTarget, EditableField, GenreStore, LockedFields, MediaKind, MediaStore, MetadataEdit,
+    MetadataEditStore, SeriesMetadataStore,
 };
 use serde_json::{Map, Value};
 
@@ -40,10 +40,11 @@ struct MetadataViewDto {
     fields: Map<String, Value>,
     editable: Vec<&'static str>,
     locked: Vec<&'static str>,
-    /// The scores as stored, unrounded, which is what `GET /Items` sends
-    /// and so what Jellyfin's editor posts back unchanged.
+    /// Fields as `GET /Items` sends them, and so as Jellyfin's editor posts
+    /// them back unchanged: the scores unrounded, and a book's Genres from
+    /// the item's genre column rather than its shelves (spec 043 FR-013).
     #[serde(skip)]
-    exact_scores: Map<String, Value>,
+    as_sent: Map<String, Value>,
 }
 
 /// A refused edit, shown against its field (FR-003).
@@ -128,7 +129,16 @@ async fn view(
             put(F::OfficialRating, opt(md.official_rating.clone()));
             put(F::CommunityRating, score(md.community_rating));
             put(F::CriticRating, score(md.critic_rating));
-            let exact_scores = Map::from_iter([
+            let book = item.kind == MediaKind::Book;
+            if book {
+                let genres = state
+                    .stores
+                    .item_genre_names(*id)
+                    .await
+                    .map_err(|e| store_failure("could not read the genres", &e))?;
+                put(F::Genres, genres.into());
+            }
+            let mut as_sent = Map::from_iter([
                 (
                     F::CommunityRating.wire().to_owned(),
                     exact_score(md.community_rating),
@@ -139,15 +149,21 @@ async fn view(
                     exact_score(pharos_jellyfin_api::dto::shown_critic_rating(&item)),
                 ),
             ]);
+            if book {
+                as_sent.insert(
+                    F::Genres.wire().to_owned(),
+                    item.probe.genre.iter().cloned().collect::<Vec<_>>().into(),
+                );
+            }
             Ok(MetadataViewDto {
                 id: raw.to_owned(),
                 target: "item",
                 kind: item.kind.base_item_kind(),
                 name: item.title.clone(),
                 fields,
-                editable: wire_list(F::ALL.into_iter().filter(|f| f.on_item())),
+                editable: wire_list(F::ALL.into_iter().filter(|f| f.on_item_of(item.kind))),
                 locked: wire_list(item.locked.iter()),
-                exact_scores,
+                as_sent,
             })
         }
         EditTarget::Series { key, name } => {
@@ -171,7 +187,7 @@ async fn view(
                 fields,
                 editable: wire_list(F::ALL.into_iter().filter(|f| f.on_series())),
                 locked: wire_list(meta.locked.iter()),
-                exact_scores: Map::from_iter([(
+                as_sent: Map::from_iter([(
                     F::CommunityRating.wire().to_owned(),
                     exact_score(meta.community_rating),
                 )]),
@@ -469,7 +485,7 @@ async fn jellyfin_update_item(
     let current = view(&state, &raw, &target).await?;
     // Compare against what `GET /Items` sent, not the view's rounded scores.
     let mut stored = current.fields;
-    stored.extend(current.exact_scores);
+    stored.extend(current.as_sent);
     let fields = jellyfin_fields(&body, &stored, &current.editable);
     if fields.is_empty() {
         tracing::info!(admin = %user.0.name, target = ?target, "metadata edit: the Jellyfin save changed nothing");
@@ -533,6 +549,69 @@ mod tests {
             ["OfficialRating", "Overview"],
             "Genres is not editable here"
         );
+    }
+
+    /// Spec 043 FR-011/FR-013: a book's editor shows its shelves, and a
+    /// Jellyfin save that leaves Genres as `GET /Items` sent them (the item's
+    /// genre column, empty for a book) does not touch them.
+    #[tokio::test]
+    async fn a_books_view_lists_its_shelves_and_a_jellyfin_save_keeps_them() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        stores
+            .put(pharos_core::MediaItem {
+                id: 4,
+                path: "/b/x.epub".into(),
+                title: "Book X".into(),
+                kind: MediaKind::Book,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        stores
+            .link_item_genres(4, &["Web".into(), "Programming".into()])
+            .await
+            .unwrap();
+        let state = AppState::new(stores, "t".into());
+        let v = view(&state, "4", &EditTarget::Item(4)).await.unwrap();
+        assert_eq!(v.fields["Genres"], json!(["Programming", "Web"]));
+        assert!(v.editable.contains(&"Genres"), "{:?}", v.editable);
+        let mut stored = v.fields;
+        stored.extend(v.as_sent);
+        let body = json!({"Name": "Book X", "Genres": []});
+        assert!(
+            jellyfin_fields(&body, &stored, &v.editable).is_empty(),
+            "an untouched Genres box must not wipe the shelves"
+        );
+        let body = json!({"Name": "Book X", "Genres": ["Security"]});
+        assert_eq!(
+            jellyfin_fields(&body, &stored, &v.editable)
+                .keys()
+                .collect::<Vec<_>>(),
+            ["Genres"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_films_view_offers_no_genres() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        stores
+            .put(pharos_core::MediaItem {
+                id: 5,
+                path: "/m/f.mkv".into(),
+                title: "Film F".into(),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = AppState::new(stores, "t".into());
+        let v = view(&state, "5", &EditTarget::Item(5)).await.unwrap();
+        assert!(!v.editable.contains(&"Genres"));
+        assert!(!v.fields.contains_key("Genres"));
     }
 
     #[test]
