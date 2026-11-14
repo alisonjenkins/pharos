@@ -4240,7 +4240,7 @@ mod tests {
 
         let html = book_with_formats("kindle-locked");
         assert!(!html.contains(">Read<"), "{html}");
-        assert!(html.contains("locked to a Kindle device"), "{html}");
+        assert!(html.contains("Locked to a Kindle (DRM)"), "{html}");
     }
 
     #[test]
