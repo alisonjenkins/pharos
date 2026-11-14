@@ -3853,6 +3853,10 @@ pub struct MediaFilters {
     /// `Is3D` — `Some(true)` keeps items whose primary file or any grouped
     /// edition is 3D; `Some(false)` keeps only items with no 3D version.
     pub is_3d: Option<bool>,
+    /// Books no client can open (`book_format = 'unreadable'`): `Some(true)`
+    /// keeps every item except those; `Some(false)` keeps only those (B1420).
+    /// Items that are not books are never dropped by `Some(true)`.
+    pub book_readable: Option<bool>,
     /// `MinWidth` — keep only items whose `width >= n`.
     pub min_width: Option<u32>,
     /// `MaxWidth` — keep only items whose `width <= n`.
@@ -3913,6 +3917,7 @@ impl MediaFilters {
             || self.is_4k.is_some()
             || self.is_hd.is_some()
             || self.is_3d.is_some()
+            || self.book_readable.is_some()
             || self.min_width.is_some()
             || self.max_width.is_some()
             || self.min_index_number.is_some()

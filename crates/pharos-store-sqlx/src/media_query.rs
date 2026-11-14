@@ -668,6 +668,13 @@ fn push_residual_clauses(
         // `has_3d` is true when the primary or any grouped edition is 3D.
         clauses.push(format!("has_3d = {}", i32::from(want)));
     }
+    match f.book_readable {
+        Some(true) => {
+            clauses.push("(book_format IS NULL OR book_format <> 'unreadable')".to_owned())
+        }
+        Some(false) => clauses.push("book_format = 'unreadable'".to_owned()),
+        None => {}
+    }
     if let Some(min) = f.min_width {
         params.push(Param::Int(i64::from(min)));
         let p = ph(params.len());
