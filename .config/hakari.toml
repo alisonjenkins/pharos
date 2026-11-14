@@ -34,8 +34,10 @@ platforms = [
 # Android (spec 044), where the server stack has no place; pharos-classgen
 # is a dependency-free build tool for the same app, and pharos-android is
 # its JNI layer. pharos-phone is the phone app over both and pharos-ui.
+# pharos-vis decodes songs for the phone visualiser (ADR-0133) and stays off
+# the server stack for the same reason.
 [final-excludes]
-workspace-members = ["pharos-android", "pharos-api", "pharos-classgen", "pharos-client", "pharos-content", "pharos-hls", "pharos-phone", "pharos-subs", "pharos-ui", "quire", "quire-pdf", "quire-web"]
+workspace-members = ["pharos-android", "pharos-api", "pharos-classgen", "pharos-client", "pharos-content", "pharos-hls", "pharos-phone", "pharos-subs", "pharos-ui", "pharos-vis", "quire", "quire-pdf", "quire-web"]
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
