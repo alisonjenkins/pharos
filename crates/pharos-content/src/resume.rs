@@ -106,6 +106,13 @@ impl Resume {
         self.lock().get(id).copied().filter(|&p| p < duration_ms)
     }
 
+    /// The position kept for `id`, with no duration to check it against: a
+    /// screen choosing which part of a book to open asks this before the
+    /// part is prepared. Only long tracks are ever kept.
+    pub fn saved(&self, id: &str) -> Option<u64> {
+        self.lock().get(id).copied()
+    }
+
     /// Notes that `id` is at `position_ms` of `duration_ms`, and saves the
     /// file when that changed what it holds.
     pub fn record(
@@ -190,6 +197,18 @@ mod tests {
         let again = Resume::open(&d);
         assert_eq!(again.position("t1", LONG), Some(125_000));
         assert_eq!(again.position("t2", LONG), None);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_reports_a_kept_position_and_none_for_the_rest() -> Result<(), ContentError> {
+        let d = dir("saved");
+        let r = Resume::open(&d);
+        assert_eq!(r.saved("t1"), None);
+        r.record("t1", 125_000, LONG)?;
+        assert_eq!(r.saved("t1"), Some(125_000));
+        r.record("t1", LONG - 1_000, LONG)?;
+        assert_eq!(r.saved("t1"), None, "a finished track keeps nothing");
         Ok(())
     }
 
