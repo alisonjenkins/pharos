@@ -28,6 +28,9 @@ const SONG_S: usize = 10;
 struct Singer {
     sung: Option<Vec<(char, i64)>>,
     device: &'static str,
+    /// Falls to the CPU at its first emission, as `Fallback` does on a
+    /// GPU device error.
+    falls_back: bool,
 }
 
 impl Model for Singer {
@@ -39,6 +42,9 @@ impl Model for Singer {
     }
 
     fn emission(&mut self, pcm: &[f32]) -> Result<Option<Vec<f32>>, ModelError> {
+        if self.falls_back {
+            self.device = "cpu";
+        }
         let Some(sung) = &self.sung else {
             return Ok(None);
         };
@@ -167,11 +173,16 @@ fn loader(sung: Option<Vec<(char, i64)>>) -> Loader {
 }
 
 fn loader_on(sung: Option<Vec<(char, i64)>>, device: &'static str) -> Loader {
+    singers(sung, device, false)
+}
+
+fn singers(sung: Option<Vec<(char, i64)>>, device: &'static str, falls_back: bool) -> Loader {
     let sung = Arc::new(sung);
     Box::new(move || {
         Ok(Box::new(Singer {
             sung: (*sung).clone(),
             device,
+            falls_back,
         }) as Box<dyn Model>)
     })
 }
@@ -359,6 +370,31 @@ fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     assert_eq!(got.placement.fallback, Some(Fallback::NoGpuStages));
     assert_eq!(got.fallback_reason, "the song ran on cpu: scripted");
     assert_eq!(got.stages.vocals_ms, 0);
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn an_emission_that_falls_back_to_the_cpu_fails_the_stage() {
+    let (sung, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard,
+        slow: Duration::ZERO,
+    };
+    let (got, events) = run(
+        &Engine::new(singers(Some(sung), "vulkan", true), silent(), None)
+            .with_stages(Box::new(stages)),
+    );
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::EmissionFailed));
+    assert!(
+        got.fallback_reason.contains("fell back to the cpu"),
+        "{}",
+        got.fallback_reason
+    );
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
     assert_eq!(events.len(), 3);
