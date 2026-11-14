@@ -438,11 +438,6 @@ pub fn user_agent() -> String {
     String::new()
 }
 
-/// Whether the UI runs inside the Android TV app (spec 025).
-pub fn android_shell() -> bool {
-    cfg!(target_os = "android")
-}
-
 pub fn palette_keys() -> &'static str {
     "Ctrl+K"
 }
