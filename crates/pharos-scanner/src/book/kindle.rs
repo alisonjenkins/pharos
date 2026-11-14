@@ -308,6 +308,13 @@ pub fn read_kindle(path: &Path) -> Result<EpubMetadata, KindleError> {
             .and_then(|c| c.position)
             .filter(|p| p.fract() == 0.0 && *p >= 0.0 && *p <= f64::from(u32::MAX))
             .map(|p| p as u32),
+        subjects: m
+            .subjects
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
         cover_href: m.cover_image.clone(),
     })
 }
@@ -424,6 +431,7 @@ mod tests {
     <dc:language>en</dc:language>
     <dc:identifier id="uid">9789300000002</dc:identifier>
     <dc:publisher>No Starch Press</dc:publisher>
+    <dc:subject>Synthetic Subject</dc:subject>
   </metadata>
   <manifest>
     <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
@@ -536,6 +544,8 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("Book A"));
         assert_eq!(meta.author.as_deref(), Some("Gjengset, Jon"));
         assert_eq!(meta.publisher.as_deref(), Some("No Starch Press"));
+        // Spec 043 FR-002: the subject survives the AZW3 round trip (EXTH 105).
+        assert_eq!(meta.subjects, vec!["Synthetic Subject".to_owned()]);
         // NOT asserted here: `isbn`. The fixture is made by boko's own AZW3
         // WRITER, and that writer does not carry `dc:identifier` through — so
         // a round-trip cannot prove anything about ISBN either way.
