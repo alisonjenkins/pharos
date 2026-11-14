@@ -46,11 +46,21 @@ enum View {
 #[derive(Clone, Debug)]
 enum Work {
     Initiate,
-    Wait { secret: String },
-    Poll { secret: String },
+    Wait {
+        secret: String,
+    },
+    Poll {
+        secret: String,
+    },
     Finish,
-    Albums { start: usize },
-    Tracks,
+    Albums {
+        start: usize,
+    },
+    /// One block of an album's tracks, from `start`.
+    Tracks {
+        album: String,
+        start: usize,
+    },
     Report(Report),
     ReportTimer,
 }
@@ -166,15 +176,22 @@ impl Pharos {
     }
 
     fn open_album(&mut self, context: &mut Context, album: Entry) {
-        let Some(account) = &self.account else {
+        if self.account.is_none() {
             return;
-        };
-        let url = api::tracks_url(SERVER, account, &album.id);
+        }
         self.tracks = Page::default();
         self.page = 0;
         self.album = Some(album.clone());
+        self.load_tracks(context, album.id.clone(), 0);
         self.view = View::Album(album);
-        self.fetch(context, url, Work::Tracks);
+    }
+
+    fn load_tracks(&mut self, context: &mut Context, album: String, start: usize) {
+        let Some(account) = &self.account else {
+            return;
+        };
+        let url = api::tracks_url(SERVER, account, &album, start);
+        self.fetch(context, url, Work::Tracks { album, start });
     }
 
     fn play(&mut self, context: &mut Context, index: usize) {
@@ -281,10 +298,27 @@ impl Pharos {
                 }
                 None => self.problem("Pharos sent a list this app could not read."),
             },
-            Work::Tracks => match api::parse_page(bytes) {
-                Some(page) => self.tracks = page,
-                None => self.problem("Pharos sent a list this app could not read."),
-            },
+            Work::Tracks { album, start } => {
+                // A reply for an album the reader has since left is stale.
+                if self.album.as_ref().is_none_or(|open| open.id != album)
+                    || start != self.tracks.entries.len()
+                {
+                    return;
+                }
+                match api::parse_page(bytes) {
+                    Some(page) => {
+                        let got = page.entries.len();
+                        self.tracks.total = page.total;
+                        self.tracks.entries.extend(page.entries);
+                        // An album is small: fetch the rest straight away.
+                        let loaded = self.tracks.entries.len();
+                        if got > 0 && loaded < self.tracks.total {
+                            self.load_tracks(context, album, loaded);
+                        }
+                    }
+                    None => self.problem("Pharos sent a list this app could not read."),
+                }
+            }
             Work::Report(report) => {
                 context.log(
                     LogLevel::Info,
@@ -452,7 +486,7 @@ fn work_label(work: &Work) -> &'static str {
         Work::Poll { .. } => "poll",
         Work::Finish => "finish",
         Work::Albums { .. } => "albums",
-        Work::Tracks => "tracks",
+        Work::Tracks { .. } => "tracks",
         Work::Report(report) => report.label(),
         Work::ReportTimer => "report-timer",
     }
