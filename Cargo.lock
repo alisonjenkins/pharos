@@ -8177,6 +8177,7 @@ version = "0.0.0"
 dependencies = [
  "actix-web",
  "burn",
+ "burn-store",
  "cubecl-runtime",
  "gemm",
  "libc",

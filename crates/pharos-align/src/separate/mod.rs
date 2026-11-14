@@ -3,6 +3,8 @@
 //! the network is here, as demucs's `apply_model` and `separate` do it, so
 //! it is tested with a stand-in network.
 
+#[cfg(feature = "separate")]
+pub mod htdemucs;
 pub mod stft;
 
 use std::time::Instant;
