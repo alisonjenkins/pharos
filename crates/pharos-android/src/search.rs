@@ -19,9 +19,10 @@ pub(crate) fn find_ranked(query: &str) -> (Vec<Item>, Option<content::SearchRepo
                 report = r;
             }
             Err(e) => {
-                log(&format!("library search failed: {e}"));
+                let why = e.redacted();
+                log(&format!("library search failed: {why}"));
                 if hits.is_empty() {
-                    hits.push(Item::notice("Search failed", &e.to_string()));
+                    hits.push(Item::notice("Search failed", &why));
                 }
             }
         }

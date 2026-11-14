@@ -1,9 +1,11 @@
-//! Spike 044: everything behind the generated `PharosMediaService` and
-//! `PharosSessionCallback` classes (see `../classgen`). No Java or Kotlin
+//! The Rust side of the Pharos Android app: everything behind the generated
+//! `PharosMediaService`, `PharosSessionCallback`, `PharosPlayerListener` and
+//! `PharosSearchActivity` classes (see `pharos-classgen`). No Java or Kotlin
 //! source exists; each Java entry point lands in one of these functions.
 //!
-//! The browse tree is the user's Pharos library (`content::Library`) with a
-//! "Test" folder of generated tones beside it. Library calls block on the
+//! The browse tree is the user's Pharos library (`content::Library`), plus a
+//! Test folder of tones when built for the host check (see `fixture`). Library
+//! calls block on the
 //! network, so they run on worker threads attached to the JVM, and browse
 //! results are detached and sent from there. Every call logs its inputs so a
 //! logcat line proves each hop reached Rust; logs carry ids, never titles.

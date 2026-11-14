@@ -313,7 +313,9 @@ pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
     let id = id.to_owned();
     on_worker("prepare", move |env| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
-        let node = lib.node(&id).map_err(|e| format!("node {id}: {e}"))?;
+        let node = lib
+            .node(&id)
+            .map_err(|e| format!("node {id}: {}", e.redacted()))?;
         prepare(env, Item::of_node(node), queue_for(&id))
     })
 }
