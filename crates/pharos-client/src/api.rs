@@ -14,7 +14,7 @@ use pharos_api::pharos_capnp::{
     session, start_tracks_result, stream_choice, telemetry, track, user_data, user_state_result,
     BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
     LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
-    StereoFilter, SubtitleDelivery,
+    StereoFilter, SubtitleDelivery, UnreadableFilter,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -241,6 +241,10 @@ pub struct Listing {
     pub watched: Option<Watched>,
     /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
     pub stereo: Option<bool>,
+    /// Books the viewer cannot open (DRM): left out, kept, or the only ones
+    /// (B1420). A server older than schemaVersion 46 ignores it and lists
+    /// them. Only a Books library's listing sets it past `Show`.
+    pub unreadable: Unreadable,
     /// Fold the films of each box set into one tile for the set (B1086).
     /// A server older than schemaVersion 37 ignores it and lists the films.
     pub collapse: bool,
@@ -254,6 +258,18 @@ pub enum Watched {
     /// Started and not finished: a film part watched, a show with an
     /// episode watched and one still to watch (V1159).
     InProgress,
+}
+
+/// What a [`Listing`] does with books no client can open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Unreadable {
+    /// Keep them with the rest.
+    #[default]
+    Show,
+    /// Leave them out.
+    Hide,
+    /// Keep only them.
+    Only,
 }
 
 impl Watched {
@@ -278,6 +294,7 @@ impl Listing {
             genre: None,
             watched: None,
             stereo: None,
+            unreadable: Unreadable::Show,
             collapse: false,
         }
     }
@@ -2107,6 +2124,11 @@ fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
         Some(false) => StereoFilter::Only2d,
     });
     q.set_collapse_collections(listing.collapse);
+    q.set_unreadable(match listing.unreadable {
+        Unreadable::Show => UnreadableFilter::Show,
+        Unreadable::Hide => UnreadableFilter::Hide,
+        Unreadable::Only => UnreadableFilter::Only,
+    });
     let watched = listing.watched.map(Watched::filter);
     let mut filters = q.init_filters(u32::from(watched.is_some()));
     if let Some(watched) = watched {

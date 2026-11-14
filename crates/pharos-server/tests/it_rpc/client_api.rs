@@ -967,3 +967,59 @@ async fn a_collapsed_listing_shows_a_box_set_as_one_tile() {
     );
     assert_eq!(grouped.total, films.total - 1);
 }
+
+/// B1420: a listing that hides unopenable books leaves out the DRM ones and
+/// counts what is kept; `Only` keeps just them; `Show` keeps all.
+/// Disarm check: with the client's query writer not sending `unreadable`, the
+/// hidden listing still holds the locked book.
+#[actix_web::test]
+async fn a_listing_can_hide_or_keep_only_books_no_client_can_open() {
+    use pharos_client::api::{Listing, Unreadable};
+    use pharos_core::{BookFormat, BookMeta, MediaItem, MediaKind};
+
+    let (api, fx, _server) = api().await;
+    for (id, title, format) in [
+        (331, "Open Book", BookFormat::Epub),
+        (332, "Locked Book", BookFormat::Unreadable),
+    ] {
+        pharos_core::MediaStore::put(
+            &fx.state.stores,
+            MediaItem {
+                id,
+                path: format!("/libA/{title}.epub").into(),
+                title: title.into(),
+                kind: MediaKind::Book,
+                book: Some(BookMeta {
+                    format,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
+        .await
+        .unwrap();
+    let call = CallInfo::default();
+    let library = api.home(&call).await.expect("home").rails[0].library.id;
+    let mut listing = Listing::of(library, None, "SortName");
+    let names = |page: &pharos_client::api::Page| -> Vec<String> {
+        page.items
+            .iter()
+            .filter(|i| i.name == "Open Book" || i.name == "Locked Book")
+            .map(|i| i.name.clone())
+            .collect()
+    };
+    let all = api.query(&call, &listing, 0, 50).await.expect("all");
+    assert_eq!(names(&all), ["Locked Book", "Open Book"]);
+    listing.unreadable = Unreadable::Hide;
+    let hidden = api.query(&call, &listing, 0, 50).await.expect("hidden");
+    assert_eq!(names(&hidden), ["Open Book"]);
+    assert_eq!(hidden.total, all.total - 1);
+    listing.unreadable = Unreadable::Only;
+    let only = api.query(&call, &listing, 0, 50).await.expect("only");
+    assert_eq!(names(&only), ["Locked Book"]);
+    assert_eq!(only.total, 1);
+}
