@@ -134,6 +134,8 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
+    // An audiobook's minute sleep timer outlives the per-part player.
+    use_context_provider(|| super::audiobook::SleepTimer(Signal::new(None)));
     // The TV remote's Back at the first page closes the player still
     // floating there before it leaves the app.
     use_hook(move || {

@@ -137,6 +137,104 @@ impl StopAtEnd {
     }
 }
 
+/// A minute sleep timer, kept as the wall-clock time it ends at. It lives
+/// above the per-part player slot (the app root provides it), so a hand-over
+/// to the next part, which drops the old controls and their tasks, neither
+/// cancels it nor resets it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SleepDeadline {
+    /// The book it was set for, see [`book_key`].
+    pub book: ItemRef,
+    pub minutes: u32,
+    pub ends_at_ms: f64,
+}
+
+/// The shared slot holding the armed minute timer, if any.
+#[derive(Clone, Copy)]
+pub struct SleepTimer(pub Signal<Option<SleepDeadline>>);
+
+/// What a newly mounted set of controls does with the shared timer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Carry {
+    None,
+    /// Still running for this book: show it and wait out the rest.
+    Resume {
+        remaining_ms: u64,
+    },
+    /// Ran out while no controls were watching: dropped, not fired.
+    Lapsed {
+        late_ms: u64,
+    },
+    /// Set for another book: dropped.
+    OtherBook,
+}
+
+impl Carry {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Resume { .. } => "resume",
+            Self::Lapsed { .. } => "lapsed",
+            Self::OtherBook => "other_book",
+        }
+    }
+}
+
+/// What identifies a book across its parts: the folder book's album, else
+/// the file playing.
+pub fn book_key(book: &Audiobook) -> ItemRef {
+    book.book.unwrap_or(book.playing)
+}
+
+/// Whether a timer found at mount is carried on, by `book` at `now_ms`.
+pub fn carry_over(timer: Option<SleepDeadline>, book: ItemRef, now_ms: f64) -> Carry {
+    let Some(timer) = timer else {
+        return Carry::None;
+    };
+    if timer.book != book {
+        return Carry::OtherBook;
+    }
+    let left = timer.ends_at_ms - now_ms;
+    if left > 0.0 {
+        Carry::Resume {
+            remaining_ms: left as u64,
+        }
+    } else {
+        Carry::Lapsed {
+            late_ms: (-left) as u64,
+        }
+    }
+}
+
+/// Waits out `deadline`, then pauses what `owned` names, unless a newer
+/// choice replaced or cleared it meanwhile.
+fn watch_deadline(
+    mut timer: Signal<Option<SleepDeadline>>,
+    mut sleep: Signal<Sleep>,
+    owned: Rc<Cell<&'static str>>,
+    deadline: SleepDeadline,
+    remaining_ms: u64,
+) {
+    spawn(async move {
+        platform::sleep_ms(u32::try_from(remaining_ms).unwrap_or(u32::MAX)).await;
+        if *timer.peek() == Some(deadline) {
+            platform::info(&format!(
+                "pharos: audiobook sleep fired timer={}m book={}",
+                deadline.minutes, deadline.book
+            ));
+            platform::pause(owned.get());
+            timer.set(None);
+            sleep.set(Sleep::Off);
+        }
+    });
+}
+
+/// Whether a key on the controls is a button's own activation. The player
+/// reads Space as play / pause, so it must not see these.
+pub fn activates_button(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::Enter)) || matches!(key, Key::Character(k) if k == " ")
+}
+
 /// The track an audiobook's Play starts on: the last one begun and not
 /// finished, else the first not finished, else the first (V1403).
 pub fn resume_track(tracks: &[Item]) -> Option<&Item> {
@@ -174,8 +272,9 @@ pub fn AudiobookControls(
     let mut sleep = use_signal(|| Sleep::Off);
     // The position the armed "end of chapter" pauses at.
     let mut sleep_pos = use_signal(|| None::<u64>);
-    // Bumped by every choice, so an older timer that wakes does nothing.
-    let mut sleep_gen = use_signal(|| 0u64);
+    let local_timer = use_signal(|| None::<SleepDeadline>);
+    let mut timer = try_use_context::<SleepTimer>().map_or(local_timer, |t| t.0);
+    let key = book_key(&book);
     let mut tracks = use_signal(Vec::<Item>::new);
     let folder = book.chapters.is_empty();
 
@@ -201,6 +300,31 @@ pub fn AudiobookControls(
         let owned = Rc::clone(&owned);
         move || platform::set_speed(owned.get(), 1.0)
     });
+
+    // A minute timer set on an earlier part carries over the hand-over.
+    use_hook({
+        let owned = Rc::clone(&owned);
+        move || {
+            let found = *timer.peek();
+            let carry = carry_over(found, key, platform::wall_clock_ms());
+            if carry != Carry::None {
+                platform::info(&format!(
+                    "pharos: audiobook sleep carry={} book={key} timer={:?}",
+                    carry.token(),
+                    found.map(|d| d.minutes),
+                ));
+            }
+            match (carry, found) {
+                (Carry::Resume { remaining_ms }, Some(d)) => {
+                    sleep.set(Sleep::Minutes(d.minutes));
+                    watch_deadline(timer, sleep, owned, d, remaining_ms);
+                }
+                (Carry::Lapsed { .. } | Carry::OtherBook, _) => timer.set(None),
+                _ => {}
+            }
+        }
+    });
+    let owned_sig = use_signal(|| Rc::clone(&owned));
 
     // A folder book's chapters are its tracks.
     let album = book.book;
@@ -249,8 +373,7 @@ pub fn AudiobookControls(
     }));
 
     let mut choose_sleep = move |next: Sleep, pos: Option<u64>| {
-        let gen = *sleep_gen.peek() + 1;
-        sleep_gen.set(gen);
+        timer.set(None);
         sleep.set(next);
         sleep_pos.set(pos);
         let holds = ends_with_track(pos, runtime_ms);
@@ -261,14 +384,14 @@ pub fn AudiobookControls(
             media.position_ms
         ));
         if let Sleep::Minutes(m) = next {
-            spawn(async move {
-                platform::sleep_ms(m.saturating_mul(60_000)).await;
-                if *sleep_gen.peek() == gen {
-                    platform::info(&format!("pharos: audiobook sleep fired timer={m}m"));
-                    platform::pause(media_id);
-                    sleep.set(Sleep::Off);
-                }
-            });
+            let ms = u64::from(m).saturating_mul(60_000);
+            let deadline = SleepDeadline {
+                book: key,
+                minutes: m,
+                ends_at_ms: platform::wall_clock_ms() + ms as f64,
+            };
+            timer.set(Some(deadline));
+            watch_deadline(timer, sleep, Rc::clone(&owned_sig.peek()), deadline, ms);
         }
     };
 
@@ -311,7 +434,16 @@ pub fn AudiobookControls(
         })
         .collect();
     rsx! {
-        div { class: "pharos-audiobook", role: "group", aria_label: "Audiobook",
+        div {
+            class: "pharos-audiobook",
+            role: "group",
+            aria_label: "Audiobook",
+            // Keys on the controls' own buttons are theirs, not the player's.
+            onkeydown: move |evt: KeyboardEvent| {
+                if activates_button(&evt.key()) {
+                    evt.stop_propagation();
+                }
+            },
             div { class: "pharos-audiobook-row", role: "group", aria_label: "Speed",
                 span { class: "pharos-audiobook-label", "Speed" }
                 for s in SPEEDS {
@@ -486,6 +618,112 @@ mod tests {
             [(OUTGOING_ID.to_owned(), 1.0)],
             "the next part's element keeps its speed"
         );
+    }
+
+    fn timer(book: ItemRef, ends_at_ms: f64) -> Option<SleepDeadline> {
+        Some(SleepDeadline {
+            book,
+            minutes: 30,
+            ends_at_ms,
+        })
+    }
+
+    #[test]
+    fn a_running_timer_carries_to_the_next_part() {
+        let book = ItemRef::Synth(5);
+        assert_eq!(
+            carry_over(timer(book, 10_000.0), book, 4_000.0),
+            Carry::Resume {
+                remaining_ms: 6_000
+            }
+        );
+    }
+
+    #[test]
+    fn a_timer_that_ran_out_unwatched_or_for_another_book_is_dropped() {
+        let book = ItemRef::Synth(5);
+        assert_eq!(
+            carry_over(timer(book, 10_000.0), book, 12_500.0),
+            Carry::Lapsed { late_ms: 2_500 }
+        );
+        assert_eq!(
+            carry_over(timer(ItemRef::Synth(6), 10_000.0), book, 4_000.0),
+            Carry::OtherBook
+        );
+        assert_eq!(carry_over(None, book, 0.0), Carry::None);
+    }
+
+    #[test]
+    fn carry_verdicts_log_distinct_tokens() {
+        let tokens: std::collections::HashSet<_> = [
+            Carry::None,
+            Carry::Resume { remaining_ms: 1 },
+            Carry::Lapsed { late_ms: 1 },
+            Carry::OtherBook,
+        ]
+        .map(Carry::token)
+        .into();
+        assert_eq!(tokens.len(), 4);
+    }
+
+    /// A part's book is its album, so every part shares one key.
+    #[test]
+    fn every_part_of_a_folder_book_shares_a_key() {
+        let part = |n| Audiobook {
+            chapters: Vec::new(),
+            book: Some(ItemRef::Synth(5)),
+            playing: ItemRef::Real(n),
+            stop_at_end: StopAtEnd::default(),
+        };
+        assert_eq!(book_key(&part(1)), book_key(&part(2)));
+        let single = Audiobook {
+            book: None,
+            ..part(9)
+        };
+        assert_eq!(book_key(&single), ItemRef::Real(9));
+    }
+
+    /// Controls mounted on the next part show the timer left running.
+    #[test]
+    fn new_controls_show_a_carried_timer() {
+        let mut dom = VirtualDom::new(|| {
+            let book = ItemRef::Synth(5);
+            use_context_provider(|| {
+                SleepTimer(Signal::new(timer(
+                    book,
+                    platform::wall_clock_ms() + 600_000.0,
+                )))
+            });
+            rsx! {
+                AudiobookControls {
+                    book: Audiobook {
+                        chapters: Vec::new(),
+                        book: Some(book),
+                        playing: ItemRef::Real(2),
+                        stop_at_end: StopAtEnd::default(),
+                    },
+                    media: MediaState::default(),
+                    runtime_ms: 60_000,
+                    media_id: "v",
+                    on_control: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        let on = html
+            .split("<button")
+            .find(|b| b.contains("30 min"))
+            .unwrap_or("");
+        assert!(on.contains("aria-pressed=\"true\""), "{html}");
+    }
+
+    #[test]
+    fn space_and_enter_stay_with_the_focused_control() {
+        assert!(activates_button(&Key::Character(" ".into())));
+        assert!(activates_button(&Key::Named(NamedKey::Enter)));
+        assert!(!activates_button(&Key::Character("m".into())));
+        assert!(!activates_button(&Key::Named(NamedKey::ArrowRight)));
     }
 
     #[test]

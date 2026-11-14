@@ -181,6 +181,77 @@ pub enum InventoryError {
     },
 }
 
+impl InventoryError {
+    /// A copy to hand out again: `io::Error` cannot be cloned, so the kind
+    /// and message are kept.
+    fn duplicate(&self) -> Self {
+        let again = |e: &std::io::Error| std::io::Error::new(e.kind(), e.to_string());
+        match self {
+            Self::ListFolder { folder, source } => Self::ListFolder {
+                folder: folder.clone(),
+                source: again(source),
+            },
+            Self::ReadEntry { folder, source } => Self::ReadEntry {
+                folder: folder.clone(),
+                source: again(source),
+            },
+            Self::FileType { path, source } => Self::FileType {
+                path: path.clone(),
+                source: again(source),
+            },
+        }
+    }
+}
+
+/// Book folders listed so far in one scan, so the N parts of a book check
+/// their numbering from one listing instead of N. Made per scan and dropped
+/// with it: a folder changed after its listing is read afresh next scan, and
+/// the watcher's single-path update never uses it.
+#[derive(Default)]
+pub struct BookInventories {
+    listed:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Result<Vec<PathBuf>, InventoryError>>>,
+}
+
+impl BookInventories {
+    /// The tracks of `folder`: the earlier listing (a failure included, so
+    /// an unreadable folder is not retried per part), else `list`'s.
+    pub fn tracks(
+        &self,
+        folder: &Path,
+        list: impl FnOnce(&Path) -> Result<Vec<PathBuf>, InventoryError>,
+    ) -> Result<Vec<PathBuf>, InventoryError> {
+        // Held across the listing: a second part of the same book waits for
+        // the first's listing rather than repeating it.
+        let mut listed = self
+            .listed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = if listed.contains_key(folder) {
+            "hit"
+        } else {
+            listed.insert(folder.to_path_buf(), list(folder));
+            "miss"
+        };
+        metrics::counter!("pharos_book_inventory_cache_total", "outcome" => outcome).increment(1);
+        tracing::debug!(folder = %folder.display(), outcome, "audiobook: book folder inventory");
+        match listed.get(folder) {
+            Some(Ok(found)) => Ok(found.clone()),
+            Some(Err(e)) => Err(e.duplicate()),
+            None => list_missing(folder),
+        }
+    }
+}
+
+/// Unreachable in practice (the entry was just inserted); an error rather
+/// than a panic keeps the lookup total.
+fn list_missing(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
+    Err(InventoryError::ListFolder {
+        folder: folder.to_path_buf(),
+        source: std::io::Error::other("inventory entry missing"),
+    })
+}
+
 /// The track files of the book in `folder`, in natural order of their
 /// paths under it: its own files and those of its disc folders, the only
 /// files whose [`book_folder`] is `folder`. Any other folder below is a
@@ -214,7 +285,7 @@ pub fn folder_tracks(folder: &Path) -> Result<Vec<PathBuf>, InventoryError> {
                 if top && disc && !crate::fs::is_ignored_dir(&path) {
                     dirs.push((path, false));
                 }
-            } else if is_track_file(&path) {
+            } else if kind.is_file() && is_track_file(&path) {
                 found.push(path);
             }
         }
@@ -679,6 +750,54 @@ mod tests {
     }
 
     #[test]
+    fn the_parts_of_a_book_share_one_listing() {
+        let inventories = BookInventories::default();
+        let listed = std::cell::Cell::new(0);
+        let folder = Path::new("/lib/Books/Widget Days");
+        for _ in 0..3 {
+            let got = inventories
+                .tracks(folder, |_| {
+                    listed.set(listed.get() + 1);
+                    Ok(vec![folder.join("01.mp3"), folder.join("02.mp3")])
+                })
+                .unwrap();
+            assert_eq!(got.len(), 2);
+        }
+        assert_eq!(listed.get(), 1, "one listing for three parts");
+        inventories
+            .tracks(Path::new("/lib/Books/Other Days"), |_| {
+                listed.set(listed.get() + 1);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(listed.get(), 2, "another folder is listed on its own");
+    }
+
+    #[test]
+    fn a_failed_listing_is_kept_for_the_scan() {
+        let inventories = BookInventories::default();
+        let listed = std::cell::Cell::new(0);
+        let folder = Path::new("/lib/Books/Widget Days");
+        for _ in 0..2 {
+            let err = inventories
+                .tracks(folder, |f| {
+                    listed.set(listed.get() + 1);
+                    Err(InventoryError::ListFolder {
+                        folder: f.to_path_buf(),
+                        source: std::io::Error::other("stale handle"),
+                    })
+                })
+                .unwrap_err();
+            assert!(
+                matches!(&err, InventoryError::ListFolder { folder: f, source }
+                    if f == folder && source.to_string() == "stale handle"),
+                "{err}"
+            );
+        }
+        assert_eq!(listed.get(), 1);
+    }
+
+    #[test]
     fn folder_tracks_lists_audio_below_in_natural_order() {
         let td = tempfile::TempDir::new().unwrap();
         for f in [
@@ -714,6 +833,24 @@ mod tests {
                 "x.m4b"
             ]
         );
+    }
+
+    /// The walk takes files only, so a link named like a track is no part.
+    #[cfg(unix)]
+    #[test]
+    fn folder_tracks_leaves_out_a_symlink_named_like_a_track() {
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::write(td.path().join("1 real.mp3"), b"").unwrap();
+        std::os::unix::fs::symlink(td.path().join("1 real.mp3"), td.path().join("2 link.mp3"))
+            .unwrap();
+        std::os::unix::fs::symlink(td.path().join("nowhere"), td.path().join("3 dead.mp3"))
+            .unwrap();
+        let got: Vec<_> = folder_tracks(td.path())
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(got, ["1 real.mp3"]);
     }
 
     #[test]
