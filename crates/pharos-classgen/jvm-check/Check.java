@@ -17,8 +17,12 @@ public class Check {
       this.code = code; this.data = data; this.flags = flags; notifyAll(); return true;
     }
     synchronized android.os.Parcel await() throws InterruptedException {
-      long end = System.currentTimeMillis() + 30_000;
-      while (data == null && System.currentTimeMillis() < end) wait(end - System.currentTimeMillis());
+      long end = System.nanoTime() + 30_000_000_000L;
+      while (data == null) {
+        long left = (end - System.nanoTime()) / 1_000_000;
+        if (left <= 0) break;
+        wait(left);
+      }
       return data;
     }
   }
