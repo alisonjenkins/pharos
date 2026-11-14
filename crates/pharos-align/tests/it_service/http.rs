@@ -37,11 +37,11 @@ fn a_song_answers_with_its_words_offset_and_version() {
     assert_eq!(
         body,
         json!({
-            "lines": [{"words": [{"at": 0, "start_ms": 250}, {"at": 6, "start_ms": 350}, {"at": 11, "start_ms": 450}], "score": 0.813}],
+            "lines": [{"words": [{"at": 0, "start_ms": 250}, {"at": 6, "start_ms": 350}, {"at": 11, "start_ms": 450}], "score": 0.813, "placement": "kept"}],
             "offset_ms": 0,
             // The contract's value, not the constant: the server holds the
             // shadow to it (spec 039, R21).
-            "aligner_version": 5,
+            "aligner_version": 6,
         })
     );
 }
@@ -219,7 +219,7 @@ fn a_streamed_song_sends_its_offset_then_each_line_then_the_whole_answer() {
     assert_eq!(kinds, ["offset", "line", "line", "done"], "{events:?}");
     assert_eq!(
         events[0],
-        json!({"event": "offset", "offset_ms": 0, "aligner_version": 5, "lines": 2})
+        json!({"event": "offset", "offset_ms": 0, "aligner_version": 6, "lines": 2})
     );
     // Each line as it was sent is the line the whole answer ends with.
     for (i, event) in events[1..3].iter().enumerate() {

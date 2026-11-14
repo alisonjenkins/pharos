@@ -101,6 +101,7 @@ fn anchor_words(line: &Line, words: &[text::Word], starts_ms: &[i64], end: i64) 
     LineWords {
         words: out,
         score: None,
+        placement: None,
     }
 }
 
@@ -559,6 +560,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
                     out[*i] = LineWords {
                         words: stamps,
                         score: crate::service::round_score(p.score),
+                        placement: None,
                     };
                     methods[*i] = Some(if bands[*i].is_some() {
                         Method::Refined
@@ -670,6 +672,7 @@ mod tests {
         LineWords {
             words,
             score: Some(0.5),
+            placement: None,
         }
     }
 

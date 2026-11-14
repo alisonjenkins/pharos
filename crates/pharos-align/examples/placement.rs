@@ -54,6 +54,7 @@ fn today(lines: &[Line], path: &str) -> Result<Vec<LineWords>, Error> {
         LineWords {
             words: Vec::new(),
             score: None,
+            placement: None,
         };
         lines.len()
     ];
@@ -89,6 +90,7 @@ fn today(lines: &[Line], path: &str) -> Result<Vec<LineWords>, Error> {
                 .map(|(at, start_ms)| Stamp { at, start_ms })
                 .collect(),
             score: l["score"].as_f64(),
+            placement: None,
         };
     }
     Ok(out)
