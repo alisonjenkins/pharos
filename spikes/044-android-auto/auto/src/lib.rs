@@ -11,6 +11,7 @@
 mod art;
 mod compat;
 mod focus;
+mod voice;
 pub mod content;
 
 use std::path::Path;
@@ -830,6 +831,10 @@ fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
 /// library hit, found on a worker. `then_play` plays it; otherwise it is
 /// only prepared.
 fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play: bool) -> R<()> {
+    if let Some(cmd) = voice::command(&query) {
+        log(&format!("{what} verdict={cmd:?} reason=voice_command"));
+        return voice::run(env, cmd);
+    }
     let tests = test_matches(&query);
     if let Some(first) = tests.first() {
         log(&format!("{what} verdict={} reason=test_match", first.id));
