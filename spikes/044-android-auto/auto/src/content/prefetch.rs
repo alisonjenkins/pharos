@@ -13,8 +13,13 @@
 //! again once, then the track is given up on until the next prefetch.
 //! Downloading pauses while [`Downloader::set_online`] says `false`.
 //!
+//! Low disk: before a download and every [`FREE_CHECK_BYTES`] while it
+//! writes, the cache must be able to keep [`super::cache::MIN_FREE_BYTES`]
+//! free after the rest of the file lands (evicting old tracks if it must);
+//! when it cannot, the track is skipped until the next prefetch.
+//!
 //! Every attempt logs `cache download id=.. bytes=.. ms=.. outcome=ok|retry|
-//! failed reason=..`. URLs and tokens are never logged.
+//! failed|skipped reason=..`. URLs and tokens are never logged.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -33,6 +38,10 @@ pub const MAX_TRACKS_PER_REQUEST: usize = 50;
 /// One request downloads at most this many bytes; the track in flight when it
 /// is reached still finishes.
 pub const MAX_BYTES_PER_REQUEST: u64 = 1024 * 1024 * 1024;
+/// Free space is read again after this many bytes are written: a statvfs
+/// per 8 MiB costs nothing next to the download, and the guard cannot be
+/// overrun by more than this between readings.
+pub const FREE_CHECK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Tuning {
@@ -98,6 +107,8 @@ pub struct Downloader {
 
 enum Fail {
     Cancelled,
+    /// Writing on would leave less than the minimum free; carries free bytes.
+    LowDisk(u64),
     Unauthorized,
     Transient(String),
     Permanent(String),
@@ -114,6 +125,7 @@ struct JobState {
 enum Outcome {
     Ok,
     Cancelled,
+    LowDisk(u64),
     Failed(String),
 }
 
@@ -376,6 +388,9 @@ impl Gate {
         let mut st = JobState::default();
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
         let outcome = loop {
+            if let Err(free) = self.cache.ensure_free(id, 0) {
+                break Outcome::LowDisk(free);
+            }
             if !self.pause_until_online(id, &mut generation).await {
                 break Outcome::Cancelled;
             }
@@ -410,6 +425,7 @@ impl Gate {
             match res {
                 Ok(()) => break Outcome::Ok,
                 Err(Fail::Cancelled) => break Outcome::Cancelled,
+                Err(Fail::LowDisk(free)) => break Outcome::LowDisk(free),
                 Err(Fail::Unauthorized) if !refreshed => {
                     refreshed = true;
                     url = None;
@@ -445,6 +461,13 @@ impl Gate {
                     "cache download id={id} bytes={} ms={ms} outcome=failed reason=cancelled (no longer wanted; partial kept)",
                     part_len()
                 );
+            }
+            Outcome::LowDisk(free) => {
+                log::warn!(
+                    "cache download id={id} bytes={} ms={ms} outcome=skipped reason=low_disk free_bytes={free}",
+                    part_len()
+                );
+                self.cache.discard_part(id);
             }
             Outcome::Failed(why) => {
                 log::warn!(
@@ -524,6 +547,13 @@ impl Gate {
                 s => return Err(Fail::Permanent(format!("http {s}"))),
             };
             st.got_ok = true;
+            let start = if append { pos } else { 0 };
+            let left = |written: u64| st.total.map_or(0, |t| t.saturating_sub(written));
+            self.cache
+                .ensure_free(id, left(start))
+                .map_err(Fail::LowDisk)?;
+            let mut written = start;
+            let mut since_check = 0u64;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -538,6 +568,14 @@ impl Gate {
             {
                 file.write_all(&chunk)
                     .map_err(|e| Fail::Permanent(format!("write part: {e}")))?;
+                written = written.saturating_add(chunk.len() as u64);
+                since_check = since_check.saturating_add(chunk.len() as u64);
+                if since_check >= FREE_CHECK_BYTES {
+                    since_check = 0;
+                    self.cache
+                        .ensure_free(id, left(written))
+                        .map_err(Fail::LowDisk)?;
+                }
                 {
                     let mut q = self.lock();
                     q.budget = q.budget.saturating_sub(chunk.len() as u64);
@@ -576,6 +614,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::content::cache::{FreeProbe, MIN_FREE_BYTES};
     use crate::content::testserver::{Script, Seen, TestServer};
 
     fn body(n: usize, salt: usize) -> Vec<u8> {
@@ -610,8 +649,27 @@ mod tests {
     /// `track/N` is served at `/audio/N`. The resolver hands out `tokens[i]`
     /// on its i-th call (the last one repeats).
     fn rig(name: &str, script: Script, cap: u64, tokens: &[&str], tuning: Tuning) -> Rig {
+        rig_with_free(
+            name,
+            script,
+            cap,
+            tokens,
+            tuning,
+            Box::new(|_| Ok(u64::MAX)),
+        )
+    }
+
+    /// [`rig`] with the cache's free-space reading supplied.
+    fn rig_with_free(
+        name: &str,
+        script: Script,
+        cap: u64,
+        tokens: &[&str],
+        tuning: Tuning,
+        free: FreeProbe,
+    ) -> Rig {
         let srv = Arc::new(TestServer::start(script));
-        let cache = Arc::new(Cache::open(&tmp(name), cap).unwrap());
+        let cache = Arc::new(Cache::open_with_probe(&tmp(name), cap, free).unwrap());
         let resolved = Arc::new(AtomicUsize::new(0));
         let tokens: Vec<String> = tokens.iter().map(|s| (*s).to_owned()).collect();
         let (s2, r2) = (srv.clone(), resolved.clone());
@@ -892,5 +950,51 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         assert!(!r.cache.is_complete("track/1"), "unqueued and oldest");
         assert!(r.cache.is_complete("track/2") && r.cache.is_complete("track/3"));
+    }
+
+    #[test]
+    fn a_download_that_would_leave_under_two_gib_free_is_skipped() {
+        let r = rig_with_free(
+            "lowdisk",
+            Script::default().file("/audio/1", body(1000, 1)),
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(|_| Ok(MIN_FREE_BYTES + 999)),
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(
+            !r.cache.is_complete("track/1"),
+            "1000 bytes would leave 1 short"
+        );
+        assert!(!r.cache.part_path("track/1").exists());
+    }
+
+    #[test]
+    fn free_space_is_checked_again_while_writing() {
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = calls.clone();
+        // Plenty before the download; short once it has begun writing.
+        let r = rig_with_free(
+            "lowdisk-mid",
+            Script::default().file("/audio/1", body(size, 1)),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let n = c2.fetch_add(1, Ordering::SeqCst);
+                Ok(if n < 2 { u64::MAX } else { 0 })
+            }),
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(!r.cache.is_complete("track/1"));
+        assert!(!r.cache.part_path("track/1").exists());
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "read before and during the write"
+        );
     }
 }
