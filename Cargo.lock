@@ -8208,6 +8208,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-android"
+version = "0.0.0"
+dependencies = [
+ "jni 0.21.1",
+ "log",
+ "pharos-content",
+]
+
+[[package]]
 name = "pharos-api"
 version = "0.0.0"
 dependencies = [
