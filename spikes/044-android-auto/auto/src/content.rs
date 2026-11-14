@@ -31,7 +31,7 @@ mod tree;
 // The Android TV app's sign-in state machine, shared rather than copied: it
 // is std-only and covered by its own tests.
 #[allow(dead_code)]
-#[path = "../../../../crates/pharos-ui/src/native/tv_auth.rs"]
+#[path = "../../../../crates/pharos-client/src/tv_auth.rs"]
 mod tv_auth;
 
 pub use cache::DEFAULT_CAP_BYTES;
