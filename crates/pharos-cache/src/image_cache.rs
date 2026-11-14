@@ -705,17 +705,29 @@ impl ImageCache {
     /// the source path + mtime so re-downloaded art invalidates. Falls back to
     /// the original path on any scale failure (never fails a public image).
     /// The source's intrinsic width, read from its header once per
-    /// `(path, mtime)` key and remembered: the header read is an open + read
-    /// on the media share, and every poster request asks it again.
+    /// `(path, mtime)` key and remembered in memory and in a small file under
+    /// the cache root: the header read is an open + read on the media share,
+    /// and every poster request asks it again, including the first after a
+    /// restart (B1444).
     async fn source_width(&self, source: &Path, key: u64) -> Option<u32> {
         let (width, lookup) = match self.widths.get(key) {
             Some(width) => (width, WidthLookup::Hit),
             None => {
-                let width = intrinsic_width(source)
-                    .instrument(tracing::info_span!("image.header_read"))
-                    .await;
-                self.widths.insert(key, width);
-                (width, WidthLookup::Miss)
+                let file = self.root.join("widths").join(format!("{key:016x}"));
+                match read_width_file(&file).await {
+                    Some(width) => {
+                        self.widths.insert(key, width);
+                        (width, WidthLookup::Disk)
+                    }
+                    None => {
+                        let width = intrinsic_width(source)
+                            .instrument(tracing::info_span!("image.header_read"))
+                            .await;
+                        self.widths.insert(key, width);
+                        write_width_file(&file, width).await;
+                        (width, WidthLookup::Miss)
+                    }
+                }
             }
         };
         metrics::counter!("pharos_image_source_width_total", "outcome" => lookup.label())
@@ -753,12 +765,10 @@ impl ImageCache {
         source.hash(&mut h);
         mtime.hash(&mut h);
         let key = h.finish();
-        // The full mtime, not the whole seconds the file key uses: a poster
-        // replaced within the same second must not keep the old width.
-        let mut wh = std::collections::hash_map::DefaultHasher::new();
-        source.hash(&mut wh);
-        meta.modified().ok().hash(&mut wh);
-        match self.source_width(source, wh.finish()).await {
+        match self
+            .source_width(source, width_key(source, meta.modified().ok()))
+            .await
+        {
             // Already at or near the requested size: re-encoding would cost
             // latency and quality for nothing, and scaling UP is always wrong.
             // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
@@ -1730,8 +1740,67 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_reads_a_remembered_width_from_disk_not_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("poster.png");
+        std::fs::write(&src, png_header(300)).unwrap();
+        let at = std::fs::metadata(&src).unwrap().modified().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let key = width_key(&src, Some(at));
+        rt.block_on(async {
+            let first = ImageCache::new(dir.path().join("cache"));
+            assert_eq!(first.source_width(&src, key).await, Some(300));
+            // The source changes under the same mtime: only a header read
+            // would see it.
+            std::fs::write(&src, png_header(2000)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&src)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+            let restarted = ImageCache::new(dir.path().join("cache"));
+            assert_eq!(
+                restarted.source_width(&src, key).await,
+                Some(300),
+                "a restarted cache answers from its width file"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unreadable_or_torn_width_file_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("w");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(read_width_file(&file).await, None);
+            write_width_file(&file, None).await;
+            assert_eq!(read_width_file(&file).await, Some(None));
+            write_width_file(&file, Some(480)).await;
+            assert_eq!(read_width_file(&file).await, Some(Some(480)));
+            std::fs::write(&file, "48x").unwrap();
+            assert_eq!(read_width_file(&file).await, None);
+        });
+    }
+
+    #[test]
     fn source_width_labels_are_distinct() {
-        assert_ne!(WidthLookup::Hit.label(), WidthLookup::Miss.label());
+        let labels =
+            [WidthLookup::Hit, WidthLookup::Disk, WidthLookup::Miss].map(WidthLookup::label);
+        assert_eq!(
+            labels
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            labels.len()
+        );
     }
 
     #[test]
@@ -2347,6 +2416,7 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WidthLookup {
     Hit,
+    Disk,
     Miss,
 }
 
@@ -2354,8 +2424,56 @@ impl WidthLookup {
     fn label(self) -> &'static str {
         match self {
             Self::Hit => "hit",
+            Self::Disk => "disk",
             Self::Miss => "miss",
         }
+    }
+}
+
+/// The width map's key for `source` at `mtime`: the full mtime, so a poster
+/// replaced within the same second is read again, hashed with xxh3 so the
+/// key, which also names the width file, is stable across builds.
+fn width_key(source: &Path, mtime: Option<std::time::SystemTime>) -> u64 {
+    use xxhash_rust::xxh3::Xxh3;
+    let mut h = Xxh3::new();
+    h.update(source.as_os_str().as_encoded_bytes());
+    match mtime.map(|t| t.duration_since(std::time::UNIX_EPOCH)) {
+        Some(Ok(d)) => {
+            h.update(&[1]);
+            h.update(&d.as_secs().to_le_bytes());
+            h.update(&d.subsec_nanos().to_le_bytes());
+        }
+        Some(Err(before)) => {
+            let d = before.duration();
+            h.update(&[2]);
+            h.update(&d.as_secs().to_le_bytes());
+            h.update(&d.subsec_nanos().to_le_bytes());
+        }
+        None => h.update(&[0]),
+    }
+    h.digest()
+}
+
+/// A remembered width file: a decimal width, or `none` for a header that
+/// could not be read. Anything else, a torn write included, reads as absent.
+async fn read_width_file(file: &Path) -> Option<Option<u32>> {
+    let text = tokio::fs::read_to_string(file).await.ok()?;
+    match text.trim() {
+        "none" => Some(None),
+        n => n.parse().ok().map(Some),
+    }
+}
+
+async fn write_width_file(file: &Path, width: Option<u32>) {
+    let text = width.map_or_else(|| "none".to_owned(), |w| w.to_string());
+    if let Some(dir) = file.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            tracing::warn!(error = %e, dir = %dir.display(), "image width dir not created");
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::write(file, text).await {
+        tracing::warn!(error = %e, file = %file.display(), "image width not kept on disk");
     }
 }
 
