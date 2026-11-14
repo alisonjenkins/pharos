@@ -531,6 +531,17 @@ impl Library {
     /// (see [`super::cache::DEFAULT_CAP_BYTES`]). Call once after
     /// [`Library::connect`]; calling again is a no-op.
     pub fn enable_cache(&self, dir: &Path, default_cap: u64) -> Result<(), ContentError> {
+        self.enable_cache_with(dir, default_cap, || {})
+    }
+
+    /// [`Library::enable_cache`] with a hook that runs just before the
+    /// downloader is published, so a test can land a network change there.
+    fn enable_cache_with(
+        &self,
+        dir: &Path,
+        default_cap: u64,
+        before_publish: impl FnOnce(),
+    ) -> Result<(), ContentError> {
         if self.offline.get().is_some() {
             return Ok(());
         }
@@ -552,7 +563,11 @@ impl Library {
             }
         }
         downloader.set_online(self.online.load(Ordering::SeqCst));
+        before_publish();
         let _ = self.offline.set(Offline { cache, downloader });
+        // A `set_online` that landed before the downloader was published
+        // could not reach it. Re-apply the state now it can, before pins run.
+        self.apply_online();
         self.resume_pins_when_known();
         Ok(())
     }
@@ -1238,6 +1253,17 @@ mod tests {
         let dir = cache_dir(name);
         lib.enable_cache(&dir, 1 << 20).unwrap();
         (lib, dir)
+    }
+
+    #[test]
+    fn a_network_loss_while_the_cache_starts_still_reaches_the_downloader() {
+        let base = dead_server();
+        let tok = std::env::temp_dir().join(format!("pharos-auto-lib-race-{}", std::process::id()));
+        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
+        lib.enable_cache_with(&cache_dir("race"), 1 << 20, || lib.set_online(false))
+            .unwrap();
+        assert!(!lib.is_online());
+        assert!(!lib.offline.get().unwrap().downloader.is_online());
     }
 
     #[test]
