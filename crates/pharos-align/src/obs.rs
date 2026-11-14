@@ -27,6 +27,12 @@ pub const SONG_FALLBACK_TOTAL: &str = "pharos_aligner_song_fallback_total";
 /// Recogniser windows decoded a second time (spec 042), by
 /// [`crate::recognise::Outcome::label`] `outcome`.
 pub const RECOGNISE_RETRY_TOTAL: &str = "pharos_aligner_recognise_retry_total";
+/// Songs by what the recogniser heard (spec 042 slice 3): `outcome` is
+/// [`crate::separate::Outcome::label`].
+pub const SEPARATION_TOTAL: &str = "pharos_aligner_separation_total";
+/// Wall time of one song's separation, by the same `outcome`; songs with no
+/// GPU are not timed.
+pub const SEPARATION_SECONDS: &str = "pharos_aligner_separation_seconds";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
@@ -142,6 +148,9 @@ impl Metrics {
             .and_then(|b| {
                 b.set_buckets_for_metric(Matcher::Full(FORWARD_SECONDS.into()), FORWARD_BUCKETS)
             })
+            .and_then(|b| {
+                b.set_buckets_for_metric(Matcher::Full(SEPARATION_SECONDS.into()), SONG_BUCKETS)
+            })
             .and_then(PrometheusBuilder::install_recorder)
             .map_err(|e| format!("prometheus recorder: {e}"))?;
         let process = metrics_process::Collector::default();
@@ -162,6 +171,15 @@ impl Metrics {
         metrics::describe_counter!(
             RECOGNISE_RETRY_TOTAL,
             "Recogniser windows decoded again with beam search after one short segment covered them, by outcome"
+        );
+        metrics::describe_counter!(
+            SEPARATION_TOTAL,
+            "Songs by what the recogniser heard: separated vocals, the mix for want of a GPU, or nothing when separating failed"
+        );
+        metrics::describe_histogram!(
+            SEPARATION_SECONDS,
+            metrics::Unit::Seconds,
+            "Wall time of one song's vocal separation, by outcome"
         );
         metrics::describe_histogram!(
             SONG_SECONDS,
