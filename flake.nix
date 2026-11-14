@@ -1582,6 +1582,10 @@
             # have on PATH.
             pkgs.yt-dlp
             pkgs.pkg-config
+            # spec 044: javac + java for crates/pharos-classgen/jvm-check/run.sh,
+            # which CI runs in this shell to load the car's generated classes
+            # on a desktop JVM.
+            pkgs.jdk17_headless
             # spec 039: pharos-align links OpenBLAS for its CPU forward pass.
             pkgs.openblas
             # spec 042: whisper.cpp for pharos-align's `recognise` feature.
