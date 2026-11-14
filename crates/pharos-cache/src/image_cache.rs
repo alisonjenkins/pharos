@@ -753,7 +753,12 @@ impl ImageCache {
         source.hash(&mut h);
         mtime.hash(&mut h);
         let key = h.finish();
-        match self.source_width(source, key).await {
+        // The full mtime, not the whole seconds the file key uses: a poster
+        // replaced within the same second must not keep the old width.
+        let mut wh = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut wh);
+        meta.modified().ok().hash(&mut wh);
+        match self.source_width(source, wh.finish()).await {
             // Already at or near the requested size: re-encoding would cost
             // latency and quality for nothing, and scaling UP is always wrong.
             // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
@@ -1688,6 +1693,40 @@ mod tests {
             (2, 1),
             "a new mtime re-reads the header"
         );
+    }
+
+    #[test]
+    fn a_sub_second_mtime_change_reads_the_width_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        let src = dir.path().join("poster.png");
+        std::fs::write(&src, png_header(300)).unwrap();
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set = |at: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&src)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        set(base);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(cache.scaled_artwork(&src, 480).await, src);
+            std::fs::write(&src, png_header(2000)).unwrap();
+            set(base + std::time::Duration::from_millis(500));
+            assert_eq!(cache.widths.map.len(), 1);
+            cache.scaled_artwork(&src, 480).await;
+            assert_eq!(
+                cache.widths.map.len(),
+                2,
+                "a new mtime in the same second is a new width entry"
+            );
+        });
     }
 
     #[test]
