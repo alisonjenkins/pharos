@@ -16,7 +16,7 @@ use pharos_api::pharos_capnp::{bootstrap, session};
 use pharos_client::api::MediaToken;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use super::cache::{self, Cache};
+use super::cache::{self, Cache, Download, OfflineSummary, MIN_FREE_BYTES};
 use super::error::ContentError;
 use super::id::NodeId;
 use super::net::{self, Closed, NativeCatalogue};
@@ -456,6 +456,27 @@ impl Library {
     /// The cap in force, when the cache is enabled.
     pub fn cache_cap(&self) -> Option<u64> {
         self.offline.get().map(|o| o.cache.cap())
+    }
+
+    /// Cap, use and free space for a settings screen, when the cache is
+    /// enabled. `free_bytes` is `None` when the filesystem cannot be read.
+    pub fn offline_summary(&self) -> Option<OfflineSummary> {
+        let c = &self.offline.get()?.cache;
+        Some(OfflineSummary {
+            cap_bytes: c.cap(),
+            used_bytes: c.used_bytes(),
+            free_bytes: c.free_bytes().ok(),
+            min_free_bytes: MIN_FREE_BYTES,
+        })
+    }
+
+    /// Every pinned album or mix with its tracks' state. Empty when the cache
+    /// is not enabled.
+    pub fn downloads(&self) -> Vec<Download> {
+        self.offline
+            .get()
+            .map(|o| o.cache.downloads())
+            .unwrap_or_default()
     }
 
     /// The finished cached file for a track id (`track/..`), or `None` when it
@@ -990,6 +1011,19 @@ mod tests {
             Library::connect_with(&dead_server(), &cache_dir("nocap").join("t"), quick()).unwrap();
         assert!(lib.set_cache_cap(1).is_err());
         assert_eq!(lib.cache_cap(), None);
+        assert_eq!(lib.offline_summary(), None);
+        assert!(lib.downloads().is_empty());
+    }
+
+    #[test]
+    fn the_offline_summary_reports_cap_use_and_the_guard() {
+        let (lib, _dir) = offline_lib("summary");
+        lib.set_cache_cap(4096).unwrap();
+        let s = lib.offline_summary().unwrap();
+        assert_eq!((s.cap_bytes, s.used_bytes), (4096, 0));
+        assert_eq!(s.min_free_bytes, MIN_FREE_BYTES);
+        assert!(s.free_bytes.is_some(), "the temp dir's filesystem reads");
+        assert!(lib.downloads().is_empty());
     }
 
     fn track(n: u32) -> Node {
