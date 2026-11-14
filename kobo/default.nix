@@ -5,6 +5,7 @@
   lib,
   stdenv,
   fetchFromGitHub,
+  applyPatches,
   makeRustPlatform,
   rust-bin,
   writeShellScript,
@@ -21,6 +22,13 @@ let
     repo = "Cobalt";
     inherit rev;
     hash = "sha256-wR0ItVpdRgst+81QqIE0YbjFSze3GLAcR9jST5Cq4BY=";
+  };
+  # The lock the build checks is the patched one (it gains kobo-pharos), so
+  # vendor from the patched tree rather than Cobalt's own.
+  patched = applyPatches {
+    name = "cobalt-pharos-src";
+    src = cobalt;
+    patches = [ ./cobalt.patch ];
   };
   target = "armv7-unknown-linux-musleabihf";
   # Cobalt's rust-toolchain.toml.
@@ -51,13 +59,11 @@ in
 stdenv.mkDerivation {
   pname = "pharos-kobo";
   version = "0.1.0";
-  src = cobalt;
+  src = patched;
 
-  # The app adds no crates.io packages of its own, so Cobalt's lock vendors
-  # everything; the patch only adds the path package kobo-pharos to it.
-  cargoDeps = rustPlatform.importCargoLock { lockFile = "${cobalt}/Cargo.lock"; };
+  # kobo-pharos is a path package, so nothing new is downloaded for it.
+  cargoDeps = rustPlatform.importCargoLock { lockFile = "${patched}/Cargo.lock"; };
 
-  patches = [ ./cobalt.patch ];
   postPatch = ''
     mkdir -p examples/pharos
     cp -r ${./app}/. examples/pharos/
