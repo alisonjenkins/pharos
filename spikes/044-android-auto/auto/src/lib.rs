@@ -1204,6 +1204,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         }
         // getDuration is -1 for a live stream: fall back to the server's length.
         let length = if duration > 0 { i64::from(duration) } else { entry.duration_ms };
+        let source = if duration > 0 { "player" } else { "server" };
+        log(&format!(
+            "duration source={source} ms={length} player_ms={duration} server_ms={} id={}",
+            entry.duration_ms, entry.id
+        ));
         set_metadata(env, session.as_obj(), &entry, length)?;
         if !focus::request(env)? {
             set_playback_state(env, session.as_obj(), STATE_PAUSED, 0)?;
