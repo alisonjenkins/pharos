@@ -74,6 +74,10 @@ struct Inner {
 struct Shared {
     inner: Mutex<Inner>,
     changed: Condvar,
+    /// A progress report waits in the worker's queue. While it does, newer
+    /// playing and paused reports are skipped, so a slow server never piles
+    /// them up in front of the car's browsing.
+    progress_queued: AtomicBool,
 }
 
 impl Shared {
@@ -282,6 +286,7 @@ impl Library {
                 hook: None,
             }),
             changed: Condvar::new(),
+            progress_queued: AtomicBool::new(false),
         });
         if token::load(token_path)?.is_some() {
             log::info!("device token found at {}", token_path.display());
@@ -382,6 +387,14 @@ impl Library {
         if !self.online.load(Ordering::SeqCst) {
             log::info!(
                 "car progress {} {id} at_ms={at_ms}: outcome=skipped_offline",
+                p.label()
+            );
+            return Ok(());
+        }
+        let queued = self.shared.progress_queued.swap(true, Ordering::SeqCst);
+        if queued && p != tree::Progress::Stopped {
+            log::info!(
+                "car progress {} {id} at_ms={at_ms}: outcome=skipped_busy",
                 p.label()
             );
             return Ok(());
@@ -801,12 +814,19 @@ impl Worker {
                 cmd = rx.recv() => {
                     let Some(Cmd { op, reply }) = cmd else { break };
                     let name = op.name();
+                    let progress = matches!(op, Op::Progress(..));
+                    if progress {
+                        self.shared.progress_queued.store(false, Ordering::SeqCst);
+                    }
                     let result = match tokio::time::timeout(self.limit, self.execute(&op, &events_tx)).await {
                         Ok(r) => r,
                         Err(_) => Err(ContentError::Timeout { op: name.clone(), secs: self.limit.as_secs() }),
                     };
-                    if let Err(e) = &result {
-                        log::warn!("{name}: {}", e.redacted());
+                    match &result {
+                        Ok(_) if progress => log::info!("car {name}: outcome=ok"),
+                        Ok(_) => {}
+                        Err(e) if progress => log::warn!("car {name}: outcome=failed: {}", e.redacted()),
+                        Err(e) => log::warn!("{name}: {}", e.redacted()),
                     }
                     let _ = reply.send(result);
                 }
@@ -870,14 +890,9 @@ impl Worker {
                 Op::Children(id) => tree::children(&link.cat, &urls, *id).await.map(Out::Nodes),
                 Op::Node(id) => tree::node(&link.cat, &urls, *id).await.map(Out::One),
                 Op::Book(a) => tree::book(&link.cat, &urls, *a).await.map(Out::Book),
-                Op::Progress(id, at, p) => {
-                    let r = tree::progress(&link.cat, *id, *at, *p).await;
-                    match &r {
-                        Ok(()) => log::info!("car {}: outcome=ok", op.name()),
-                        Err(e) => log::warn!("car {}: outcome=failed: {}", op.name(), e.redacted()),
-                    }
-                    r.map(|()| Out::Done)
-                }
+                Op::Progress(id, at, p) => tree::progress(&link.cat, *id, *at, *p)
+                    .await
+                    .map(|()| Out::Done),
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
