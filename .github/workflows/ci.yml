@@ -479,6 +479,14 @@ jobs:
       - name: Type-check the TV app (mobile feature, armv7 Android)
         if: ${{ !cancelled() }}
         run: nix develop --command just tv-check
+      # Spec 044 (T18): the phone app and the car's media service are
+      # Android-only too, and the car's entry classes run only on a JVM.
+      - name: Type-check the phone app (mobile feature, arm64 Android)
+        if: ${{ !cancelled() }}
+        run: nix develop --command just phone-check
+      - name: Load the car's entry classes on a JVM
+        if: ${{ !cancelled() }}
+        run: nix develop --command bash -c 'timeout 600 ./crates/pharos-classgen/jvm-check/run.sh'
 
   # The single `dioxus UI` check, as before the split, so a required-check
   # rule or a reader keyed on that name still sees one result. It passes when

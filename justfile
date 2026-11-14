@@ -92,6 +92,26 @@ tv-check:
     nix develop .#android --command cargo clippy -p pharos-ui --bin pharos-tv \
       --features mobile --target armv7-linux-androideabi -- -D warnings
 
+# Spec 044 (T18): type-check and lint the phone app and the car's media
+# service for the phone's own target. Both are Android-only, so no host
+# build compiles them. The visualiser stand-ins are as in tv-check, since
+# the phone links pharos-ui too.
+phone-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gen=crates/pharos-ui/assets/generated
+    mkdir -p "$gen"
+    for f in tv-visualiser.js tv-visualiser.wasm.b64; do
+      [ -e "$gen/$f" ] || : > "$gen/$f"
+    done
+    nix develop .#android --command cargo clippy -p pharos-phone -p pharos-android \
+      --features pharos-phone/mobile --target aarch64-linux-android -- -D warnings
+
+# Spec 044 (T17): check a built phone APK has the label, the car's service,
+# provider and classes, and libmain.so's car entry points.
+phone-apk-check apk:
+    bash scripts/android-phone-apk-check.sh {{ quote(apk) }}
+
 # B1329/V1302: check a built TV APK has the Pharos label, icon, banner, dark
 # launch theme and config changes before it goes near the TV.
 tv-apk-check apk:
