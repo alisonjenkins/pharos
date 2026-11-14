@@ -216,7 +216,7 @@ fn now_ms() -> u64 {
 }
 
 /// Write `bytes` to `path` whole: temp file, fsync, rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
