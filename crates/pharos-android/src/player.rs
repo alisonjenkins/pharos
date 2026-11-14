@@ -233,10 +233,10 @@ pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u6
 
 /// Plays the book `id` (an `album/` id) from the part and place it stopped,
 /// with every part queued, from a worker thread. A newer request made while
-/// the book resolves wins.
-pub(crate) fn play_book(id: &str) -> R<()> {
+/// the book resolves wins; `gen` is the request's own generation, taken
+/// when it was made, so an older book request cannot overtake a newer play.
+pub(crate) fn play_book(id: &str, gen: u64) -> R<()> {
     let id = id.to_owned();
-    let gen = supersede();
     on_worker("book", move |env| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
         let book = match lib.book(&id) {
@@ -298,7 +298,7 @@ pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<(
 pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
     if is_book_id(id) {
         log(&format!("start id={id}: a book, resolving its parts"));
-        return play_book(id);
+        return play_book(id, gen);
     }
     if let Some(item) = fixture::playable(id) {
         let source = fixture::source(env, id)?;
