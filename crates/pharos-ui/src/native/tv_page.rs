@@ -606,6 +606,8 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__TILE_HOLD__", TILE_HOLD_JS)
         .replace("__ARROWS_SKIP_VDOM__", ARROWS_SKIP_VDOM_JS)
         .replace("__GRID_VIEW__", GRID_VIEW_JS)
+        .replace("__MEASURE__", MEASURE_JS)
+        .replace("__MEASURE_ATTR__", MEASURE_ATTR)
         .replace("__PAGE_ONLY_ARROWS__", PAGE_ONLY_ARROWS)
         .replace("__TILE_HOLD_MS__", &TILE_HOLD_MS.to_string())
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
@@ -664,6 +666,9 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// The rendered width of the element `id` that carries [`MEASURE_ATTR`],
+    /// as it appears and whenever it resizes.
+    Width { id: String, w: f64 },
     /// Where the browse grid on `path` stands once its scroll or focus has
     /// settled: the tile with the focus, else the first in view, and how far
     /// below the viewport's top it sits (FR-603).
@@ -986,6 +991,29 @@ pub fn script_takes(key: &str) -> bool {
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | " "
     )
 }
+
+/// The attribute that has the page report an element's width, so a touch
+/// on the seek bars can be turned into a position without a layout call.
+pub const MEASURE_ATTR: &str = "data-measure";
+
+/// Script, in the bridge: sends the width of every element with
+/// [`MEASURE_ATTR`] as it is added and whenever it resizes.
+pub const MEASURE_JS: &str = r#"
+const measured = new ResizeObserver((entries) => {
+  for (const e of entries) {
+    if (e.target.id) send({ t: "width", id: e.target.id, w: e.target.getBoundingClientRect().width });
+  }
+});
+const measure = (n) => {
+  if (n.nodeType !== 1) return;
+  if (n.matches("[__MEASURE_ATTR__]")) measured.observe(n);
+  for (const m of n.querySelectorAll("[__MEASURE_ATTR__]")) measured.observe(m);
+};
+new MutationObserver((records) => {
+  for (const r of records) for (const n of r.addedNodes) measure(n);
+}).observe(document.documentElement, { childList: true, subtree: true });
+measure(document.documentElement);
+"#;
 
 /// The browse grid whose children are the tiles, as `web` finds them.
 const GRID: &str = ".pharos-browse .pharos-grid";
@@ -1740,6 +1768,21 @@ mod tests {
         assert_eq!(login_status("limit"), 429);
         assert_eq!(login_status("unavailable"), 503);
         assert_eq!(login_status("other"), 500);
+    }
+
+    #[test]
+    fn an_elements_width_comes_in_from_the_page() {
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "width", "id": "pharos-seek", "w": 312.5})),
+            Some(Bridge::Width {
+                id: "pharos-seek".into(),
+                w: 312.5
+            })
+        );
+        let script = bridge_script("__MEASURE__");
+        assert!(!script.contains("__"), "{script}");
+        assert!(script.contains(&format!("[{MEASURE_ATTR}]")), "{script}");
+        assert!(script.contains("ResizeObserver"), "{script}");
     }
 
     #[test]
