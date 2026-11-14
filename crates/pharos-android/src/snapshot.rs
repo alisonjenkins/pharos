@@ -190,6 +190,11 @@ fn known(ms: i64) -> Option<u64> {
     u64::try_from(ms).ok().filter(|&ms| ms > 0)
 }
 
+/// Serialises every test that reads or writes the process-wide channel:
+/// `cargo test` runs them in one process, so they would race otherwise.
+#[cfg(test)]
+pub(crate) static TEST_CHANNEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,9 +226,9 @@ mod tests {
         assert_eq!(known(1_500), Some(1_500));
     }
 
-    // One test drives the shared channel, so no other test races it.
     #[test]
     fn the_channel_follows_a_track_through_error_end_and_stop() {
+        let _channel = TEST_CHANNEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rx = subscribe();
         let queue = vec!["track/1".to_owned(), "track/2".to_owned()];
         note_track("track/2", &queue, 0);
