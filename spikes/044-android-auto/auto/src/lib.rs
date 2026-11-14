@@ -13,6 +13,7 @@ mod compat;
 mod focus;
 mod debug;
 mod network;
+mod receiver;
 mod voice;
 pub mod content;
 
