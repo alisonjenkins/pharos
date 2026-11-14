@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::anchor::{match_lines, Options};
 use crate::audio::DecodeError;
+use crate::crash::CrashGuard;
 use crate::ctc::Emission;
 use crate::line::LineSpans;
 use crate::offset::{estimate, probe_windows, shift};
@@ -323,6 +324,7 @@ pub struct Engine {
     idle_unload: Option<Duration>,
     stages: Option<Box<dyn Stages>>,
     stage_budget: Duration,
+    crash_guard: Option<CrashGuard>,
 }
 
 impl Engine {
@@ -337,6 +339,7 @@ impl Engine {
             idle_unload,
             stages: None,
             stage_budget: DEFAULT_STAGE_BUDGET,
+            crash_guard: None,
         }
     }
 
@@ -345,6 +348,14 @@ impl Engine {
     #[must_use]
     pub fn with_stages(mut self, stages: Box<dyn Stages>) -> Self {
         self.stages = Some(stages);
+        self
+    }
+
+    /// Writes each song down while its stages run, and skips the stages
+    /// for a song whose stages ended an earlier process (B1435).
+    #[must_use]
+    pub fn with_crash_guard(mut self, guard: CrashGuard) -> Self {
+        self.crash_guard = Some(guard);
         self
     }
 
@@ -461,15 +472,34 @@ impl Engine {
                     |today| match self.stages.as_deref() {
                         Some(stages) => {
                             let used = model.device();
-                            if used.on_gpu() {
-                                improve(model, stages, &budget, rel_path, full_path, today, on)
-                            } else {
+                            let guard = self.crash_guard.as_ref();
+                            if !used.on_gpu() {
                                 skip_stages(
                                     rel_path,
                                     today,
                                     Fallback::NoGpuStages,
                                     format!("the song ran on {}: {}", used.device, used.reason),
                                 )
+                            } else if guard.is_some_and(|g| g.crashed(rel_path)) {
+                                skip_stages(
+                                    rel_path,
+                                    today,
+                                    Fallback::StageCrashed,
+                                    "the stages ended an earlier process on this song".into(),
+                                )
+                            } else {
+                                let _in_flight = guard.and_then(|g| {
+                                    g.begin(rel_path)
+                                        .inspect_err(|e| {
+                                            tracing::warn!(
+                                                path = %rel_path,
+                                                error = %e,
+                                                "stages' in-flight marker not written; a crash in them would repeat"
+                                            );
+                                        })
+                                        .ok()
+                                });
+                                improve(model, stages, &budget, rel_path, full_path, today, on)
                             }
                         }
                         None => today.kept(Fallback::Off, String::new()),

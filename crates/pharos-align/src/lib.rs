@@ -9,6 +9,7 @@
 pub mod anchor;
 pub mod audio;
 pub mod config;
+pub mod crash;
 pub mod ctc;
 pub mod device;
 pub mod forward;
