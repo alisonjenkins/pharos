@@ -165,6 +165,12 @@ struct Offline {
     downloader: Downloader,
 }
 
+/// A track, not a playable book's "Continue" row: only tracks are queued,
+/// pinned or downloaded.
+fn is_track_id(id: &str) -> bool {
+    matches!(NodeId::parse(id), Ok(NodeId::Track(_)))
+}
+
 /// Which album or mix each track was last listed in, in play order.
 #[derive(Default)]
 struct Queues {
@@ -176,7 +182,7 @@ impl Queues {
     fn note(&mut self, container: &str, nodes: impl IntoIterator<Item = (String, bool)>) {
         let tracks: Vec<String> = nodes
             .into_iter()
-            .filter_map(|(id, playable)| playable.then_some(id))
+            .filter_map(|(id, playable)| (playable && is_track_id(&id)).then_some(id))
             .collect();
         for t in &tracks {
             self.container_of.insert(t.clone(), container.to_owned());
@@ -547,7 +553,7 @@ impl Library {
         let playable = |nodes: Vec<Node>| -> Vec<String> {
             nodes
                 .into_iter()
-                .filter(|n| n.playable)
+                .filter(|n| n.playable && is_track_id(&n.id))
                 .map(|n| n.id)
                 .collect()
         };
@@ -559,7 +565,7 @@ impl Library {
             Err(e) => match o.cache.load_listing(container_id) {
                 Some(rows) => rows
                     .into_iter()
-                    .filter(|r| r.playable)
+                    .filter(|r| r.playable && is_track_id(&r.id))
                     .map(|r| r.id)
                     .collect(),
                 None => return Err(e),
