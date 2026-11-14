@@ -33,42 +33,51 @@ static AUDIO: Mutex<Option<Audio>> = Mutex::new(None);
 /// Whether a transient loss paused us, so the matching gain resumes.
 static INTENT: Mutex<Intent> = Mutex::new(Intent::new());
 
-/// The playback intent focus changes act on. `epoch` counts the times the
-/// user (or the output going away) cancelled it, so a transient-loss handler
-/// that decided to arm it before such a cancel can tell it must not.
+/// The playback intent focus changes act on. Invariant: a gain never
+/// resumes after a user pause until a user play. `user_paused` is sticky and
+/// is checked at the gain, so it does not matter in what order a pause, the
+/// player's own state and a transient-loss handler interleave.
 #[derive(Debug)]
 struct Intent {
     resume_on_gain: bool,
-    epoch: u64,
+    /// The user (or the output going away) paused; cleared by a user play.
+    user_paused: bool,
 }
 
 impl Intent {
     const fn new() -> Self {
         Self {
             resume_on_gain: false,
-            epoch: 0,
+            user_paused: false,
         }
     }
 
-    /// Forget a pending resume and invalidate any arm decided earlier.
+    /// Forget a pending resume (focus requested or abandoned).
     fn clear(&mut self) {
         self.resume_on_gain = false;
-        self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Arm the resume, unless a clear happened since `seen`. Returns whether
-    /// it armed.
-    fn arm(&mut self, seen: u64) -> bool {
-        if self.epoch != seen {
-            return false;
-        }
+    /// The user paused or stopped, or the output went away.
+    fn user_pause(&mut self) {
+        self.resume_on_gain = false;
+        self.user_paused = true;
+    }
+
+    /// The user played.
+    fn user_play(&mut self) {
+        self.user_paused = false;
+    }
+
+    /// A transient loss paused the player. Always records; a user pause in
+    /// flight still wins at the gain.
+    fn arm(&mut self) {
         self.resume_on_gain = true;
-        true
     }
 
     /// A gain: whether to resume. The intent is spent.
     fn take(&mut self) -> bool {
-        std::mem::replace(&mut self.resume_on_gain, false)
+        let resume = std::mem::replace(&mut self.resume_on_gain, false);
+        resume && !self.user_paused
     }
 }
 
@@ -248,8 +257,13 @@ pub fn destroy(env: &mut JNIEnv) -> R<()> {
 
 /// Forgets a pending resume-on-gain: the user paused, or the output went
 /// away, so regaining focus must not start playback again.
-pub(crate) fn clear_resume_on_gain() {
-    intent().clear();
+pub(crate) fn note_user_pause() {
+    intent().user_pause();
+}
+
+/// The user started playback: a later gain may resume it again.
+pub(crate) fn note_user_play() {
+    intent().user_play();
 }
 
 /// The share of the app's level that plays now: lower while ducked.
@@ -320,18 +334,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
                 "pause+abandon".to_owned()
             }
             AUDIOFOCUS_LOSS_TRANSIENT => {
-                // Read before asking the player: a cancel that lands after
-                // this bumps the epoch, and arming below then declines.
-                let seen = intent().epoch;
                 if is_playing(env)? {
-                    // Armed before pausing, and only if nothing cancelled
-                    // since `seen`. The lock is not held over the pause.
-                    if !intent().arm(seen) {
-                        log("focus: a pause cancelled the resume, left paused");
-                        return Ok(());
-                    }
+                    // Armed before pausing. A user pause in flight sets
+                    // `user_paused`, which the gain checks, so the order of
+                    // the two does not matter. No lock is held over the pause.
+                    intent().arm();
                     if let Err(e) = transport_with(env, "pause", STATE_PAUSED, false) {
-                        clear_resume_on_gain();
+                        intent().clear();
                         return Err(e);
                     }
                     "pause".to_owned()
@@ -358,27 +367,42 @@ mod tests {
     #[test]
     fn clearing_forgets_a_pending_resume_on_gain() {
         let mut i = Intent::new();
-        assert!(i.arm(i.epoch));
+        i.arm();
         i.clear();
         assert!(!i.take());
     }
 
     #[test]
-    fn a_cancel_between_the_check_and_the_arm_wins() {
+    fn an_arm_with_no_user_pause_resumes_once() {
         let mut i = Intent::new();
-        // The handler read the epoch, saw the player playing...
-        let seen = i.epoch;
-        // ...the user paused before it armed.
-        i.clear();
-        assert!(!i.arm(seen), "the stale arm declines");
-        assert!(!i.take(), "so the gain does not resume");
+        i.arm();
+        assert!(i.take());
+        assert!(!i.take(), "spent");
     }
 
     #[test]
-    fn an_arm_with_no_cancel_resumes_once() {
+    fn a_user_pause_before_the_arm_wins() {
         let mut i = Intent::new();
-        assert!(i.arm(i.epoch));
+        i.user_pause();
+        i.arm();
+        assert!(!i.take(), "gain never resumes after a user pause");
+    }
+
+    #[test]
+    fn a_user_pause_after_the_arm_wins() {
+        let mut i = Intent::new();
+        i.arm();
+        i.user_pause();
+        assert!(!i.take());
+    }
+
+    #[test]
+    fn a_user_play_lets_a_later_gain_resume() {
+        let mut i = Intent::new();
+        i.user_pause();
+        assert!(!i.take());
+        i.user_play();
+        i.arm();
         assert!(i.take());
-        assert!(!i.take(), "spent");
     }
 }

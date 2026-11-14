@@ -53,7 +53,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNoisyReceiver_on
     _intent: JObject<'l>,
 ) {
     guarded(&mut env, "noisy onReceive", (), |env| {
-        focus::clear_resume_on_gain();
+        focus::note_user_pause();
         let action = if focus::is_playing(env)? || is_starting()? {
             transport(env, "pause", STATE_PAUSED)?;
             "pause"
