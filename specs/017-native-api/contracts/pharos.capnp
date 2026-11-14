@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 46;
+const schemaVersion :UInt32 = 47;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -165,6 +165,18 @@ interface Session {
   # on answers notPermitted, a malformed codec name or `aac` (what every
   # conversion produces) invalid on `codecs`. Since schemaVersion 38.
   setDeviceConvertedAudio @17 (ctx :CallContext, deviceId :Text, codecs :List(Text)) -> (result :Done);
+  # The user's live e-reader passwords, which open only the OPDS catalogue at
+  # /opds/ over HTTP Basic auth (045, ADR 0128); newest first, never the
+  # password itself. Since schemaVersion 47.
+  readerPasswords @18 (ctx :CallContext) -> (result :ReaderPasswordsResult);
+  # Makes an e-reader password labelled `label`. The password is in this
+  # result and nowhere else, ever. A blank label, one over 64 characters or one
+  # with a control character answers invalid on `label`; holding 10 live
+  # passwords answers limit. Since schemaVersion 47.
+  createReaderPassword @19 (ctx :CallContext, label :Text) -> (result :CreatedReaderPasswordResult);
+  # Revokes one of the user's e-reader passwords at once; an id they hold no
+  # live password by answers notFound. Since schemaVersion 47.
+  revokeReaderPassword @20 (ctx :CallContext, id :Text) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
@@ -175,6 +187,13 @@ struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
 struct MyDevice { id @0 :Text; name @1 :Text; current @2 :Bool; convertedAudio @3 :List(Text); }
 struct MyDevicesResult { union { devices @0 :List(MyDevice); error @1 :Error; } }
 struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
+# An e-reader password as listed; `lastUsedAtMs` 0 = never used. Since
+# schemaVersion 47.
+struct ReaderPassword { id @0 :Text; label @1 :Text; createdAtMs @2 :Int64; lastUsedAtMs @3 :Int64; }
+struct ReaderPasswordsResult { union { passwords @0 :List(ReaderPassword); error @1 :Error; } }
+# `opdsPath` is the catalogue's path on this server, for the reader's URL.
+struct CreatedReaderPassword { listed @0 :ReaderPassword; password @1 :Text $secret; opdsPath @2 :Text; }
+struct CreatedReaderPasswordResult { union { created @0 :CreatedReaderPassword; error @1 :Error; } }
 struct MediaToken {
   token       @0 :Text $secret;
   expiresAtMs @1 :UInt64;
