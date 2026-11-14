@@ -1224,6 +1224,16 @@ impl MediaConfig {
         out
     }
 
+    /// The roots of the configured Books libraries, under which a video is a
+    /// course lesson (ADR-0126).
+    pub fn course_roots(&self) -> Vec<PathBuf> {
+        self.library_specs()
+            .into_iter()
+            .filter(|(_, _, kind)| *kind == pharos_core::LibraryKind::Books)
+            .map(|(_, path, _)| path)
+            .collect()
+    }
+
     /// LIB-C1 — reconcile config into `(name, root_path, kind)` tuples for
     /// the `libraries` table. A path appearing in both `roots` and
     /// `[[media.libraries]]` yields a single typed entry (the typed kind
@@ -2146,6 +2156,28 @@ mod tests {
             c.media.scan_roots(),
             vec![PathBuf::from("/srv/Movies"), PathBuf::from("/srv/TV")]
         );
+    }
+
+    /// ADR-0126 — only a Books library's root holds course lessons.
+    #[test]
+    fn course_roots_are_the_books_libraries() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            roots = ["/srv/Shared"]
+
+            [[media.libraries]]
+            path = "/srv/Shows"
+            kind = "tvshows"
+
+            [[media.libraries]]
+            path = "/srv/Reading"
+            kind = "books"
+        "#;
+        let c = Config::from_toml_str(s).unwrap();
+        assert_eq!(c.media.course_roots(), vec![PathBuf::from("/srv/Reading")]);
     }
 
     #[test]

@@ -1332,6 +1332,16 @@ impl AppState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The roots of the Books libraries, under which a video is a course
+    /// lesson (ADR-0126).
+    pub fn course_roots(&self) -> Vec<std::path::PathBuf> {
+        self.libraries()
+            .iter()
+            .filter(|l| l.kind == pharos_core::LibraryKind::Books)
+            .map(|l| std::path::PathBuf::from(&l.root_path))
+            .collect()
+    }
+
     /// Replace the typed-library set at runtime (dashboard Add/Remove).
     pub fn set_libraries(&self, libraries: Vec<pharos_core::Library>) {
         *self
