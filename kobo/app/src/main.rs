@@ -410,8 +410,8 @@ impl Pharos {
                      and enter this code.",
                 )
                 .build(),
-            View::Albums if self.albums.entries.is_empty() => ScreenBuilder::new("pharos-albums")
-                .top_bar("Music")
+            View::Albums if self.albums.entries.is_empty() => self
+                .now_playing(ScreenBuilder::new("pharos-albums").top_bar("Music"))
                 .activity("Loading your albums", None)
                 .button("sign-out", "Sign out")
                 .build(),
@@ -424,13 +424,11 @@ impl Pharos {
                 .page_turns("page-back", "page-next")
                 .bottom_action("sign-out", "Sign out")
                 .build(),
-            View::Album(album) if self.tracks.entries.is_empty() => {
-                ScreenBuilder::new("pharos-album")
-                    .top_bar(album.name.clone())
-                    .activity("Loading the tracks", None)
-                    .build()
-                    .with_own_back(true)
-            }
+            View::Album(album) if self.tracks.entries.is_empty() => self
+                .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
+                .activity("Loading the tracks", None)
+                .build()
+                .with_own_back(true),
             View::Album(album) => self
                 .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
                 .rows(Self::rows(&self.tracks, self.page, true))
