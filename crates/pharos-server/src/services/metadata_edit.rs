@@ -88,7 +88,20 @@ pub async fn apply(
     target: &EditTarget,
     edit: &MetadataEdit,
 ) -> Result<LockedFields, EditError> {
-    let edit = match edit.normalised(target) {
+    let kind = match genres_kind(state, target, edit).await {
+        Ok(k) => k,
+        Err(EditError::NotFound(id)) => {
+            record(target, Outcome::NotFound, "none");
+            tracing::warn!(admin, target = ?target, "metadata edit: no such item");
+            return Err(EditError::NotFound(id));
+        }
+        Err(e) => {
+            record(target, Outcome::Failed, "store");
+            tracing::error!(admin, target = ?target, error = %e, "metadata edit: could not read the item's kind");
+            return Err(e);
+        }
+    };
+    let edit = match edit.normalised_for(target, kind) {
         Ok(e) => e,
         Err(rejected) => {
             record(target, Outcome::Rejected, rejected.label());
@@ -121,6 +134,7 @@ pub async fn apply(
             tracing::info!(
                 admin,
                 target = ?target,
+                genres = ?edit.genres,
                 set = %names(edit.fields()),
                 unlocked = %names(edit.unlock),
                 locked = %names(locked),
@@ -139,6 +153,31 @@ pub async fn apply(
             tracing::error!(admin, target = ?target, error = %e, "metadata edit failed");
             Err(EditError::Store(e.to_string()))
         }
+    }
+}
+
+/// The item's kind when the edit sets or unlocks Genres, which only a book's
+/// row can carry (spec 043 FR-011); `None` otherwise, so other edits read
+/// nothing more than before.
+async fn genres_kind(
+    state: &AppState,
+    target: &EditTarget,
+    edit: &MetadataEdit,
+) -> Result<Option<MediaKind>, EditError> {
+    let EditTarget::Item(id) = target else {
+        return Ok(None);
+    };
+    if !edit
+        .fields()
+        .union(edit.unlock)
+        .contains(pharos_core::EditableField::Genres)
+    {
+        return Ok(None);
+    }
+    match pharos_core::MediaStore::get(&state.stores, *id).await {
+        Ok(item) => Ok(Some(item.kind)),
+        Err(DomainError::NotFound(id)) => Err(EditError::NotFound(id)),
+        Err(e) => Err(EditError::Store(e.to_string())),
     }
 }
 
@@ -289,6 +328,55 @@ mod tests {
             !seen.contains(&("failed".to_string(), "store".to_string())),
             "no call here failed in the store, so a miss while deriving the sort title must not count as one: {seen:?}"
         );
+    }
+
+    /// Spec 043 FR-011/FR-012: a book's genres are editable and the edit
+    /// survives a relink; a film's are not editable.
+    #[tokio::test]
+    async fn a_books_genres_are_edited_and_kept_a_films_are_refused() {
+        use pharos_core::{GenreStore, MediaKind, MediaStore};
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for (id, kind) in [(1, MediaKind::Book), (2, MediaKind::Movie)] {
+            stores
+                .put(pharos_core::MediaItem {
+                    id,
+                    path: format!("/m/{id}").into(),
+                    title: "A".into(),
+                    kind,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let state = AppState::new(stores, "t".into());
+        let edit = MetadataEdit {
+            genres: Some(vec!["Security".into()]),
+            ..Default::default()
+        };
+        let locked = apply(&state, "admin", &EditTarget::Item(1), &edit)
+            .await
+            .unwrap();
+        assert!(locked.contains(pharos_core::EditableField::Genres));
+        state
+            .stores
+            .link_item_genres(1, &["Fiction".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            state.stores.item_genre_names(1).await.unwrap(),
+            vec!["Security".to_string()],
+            "the scan must not overwrite an admin's genres"
+        );
+        assert!(matches!(
+            apply(&state, "admin", &EditTarget::Item(2), &edit).await,
+            Err(EditError::Rejected(EditRejected::NotEditable { .. }))
+        ));
+        assert!(matches!(
+            apply(&state, "admin", &EditTarget::Item(3), &edit).await,
+            Err(EditError::NotFound(3))
+        ));
     }
 
     #[test]
