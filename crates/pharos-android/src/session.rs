@@ -169,6 +169,9 @@ pub(crate) fn ids(items: &[Item]) -> Vec<String> {
 
 /// Calls `method` on the current player, then publishes `state`.
 pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
+    if method == "stop" {
+        supersede();
+    }
     let guard = state_lock()?;
     let st = guard.as_ref().ok_or("transport before onCreate")?;
     let session = st.session.clone();
