@@ -888,10 +888,20 @@ mod tests {
         assert!(p.probe.has_embedded_cover);
         let without = br#"{"streams": [{"codec_type": "audio", "codec_name": "mp3"}],
             "format": {"format_name": "mp3"}}"#;
-        assert!(!parse_ffprobe_output(without).unwrap().probe.has_embedded_cover);
+        assert!(
+            !parse_ffprobe_output(without)
+                .unwrap()
+                .probe
+                .has_embedded_cover
+        );
         let video = br#"{"streams": [{"codec_type": "video", "codec_name": "h264"}],
             "format": {"format_name": "mov"}}"#;
-        assert!(!parse_ffprobe_output(video).unwrap().probe.has_embedded_cover);
+        assert!(
+            !parse_ffprobe_output(video)
+                .unwrap()
+                .probe
+                .has_embedded_cover
+        );
     }
 
     #[test]
