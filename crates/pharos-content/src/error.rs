@@ -59,6 +59,26 @@ impl ContentError {
         }
     }
 
+    /// The error for a log line or a notice the car shows: `Display` minus
+    /// anything that names the server, a URL, a path or a TLS reason.
+    pub fn redacted(&self) -> String {
+        match self {
+            ContentError::Timeout { .. }
+            | ContentError::Closed { .. }
+            | ContentError::Api { .. }
+            | ContentError::NeedsSignIn
+            | ContentError::BadId(_)
+            | ContentError::Cache { .. }
+            | ContentError::Resume { .. }
+            | ContentError::WorkerGone => self.to_string(),
+            ContentError::Rpc { op, .. } => format!("{op}: rpc failed"),
+            ContentError::TokenFile { why, .. } => format!("token file: {why}"),
+            ContentError::Url(_) | ContentError::Connect { .. } | ContentError::NoCode { .. } => {
+                self.label().to_owned()
+            }
+        }
+    }
+
     /// The server refused because the session or device token is revoked.
     pub fn is_revoked(&self) -> bool {
         matches!(
@@ -83,5 +103,43 @@ impl ContentError {
                 why: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_never_names_the_server_or_the_tls_reason() {
+        let host = "pharos.example";
+        for e in [
+            ContentError::Url(format!("bad scheme: http://{host}")),
+            ContentError::Connect {
+                url: format!("wss://{host}/rpc"),
+                why: "invalid peer certificate: UnknownIssuer".into(),
+            },
+            ContentError::Rpc {
+                op: "search".into(),
+                why: format!("io error talking to {host}"),
+            },
+            ContentError::NoCode {
+                server: format!("https://{host}"),
+                last: "refused".into(),
+            },
+            ContentError::TokenFile {
+                path: PathBuf::from(format!("/data/{host}/device-token")),
+                why: "permission denied".into(),
+            },
+        ] {
+            let r = e.redacted();
+            assert!(!r.contains(host), "{r}");
+            assert!(!r.contains("certificate"), "{r}");
+        }
+        let t = ContentError::Timeout {
+            op: "children".into(),
+            secs: 8,
+        };
+        assert_eq!(t.redacted(), t.to_string());
     }
 }
