@@ -26,6 +26,13 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+        <!-- Artwork: the car host opens content://…art/<key> URIs here.
+             Exported with no permission so the host can read it; it serves
+             only images the app registered or already cached. -->
+        <provider
+            android:name=".PharosArtProvider"
+            android:authorities="com.alisonjenkins.pharos.auto.art"
+            android:exported="true" />
         <service
             android:name="com.alisonjenkins.pharos.auto.PharosMediaService"
             android:exported="true"
