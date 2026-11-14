@@ -1051,7 +1051,9 @@ mod tests {
     fn a_pinned_track_already_queued_for_playback_survives_a_later_prefetch() {
         let r = pin_rig("pin-queued-replaced", fast(), 3, 1000);
         r.dl.set_online(false);
-        r.dl.prefetch(&ids(&["track/2"]));
+        // Offline, the worker takes track/1 and waits on it, so track/2 is
+        // still in the playback queue when the pin is enqueued.
+        r.dl.prefetch(&ids(&["track/1", "track/2"]));
         r.cache.pin("album/1", &ids(&["track/2"]));
         r.dl.enqueue(&ids(&["track/2"]));
         r.dl.prefetch(&ids(&["track/3"]));
