@@ -88,6 +88,11 @@ impl Player {
 }
 
 static PLAYER: OnceLock<Player> = OnceLock::new();
+
+/// The player, if [`runtime`] has run.
+pub(crate) fn started() -> Option<&'static Player> {
+    PLAYER.get()
+}
 /// Held while the runtime starts, so two entry points do not both start it.
 static STARTING: Mutex<()> = Mutex::new(());
 
