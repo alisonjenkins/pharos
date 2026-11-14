@@ -225,7 +225,12 @@ pub async fn children<C: Catalogue>(
             Node::folder(NodeId::Artists, "Artists"),
             Node::folder(NodeId::Mixes, "Mixes"),
         ],
-        NodeId::Audiobooks => nodes(urls, &audiobooks(cat).await?),
+        NodeId::Audiobooks => {
+            let mut books = nodes(urls, &audiobooks(cat).await?);
+            // Tapping a book plays it from where it stopped ([`book`]).
+            books.iter_mut().for_each(|b| b.playable = true);
+            books
+        }
         NodeId::Track(_) | NodeId::SignIn => Vec::new(),
         NodeId::Recent => nodes(urls, &not_books(cat.recent_music().await?)),
         NodeId::Albums => {
@@ -626,7 +631,10 @@ mod tests {
         };
         let books = block_on(children(&f, &urls(), NodeId::Audiobooks)).unwrap();
         assert_eq!(ids(&books), ["album/s3"]);
-        assert!(books.iter().all(|b| b.browsable && !b.playable));
+        assert!(
+            books.iter().all(|b| b.browsable && b.playable),
+            "a book opens and also plays"
+        );
         assert_eq!(
             *f.calls.borrow(),
             [format!("list 200 Some(Album) SortName {MAX_CHILDREN}")]
