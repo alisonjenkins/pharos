@@ -337,6 +337,43 @@ fn joint(song: &Song<'_>, parts: &[Part]) -> Option<Vec<Placed>> {
     Some(out)
 }
 
+type Band = (f64, f64, f64);
+
+/// Line `i`, just outside the anchored span, when its answer today runs
+/// past the span's placed edge at `edge_ms`: left as it is it would overlap
+/// the line inside (V1373). `shift` is the edge anchor's offset.
+fn edge_part(
+    lines: &[Line],
+    today: &[LineWords],
+    tokens: &[Option<Vec<Vec<u32>>>],
+    i: usize,
+    shift: f64,
+    edge_ms: f64,
+    before: bool,
+) -> Option<Part> {
+    let words = tokens[i].as_ref()?;
+    let first = today[i].words.first()?.start_ms as f64;
+    let end = today[i].words.last()?.start_ms as f64;
+    let pad = 2.0 * PAD_MS as f64;
+    let expect_ms = lines[i].start_ms as f64 + shift;
+    if before {
+        (end > edge_ms).then(|| Part {
+            words: words.clone(),
+            lo_ms: first.min(expect_ms) - pad,
+            hi_ms: edge_ms + pad,
+            expect_ms,
+        })
+    } else {
+        let length = (lines[i].end_ms - lines[i].start_ms) as f64;
+        (first < edge_ms).then(|| Part {
+            words: words.clone(),
+            lo_ms: edge_ms - pad,
+            hi_ms: end.max(expect_ms + length) + pad,
+            expect_ms,
+        })
+    }
+}
+
 /// Places every line: `today` is today's per-line answer, `matched` the
 /// recogniser's anchors.
 pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song<'_>) -> Refined {
@@ -379,7 +416,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
     let frames_ms = song.ms(song.emission.frames()) as f64;
     // Anchored lines with the band around their anchor; a band the song
     // cannot hold keeps the recogniser's times.
-    let mut bands: Vec<Option<(f64, f64, f64)>> = vec![None; lines.len()];
+    let mut bands: Vec<Option<Band>> = vec![None; lines.len()];
     for (i, m) in matched.lines.iter().enumerate() {
         let (Some(a), Some(t), false) = (m.anchor.as_ref(), tokens[i].as_ref(), dropped[i]) else {
             continue;
@@ -436,9 +473,51 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
                 ));
             }
         }
-        let only: Vec<Part> = parts.iter().map(|(_, p)| p.clone()).collect();
-        match joint(song, &only) {
-            Some(placed) => {
+        let shift_at = |i: usize| bands[i].map_or(0.0, |b| b.2 - lines[i].start_ms as f64);
+        let mut before: Vec<(usize, Part)> = Vec::new();
+        let mut after: Vec<(usize, Part)> = Vec::new();
+        // Each pass that finds an edge line overlapping takes it in and
+        // aligns again, so a line moves only when the placed edge reaches it.
+        // A line taken in that makes the alignment impossible is left out.
+        let mut last = None;
+        let result = loop {
+            let all: Vec<(usize, Part)> = before
+                .iter()
+                .rev()
+                .chain(&parts)
+                .chain(&after)
+                .cloned()
+                .collect();
+            let only: Vec<Part> = all.iter().map(|(_, p)| p.clone()).collect();
+            let Some(placed) = joint(song, &only) else {
+                break last;
+            };
+            let (lo_i, hi_i) = (all[0].0, all[all.len() - 1].0);
+            let start = placed.first().and_then(|p| p.words.first());
+            let end = placed.last().and_then(|p| p.words.last());
+            let mut grew = false;
+            if let (Some(&(s, _)), Some(i)) = (start, lo_i.checked_sub(1)) {
+                let edge = song.ms(s) as f64;
+                if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(from), edge, true) {
+                    before.push((i, p));
+                    grew = true;
+                }
+            }
+            if let (Some(&(_, e)), true) = (end, hi_i + 1 < lines.len()) {
+                let edge = song.ms(e) as f64;
+                let i = hi_i + 1;
+                if let Some(p) = edge_part(lines, today, &tokens, i, shift_at(to), edge, false) {
+                    after.push((i, p));
+                    grew = true;
+                }
+            }
+            if !grew {
+                break Some((all, placed));
+            }
+            last = Some((all, placed));
+        };
+        match result {
+            Some((parts, placed)) => {
                 for ((i, _), p) in parts.iter().zip(placed) {
                     let times: Vec<(u64, u64)> = p
                         .words
@@ -792,5 +871,47 @@ mod tests {
         assert_eq!(r.lines[2], t[2]);
         assert_eq!(r.placement.dropped_anchors, 1);
         assert_eq!(r.placement.anchor_share, Some(0.5));
+    }
+
+    #[test]
+    fn a_line_before_the_first_anchor_that_runs_into_it_is_placed_before_it() {
+        let lines = [
+            line(1_000, 4_000, "grey gulls wheel"),
+            line(4_000, 7_000, "nets dry slow"),
+            line(7_000, 10_000, "low tide hums"),
+            line(10_000, 13_000, "boats come home"),
+        ];
+        let mut sung = sing("grey gulls wheel", 1_000);
+        sung.extend(sing("nets dry slow", 4_000));
+        sung.extend(sing("low tide hums", 7_000));
+        sung.extend(sing("boats come home", 10_000));
+        let frames = 700;
+        let e = emission(frames, &sung);
+        let song = Song {
+            emission: Emission::new(&e, frames, CLASSES).unwrap(),
+            n_samples: frames * SAMPLES_PER_FRAME,
+        };
+        let mut h = heard("nets dry slow", 4.0);
+        h.extend(heard("low tide hums", 7.0));
+        let m = match_lines(&lines, &h, Options::default());
+        // Today ran line 0 on into line 1; line 3 it left well clear.
+        let t = [
+            today(&lines[0], 3_500),
+            today(&lines[1], 4_000),
+            today(&lines[2], 7_000),
+            today(&lines[3], 12_000),
+        ];
+        let r = place(&lines, &t, &m, &song);
+        assert_eq!(
+            r.methods,
+            vec![
+                Some(Method::Between),
+                Some(Method::Refined),
+                Some(Method::Refined),
+                Some(Method::Kept)
+            ]
+        );
+        sung_at(&r.lines[0], &[1_000, 1_500, 2_100]);
+        assert_eq!(r.lines[3], t[3]);
     }
 }
