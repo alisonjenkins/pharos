@@ -695,7 +695,11 @@ impl<P: Prober> FsScanner<P> {
             .instrument(tracing::info_span!("scan.copy_facts"))
             .await;
         let mut tally = CopyTally::default();
-        let mut groups = group_copies_guarded(groups, &facts, &guard, &mut tally);
+        let groups = group_copies_guarded(groups, &facts, &guard, &mut tally);
+        // V1391 — one item per book: its formats and copies become versions.
+        let mut groups = crate::book::fold::fold_formats(groups)
+            .instrument(tracing::info_span!("scan.book_formats"))
+            .await;
         groups.extend(stacks);
         tally.publish();
         // A file now grouped under another may still hold its own row from an
@@ -1724,6 +1728,13 @@ impl<P: Prober> FsScanner<P> {
         alts: Vec<(String, PathBuf)>,
     ) -> Option<MediaItem> {
         let mut item = self.probe_one(primary).await?;
+        if item.kind == MediaKind::Book {
+            for (label, alt_path) in alts {
+                let alt = book_alternate(&item.probe.alternate_sources, &label, alt_path).await;
+                item.probe.alternate_sources.extend(alt);
+            }
+            return Some(item);
+        }
         for (edition, alt_path) in alts {
             match self.prober.probe(&alt_path).await {
                 Ok(info) => {
@@ -2202,6 +2213,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .collect();
         let sizes = copy_sizes(&candidates).await;
         let groups = group_copies(groups, &sizes, &mut CopyTally::default());
+        let groups = crate::book::fold::fold_formats(groups).await;
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -2296,6 +2308,47 @@ fn unique_edition_id(taken: &[AlternateMediaSource], edition: &str) -> String {
         n += 1;
     }
     id
+}
+
+/// V1391 — another format or copy of a book, as a version of its item. Read
+/// by the book parser, never the prober: its container is the format a client
+/// reads it as, and its probe carries that and its size, so a request naming
+/// it is served from its file. `None` for a file that is no longer a book.
+async fn book_alternate(
+    taken: &[AlternateMediaSource],
+    label: &str,
+    path: PathBuf,
+) -> Option<AlternateMediaSource> {
+    let owned = path.clone();
+    let meta = match tokio::task::spawn_blocking(move || crate::book::read_book_meta(&owned)).await
+    {
+        Ok(meta) => meta?,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "book version could not be read; skipping just this version");
+            return None;
+        }
+    };
+    let container = crate::book::fold::readable_container(&path, meta.format);
+    let size_bytes = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
+    let probe = pharos_core::MediaProbe {
+        container: Some(container.clone()),
+        size_bytes,
+        ..Default::default()
+    };
+    Some(AlternateMediaSource {
+        id: unique_edition_id(taken, label),
+        container: Some(container),
+        video_codec: None,
+        audio_codec: None,
+        bitrate_bps: None,
+        size_bytes,
+        duration_ms: None,
+        name: Some(label.to_string()),
+        video_3d_format: None,
+        path,
+        probe: Some(Box::new(probe)),
+        part: None,
+    })
 }
 
 /// P41 — slugify an edition label into a URL-stable identifier suffix
