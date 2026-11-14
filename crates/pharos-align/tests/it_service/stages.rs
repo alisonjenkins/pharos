@@ -9,8 +9,8 @@ use pharos_align::line::LineSpans;
 use pharos_align::placement::{Fallback, Method};
 use pharos_align::plan::Line;
 use pharos_align::service::{
-    Aligned, Decoder, Engine, LineWords, Loader, Model, ModelError, Progress, StageError, Stages,
-    ALIGNER_VERSION,
+    Aligned, Decoder, DeviceUsed, Engine, LineWords, Loader, Model, ModelError, Progress,
+    StageError, Stages, ALIGNER_VERSION,
 };
 use pharos_align::tokens::{label, CLASSES, STAR};
 use pharos_align::transcript::Word;
@@ -22,9 +22,10 @@ const FRAME_MS: i64 = 20;
 const SONG_S: usize = 10;
 
 /// Today's model, as `engine.rs`'s `Even`, that can also give an emission
-/// in which `sung` letters stand out of the blank.
+/// in which `sung` letters stand out of the blank, on `device`.
 struct Singer {
     sung: Option<Vec<(char, i64)>>,
+    device: &'static str,
 }
 
 impl Model for Singer {
@@ -54,6 +55,13 @@ impl Model for Singer {
             }
         }
         Ok(Some(e))
+    }
+
+    fn device(&self) -> DeviceUsed {
+        DeviceUsed {
+            device: self.device,
+            reason: "scripted".into(),
+        }
     }
 }
 
@@ -150,10 +158,15 @@ fn silent() -> Decoder {
 }
 
 fn loader(sung: Option<Vec<(char, i64)>>) -> Loader {
+    loader_on(sung, "vulkan")
+}
+
+fn loader_on(sung: Option<Vec<(char, i64)>>, device: &'static str) -> Loader {
     let sung = Arc::new(sung);
     Box::new(move || {
         Ok(Box::new(Singer {
             sung: (*sung).clone(),
+            device,
         }) as Box<dyn Model>)
     })
 }
@@ -317,6 +330,27 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
     let (before, _) = today();
     assert_eq!(got.placement.fallback, Some(Fallback::LowAnchorShare));
     assert!(got.fallback_reason.starts_with("low_anchor_share"));
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
+    let (sung, _) = song();
+    // Both stages would panic: running either is a failure of the gate.
+    let stages = Scripted {
+        vocals: Step::Panics,
+        recognise: Step::Panics,
+        heard: Vec::new(),
+    };
+    let (got, events) =
+        run(&Engine::new(loader_on(Some(sung), "cpu"), silent(), None)
+            .with_stages(Box::new(stages)));
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::NoGpuStages));
+    assert_eq!(got.fallback_reason, "the song ran on cpu: scripted");
+    assert_eq!(got.stages.vocals_ms, 0);
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
     assert_eq!(events.len(), 3);

@@ -54,6 +54,14 @@ pub struct DeviceUsed {
     pub reason: String,
 }
 
+impl DeviceUsed {
+    /// True when the song ran on the Vulkan GPU, the only device the
+    /// recogniser's stages finish on within the server's wait (B1428).
+    pub fn on_gpu(&self) -> bool {
+        self.device == "vulkan"
+    }
+}
+
 /// A GPU memory pool's bytes at one moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuPool {
@@ -425,7 +433,19 @@ impl Engine {
                 model.begin_song();
                 let r = run_song(model, &self.decoder, rel_path, full_path, lines, probes, on).map(
                     |today| match self.stages.as_deref() {
-                        Some(stages) => improve(model, stages, rel_path, full_path, today, on),
+                        Some(stages) => {
+                            let used = model.device();
+                            if used.on_gpu() {
+                                improve(model, stages, rel_path, full_path, today, on)
+                            } else {
+                                skip_stages(
+                                    rel_path,
+                                    today,
+                                    Fallback::NoGpuStages,
+                                    format!("the song ran on {}: {}", used.device, used.reason),
+                                )
+                            }
+                        }
                         None => today.kept(Fallback::Off, String::new()),
                     },
                 );
@@ -552,6 +572,17 @@ fn caught<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
             .unwrap_or_else(|| "a panic without a message".into());
         Err(format!("panicked: {message}"))
     })
+}
+
+/// Today's answer for a song the stages are not run on, logged with why.
+fn skip_stages(rel_path: &str, today: Today, why: Fallback, reason: String) -> Aligned {
+    tracing::info!(
+        path = %rel_path,
+        fallback = why.label(),
+        reason = %reason,
+        "recogniser stages skipped"
+    );
+    today.kept(why, reason)
 }
 
 fn ms_since(t: Instant) -> u64 {
