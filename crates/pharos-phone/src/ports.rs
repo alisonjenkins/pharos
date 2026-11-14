@@ -13,8 +13,10 @@ use pharos_android::snapshot::{self, PlayState as HostState, Snapshot};
 use pharos_android::{content, Player};
 use pharos_ui::native::ports::{
     self, ContainerKind, ContainerRef, Download, NativeAudio, OfflineError, OfflineStore,
-    PlayState, PlayerSnapshot, TrackDownload, TrackState,
+    PlayState, PlayerSnapshot, TrackDownload, TrackState, VisFrame,
 };
+use pharos_vis::engine as vis;
+use pharos_vis::source;
 use tokio::sync::watch;
 
 /// Registers both ports; call before `launch`, so the first render sees them.
@@ -95,6 +97,54 @@ impl NativeAudio for PhoneAudio {
     fn state(&self) -> watch::Receiver<PlayerSnapshot> {
         bridge().subscribe()
     }
+
+    fn visualiser_enable(&self, on: bool) {
+        analyser().set_enabled(on);
+    }
+
+    fn visualiser_frame(&self) -> Option<VisFrame> {
+        let pulled = analyser().frame()?;
+        Some(VisFrame {
+            sample_rate: pulled.sample_rate,
+            bins: pulled.frame.bins,
+            wave: pulled.frame.wave,
+        })
+    }
+}
+
+/// The visualiser's decoder (ADR-0133). Idle, with no thread work and no
+/// memory beyond the engine itself, until the UI shows the visualiser.
+fn analyser() -> &'static vis::Engine {
+    static ENGINE: OnceLock<vis::Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| vis::Engine::new(Arc::new(SongSource)))
+}
+
+/// Finds the song for the decoder: the cached file when it is whole, else a
+/// ranged read of the stream URL.
+struct SongSource;
+
+impl vis::Opener for SongSource {
+    fn open(&self, ui_id: &str) -> Result<vis::Opened, String> {
+        // The snapshot carries the UI's id; the library knows the node.
+        let id = snapshot::car_id(ui_id);
+        let id = id.as_str();
+        let lib = pharos_android::library().ok_or("the library is not connected")?;
+        if let Some(path) = lib.local_path(id) {
+            let file = std::fs::File::open(&path).map_err(|e| format!("cached file: {e}"))?;
+            return Ok(vis::Opened {
+                source: Box::new(file),
+                extension: path.extension().and_then(|e| e.to_str()).map(str::to_owned),
+            });
+        }
+        let node = lib.node(id).map_err(|e| e.redacted())?;
+        let url = node.stream_url.ok_or("the track has no stream url")?;
+        let reader = content::ranged::RangedReader::open(&url).map_err(|e| e.to_string())?;
+        let len = reader.len();
+        Ok(vis::Opened {
+            source: Box::new(source::ReadSeekSource::new(reader, len)),
+            extension: None,
+        })
+    }
 }
 
 /// The UI's snapshot channel, fed from the host's by one thread.
@@ -116,7 +166,13 @@ fn bridge() -> &'static watch::Sender<PlayerSnapshot> {
                 };
                 rt.block_on(async move {
                     while host.changed().await.is_ok() {
-                        feed.send_replace(to_ui(&host.borrow_and_update()));
+                        let latest = host.borrow_and_update().clone();
+                        analyser().update(
+                            latest.state == HostState::Playing,
+                            latest.current_id.as_deref(),
+                            latest.position_ms,
+                        );
+                        feed.send_replace(to_ui(&latest));
                     }
                     log::warn!("pharos: snapshot bridge verdict=stopped reason=host_closed");
                 });
