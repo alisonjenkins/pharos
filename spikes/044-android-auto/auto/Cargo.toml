@@ -14,3 +14,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21.1"
+log = "0.4"
+thiserror = "2"
+capnp = "0.27"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+pharos-api = { path = "../../../crates/pharos-api" }
+pharos-client = { path = "../../../crates/pharos-client" }
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"] }
