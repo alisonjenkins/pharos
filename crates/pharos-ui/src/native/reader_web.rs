@@ -1284,11 +1284,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                 auto,
                             );
                             platform::info(&format!(
-                                "pharos: reader opened item={id} format=pdf from={from} version={} bytes={length} ms={:.0} resumed={} at={}",
-                                version_log,
+                                "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={} version={}",
                                 platform::now_ms() - began,
                                 saved.is_some(),
-                                at
+                                at,
+                                version_log
                             ));
                         }
                         Ok(o) => o.core.engine.unmount(),
@@ -1385,11 +1385,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             auto,
                         );
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub from={from} version={} bytes={length} ms={:.0} resumed={} at={}",
-                            version_log,
+                            "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={} version={}",
                             platform::now_ms() - began,
                             saved.is_some(),
-                            at
+                            at,
+                            version_log
                         ));
                     }
                     Ok(o) => o.core.engine.unmount(),
