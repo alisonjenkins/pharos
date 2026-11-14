@@ -585,6 +585,12 @@ impl Library {
         self.apply_online();
     }
 
+    /// Whether browsing and downloads may use the server now: the network
+    /// is up and the debug switch is off.
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::SeqCst)
+    }
+
     /// Debug: refuse every server connection (websocket, listings,
     /// downloads) as if the server were unreachable, and go offline. Off
     /// restores what the network callback last said.
@@ -1184,6 +1190,7 @@ mod tests {
         lib.note_listing("album/7", album, &[track(1)]);
         keep(&lib, "track/1");
         lib.set_online(false);
+        assert!(!lib.is_online());
         let t = std::time::Instant::now();
         assert_eq!(lib.children("album/7").unwrap().len(), 1);
         assert!(t.elapsed() < Duration::from_millis(500));
