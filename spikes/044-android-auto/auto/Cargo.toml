@@ -1,0 +1,16 @@
+[package]
+name = "pharos-auto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike 044: the Rust side of the Android Auto media service"
+
+# Not a member of the pharos workspace while it is a spike.
+[workspace]
+
+[lib]
+name = "pharos_auto"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21.1"
