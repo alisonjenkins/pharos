@@ -129,7 +129,7 @@ pub(super) fn write_batch(
     mixed: &Mixed,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &super::library::DamagedIds,
+    damaged: &super::library::SummaryFacts,
 ) {
     let len = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     out.set_pool(len(mixed.pool));
