@@ -10,6 +10,7 @@ description = "Decodes a song just ahead of the playhead into visualiser frames 
 [dependencies]
 log = "0.4"
 realfft = "3"
+thiserror = { workspace = true }
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "aac", "isomp4", "ogg", "vorbis", "wav", "alac", "pcm"] }
 
 [lints]
