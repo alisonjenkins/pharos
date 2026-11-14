@@ -127,6 +127,18 @@ pub struct PlayerSnapshot {
     pub error: Option<String>,
 }
 
+/// One frame of the visualiser's analysis of the song now playing, made by
+/// the host (ADR-0133) in the web analyser's terms and quantised to bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisFrame {
+    /// The song's sample rate, which sets what each bin's frequency is.
+    pub sample_rate: u32,
+    /// Each bin's level: byte `b` is `-b * 0.5` dBFS, 255 for none.
+    pub bins: Vec<u8>,
+    /// The latest samples, twice as many as `bins`: `s / 127`, -1 to 1.
+    pub wave: Vec<i8>,
+}
+
 /// The native audio engine. Commands return at once: the host hops to its own
 /// worker, and the outcome arrives as a snapshot. The UI never blocks on JNI.
 pub trait NativeAudio: Send + Sync {
@@ -146,6 +158,15 @@ pub trait NativeAudio: Send + Sync {
     fn set_volume(&self, level: f32);
     /// A receiver that always holds the latest snapshot.
     fn state(&self) -> watch::Receiver<PlayerSnapshot>;
+    /// The visualiser is shown (`true`) or gone (`false`). The host analyses
+    /// the song only while it is shown and playing. A host with no analyser
+    /// ignores it.
+    fn visualiser_enable(&self, _on: bool) {}
+    /// The frame under the playhead now, or `None`: nothing plays, the song
+    /// cannot be decoded, or the analysis is not ready.
+    fn visualiser_frame(&self) -> Option<VisFrame> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
