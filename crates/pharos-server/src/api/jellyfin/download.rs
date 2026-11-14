@@ -88,8 +88,44 @@ fn disposition_for(source: &std::path::Path, served: &std::path::Path) -> String
         Some(ext) => format!("{stem}.{ext}"),
         None => stem.to_string(),
     };
-    let name: String = name.chars().filter(|c| *c != '"' && *c != '\\').collect();
-    format!("attachment; filename=\"{name}\"")
+    // B1425: a control character made the header invalid, so it was dropped
+    // and the reader saved "Download"; a non-ASCII name went out as raw
+    // UTF-8, which clients read as Latin-1. Now control characters go, an
+    // ASCII stand-in fills `filename`, and the real name rides in
+    // `filename*` (RFC 6266).
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let fallback: String = name
+        .chars()
+        .filter(|c| *c != '"' && *c != '\\')
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+    let fallback = if fallback.trim().is_empty() {
+        "download".to_owned()
+    } else {
+        fallback
+    };
+    if name.is_ascii() {
+        format!("attachment; filename=\"{fallback}\"")
+    } else {
+        format!(
+            "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+            rfc5987(&name)
+        )
+    }
+}
+
+/// `value` percent-encoded as an RFC 5987 `ext-value`: every byte outside
+/// `attr-char` as `%XX`.
+fn rfc5987(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 async fn download(
@@ -189,4 +225,43 @@ pub(crate) async fn serve_item_file(
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn an_ascii_name_is_sent_as_before() {
+        assert_eq!(
+            disposition_for(Path::new("/m/Book A.epub"), Path::new("/m/Book A.epub")),
+            "attachment; filename=\"Book A.epub\""
+        );
+        assert_eq!(
+            disposition_for(
+                Path::new("/m/Say \"Hi\".pdf"),
+                Path::new("/m/Say \"Hi\".pdf")
+            ),
+            "attachment; filename=\"Say Hi.pdf\""
+        );
+    }
+
+    /// B1425. Disarm check: with the old body, the first assertion sees raw
+    /// UTF-8 and the second a header value that does not parse.
+    #[test]
+    fn any_name_gives_a_valid_header_that_keeps_the_real_name() {
+        let d = disposition_for(Path::new("/m/Élan vital.azw3"), Path::new("/c/42.epub"));
+        assert_eq!(
+            d,
+            "attachment; filename=\"_lan vital.epub\"; filename*=UTF-8''%C3%89lan%20vital.epub"
+        );
+        assert!(d.is_ascii());
+        let d = disposition_for(Path::new("/m/Bad\nName.pdf"), Path::new("/m/Bad\nName.pdf"));
+        assert!(
+            actix_web::http::header::HeaderValue::from_str(&d).is_ok(),
+            "{d}"
+        );
+        assert_eq!(d, "attachment; filename=\"BadName.pdf\"");
+    }
 }
