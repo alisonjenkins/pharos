@@ -2,7 +2,7 @@
 //!
 //! The car host draws item icons and album art from `content://` URIs it
 //! opens through this provider, not from http URLs. [`art_uri`] turns an
-//! image URL into `content://<AUTHORITY>/<key>`; `openFile` downloads the
+//! image URL into `content://<authority>/<key>`; `openFile` downloads the
 //! image into the cache dir on first use and hands back a read-only file.
 //!
 //! Only URLs registered through [`art_uri`] in this process are fetched, so
@@ -10,7 +10,7 @@
 //! URLs. A file already in the cache is served by key after a restart.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jni::objects::{JObject, JString, JValue};
@@ -19,7 +19,34 @@ use jni::JNIEnv;
 
 use crate::{jerr, log, string, R};
 
-pub const AUTHORITY: &str = "com.alisonjenkins.pharos.auto.art";
+/// The spike APK's authority, used until [`set_authority`] runs and in tests.
+const FALLBACK_AUTHORITY: &str = "com.alisonjenkins.pharos.auto.art";
+
+/// `<application id>.art`, matching the manifest's `${applicationId}.art`, so
+/// each build flavour's provider answers its own URIs.
+static AUTHORITY: OnceLock<String> = OnceLock::new();
+
+/// The provider authority this process hands out in art URIs.
+pub fn authority() -> &'static str {
+    AUTHORITY.get().map_or(FALLBACK_AUTHORITY, String::as_str)
+}
+
+/// Derives the authority from the application id; the first call wins.
+pub(crate) fn set_authority(package: &str) {
+    let wanted = authority_for(package);
+    match AUTHORITY.set(wanted.clone()) {
+        Ok(()) => log(&format!("art authority={wanted}")),
+        Err(_) if authority() == wanted => {}
+        Err(_) => log(&format!(
+            "art authority={} kept, ignored package={package}",
+            authority()
+        )),
+    }
+}
+
+fn authority_for(package: &str) -> String {
+    format!("{package}.art")
+}
 
 /// How long a download may take to connect, and then between reads. Without
 /// a limit `URLConnection` waits forever and pins the car host's binder thread.
@@ -79,7 +106,7 @@ pub fn art_uri(http_url: &str) -> String {
         map.get_or_insert_with(HashMap::new)
             .insert(k.clone(), http_url.to_owned());
     }
-    format!("content://{AUTHORITY}/{k}")
+    format!("content://{}/{k}", authority())
 }
 
 /// `Uri.parse(art_uri(http_url))`.
@@ -359,10 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn the_authority_follows_the_application_id() {
+        assert_eq!(
+            authority_for("com.alisonjenkins.pharos.phone"),
+            "com.alisonjenkins.pharos.phone.art"
+        );
+        assert_eq!(
+            authority_for("com.alisonjenkins.pharos.auto"),
+            FALLBACK_AUTHORITY
+        );
+    }
+
+    #[test]
     fn art_uri_registers() -> Result<(), String> {
         let u = art_uri("https://h/x.jpg");
         let k = u.rsplit('/').next().ok_or("no key")?;
-        assert_eq!(u, format!("content://{AUTHORITY}/{k}"));
+        assert_eq!(u, format!("content://{}/{k}", authority()));
         let allowed = ALLOWED.lock().map_err(|e| e.to_string())?;
         assert!(allowed.as_ref().is_some_and(|m| m.contains_key(k)));
         Ok(())

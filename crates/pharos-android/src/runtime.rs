@@ -109,6 +109,16 @@ pub fn runtime(env: &mut JNIEnv, ctx: &JObject) -> R<&'static Player> {
         let _ = VM.set(env.get_java_vm().map_err(jerr("get_java_vm"))?);
     }
     cache_classes(env)?;
+    match package_name(env, ctx) {
+        Ok(package) => art::set_authority(&package),
+        Err(e) => {
+            let exception = take_exception(env);
+            log(&format!(
+                "runtime: no application id, art authority={}: {e}{exception}",
+                art::authority()
+            ));
+        }
+    }
     // The test folder still works when these fail.
     if let Err(e) = connect_library(env, ctx) {
         log(&format!("runtime: library not connected: {e}"));
