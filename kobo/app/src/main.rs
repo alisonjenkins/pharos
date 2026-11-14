@@ -411,8 +411,11 @@ impl Pharos {
                 .activity("Loading your albums", None)
                 .button("sign-out", "Sign out")
                 .build(),
-            View::Albums => ScreenBuilder::new("pharos-albums")
-                .top_bar(format!("Music · {} albums", self.albums.total))
+            View::Albums => self
+                .now_playing(
+                    ScreenBuilder::new("pharos-albums")
+                        .top_bar(format!("Music · {} albums", self.albums.total)),
+                )
                 .rows(Self::rows(&self.albums, self.page, false))
                 .page_turns("page-back", "page-next")
                 .bottom_action("sign-out", "Sign out")
@@ -424,8 +427,8 @@ impl Pharos {
                     .build()
                     .with_own_back(true)
             }
-            View::Album(album) => ScreenBuilder::new("pharos-album")
-                .top_bar(album.name.clone())
+            View::Album(album) => self
+                .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
                 .rows(Self::rows(&self.tracks, self.page, true))
                 .page_turns("page-back", "page-next")
                 .build()
@@ -441,6 +444,16 @@ impl Pharos {
                 .error_state(why.clone())
                 .primary_button("retry", "Try again")
                 .build(),
+        }
+    }
+
+    /// Adds the way back to the player while something plays: Back from the
+    /// player keeps the track going, and choosing it again would restart it.
+    fn now_playing(&self, screen: ScreenBuilder) -> ScreenBuilder {
+        if self.playing.is_some() {
+            screen.top_bar_action("now-playing", "Playing")
+        } else {
+            screen
         }
     }
 
@@ -549,6 +562,8 @@ impl KoboApp for Pharos {
                 }
                 None => self.sign_in(context),
             }
+        } else if action == action_id("now-playing") && self.playing.is_some() {
+            self.view = View::Player;
         } else if action == action_id("sign-out") {
             self.sign_out(context);
         } else if action == action_id("page-next") {
