@@ -462,6 +462,11 @@ fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
         .map_err(|e| format!("library {server}: {e}"))?;
     lib.on_auth_change(|_| notify_changed());
     log(&format!("library server={server} auth={:?}", lib.auth_state()));
+    let cache_dir = Path::new(&files).join("audio-cache");
+    match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
+        Ok(()) => log(&format!("cache enabled cap_bytes={}", content::DEFAULT_CAP_BYTES)),
+        Err(e) => log(&format!("cache disabled: {e}")),
+    }
     let _ = LIBRARY.set(lib);
     Ok(())
 }
@@ -643,8 +648,20 @@ fn play(env: &mut JNIEnv, item: Item, source: &str, mut queue: Vec<Item>, gen: u
 fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
+        if let Some(path) = lib.local_path(id) {
+            let listed = queue.iter().find(|i| i.id == id).cloned();
+            let item = match listed {
+                Some(i) => i,
+                None => Item::of_node(lib.node(id).map_err(|e| format!("node {id} (cached, unlisted): {e}"))?),
+            };
+            let ahead = lib.prefetch_from(id);
+            log(&format!("play id={id} verdict=cache-hit prefetch_queued={ahead}"));
+            return play(env, item, &path.to_string_lossy(), queue, gen);
+        }
         let node = lib.node(id).map_err(|e| format!("node {id}: {e}"))?;
         let url = node.stream_url.clone().ok_or_else(|| format!("node {id} has no stream"))?;
+        let ahead = lib.prefetch_from(id);
+        log(&format!("play id={id} verdict=stream prefetch_queued={ahead}"));
         play(env, Item::of_node(node), &url, queue, gen)
     })();
     if let Err(e) = &outcome {
