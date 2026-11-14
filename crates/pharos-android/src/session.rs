@@ -172,6 +172,9 @@ pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
     if method == "stop" {
         supersede();
     }
+    if method != "start" {
+        focus::clear_resume_on_gain();
+    }
     let mut guard = state_lock()?;
     let st = guard.as_mut().ok_or("transport before onCreate")?;
     let session = st.session.clone();
