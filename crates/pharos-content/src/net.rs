@@ -266,7 +266,7 @@ impl NativeCatalogue {
             }
         }
         let op = format!("start playback {id}");
-        let (_, g) = bounded(
+        let (decision, g) = bounded(
             &op,
             &self.closed,
             self.api.play(
@@ -278,6 +278,11 @@ impl NativeCatalogue {
             ),
         )
         .await?;
+        log::info!(
+            "car grant {id} method={} block={:?}",
+            decision.method,
+            decision.direct_play_block
+        );
         *self.grant.borrow_mut() = Some((id, g.clone()));
         Ok(g)
     }
