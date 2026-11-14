@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use pharos_align::config::Config;
+use pharos_align::crash::CrashGuard;
 use pharos_align::device::{self, DeviceMode};
 use pharos_align::forward::cpu::CpuModel;
 use pharos_align::forward::CpuAligner;
@@ -357,6 +358,14 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
         Engine::new(loader, decoder, config.idle_unload).with_stage_budget(config.stage_budget);
     if let Some(stages) = stages {
         engine = engine.with_stages(stages);
+        match CrashGuard::open(&config.cache_dir) {
+            Ok(guard) => engine = engine.with_crash_guard(guard),
+            Err(e) => tracing::warn!(
+                dir = %config.cache_dir.display(),
+                error = %e,
+                "crash guard off: a song whose stages abort the process will crash it again"
+            ),
+        }
     }
     let engine = Arc::new(engine);
 
