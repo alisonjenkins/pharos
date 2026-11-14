@@ -141,6 +141,25 @@ pub fn proxied(segment: &str) -> bool {
     PROXIED.contains(&segment)
 }
 
+/// A bounded label for a proxied request's route, for logs: the path's first
+/// segment when proxied, `subtitle_image` for image subtitle frames, else
+/// `other`. Never the path itself, which carries item ids.
+pub fn proxy_segment(path: &str) -> &'static str {
+    if path.contains("/subtitles/") && path.contains("/images/") {
+        return "subtitle_image";
+    }
+    let first = path
+        .trim_start_matches('/')
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+    PROXIED
+        .iter()
+        .find(|s| **s == first)
+        .copied()
+        .unwrap_or("other")
+}
+
 /// Every segment the proxy registers a handler for.
 pub fn proxied_segments() -> &'static [&'static str] {
     &PROXIED
@@ -1777,6 +1796,18 @@ mod tests {
             "/videos/1/master.m3u8"
         );
         assert_eq!(art_src("https://s", "https://x/a.png"), "https://x/a.png");
+    }
+
+    #[test]
+    fn a_proxied_route_logs_as_a_bounded_label() {
+        assert_eq!(
+            proxy_segment("/videos/1/subtitles/2/images/9.png"),
+            "subtitle_image"
+        );
+        assert_eq!(proxy_segment("/Items/1/Images/Primary?tag=a"), "Items");
+        assert_eq!(proxy_segment("/ui/assets/x.js"), "ui");
+        assert_eq!(proxy_segment("/nope/1"), "other");
+        assert_eq!(proxy_segment(""), "other");
     }
 
     #[test]
