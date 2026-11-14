@@ -16,6 +16,7 @@
 
 mod cache;
 mod error;
+mod fault;
 mod fuzzy;
 mod http;
 mod id;
@@ -35,6 +36,7 @@ mod tv_auth;
 
 pub use cache::DEFAULT_CAP_BYTES;
 pub use error::ContentError;
+pub use fault::unreachable as server_unreachable;
 pub use id::NodeId;
 pub use library::{AuthState, Library, Timeouts};
 pub use node::{Node, ART_WIDTH};

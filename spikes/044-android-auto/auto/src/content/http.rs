@@ -196,6 +196,12 @@ pub async fn get(
     read_timeout: Duration,
 ) -> Result<Response, HttpError> {
     let host = url.host.clone();
+    if super::fault::unreachable() {
+        return Err(HttpError::Connect {
+            host,
+            why: super::fault::WHY.into(),
+        });
+    }
     let tcp = tokio::time::timeout(
         connect_timeout,
         TcpStream::connect((url.host.trim_matches(['[', ']']), url.port)),
