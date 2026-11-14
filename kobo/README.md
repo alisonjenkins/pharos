@@ -44,10 +44,17 @@ steps rather than Cobalt's own installer, whose releases do not carry Pharos.
   to connect, try another cable.
 - **Bluetooth headphones or a speaker.** The Libra Colour has no speaker or
   headphone socket.
-- **What setup changes.** It writes only to the Kobo's book storage, never to
-  system files, the kernel or the bootloader. It turns on the Kobo's SSH
-  server, with this computer's key as the only way in, so later installs
-  can go over Wi-Fi. `kobo setup --no-ssh` leaves SSH off.
+- **What setup changes.** Cobalt and its apps go in the Kobo's book storage
+  (`.adds/`). Setup also leaves an update archive that the Kobo's own
+  firmware installs as root at the next start, and that writes outside book
+  storage:
+  - NickelMenu, the menu add-on that starts Cobalt
+    (`/usr/local/Kobo/imageformats/libnm.so`).
+  - The Kobo's SSH server turned on, with this computer's key as the only
+    way in, so later installs can go over Wi-Fi. `--setup --no-ssh` leaves
+    SSH off.
+
+  It never touches the kernel, the bootloader or the partitions.
 
 ### 1. Build and install over USB
 
@@ -61,7 +68,7 @@ nix shell nixpkgs#zig nixpkgs#rustup --command kobo/build.sh --setup
 then runs `kobo setup --source`, which installs that build and no official
 release. The first build downloads Cobalt's Rust toolchain.
 
-When setup asks for the reader:
+Setup waits for the reader:
 
 1. Plug the Kobo in.
 2. **Tap Connect on the Kobo's screen.** Until you do, it only charges.
@@ -72,9 +79,17 @@ writing. To see the changes without writing anything, run
 `kobo/build.sh --setup --dry-run` instead. Anything after `--setup` goes to
 `kobo setup`.
 
-### 2. Restart the Kobo
+### 2. Let the Kobo restart
 
-Hold the power button until the Kobo turns off, then turn it on again.
+Follow what setup prints. Usually that is:
+
+1. Once setup has ejected the Kobo, unplug the USB cable.
+2. The Kobo restarts by itself: it shows its Updating screen, installs the
+   archive and reboots. Do not restart it again yourself.
+3. Join it to Wi-Fi if it is not already.
+
+Restart it by hand (hold the power button until it turns off, then turn it
+on) only if setup asks you to.
 
 **Then leave it on the home screen for a minute.** The menu add-on turns
 itself off if the reader restarts again straight away.

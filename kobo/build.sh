@@ -79,6 +79,7 @@ cargo build --locked -p kobo-cli
 echo "built $work/KoboRoot.tgz for $PHAROS_KOBO_SERVER"
 
 if [ "$setup" = true ]; then
-  # --source installs the tree just built, never an official release.
-  exec ./target/debug/kobo setup --source "$@"
+  # --source installs the tree just built, never an official release, and
+  # setup waits for the reader to be plugged in.
+  exec ./target/debug/kobo setup --source --wait-for-reader "$@"
 fi
