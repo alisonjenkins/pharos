@@ -225,9 +225,22 @@ pub fn direct_media_url(base: &str, url: &str, token: &str) -> String {
 /// label with the error. The app runs it without waiting on its result,
 /// which the WebView can drop after the script ran (B1036, V996).
 pub fn visualiser_start_js(id: u64, style: &str) -> String {
+    visualiser_start_for_js(id, style, false)
+}
+
+/// As [`visualiser_start_js`]; with `host` the page reads its sound from the
+/// frames the app pushes ([`visualiser_frame_js`]) instead of an `<audio>`
+/// element, because the song plays in the host's engine (ADR-0133). The
+/// script is unchanged without it.
+pub fn visualiser_start_for_js(id: u64, style: &str, host: bool) -> String {
     let style = serde_json::Value::String(style.to_owned());
+    let hosted = if host {
+        "window.__pharosVisHost = true;\n"
+    } else {
+        ""
+    };
     format!(
-        r#"const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
+        r#"{hosted}const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
 const send = (reason, error) => window.__pharosSend &&
   window.__pharosSend({{ t: "visualiser", id: {id}, reason: String(reason), error: String(error || "") }});
 (async () => {{
@@ -240,6 +253,48 @@ const send = (reason, error) => window.__pharosSend &&
   }} catch (e) {{
     send("no_webgl2", e && e.message ? e.message : e);
   }}
+}})();"#
+    )
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard padded base64, for bytes the page decodes with `atob`.
+pub fn base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let at = ((n >> (18 - 6 * i)) & 63) as usize;
+                out.push(char::from(BASE64.get(at).copied().unwrap_or(b'=')));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The script that hands the page the host's frame: `window.__pharosVisFrame`
+/// holds the song's rate, the bin bytes and the waveform samples, stamped
+/// with the page's own clock when it arrives. The page's visualiser reads it
+/// each animation frame and takes a stamp older than `wire::FRESH_MS` as
+/// "nothing playing".
+pub fn visualiser_frame_js(frame: &super::ports::VisFrame) -> String {
+    let bins = base64(&frame.bins);
+    let wave: Vec<u8> = frame.wave.iter().map(|s| *s as u8).collect();
+    let wave = base64(&wave);
+    let rate = frame.sample_rate;
+    format!(
+        r#"(() => {{
+  const d = (s) => {{ const b = atob(s); const a = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; }};
+  window.__pharosVisFrame = {{ rate: {rate}, at: performance.now(),
+    bins: d("{bins}"), wave: new Int8Array(d("{wave}").buffer) }};
 }})();"#
     )
 }
@@ -1651,6 +1706,55 @@ mod tests {
         for verdict in ["verdict=play", "verdict=open"] {
             assert!(hold.contains(verdict), "{verdict} logged: {hold}");
         }
+    }
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        for (raw, enc) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), enc, "{raw}");
+        }
+        assert_eq!(base64(&[0xFB, 0xFF, 0xFE]), "+//+");
+    }
+
+    #[test]
+    fn a_host_frame_is_pushed_as_bytes_with_the_pages_own_stamp() {
+        let frame = super::super::ports::VisFrame {
+            sample_rate: 44_100,
+            bins: vec![0, 255],
+            wave: vec![127, -127],
+        };
+        let js = visualiser_frame_js(&frame);
+        assert!(js.contains("rate: 44100"), "{js}");
+        assert!(js.contains("at: performance.now()"), "{js}");
+        assert!(js.contains(r#"bins: d("AP8=")"#), "{js}");
+        assert!(
+            js.contains(r#"d("f4E=")"#),
+            "i8 127, -127 are bytes 7f 81 -> {js}"
+        );
+    }
+
+    #[test]
+    fn only_a_host_visualiser_is_told_to_read_pushed_frames() {
+        let plain = visualiser_start_for_js(3, "plasma", false);
+        assert_eq!(plain, visualiser_start_js(3, "plasma"));
+        assert!(!plain.contains("__pharosVisHost"));
+        let hosted = visualiser_start_for_js(3, "plasma", true);
+        assert!(
+            hosted.starts_with("window.__pharosVisHost = true;"),
+            "{hosted}"
+        );
+        assert!(
+            hosted.ends_with(plain.as_str()) || hosted.contains(&plain),
+            "{hosted}"
+        );
     }
 
     #[test]
