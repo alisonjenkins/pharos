@@ -209,23 +209,52 @@ fn library(op: &str) -> Result<&'static content::Library, OfflineError> {
         .ok_or_else(|| OfflineError::Host(format!("{op}: the library is not connected")))
 }
 
-/// The library's id for a UI container: `album/<item id>` or `mix/<n>`.
-fn container_id(c: &ContainerRef) -> String {
-    format!("{}/{}", c.kind.label(), c.id)
+/// The library's id for a UI container: `album/<item id>`, or `mix/<n>` for
+/// the Nth built-in mix, which the UI names by its title. `None` for a mix
+/// the library has no id for (a saved one).
+fn container_id(c: &ContainerRef) -> Option<String> {
+    match c.kind {
+        ContainerKind::Album => Some(format!("album/{}", c.id)),
+        ContainerKind::Mix => pharos_client::mix::presets()
+            .iter()
+            .position(|m| m.name == c.id)
+            .map(|n| format!("mix/{n}")),
+    }
 }
 
 /// The UI's container for a library id; `None` for anything but an album or
-/// a mix.
+/// a built-in mix.
 fn container_ref(id: &str) -> Option<ContainerRef> {
     let (kind, rest) = id.split_once('/')?;
-    let kind = match kind {
-        "album" => ContainerKind::Album,
-        "mix" => ContainerKind::Mix,
-        _ => return None,
-    };
-    Some(ContainerRef {
-        kind,
-        id: rest.to_owned(),
+    match kind {
+        "album" => Some(ContainerRef {
+            kind: ContainerKind::Album,
+            id: rest.to_owned(),
+        }),
+        "mix" => {
+            let n: usize = rest.parse().ok()?;
+            let name = pharos_client::mix::presets().into_iter().nth(n)?.name;
+            Some(ContainerRef {
+                kind: ContainerKind::Mix,
+                id: name,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`container_id`], or the error the UI shows for a container the library
+/// cannot keep.
+fn library_id(c: &ContainerRef) -> Result<String, OfflineError> {
+    container_id(c).ok_or_else(|| {
+        log::warn!(
+            "pharos: offline container verdict=unknown reason=no_library_id kind={}",
+            c.kind.label()
+        );
+        OfflineError::UnknownContainer {
+            kind: c.kind,
+            id: c.id.clone(),
+        }
     })
 }
 
@@ -295,7 +324,7 @@ impl OfflineStore for PhoneOffline {
     }
 
     fn pin(&self, container: &ContainerRef) -> Result<(), OfflineError> {
-        let id = container_id(container);
+        let id = library_id(container)?;
         let lib = library("pin")?;
         match lib.pin(&id) {
             Ok(tracks) => {
@@ -315,7 +344,7 @@ impl OfflineStore for PhoneOffline {
     }
 
     fn unpin(&self, container: &ContainerRef) -> Result<(), OfflineError> {
-        let id = container_id(container);
+        let id = library_id(container)?;
         library("unpin")?.unpin(&id);
         log::info!("pharos: offline unpin id={id} verdict=unpinned");
         Ok(())
