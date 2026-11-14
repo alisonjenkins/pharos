@@ -691,6 +691,22 @@ pub fn version_book(book: &Book, versions: &[pharos_client::api::Version], versi
     }
 }
 
+/// Whether a copy kept offline as `kept` serves an open of `book` with
+/// `picked` chosen on the title page (V1391): yes when nothing is picked, or
+/// the pick is gone, or it reads as the kept format; a pick of another format
+/// is fetched instead.
+pub fn kept_copy_serves(
+    kept: BookFormat,
+    book: &Book,
+    versions: &[pharos_client::api::Version],
+    picked: &str,
+) -> bool {
+    version_book(book, versions, picked).format == kept
+        || !versions
+            .iter()
+            .any(|v| !picked.is_empty() && v.id == picked)
+}
+
 /// The format a version's container reads as; a container the reader does
 /// not know is unreadable.
 fn format_of_container(container: &str) -> BookFormat {
@@ -1357,6 +1373,28 @@ mod tests {
         assert_eq!(format("kindle"), BookFormat::Epub);
         assert_eq!(format("gone"), BookFormat::Epub);
         assert_eq!(version_book(&epub, &versions, "pdf").author, "A");
+    }
+
+    /// A kept EPUB opens offline-first unless the title page picked a
+    /// version of another format, which is fetched instead.
+    #[test]
+    fn a_pick_of_another_format_passes_over_the_kept_copy() {
+        use pharos_client::api::Version;
+        let epub = Book {
+            format: BookFormat::Epub,
+            author: String::new(),
+            page_count: 0,
+        };
+        let versions = [Version {
+            id: "pdf".into(),
+            container: "pdf".into(),
+            ..Version::default()
+        }];
+        let serves = |kept, picked| kept_copy_serves(kept, &epub, &versions, picked);
+        assert!(serves(BookFormat::Epub, ""), "nothing picked: kept first");
+        assert!(serves(BookFormat::Epub, "gone"), "a gone pick: kept first");
+        assert!(!serves(BookFormat::Epub, "pdf"), "a PDF pick is fetched");
+        assert!(serves(BookFormat::Pdf, "pdf"), "the kept format picked");
     }
 
     #[test]
