@@ -63,9 +63,14 @@ the car reuses that device token and never shows a sign-in step (Alison,
 browse item "Sign in: approve code NNNNNN" approved in the web UI
 (QuickConnect, as the TV app does).
 
-### US5: offline (P3, later)
+### US5: offline (P1)
 
-Download albums and books to the phone for no-signal stretches.
+Music and audiobooks keep playing through UK signal black spots (Alison,
+2026-11-14T09:28Z). When a track starts, the rest of its album or mix
+downloads in the background; a cached track plays from the phone first.
+LRU cache, 4 GiB default cap (assumed, not yet confirmed); pinning ("keep
+for offline") has an API but no UI yet. Offline browse shows the last saved
+listings; album and mix lists show only cached tracks. `content::cache`.
 
 ## Slices
 
@@ -79,13 +84,25 @@ Download albums and books to the phone for no-signal stretches.
    media notification, audio focus, resume positions, the app's spoken name
    (see Open questions), phone UI (reuse the Dioxus Android build from 025
    for the phone screen).
-3. **Offline downloads.**
+3. **Offline:** read-ahead cache landed in slice 1 (`content::cache`);
+   pin UI and audiobook caching follow.
 
 ## Distribution
 
 Sideloaded APK; Android Auto lists it because Android Auto's developer
 settings have "Unknown sources" on. Play Store (internal track) stays an
 option: about 2–3 days plus review.
+
+## Voice findings (2026-11-14)
+
+- Works: transport commands to the active session ("next song", "pause"),
+  and dictation through the in-app search mic (androidx compat Messenger
+  search, generated from Rust).
+- Does not work: Gemini "play X on <app>" goes to YouTube Music. Gemini
+  appears to route play-from-search only to a Google partner list; no
+  documented app-side fix changed it (intent filter, launcher activity,
+  installer id, session flags).
+- Future route: Android AppFunctions (private preview, size L).
 
 ## Open questions
 
