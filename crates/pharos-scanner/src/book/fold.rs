@@ -126,14 +126,21 @@ pub(crate) fn read_fold_facts(path: &Path) -> Option<FoldFacts> {
             })
             .flatten(),
         ),
-        BookFormat::Unreadable => {
-            match guard_parser(path, format, "kindle fold facts", || {
-                kindle::read_kindle(path)
-            }) {
-                Some(Ok(meta)) => (FormatRank::Kindle, meta.author),
-                _ => (FormatRank::Locked, None),
+        BookFormat::Unreadable => guard_parser(path, format, "kindle fold facts", || {
+            match kindle::read_kindle(path) {
+                Ok(meta) => (FormatRank::Kindle, meta.author),
+                // DRM encrypts the text only; the EXTH header still names the
+                // author, which keeps a locked file out of another's book.
+                Err(kindle::KindleError::Drm(_)) => (
+                    FormatRank::Locked,
+                    super::mobi_exth::read_exth(path)
+                        .ok()
+                        .and_then(|m| m.author),
+                ),
+                Err(_) => (FormatRank::Locked, None),
             }
-        }
+        })
+        .unwrap_or((FormatRank::Locked, None)),
     };
     Some(FoldFacts { rank, author, size })
 }
@@ -633,6 +640,24 @@ mod tests {
                 reason: FoldReason::AuthorsDiffer,
             }]
         );
+    }
+
+    /// A DRM-locked Kindle file names its author from the clear EXTH header,
+    /// so it cannot fold into another author's book of the same title.
+    #[test]
+    fn a_locked_kindle_file_names_its_author_from_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Gardening.azw3");
+        let bytes = super::super::mobi_exth::tests::drm_azw(
+            65001,
+            &[(100, b"Ada Field".to_vec())],
+            b"Gardening",
+            None,
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let f = read_fold_facts(&path).expect("a kindle path is a book");
+        assert_eq!(f.rank, FormatRank::Locked);
+        assert_eq!(f.author.as_deref(), Some("Ada Field"));
     }
 
     /// A primary that names no author joins either known author's book, but
