@@ -229,6 +229,12 @@ fn watch_deadline(
     });
 }
 
+/// Whether a key on the controls is a button's own activation. The player
+/// reads Space as play / pause, so it must not see these.
+pub fn activates_button(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::Enter)) || matches!(key, Key::Character(k) if k == " ")
+}
+
 /// The track an audiobook's Play starts on: the last one begun and not
 /// finished, else the first not finished, else the first (V1403).
 pub fn resume_track(tracks: &[Item]) -> Option<&Item> {
@@ -428,7 +434,16 @@ pub fn AudiobookControls(
         })
         .collect();
     rsx! {
-        div { class: "pharos-audiobook", role: "group", aria_label: "Audiobook",
+        div {
+            class: "pharos-audiobook",
+            role: "group",
+            aria_label: "Audiobook",
+            // Keys on the controls' own buttons are theirs, not the player's.
+            onkeydown: move |evt: KeyboardEvent| {
+                if activates_button(&evt.key()) {
+                    evt.stop_propagation();
+                }
+            },
             div { class: "pharos-audiobook-row", role: "group", aria_label: "Speed",
                 span { class: "pharos-audiobook-label", "Speed" }
                 for s in SPEEDS {
@@ -701,6 +716,14 @@ mod tests {
             .find(|b| b.contains("30 min"))
             .unwrap_or("");
         assert!(on.contains("aria-pressed=\"true\""), "{html}");
+    }
+
+    #[test]
+    fn space_and_enter_stay_with_the_focused_control() {
+        assert!(activates_button(&Key::Character(" ".into())));
+        assert!(activates_button(&Key::Named(NamedKey::Enter)));
+        assert!(!activates_button(&Key::Character("m".into())));
+        assert!(!activates_button(&Key::Named(NamedKey::ArrowRight)));
     }
 
     #[test]
