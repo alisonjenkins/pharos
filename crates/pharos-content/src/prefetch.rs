@@ -130,6 +130,9 @@ enum Outcome {
     Cancelled,
     LowDisk(u64),
     Failed(String),
+    /// A retrying pin download stepped aside for playback read-ahead; the pin
+    /// is queued again.
+    Yielded,
 }
 
 impl Downloader {
@@ -395,6 +398,22 @@ impl Gate {
         }
     }
 
+    /// A pin download that is only waiting to retry gives the worker to
+    /// playback read-ahead and queues itself again behind it.
+    fn yield_to_playback(&self, id: &str) -> bool {
+        if !self.is_pin_work(id) {
+            return false;
+        }
+        let mut q = self.lock();
+        if q.wanted.is_empty() {
+            return false;
+        }
+        if !q.pinned.iter().any(|w| w == id) {
+            q.pinned.push_back(id.to_owned());
+        }
+        true
+    }
+
     async fn sleep_backoff(&self, backoff: &mut Duration, epoch: &mut u64) {
         let wait = self.wake.notified();
         tokio::pin!(wait);
@@ -452,6 +471,9 @@ impl Gate {
                             started.elapsed().as_millis()
                         );
                         self.sleep_backoff(&mut backoff, &mut epoch).await;
+                        if self.yield_to_playback(id) {
+                            break Outcome::Yielded;
+                        }
                         continue;
                     }
                     Err(ResolveError::Permanent(why)) => {
@@ -489,6 +511,9 @@ impl Gate {
                         backoff.as_millis()
                     );
                     self.sleep_backoff(&mut backoff, &mut epoch).await;
+                    if self.yield_to_playback(id) {
+                        break Outcome::Yielded;
+                    }
                 }
                 Err(Fail::Permanent(why)) => break Outcome::Failed(why),
             }
@@ -498,6 +523,12 @@ impl Gate {
             Outcome::Ok => {
                 let bytes = self.cache.entry(id).map_or(0, |e| e.size);
                 log::info!("cache download id={id} bytes={bytes} ms={ms} outcome=ok reason=- attempts={attempt}");
+            }
+            Outcome::Yielded => {
+                log::info!(
+                    "cache download id={id} bytes={} ms={ms} outcome=yielded reason=playback read-ahead is waiting; pin queued again",
+                    part_len()
+                );
             }
             Outcome::Cancelled => {
                 log::info!(
@@ -1028,6 +1059,32 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         assert!(r.cache.is_complete("track/3"));
         assert!(r.cache.is_complete("track/2"), "pinned, so not replaced");
+    }
+
+    #[test]
+    fn a_pin_that_keeps_failing_gives_way_to_playback_read_ahead() {
+        let mut script = Script::default()
+            .file("/audio/2", body(1000, 2))
+            .busy("/audio/1");
+        script = script.file("/audio/1", body(1000, 1));
+        let r = rig("pin-yield", script, 1 << 20, &["t"], fast());
+        r.cache.pin("album/1", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        // The pin is retrying its 503s when playback asks for another track.
+        let until = Instant::now() + Duration::from_secs(5);
+        while ranges(&r.srv, "/audio/1").len() < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        r.dl.prefetch(&ids(&["track/2"]));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !r.cache.is_complete("track/2") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(r.cache.is_complete("track/2"), "playback was not starved");
+        assert!(
+            r.cache.entry("track/1").is_some_and(|e| e.pinned),
+            "pin kept"
+        );
     }
 
     #[test]
