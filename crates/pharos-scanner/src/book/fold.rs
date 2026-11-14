@@ -228,11 +228,18 @@ fn fold_key(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 /// Whether the stem carries junk the title cleanup removes (`(1)`,
-/// `- Copy`): such a file is the copy, the clean one its original.
+/// `- Copy`): such a file is the copy, the clean one its original. Spacing
+/// separators (`learn-rust-fast`) is not junk.
 fn has_junk_stem(path: &Path) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
     path.file_stem()
         .and_then(|s| s.to_str())
-        .is_some_and(|s| clean_stem_title(s) != s)
+        .is_some_and(|s| words(&clean_stem_title(s)) != words(s))
 }
 
 /// How a file ranks for its title's primary, best first: the format the
@@ -656,7 +663,16 @@ mod tests {
             ),
         ]);
         let (out, _) = fold(groups, &f);
-        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out,
+            vec![(
+                PathBuf::from("/b/learn-rust-fast.epub"),
+                vec![(
+                    "EPUB copy".to_string(),
+                    PathBuf::from("/b/learn-rust-fast - Copy.epub")
+                )]
+            )]
+        );
     }
 
     /// A DRM-locked Kindle file names its author from the clear EXTH header,
