@@ -4361,3 +4361,25 @@ async fn a_books_library_lists_books_and_its_courses_apart() {
         "a course is never a TV library's show"
     );
 }
+
+/// V1393 — a Books library's genre picker offers its books' genres, not its
+/// course lessons'. Disarm check: building the facet query from the listing
+/// as asked (no `books_default`) offers "Widgetry" too.
+#[actix_web::test]
+async fn a_books_librarys_genres_are_its_books_genres() {
+    use pharos_core::GenreStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let books = seed_books_library(&fx).await;
+    for (id, genre) in [(701, "Gardening"), (702, "Widgetry")] {
+        fx.state
+            .stores
+            .link_item_genres(id, &[genre.to_owned()])
+            .await
+            .unwrap();
+    }
+    let (_, genres) = wire_index(&session, &books, &[], "").await;
+    assert_eq!(genres, ["Gardening"]);
+}

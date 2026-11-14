@@ -250,7 +250,7 @@ pub struct FsScanner<P: Prober> {
     cover_sink: Option<Arc<dyn CoverSink>>,
     /// ADR-0126 — the roots of the Books libraries, under which a video is a
     /// course lesson ([`crate::course`]). Empty: no video is a lesson.
-    course_roots: Vec<PathBuf>,
+    course_roots: crate::course::CourseRoots,
 }
 
 /// 004-books (T063) — destination for a book cover's bytes.
@@ -358,7 +358,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
-            course_roots: Vec::new(),
+            course_roots: crate::course::CourseRoots::default(),
         }
     }
 
@@ -378,7 +378,7 @@ impl<P: Prober> FsScanner<P> {
             probe_memo: None,
             series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
-            course_roots: Vec::new(),
+            course_roots: crate::course::CourseRoots::default(),
         }
     }
 
@@ -451,8 +451,8 @@ impl<P: Prober> FsScanner<P> {
 
     /// ADR-0126 — the Books library roots, under which a video is read as a
     /// course lesson rather than a film.
-    pub fn with_course_roots(mut self, roots: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.course_roots = roots.into_iter().collect();
+    pub fn with_course_roots(mut self, roots: impl Into<crate::course::CourseRoots>) -> Self {
+        self.course_roots = roots.into();
         self
     }
 
@@ -470,16 +470,8 @@ impl<P: Prober> FsScanner<P> {
         if prior.source.as_deref() == Some(COURSE_MATCH_SOURCE) {
             return Ok(());
         }
-        store
-            .set_item_match(
-                id,
-                COURSE_MATCH_PROVIDER,
-                "",
-                COURSE_MATCH_SOURCE,
-                None,
-                unix_now(),
-            )
-            .await?;
+        // The mark goes last: a row carrying it is never re-read, so a cleanup
+        // that fails before it is retried by the next scan.
         let art = store.delete_provider_artwork(id).await?;
         if !art.is_empty() {
             let mut kinds = vec![MediaKind::Episode];
@@ -502,6 +494,16 @@ impl<P: Prober> FsScanner<P> {
             }
             store.bump_art_version(id).await?;
         }
+        store
+            .set_item_match(
+                id,
+                COURSE_MATCH_PROVIDER,
+                "",
+                COURSE_MATCH_SOURCE,
+                None,
+                unix_now(),
+            )
+            .await?;
         if let Some(provider) = prior
             .provider
             .filter(|p| !p.is_empty() && p != COURSE_MATCH_PROVIDER)
@@ -1814,6 +1816,11 @@ impl<P: Prober> FsScanner<P> {
             (None, Some(prior)) => stale_match(prior, &item),
             _ => None,
         };
+        // V1391 — a book's versions are grouped by the scan's fold, which a
+        // single watched path cannot rerun; keep the stored ones still on disk.
+        if let (MediaKind::Book, Some(row)) = (item_kind, existing) {
+            item.probe.alternate_sources = book_versions_on_disk(store, row).await?;
+        }
         store.put(item).await?;
         match course {
             Some(prior) => {
@@ -2133,8 +2140,12 @@ impl CourseLessonOutcome {
 
 /// ADR-0126 — a probed video read as a course lesson: logged with where it
 /// sits in its course, and counted.
-fn record_course_lesson(path: &Path, lesson: &crate::course::CourseLesson, roots: &[PathBuf]) {
-    let root = roots.iter().find(|r| path.starts_with(r));
+fn record_course_lesson(
+    path: &Path,
+    lesson: &crate::course::CourseLesson,
+    roots: &crate::course::CourseRoots,
+) {
+    let root = roots.root_of(path);
     let module = lesson
         .series
         .series_folder
@@ -2426,6 +2437,11 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         let paths = walk(root.to_path_buf(), self.extensions.clone())
             .await?
             .files;
+        // A course's lessons are not editions or copies of one another, as
+        // in `scan_into` (ADR-0126).
+        let (lessons, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| self.course_lesson(p).is_some());
         let groups = group_by_edition(paths);
         let candidates: Vec<PathBuf> = copy_candidates(&groups)
             .into_iter()
@@ -2433,7 +2449,8 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .collect();
         let sizes = copy_sizes(&candidates).await;
         let groups = group_copies(groups, &sizes, &mut CopyTally::default());
-        let groups = crate::book::fold::fold_formats(groups).await;
+        let mut groups = crate::book::fold::fold_formats(groups).await;
+        groups.extend(lessons.into_iter().map(|p| (p, Vec::new())));
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -2569,6 +2586,26 @@ async fn book_alternate(
         probe: Some(Box::new(probe)),
         part: None,
     })
+}
+
+/// The versions stored on book `row` whose files are still on disk.
+async fn book_versions_on_disk<S: MediaStore>(
+    store: &S,
+    row: MediaId,
+) -> DomainResult<Vec<AlternateMediaSource>> {
+    let mut kept = Vec::new();
+    for alt in store.alternate_sources(row).await? {
+        if tokio::fs::try_exists(&alt.path).await.unwrap_or(false) {
+            kept.push(alt);
+        } else {
+            tracing::info!(
+                media.id = %row,
+                version = %alt.path.display(),
+                "book version's file is gone; dropping it from the watched row",
+            );
+        }
+    }
+    Ok(kept)
 }
 
 /// P41 — slugify an edition label into a URL-stable identifier suffix
@@ -3054,7 +3091,11 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
             continue;
         };
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        if split_edition_tag(stem).is_some() {
+        // A book's formats and copies are grouped by the book fold, which
+        // checks the author; an edition tag alone never makes two books one.
+        if crate::book::format_for_path(&path).is_some() {
+            standalone.push(path);
+        } else if split_edition_tag(stem).is_some() {
             alternates.push((parent, stem.to_string(), path));
         } else {
             primaries.insert((parent.clone(), stem.to_ascii_lowercase()), path.clone());
@@ -5413,6 +5454,9 @@ mod tests {
         overrides: Mutex<Vec<pharos_core::SeriesOverride>>,
         /// Paths `mark_reconcile_paths` marked, in order.
         reconcile_marked: Mutex<Vec<String>>,
+        /// Makes `delete_provider_artwork` fail, like a database that refuses
+        /// the write.
+        fail_art_cleanup: std::sync::atomic::AtomicBool,
     }
 
     impl MediaStore for MemStore {
@@ -6325,6 +6369,9 @@ mod tests {
             &self,
             id: MediaId,
         ) -> DomainResult<Vec<(String, String)>> {
+            if self.fail_art_cleanup.load(Ordering::SeqCst) {
+                return Err(DomainError::Backend("artwork cleanup refused".into()));
+            }
             let mut art = self
                 .artwork
                 .lock()
@@ -9152,6 +9199,21 @@ mod tests {
         assert_eq!(groups[0].1.len(), 1);
         assert_eq!(groups[0].1[0].0, "Director's Cut");
         assert_eq!(groups[0].1[0].1, alt);
+    }
+
+    /// A book's other formats are grouped by the book fold, which checks the
+    /// author; an edition tag on a book's stem never groups it.
+    #[test]
+    fn group_editions_leaves_books_to_the_book_fold() {
+        let dir = std::path::PathBuf::from("/srv/books");
+        let primary = dir.join("Gardening.epub");
+        let special = dir.join("Gardening - Special Edition.pdf");
+        let groups = group_by_edition(vec![primary.clone(), special.clone()]);
+        assert_eq!(
+            groups,
+            vec![(primary, Vec::new()), (special, Vec::new())],
+            "a book must not be grouped as a video edition"
+        );
     }
 
     #[test]
@@ -12064,6 +12126,47 @@ mod tests {
         assert_eq!(item.match_external_id.as_deref(), Some(""));
     }
 
+    /// V1391 — a watched write to a book's primary keeps the versions the
+    /// last scan grouped under it, less any whose file has gone.
+    #[tokio::test]
+    async fn a_watched_book_primary_keeps_its_versions() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Gardening.epub", b"not really an epub").await;
+        write_file(td.path(), "Gardening.pdf", b"not really a pdf").await;
+        write_file(td.path(), "Gardening.cbz", b"not really a comic").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let primary = td.path().join("Gardening.epub");
+        let id = stable_id(&primary);
+        let versions = |item: &MediaItem| {
+            item.probe
+                .alternate_sources
+                .iter()
+                .map(|a| a.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&store.get(id).await.unwrap()).len(), 2);
+
+        tokio::fs::remove_file(td.path().join("Gardening.cbz"))
+            .await
+            .unwrap();
+        write_file(
+            td.path(),
+            "Gardening.epub",
+            b"not really an epub, rewritten",
+        )
+        .await;
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&primary, &store, scan_id).await.unwrap();
+
+        assert_eq!(
+            versions(&store.get(id).await.unwrap()),
+            vec![td.path().join("Gardening.pdf")],
+            "a watched write must keep the versions still on disk"
+        );
+    }
+
     /// B1024 / V983 — which stored matches a re-probe resets.
     #[test]
     fn a_match_that_no_longer_fits_its_row_is_stale() {
@@ -12260,6 +12363,31 @@ mod tests {
         );
     }
 
+    /// V1392 — the bare `scan` keeps a lesson whose name carries an edition
+    /// tag its own item, as `scan_into` does.
+    #[tokio::test]
+    async fn the_bare_scan_keeps_each_lesson_its_own_item() {
+        let td = TempDir::new().unwrap();
+        let files = [
+            "Widget Basics/02 - Wrap Up.mp4",
+            "Widget Basics/02 - Wrap Up - Extended.mp4",
+        ];
+        for f in files {
+            touch(td.path(), f).await;
+        }
+        let items = FsScanner::new(FakeProber::default())
+            .with_course_roots([td.path().to_path_buf()])
+            .scan(td.path())
+            .await
+            .unwrap();
+        let mut paths: Vec<PathBuf> = items.iter().map(|i| i.path.clone()).collect();
+        paths.sort();
+        let mut want = files.map(|f| td.path().join(f)).to_vec();
+        want.sort();
+        assert_eq!(paths, want, "each lesson is its own item");
+        assert!(items.iter().all(|i| i.probe.alternate_sources.is_empty()));
+    }
+
     /// V1392 — with no Books root the same video is a film, as before.
     #[tokio::test]
     async fn a_video_outside_any_books_root_is_not_a_lesson() {
@@ -12343,6 +12471,44 @@ mod tests {
         assert_eq!(again.skipped, 1, "a stamped lesson is skipped: {again:?}");
         assert_eq!(count("pharos_scan_reprobe_total"), 1);
         assert_eq!(count("pharos_scan_match_reset_total"), 1);
+    }
+
+    /// V1392 — a lesson is marked only once its provider artwork is gone, so
+    /// a cleanup that fails is retried by the next scan rather than skipped.
+    #[tokio::test]
+    async fn a_failed_artwork_cleanup_leaves_the_lesson_unmarked() {
+        let td = TempDir::new().unwrap();
+        let file = "Intro to Widgets/02 - Assembly/03 - Fitting.mp4";
+        touch(td.path(), file).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let id = stable_id(&td.path().join(file));
+        store
+            .set_item_match(id, "tmdb", "1234", "search", Some(0.9), 100)
+            .await
+            .unwrap();
+        store
+            .set_artwork(id, "Primary", "tmdb", "/cache/primary/movie/1.jpg")
+            .await
+            .unwrap();
+
+        let s = FsScanner::new(FakeProber::default()).with_course_roots([td.path().to_path_buf()]);
+        store.fail_art_cleanup.store(true, Ordering::SeqCst);
+        let _ = s.scan_into(td.path(), &store).await;
+        assert_ne!(
+            store.get(id).await.unwrap().match_source.as_deref(),
+            Some("course"),
+            "a lesson whose artwork cleanup failed must not be marked done"
+        );
+
+        store.fail_art_cleanup.store(false, Ordering::SeqCst);
+        s.scan_into(td.path(), &store).await.unwrap();
+        let item = store.get(id).await.unwrap();
+        assert_eq!(item.match_source.as_deref(), Some("course"));
+        assert!(store.artwork_for(id).await.unwrap().is_empty());
     }
 
     /// V1392 — a new lesson is marked on its first write, by the watcher too.

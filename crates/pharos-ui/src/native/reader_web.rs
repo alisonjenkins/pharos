@@ -33,7 +33,7 @@ use super::reader::{
     ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE,
     PENDING_KEY, SETTINGS_KEY,
 };
-use super::reader::{version_book, version_href};
+use super::reader::{kept_copy_serves, version_book, version_href};
 use super::route::Route;
 use super::versions;
 use super::views::{display_name, Nav};
@@ -1056,6 +1056,39 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             let live_api = ctx.api;
             spawn(async move {
                 let began = platform::now_ms();
+                // The format picked on the title page (V1391).
+                let stored = platform::stored_theme(&versions::version_key(id))
+                    .ok()
+                    .flatten();
+                let mut held = held;
+                let mut detail = None;
+                // A kept copy opens first unless the title page picked a
+                // version of another format: that one is fetched instead.
+                if let (Some((_, book)), Some(api), Some(pick)) =
+                    (&held, &api, stored.as_deref().filter(|p| !p.is_empty()))
+                {
+                    if !kept_web::is_offline() {
+                        match api.detail(&call("read", "load"), id).await {
+                            Ok(d) => {
+                                let kept = book.format.book_format();
+                                let passed_over = d.book.as_ref().is_some_and(|b| {
+                                    !kept_copy_serves(kept, b, &d.versions, pick)
+                                });
+                                if passed_over {
+                                    platform::info(&format!(
+                                        "pharos: reader skipped kept copy item={id} kept={} picked={pick}",
+                                        book.format.label()
+                                    ));
+                                    held = None;
+                                    detail = Some(d);
+                                }
+                            }
+                            Err(e) => platform::warn(&format!(
+                                "pharos: reader kept copy used item={id} why=could not check the picked format: {e}"
+                            )),
+                        }
+                    }
+                }
                 let head = match (&held, &api) {
                     (Some((_, book)), _) => {
                         let queued = load_pending()
@@ -1070,30 +1103,37 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             version: String::new(),
                         }
                     }
-                    (None, Some(api)) => match api.detail(&call("read", "load"), id).await {
-                        Ok(d) => {
-                            // The format picked on the title page (V1391).
-                            let stored = platform::stored_theme(&versions::version_key(id))
-                                .ok()
-                                .flatten();
-                            let version =
-                                versions::chosen_version(&d.versions, stored.as_deref()).to_owned();
-                            Head {
-                                title: display_name(&d.item),
-                                format: d
-                                    .book
-                                    .as_ref()
-                                    .map(|b| version_book(b, &d.versions, &version).format),
-                                saved: d.read_position.as_ref().map(|p| p.locator.clone()),
-                                version,
+                    (None, Some(api)) => {
+                        let looked_up = match detail.take() {
+                            Some(d) => Ok(d),
+                            None => api.detail(&call("read", "load"), id).await,
+                        };
+                        match looked_up {
+                            Ok(d) => {
+                                let version =
+                                    versions::chosen_version(&d.versions, stored.as_deref())
+                                        .to_owned();
+                                Head {
+                                    title: display_name(&d.item),
+                                    format: d
+                                        .book
+                                        .as_ref()
+                                        .map(|b| version_book(b, &d.versions, &version).format),
+                                    saved: d.read_position.as_ref().map(|p| p.locator.clone()),
+                                    version,
+                                }
+                            }
+                            Err(e) => {
+                                platform::warn(&format!(
+                                    "pharos: reader failed item={id} error={e}"
+                                ));
+                                phase.set(Phase::Failed(format!(
+                                    "The book could not be loaded: {e}"
+                                )));
+                                return;
                             }
                         }
-                        Err(e) => {
-                            platform::warn(&format!("pharos: reader failed item={id} error={e}"));
-                            phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
-                            return;
-                        }
-                    },
+                    }
                     (None, None) => return,
                 };
                 title.set(head.title.clone());

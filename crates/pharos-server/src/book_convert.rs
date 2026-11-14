@@ -161,7 +161,8 @@ pub fn converted_book_path(
 ) -> Option<PathBuf> {
     let cache = cache?;
     let book = item.book.as_ref()?;
-    kindle::is_converted_kindle(&item.path, book.format).then(|| cache.path_for(item.id))
+    kindle::is_converted_kindle(&item.path, book.format)
+        .then(|| cache.path_for_version(item.id, item.edition.as_deref()))
 }
 
 #[cfg(test)]
@@ -194,6 +195,36 @@ mod tests {
         assert_eq!(
             c.path_for_version(id, Some("../x/y")),
             PathBuf::from("/cache/books/42-xy.epub")
+        );
+    }
+
+    /// The advertised path is the one the download route writes: a selected
+    /// version converts to its own file, never the primary's.
+    #[test]
+    fn a_selected_version_advertises_its_own_converted_file() {
+        let c = ConvertedBookCache::new(PathBuf::from("/cache/books"));
+        let item = pharos_core::MediaItem {
+            id: MediaId::from(42u64),
+            path: "/b/Widget Cookbook.azw3".into(),
+            kind: pharos_core::MediaKind::Book,
+            book: Some(pharos_core::BookMeta {
+                format: pharos_core::BookFormat::Epub,
+                ..Default::default()
+            }),
+            edition: Some("azw3".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            converted_book_path(Some(&c), &item),
+            Some(c.path_for_version(item.id, Some("azw3")))
+        );
+        let primary = pharos_core::MediaItem {
+            edition: None,
+            ..item
+        };
+        assert_eq!(
+            converted_book_path(Some(&c), &primary),
+            Some(c.path_for(primary.id))
         );
     }
 

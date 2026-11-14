@@ -6704,7 +6704,11 @@ fn series_dto(
 
 /// A season's name: a course's module folder where it has a named one
 /// (ADR-0126), else the show's "Season N".
-fn season_name(episode: &MediaItem, season_n: u32, course_roots: &[std::path::PathBuf]) -> String {
+fn season_name(
+    episode: &MediaItem,
+    season_n: u32,
+    course_roots: &pharos_scanner::course::CourseRoots,
+) -> String {
     use pharos_scanner::course;
     course::lesson(&episode.path, course_roots)
         .and_then(|lesson| lesson.series.series_folder)
