@@ -8562,7 +8562,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "gloo-net",
- "jni 0.21.1",
+ "jni 0.22.4",
  "js-sys",
  "log",
  "ndk-context",
