@@ -58,7 +58,7 @@ const fn grid_page(tv: bool) -> u32 {
 
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
-const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
+pub(super) const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
 
 /// `SortBy` for an artist's albums: oldest first, then by name.
 const ARTIST_ALBUM_ORDER: &str = "ProductionYear,SortName";
@@ -362,13 +362,14 @@ pub enum Browse {
         artists: Page,
         albums: Page,
     },
-    /// A Books library: its books, and its video courses as series
-    /// (ADR-0126).
+    /// A Books library: its books, its video courses as series (ADR-0126)
+    /// and its audiobooks as albums (ADR-0132).
     Books {
         title: String,
         library: ItemRef,
         books: Page,
         courses: Page,
+        audiobooks: Page,
     },
     Artist {
         detail: Detail,
@@ -748,15 +749,20 @@ pub async fn load<A: PharosApi>(
             }
         }
         (Plan::BooksLibrary, _) => {
-            // The books are the page; a course listing that fails leaves
-            // the library as it was before it had courses.
-            let (books, courses) = join(
+            // The books are the page; a course or audiobook listing that
+            // fails leaves the library as it was before it had them.
+            let (books, courses, audiobooks) = join3(
                 paged(books_listing(id)),
                 grid(id, Some(ItemKind::Series), "SortName"),
+                grid(id, Some(ItemKind::Album), "SortName"),
             )
             .await;
             let courses = courses.unwrap_or_else(|e| {
                 warn(format!("pharos: browse {id}: courses unavailable: {e}"));
+                Page::default()
+            });
+            let audiobooks = audiobooks.unwrap_or_else(|e| {
+                warn(format!("pharos: browse {id}: audiobooks unavailable: {e}"));
                 Page::default()
             });
             Browse::Books {
@@ -764,6 +770,7 @@ pub async fn load<A: PharosApi>(
                 library: id,
                 books: books?,
                 courses,
+                audiobooks,
             }
         }
         (Plan::Series, series) => {
@@ -986,7 +993,8 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
             library,
             books,
             courses,
-        } => rsx! { BooksLibraryView { title, library, books, courses } },
+            audiobooks,
+        } => rsx! { BooksLibraryView { title, library, books, courses, audiobooks } },
         Browse::Artist { detail, albums } => rsx! { ArtistView { detail, albums } },
         Browse::Album { detail, tracks } => rsx! { AlbumView { detail, tracks } },
     }
@@ -3110,16 +3118,32 @@ pub enum BooksTab {
     Books,
     /// Its video courses, each opening on the show page.
     Courses,
+    /// Its audiobooks, each opening on its album page (ADR-0132).
+    Audiobooks,
 }
 
 impl BooksTab {
-    pub const ALL: [Self; 2] = [Self::Books, Self::Courses];
+    pub const ALL: [Self; 3] = [Self::Books, Self::Courses, Self::Audiobooks];
+
+    /// The tabs a Books library shows: Books, then Courses and Audiobooks
+    /// once it has any.
+    pub fn shown(courses: u32, audiobooks: u32) -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|t| match t {
+                Self::Books => true,
+                Self::Courses => courses > 0,
+                Self::Audiobooks => audiobooks > 0,
+            })
+            .collect()
+    }
 
     /// Its `tab=` value in the URL.
     pub fn token(self) -> &'static str {
         match self {
             Self::Books => "books",
             Self::Courses => "courses",
+            Self::Audiobooks => "audiobooks",
         }
     }
 
@@ -3127,6 +3151,7 @@ impl BooksTab {
         match self {
             Self::Books => "Books",
             Self::Courses => "Courses",
+            Self::Audiobooks => "Audiobooks",
         }
     }
 
@@ -3135,22 +3160,23 @@ impl BooksTab {
         match self {
             Self::Books => "pharos-books-tab-books",
             Self::Courses => "pharos-books-tab-courses",
+            Self::Audiobooks => "pharos-books-tab-audiobooks",
         }
     }
 
-    /// The tab an arrow key, Home or End moves to from this one, wrapping
-    /// at either end; `None` for any other key.
-    pub fn stepped(self, key: &Key) -> Option<Self> {
-        let at = Self::ALL.iter().position(|t| *t == self)?;
-        let last = Self::ALL.len() - 1;
+    /// The tab of `tabs` an arrow key, Home or End moves to from this one,
+    /// wrapping at either end; `None` for any other key, or a tab not shown.
+    pub fn stepped(self, tabs: &[Self], key: &Key) -> Option<Self> {
+        let at = tabs.iter().position(|t| *t == self)?;
+        let last = tabs.len().checked_sub(1)?;
         let to = match key {
-            Key::Named(NamedKey::ArrowRight) => (at + 1) % Self::ALL.len(),
+            Key::Named(NamedKey::ArrowRight) => (at + 1) % tabs.len(),
             Key::Named(NamedKey::ArrowLeft) => at.checked_sub(1).unwrap_or(last),
             Key::Named(NamedKey::Home) => 0,
             Key::Named(NamedKey::End) => last,
             _ => return None,
         };
-        Self::ALL.get(to).copied()
+        tabs.get(to).copied()
     }
 }
 
@@ -3217,11 +3243,18 @@ fn books_listing(library: ItemRef) -> Listing {
 }
 
 /// A Books library: its books' grid, unchanged, and once it has any
-/// courses, a Courses tab of their series tiles (B1424). The tab is kept in
-/// the URL, so Back returns to it.
+/// courses, a Courses tab of their series tiles (B1424), and once it has
+/// any audiobooks, an Audiobooks tab of their covers (ADR-0132). The tab is
+/// kept in the URL, so Back returns to it.
 #[component]
-pub fn BooksLibraryView(title: String, library: ItemRef, books: Page, courses: Page) -> Element {
-    if courses.total == 0 {
+pub fn BooksLibraryView(
+    title: String,
+    library: ItemRef,
+    books: Page,
+    courses: Page,
+    audiobooks: Page,
+) -> Element {
+    if courses.total == 0 && audiobooks.total == 0 {
         return rsx! {
             GridView {
                 title,
@@ -3232,14 +3265,26 @@ pub fn BooksLibraryView(title: String, library: ItemRef, books: Page, courses: P
             }
         };
     }
-    rsx! { BooksTabs { title, library, books, courses } }
+    rsx! { BooksTabs { title, library, books, courses, audiobooks } }
 }
 
 #[component]
-fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Element {
+fn BooksTabs(
+    title: String,
+    library: ItemRef,
+    books: Page,
+    courses: Page,
+    audiobooks: Page,
+) -> Element {
+    let tabs = BooksTab::shown(courses.total, audiobooks.total);
     let opened = use_hook(|| {
-        if Route::parse(&platform::current_path()) == Route::Browse(library) {
+        let asked = if Route::parse(&platform::current_path()) == Route::Browse(library) {
             books_choice(&platform::current_search())
+        } else {
+            BooksTab::Books
+        };
+        if BooksTab::shown(courses.total, audiobooks.total).contains(&asked) {
+            asked
         } else {
             BooksTab::Books
         }
@@ -3273,13 +3318,13 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
                     aria_label: "{title}",
                     "data-key-tabs": "books",
                     onkeydown: move |e: KeyboardEvent| {
-                        if let Some(next) = tab().stepped(&e.key()) {
+                        if let Some(next) = tab().stepped(&tabs, &e.key()) {
                             e.prevent_default();
                             switch_books_tab(library, tab, next);
                             platform::focus_by_id(next.id());
                         }
                     },
-                    for t in BooksTab::ALL {
+                    for t in BooksTab::shown(courses.total, audiobooks.total) {
                         button {
                             key: "{t.token()}",
                             r#type: "button",
@@ -3312,6 +3357,17 @@ fn BooksTabs(title: String, library: ItemRef, books: Page, courses: Page) -> Ele
                             first: courses.clone(),
                             source: Listing::of(library, Some(ItemKind::Series), "SortName"),
                             rail: Some(Rail::Letters),
+                        }
+                    },
+                ),
+                BooksTab::Audiobooks => remount_on(
+                    &format!("audiobooks {library}"),
+                    rsx! {
+                        PagedGrid {
+                            first: audiobooks.clone(),
+                            source: Listing::of(library, Some(ItemKind::Album), "SortName"),
+                            rail: Some(Rail::Letters),
+                            square: Some(true),
                         }
                     },
                 ),
@@ -3419,11 +3475,13 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
 #[component]
 pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     let total_ms: u64 = tracks.items.iter().map(|t| t.runtime_ms).sum();
+    let audiobook = detail.item.audiobook;
+    let part = if audiobook { "part" } else { "track" };
     let facts: Vec<String> = [
         detail.item.year.map(|y| y.to_string()),
         Some(match tracks.total {
-            1 => "1 track".to_owned(),
-            n => format!("{n} tracks"),
+            1 => format!("1 {part}"),
+            n => format!("{n} {part}s"),
         }),
         runtime(total_ms),
     ]
@@ -3446,12 +3504,18 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     } else {
         Vec::new()
     };
-    // Play opens the first song: an album folder can also hold a clip.
-    let first_song = tracks
-        .items
-        .iter()
-        .find(|t| t.kind == ItemKind::Audio)
-        .map(|t| t.id);
+    // Play opens the first song: an album folder can also hold a clip. An
+    // audiobook opens where the listener left it (V1403).
+    let first_song = if audiobook {
+        super::audiobook::resume_track(&tracks.items).map(|t| t.id)
+    } else {
+        tracks
+            .items
+            .iter()
+            .find(|t| t.kind == ItemKind::Audio)
+            .map(|t| t.id)
+    };
+    let resumes = audiobook && tracks.items.iter().any(|t| t.position_ms > 0 || t.played);
     let lead = (!tracks.items.is_empty()).then(|| {
         rsx! {
             if let Some(first) = first_song {
@@ -3460,6 +3524,7 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                     name: detail.item.name.clone(),
                     first,
                     tracks: whole.clone(),
+                    resume: resumes,
                 }
             }
             QueueButtons {
@@ -3519,7 +3584,15 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 /// whole album, fetched when the page holds only part of it) and plays the
 /// first of them.
 #[component]
-fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) -> Element {
+fn AlbumPlay(
+    album: ItemRef,
+    name: String,
+    first: ItemRef,
+    tracks: Vec<Item>,
+    /// An audiobook already begun: Play says Resume (ADR-0132).
+    #[props(default)]
+    resume: bool,
+) -> Element {
     let queue = try_use_context::<QueueCtx>().map(|q| q.0);
     let mix = try_use_context::<MixCtx>();
     let nav = try_use_context::<Nav>();
@@ -3636,7 +3709,7 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             "data-key-action": "play",
             onclick: play,
             Icon { path: ICON_PLAY }
-            span { "Play" }
+            span { if resume { "Resume" } else { "Play" } }
         }
         if queue.is_some() && nav.is_some() && !in_group {
             button {
@@ -4081,7 +4154,7 @@ pub async fn neighbours_and_rest<A: PharosApi>(
 }
 
 /// Every child of `parent`, page after page: a season can run past one page.
-async fn list_all<A: PharosApi>(
+pub(super) async fn list_all<A: PharosApi>(
     api: &A,
     info: &CallInfo,
     parent: ItemRef,
@@ -4138,6 +4211,7 @@ mod tests {
             stereo: None,
             damaged: false,
             new_children: 0,
+            audiobook: false,
         }
     }
 
@@ -5339,27 +5413,103 @@ mod tests {
     #[test]
     fn the_books_tabs_step_with_the_arrows() {
         let key = |k| Key::Named(k);
+        let two = BooksTab::shown(1, 0);
         assert_eq!(
-            BooksTab::Books.stepped(&key(NamedKey::ArrowRight)),
+            BooksTab::Books.stepped(&two, &key(NamedKey::ArrowRight)),
             Some(BooksTab::Courses)
         );
         assert_eq!(
-            BooksTab::Courses.stepped(&key(NamedKey::ArrowRight)),
+            BooksTab::Courses.stepped(&two, &key(NamedKey::ArrowRight)),
             Some(BooksTab::Books)
         );
         assert_eq!(
-            BooksTab::Books.stepped(&key(NamedKey::ArrowLeft)),
+            BooksTab::Books.stepped(&two, &key(NamedKey::ArrowLeft)),
             Some(BooksTab::Courses)
         );
         assert_eq!(
-            BooksTab::Courses.stepped(&key(NamedKey::Home)),
+            BooksTab::Courses.stepped(&two, &key(NamedKey::Home)),
             Some(BooksTab::Books)
         );
         assert_eq!(
-            BooksTab::Books.stepped(&key(NamedKey::End)),
+            BooksTab::Books.stepped(&two, &key(NamedKey::End)),
             Some(BooksTab::Courses)
         );
-        assert_eq!(BooksTab::Books.stepped(&Key::Character("a".into())), None);
+        assert_eq!(
+            BooksTab::Books.stepped(&two, &Key::Character("a".into())),
+            None
+        );
+        let all = BooksTab::shown(1, 1);
+        assert_eq!(
+            BooksTab::Courses.stepped(&all, &key(NamedKey::ArrowRight)),
+            Some(BooksTab::Audiobooks)
+        );
+        assert_eq!(
+            BooksTab::Books.stepped(&all, &key(NamedKey::End)),
+            Some(BooksTab::Audiobooks)
+        );
+        assert_eq!(
+            BooksTab::Audiobooks.stepped(&two, &key(NamedKey::Home)),
+            None,
+            "a tab not shown steps nowhere"
+        );
+    }
+
+    /// ADR-0132: the tab row offers only the lists a Books library has.
+    #[test]
+    fn a_books_library_shows_only_the_tabs_it_has() {
+        assert_eq!(BooksTab::shown(0, 0), [BooksTab::Books]);
+        assert_eq!(BooksTab::shown(2, 0), [BooksTab::Books, BooksTab::Courses]);
+        assert_eq!(
+            BooksTab::shown(0, 3),
+            [BooksTab::Books, BooksTab::Audiobooks]
+        );
+        assert_eq!(BooksTab::shown(1, 1), BooksTab::ALL);
+        assert_eq!(books_query(BooksTab::Audiobooks), "?tab=audiobooks");
+    }
+
+    /// ADR-0132: a Books library lists its audiobooks as albums beside its
+    /// books, and a listing that fails leaves the books shown.
+    #[test]
+    fn a_books_library_loads_its_audiobooks() {
+        let lib = ItemRef::Synth(61);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Reading");
+        l.library_kind = Some(LibraryKind::Books);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, None),
+            vec![item(ItemRef::Real(1), ItemKind::Book, "Widget Handbook")],
+        );
+        fake.lists.insert(
+            (lib, Some(ItemKind::Album)),
+            vec![item(ItemRef::Synth(3), ItemKind::Album, "Gadget Tales")],
+        );
+        let Browse::Books {
+            books, audiobooks, ..
+        } = run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a books library");
+        };
+        assert_eq!(books.items[0].name, "Widget Handbook");
+        assert_eq!(audiobooks.items[0].name, "Gadget Tales");
+
+        fake.refuse_groups = vec![ItemKind::Album];
+        let warned = RefCell::new(Vec::new());
+        let Browse::Books {
+            books, audiobooks, ..
+        } = run(load(&fake, &CallInfo::default(), lib, |line| {
+            warned.borrow_mut().push(line)
+        }))
+        .unwrap()
+        else {
+            panic!("not a books library");
+        };
+        assert_eq!(books.items.len(), 1);
+        assert_eq!(audiobooks.total, 0);
+        assert!(warned
+            .borrow()
+            .iter()
+            .any(|l| l.contains("audiobooks unavailable")));
     }
 
     /// B1424: the tab row shows only once the library has a course; without
@@ -5382,6 +5532,7 @@ mod tests {
                         library: ItemRef::Real(1),
                         books: page(vec![item(ItemRef::Real(2), ItemKind::Book, "Widget Handbook")]),
                         courses: page(courses.clone()),
+                        audiobooks: page(Vec::new()),
                     }
                 }
             })
@@ -5477,6 +5628,43 @@ mod tests {
         assert!(html.contains("3:07"), "{html}");
         assert!(html.contains("3 tracks"), "{html}");
         assert!(html.contains("/ui/watch/1"), "{html}");
+    }
+
+    /// V1403: an audiobook begun opens on Resume, on the part last begun;
+    /// its parts are counted as parts. A music album keeps Play on track 1.
+    #[test]
+    fn a_begun_audiobook_resumes_on_the_part_last_begun() {
+        let part = |id, position_ms, played| {
+            let mut t = item(ItemRef::Real(id), ItemKind::Audio, "Part");
+            t.episode = u32::try_from(id).ok();
+            t.position_ms = position_ms;
+            t.played = played;
+            t
+        };
+        let tracks = vec![part(1, 0, true), part(2, 120_000, false), part(3, 0, false)];
+        let mut book = item(ItemRef::Synth(5), ItemKind::Album, "Gadget Tales");
+        book.audiobook = true;
+        let album = detail(book);
+        let shown = tracks.clone();
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(shown.clone()) } }
+        });
+        assert!(html.contains("Resume"), "{html}");
+        assert!(html.contains("3 parts"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="play" href="/ui/watch/2""#),
+            "{html}"
+        );
+
+        let album = detail(item(ItemRef::Synth(6), ItemKind::Album, "Record"));
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(tracks.clone()) } }
+        });
+        assert!(!html.contains("Resume"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="play" href="/ui/watch/1""#),
+            "{html}"
+        );
     }
 
     /// B1085: an album or an artist can be made a favourite from its page,
@@ -6076,8 +6264,9 @@ mod tests {
         assert!(sets(&opened(ItemRef::Real(9))));
         assert!(!sets(&opened(ItemRef::Real(8))));
         assert!(!sets(&opened(set)));
-        // The Books library asks for its books and its courses.
-        assert_eq!(*fake.collapsed.borrow(), [true, false, false, false]);
+        // The Books library asks for its books, its courses and its
+        // audiobooks.
+        assert_eq!(*fake.collapsed.borrow(), [true, false, false, false, false]);
         assert!(collections_on(None));
         assert!(collections_on(Some("on")));
         assert!(!collections_on(Some("off")));

@@ -133,7 +133,7 @@ impl server::library::Handler for Library {
             &tiles,
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
             &reads,
         );
         Ok(())
@@ -164,7 +164,7 @@ impl server::library::Handler for Library {
             "resume",
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
             &reads,
         );
         Ok(())
@@ -232,7 +232,7 @@ impl server::library::Handler for Library {
                 folded,
                 &state.server_id,
                 &state.image_tag_key,
-                &DamagedIds::of(state),
+                &SummaryFacts::of(state),
                 &reads,
             );
             return Ok(());
@@ -256,7 +256,7 @@ impl server::library::Handler for Library {
             "query",
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
             &reads,
         );
         Ok(())
@@ -427,7 +427,7 @@ impl server::library::Handler for Library {
                         "search",
                         &state.server_id,
                         &state.image_tag_key,
-                        &DamagedIds::of(state),
+                        &SummaryFacts::of(state),
                         &Reads::default(),
                     );
                     return Ok(());
@@ -454,7 +454,7 @@ impl server::library::Handler for Library {
                     "search",
                     &state.server_id,
                     &state.image_tag_key,
-                    &DamagedIds::of(state),
+                    &SummaryFacts::of(state),
                     &Reads::default(),
                 );
                 return Ok(());
@@ -478,7 +478,7 @@ impl server::library::Handler for Library {
                     played.next().unwrap_or_default(),
                     &state.server_id,
                     &state.image_tag_key,
-                    &DamagedIds::of(state),
+                    &SummaryFacts::of(state),
                 ),
             }
         }
@@ -578,7 +578,7 @@ impl server::library::Handler for Library {
             user_data,
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
         );
         if let (Some(position), Ok(state)) = (&read, summary.reborrow().get_user_state()) {
             write_read_state(state, position);
@@ -750,7 +750,7 @@ impl server::library::Handler for Library {
             &shows,
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
         );
         Ok(())
     }
@@ -783,7 +783,7 @@ impl server::library::Handler for Library {
             home,
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
             &reads,
         );
         Ok(())
@@ -812,7 +812,7 @@ impl server::library::Handler for Library {
             "next_up",
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
             &reads,
         );
         Ok(())
@@ -892,7 +892,7 @@ fn write_home(
     home: Result<library::Home, ListError>,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     let home = match home {
@@ -1005,7 +1005,7 @@ fn write_tiles(
     tiles: &[(&library::LatestTile, Option<WireId>)],
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     for (i, (tile, id)) in (0..out.len()).zip(tiles) {
@@ -1029,7 +1029,7 @@ fn write_items(
     items: &Rows,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
@@ -1045,7 +1045,7 @@ fn write_items_one(
     user_data: UserItemData,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     write_item(summary.reborrow(), item, user_data, server_id, key, damaged);
@@ -1167,7 +1167,7 @@ async fn run_mix(
             &mixed,
             &state.server_id,
             &state.image_tag_key,
-            &DamagedIds::of(state),
+            &SummaryFacts::of(state),
         ),
         Err(mix::MixError::Invalid(e)) => {
             Denial::Invalid { field: e.label() }.write(out.init_error())
@@ -1189,7 +1189,7 @@ fn write_listing(
     method: &'static str,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     let listed = match listed {
@@ -1223,7 +1223,7 @@ fn write_folded(
     folded: Result<library::FoldedPage, ListError>,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
     reads: &Reads,
 ) {
     let folded = match folded {
@@ -1752,7 +1752,7 @@ fn write_person(
     shows: &[Option<(WireId, serde_json::Value)>],
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
 ) {
     let mut out = out.init_person();
     set_item_id(out.reborrow().init_id(), id);
@@ -1805,7 +1805,7 @@ fn write_appearance(
     appearance: &person::Appearance,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
 ) {
     write_item(
         out.reborrow().init_item(),
@@ -1917,6 +1917,23 @@ fn write_synth_summary(
     {
         summary.reborrow().init_critic_rating().set_some(score);
     }
+    if kind == Kind::Album {
+        summary.set_runtime_ms(
+            dto.get("RunTimeTicks")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                / 10_000,
+        );
+        // ADR-0132 — an audiobook's tile names its author.
+        if dto
+            .get("PharosAudiobook")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            summary.set_audiobook(true);
+            summary.set_artist(dto_str(dto, "AlbumArtist"));
+        }
+    }
     if let Some(tenths) = dto
         .get("PharosImdbRating")
         .and_then(serde_json::Value::as_f64)
@@ -1985,24 +2002,35 @@ fn write_damage(
     }
 }
 
-/// The ids the integrity check holds damaged, read once per call so a page of
-/// summaries does not take the memo's lock per item.
+/// What a page of summaries reads from the server once per call rather than
+/// per item: the ids the integrity check holds damaged, so it does not take
+/// the memo's lock per item; and the library roots, so a song can say whether
+/// it is an audiobook's track (ADR-0132).
 #[derive(Debug, Default)]
-pub(super) struct DamagedIds(std::collections::HashSet<u64>);
+pub(super) struct SummaryFacts {
+    damaged: std::collections::HashSet<u64>,
+    books: pharos_scanner::course::CourseRoots,
+}
 
-impl DamagedIds {
+impl SummaryFacts {
     pub(super) fn of(state: &crate::state::AppState) -> Self {
-        Self(
-            state
+        Self {
+            damaged: state
                 .integrity_memo
                 .as_ref()
                 .map(|m| m.damaged_ids())
                 .unwrap_or_default(),
-        )
+            books: state.course_roots(),
+        }
     }
 
     pub(super) fn contains(&self, id: u64) -> bool {
-        self.0.contains(&id)
+        self.damaged.contains(&id)
+    }
+
+    /// Whether `item` is a track of an audiobook: a song in a Books library.
+    fn audiobook(&self, item: &MediaItem) -> bool {
+        item.kind == MediaKind::Audio && self.books.root_of(&item.path).is_some()
     }
 }
 
@@ -2015,7 +2043,7 @@ pub(super) fn write_item(
     user_data: UserItemData,
     server_id: &str,
     key: &ImageTagKey,
-    damaged: &DamagedIds,
+    damaged: &SummaryFacts,
 ) {
     let dto = BaseItemDto::from_domain_with_user_data(item, server_id, user_data);
     set_item_id(out.reborrow().init_id(), WireId::Real(item.id));
@@ -2055,6 +2083,7 @@ pub(super) fn write_item(
         if let Some(artist) = card_artist(&dto) {
             out.set_artist(artist.as_str());
         }
+        out.set_audiobook(damaged.audiobook(item));
     }
     if let Some(tenths) = item.metadata.ratings.imdb.and_then(imdb_tenths) {
         out.init_imdb_rating().set_some(tenths);

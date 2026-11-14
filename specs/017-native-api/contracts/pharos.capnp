@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 47;
+const schemaVersion :UInt32 = 48;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -89,6 +89,8 @@ struct ItemSummary {
   stereo @15 :Stereo3d;        # the primary's packing, else the first 3D version's. Since schemaVersion 29.
   damaged @16 :Bool;           # the integrity check found this file damaged; Library.detail says where. Since schemaVersion 30.
   newChildren @17 :UInt32;     # a latest rail's series or album tile: how many of its children are newly added; 0 otherwise. Since schemaVersion 42.
+  audiobook @18 :Bool;         # a song or album that is an audiobook or one of its tracks: audio in a Books library (ADR-0132).
+                               # An audiobook album's `artist` is its author and its `runtimeMs` the whole book's. Since schemaVersion 48.
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }

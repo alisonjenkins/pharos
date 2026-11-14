@@ -8417,6 +8417,11 @@ fn Player(
                 on_queue,
                 on_media,
                 on_control,
+                audiobook: p.detail.item.audiobook.then(|| super::audiobook::Audiobook {
+                    chapters: p.detail.chapters.clone(),
+                    book: p.detail.item.parent,
+                    playing: p.detail.item.id,
+                }),
             }
         } else {
             WatchView {
@@ -8900,6 +8905,7 @@ mod tests {
                     stereo: None,
                     damaged: false,
                     new_children: 0,
+                    audiobook: false,
                 };
                 let mut home = revisit.home;
                 home.set(Some(Home {

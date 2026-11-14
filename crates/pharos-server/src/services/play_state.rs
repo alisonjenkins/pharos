@@ -387,8 +387,12 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     };
     let position = r.position_ticks;
     let progress_key = ProgressKey::new(user.id, item_id, r.play_session_id);
-    let (kind, runtime) = match state.stores.get(item_id).await {
-        Ok(item) => (item.kind, item.probe.run_time_ticks().unwrap_or(0)),
+    let (kind, runtime, audiobook) = match state.stores.get(item_id).await {
+        Ok(item) => (
+            item.kind,
+            item.probe.run_time_ticks().unwrap_or(0),
+            state.is_audiobook(&item),
+        ),
         // Removed since it started playing: there is no row to store on.
         Err(pharos_core::DomainError::NotFound(_)) => {
             StopOutcome::ItemMissing.record();
@@ -406,9 +410,16 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     };
     // P36 — threshold configurable via [server].played_threshold_pct
     // (default 90, clamped to [50, 100] at boot).
-    let played_complement = 100u64.saturating_sub(state.played_threshold_pct as u64);
-    let finished =
-        runtime > 0 && position >= runtime.saturating_sub(runtime * played_complement / 100);
+    let finished = finished(runtime, position, state.played_threshold_pct, audiobook);
+    tracing::debug!(
+        item = item_id,
+        position,
+        runtime,
+        audiobook,
+        finished,
+        threshold_pct = state.played_threshold_pct,
+        "playback stop: finished or kept"
+    );
     if let Some(which) = (!finished)
         .then(|| state.min_resume.below(kind, runtime, position))
         .flatten()
@@ -479,6 +490,23 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     Ok(())
 }
 
+/// The most an audiobook's track may have left to play and count as
+/// finished (V1404): the played threshold's share of a twenty-hour book is
+/// hours, which a listener stopping for the night has not heard.
+const AUDIOBOOK_FINISH_SLACK_TICKS: u64 = 60 * pharos_core::time::TICKS_PER_SECOND;
+
+/// Whether a stop at `position` of `runtime` (ticks; 0 when unknown) ends
+/// the item: past the played threshold (`threshold_pct` of the runtime), or
+/// for an audiobook's track also no more than a minute from its end.
+fn finished(runtime: u64, position: u64, threshold_pct: u32, audiobook: bool) -> bool {
+    let complement = 100u64.saturating_sub(u64::from(threshold_pct));
+    let mut slack = runtime / 100 * complement;
+    if audiobook {
+        slack = slack.min(AUDIOBOOK_FINISH_SLACK_TICKS);
+    }
+    runtime > 0 && position >= runtime.saturating_sub(slack)
+}
+
 fn announce(
     state: &AppState,
     user: &User,
@@ -538,6 +566,28 @@ mod tests {
         let off = MinResume::OFF;
         assert_eq!(off.below(MediaKind::Movie, 60 * S, 1), None);
         assert_eq!(off.below(MediaKind::Audio, 60 * S, 1), None);
+    }
+
+    /// V1404 — the played threshold's tenth of a long book is hours; an
+    /// audiobook's track finishes only in its last minute.
+    #[test]
+    fn an_audiobook_finishes_only_near_its_end() {
+        let book = 20 * 60 * 60 * S;
+        let two_hours_left = book - 2 * 60 * 60 * S;
+        assert!(
+            finished(book, two_hours_left, 90, false),
+            "a film there is done"
+        );
+        assert!(!finished(book, two_hours_left, 90, true));
+        assert!(!finished(book, book - 61 * S, 90, true));
+        assert!(finished(book, book - 60 * S, 90, true));
+        let chapter = 3 * 60 * S;
+        assert!(
+            finished(chapter, chapter - 18 * S, 90, true),
+            "a short track keeps the threshold"
+        );
+        assert!(!finished(chapter, chapter - 19 * S, 90, true));
+        assert!(!finished(0, 5 * S, 90, true));
     }
 
     #[test]

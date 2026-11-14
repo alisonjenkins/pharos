@@ -225,6 +225,10 @@ pub fn ListenView(
     /// render it, the app leaves it unset.
     #[props(default)]
     not_stored: Option<Notice>,
+    /// Set while an audiobook plays: its speed, sleep timer and chapters
+    /// show under the controls (ADR-0132).
+    #[props(default)]
+    audiobook: Option<super::audiobook::Audiobook>,
 ) -> Element {
     let media = MediaState {
         position_ms: live_position.map_or(media.position_ms, |s| s()),
@@ -578,6 +582,16 @@ pub fn ListenView(
                             range_class: "pharos-listen-range",
                             icon: rsx! { Icon { path: if media.muted || media.volume == 0.0 { ICON_MUTED } else { ICON_VOLUME } } },
                             filled: true,
+                        }
+                    }
+                    if let Some(book) = audiobook {
+                        super::audiobook::AudiobookControls {
+                            key: "{book.book:?}",
+                            book,
+                            media,
+                            runtime_ms: total,
+                            media_id,
+                            on_control,
                         }
                     }
                 }
@@ -1271,6 +1285,56 @@ mod tests {
         assert!(html.contains("role=\"alert\""), "{html}");
         let plain = render("Song", None);
         assert!(!plain.contains("Could not save"), "{plain}");
+    }
+
+    /// ADR-0132: an audiobook's speed, sleep timer and chapters show only
+    /// while an audiobook plays; a song's screen has none of them.
+    #[test]
+    fn audiobook_controls_show_only_for_an_audiobook() {
+        use pharos_client::api::{Chapter, ItemRef};
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                ListenView {
+                    title: "Gadget Tales".to_owned(),
+                    image: None,
+                    artists: Vec::new(),
+                    genres: Vec::new(),
+                    runtime_ms: 120_000,
+                    media: MediaState { position_ms: 70_000, ..MediaState::default() },
+                    on_media: |_| {},
+                    on_control: |_| {},
+                    audiobook: Some(super::super::audiobook::Audiobook {
+                        chapters: vec![
+                            Chapter { name: "Opening".into(), start_ms: 0 },
+                            Chapter { name: "Middle".into(), start_ms: 60_000 },
+                        ],
+                        book: Some(ItemRef::Synth(5)),
+                        playing: ItemRef::Real(1),
+                    }),
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        for want in [
+            "1.25×",
+            "2×",
+            "0.75×",
+            "15 min",
+            "End of chapter",
+            "Chapters (2)",
+            "Middle",
+        ] {
+            assert!(html.contains(want), "{want}: {html}");
+        }
+        assert!(
+            html.contains(
+                r#"aria-current="true"><span class="pharos-audiobook-chapter-name">Middle"#
+            ),
+            "the chapter playing is marked: {html}"
+        );
+        let song = render("Song", None);
+        assert!(!song.contains("pharos-audiobook"), "{song}");
     }
 
     #[test]
