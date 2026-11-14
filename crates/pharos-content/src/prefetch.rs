@@ -21,7 +21,7 @@
 //! Every attempt logs `cache download id=.. bytes=.. ms=.. outcome=ok|retry|
 //! failed|skipped reason=..`. URLs and tokens are never logged.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -85,6 +85,9 @@ struct Queue {
     wanted: VecDeque<String>,
     /// Pin downloads: kept across prefetches, never spent from `budget`.
     pinned: VecDeque<String>,
+    /// Where a pin that yielded to playback left off, so its resume still
+    /// sends `If-Range` for the partial file it kept.
+    deferred: HashMap<String, JobState>,
     generation: u64,
     budget: u64,
     busy: bool,
@@ -117,7 +120,7 @@ enum Fail {
     Permanent(String),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct JobState {
     etag: Option<String>,
     total: Option<u64>,
@@ -151,6 +154,7 @@ impl Downloader {
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
+                deferred: HashMap::new(),
                 generation: 0,
                 budget: 0,
                 busy: false,
@@ -406,7 +410,7 @@ impl Gate {
 
     /// A pin download that is only waiting to retry gives the worker to
     /// playback read-ahead and queues itself again behind it.
-    fn yield_to_playback(&self, id: &str) -> bool {
+    fn yield_to_playback(&self, id: &str, st: &JobState) -> bool {
         if !self.is_pin_work(id) {
             return false;
         }
@@ -417,6 +421,7 @@ impl Gate {
         if !q.pinned.iter().any(|w| w == id) {
             q.pinned.push_back(id.to_owned());
         }
+        q.deferred.insert(id.to_owned(), st.clone());
         true
     }
 
@@ -452,7 +457,7 @@ impl Gate {
         let mut epoch = self.online_epoch.load(Ordering::SeqCst);
         let mut refreshed = false;
         let mut attempt = 0u32;
-        let mut st = JobState::default();
+        let mut st = self.lock().deferred.remove(id).unwrap_or_default();
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
         self.cache.clear_failed(id);
         let outcome = loop {
@@ -477,7 +482,7 @@ impl Gate {
                             started.elapsed().as_millis()
                         );
                         self.sleep_backoff(&mut backoff, &mut epoch).await;
-                        if self.yield_to_playback(id) {
+                        if self.yield_to_playback(id, &st) {
                             break Outcome::Yielded;
                         }
                         continue;
@@ -517,7 +522,7 @@ impl Gate {
                         backoff.as_millis()
                     );
                     self.sleep_backoff(&mut backoff, &mut epoch).await;
-                    if self.yield_to_playback(id) {
+                    if self.yield_to_playback(id, &st) {
                         break Outcome::Yielded;
                     }
                 }
@@ -1092,6 +1097,46 @@ mod tests {
         assert!(
             r.cache.entry("track/1").is_some_and(|e| e.pinned),
             "pin kept"
+        );
+    }
+
+    #[test]
+    fn a_pin_that_yielded_resumes_with_its_validator_so_a_changed_file_is_not_appended() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .file("/audio/2", body(1000, 2))
+            .drop_first_after(300);
+        let r = rig(
+            "pin-yield-etag",
+            script,
+            1 << 20,
+            &["t"],
+            Tuning {
+                backoff_min: Duration::from_millis(300),
+                backoff_max: Duration::from_millis(300),
+                ..fast()
+            },
+        );
+        r.cache.pin("album/1", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        // The first body drops after 300 bytes; playback asks while the pin backs off.
+        let until = Instant::now() + Duration::from_secs(5);
+        while r.srv.seen().is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        r.dl.prefetch(&ids(&["track/2"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/1"));
+        let resumed: Vec<_> = r
+            .srv
+            .seen()
+            .into_iter()
+            .filter(|s| s.path == "/audio/1" && s.range.is_some())
+            .collect();
+        assert!(!resumed.is_empty(), "the pin resumed with a range");
+        assert!(
+            resumed.iter().all(|s| s.if_range.is_some()),
+            "a resumed range carries If-Range so a changed file restarts: {resumed:?}"
         );
     }
 
