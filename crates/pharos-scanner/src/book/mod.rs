@@ -811,6 +811,25 @@ mod tests {
         }
     }
 
+    /// An ISBN-10 whose check character is `X` is still an ISBN.
+    #[test]
+    fn a_drm_books_isbn_10_may_end_in_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = mobi_exth::tests::drm_azw(
+            65001,
+            &[
+                (100, b"Test Author".to_vec()),
+                (104, b"1-23456-789-X".to_vec()),
+            ],
+            b"Synthetic Title",
+            None,
+        );
+        let path = dir.path().join("locked.azw");
+        std::fs::write(&path, bytes).unwrap();
+        let meta = read_book_meta(&path).expect("a kindle path is a book");
+        assert_eq!(meta.isbn.as_deref(), Some("1-23456-789-X"));
+    }
+
     /// The counterweight: a DRM file whose header is unusable stays on the
     /// plain `drm` reason, so the two counts never merge.
     #[test]

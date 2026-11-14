@@ -319,9 +319,26 @@ pub fn read_kindle(path: &Path) -> Result<EpubMetadata, KindleError> {
 /// than an ISBN, and one library file carries the placeholder `0000000000000`,
 /// which passes a pure digit count. Storing either as an ISBN would be a lie
 /// the UI displays and an online-metadata lookup would then act on.
+///
+/// An ISBN-10's check character may be `X` (ten), and only as its last one.
 pub(super) fn isbn_of(identifier: &str) -> Option<String> {
     let digits: String = identifier.chars().filter(char::is_ascii_digit).collect();
-    if (digits.len() == 10 || digits.len() == 13) && digits.bytes().any(|b| b != b'0') {
+    let check_x = identifier
+        .chars()
+        .rev()
+        .find(char::is_ascii_alphanumeric)
+        .is_some_and(|c| c.eq_ignore_ascii_case(&'x'));
+    let len = digits.len() + usize::from(check_x);
+    let only_digits_and_x = !check_x
+        || identifier
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .count()
+            == len;
+    if only_digits_and_x
+        && (len == 10 || (len == 13 && !check_x))
+        && digits.bytes().any(|b| b != b'0')
+    {
         Some(identifier.to_string())
     } else {
         None
@@ -818,6 +835,9 @@ mod tests {
             isbn_of("978-0-9888202-0-4").as_deref(),
             Some("978-0-9888202-0-4")
         );
+        assert_eq!(isbn_of("1-23456-789-X").as_deref(), Some("1-23456-789-X"));
+        assert_eq!(isbn_of("123456789x").as_deref(), Some("123456789x"));
+        assert_eq!(isbn_of("12345X6789"), None);
         assert_eq!(isbn_of("B002N3M6RW"), None);
         assert_eq!(isbn_of("0000000000000"), None);
         assert_eq!(isbn_of(""), None);
