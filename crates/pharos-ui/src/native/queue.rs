@@ -209,6 +209,9 @@ pub struct Queue {
     /// Read back after a reload: the playing song starting again is the
     /// same song resuming, not a new start that reseeds its album.
     restored: bool,
+    /// How many times [`Queue::started`] has run: a screen that recorded it
+    /// on mount can tell whether the song it plays has left the queue yet.
+    starts: u64,
     /// The signed-in user the queue was built for, once known: a reload
     /// keeps it, and another user's queue is dropped rather than shown.
     owner: Option<String>,
@@ -288,6 +291,11 @@ pub struct VideoQueueCtx(pub Signal<Queue>, pub Signal<bool>);
 impl Queue {
     pub fn upcoming(&self) -> &[Entry] {
         &self.upcoming
+    }
+
+    /// How many songs have been started through [`Queue::started`].
+    pub fn starts(&self) -> u64 {
+        self.starts
     }
 
     pub fn shuffled(&self) -> bool {
@@ -460,6 +468,7 @@ impl Queue {
     /// added stays. `album_after` of `None` (its album could not be read)
     /// leaves the album part alone.
     pub fn started(&mut self, id: ItemRef, album_after: Option<&[Item]>, seed: u64) {
+        self.starts = self.starts.wrapping_add(1);
         // After a reload the playing song starts again: the queue already
         // holds what follows it, as the listener left it.
         if std::mem::take(&mut self.restored) && self.current == Some(id) {
@@ -809,6 +818,15 @@ mod tests {
             new_children: 0,
             audiobook: false,
         }
+    }
+
+    #[test]
+    fn started_counts_every_start_so_a_screen_can_tell_the_head_was_taken() {
+        let mut q = Queue::default();
+        assert_eq!(q.starts(), 0);
+        q.started(ItemRef::Real(1), Some(&album(&[2])), 7);
+        q.started(ItemRef::Real(2), None, 7);
+        assert_eq!(q.starts(), 2);
     }
 
     fn ids(q: &Queue) -> Vec<u64> {

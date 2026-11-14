@@ -59,9 +59,16 @@ pub fn media_state(snapshot: &PlayerSnapshot) -> MediaState {
     }
 }
 
-/// The songs the host should play after `playing`: the queue's upcoming, minus
-/// the head when it is `playing` itself (the queue pops it as the song starts).
-pub fn after(playing: ItemRef, upcoming: &[ItemRef]) -> Vec<ItemRef> {
+/// The songs the host should play after `playing`, from the queue's upcoming
+/// once `playing` has left it. A copy of `playing` further on is a repeat the
+/// listener queued and stays.
+pub fn after(_playing: ItemRef, upcoming: &[ItemRef]) -> Vec<ItemRef> {
+    upcoming.to_vec()
+}
+
+/// As [`after`] for a song the queue has not yet taken in (it pops the head
+/// as the song starts): the head is that song itself, not a repeat.
+pub fn after_unstarted(playing: ItemRef, upcoming: &[ItemRef]) -> Vec<ItemRef> {
     match upcoming.split_first() {
         Some((head, rest)) if *head == playing => rest.to_vec(),
         _ => upcoming.to_vec(),
@@ -440,10 +447,18 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_head_that_is_the_playing_song_is_not_sent_twice() {
-        assert_eq!(after(id(1), &ids(&[1, 2, 3])), ids(&[2, 3]));
-        assert_eq!(after(id(1), &ids(&[2, 3])), ids(&[2, 3]));
-        assert_eq!(after(id(1), &[]), Vec::new());
+    fn a_queue_head_that_is_the_playing_song_is_not_sent_twice_until_the_queue_took_it() {
+        assert_eq!(after_unstarted(id(1), &ids(&[1, 2, 3])), ids(&[2, 3]));
+        assert_eq!(after_unstarted(id(1), &ids(&[2, 3])), ids(&[2, 3]));
+        assert_eq!(after_unstarted(id(1), &[]), Vec::new());
+    }
+
+    #[test]
+    fn a_repeat_queued_behind_the_playing_song_is_kept_once_it_started() {
+        assert_eq!(after(id(1), &ids(&[1, 2])), ids(&[1, 2]));
+        let (fake, m) = music();
+        m.restart(id(1), &ids(&[1, 2]));
+        assert_eq!(fake.snapshot().queue, vec!["1", "1", "2"]);
     }
 
     #[test]
