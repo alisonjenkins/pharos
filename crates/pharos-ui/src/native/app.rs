@@ -8045,10 +8045,19 @@ fn Player(
                 w.card(seek_tick(), unindexed)
             }),
         up_next: match (up_next_step(), upcoming.as_ref()) {
-            (UpNextStep::Counting { left_ms, of_ms }, next) => {
+            (
+                UpNextStep::Counting {
+                    left_ms,
+                    of_ms,
+                    due_ms,
+                },
+                next,
+            ) => {
                 // Only the card's own item: a group's next is not the queue's.
                 let next = next.filter(|n| Some(n.id) == up_next_to.get());
                 let mut card = UpNextCard::of(next, left_ms, of_ms);
+                card.due_ms = due_ms;
+                card.paused = media_rest().paused;
                 if next.is_none() && p.kind != ItemKind::Episode {
                     "Next".clone_into(&mut card.name);
                 }

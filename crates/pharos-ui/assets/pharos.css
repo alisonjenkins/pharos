@@ -3381,7 +3381,32 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   height: 3px;
   margin: 0.45rem 0 0.6rem;
   border-radius: 2px;
-  background: linear-gradient(to right, var(--px-color-accent) var(--pharos-fill, 0%), rgb(255 255 255 / 0.25) 0); /* not themed: controls sit on the video, whose colours no theme sets */
+  overflow: hidden;
+  background: rgb(255 255 255 / 0.25); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+/* The fill wipes across on the compositor: scaleX over the whole countdown,
+   its duration, start and play state set inline. */
+.pharos-up-next-bar-fill {
+  height: 100%;
+  background: var(--px-color-accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation-name: pharos-up-next-wipe;
+  animation-timing-function: linear;
+  animation-fill-mode: both;
+}
+@keyframes pharos-up-next-wipe {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pharos-up-next-bar-fill {
+    animation-timing-function: steps(var(--pharos-steps, 15), end);
+  }
 }
 .pharos-up-next-actions {
   display: flex;
