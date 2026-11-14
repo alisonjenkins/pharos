@@ -428,6 +428,8 @@ enum EnrichOutcome {
     SkippedManual,
     /// No provider configured for the kind, or an audio item — nothing tried.
     Skipped,
+    /// A course lesson (ADR-0126): never matched online.
+    SkippedCourse,
 }
 
 impl EnrichOutcome {
@@ -441,6 +443,7 @@ impl EnrichOutcome {
             Self::NoMatch => "no_match",
             Self::SkippedManual => "skipped_manual",
             Self::Skipped => "skipped",
+            Self::SkippedCourse => "skipped_course",
         }
     }
 }
@@ -528,6 +531,17 @@ where
     Tv: OnlineEnricher,
     S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
+    // V1392 — the match queries leave lessons out; one that reaches here
+    // anyway (marked between the read and this call) is still not searched.
+    if item.match_source.as_deref() == Some(pharos_scanner::course::COURSE_MATCH_SOURCE) {
+        tracing::debug!(
+            media.id = item.id,
+            path = %item.path.display(),
+            "metadata enrich: course lesson skipped, never matched online"
+        );
+        record_enrich(item.kind, EnrichOutcome::SkippedCourse);
+        return Ok(false);
+    }
     let stem = search_stem(&item);
     let name = episode_name(&item);
 
@@ -4577,6 +4591,7 @@ mod tests {
             EnrichOutcome::NoMatch,
             EnrichOutcome::SkippedManual,
             EnrichOutcome::Skipped,
+            EnrichOutcome::SkippedCourse,
         ];
         // The label strings are a metric contract — bounded and all distinct.
         let labels: BTreeSet<&str> = all.iter().map(|o| o.label()).collect();
@@ -5688,6 +5703,51 @@ mod tests {
         // record's metadata.
         assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
         assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
+    }
+
+    /// V1392 — a course lesson that reaches the enricher is not searched:
+    /// its mark stays, and the skip is counted.
+    #[tokio::test]
+    async fn enrich_one_never_searches_a_course_lesson() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_bare_episode(&s, 1, "Intro to Widgets", "/books/Intro to Widgets").await;
+        s.set_item_match(1, "local", "", "course", None, 1)
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("900001", "Intro to Widgets", Some(2003))])
+            .with_detail(enriched_overview("A film about something else."));
+
+        let item = s.get(1).await.unwrap();
+        let hit = enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert!(!hit);
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("course"));
+        assert_eq!(got.metadata.overview, None);
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_metadata_enrich_total",
+                &[("outcome", "skipped_course")]
+            ),
+            1
+        );
     }
 
     #[tokio::test]
