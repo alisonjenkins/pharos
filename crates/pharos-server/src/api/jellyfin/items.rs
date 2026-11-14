@@ -2023,7 +2023,7 @@ async fn shows_seasons(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::BTreeMap;
     // B85 — canonicalise the dashed synth id the kotlin SDK sends (else the
     // season list is empty and the show won't open on Android TV).
@@ -2046,23 +2046,27 @@ async fn shows_seasons(
     crate::services::access::retain_visible(&state, &user.0, &mut episodes, |e| e.id, "series")
         .await
         .map_err(crate::api::jellyfin::access_error)?;
-    let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
+    let mut seasons: BTreeMap<u32, (&MediaItem, &pharos_core::SeriesInfo)> = BTreeMap::new();
     let mut episode_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    for series in episodes.iter().filter_map(|e| e.series.as_ref()) {
+    for (episode, series) in episodes
+        .iter()
+        .filter_map(|e| e.series.as_ref().map(|s| (*e, s)))
+    {
         let Some(n) = series.season_number else {
             continue;
         };
-        seasons.entry(n).or_insert(series);
+        seasons.entry(n).or_insert((episode, series));
         *episode_counts.entry(n).or_insert(0) += 1;
     }
+    let course_roots = state.course_roots();
     let items: Vec<serde_json::Value> = seasons
         .iter()
-        .map(|(n, series)| {
+        .map(|(n, (episode, series))| {
             season_dto(
                 &state.server_id,
                 series,
                 *n,
-                &season_display_name(*n),
+                &season_name(episode, *n, &course_roots),
                 episode_counts.get(n).copied().unwrap_or(0),
             )
         })
@@ -6298,7 +6302,7 @@ pub(crate) async fn virtual_shows_page(
     mode: ShowFolderKind,
     q: &ItemQuery,
 ) -> Result<SynthPage, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     // Reuse the full parent/search scoping the media query already implements:
@@ -6485,6 +6489,7 @@ pub(crate) async fn virtual_shows_page(
             }
         }
         ShowFolderKind::Season => {
+            let course_roots = state.course_roots();
             for ep in &episodes {
                 let Some(series) = ep.series.as_ref() else {
                     continue;
@@ -6502,7 +6507,7 @@ pub(crate) async fn virtual_shows_page(
                             &state.server_id,
                             series,
                             season_n,
-                            &season_display_name(season_n),
+                            &season_name(ep, season_n, &course_roots),
                             episode_count,
                         ),
                     )
@@ -6554,7 +6559,6 @@ async fn synth_series_or_season(
     user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
-    use crate::api::jellyfin::dto::season_display_name;
     use pharos_core::ParentFilter;
     let internal = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
     let filter = match synth_parent_filter(state, id_str).await.map_err(internal)? {
@@ -6584,7 +6588,7 @@ async fn synth_series_or_season(
             &state.server_id,
             series,
             season_n,
-            &season_display_name(season_n),
+            &season_name(item, season_n, &state.course_roots()),
             episode_count,
         )));
     }
@@ -6696,6 +6700,16 @@ fn series_dto(
         id,
     })
     .unwrap_or(serde_json::Value::Null)
+}
+
+/// A season's name: a course's module folder where it has a named one
+/// (ADR-0126), else the show's "Season N".
+fn season_name(episode: &MediaItem, season_n: u32, course_roots: &[std::path::PathBuf]) -> String {
+    use pharos_scanner::course;
+    course::lesson(&episode.path, course_roots)
+        .and_then(|lesson| lesson.series.series_folder)
+        .and_then(|folder| course::module_title(&episode.path, std::path::Path::new(&folder)))
+        .unwrap_or_else(|| crate::api::jellyfin::dto::season_display_name(season_n))
 }
 
 fn season_dto(
