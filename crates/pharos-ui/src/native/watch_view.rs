@@ -1568,6 +1568,7 @@ fn SeekBar(
         div {
             id: SEEK_ID,
             class,
+            "data-measure": "true",
             role: "slider",
             // Focusable, so the arrow keys (the player's own seek steps)
             // reach it from Tab, and a TV's D-pad stops on it (B1330).
