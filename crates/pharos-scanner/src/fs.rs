@@ -1407,6 +1407,7 @@ impl<P: Prober> FsScanner<P> {
                 // Captured before `put` consumes the item; the cover write below
                 // needs them and must run AFTER the row exists.
                 let (item_kind, item_path) = (item.kind, item.path.clone());
+                let embedded_cover = item.probe.has_embedded_cover;
                 let course = (item_kind == MediaKind::Episode
                     && self.course_lesson(&item_path).is_some())
                 .then(CoursePrior::default);
@@ -1415,6 +1416,7 @@ impl<P: Prober> FsScanner<P> {
                     item_id,
                     item_kind,
                     item_path,
+                    embedded_cover,
                     genres,
                     artwork,
                     people,
@@ -1839,6 +1841,7 @@ impl<P: Prober> FsScanner<P> {
             item_id,
             item_kind,
             item_path,
+            embedded_cover,
             genres,
             artwork,
             people,
@@ -1893,7 +1896,15 @@ impl<P: Prober> FsScanner<P> {
         // any NFO thumb/fanart URLs) keyed by item id + role. One row per
         // role; the resolver fed refs in priority order so the first per
         // role is the winner. `set_artwork` upserts.
-        persist_artwork(store, item_id, &artwork).await?;
+        persist_artwork(
+            store,
+            item_id,
+            item_kind,
+            &item_path,
+            embedded_cover,
+            &artwork,
+        )
+        .await?;
         // Persist the freshly-stat'd signature so the next scan can
         // skip this file. mark_seen is an UPDATE — the put() above
         // guarantees the row exists first.
@@ -1969,6 +1980,7 @@ impl<P: Prober> FsScanner<P> {
         } = merge_metadata_into_item(&mut item, meta);
         self.keep_lesson_title(&mut item);
         let item_kind = item.kind;
+        let embedded_cover = item.probe.has_embedded_cover;
         let prior = match existing {
             Some(_) => store.get(item_id).await.ok(),
             None => None,
@@ -2013,7 +2025,7 @@ impl<P: Prober> FsScanner<P> {
         // full scan does).
         store.link_item_tags(item_id, &tags).await?;
         // LIB-D7 — persist discovered artwork (FK on the row just put).
-        persist_artwork(store, item_id, &artwork).await?;
+        persist_artwork(store, item_id, item_kind, path, embedded_cover, &artwork).await?;
         if let Some((mtime, size)) = sig {
             store.mark_seen(item_id, scan_id, mtime, size).await?;
         }
@@ -2375,6 +2387,7 @@ struct WrittenItem {
     item_id: MediaId,
     item_kind: MediaKind,
     item_path: PathBuf,
+    embedded_cover: bool,
     genres: Vec<String>,
     artwork: Vec<pharos_core::ArtworkRef>,
     people: Vec<pharos_core::PersonRef>,
@@ -2610,6 +2623,9 @@ fn normalise_list(items: Vec<String>) -> Vec<String> {
 async fn persist_artwork<S: MediaStore>(
     store: &S,
     item_id: MediaId,
+    kind: MediaKind,
+    path: &Path,
+    embedded_cover: bool,
     artwork: &[pharos_core::ArtworkRef],
 ) -> DomainResult<()> {
     let mut written: HashSet<&'static str> = HashSet::new();
@@ -2627,6 +2643,93 @@ async fn persist_artwork<S: MediaStore>(
         };
         store.set_artwork(item_id, role, source, &locator).await?;
     }
+    if kind == MediaKind::Audio {
+        let primary_written = written.contains("Primary");
+        record_embedded_cover(store, item_id, path, embedded_cover, primary_written).await?;
+    }
+    Ok(())
+}
+
+/// What the scan decided about an audio file's embedded cover. `label()` is
+/// the `outcome` of `pharos_embedded_cover_total`, a dashboard contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedCoverOutcome {
+    Recorded,
+    SidecarWins,
+    KeptProvider,
+    Absent,
+    Withdrawn,
+}
+
+impl EmbeddedCoverOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::SidecarWins => "sidecar_wins",
+            Self::KeptProvider => "kept_provider",
+            Self::Absent => "absent",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// B1437 / V1411 — an audio file with an `attached_pic` advertises a Primary
+/// (the image route extracts it on demand), unless a sidecar or a provider
+/// cover already holds the role. A row left from an earlier scan whose file no
+/// longer has a cover is withdrawn, or the tile would 404.
+async fn record_embedded_cover<S: MediaStore>(
+    store: &S,
+    item_id: MediaId,
+    path: &Path,
+    embedded_cover: bool,
+    sidecar_written: bool,
+) -> DomainResult<()> {
+    let existing = if sidecar_written {
+        None
+    } else {
+        store
+            .artwork_for(item_id)
+            .await?
+            .into_iter()
+            .find(|(role, _, _)| role.eq_ignore_ascii_case("Primary"))
+            .map(|(_, source, _)| source)
+    };
+    let existing_embedded = existing
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case(pharos_core::EMBEDDED_ARTWORK_SOURCE));
+    let outcome = if sidecar_written {
+        if !embedded_cover {
+            return Ok(());
+        }
+        EmbeddedCoverOutcome::SidecarWins
+    } else if embedded_cover {
+        if existing.is_some() && !existing_embedded {
+            EmbeddedCoverOutcome::KeptProvider
+        } else {
+            store
+                .set_artwork(
+                    item_id,
+                    "Primary",
+                    pharos_core::EMBEDDED_ARTWORK_SOURCE,
+                    &path.to_string_lossy(),
+                )
+                .await?;
+            EmbeddedCoverOutcome::Recorded
+        }
+    } else if existing_embedded {
+        store.remove_dead_artwork(item_id, "Primary", false).await?;
+        EmbeddedCoverOutcome::Withdrawn
+    } else {
+        EmbeddedCoverOutcome::Absent
+    };
+    tracing::debug!(
+        media.id = item_id,
+        media.path = %path.display(),
+        outcome = outcome.label(),
+        existing_source = existing.as_deref(),
+        "audio embedded cover decision"
+    );
+    metrics::counter!("pharos_embedded_cover_total", "outcome" => outcome.label()).increment(1);
     Ok(())
 }
 
@@ -6124,10 +6227,14 @@ mod tests {
 
         async fn remove_dead_artwork(
             &self,
-            _item_id: MediaId,
-            _role: &str,
+            item_id: MediaId,
+            role: &str,
             _readmit: bool,
         ) -> DomainResult<()> {
+            self.artwork
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .remove(&(item_id, role.to_string()));
             Ok(())
         }
 
@@ -6972,6 +7079,8 @@ mod tests {
         duration_ms: Option<u64>,
         // Every probe of a path holding the needle carries these chapters.
         chapters_for: Option<(String, Vec<pharos_core::MediaChapter>)>,
+        // Every probe reports an embedded cover (an attached_pic stream).
+        embedded_cover: bool,
     }
 
     impl Prober for FakeProber {
@@ -7018,6 +7127,7 @@ mod tests {
                     synopsis: self.synopsis.clone(),
                     duration_ms: self.duration_ms,
                     chapters,
+                    has_embedded_cover: self.embedded_cover,
                     ..Default::default()
                 },
             })
@@ -7162,6 +7272,116 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, MediaKind::Audio);
         assert_eq!(items[0].title, "Something Got Me Started");
+    }
+
+    async fn scan_audio_cover(
+        embedded: bool,
+        files: &[&str],
+        td: &TempDir,
+    ) -> (MemStore, Vec<MediaItem>) {
+        for f in files {
+            touch(td.path(), f).await;
+        }
+        let prober = FakeProber {
+            embedded_cover: embedded,
+            ..Default::default()
+        };
+        let store = MemStore::default();
+        FsScanner::new(prober)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let items = store.list().await.unwrap();
+        (store, items)
+    }
+
+    fn embedded_cover_count(snap: &metrics_util::debugging::Snapshotter, outcome: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| {
+                k.key().name() == "pharos_embedded_cover_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == outcome)
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn audio_with_an_embedded_cover_records_a_primary() {
+        // B1437 — a part whose only cover is inside the file must advertise one.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        let (store, items) = scan_audio_cover(true, &["Part 1.m4b"], &td).await;
+        let rows = store.artwork_for(items[0].id).await.unwrap();
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1.as_str()),
+            ("Primary", "embedded")
+        );
+        assert_eq!(embedded_cover_count(&snap, "recorded"), 1);
+    }
+
+    #[tokio::test]
+    async fn audio_without_an_embedded_cover_records_nothing() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        let (store, items) = scan_audio_cover(false, &["Part 1.m4b"], &td).await;
+        assert!(store.artwork_for(items[0].id).await.unwrap().is_empty());
+        assert_eq!(embedded_cover_count(&snap, "absent"), 1);
+        assert_eq!(embedded_cover_count(&snap, "recorded"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_cover_beats_the_embedded_one() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "cover.jpg").await;
+        let (store, items) = scan_audio_cover(true, &["Part 1.m4b"], &td).await;
+        let rows = store.artwork_for(items[0].id).await.unwrap();
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].1, "local");
+        assert_eq!(embedded_cover_count(&snap, "sidecar_wins"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rescan_withdraws_an_embedded_row_the_file_no_longer_backs() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        let (store, items) = scan_audio_cover(true, &["Part 1.m4b"], &td).await;
+        let id = items[0].id;
+        assert_eq!(store.artwork_for(id).await.unwrap().len(), 1);
+        write_file(td.path(), "Part 1.m4b", b"changed").await;
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert!(store.artwork_for(id).await.unwrap().is_empty());
+        assert_eq!(embedded_cover_count(&snap, "withdrawn"), 1);
+    }
+
+    #[test]
+    fn embedded_cover_outcome_labels_are_distinct() {
+        use EmbeddedCoverOutcome::*;
+        let labels: HashSet<&str> = [Recorded, SidecarWins, KeptProvider, Absent, Withdrawn]
+            .iter()
+            .map(|o| o.label())
+            .collect();
+        assert_eq!(labels.len(), 5);
     }
 
     #[tokio::test]
