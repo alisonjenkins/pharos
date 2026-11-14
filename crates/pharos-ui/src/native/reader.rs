@@ -673,7 +673,7 @@ pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
                 .unwrap_or_else(|| "Read".to_owned()),
         ),
         BookFormat::Unreadable => {
-            BookAction::Closed("This book is locked to a Kindle device and cannot be opened here.")
+            BookAction::Closed("Locked to a Kindle (DRM). Pharos can't open it.")
         }
         BookFormat::Comic => BookAction::Closed("Comic reading is coming."),
     }
