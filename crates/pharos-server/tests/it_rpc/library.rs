@@ -4361,3 +4361,54 @@ async fn a_books_library_lists_books_and_its_courses_apart() {
         "a course is never a TV library's show"
     );
 }
+
+/// Spec 043 SC-002 — a Books library's genre filter offers the shelves its
+/// books carry and nothing else: not a film's genres from another library,
+/// not a course lesson's; and picking a shelf lists its books.
+/// Disarm check: with `index` building its facet query without the Books
+/// library's books-only default, the lesson's "Drama" is offered too.
+#[actix_web::test]
+async fn a_books_library_offers_only_its_books_shelves() {
+    use pharos_core::{GenreStore as _, MediaItem, MediaKind, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    fx.state
+        .stores
+        .link_item_genres(101, &["Action".to_owned()])
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 705,
+            path: "/libBooks/Gadget Locks.pdf".into(),
+            title: "Gadget Locks".into(),
+            kind: MediaKind::Book,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let books = seed_books_library(&fx).await;
+    for (id, shelves) in [
+        (701, vec!["Programming", "Web"]),
+        (705, vec!["Security"]),
+        (702, vec!["Drama"]),
+    ] {
+        let names: Vec<String> = shelves.into_iter().map(str::to_owned).collect();
+        fx.state.stores.link_item_genres(id, &names).await.unwrap();
+    }
+
+    let (_, genres) = wire_index(&session, &books, &[], "").await;
+    assert_eq!(genres, ["Programming", "Security", "Web"]);
+    assert_eq!(
+        listed_in(&session, &books, &[], "Security", &[]).await,
+        ["Gadget Locks"]
+    );
+    assert_eq!(
+        listed_in(&session, &books, &[], "Web", &[]).await,
+        ["Widget Handbook"]
+    );
+}
