@@ -28,7 +28,7 @@ Three failure classes found, each designed out below:
 5. **Refine** each anchored line letter by letter (MMS_FA CTC on the vocals' emission) within the anchor ±1.5 s, with no gap penalty inside the anchor and a small cost for leaving it. An infeasible band keeps the anchor's recogniser times.
 6. **Place** the rest in one joint pass: a single banded Viterbi over the whole anchored span times anchored and between lines together, so one line's error cannot spread to the next (per-line windows clamped to the gap did, on the private set). Before it:
    - an anchor whose offset is more than 5 s from both neighbouring anchors' offsets AND that leaps a sung line (a line between it and a neighbour, moved by that neighbour's offset, lands on its far side) is dropped as an outlier;
-   - a kept line just outside the span whose today's time overlaps the placed edge line is taken into the span and the pass runs again; if that makes it infeasible, the last feasible answer stands (V1373).
+   - a kept line just outside the span whose today's time overlaps the placed edge line is taken into the span and the pass runs again; if that makes it infeasible, the last feasible answer stands, and the line left out is checked at the boundary: any of its word starts past the placed edge line's first word start (before the span) or before its last word start (after it) is held at that start, so word starts never decrease across the boundary (V1373, FR-006).
    A line outside any anchor pair keeps today's time.
 7. **Emit** a corrected event for every line whose time changed, then the whole answer (ADR-0121 shape, additive `placement` per line).
 
