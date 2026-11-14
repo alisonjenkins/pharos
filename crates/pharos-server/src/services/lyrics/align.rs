@@ -1112,6 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn sung_subtitle_lines_are_shadowed_too_after_the_answer_is_stored() {
         use crate::services::lyrics::shadow::tests::{body, by_path, fake};
+        use crate::services::lyrics::shadow::SHADOW_VERSION;
         use metrics_util::debugging::DebuggingRecorder;
         use tokio::sync::oneshot;
 
@@ -1131,7 +1132,7 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let (primary_base, primary_got) = fake(200, body(&primary, 4), None).await;
         let (release, hold) = oneshot::channel();
-        let (shadow_base, shadow_got) = fake(200, body(&primary, 5), Some(hold)).await;
+        let (shadow_base, shadow_got) = fake(200, body(&primary, SHADOW_VERSION), Some(hold)).await;
         let cache = AlignCache::new(None);
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Aligner {
@@ -2072,6 +2073,68 @@ mod tests {
         let line = eta_line(&logs, "lyrics: aligned");
         assert!(line.contains("lines_streamed=2"), "{line}");
         assert!(line.contains("first_line_ms="), "{line}");
+    }
+
+    /// ADR-0124: aligner 6 streams today's lines, then sends a line again
+    /// once the recogniser has placed it, with an additive `placement`.
+    /// The later report replaces the earlier one in what the player shows,
+    /// and the whole answer, `placement` and all, is what is stored.
+    /// Disarm check: with `Event::Line` keeping a slot's first words, the
+    /// partial never shows the corrected line and this fails.
+    #[tokio::test]
+    async fn a_line_sent_again_replaces_what_was_shown_and_placement_is_accepted() {
+        let events = vec![
+            r#"{"event":"offset","offset_ms":100,"aligner_version":6,"lines":2}"#.to_owned(),
+            r#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1100}],"score":0.9}"#
+                .to_owned(),
+            r#"{"event":"line","index":1,"words":[{"at":0,"start_ms":3100}],"score":0.8}"#
+                .to_owned(),
+            r#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1500}],"score":0.95,"placement":"refined"}"#
+                .to_owned(),
+            r#"{"event":"done","lines":[{"words":[{"at":0,"start_ms":1500}],"score":0.95,"placement":"refined"},{"words":[{"at":0,"start_ms":3100}],"score":0.8,"placement":"kept"}],"offset_ms":100,"aligner_version":6}"#
+                .to_owned(),
+        ];
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let base = fake_stream(events, 4, gate, true).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Arc::new(Aligner {
+            base,
+            ..test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx)
+        });
+        let job = two_line_job();
+        let running = {
+            let aligner = Arc::clone(&aligner);
+            tokio::spawn(async move { aligner.process_job(&two_line_job()).await })
+        };
+
+        let corrected = vec![WordStamp {
+            at: 0,
+            start_ms: 1500,
+        }];
+        let mut shown = None;
+        for _ in 0..200 {
+            shown = aligner
+                .partial_for(job.id, &job.key)
+                .filter(|p| p.lines.first() == Some(&corrected));
+            if shown.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let shown = shown.expect("the corrected line replaces the first report");
+        assert_eq!(
+            shown.lines[1],
+            vec![WordStamp {
+                at: 0,
+                start_ms: 3100
+            }]
+        );
+
+        open.send(()).unwrap();
+        running.await.unwrap().unwrap();
+        let stored = aligner.cache.get(job.id, "k").expect("stored when done");
+        assert_eq!(stored.lines[0], corrected);
+        assert_eq!(stored.scores, vec![Some(950), Some(800)]);
     }
 
     /// ADR-0121: a song that fails after some lines streamed fails the job
