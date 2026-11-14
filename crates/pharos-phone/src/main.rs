@@ -32,6 +32,17 @@ fn main() {
     pharos_android::link();
     log::info!("pharos: start app=phone");
     ports::register();
+    let hook = pharos_ui::native::ports::register_on_credentials_changed(
+        pharos_android::credentials_changed,
+    );
+    log::info!(
+        "pharos: credentials hook verdict={}",
+        if hook.is_ok() {
+            "registered"
+        } else {
+            "already_registered"
+        }
+    );
     let config = dioxus::mobile::Config::new()
         .with_background_color((0x0e, 0x11, 0x16, 0xff))
         .with_custom_head(format!(
