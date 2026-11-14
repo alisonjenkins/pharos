@@ -11,6 +11,9 @@ description = "CTC forced alignment of lyric words to MMS_FA emissions, matching
 vulkan = ["dep:burn", "dep:wgpu", "dep:pollster", "dep:cubecl-runtime"]
 # The recogniser (spec 042 slice 2, ADR-0125): whisper.cpp on Vulkan.
 recognise = ["dep:whisper-rs"]
+# The vocal separator (spec 042 slice 3, ADR-0125): htdemucs converted to
+# Burn by the flake, which exports PHAROS_SEPARATOR_MODEL.
+separate = ["vulkan", "dep:burn-store"]
 
 [dependencies]
 # The GPU forward pass: wgpu on Vulkan only (spec 039, R9).
@@ -20,6 +23,8 @@ cubecl-runtime = { version = "0.11.4", default-features = false, features = ["st
 # Listing adapters for the device choice; the versions Burn already pulls in.
 wgpu = { version = "30", default-features = false, optional = true }
 pollster = { version = "0.4", optional = true }
+# Loads the separator's burnpack weights; the version Burn already pulls in.
+burn-store = { version = "0.22.1", default-features = false, features = ["std", "memmap"], optional = true }
 # Pinned: the decode settings in `recognise` were measured on this release.
 whisper-rs = { version = "=0.16.0", features = ["vulkan"], optional = true }
 actix-web.workspace = true
