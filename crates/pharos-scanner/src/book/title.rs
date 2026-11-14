@@ -45,9 +45,9 @@ static TRAILING: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"(?i)\s+(?:web-?dl|web-?rip)$",
         // A bracketed format or edition tag: `[eBook]`, `(Kindle Edition)`,
         // `[Kindle in Motion]`. Only these words, so `[Part 1]` stays.
-        r"(?i)\s*[(\[](?:e-?book|kindle(?:\s+(?:edition|in\s+motion))?|retail|epub|pdf|mobi|azw3?)[)\]]$",
+        r"(?i)\s*[(\[](?:e[-\s]?book|kindle(?:\s+(?:edition|in\s+motion))?|retail|epub|pdf|mobi|azw3?)[)\]]$",
         // A bare format word left by a hyphenated stem: `Title-ebook`.
-        r"(?i)[\s-]+e-?book$",
+        r"(?i)[\s-]+e[-\s]?book$",
     ]
     .iter()
     .filter_map(|p| rule(p))
@@ -193,6 +193,9 @@ mod tests {
             ("Some Title [Kindle in Motion]", "Some Title"),
             ("Some Title-ebook", "Some Title"),
             ("Some Title - eBook", "Some Title"),
+            // A hyphenated stem's hyphens become spaces before the rules run.
+            ("Some-Title-e-book", "Some Title"),
+            ("long-title-here [e-book]", "long title here"),
             ("Some Title [Part 1]", "Some Title [Part 1]"),
             ("Ebook", "Ebook"),
             // Real content stays.
