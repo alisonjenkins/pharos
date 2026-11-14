@@ -24,6 +24,8 @@ mod node;
 mod prefetch;
 mod resume;
 #[cfg(test)]
+mod testlog;
+#[cfg(test)]
 mod testserver;
 mod token;
 mod tree;
