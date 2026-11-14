@@ -314,6 +314,7 @@ impl Library {
                     link: None,
                     qc: None,
                     qc_gen: 0,
+                    qc_approved: Arc::default(),
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -803,6 +804,9 @@ struct Worker {
     /// Names the current poller. Its events carry it, so one queued before a
     /// sign-out or reload (which an abort cannot recall) is ignored.
     qc_gen: u64,
+    /// Set by the poller once it has queued its approval, so a command that
+    /// runs before the worker consumes it does not start a poller over it.
+    qc_approved: Arc<AtomicBool>,
     limit: Duration,
 }
 
@@ -887,6 +891,7 @@ impl Worker {
                 token,
             } => {
                 self.qc = None;
+                self.qc_approved.store(false, Ordering::SeqCst);
                 if let Err(e) = token::store(&self.token_path, &token) {
                     log::warn!(
                         "device token not kept, signing in again next start: {}",
@@ -1057,6 +1062,7 @@ impl Worker {
     /// True when one was running.
     fn stop_sign_in(&mut self) -> bool {
         self.qc_gen = self.qc_gen.wrapping_add(1);
+        self.qc_approved = Arc::default();
         self.qc.take().inspect(|h| h.abort()).is_some()
     }
 
@@ -1073,13 +1079,17 @@ impl Worker {
     }
 
     fn start_sign_in(&mut self, events: &UnboundedSender<(u64, Event)>) {
-        if self.qc.as_ref().is_some_and(|h| !h.is_finished()) {
+        if self.qc.as_ref().is_some_and(|h| !h.is_finished())
+            || self.qc_approved.load(Ordering::SeqCst)
+        {
             return;
         }
         self.qc_gen = self.qc_gen.wrapping_add(1);
+        self.qc_approved = Arc::default();
         self.qc = Some(tokio::task::spawn_local(quick_connect(
             self.base.clone(),
             self.qc_gen,
+            self.qc_approved.clone(),
             events.clone(),
         )));
     }
@@ -1087,7 +1097,12 @@ impl Worker {
 
 /// Mint a code, report it, and poll until someone approves it. Reconnect and
 /// re-mint decisions are `tv_auth`'s (see its module comment for why).
-async fn quick_connect(base: String, gen: u64, events: UnboundedSender<(u64, Event)>) {
+async fn quick_connect(
+    base: String,
+    gen: u64,
+    approved: Arc<AtomicBool>,
+    events: UnboundedSender<(u64, Event)>,
+) {
     let mut qc = QuickConnect::new();
     let mut link: Option<(bootstrap::Client, Closed)> = None;
     loop {
@@ -1133,6 +1148,7 @@ async fn quick_connect(base: String, gen: u64, events: UnboundedSender<(u64, Eve
         match qc.on_poll(&polled) {
             Action::Finish => {
                 if let Polled::Approved((session, token)) = polled {
+                    approved.store(true, Ordering::SeqCst);
                     let _ = events.send((
                         gen,
                         Event::Approved {
@@ -1518,6 +1534,7 @@ mod tests {
             link: None,
             qc: None,
             qc_gen: 0,
+            qc_approved: Arc::default(),
             limit: Duration::from_secs(5),
         };
         (w, shared, token_path)
@@ -1594,5 +1611,28 @@ mod tests {
         assert!(!lib.is_online());
         lib.set_online(false);
         assert_eq!(o.downloader.pending(), 2, "resumed once, not per report");
+    }
+
+    #[test]
+    fn a_poller_that_queued_its_approval_is_not_replaced_before_it_is_consumed() {
+        let (mut w, _, _) = worker("approved-pending");
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.start_sign_in(&events);
+            let polling_as = w.qc_gen;
+            // The poller has queued its approval and returned.
+            w.qc_approved.store(true, Ordering::SeqCst);
+            if let Some(h) = w.qc.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            w.start_sign_in(&events);
+            assert_eq!(w.qc_gen, polling_as, "its approval stays current");
+            assert!(w.qc.is_none(), "no second poller over it");
+            w.stop_sign_in();
+            w.start_sign_in(&events);
+            assert!(w.qc.is_some(), "a sign-out clears the guard");
+        });
     }
 }
