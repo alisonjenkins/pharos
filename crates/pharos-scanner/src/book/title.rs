@@ -43,6 +43,11 @@ static TRAILING: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\s+\d{10,13}[xX]?$",
         // Release tag meant for video.
         r"(?i)\s+(?:web-?dl|web-?rip)$",
+        // A bracketed format or edition tag: `[eBook]`, `(Kindle Edition)`,
+        // `[Kindle in Motion]`. Only these words, so `[Part 1]` stays.
+        r"(?i)\s*[(\[](?:e-?book|kindle(?:\s+(?:edition|in\s+motion))?|retail|epub|pdf|mobi|azw3?)[)\]]$",
+        // A bare format word left by a hyphenated stem: `Title-ebook`.
+        r"(?i)[\s-]+e-?book$",
     ]
     .iter()
     .filter_map(|p| rule(p))
@@ -181,6 +186,15 @@ mod tests {
             ("Some Title (1) (for Mr A B Smith)", "Some Title"),
             // Video release tag.
             ("Some Title WEB-DL", "Some Title"),
+            // Format and edition tags (B1433).
+            ("Some Title [eBook]", "Some Title"),
+            ("Some Title [eBook] www.somesite.se", "Some Title"),
+            ("Some Title (Kindle Edition)", "Some Title"),
+            ("Some Title [Kindle in Motion]", "Some Title"),
+            ("Some Title-ebook", "Some Title"),
+            ("Some Title - eBook", "Some Title"),
+            ("Some Title [Part 1]", "Some Title [Part 1]"),
+            ("Ebook", "Ebook"),
             // Real content stays.
             ("Taming Editors 4.1", "Taming Editors 4.1"),
             ("Taming Editors 4 1", "Taming Editors 4 1"),
