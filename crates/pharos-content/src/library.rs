@@ -266,6 +266,11 @@ fn resolve_stream(
             .ok_or_else(|| ResolveError::Permanent(format!("{id} has no stream url"))),
         Ok(_) => Err(ResolveError::Permanent("unexpected reply".into())),
         Err(e) if is_unreachable(&e) => Err(ResolveError::Transient(e.redacted())),
+        // Not signed in yet: QuickConnect is running, and a download that gave
+        // up now (restored pins at start-up) would never be asked for again.
+        Err(ContentError::NeedsSignIn) => Err(ResolveError::Transient(
+            ContentError::NeedsSignIn.redacted(),
+        )),
         Err(e) => Err(ResolveError::Permanent(e.redacted())),
     }
 }
@@ -1634,5 +1639,15 @@ mod tests {
             w.start_sign_in(&events);
             assert!(w.qc.is_some(), "a sign-out clears the guard");
         });
+    }
+
+    #[test]
+    fn a_stream_lookup_before_sign_in_is_retried_not_failed() {
+        let dir = std::env::temp_dir().join(format!("pharos-lib-nosign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        let got = resolve_stream(&lib.tx, &lib.timeouts, "track/1");
+        assert!(matches!(got, Err(ResolveError::Transient(_))), "{got:?}");
     }
 }
