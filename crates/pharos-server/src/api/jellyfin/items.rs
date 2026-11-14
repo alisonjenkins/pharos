@@ -400,7 +400,8 @@ async fn build_facet_base(
         ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t.clone()),
         ParentResolution::All | ParentResolution::Empty => {}
     }
-    match parse_kind_filter(q.include_item_types.as_deref()) {
+    let kinds = parse_kind_filter(q.include_item_types.as_deref());
+    match crate::services::library::books_default(state, &parent, &kinds) {
         KindFilter::Unset => {}
         KindFilter::Kinds(wanted) => mq.kinds = wanted,
         // "You asked for nothing" — the same shape an empty-but-present `Ids=`
