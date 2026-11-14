@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wait_timeout::ChildExt;
 
@@ -89,14 +89,25 @@ fn decode_with(
 /// The longest song decoded whole for the recogniser: an hour.
 pub const SONG_MS: i64 = 3_600_000;
 
+/// [`TIMEOUT`], or less when `deadline` comes sooner: a stage's subprocess
+/// stops with the stage's budget.
+fn until(deadline: Instant) -> Duration {
+    TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+}
+
 /// The first [`SONG_MS`] of `path` at `rate` in stereo, as the separator
-/// takes it.
-pub fn decode_stereo(ffmpeg: &str, path: &Path, rate: u32) -> Result<[Vec<f32>; 2], DecodeError> {
+/// takes it, killed at `deadline`.
+pub fn decode_stereo(
+    ffmpeg: &str,
+    path: &Path,
+    rate: u32,
+    deadline: Instant,
+) -> Result<[Vec<f32>; 2], DecodeError> {
     let mut args = ffmpeg_args(path, 0, SONG_MS, rate);
     if let Some(ac) = args.iter().position(|a| a == "-ac") {
         args[ac + 1] = "2".into();
     }
-    let bytes = run(ffmpeg, args, None, TIMEOUT, (0, SONG_MS))?;
+    let bytes = run(ffmpeg, args, None, until(deadline), (0, SONG_MS))?;
     let mut out = [Vec::new(), Vec::new()];
     for frame in f32s(&bytes).chunks_exact(2) {
         out[0].push(frame[0]);
@@ -107,10 +118,12 @@ pub fn decode_stereo(ffmpeg: &str, path: &Path, rate: u32) -> Result<[Vec<f32>; 
 
 /// `stereo` at `from` Hz down to [`RATE`] mono with ffmpeg's resampler: the
 /// recogniser and the letter model hear separated vocals as they hear a file.
+/// Killed at `deadline`.
 pub fn resample_mono(
     ffmpeg: &str,
     stereo: &[Vec<f32>; 2],
     from: u32,
+    deadline: Instant,
 ) -> Result<Vec<f32>, DecodeError> {
     let mut input = Vec::with_capacity(stereo[0].len() * 8);
     for (l, r) in stereo[0].iter().zip(&stereo[1]) {
@@ -127,7 +140,7 @@ pub fn resample_mono(
         .chain([RATE.to_string().into()])
         .chain(["-f", "f32le", "-"].map(OsString::from))
         .collect();
-    let bytes = run(ffmpeg, args, Some(input), TIMEOUT, (0, len_ms))?;
+    let bytes = run(ffmpeg, args, Some(input), until(deadline), (0, len_ms))?;
     Ok(f32s(&bytes))
 }
 
@@ -297,14 +310,38 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let stereo = decode_stereo(ffmpeg, &wav, 44_100).unwrap();
+        let stereo = decode_stereo(ffmpeg, &wav, 44_100, later()).unwrap();
         assert_eq!(stereo[0].len(), 88_200);
         assert_eq!(stereo[0], stereo[1], "the tone is the same both sides");
-        let mono = resample_mono(ffmpeg, &stereo, 44_100).unwrap();
+        let mono = resample_mono(ffmpeg, &stereo, 44_100, later()).unwrap();
         assert!((mono.len() as i64 - 32_000).abs() <= 16, "{}", mono.len());
         assert!(mono.iter().any(|s| s.abs() > 0.05));
-        let missing = decode_stereo(ffmpeg, &dir.join("missing.wav"), 44_100).unwrap_err();
+        let missing = decode_stereo(ffmpeg, &dir.join("missing.wav"), 44_100, later()).unwrap_err();
         assert!(matches!(missing, DecodeError::Failed { .. }), "{missing}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn later() -> std::time::Instant {
+        std::time::Instant::now() + TIMEOUT
+    }
+
+    #[test]
+    fn a_hung_stage_decoder_is_killed_at_the_stage_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pharos-align-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ffmpeg");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = fake.to_str().unwrap();
+        let soon = || std::time::Instant::now() + Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let got = decode_stereo(fake, Path::new("a"), 44_100, soon());
+        assert!(matches!(got, Err(DecodeError::TimedOut { .. })), "{got:?}");
+        let stereo = [vec![0.0; 16], vec![0.0; 16]];
+        let got = resample_mono(fake, &stereo, 44_100, soon());
+        assert!(matches!(got, Err(DecodeError::TimedOut { .. })), "{got:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
