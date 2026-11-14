@@ -622,6 +622,28 @@ impl<P: Prober> FsScanner<P> {
         drifted
     }
 
+    /// Whether a file moved from `from` to `to` with the same bytes must be
+    /// re-probed after its row is rebound: an audiobook's album and track
+    /// number come from its folder, so a move into, out of or within a
+    /// Books root changes them though the bytes did not (ADR-0132).
+    fn moved_book(&self, row: MediaId, from: &Path, to: &Path) -> bool {
+        let book = |p: &Path| {
+            crate::audiobook::is_book_container(p) && self.course_roots.root_of(p).is_some()
+        };
+        let moved = book(from) || book(to);
+        if moved {
+            tracing::info!(
+                media.id = %row,
+                from = %from.display(),
+                to = %to.display(),
+                "an audiobook file moved; re-probing it for its new book",
+            );
+            metrics::counter!("pharos_scan_reprobe_total", "reason" => ReprobeReason::BookChanged.label())
+                .increment(1);
+        }
+        moved
+    }
+
     /// The lesson `path` is, under this scanner's Books roots.
     fn course_lesson(&self, path: &Path) -> Option<crate::course::CourseLesson> {
         crate::course::lesson(path, &self.course_roots)
@@ -1150,11 +1172,24 @@ impl<P: Prober> FsScanner<P> {
                     // falls through to a fresh insert under `id`.
                     Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
                         store.rebind_path(c.id, &primary).await?;
-                        if let Some((mtime, size)) = sig {
-                            seen_batch.push((c.id, mtime, size));
-                        }
                         if let Some(fp) = fp {
                             store.set_fingerprint(c.id, fp).await?;
+                        }
+                        if self.moved_book(c.id, &c.path, &primary) {
+                            pending.push(Pending {
+                                primary,
+                                alts,
+                                id,
+                                row: c.id,
+                                sig,
+                                fp,
+                                existed: true,
+                                kept: sig,
+                            });
+                            continue;
+                        }
+                        if let Some((mtime, size)) = sig {
+                            seen_batch.push((c.id, mtime, size));
                         }
                         seen += 1;
                         outcome.updated.push(c.id);
@@ -1667,6 +1702,10 @@ impl<P: Prober> FsScanner<P> {
                 }
                 if let Some(fp) = fp {
                     store.set_fingerprint(c.id, fp).await?;
+                }
+                if self.moved_book(c.id, &c.path, path) {
+                    self.probe_put_one(path, store, scan_id, sig, fp, Some(c.id))
+                        .await?;
                 }
                 Ok(PathUpdate::Updated(c.id))
             }
@@ -12785,6 +12824,50 @@ mod tests {
             })
             .sum();
         assert_eq!(renumbered, 1, "only 04.mp3 moved");
+    }
+
+    /// ADR-0132 — an audiobook file moved to another book folder, bytes
+    /// unchanged, keeps its row and takes the new book's album and place,
+    /// in a full scan and from the watcher.
+    #[tokio::test]
+    async fn a_moved_audiobook_file_joins_its_new_book() {
+        let td = TempDir::new().unwrap();
+        let books = td.path().join("Books");
+        let s = FsScanner::new(FakeProber::default())
+            .with_course_roots(crate::course::CourseRoots::new([(books.clone(), true)]));
+        let store = MemStore::default();
+        for (f, bytes) in [
+            ("Widget Days/01.mp3", b"part one".as_slice()),
+            ("Widget Days/02.mp3", b"part two"),
+            ("Gadget Tales/01.mp3", b"tale one"),
+        ] {
+            write_file(&books, f, bytes).await;
+        }
+        s.scan_into(td.path(), &store).await.unwrap();
+        let moved = stable_id(&books.join("Widget Days/02.mp3"));
+
+        let to = books.join("Gadget Tales/02.mp3");
+        tokio::fs::rename(books.join("Widget Days/02.mp3"), &to)
+            .await
+            .unwrap();
+        s.scan_into(td.path(), &store).await.unwrap();
+        let row = store.get(moved).await.unwrap();
+        assert_eq!(row.path, to, "the move keeps the row");
+        assert_eq!(row.probe.album.as_deref(), Some("Gadget Tales"));
+        assert_eq!(row.probe.track_number, Some(2));
+
+        let back = books.join("Widget Days/03.mp3");
+        tokio::fs::rename(&to, &back).await.unwrap();
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&back, &store, scan_id).await.unwrap();
+        let row = store.get(moved).await.unwrap();
+        assert_eq!(row.path, back);
+        assert_eq!(
+            row.probe.album.as_deref(),
+            Some("Widget Days"),
+            "watched move"
+        );
+        assert_eq!(row.probe.track_number, Some(2), "watched move");
     }
 
     #[test]
