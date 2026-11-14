@@ -469,6 +469,19 @@ pub fn android_auto_classes() -> Vec<ClassSpec> {
             interfaces: Vec::new(),
             methods: vec![native("handleMessage", "(Landroid/os/Message;)V")],
         },
+        // The default network's comings and goings, so the library knows
+        // when the phone is offline.
+        ClassSpec {
+            name: format!("{PKG}/PharosNetworkCallback"),
+            superclass: "android/net/ConnectivityManager$NetworkCallback".into(),
+            init: "()V".into(),
+            load_library: None,
+            interfaces: Vec::new(),
+            methods: vec![
+                native("onAvailable", "(Landroid/net/Network;)V"),
+                native("onLost", "(Landroid/net/Network;)V"),
+            ],
+        },
         // Search results go back in a Bundle, which names each item's class;
         // the car casts them to androidx's MediaItem. Its parcel is the
         // framework MediaItem's (flags, then the description), so a subclass
