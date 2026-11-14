@@ -2561,16 +2561,19 @@ impl SourceWidths {
     }
 }
 
+/// Enough for a PNG/WebP header and for the SOF marker of essentially every
+/// JPEG (EXIF thumbnails push it back, but not this far).
+const HEADER_BYTES: u64 = 64 * 1024;
+
 /// `Ok(None)` is a header this parser does not know; `Err` is a source that
 /// could not be opened or read.
 async fn intrinsic_width(source: &Path) -> std::io::Result<Option<u32>> {
     use tokio::io::AsyncReadExt;
-    let mut f = tokio::fs::File::open(source).await?;
-    // Enough for a PNG/WebP header and for the SOF marker of essentially every
-    // JPEG (EXIF thumbnails push it back, but not this far).
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = f.read(&mut buf).await?;
-    buf.truncate(n);
+    let f = tokio::fs::File::open(source).await?;
+    // `take` + `read_to_end` loops past short reads, which a network share
+    // can return before EOF; one `read` could stop short of the marker.
+    let mut buf = Vec::with_capacity(HEADER_BYTES as usize);
+    f.take(HEADER_BYTES).read_to_end(&mut buf).await?;
     Ok(width_from_header(&buf))
 }
 
