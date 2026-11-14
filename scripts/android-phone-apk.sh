@@ -47,6 +47,11 @@ out=${PHAROS_ANDROID_APK_OUT:-$target_dir/pharos-phone-$profile.apk}
 gradle_root=$target_dir/dx/pharos-phone/$profile/android/app
 main_dir=$gradle_root/app/src/main
 
+# pharos-ui includes the page visualiser's wasm bundle at compile time, as for
+# the TV; without this step a clean tree fails to build or ships a stale one.
+echo "android-phone-apk: building the page visualiser" >&2
+nix develop -c sh scripts/tv-visualiser.sh
+
 # shellcheck disable=SC2016 # expanded by the dev shell, not here
 android_home=$(nix develop .#android -c sh -c 'echo "$ANDROID_HOME"')
 build_tools=$android_home/build-tools/35.0.0
