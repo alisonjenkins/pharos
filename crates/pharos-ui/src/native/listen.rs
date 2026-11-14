@@ -106,6 +106,10 @@ fn note_stored(
 struct Tap {
     tap: Rc<RefCell<Option<Box<dyn AudioTap>>>>,
     tried: Rc<Cell<bool>>,
+    /// Set when the host's engine plays the song and there is no element:
+    /// whether it is playing. Nothing is tapped, and the visualiser follows
+    /// this instead of the element.
+    on_host: Rc<Cell<Option<bool>>>,
     /// Why the last attempt waited, so each new reason is logged once.
     waiting: Rc<Cell<Option<&'static str>>>,
 }
@@ -124,7 +128,7 @@ impl Tap {
     /// song is tapped with the player shrunk too (B734, V682): the tap's
     /// running context is what keeps the output awake through a pause.
     fn connect(&self, media_id: &str) {
-        if self.tried.get() {
+        if self.tried.get() || self.on_host.get().is_some() {
             return;
         }
         let waiting = if !platform::media_playing(media_id) {
@@ -217,6 +221,9 @@ pub fn ListenView(
     /// hands over to the next.
     #[props(default = VIDEO_ID)]
     media_id: &'static str,
+    /// The host's engine plays the song, so the screen draws no `<audio>`.
+    #[props(default)]
+    on_host: bool,
     /// The position as a signal, when the player keeps it apart from `media`
     /// so its own render does not run on every tick (B815).
     #[props(default)]
@@ -231,6 +238,7 @@ pub fn ListenView(
         ..media
     };
     let tap = use_hook(Tap::default);
+    tap.on_host.set(on_host.then_some(!media.paused));
     // A choice below that this device could not store (FR-705).
     let not_stored = use_signal(move || not_stored);
     let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
@@ -449,28 +457,30 @@ pub fn ListenView(
                     if let Some(meta) = meta {
                         p { class: "pharos-listen-meta", title: "{meta}", "{meta}" }
                     }
-                    audio {
-                        id: media_id,
-                        class: "pharos-audio",
-                        autoplay: true,
-                        onplaying: {
-                            let tap = tap.clone();
-                            move |_| {
-                                platform::wake_media_tap(media_id);
-                                tap.connect(media_id);
-                                on_media.call(MediaEvent::Playing);
-                            }
-                        },
-                        onpause: move |_| on_media.call(MediaEvent::Pause),
-                        onseeked: move |_| {
-                            scrub.set(None);
-                            on_media.call(MediaEvent::Seeked);
-                        },
-                        ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
-                        onended: move |_| on_media.call(MediaEvent::Ended),
-                        onvolumechange: move |_| on_media.call(MediaEvent::Changed),
-                        ondurationchange: move |_| on_media.call(MediaEvent::Changed),
-                        onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                    if !on_host {
+                        audio {
+                            id: media_id,
+                            class: "pharos-audio",
+                            autoplay: true,
+                            onplaying: {
+                                let tap = tap.clone();
+                                move |_| {
+                                    platform::wake_media_tap(media_id);
+                                    tap.connect(media_id);
+                                    on_media.call(MediaEvent::Playing);
+                                }
+                            },
+                            onpause: move |_| on_media.call(MediaEvent::Pause),
+                            onseeked: move |_| {
+                                scrub.set(None);
+                                on_media.call(MediaEvent::Seeked);
+                            },
+                            ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
+                            onended: move |_| on_media.call(MediaEvent::Ended),
+                            onvolumechange: move |_| on_media.call(MediaEvent::Changed),
+                            ondurationchange: move |_| on_media.call(MediaEvent::Changed),
+                            onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                        }
                     }
                     div { class: "pharos-listen-seek",
                         input {
@@ -1122,7 +1132,9 @@ async fn draw(
         platform::animation_frame().await;
         if idle(
             drawn,
-            platform::media_playing(media_id),
+            tap.on_host
+                .get()
+                .unwrap_or_else(|| platform::media_playing(media_id)),
             surface.needs_frame(),
         ) {
             platform::sleep_ms(IDLE_CHECK_MS).await;
@@ -1191,6 +1203,17 @@ mod tests {
         lyrics: Option<Lyrics>,
         compact: bool,
     ) -> String {
+        render_on(title, image, media, lyrics, compact, false)
+    }
+
+    fn render_on(
+        title: &str,
+        image: Option<&str>,
+        media: MediaState,
+        lyrics: Option<Lyrics>,
+        compact: bool,
+        on_host: bool,
+    ) -> String {
         let (title, image) = (title.to_owned(), image.map(str::to_owned));
         let mut dom = VirtualDom::new_with_props(
             move |()| {
@@ -1209,6 +1232,7 @@ mod tests {
                         on_media: |_| {},
                         on_control: |_| {},
                         compact,
+                        on_host,
                     }
                 }
             },
@@ -1216,6 +1240,25 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// With the host's engine the screen has no `<audio>`, and it is the
+    /// only thing that differs: same controls, same markup, same classes.
+    #[test]
+    fn a_song_on_the_host_draws_the_same_screen_without_an_audio_element() {
+        let media = MediaState {
+            position_ms: 61_000,
+            duration_ms: 330_000,
+            paused: false,
+            ..MediaState::default()
+        };
+        let element = render_on("Teardrop", None, media, None, false, false);
+        let host = render_on("Teardrop", None, media, None, false, true);
+        assert!(element.contains("<audio"), "{element}");
+        assert!(!host.contains("<audio"), "{host}");
+        let (start, rest) = element.split_once("<audio").expect("audio tag");
+        let (_, end) = rest.split_once("</audio>").expect("audio close");
+        assert_eq!(host, format!("{start}{end}"));
     }
 
     /// A choice stored after one that was not clears the notice, so it
