@@ -12,6 +12,7 @@ public class Context {
   public Intent registerReceiver(BroadcastReceiver r, IntentFilter f, String permission, android.os.Handler h, int flags) { receiverPermissions.put(f.action, permission); return registerReceiver(r, f, flags); }
   public void unregisterReceiver(BroadcastReceiver r) { if (receivers.containsValue(r)) unregistered.add(r); }
   public android.content.res.Resources getResources() { return new android.content.res.Resources(); }
+  public android.content.pm.PackageManager getPackageManager() { return new android.content.pm.PackageManager(); }
   public String getPackageName() { return "com.alisonjenkins.pharos.auto"; }
   public java.io.File getFilesDir() { java.io.File d = new java.io.File(getCacheDir(), "pharos-jvm-check-files"); d.mkdirs(); return d; }
 }

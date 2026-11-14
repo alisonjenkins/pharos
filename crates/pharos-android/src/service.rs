@@ -200,19 +200,150 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
     })
 }
 
+/// `Process.SYSTEM_UID`.
+const SYSTEM_UID: i32 = 1000;
+/// `ApplicationInfo.FLAG_SYSTEM`.
+const FLAG_SYSTEM: i32 = 1;
+
+/// What the platform says about a media-browser client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caller {
+    pub uid: i32,
+    pub own_uid: i32,
+    /// The claimed package is one of the calling uid's packages.
+    pub owns_package: bool,
+    /// That package is on the system image (Android Auto, SystemUI's media
+    /// controls, the Assistant); a sideload cannot replace one.
+    pub system_app: bool,
+}
+
+/// Whether `caller` may browse the signed-in library: `Ok(reason)` or
+/// `Err(reason)`. A package name alone proves nothing, so it must belong to
+/// the calling uid and be a system app.
+pub(crate) fn access(caller: &Caller) -> Result<&'static str, &'static str> {
+    if caller.uid == caller.own_uid {
+        return Ok("own_app");
+    }
+    if caller.uid == SYSTEM_UID || caller.uid == 0 {
+        return Ok("system_uid");
+    }
+    if !caller.owns_package {
+        return Err("package_not_of_uid");
+    }
+    if caller.system_app {
+        Ok("system_app")
+    } else {
+        Err("not_system_app")
+    }
+}
+
+/// Clears a pending Java exception left by a failed call, so the next JNI
+/// call is legal.
+fn clear_exception(env: &mut JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+}
+
+fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
+    let own_uid = env
+        .call_static_method("android/os/Process", "myUid", "()I", &[])
+        .and_then(|v| v.i())
+        .map_err(jerr("Process.myUid"))?;
+    let pm = env
+        .call_method(
+            ctx,
+            "getPackageManager",
+            "()Landroid/content/pm/PackageManager;",
+            &[],
+        )
+        .and_then(|v| v.l())
+        .map_err(jerr("getPackageManager"))?;
+    let owned = match env
+        .call_method(
+            &pm,
+            "getPackagesForUid",
+            "(I)[Ljava/lang/String;",
+            &[JValue::Int(uid)],
+        )
+        .and_then(|v| v.l())
+    {
+        Ok(a) => a,
+        Err(e) => {
+            clear_exception(env);
+            return Err(format!("getPackagesForUid({uid}): {e}"));
+        }
+    };
+    let mut owns_package = false;
+    if !owned.is_null() {
+        let owned = jni::objects::JObjectArray::from(owned);
+        let n = env
+            .get_array_length(&owned)
+            .map_err(jerr("packages length"))?;
+        for i in 0..n {
+            let name = env
+                .get_object_array_element(&owned, i)
+                .map_err(jerr("packages element"))?;
+            if !name.is_null() && string(env, &JString::from(name))? == pkg {
+                owns_package = true;
+                break;
+            }
+        }
+    }
+    let mut system_app = false;
+    if owns_package {
+        let name = JObject::from(env.new_string(pkg).map_err(jerr("package name"))?);
+        match env
+            .call_method(
+                &pm,
+                "getApplicationInfo",
+                "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;",
+                &[JValue::Object(&name), JValue::Int(0)],
+            )
+            .and_then(|v| v.l())
+        {
+            Ok(info) => {
+                let flags = env
+                    .get_field(&info, "flags", "I")
+                    .and_then(|v| v.i())
+                    .map_err(jerr("ApplicationInfo.flags"))?;
+                system_app = flags & FLAG_SYSTEM != 0;
+            }
+            // NameNotFoundException: the package went away; not a system app.
+            Err(_) => clear_exception(env),
+        }
+    }
+    Ok(Caller {
+        uid,
+        own_uid,
+        owns_package,
+        system_app,
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onGetRoot<'l>(
     mut env: JNIEnv<'l>,
-    _this: JObject<'l>,
+    this: JObject<'l>,
     package: JString<'l>,
     uid: i32,
     _hints: JObject<'l>,
 ) -> jobject {
     guarded(&mut env, "onGetRoot", std::ptr::null_mut(), |env| {
         let pkg = string(env, &package)?;
+        let caller = caller(env, &this, &pkg, uid)?;
+        let verdict = access(&caller);
         log(&format!(
-            "onGetRoot package={pkg} uid={uid} verdict=allow reason=any_caller"
+            "onGetRoot package={pkg} uid={uid} own_uid={} owns_package={} system_app={} verdict={} reason={}",
+            caller.own_uid,
+            caller.owns_package,
+            caller.system_app,
+            if verdict.is_ok() { "allow" } else { "deny" },
+            verdict.unwrap_or_else(|reason| reason),
         ));
+        if verdict.is_err() {
+            return Ok(std::ptr::null_mut());
+        }
         let root = JObject::from(env.new_string(ROOT).map_err(jerr("root"))?);
         // Without this extra the car hides its search button (DHU check,
         // 2026-11-14): voice still binds, but typed search never reaches onSearch.
@@ -262,4 +393,42 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
             kids
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{access, Caller};
+
+    fn caller(uid: i32, owns_package: bool, system_app: bool) -> Caller {
+        Caller {
+            uid,
+            own_uid: 10500,
+            owns_package,
+            system_app,
+        }
+    }
+
+    #[test]
+    fn this_app_and_the_system_may_browse() {
+        assert_eq!(access(&caller(10500, false, false)), Ok("own_app"));
+        assert_eq!(access(&caller(1000, false, false)), Ok("system_uid"));
+    }
+
+    #[test]
+    fn a_system_app_whose_package_is_its_own_may_browse() {
+        assert_eq!(access(&caller(10123, true, true)), Ok("system_app"));
+    }
+
+    #[test]
+    fn an_installed_app_may_not_browse_the_library() {
+        assert_eq!(access(&caller(10777, true, false)), Err("not_system_app"));
+    }
+
+    #[test]
+    fn a_package_name_the_caller_does_not_own_proves_nothing() {
+        assert_eq!(
+            access(&caller(10777, false, true)),
+            Err("package_not_of_uid")
+        );
+    }
 }
