@@ -130,6 +130,7 @@ const DEFAULT_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 struct StoreState {
     cap: u64,
     free: u64,
+    online: bool,
     /// What the server would list for each container: track id and size.
     catalogue: HashMap<ContainerRef, Vec<(String, u64)>>,
     pinned: Vec<Download>,
@@ -145,6 +146,7 @@ impl FakeOfflineStore {
             inner: Mutex::new(StoreState {
                 cap: DEFAULT_CAP_BYTES,
                 free: u64::MAX,
+                online: true,
                 catalogue: HashMap::new(),
                 pinned: Vec::new(),
             }),
@@ -158,6 +160,10 @@ impl FakeOfflineStore {
 
     pub fn set_free_bytes(&self, bytes: u64) {
         lock(&self.inner).free = bytes;
+    }
+
+    pub fn set_online(&self, online: bool) {
+        lock(&self.inner).online = online;
     }
 
     /// Marks a pinned track as failed, as a dropped download would.
@@ -252,6 +258,10 @@ impl OfflineStore for FakeOfflineStore {
                 .any(|t| t.id == track_id && t.state == TrackState::Cached)
         })
     }
+
+    fn is_online(&self) -> bool {
+        lock(&self.inner).online
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +278,14 @@ mod tests {
             kind: ContainerKind::Album,
             id: id.into(),
         }
+    }
+
+    #[test]
+    fn the_store_is_online_until_told_otherwise() {
+        let s = FakeOfflineStore::new();
+        assert!(s.is_online());
+        s.set_online(false);
+        assert!(!s.is_online());
     }
 
     #[test]
