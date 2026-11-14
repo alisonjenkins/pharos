@@ -9,6 +9,8 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::watch;
 
+pub mod fake;
+
 /// A set-once cell holding a port implementation.
 pub struct Slot<T: ?Sized> {
     cell: OnceLock<Arc<T>>,
