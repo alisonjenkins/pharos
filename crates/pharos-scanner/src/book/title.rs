@@ -146,10 +146,7 @@ mod tests {
             ("A Book Title (z-lib.org)", "A Book Title"),
             ("A Book Title [libsite.com]", "A Book Title"),
             // Trailing id.
-            (
-                "making-a-paper-kite 1234509876",
-                "making a paper kite",
-            ),
+            ("making-a-paper-kite 1234509876", "making a paper kite"),
             ("A Book Title 9781234567897", "A Book Title"),
             // Copy counters.
             ("A Book Title (1)", "A Book Title"),
