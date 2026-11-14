@@ -2777,6 +2777,12 @@ pub struct MediaProbe {
     // No `skip_serializing_if`: bincode over the worker pipe (see above).
     #[serde(default)]
     pub picture_check: Option<PictureCheck>,
+    /// The file carries an embedded cover (an `attached_pic` stream). Set by
+    /// the prober, read by the scanner to record an embedded
+    /// Primary row (B1437). Not stored: the artwork row is the record.
+    // No `skip_serializing_if`: bincode over the worker pipe (see above).
+    #[serde(default)]
+    pub has_embedded_cover: bool,
 }
 
 impl MediaProbe {

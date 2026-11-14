@@ -157,6 +157,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 // Not written by `put`; the sweep owns it (V385).
                 audio_analysis: None,
                 picture_check: None,
+                has_embedded_cover: false,
             },
         )
 }

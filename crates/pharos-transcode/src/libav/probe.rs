@@ -142,6 +142,13 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
         }
     }
 
+    let has_embedded_cover = ictx.streams().any(|stream| {
+        // SAFETY: stream + its codecpar are valid for the iteration.
+        let st = unsafe { &*stream.as_ptr() };
+        let par = unsafe { &*st.codecpar };
+        par.codec_type == ffi::AVMediaType::VIDEO
+            && st.disposition & ffi::AV_DISPOSITION_ATTACHED_PIC != 0
+    });
     let chapters = extract_chapters(fmt);
     let ftags = format_tags(fmt);
     let kind = if video.is_some() {
@@ -203,6 +210,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             // Written by the audio analysis sweep, never by the prober.
             audio_analysis: None,
             picture_check: None,
+            has_embedded_cover,
         },
     })
 }

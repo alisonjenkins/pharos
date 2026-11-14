@@ -535,6 +535,11 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         })
         .collect();
 
+    let has_embedded_cover = parsed
+        .streams
+        .iter()
+        .any(|s| s.codec_type == "video" && s.disposition.attached_pic != 0);
+
     Ok(ProbeInfo {
         kind,
         probe: MediaProbe {
@@ -602,6 +607,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             // Written by the audio analysis sweep, never by the prober.
             audio_analysis: None,
             picture_check: None,
+            has_embedded_cover,
         },
     })
 }
@@ -866,6 +872,26 @@ mod tests {
         assert_eq!(p.track_number, Some(1));
         // Original release year wins over the 2008 reissue `date`.
         assert_eq!(p.year, Some(1991));
+    }
+
+    #[test]
+    fn parse_audio_reports_an_embedded_cover_only_when_one_is_attached() {
+        // B1437 — an `attached_pic` video stream is the file's cover; a plain
+        // audio file and a real video track are not.
+        let with = br#"{"streams": [
+            {"codec_type": "audio", "codec_name": "mp3"},
+            {"codec_type": "video", "codec_name": "mjpeg",
+             "disposition": {"attached_pic": 1}}],
+            "format": {"format_name": "mp3"}}"#;
+        let p = parse_ffprobe_output(with).unwrap();
+        assert_eq!(p.kind, MediaKind::Audio);
+        assert!(p.probe.has_embedded_cover);
+        let without = br#"{"streams": [{"codec_type": "audio", "codec_name": "mp3"}],
+            "format": {"format_name": "mp3"}}"#;
+        assert!(!parse_ffprobe_output(without).unwrap().probe.has_embedded_cover);
+        let video = br#"{"streams": [{"codec_type": "video", "codec_name": "h264"}],
+            "format": {"format_name": "mov"}}"#;
+        assert!(!parse_ffprobe_output(video).unwrap().probe.has_embedded_cover);
     }
 
     #[test]
