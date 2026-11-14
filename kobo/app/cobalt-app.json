@@ -1,0 +1,10 @@
+{
+  "id": "pharos",
+  "display_name": "Pharos",
+  "short_label": "Pharos",
+  "summary": "Listen to music and audiobooks and read ebooks from your own Pharos server.",
+  "version": "0.1.0",
+  "release_notes": "Spike: sign in with a code, list music, play a track.",
+  "glyph": "headphones",
+  "capabilities": ["network", "audio", "bluetooth-audio", "bluetooth-control"]
+}

@@ -1,0 +1,97 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ff9a0140..eadda66e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1559,6 +1559,15 @@ dependencies = [
+  "kobo-zstory",
+ ]
+ 
++[[package]]
++name = "kobo-pharos"
++version = "0.3.37"
++dependencies = [
++ "kobo-audio",
++ "kobo-json",
++ "kobo-sdk",
++]
++
+ [[package]]
+ name = "kobo-policy"
+ version = "0.3.37"
+diff --git a/Cargo.toml b/Cargo.toml
+index 209fdaa9..68ff56b8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -54,6 +54,7 @@ members = [
+     "examples/gallery",
+     "examples/gutenbird",
+     "examples/hello",
++    "examples/pharos",
+     "examples/hn",
+     "examples/books",
+     "examples/launcher",
+diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
+index 6220e125..752dd9fd 100644
+--- a/crates/kobo-cli/src/main.rs
++++ b/crates/kobo-cli/src/main.rs
+@@ -106,6 +106,7 @@ const INSTALLED_PACKAGES: &[(&str, Option<&str>)] = &[
+     ("kobo-settings", None),
+     ("kobo-books", None),
+     ("kobo-sidekick", None),
++    ("kobo-pharos", None),
+     ("kobo-store", None),
+ ];
+ /// Applications released through Store, including the initial built-in copies
+diff --git a/crates/kobod/src/app_store.rs b/crates/kobod/src/app_store.rs
+index fb5d8666..8c4a7ae5 100644
+--- a/crates/kobod/src/app_store.rs
++++ b/crates/kobod/src/app_store.rs
+@@ -127,6 +127,17 @@ const MANAGED_BUILTINS: &[BuiltinApp] = &[
+         glyph: Glyph::Rss,
+         capabilities: &["network"],
+     },
++    BuiltinApp {
++        id: "pharos",
++        title: "Pharos",
++        label: "Pharos",
++        summary: "Your music, audiobooks and books from your own Pharos server.",
++        version: "0.1.0",
++        glyph: Glyph::Headphones,
++        // The same four as Audiobook Studio, for the same reason: the
++        // player's headphone picker makes `bluetooth-control` requests.
++        capabilities: &["network", "audio", "bluetooth-audio", "bluetooth-control"],
++    },
+     BuiltinApp {
+         id: "sidekick",
+         title: "Sidekick",
+diff --git a/crates/kobod/src/update.rs b/crates/kobod/src/update.rs
+index f136bcf2..bf8710d5 100644
+--- a/crates/kobod/src/update.rs
++++ b/crates/kobod/src/update.rs
+@@ -16,6 +16,9 @@
+ use crate::blackbox::trace;
+ use kobo_protocol::DeviceError;
+ 
++/// This runtime was built with the Pharos app added (see `apply`).
++const PHAROS_BUILD: bool = true;
++
+ /// Where the trace goes when there is no device to write one on.
+ ///
+ /// `install` is built for the host too, so that the unpacking and the
+@@ -112,6 +115,16 @@ const BLOCK: usize = 512;
+ /// [`DeviceError::Backend`] when the book partition refuses a write.
+ #[cfg(feature = "device-write")]
+ pub fn apply(url: &str, sha256: &str) -> Result<(), DeviceError> {
++    // Pharos build: this Cobalt carries the Pharos app, which the official
++    // releases do not. Installing one would remove Pharos from the reader, so
++    // the platform is updated only by rebuilding from a newer pinned Cobalt.
++    if PHAROS_BUILD {
++        trace(&format!(
++            "platform update: refused, this is a Pharos build (asked for {url})"
++        ));
++        let _ = sha256;
++        return Err(DeviceError::InvalidInput);
++    }
+     // Traced before it is returned, because the reply an owner sees is one of
+     // seven shared codes and several failures here map to the same one. An
+     // update that could not be downloaded and an update whose archive would
