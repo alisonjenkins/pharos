@@ -116,12 +116,37 @@ pub enum Step {
 pub struct Follow {
     /// The snapshot last seen while the host was on this song.
     seen: Option<PlayerSnapshot>,
+    /// The error the last snapshot carried: only a change to a new one is a
+    /// failure of this attempt.
+    error: Option<String>,
 }
 
 impl Follow {
+    /// A follower that treats the error `snapshot` already carries as old.
+    pub fn after(snapshot: &PlayerSnapshot) -> Self {
+        Self {
+            seen: None,
+            error: snapshot.error.clone(),
+        }
+    }
+
+    /// The host's cause, when `snapshot` carries one not seen before. The host
+    /// may fail before it reaches the song, so this does not wait for it.
+    fn new_failure(&mut self, snapshot: &PlayerSnapshot) -> Option<Step> {
+        if snapshot.error == self.error {
+            return None;
+        }
+        self.error.clone_from(&snapshot.error);
+        snapshot.error.clone().map(Step::Failed)
+    }
+
     pub fn step(&mut self, playing: ItemRef, snapshot: &PlayerSnapshot) -> Vec<Step> {
         let current = current_of(snapshot);
+        let failure = self.new_failure(snapshot);
         if current != Some(playing) {
+            if let Some(failed) = failure {
+                return vec![failed];
+            }
             // Before the host reaches this song there is nothing to follow;
             // once it has been here and is elsewhere, it moved on or stopped.
             let Some(was) = self.seen.take() else {
@@ -164,11 +189,7 @@ impl Follow {
                 MediaEvent::TimeUpdate
             }));
         }
-        if snapshot.error != before.error {
-            if let Some(cause) = &snapshot.error {
-                steps.push(Step::Failed(cause.clone()));
-            }
-        }
+        steps.extend(failure);
         steps
     }
 }
@@ -205,10 +226,14 @@ impl Music {
         self.sent.borrow().clone()
     }
 
-    /// Start `playing` and what follows it, unless the host is on it already.
+    /// Start `playing` and what follows it, unless the host is playing it already
+    /// (a song it stopped on, finished or failed is not playing).
     /// Returns whether it asked the host to play.
     pub fn begin(&self, playing: ItemRef, upcoming: &[ItemRef]) -> bool {
-        if current_of(&self.snapshot()) == Some(playing) {
+        let snapshot = self.snapshot();
+        let live = !matches!(snapshot.state, PlayState::Idle | PlayState::Ended)
+            && snapshot.error.is_none();
+        if live && current_of(&snapshot) == Some(playing) {
             return false;
         }
         self.restart(playing, upcoming);
@@ -644,6 +669,41 @@ mod tests {
         let mut f = Follow::default();
         m.begin(id(1), &[]);
         assert!(follow(&fake, &mut f, 2).is_empty());
+    }
+
+    #[test]
+    fn a_failure_before_the_host_reaches_the_song_is_surfaced_once() {
+        let (fake, m) = music();
+        let mut f = Follow::after(&m.snapshot());
+        // The host refuses the play: it never reaches song 1.
+        fake.play(Vec::new(), 0);
+        assert_eq!(
+            follow(&fake, &mut f, 1),
+            vec![Step::Failed("start index 0 is outside a queue of 0".into())]
+        );
+        assert!(follow(&fake, &mut f, 1).is_empty());
+    }
+
+    #[test]
+    fn an_error_from_before_the_attempt_is_not_this_songs_failure() {
+        let (fake, m) = music();
+        fake.play(Vec::new(), 0);
+        let mut f = Follow::after(&m.snapshot());
+        assert!(follow(&fake, &mut f, 1).is_empty());
+    }
+
+    #[test]
+    fn begin_plays_again_when_the_hosts_song_is_stale() {
+        let (fake, m) = music();
+        fake.play(vec!["7".into()], 0);
+        fake.next();
+        assert_eq!(fake.snapshot().state, PlayState::Ended);
+        assert!(m.begin(id(7), &[]), "an ended song restarts");
+
+        fake.play(vec!["7".into()], 0);
+        fake.play(Vec::new(), 0);
+        assert!(fake.snapshot().error.is_some());
+        assert!(m.begin(id(7), &[]), "a failed attempt is retried");
     }
 
     #[test]
