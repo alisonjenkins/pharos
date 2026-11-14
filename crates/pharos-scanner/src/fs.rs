@@ -534,8 +534,10 @@ impl<P: Prober> FsScanner<P> {
         &self,
         path: &Path,
         probe: &pharos_core::MediaProbe,
-    ) -> Option<crate::audiobook::Classified> {
-        self.course_roots.root_of(path)?;
+    ) -> Result<Option<crate::audiobook::Classified>, ProbeMiss> {
+        if self.course_roots.root_of(path).is_none() {
+            return Ok(None);
+        }
         let (path, probe, roots) = (path.to_path_buf(), probe.clone(), self.course_roots.clone());
         let shown = path.clone();
         match tokio::task::spawn_blocking(move || {
@@ -543,10 +545,14 @@ impl<P: Prober> FsScanner<P> {
         })
         .await
         {
-            Ok(got) => got,
+            Ok(Ok(got)) => Ok(got),
+            Ok(Err(e)) => {
+                tracing::warn!(path = %shown.display(), error = %e, "audiobook: its book folder could not be listed whole; trying again next pass");
+                Err(ProbeMiss::Incomplete)
+            }
             Err(e) => {
                 tracing::warn!(path = %shown.display(), error = %e, "audiobook: the classify task failed; stored as a song");
-                None
+                Ok(None)
             }
         }
     }
@@ -1244,6 +1250,7 @@ impl<P: Prober> FsScanner<P> {
                     match &item {
                         Ok(_) | Err(ProbeMiss::Excluded) => memo.forget(probed_id),
                         Err(ProbeMiss::Unreadable) => memo.record(probed_id, sig),
+                        Err(ProbeMiss::Incomplete) => {}
                     }
                 }
                 let mut item = match item {
@@ -1258,6 +1265,14 @@ impl<P: Prober> FsScanner<P> {
                     }
                     // Left unseen, so the sweep takes a row the file had.
                     Err(ProbeMiss::Excluded) => continue,
+                    Err(ProbeMiss::Incomplete) => {
+                        if let Some((path, mtime, size)) = kept {
+                            store.mark_seen(row, scan_id, mtime, size).await?;
+                            seen += 1;
+                            keep_unreadable_row(row, &path, "book_inventory_incomplete");
+                        }
+                        continue;
+                    }
                 };
                 item.id = row;
                 let item_id = item.id;
@@ -2070,7 +2085,7 @@ impl<P: Prober> FsScanner<P> {
                 // ADR-0132 — audio under a Books root is an audiobook, or
                 // left out when it is a loose file without chapters.
                 let book = match info.kind {
-                    MediaKind::Audio => self.audiobook(&path, &probe).await,
+                    MediaKind::Audio => self.audiobook(&path, &probe).await?,
                     _ => None,
                 };
                 if let Some(got) = &book {
@@ -2182,6 +2197,10 @@ enum ProbeMiss {
     /// without chapters in a Books root, ADR-0132): a row already there is
     /// swept, and the memo forgets the file.
     Excluded,
+    /// What the file is could not be told this pass (its book folder could
+    /// not be listed whole): a row already there is kept as it was, and the
+    /// memo does not hold it, so the next pass tries again.
+    Incomplete,
 }
 
 /// What became of a video read as a course lesson: the
