@@ -263,6 +263,9 @@ mod tests {
 
     #[test]
     fn a_player_whose_thread_is_gone_reports_it_on_the_snapshot() {
+        let _channel = crate::snapshot::TEST_CHANNEL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = mpsc::channel();
         drop(rx);
         let player = Player { tx };
