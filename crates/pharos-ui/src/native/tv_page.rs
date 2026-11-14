@@ -8,6 +8,7 @@ use pharos_hls::planner::Track;
 use serde::Deserialize;
 
 use super::hls_trace::{Appended, Clip, Signal};
+use super::shell::Shell;
 
 /// The server a build points at when nothing is stored: `PHAROS_TV_SERVER`
 /// at build time, else Alison's prototype server (spec 025 slice 0).
@@ -148,10 +149,26 @@ pub fn proxied_segments() -> &'static [&'static str] {
 /// An artwork `src` (`/Items/{id}/Images/…`) as the server's own URL, which
 /// the WebView loads and caches itself; any other `src` as it is.
 pub fn art_src(base: &str, src: &str) -> String {
-    if src.starts_with('/') && src.contains("/Images/") {
+    if is_server_art(src) {
         server_url(base, src)
     } else {
         src.to_owned()
+    }
+}
+
+/// Whether `src` is artwork on the server (`/Items/{id}/Images/…`).
+pub fn is_server_art(src: &str) -> bool {
+    src.starts_with('/') && src.contains("/Images/")
+}
+
+/// Where the page loads artwork from in `shell`. The phone's WebView cannot
+/// resolve the server's name, though the app's own resolver can, so there
+/// artwork stays relative and goes through the page proxy; the TV loads it
+/// straight from the server (see `android_page::art_src`).
+pub fn art_src_for(shell: Shell, base: &str, src: &str) -> String {
+    match shell {
+        Shell::AndroidPhone => src.to_owned(),
+        Shell::AndroidTv | Shell::Browser => art_src(base, src),
     }
 }
 
@@ -1760,6 +1777,17 @@ mod tests {
             "/videos/1/master.m3u8"
         );
         assert_eq!(art_src("https://s", "https://x/a.png"), "https://x/a.png");
+    }
+
+    #[test]
+    fn the_phone_loads_artwork_through_the_proxy_and_the_tv_direct() {
+        let art = "/Items/1/Images/Primary?tag=a";
+        assert_eq!(art_src_for(Shell::AndroidPhone, "https://s", art), art);
+        assert!(proxied(art.split('/').nth(1).unwrap_or_default()));
+        assert_eq!(
+            art_src_for(Shell::AndroidTv, "https://s", art),
+            "https://s/Items/1/Images/Primary?tag=a"
+        );
     }
 
     #[test]
