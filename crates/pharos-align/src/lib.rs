@@ -23,6 +23,7 @@ pub mod recognise;
 pub mod refine;
 pub mod separate;
 pub mod service;
+pub mod stitch;
 pub mod text;
 pub mod tokens;
 pub mod transcript;
