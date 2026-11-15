@@ -256,7 +256,9 @@ impl Reading {
                 .as_ref()
                 .map_or("Book", |book| book.title.as_str());
             if let Some(screen) = self.view.screen(title) {
-                return screen;
+                // Back closes the book onto the list; left to the platform it
+                // would leave Pharos for the launcher.
+                return screen.with_own_back(true);
             }
         }
         if let Some(screen) = self.busy_screen() {
