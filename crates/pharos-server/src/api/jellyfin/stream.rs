@@ -542,7 +542,11 @@ fn audio_remux_args(
     if let Some(n) = max_channels.filter(|n| *n > 0) {
         // libmp3lame encodes only mono and stereo: `-ac 6` fails the encode
         // after the 200 has gone out, leaving the client with no audio.
-        let n = if ffmpeg_codec == "libmp3lame" { n.min(2) } else { n };
+        let n = if ffmpeg_codec == "libmp3lame" {
+            n.min(2)
+        } else {
+            n
+        };
         args.push("-ac".into());
         args.push(n.to_string());
     }
