@@ -590,6 +590,31 @@ index b6e6ed5..811a2e3 100644
      /// Every picture the page being read refers to, in the order it does.
      ///
      /// The subset of [`Self::pictures_wanted`] that is actually on screen, and
+diff --git a/crates/kobo-ui/src/lib.rs b/crates/kobo-ui/src/lib.rs
+index b834cea..cefd140 100644
+--- a/crates/kobo-ui/src/lib.rs
++++ b/crates/kobo-ui/src/lib.rs
+@@ -16617,13 +16617,16 @@ const fn rect_is_inside(rect: Rect, bounds: Rect) -> bool {
+         && rect.y.saturating_add(rect.height) <= bounds.y.saturating_add(bounds.height)
+ }
+ 
+-/// Eight megabytes, which is a shelf of about seventy covers.
++/// Twenty-four megabytes: a shelf of about two hundred covers, or five or six
++/// full-page colour plates.
+ ///
+ /// The bound is on bytes rather than on a count, because a count would let one
+ /// application holding a few large pictures use far more memory than another
+-/// holding many small ones. This device has 512 MB and no swap, so an unbounded
+-/// cache is a way to have the kernel kill the runtime.
+-pub const DEFAULT_PICTURE_BUDGET: usize = 8 * 1024 * 1024;
++/// holding many small ones. These devices have no swap, so an unbounded cache
++/// is a way to have the kernel kill the runtime. A colour plate decodes to about
++/// four megabytes, so eight held one; twenty-four is still under five percent
++/// of a 512 MB reader.
++pub const DEFAULT_PICTURE_BUDGET: usize = 24 * 1024 * 1024;
+ 
+ struct HeldPicture {
+     handle: PictureHandle,
 diff --git a/crates/kobod/src/app_store.rs b/crates/kobod/src/app_store.rs
 index fb5d866..8c4a7ae 100644
 --- a/crates/kobod/src/app_store.rs
