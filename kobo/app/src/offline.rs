@@ -7,6 +7,7 @@
 //! Both values are rewritten whole, oldest dropped first when one is full.
 
 use crate::api::{Entry, Page};
+use std::collections::HashMap;
 
 /// The most the saved albums may take. Under the store's own cap so a value
 /// that fits here is never refused there.
@@ -159,10 +160,24 @@ impl Offline {
     }
 }
 
+/// A place the listener reached in a track, with the order it was reported in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Place {
+    pub track: String,
+    pub position_ms: u64,
+    /// When the report that carried this place was issued: later is larger,
+    /// whatever the positions say (a seek back is newer and smaller). Places
+    /// read from the store are 0, older than anything this run issues.
+    pub issued: u64,
+}
+
 /// Places the listener reached that the server has not been told, by track.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Unsent {
-    places: Vec<(String, u64)>,
+    places: Vec<Place>,
+    /// The newest report of each track the server has acknowledged. Anything
+    /// issued before it is stale, so a late failure does not bring it back.
+    heard: HashMap<String, u64>,
 }
 
 impl Unsent {
@@ -172,31 +187,53 @@ impl Unsent {
     }
 
     #[must_use]
-    pub fn places(&self) -> &[(String, u64)] {
+    pub fn places(&self) -> &[Place] {
         &self.places
     }
 
-    /// Notes the place reached in `track`, replacing an older one.
-    pub fn note(&mut self, track: &str, position_ms: u64) {
-        self.places.retain(|(id, _)| id != track);
-        self.places.push((clean(track), position_ms));
+    /// Notes the place reached in `track` by the report `issued`, replacing
+    /// an older one. A place older than one already kept, or than what the
+    /// server has heard, is dropped. `true` when the kept places changed.
+    pub fn note(&mut self, track: &str, position_ms: u64, issued: u64) -> bool {
+        if self.heard.get(track).is_some_and(|heard| *heard >= issued) {
+            return false;
+        }
+        if self
+            .places
+            .iter()
+            .any(|place| place.track == track && place.issued > issued)
+        {
+            return false;
+        }
+        self.places.retain(|place| place.track != track);
+        self.places.push(Place {
+            track: clean(track),
+            position_ms,
+            issued,
+        });
         if self.places.len() > MAX_UNSENT {
             self.places.remove(0);
         }
+        true
     }
 
-    /// Forgets the place in `track`. `true` when there was one.
-    pub fn sent(&mut self, track: &str) -> bool {
+    /// The server heard the report `issued` for `track`: forgets the kept
+    /// place if it is that one or older. A place kept from a later report
+    /// stays. `true` when a place was forgotten.
+    pub fn sent(&mut self, track: &str, issued: u64) -> bool {
+        let heard = self.heard.entry(track.to_owned()).or_insert(issued);
+        *heard = (*heard).max(issued);
         let before = self.places.len();
-        self.places.retain(|(id, _)| id != track);
+        self.places
+            .retain(|place| place.track != track || place.issued > issued);
         self.places.len() != before
     }
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut text = String::new();
-        for (track, ms) in &self.places {
-            text.push_str(&format!("{track}\t{ms}\n"));
+        for place in &self.places {
+            text.push_str(&format!("{}\t{}\n", place.track, place.position_ms));
         }
         text.into_bytes()
     }
@@ -207,11 +244,19 @@ impl Unsent {
             .lines()
             .filter_map(|text| {
                 let (track, ms) = text.split_once('\t')?;
-                (!track.is_empty()).then_some((track.to_owned(), ms.parse().ok()?))
+                let position_ms = ms.parse().ok()?;
+                (!track.is_empty()).then(|| Place {
+                    track: track.to_owned(),
+                    position_ms,
+                    issued: 0,
+                })
             })
             .take(MAX_UNSENT)
             .collect();
-        Self { places }
+        Self {
+            places,
+            heard: HashMap::new(),
+        }
     }
 }
 
@@ -277,18 +322,59 @@ mod tests {
         assert!(!back.contains("al0"));
     }
 
+    fn kept(unsent: &Unsent) -> Vec<(&str, u64)> {
+        unsent
+            .places()
+            .iter()
+            .map(|place| (place.track.as_str(), place.position_ms))
+            .collect()
+    }
+
     #[test]
     fn an_unsent_place_is_replaced_by_a_newer_one_and_the_oldest_is_dropped_when_full() {
         let mut unsent = Unsent::default();
-        unsent.note("t1", 5);
-        unsent.note("t1", 9);
-        assert_eq!(unsent.places(), [("t1".to_owned(), 9)]);
+        assert!(unsent.note("t1", 5, 1));
+        assert!(unsent.note("t1", 9, 2));
+        assert_eq!(kept(&unsent), [("t1", 9)]);
         for at in 0..40 {
-            unsent.note(&format!("x{at}"), at);
+            unsent.note(&format!("x{at}"), at, 3 + at);
         }
         assert_eq!(unsent.places().len(), MAX_UNSENT);
-        assert_eq!(Unsent::decode(&unsent.encode()), unsent);
-        assert!(unsent.sent("x39"));
-        assert!(!unsent.sent("x39"));
+        let back = Unsent::decode(&unsent.encode());
+        assert_eq!(kept(&back), kept(&unsent));
+        assert!(unsent.sent("x39", 42));
+        assert!(!unsent.sent("x39", 42));
+    }
+
+    #[test]
+    fn the_later_report_wins_whatever_the_order_of_arrival_or_the_positions() {
+        // A seek back: report 2 is newer than report 1 and smaller.
+        let mut unsent = Unsent::default();
+        assert!(unsent.note("t1", 100, 2));
+        assert!(!unsent.note("t1", 900, 1));
+        assert_eq!(kept(&unsent), [("t1", 100)]);
+        let mut unsent = Unsent::default();
+        assert!(unsent.note("t1", 900, 1));
+        assert!(unsent.note("t1", 100, 2));
+        assert_eq!(kept(&unsent), [("t1", 100)]);
+    }
+
+    #[test]
+    fn a_success_forgets_only_what_it_carried_or_older() {
+        let mut unsent = Unsent::default();
+        unsent.note("t1", 100, 2);
+        assert!(!unsent.sent("t1", 1), "an older report heard");
+        assert_eq!(kept(&unsent), [("t1", 100)]);
+        assert!(unsent.sent("t1", 2));
+        assert!(unsent.is_empty());
+    }
+
+    #[test]
+    fn a_report_the_server_heard_is_not_kept_by_an_older_failure() {
+        let mut unsent = Unsent::default();
+        assert!(!unsent.sent("t1", 2));
+        assert!(!unsent.note("t1", 900, 1));
+        assert!(unsent.is_empty());
+        assert!(unsent.note("t1", 5, 3));
     }
 }

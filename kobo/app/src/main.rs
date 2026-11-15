@@ -14,7 +14,7 @@ use api::{Account, Entry, Page, Report};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
 use kobo_sdk::{Header, LogLevel, Task, TaskError, TaskId, TaskOutcome};
-use offline::{Offline, Unsent};
+use offline::{Offline, Place, Unsent};
 use std::collections::HashMap;
 use std::process::ExitCode;
 
@@ -77,11 +77,13 @@ enum Work {
         report: Report,
         track: String,
         position_ms: u64,
+        issued: u64,
     },
     ReportTimer,
     /// A place kept from when the server was out of reach, sent now.
     Replay {
         track: String,
+        issued: u64,
     },
     DownloadsTimer,
 }
@@ -113,7 +115,13 @@ struct Playing {
 struct Pharos {
     view: View,
     account: Option<Account>,
-    tasks: Vec<(TaskId, Work)>,
+    /// Each task with the account generation it was started under.
+    tasks: Vec<(TaskId, Work, u64)>,
+    /// Counts sign-outs: an answer to a task from an earlier account is
+    /// dropped, not applied to the next one.
+    generation: u64,
+    /// Counts the reports sent, to tell which of two is the later.
+    issued: u64,
     albums: Page,
     tracks: Page,
     page: usize,
@@ -141,6 +149,8 @@ impl Default for Pharos {
             view: View::Opening,
             account: None,
             tasks: Vec::new(),
+            generation: 0,
+            issued: 0,
             albums: Page::default(),
             tracks: Page::default(),
             page: 0,
@@ -168,7 +178,7 @@ impl Pharos {
 
     fn track(&mut self, context: &mut Context, task: Option<TaskId>, work: Work) {
         if let Some(task) = task {
-            self.tasks.push((task, work));
+            self.tasks.push((task, work, self.generation));
         } else {
             context.log(
                 LogLevel::Info,
@@ -218,6 +228,7 @@ impl Pharos {
 
     fn sign_out(&mut self, context: &mut Context) {
         self.stop_playing(context);
+        self.generation = self.generation.saturating_add(1);
         self.account = None;
         self.albums = Page::default();
         context.store().forget(ACCOUNT_KEY);
@@ -327,10 +338,12 @@ impl Pharos {
         let paused = !playing.player.is_playing();
         playing.sound_reported = !paused;
         let body = api::report_body(&playing.track, position_ms, paused);
+        self.issued = self.issued.saturating_add(1);
         let work = Work::Report {
             report,
             track: playing.track.clone(),
             position_ms,
+            issued: self.issued,
         };
         self.post(context, report.url(SERVER), body, work);
     }
@@ -340,27 +353,30 @@ impl Pharos {
     /// are newer than anything kept.
     fn replay_unsent(&mut self, context: &mut Context) {
         let playing = self.playing.as_ref().map(|playing| playing.track.clone());
-        let waiting: Vec<(String, u64)> = self
+        let waiting: Vec<Place> = self
             .unsent
             .places()
             .iter()
-            .filter(|(track, _)| Some(track) != playing.as_ref())
+            .filter(|place| Some(&place.track) != playing.as_ref())
             .cloned()
             .collect();
-        for (track, position_ms) in waiting {
-            let sending = self
-                .tasks
-                .iter()
-                .any(|(_, work)| matches!(work, Work::Replay { track: sent } if *sent == track));
+        for place in waiting {
+            let sending = self.tasks.iter().any(|(_, work, generation)| {
+                *generation == self.generation
+                    && matches!(work, Work::Replay { track, .. } if *track == place.track)
+            });
             if sending {
                 continue;
             }
-            let body = api::report_body(&track, position_ms, true);
+            let body = api::report_body(&place.track, place.position_ms, true);
             self.post(
                 context,
                 Report::Stopped.url(SERVER),
                 body,
-                Work::Replay { track },
+                Work::Replay {
+                    track: place.track,
+                    issued: place.issued,
+                },
             );
         }
     }
@@ -451,7 +467,13 @@ impl Pharos {
                 .get(&track.id)
                 .is_some_and(|kept| kept.have > 0)
         });
-        let checked_all = self.asked.len() >= self.tracks.entries.len();
+        // Every track of the album was among those asked about, not just as
+        // many: the playing track of another album takes a slot.
+        let checked_all = self
+            .tracks
+            .entries
+            .iter()
+            .all(|track| self.asked.iter().any(|(_, asked)| *asked == track.id));
         let changed = if any {
             self.offline.keep(&album, &self.tracks.entries)
         } else {
@@ -569,26 +591,27 @@ impl Pharos {
             Work::Report {
                 report,
                 track,
-                position_ms,
+                issued,
+                ..
             } => {
                 context.log(
                     LogLevel::Info,
                     format!("pharos: report {} sent", report.label()),
                 );
                 // The server hears this track again, so a kept place for it
-                // is stale; the others are news to it.
-                if self.unsent.sent(&track) {
+                // from this report or before is stale; the others are news
+                // to it.
+                if self.unsent.sent(&track, issued) {
                     self.save_unsent(context);
                 }
-                let _ = position_ms;
                 self.replay_unsent(context);
             }
-            Work::Replay { track } => {
+            Work::Replay { track, issued } => {
                 context.log(
                     LogLevel::Info,
                     format!("pharos: kept place sent track={track}"),
                 );
-                if self.unsent.sent(&track) {
+                if self.unsent.sent(&track, issued) {
                     self.save_unsent(context);
                 }
             }
@@ -629,12 +652,16 @@ impl Pharos {
             // answers again. The next one carries a newer place anyway.
             (
                 Work::Report {
-                    track, position_ms, ..
+                    track,
+                    position_ms,
+                    issued,
+                    ..
                 },
                 _,
             ) => {
-                self.unsent.note(&track, position_ms);
-                self.save_unsent(context);
+                if self.unsent.note(&track, position_ms, issued) {
+                    self.save_unsent(context);
+                }
             }
             (Work::ReportTimer | Work::DownloadsTimer | Work::Replay { .. }, _) => {}
             // Albums with downloads are still there with the server away.
@@ -810,7 +837,7 @@ impl Pharos {
             && !self
                 .tasks
                 .iter()
-                .any(|(_, work)| matches!(work, Work::Albums { .. }))
+                .any(|(_, work, _)| matches!(work, Work::Albums { .. }))
         {
             self.load_albums(context, loaded);
         }
@@ -978,15 +1005,25 @@ impl KoboApp for Pharos {
                 return;
             }
         }
-        let Some(position) = self.tasks.iter().position(|(id, _)| *id == task) else {
+        let Some(position) = self.tasks.iter().position(|(id, _, _)| *id == task) else {
             return;
         };
-        let (_, work) = self.tasks.swap_remove(position);
+        let (_, work, generation) = self.tasks.swap_remove(position);
         if self.report_timer == Some(task) {
             self.report_timer = None;
         }
         if self.downloads_timer == Some(task) {
             self.downloads_timer = None;
+        }
+        if generation != self.generation {
+            context.log(
+                LogLevel::Info,
+                format!(
+                    "pharos: {} from a signed-out account ignored",
+                    work_label(&work)
+                ),
+            );
+            return;
         }
         match outcome {
             TaskOutcome::Completed(bytes) => self.completed(context, work, &bytes),

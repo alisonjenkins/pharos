@@ -587,3 +587,90 @@ fn signing_out_forgets_the_saved_albums_and_unsent_places() {
     let commands = runner.action(action_id("sign-out"));
     assert!(forgotten(&commands, OFFLINE_KEY) && forgotten(&commands, UNSENT_KEY));
 }
+
+fn stopped_body(commands: &[Command]) -> Option<(TaskId, String)> {
+    let (id, task) = asked(commands, "/Sessions/Playing/Stopped")?;
+    let Task::Post { body, .. } = task else {
+        return None;
+    };
+    Some((id, body))
+}
+
+#[test]
+fn a_report_queued_by_sign_out_that_fails_later_keeps_nothing_for_the_next_account() {
+    let (mut runner, _) = playing();
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("sign-out"));
+    let (stopped, _) = stopped_body(&commands).expect("the stop is reported");
+    let commands = runner.task_outcome(stopped, TaskOutcome::Failed(TaskError::Offline));
+    assert!(saved(&commands, UNSENT_KEY).is_none());
+    assert!(runner.app_mut().unsent.is_empty());
+}
+
+#[test]
+fn a_report_queued_by_sign_out_that_succeeds_later_starts_no_replay() {
+    let (mut runner, _) = playing();
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("sign-out"));
+    let (stopped, _) = stopped_body(&commands).expect("the stop is reported");
+    runner.app_mut().unsent = Unsent::decode(b"tr9\t5\n");
+    let commands = runner.task_outcome(stopped, ok(""));
+    assert!(
+        asked(&commands, "/Sessions/Playing").is_none(),
+        "the old account's report must not send the new account's places"
+    );
+}
+
+fn library_of(album: &str, track: &str) -> Vec<u8> {
+    let entry = |id: &str| Entry {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        by: String::new(),
+        runtime_ms: None,
+    };
+    let mut offline = Offline::default();
+    offline.keep(&entry(album), &[entry(track)]);
+    offline.encode()
+}
+
+#[test]
+fn a_saved_album_is_not_forgotten_while_only_the_playing_track_was_asked_about() {
+    let (mut runner, commands) = started_with_saved(Some(library_of("al2", "b1")), None);
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let _ = runner.action(action_id("row-1"));
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-1"));
+    let (tracks, _) = asked(&commands, "ParentId=al2").expect("tracks");
+    let _ = runner.task_outcome(
+        tracks,
+        ok(r#"{"Items":[{"Id":"b1","Name":"b1"}],"TotalRecordCount":1}"#),
+    );
+    // The question was about the playing track alone; b1 was never asked.
+    let commands = runner.device_result(DeviceResult::Downloads {
+        entries: Vec::new(),
+    });
+    assert!(!forgotten(&commands, OFFLINE_KEY));
+    assert!(runner.app_mut().offline.contains("al2"));
+}
+
+#[test]
+fn an_older_report_arriving_does_not_forget_a_newer_kept_place() {
+    let (mut runner, commands) = playing();
+    let (started, _) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-0"));
+    let (stopped, body) = stopped_body(&commands).expect("the first track is stopped");
+    assert!(body.contains("\"ItemId\":\"tr2\""), "{body}");
+    let commands = runner.task_outcome(stopped, TaskOutcome::Failed(TaskError::Offline));
+    assert!(saved(&commands, UNSENT_KEY).is_some());
+    // The earlier report for the same track gets through afterwards.
+    let _ = runner.task_outcome(started, ok(""));
+    assert_eq!(runner.app_mut().unsent.places().len(), 1);
+}
