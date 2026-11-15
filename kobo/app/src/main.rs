@@ -8,6 +8,7 @@
 //! The server address is fixed when the package is built
 //! (`PHAROS_KOBO_SERVER`); the reader has one owner and one server.
 
+mod about;
 mod api;
 mod books;
 mod letters;
@@ -133,6 +134,9 @@ struct Pharos {
     page: usize,
     /// The album whose tracks are loaded, for Back from the player.
     album: Option<Entry>,
+    /// The page of the open album's description on show in place of its
+    /// tracks, if it is.
+    about: Option<usize>,
     playing: Option<Playing>,
     report_timer: Option<TaskId>,
     reading: Reading,
@@ -156,6 +160,7 @@ impl Default for Pharos {
             tracks: Page::default(),
             page: 0,
             album: None,
+            about: None,
             playing: None,
             report_timer: None,
             reading: Reading::new(SERVER, VERSION),
@@ -571,6 +576,7 @@ impl Pharos {
         }
         self.tracks = Page::default();
         self.page = 0;
+        self.about = None;
         self.album = Some(album.clone());
         self.load_tracks(context, album.id.clone(), 0);
         self.view = View::Album(album);
@@ -831,14 +837,23 @@ impl Pharos {
             facts.push(("Length", api::clock(ms)));
         }
         let by = (!album.by.is_empty()).then(|| album.by.clone());
-        self.now_playing(ScreenBuilder::new("pharos-album").top_bar(self.kind.label()))
-            .hero(
-                self.cover_of(&album.id),
-                HERO_COVER_MM,
-                album.name.clone(),
-                by,
-                facts,
-            )
+        let teaser = about::teaser(&album.overview, about::TEASER_CHARS);
+        let mut screen =
+            self.now_playing(ScreenBuilder::new("pharos-album").top_bar(self.kind.label()));
+        if matches!(teaser, Some((_, true))) {
+            screen = screen.top_bar_action("about", "About");
+        }
+        let screen = screen.hero(
+            self.cover_of(&album.id),
+            HERO_COVER_MM,
+            album.name.clone(),
+            by,
+            facts,
+        );
+        match teaser {
+            Some((shown, _)) => screen.text(shown),
+            None => screen,
+        }
     }
 
     /// The tracks split into pages. The first page sits under the masthead,
@@ -915,6 +930,17 @@ impl Pharos {
                 .build()
                 .with_own_back(true),
             View::Books => self.reading.screen(context, &|id| self.cover_of(id)),
+            View::Album(album) if self.about.is_some() => self
+                .now_playing(about::screen(
+                    context,
+                    "pharos-album-about",
+                    &album.name,
+                    &album.overview,
+                    self.about.unwrap_or_default(),
+                    ("page-back", "page-next"),
+                ))
+                .build()
+                .with_own_back(true),
             View::Album(album) if self.tracks.entries.is_empty() => self
                 .masthead(album)
                 .activity("Loading the tracks", None)
@@ -1102,13 +1128,16 @@ impl Pharos {
     fn turn(&mut self, context: &Context, forward: bool) {
         let pages = match &self.view {
             View::Library(_) => self.grid_pages(context).len().max(1),
+            View::Album(album) if self.about.is_some() => {
+                about::page_count(context, &album.overview)
+            }
             View::Album(album) => self.track_pages(context, album).len().max(1),
             _ => return,
         };
-        let current = if matches!(self.view, View::Library(_)) {
-            &mut self.shelf_page
-        } else {
-            &mut self.page
+        let current = match (&self.view, self.about.as_mut()) {
+            (View::Library(_), _) => &mut self.shelf_page,
+            (_, Some(about)) => about,
+            _ => &mut self.page,
         };
         if forward && *current + 1 < pages {
             *current += 1;
@@ -1218,6 +1247,7 @@ impl KoboApp for Pharos {
         }
         if action == ActionId::BACK {
             match self.view {
+                View::Album(_) if self.about.is_some() => self.about = None,
                 View::Album(_) => {
                     self.view = View::Library(self.kind);
                     self.album = None;
@@ -1231,6 +1261,8 @@ impl KoboApp for Pharos {
                 Some(_) => self.load_views(context),
                 None => self.sign_in(context),
             }
+        } else if action == action_id("about") && matches!(self.view, View::Album(_)) {
+            self.about = Some(0);
         } else if action == action_id("now-playing") && self.playing.is_some() {
             self.view = View::Player;
         } else if action == action_id("sign-out") {
