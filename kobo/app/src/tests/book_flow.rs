@@ -193,9 +193,13 @@ fn a_downloaded_book_reopens_from_the_shelf_and_its_menu_removes_it() {
         size: u32::try_from(PROSE.len()).expect("small"),
         bytes: PROSE.as_bytes().to_vec(),
     });
-    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    let reader = last_screen(&commands).expect("a screen");
+    let screen = screen_text(&reader);
     assert!(screen.contains("Some prose to read"), "{screen}");
-    let _ = runner.action(ActionId::BACK);
+    assert!(reader.owns_back, "Back in a book must stay in Pharos");
+    let commands = runner.action(ActionId::BACK);
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("Book One"), "Back returns to the list: {screen}");
     let _ = runner.store_result(StoreResult::Saved {
         key: books::KEY.to_owned(),
     });
