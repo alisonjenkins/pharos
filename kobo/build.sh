@@ -9,6 +9,7 @@
 #   e.g. --setup --dry-run, --setup --menu, --setup --undo
 # KOBO_COBALT_DIR picks the work directory (default kobo/.cobalt, git-ignored).
 # Needs: git, rustup (it installs Cobalt's toolchain from rust-toolchain.toml),
+# a host C compiler named cc (cargo links build scripts with it),
 # and either zig on PATH or a musl C toolchain for the reader named by
 # CC_armv7_unknown_linux_musleabihf and AR_armv7_unknown_linux_musleabihf.
 # With zig and neither variable set, the script writes the same wrappers
@@ -23,6 +24,13 @@ if [ "${1:-}" = "--setup" ]; then
 elif [ $# -gt 0 ]; then
   echo "usage: kobo/build.sh [--setup [kobo setup options]]" >&2
   exit 2
+fi
+
+if ! command -v cc >/dev/null; then
+  # cargo links every build script for this machine with cc, before any
+  # Kobo code builds; without it the build fails at libc's build script.
+  echo "kobo/build.sh: no cc on PATH; add a host C compiler (e.g. nixpkgs#gcc)" >&2
+  exit 1
 fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
