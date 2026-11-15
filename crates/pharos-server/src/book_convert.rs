@@ -58,6 +58,30 @@ impl ConvertedBookCache {
         }
     }
 
+    /// Where slimmed copies of books live (B1451); see [`crate::book_slim`].
+    pub fn slim_dir(&self) -> PathBuf {
+        self.dir.join("slim")
+    }
+
+    /// The cache path, without extension, of item `id`'s (version `edition`)
+    /// copy slimmed to `bx` from a source of `source_bytes` last modified at
+    /// `mtime_ns`: an edited book or another box gets its own copy.
+    pub fn slim_stem(
+        &self,
+        id: MediaId,
+        edition: Option<&str>,
+        mtime_ns: u128,
+        source_bytes: u64,
+        bx: crate::book_slim::SlimBox,
+    ) -> PathBuf {
+        let name = self.path_for_version(id, edition);
+        let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+        self.slim_dir().join(format!(
+            "{stem}-{mtime_ns}-{source_bytes}-{}x{}",
+            bx.width, bx.height
+        ))
+    }
+
     /// The converted EPUB for `id`, converting `src` if it is not cached yet.
     ///
     /// # Concurrency
