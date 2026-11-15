@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..84a21fa
+index 0000000..d48e5fb
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1128 @@
+@@ -0,0 +1,1144 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1818,6 +1818,22 @@ index 0000000..84a21fa
 +            return false;
 +        }
 +        let mut entries = self.scan();
++        // A sidecar beside a file that is not its own is junk that eviction
++        // would never take (it is not complete): reclaim it so it does not
++        // hold the budget against another book.
++        entries.retain(|entry| {
++            let junk = !Self::belongs(&entry.data, &entry.meta)
++                && entry.data != keep
++                && !Self::is_open(open, &entry.data);
++            if junk {
++                Self::delete(entry);
++                self.say(&format!(
++                    "downloads: reclaim key={} reason=sidecar and data file are not a pair",
++                    entry.key
++                ));
++            }
++            !junk
++        });
 +        let mut used: u64 = entries
 +            .iter()
 +            .filter(|entry| entry.data != keep)
@@ -2444,10 +2460,10 @@ index 0000000..84a21fa
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..2be8c49
+index 0000000..dee5be6
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,593 @@
+@@ -0,0 +1,616 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3040,6 +3056,29 @@ index 0000000..2be8c49
 +    assert!(!data.exists() && !sidecar.exists(), "the pair was kept");
 +    let fresh = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
 +    assert!(!fresh.has(0));
++}
++
++#[test]
++fn an_interrupted_replacement_does_not_hold_the_budget_against_another_book() {
++    const OTHER: &str = "https://books.example/Audio/bbb/universal?api_key=old&static=true";
++    let dir = scratch("interrupted-budget");
++    let (_card, policy) = Card::policy(5_000, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    old.flush().unwrap();
++    drop(old);
++    // New data beside the old sidecar, as a stop between the renames leaves.
++    let (data, sidecar) = pair(&dir);
++    let staged = data.with_extension("new");
++    std::fs::write(&staged, vec![0_u8; 3_000]).unwrap();
++    std::fs::rename(&staged, &data).unwrap();
++    // The pair is junk and partial, so eviction would never take it; it must
++    // not count against the budget.
++    assert!(downloads
++        .begin("shelf", OTHER, Some(3_000), BLOCK)
++        .is_some());
++    assert!(!data.exists() && !sidecar.exists(), "the junk pair stayed");
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
