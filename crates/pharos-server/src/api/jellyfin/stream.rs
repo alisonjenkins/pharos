@@ -540,6 +540,9 @@ fn audio_remux_args(
     // P19 — downmix to the requested channel count when the client asked for
     // one. ffmpeg's `-ac N` runs a default mix-down for surround → stereo/mono.
     if let Some(n) = max_channels.filter(|n| *n > 0) {
+        // libmp3lame encodes only mono and stereo: `-ac 6` fails the encode
+        // after the 200 has gone out, leaving the client with no audio.
+        let n = if ffmpeg_codec == "libmp3lame" { n.min(2) } else { n };
         args.push("-ac".into());
         args.push(n.to_string());
     }
@@ -1512,6 +1515,30 @@ mod tests {
         assert!(ss < i, "-ss must precede -i (input seek): {joined}");
         assert_eq!(args[ss + 1], "60.000", "seek seconds: {joined}");
         assert!(joined.contains("-ac 2"), "downmix preserved: {joined}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn audio_remux_args_cap_mp3_at_stereo() {
+        let mp3 = audio_remux_args(
+            std::path::Path::new("/m.mkv"),
+            "libmp3lame",
+            "mp3",
+            192_000,
+            Some(6),
+            0,
+        )
+        .join(" ");
+        assert!(mp3.contains("-ac 2"), "mp3 is mono or stereo: {mp3}");
+        let aac = audio_remux_args(
+            std::path::Path::new("/m.mkv"),
+            "aac",
+            "adts",
+            192_000,
+            Some(6),
+            0,
+        )
+        .join(" ");
+        assert!(aac.contains("-ac 6"), "aac keeps the cap asked for: {aac}");
     }
 
     #[::core::prelude::v1::test]
