@@ -1230,6 +1230,16 @@ async fn the_styled_track_is_the_default_where_its_source_would_show() {
         .await
         .unwrap();
     assert_eq!(signs.subtitle, Some(styled_slot), "{signs:?}");
+
+    // An image signs track (forced PGS) may be burned, and the styled track
+    // over it would show its signs twice: the default stays plain.
+    item.probe.subtitle_tracks[0].codec = Some("hdmv_pgs_subtitle".into());
+    item.probe.subtitle_tracks[0].is_forced = true;
+    fx.state.stores.put(item.clone()).await.unwrap();
+    let (_g, image) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_ne!(image.subtitle, Some(styled_slot), "{image:?}");
 }
 
 const HDR_MOVIE: u64 = 302;

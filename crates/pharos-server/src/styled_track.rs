@@ -9,7 +9,7 @@ use pharos_core::{MediaItem, SubtitleStyling, SubtitleStylingStore};
 use pharos_jellyfin_api::dto::sidecar_base_index;
 use pharos_styling::DIRECTOR_VERSION;
 
-use crate::api::jellyfin::subtitles::discover_sidecars;
+use crate::api::jellyfin::subtitles::{discover_sidecars, is_image_subtitle_codec};
 use crate::subtitle_styling::{is_signs_only_title, signature};
 
 /// The styled track's subtitle index: one past the last sidecar (FR-017), so
@@ -112,13 +112,20 @@ pub async fn default_pick<S: SubtitleStylingStore>(
     Some(index)
 }
 
-/// Whether embedded stream `source` is a signs/songs-only track: flagged
-/// forced, or titled so ([`is_signs_only_title`]).
+/// Whether embedded stream `source` is a text signs/songs-only track:
+/// flagged forced, or titled so ([`is_signs_only_title`]). An image track
+/// (forced PGS) is not: negotiation may burn it, and the styled track drawn
+/// over it would show its signs twice.
 fn signs_only_embedded(item: &MediaItem, source: u32) -> bool {
     item.probe
         .subtitle_tracks
         .iter()
         .find(|t| t.stream_index == source)
+        .filter(|t| {
+            t.codec
+                .as_deref()
+                .is_some_and(|c| !c.is_empty() && !is_image_subtitle_codec(c))
+        })
         .is_some_and(|t| t.is_forced || t.title.as_deref().is_some_and(is_signs_only_title))
 }
 
