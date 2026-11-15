@@ -569,6 +569,23 @@ fn a_cover_is_sent_grey_to_a_grey_panel_and_in_colour_to_a_colour_one() {
     assert_ne!((sent[0].2, sent[0].3), (64, 96));
 }
 
+#[test]
+fn a_square_cover_on_a_tall_tile_is_fitted_whole_not_cropped() {
+    let (mut runner, commands) = books_shelf(false);
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let rgb: Vec<u8> = (0u32..90 * 90)
+        .flat_map(|n| [u8::try_from(n % 251).unwrap_or(0), 90, 200])
+        .collect();
+    let square = TaskOutcome::Completed(kobo_image::encode_png_rgb(90, 90, &rgb).expect("a png"));
+    let sent = puts(&runner.task_outcome(first, square));
+    assert_eq!(sent.len(), 1);
+    let (_, _, width, height) = sent[0];
+    assert_eq!(
+        width, height,
+        "the whole square cover is kept: {width}x{height}"
+    );
+}
+
 /// Answers covers, first asked first, until the page is drawn with them.
 fn page_drawn(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Screen {
     let mut pending = cover_tasks(commands);
