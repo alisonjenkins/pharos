@@ -449,17 +449,6 @@ fn a_shelf_block_for_a_shelf_already_left_is_ignored() {
     assert!(!screen.contains("First Album"), "{screen}");
 }
 
-#[test]
-fn books_is_a_placeholder_and_back_returns_home() {
-    let (mut runner, _) = home();
-    let commands = runner.action(action_id("section-books"));
-    let screen = last_screen(&commands).expect("a screen");
-    assert!(screen_text(&screen).contains("coming"));
-    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
-    let commands = runner.action(ActionId::BACK);
-    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Audiobooks"));
-}
-
 /// `count` albums, each with a cover tag, named `Album n`.
 fn albums_with_art(count: usize) -> String {
     let items: Vec<String> = (0..count)

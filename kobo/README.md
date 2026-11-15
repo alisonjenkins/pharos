@@ -17,8 +17,8 @@ and only that many are kept on the reader. Colour covers go to a colour
 panel (such as the Libra Colour) and grey ones to the rest. A cover that
 cannot be fetched leaves the tile's icon in its place.
 
-It also reads books. Choose **Books** at the top of a music or audiobooks shelf for your
-Pharos books by name, with authors; a book that is on the reader says
+It also reads books. Choose **Books** on the home screen for your Pharos
+books by name, with authors; a book that is on the reader says
 **Downloaded**. Open one to download it (progress is shown) and read it;
 the reader remembers where you stopped. A book's `⋮` menu removes its
 download. Books come from Pharos's `/Items/{id}/Download`, with the same
