@@ -1376,7 +1376,11 @@ fn sidecar_candidate(index: u32, path: &std::path::Path, media_stem: &str) -> Su
     // word such as "Full" in the stem must not make a signs file look full.
     let suffix = lower
         .strip_prefix(&media_stem.to_ascii_lowercase())
-        .filter(|_| !media_stem.is_empty())
+        // The stem must end at a word boundary: `Song/Songs.en.ass` beside
+        // `Song.mkv` is not `s.en.ass`.
+        .filter(|rest| {
+            !media_stem.is_empty() && !rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+        })
         .unwrap_or(&lower);
     let codec = match lower.rsplit_once('.').map(|(_, e)| e) {
         Some("ass") => "ass",
@@ -1669,6 +1673,8 @@ mod tests {
         assert!(signs.signs_only);
         let full = sidecar_candidate(6, std::path::Path::new("/m/Full.Moon.S01E01.en.ass"), stem);
         assert!(!full.signs_only);
+        let longer = sidecar_candidate(8, std::path::Path::new("/m/Song/Songs.en.ass"), "Song");
+        assert!(longer.signs_only, "the stem must end at a word boundary");
         let elsewhere = sidecar_candidate(7, std::path::Path::new("/m/Subs/signs.en.ass"), stem);
         assert!(elsewhere.signs_only);
     }
