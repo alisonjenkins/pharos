@@ -123,6 +123,9 @@ struct Pharos {
     shelf_done: bool,
     shelf_page: usize,
     covers: CoverCache,
+    /// The screen last handed to the runtime, so a task that changes nothing
+    /// on it does not make the runtime draw the whole panel again.
+    shown: Option<Screen>,
     tracks: Page,
     page: usize,
     /// The album whose tracks are loaded, for Back from the player.
@@ -145,6 +148,7 @@ impl Default for Pharos {
             shelf_done: false,
             shelf_page: 0,
             covers: CoverCache::new(MIN_COVERS),
+            shown: None,
             tracks: Page::default(),
             page: 0,
             album: None,
@@ -935,8 +939,24 @@ impl Pharos {
         }
     }
 
-    fn show(&self, context: &mut Context) {
+    fn show(&mut self, context: &mut Context) {
         let screen = self.screen(context);
+        self.shown = Some(screen.clone());
+        context.set_screen(screen);
+    }
+
+    /// [`Self::show`], unless the screen is the one already showing. The
+    /// runtime re-renders and re-compares the whole panel for every screen it
+    /// is sent, so a cover arriving for a page not on show, or a report
+    /// answered, would cost a full redraw for nothing. Only for task answers:
+    /// a screen after input is always sent, because the runtime waits on one
+    /// after handing Back over.
+    fn show_if_changed(&mut self, context: &mut Context) {
+        let screen = self.screen(context);
+        if self.shown.as_ref() == Some(&screen) {
+            return;
+        }
+        self.shown = Some(screen.clone());
         context.set_screen(screen);
     }
 
@@ -1162,7 +1182,7 @@ impl KoboApp for Pharos {
             TaskOutcome::Cancelled => {}
         }
         self.refresh_covers(context);
-        self.show(context);
+        self.show_if_changed(context);
     }
 }
 
