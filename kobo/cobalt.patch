@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..d48e5fb
+index 0000000..1628b18
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1144 @@
+@@ -0,0 +1,1192 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1327,11 +1327,13 @@ index 0000000..d48e5fb
 +//! size far under an audiobook, and an app that could name a path could also
 +//! name someone else's.
 +
++use std::collections::hash_map::RandomState;
 +use std::collections::{HashMap, HashSet};
 +use std::fmt;
 +use std::fs::{self, File, OpenOptions};
++use std::hash::{BuildHasher, Hasher};
 +use std::io::{self, Write};
-+use std::os::unix::fs::{FileExt, MetadataExt};
++use std::os::unix::fs::FileExt;
 +use std::path::{Path, PathBuf};
 +use std::sync::atomic::{AtomicU64, Ordering};
 +use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -1351,9 +1353,9 @@ index 0000000..d48e5fb
 +/// many blocks of work, never a wrong block.
 +const FLUSH_EVERY_BLOCKS: u32 = 16;
 +
-+const SIDECAR_MAGIC: &str = "pharos-download 2";
++const SIDECAR_MAGIC: &str = "pharos-download 3";
 +const SIDECAR_SUFFIX: &str = "meta";
-+const DATA_SUFFIX: &str = "dat";
++const DATA_SUFFIX: &str = "data";
 +
 +type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 +type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -1499,10 +1501,10 @@ index 0000000..d48e5fb
 +    block_bytes: u32,
 +    played: u64,
 +    complete: bool,
-+    /// The data file this sidecar describes, by inode. A sidecar beside a
-+    /// data file that is another one (a replacement that stopped between its
-+    /// two renames) is not trusted.
-+    file_id: u64,
++    /// Which data file this sidecar describes: the file is named
++    /// `<key>.<generation>.data`. A replacement writes its own generation
++    /// beside the old one and the sidecar rename switches to it.
++    generation: u64,
 +    present: Vec<u8>,
 +}
 +
@@ -1515,7 +1517,7 @@ index 0000000..d48e5fb
 +            block_bytes,
 +            played,
 +            complete: false,
-+            file_id: 0,
++            generation: 0,
 +            present: vec![0; bytes],
 +        }
 +    }
@@ -1573,12 +1575,12 @@ index 0000000..d48e5fb
 +            bits.push_str(&format!("{byte:02x}"));
 +        }
 +        format!(
-+            "{SIDECAR_MAGIC}\ntotal={}\nblock={}\nplayed={}\ncomplete={}\nfile={}\nbits={bits}\n",
++            "{SIDECAR_MAGIC}\ntotal={}\nblock={}\nplayed={}\ncomplete={}\nfile={:016x}\nbits={bits}\n",
 +            self.total,
 +            self.block_bytes,
 +            self.played,
 +            u8::from(self.complete),
-+            self.file_id,
++            self.generation,
 +        )
 +    }
 +
@@ -1601,9 +1603,9 @@ index 0000000..d48e5fb
 +            "1" => true,
 +            _ => return None,
 +        };
-+        let file_id: u64 = field("file")?.parse().ok()?;
++        let generation = u64::from_str_radix(&field("file")?, 16).ok()?;
 +        let bits = field("bits")?;
-+        if block_bytes == 0 || total == 0 || bits.len() % 2 != 0 {
++        if block_bytes == 0 || total == 0 || generation == 0 || bits.len() % 2 != 0 {
 +            return None;
 +        }
 +        let present = (0..bits.len())
@@ -1615,7 +1617,7 @@ index 0000000..d48e5fb
 +            block_bytes,
 +            played,
 +            complete,
-+            file_id,
++            generation,
 +            present,
 +        };
 +        let expected = usize::try_from(meta.blocks().div_ceil(8)).ok()?;
@@ -1726,24 +1728,46 @@ index 0000000..d48e5fb
 +        (self.log)(line);
 +    }
 +
++    /// The folder of `app` and the sidecar of the download keyed `key`.
 +    fn paths(&self, app: &str, key: &str) -> (PathBuf, PathBuf) {
 +        let dir = self.root.join(app);
-+        (
-+            dir.join(format!("{key}.{DATA_SUFFIX}")),
-+            dir.join(format!("{key}.{SIDECAR_SUFFIX}")),
-+        )
++        let sidecar = dir.join(format!("{key}.{SIDECAR_SUFFIX}"));
++        (dir, sidecar)
 +    }
 +
-+    /// Whether `data` is the file `meta` was written for.
-+    fn belongs(data: &Path, meta: &Meta) -> bool {
-+        meta.file_id != 0 && fs::metadata(data).is_ok_and(|file| file.ino() == meta.file_id)
++    /// The data file of generation `generation` beside `sidecar`.
++    fn data_of(sidecar: &Path, generation: u64) -> PathBuf {
++        let key = sidecar
++            .file_stem()
++            .and_then(|stem| stem.to_str())
++            .unwrap_or_default();
++        sidecar.with_file_name(format!("{key}.{generation:016x}.{DATA_SUFFIX}"))
++    }
++
++    /// A generation no earlier file of a download has had.
++    fn new_generation() -> u64 {
++        static COUNTER: AtomicU64 = AtomicU64::new(0);
++        let nanos = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_or(0, |since| since.as_nanos());
++        let mut hasher = RandomState::new().build_hasher();
++        hasher.write_u128(nanos);
++        hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
++        hasher.finish().max(1)
 +    }
 +
 +    fn read_meta(sidecar: &Path) -> Option<Meta> {
 +        Meta::decode(&fs::read_to_string(sidecar).ok()?)
 +    }
 +
++    /// Saves `meta` as the sidecar, unless the sidecar on disk already names
++    /// another generation: a store left over from a replaced book must not
++    /// put its older state over the new book's. The caller holds the open
++    /// lock, which the replacement's commit also takes.
 +    fn write_meta(sidecar: &Path, meta: &Meta) -> io::Result<()> {
++        if Self::read_meta(sidecar).is_some_and(|disk| disk.generation != meta.generation) {
++            return Ok(());
++        }
 +        let staging = sidecar.with_extension("tmp");
 +        Self::write_synced(&staging, &meta.encode())?;
 +        fs::rename(&staging, sidecar)?;
@@ -1791,7 +1815,7 @@ index 0000000..d48e5fb
 +                };
 +                found.push(Entry {
 +                    key: key.to_owned(),
-+                    data: sidecar.with_extension(DATA_SUFFIX),
++                    data: Self::data_of(&sidecar, meta.generation),
 +                    sidecar: sidecar.clone(),
 +                    meta,
 +                });
@@ -1809,26 +1833,66 @@ index 0000000..d48e5fb
 +        let _ignored = fs::remove_file(&entry.sidecar);
 +    }
 +
++    /// Removes what no sidecar names in `dir`: data files of a generation a
++    /// replacement left behind, or one that stopped before its sidecar
++    /// landed, and staged sidecars. A data file a store has open stays; it is
++    /// swept on a later pass.
++    fn sweep(&self, open: &OpenMap, dir: &Path) {
++        let Ok(listing) = fs::read_dir(dir) else {
++            return;
++        };
++        let files: Vec<PathBuf> = listing.flatten().map(|file| file.path()).collect();
++        let ext = |path: &Path| {
++            path.extension()
++                .and_then(|ext| ext.to_str())
++                .map(str::to_owned)
++        };
++        let named: HashSet<PathBuf> = files
++            .iter()
++            .filter(|path| ext(path).as_deref() == Some(SIDECAR_SUFFIX))
++            .filter_map(|path| Some(Self::data_of(path, Self::read_meta(path)?.generation)))
++            .collect();
++        for path in files {
++            let stray = match ext(&path).as_deref() {
++                Some(DATA_SUFFIX) => !named.contains(&path) && !Self::is_open(open, &path),
++                Some("tmp") => path.is_file(),
++                _ => false,
++            };
++            if stray {
++                let _ignored = fs::remove_file(&path);
++                self.say(&format!(
++                    "downloads: sweep path={} reason=no sidecar names it",
++                    path.display()
++                ));
++            }
++        }
++    }
++
 +    /// Frees the least recently played complete downloads that nothing has
-+    /// open until `needed` more bytes fit in the budget. `false` when they
-+    /// do not fit even then.
++    /// open until `needed` more bytes fit in the budget, leaving the one at
++    /// `keep` (a sidecar) out of the count. `false` when they do not fit even
++    /// then.
 +    fn make_room(&self, open: &OpenMap, needed: u64, keep: &Path) -> bool {
++        if let Ok(apps) = fs::read_dir(&self.root) {
++            for app in apps.flatten() {
++                self.sweep(open, &app.path());
++            }
++        }
 +        let budget = self.policy.budget_bytes;
 +        if needed > budget {
 +            return false;
 +        }
 +        let mut entries = self.scan();
-+        // A sidecar beside a file that is not its own is junk that eviction
++        // A sidecar naming a data file that is gone is junk that eviction
 +        // would never take (it is not complete): reclaim it so it does not
 +        // hold the budget against another book.
 +        entries.retain(|entry| {
-+            let junk = !Self::belongs(&entry.data, &entry.meta)
-+                && entry.data != keep
-+                && !Self::is_open(open, &entry.data);
++            let junk =
++                !entry.data.is_file() && entry.sidecar != keep && !Self::is_open(open, &entry.data);
 +            if junk {
 +                Self::delete(entry);
 +                self.say(&format!(
-+                    "downloads: reclaim key={} reason=sidecar and data file are not a pair",
++                    "downloads: reclaim key={} reason=sidecar names a data file that is gone",
 +                    entry.key
 +                ));
 +            }
@@ -1836,13 +1900,13 @@ index 0000000..d48e5fb
 +        });
 +        let mut used: u64 = entries
 +            .iter()
-+            .filter(|entry| entry.data != keep)
++            .filter(|entry| entry.sidecar != keep)
 +            .map(|entry| entry.meta.total)
 +            .sum();
 +        if used.saturating_add(needed) <= budget {
 +            return true;
 +        }
-+        entries.retain(|entry| entry.meta.complete && entry.data != keep);
++        entries.retain(|entry| entry.meta.complete && entry.sidecar != keep);
 +        entries.sort_by_key(|entry| entry.meta.played);
 +        for entry in entries {
 +            if used.saturating_add(needed) <= budget {
@@ -1884,26 +1948,32 @@ index 0000000..d48e5fb
 +            return None;
 +        }
 +        let key = key_of(url);
-+        let (data, sidecar) = self.paths(app, &key);
++        let (dir, sidecar) = self.paths(app, &key);
 +        let mut open = lock(&self.open);
 +        let now = (self.policy.now)();
 +        let fits = |total: u64, block: u32| {
 +            expected_total.is_none_or(|expected| expected == total)
 +                && (expected_total.is_none() || block == block_bytes)
-+                && data.is_file()
 +        };
++        let named = Self::read_meta(&sidecar).map(|meta| {
++            let data = Self::data_of(&sidecar, meta.generation);
++            (meta, data)
++        });
 +        // A download already open is the state of record, not the sidecar,
 +        // which may be behind it.
-+        let shared = open
-+            .get(&data)
-+            .filter(|entry| fits(entry.total, entry.block_bytes))
-+            .map(|entry| Arc::clone(&entry.state));
-+        let mut from_disk = if shared.is_none() {
-+            let existing = Self::read_meta(&sidecar).filter(|meta| {
++        let shared = named.as_ref().and_then(|(_, data)| {
++            open.get(data)
++                .filter(|entry| fits(entry.total, entry.block_bytes))
++                .map(|entry| (Arc::clone(&entry.state), data.clone()))
++        });
++        let mut from_disk = None;
++        let mut data = shared.as_ref().map(|(_, data)| data.clone());
++        if shared.is_none() {
++            let existing = named.filter(|(meta, data)| {
 +                let same = fits(meta.total, meta.block_bytes);
-+                if same && !Self::belongs(&data, meta) {
++                if same && !data.is_file() {
 +                    self.say(&format!(
-+                        "downloads: discard key={key} reason=sidecar and data file are not a pair"
++                        "downloads: discard key={key} reason=sidecar names a data file that is gone"
 +                    ));
 +                    return false;
 +                }
@@ -1916,18 +1986,20 @@ index 0000000..d48e5fb
 +                same
 +            });
 +            let (mut meta, fresh) = match existing {
-+                Some(meta) => (meta, false),
++                Some((meta, existing)) => {
++                    data = Some(existing);
++                    (meta, false)
++                }
 +                None => (
 +                    self.create(&open, app, &key, expected_total, block_bytes)?,
 +                    true,
 +                ),
 +            };
 +            meta.played = now;
-+            Some((meta, fresh))
-+        } else {
-+            None
-+        };
-+        let file = self.open_file(&key, &data, &sidecar, &mut from_disk)?;
++            from_disk = Some((meta, fresh));
++        }
++        let (file, data) = self.open_file(&key, &sidecar, data, &mut from_disk)?;
++        self.sweep(&open, &dir);
 +        let fresh = from_disk.as_ref().is_some_and(|(_, fresh)| *fresh);
 +        // The open lock comes after a store's own lock everywhere, so no
 +        // store's state is locked while it is held.
@@ -1939,7 +2011,7 @@ index 0000000..d48e5fb
 +            (None, None) => return None,
 +        };
 +        let state = match (shared, from_disk) {
-+            (Some(state), _) => state,
++            (Some((state, _)), _) => state,
 +            (None, Some((meta, _))) => Arc::new(Mutex::new(Inner {
 +                meta,
 +                unflushed: 0,
@@ -1974,26 +2046,27 @@ index 0000000..d48e5fb
 +        })
 +    }
 +
-+    /// The data file, sized and with its sidecar written when `made` holds a
-+    /// new or resumed download's metadata; as it stands when the download is
-+    /// already open.
++    /// The data file and its path: a new download's, installed beside the
++    /// old one; a resumed one's, with its sidecar saved again; or `data` as it
++    /// stands when the download is already open.
 +    fn open_file(
 +        &self,
 +        key: &str,
-+        data: &Path,
 +        sidecar: &Path,
++        data: Option<PathBuf>,
 +        made: &mut Option<(Meta, bool)>,
-+    ) -> Option<File> {
-+        match made {
-+            Some((meta, true)) => self.install(data, sidecar, meta),
-+            Some((meta, false)) => Self::open_data(data)
-+                .and_then(|file| Self::write_meta(sidecar, meta).map(|()| file)),
-+            None => Self::open_data(data),
++    ) -> Option<(File, PathBuf)> {
++        match (made, data) {
++            (Some((meta, true)), _) => self.install(sidecar, meta),
++            (Some((meta, false)), Some(data)) => Self::open_data(&data)
++                .and_then(|file| Self::write_meta(sidecar, meta).map(|()| (file, data))),
++            (None, Some(data)) => Self::open_data(&data).map(|file| (file, data)),
++            (Some(_) | None, None) => Err(io::Error::from(io::ErrorKind::NotFound)),
 +        }
 +        .map_err(|error| {
 +            self.say(&format!(
-+                "downloads: skip key={key} path={} reason=cannot create: {error}",
-+                data.display()
++                "downloads: skip key={key} sidecar={} reason=cannot create: {error}",
++                sidecar.display()
 +            ));
 +        })
 +        .ok()
@@ -2019,62 +2092,39 @@ index 0000000..d48e5fb
 +    }
 +
 +    fn open_data(data: &Path) -> io::Result<File> {
-+        OpenOptions::new()
-+            .create(true)
-+            .truncate(false)
-+            .read(true)
-+            .write(true)
-+            .open(data)
++        OpenOptions::new().read(true).write(true).open(data)
 +    }
 +
-+    /// Puts a new download in place of whatever is at `data` and `sidecar`.
-+    /// Both are prepared under other names and renamed over the old pair, so
-+    /// a failure before that leaves the old download as it was.
-+    fn install(&self, data: &Path, sidecar: &Path, meta: &mut Meta) -> io::Result<File> {
-+        let staged_data = data.with_extension("new");
-+        let staged_sidecar = sidecar.with_extension("tmp");
-+        let cleanup = || {
-+            let _ignored = fs::remove_file(&staged_data);
-+            let _ignored = fs::remove_file(&staged_sidecar);
-+        };
++    /// Puts a new download beside whatever is there. Its data file has a
++    /// generation of its own, so the old pair is not touched until the
++    /// sidecar rename, which is the one commit point: before it the old
++    /// download is whole, after it the new one is. The old data file is swept
++    /// afterwards.
++    fn install(&self, sidecar: &Path, meta: &mut Meta) -> io::Result<(File, PathBuf)> {
++        meta.generation = Self::new_generation();
++        let data = Self::data_of(sidecar, meta.generation);
++        let staged = sidecar.with_extension("tmp");
 +        let prepared = OpenOptions::new()
-+            .create(true)
-+            .truncate(true)
++            .create_new(true)
 +            .read(true)
 +            .write(true)
-+            .open(&staged_data)
++            .open(&data)
 +            .and_then(|file| file.set_len(meta.total).map(|()| file))
 +            .and_then(|file| file.sync_all().map(|()| file))
-+            .and_then(|file| {
-+                meta.file_id = file.metadata()?.ino();
-+                Self::write_synced(&staged_sidecar, &meta.encode()).map(|()| file)
-+            })
-+            .and_then(|file| self.step("rename-data").map(|()| file));
-+        let file = match prepared {
-+            Ok(file) => file,
-+            Err(error) => {
-+                cleanup();
-+                return Err(error);
++            .and_then(|file| Self::write_synced(&staged, &meta.encode()).map(|()| file))
++            .and_then(|file| self.step("rename-sidecar").map(|()| file))
++            .and_then(|file| fs::rename(&staged, sidecar).map(|()| file));
++        match prepared {
++            Ok(file) => {
++                Self::sync_dir(sidecar);
++                Ok((file, data))
 +            }
-+        };
-+        if let Err(error) = fs::rename(&staged_data, data) {
-+            cleanup();
-+            return Err(error);
++            Err(error) => {
++                let _ignored = fs::remove_file(&data);
++                let _ignored = fs::remove_file(&staged);
++                Err(error)
++            }
 +        }
-+        // The sidecar names the new data file's inode, so it is the commit:
-+        // before it lands the old sidecar names a file that is gone and the
-+        // pair is discarded on the next open, never trusted.
-+        let committed = self
-+            .step("rename-sidecar")
-+            .and_then(|()| fs::rename(&staged_sidecar, sidecar));
-+        if let Err(error) = committed {
-+            cleanup();
-+            let _ignored = fs::remove_file(data);
-+            let _ignored = fs::remove_file(sidecar);
-+            return Err(error);
-+        }
-+        Self::sync_dir(sidecar);
-+        Ok(file)
 +    }
 +
 +    fn announce(&self, key: &str, app: &str, fresh: bool, have: u64, total: u64) {
@@ -2091,8 +2141,10 @@ index 0000000..d48e5fb
 +        }
 +    }
 +
-+    /// Clears what is on disk for `key` and admits a new download of
-+    /// `expected_total` bytes in its place: its first metadata.
++    /// Admits a new download of `expected_total` bytes for `key`: its first
++    /// metadata. Nothing on disk is touched while it is only admitted: a store
++    /// still open on the old download saves its sidecar again, which must
++    /// find its data file. With no length to admit, what is there is removed.
 +    fn create(
 +        &self,
 +        open: &OpenMap,
@@ -2101,8 +2153,7 @@ index 0000000..d48e5fb
 +        expected_total: Option<u64>,
 +        block_bytes: u32,
 +    ) -> Option<Meta> {
-+        let dir = self.root.join(app);
-+        let (data, sidecar) = self.paths(app, key);
++        let (dir, sidecar) = self.paths(app, key);
 +        fs::create_dir_all(&dir)
 +            .map_err(|error| {
 +                self.say(&format!(
@@ -2111,24 +2162,25 @@ index 0000000..d48e5fb
 +                ));
 +            })
 +            .ok()?;
-+        let clear = || {
-+            let _ignored = fs::remove_file(&data);
-+            let _ignored = fs::remove_file(&sidecar);
-+        };
 +        let Some(total) = expected_total.filter(|total| *total > 0) else {
-+            clear();
++            let _ignored = fs::remove_file(&sidecar);
++            self.sweep(open, &dir);
 +            return None;
 +        };
-+        // Nothing on disk is touched yet: a store still open on it saves its
-+        // sidecar again, which must find its data file. `install` swaps the
-+        // files only once the new pair is ready.
-+        self.admit(open, key, &dir, &data, total)?;
++        self.admit(open, key, &dir, &sidecar, total)?;
 +        Some(Meta::fresh(total, block_bytes, 0))
 +    }
 +
 +    /// Whether a new download of `total` bytes may start: the volume has room
 +    /// above the floor and the budget has room after evicting.
-+    fn admit(&self, open: &OpenMap, key: &str, dir: &Path, data: &Path, total: u64) -> Option<()> {
++    fn admit(
++        &self,
++        open: &OpenMap,
++        key: &str,
++        dir: &Path,
++        sidecar: &Path,
++        total: u64,
++    ) -> Option<()> {
 +        let free = (self.policy.free_space)(dir);
 +        if free.is_some_and(|free| free < self.policy.min_free_bytes) {
 +            bump(&self.counters.skipped_low_space, 1);
@@ -2138,7 +2190,7 @@ index 0000000..d48e5fb
 +            ));
 +            return None;
 +        }
-+        if !self.make_room(open, total, data) {
++        if !self.make_room(open, total, sidecar) {
 +            bump(&self.counters.skipped_budget, 1);
 +            self.say(&format!(
 +                "downloads: skip key={key} bytes={total} reason=over budget {}",
@@ -2158,8 +2210,9 @@ index 0000000..d48e5fb
 +        let mut seen = HashSet::new();
 +        urls.iter()
 +            .filter_map(|url| {
-+                let (data, sidecar) = self.paths(app, &key_of(url));
-+                let meta = Self::read_meta(&sidecar).filter(|meta| Self::belongs(&data, meta))?;
++                let (_, sidecar) = self.paths(app, &key_of(url));
++                let meta = Self::read_meta(&sidecar)
++                    .filter(|meta| Self::data_of(&sidecar, meta.generation).is_file())?;
 +                seen.insert(sidecar).then(|| DownloadProgress {
 +                    url: url.clone(),
 +                    have: meta.have_bytes(),
@@ -2176,21 +2229,23 @@ index 0000000..d48e5fb
 +            return RemoveOutcome::Absent;
 +        }
 +        let key = key_of(url);
-+        let (data, sidecar) = self.paths(app, &key);
++        let (dir, sidecar) = self.paths(app, &key);
 +        let open = lock(&self.open);
++        let Some(meta) = Self::read_meta(&sidecar) else {
++            return RemoveOutcome::Absent;
++        };
++        let data = Self::data_of(&sidecar, meta.generation);
 +        if Self::is_open(&open, &data) {
 +            self.say(&format!("downloads: remove refused key={key} reason=open"));
 +            return RemoveOutcome::InUse;
 +        }
-+        let Some(meta) = Self::read_meta(&sidecar) else {
-+            return RemoveOutcome::Absent;
-+        };
 +        Self::delete(&Entry {
 +            key: key.clone(),
 +            data,
 +            sidecar,
 +            meta: meta.clone(),
 +        });
++        self.sweep(&open, &dir);
 +        bump(&self.counters.removed, 1);
 +        self.say(&format!(
 +            "downloads: remove key={key} bytes={} have={}",
@@ -2386,18 +2441,11 @@ index 0000000..d48e5fb
 +        self.save(&inner)
 +    }
 +
-+    /// Writes the sidecar, unless a newer open of the download has replaced
-+    /// this one's state: a store left over from a replaced book must not put
-+    /// its older sidecar over the new book's. Held under the open lock so a
-+    /// replacement cannot land between the check and the write.
++    /// Writes the sidecar, unless a replacement has put another generation
++    /// in its place (see `write_meta`). Held under the open lock so the
++    /// replacement's commit cannot land between the check and the write.
 +    fn save(&self, inner: &Inner) -> io::Result<()> {
-+        let open = lock(&self.downloads.open);
-+        let current = open
-+            .get(&self.data)
-+            .is_some_and(|entry| Arc::ptr_eq(&entry.state, &self.inner));
-+        if !current {
-+            return Ok(());
-+        }
++        let _open = lock(&self.downloads.open);
 +        Downloads::write_meta(&self.sidecar, &inner.meta)
 +    }
 +
@@ -2460,10 +2508,10 @@ index 0000000..d48e5fb
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..dee5be6
+index 0000000..4ddf66e
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,674 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -2472,9 +2520,7 @@ index 0000000..dee5be6
 +use std::sync::{Arc, Mutex};
 +use std::time::{Duration, Instant};
 +
-+use super::{
-+    key_of, stable_url, DownloadPolicy, Downloads, Meta, RemoveOutcome, DATA_SUFFIX, SIDECAR_SUFFIX,
-+};
++use super::{key_of, stable_url, DownloadPolicy, Downloads, Meta, RemoveOutcome, DATA_SUFFIX};
 +use crate::remote::tests::{quick, served};
 +use crate::{Book, FetchFailure, RangeFetch, Remote};
 +
@@ -2592,11 +2638,12 @@ index 0000000..dee5be6
 +#[test]
 +fn a_sidecar_round_trips_and_a_damaged_one_is_refused() {
 +    let mut meta = Meta::fresh(10_000, BLOCK, 7);
++    meta.generation = 0xabc;
 +    meta.set(0);
 +    meta.set(9);
 +    assert_eq!(Meta::decode(&meta.encode()), Some(meta.clone()));
 +    assert_eq!(meta.have_bytes(), 1_024 + (10_000 - 9 * 1_024));
-+    assert_eq!(Meta::decode("pharos-download 1\ntotal=10\n"), None);
++    assert_eq!(Meta::decode("pharos-download 3\ntotal=10\n"), None);
 +    assert_eq!(
 +        Meta::decode(&meta.encode().replace("bits=", "bits=00")),
 +        None
@@ -3001,17 +3048,57 @@ index 0000000..dee5be6
 +    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 +
-+fn pair(dir: &Path) -> (PathBuf, PathBuf) {
-+    let key = key_of(URL);
-+    (
-+        dir.join("shelf").join(format!("{key}.{DATA_SUFFIX}")),
-+        dir.join("shelf").join(format!("{key}.{SIDECAR_SUFFIX}")),
-+    )
++fn copy_tree(from: &Path, to: &Path) {
++    std::fs::create_dir_all(to).unwrap();
++    for entry in std::fs::read_dir(from).unwrap().flatten() {
++        let target = to.join(entry.file_name());
++        if entry.file_type().unwrap().is_dir() {
++            copy_tree(&entry.path(), &target);
++        } else {
++            std::fs::copy(entry.path(), target).unwrap();
++        }
++    }
 +}
 +
 +#[test]
-+fn a_failure_at_the_second_rename_never_leaves_a_mixed_pair() {
-+    let dir = scratch("second-rename");
++fn a_download_is_still_served_after_the_volume_is_remounted() {
++    // FAT numbers its inodes in memory, so every remount renumbers the
++    // files; copying the folder renumbers them the same way.
++    let dir = scratch("remount-before");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (kept, _lines) = downloads(&dir, policy);
++    fill(&kept, URL, 3_000);
++    let after = scratch("remount-after");
++    copy_tree(&dir, &after);
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (remounted, _lines) = downloads(&after, policy);
++    let held = remounted.progress("shelf", &[URL.to_owned()]);
++    assert_eq!(held.len(), 1, "the download was discarded");
++    assert_eq!((held[0].have, held[0].total), (3_000, 3_000));
++    let store = remounted.begin("shelf", URL, None, BLOCK).expect("served");
++    assert!(store.is_complete());
++    assert_eq!(store.read(0).unwrap(), block(0, 3_000));
++}
++
++/// The data files of the download in the `shelf` folder.
++fn datas(dir: &Path) -> Vec<PathBuf> {
++    let mut found: Vec<PathBuf> = std::fs::read_dir(dir.join("shelf"))
++        .unwrap()
++        .flatten()
++        .map(|file| file.path())
++        .filter(|path| path.extension().is_some_and(|ext| ext == DATA_SUFFIX))
++        .collect();
++    found.sort();
++    found
++}
++
++fn sidecar_of(dir: &Path) -> PathBuf {
++    dir.join("shelf").join(format!("{}.meta", key_of(URL)))
++}
++
++#[test]
++fn a_failure_at_the_commit_rename_leaves_the_old_download_intact() {
++    let dir = scratch("commit-fails");
 +    let (_card, policy) = Card::policy(u64::MAX, 0);
 +    let (plain, _lines) = downloads(&dir, policy);
 +    let old = plain.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
@@ -3026,59 +3113,78 @@ index 0000000..dee5be6
 +    });
 +    assert!(failing.begin("shelf", URL, Some(4_000), BLOCK).is_none());
 +    // The old store goes on to save its sidecar, as it would.
++    old.flush().unwrap();
 +    drop(old);
-+    assert!(
-+        plain.progress("shelf", &[URL.to_owned()]).is_empty(),
-+        "an old sidecar is listed beside new data"
-+    );
-+    assert!(plain.begin("shelf", URL, None, BLOCK).is_none());
++    assert_eq!(datas(&dir).len(), 1, "the failed replacement left a file");
++    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("kept");
++    assert_eq!(reopened.total(), 3_000);
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 +
 +#[test]
-+fn a_crash_between_the_two_renames_is_discarded_on_the_next_open() {
-+    let dir = scratch("crash-between");
++fn a_crash_before_the_commit_leaves_the_old_pair_serving_and_sweeps_the_orphan() {
++    let dir = scratch("crash-before-commit");
 +    let (_card, policy) = Card::policy(u64::MAX, 0);
 +    let (downloads, _lines) = downloads(&dir, policy);
 +    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
 +    assert!(old.write(0, &block(0, 3_000)).unwrap());
 +    old.flush().unwrap();
 +    drop(old);
-+    // What a crash leaves: the new data in place, the old sidecar beside it.
-+    let (data, sidecar) = pair(&dir);
-+    let staged = data.with_extension("new");
-+    std::fs::write(&staged, vec![0_u8; 3_000]).unwrap();
-+    std::fs::rename(&staged, &data).unwrap();
-+    assert!(
-+        downloads.progress("shelf", &[URL.to_owned()]).is_empty(),
-+        "a mixed pair is listed"
-+    );
-+    assert!(downloads.begin("shelf", URL, None, BLOCK).is_none());
-+    assert!(!data.exists() && !sidecar.exists(), "the pair was kept");
-+    let fresh = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
-+    assert!(!fresh.has(0));
++    // What a stop before the sidecar rename leaves: a new generation's data
++    // file and a staged sidecar, with the old sidecar still in place.
++    let folder = dir.join("shelf");
++    let orphan = folder.join(format!("{}.00000000000000aa.{DATA_SUFFIX}", key_of(URL)));
++    let staged = sidecar_of(&dir).with_extension("tmp");
++    std::fs::write(&orphan, vec![0_u8; 4_000]).unwrap();
++    std::fs::write(&staged, b"half written").unwrap();
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).expect("old");
++    assert_eq!(reopened.total(), 3_000);
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
++    assert!(!orphan.exists() && !staged.exists(), "leftovers stayed");
 +}
 +
 +#[test]
-+fn an_interrupted_replacement_does_not_hold_the_budget_against_another_book() {
++fn a_crash_after_the_commit_serves_the_new_pair_and_sweeps_the_old_file() {
++    let dir = scratch("crash-after-commit");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    old.flush().unwrap();
++    drop(old);
++    let before = datas(&dir);
++    let backup = dir.join("backup");
++    std::fs::copy(&before[0], &backup).unwrap();
++    let new = downloads.begin("shelf", URL, Some(4_000), BLOCK).unwrap();
++    assert!(new.write(1, &block(1, 4_000)).unwrap());
++    new.flush().unwrap();
++    drop(new);
++    // The stop came before the old file was removed.
++    std::fs::copy(&backup, &before[0]).unwrap();
++    assert_eq!(datas(&dir).len(), 2);
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).expect("new");
++    assert_eq!(reopened.total(), 4_000);
++    assert!(reopened.has(1) && !reopened.has(0));
++    assert_eq!(reopened.read(1).unwrap(), block(1, 4_000));
++    assert_eq!(datas(&dir).len(), 1, "the old file stayed");
++}
++
++#[test]
++fn a_sidecar_naming_a_data_file_that_is_gone_does_not_hold_the_budget() {
 +    const OTHER: &str = "https://books.example/Audio/bbb/universal?api_key=old&static=true";
-+    let dir = scratch("interrupted-budget");
++    let dir = scratch("gone-budget");
 +    let (_card, policy) = Card::policy(5_000, 0);
 +    let (downloads, _lines) = downloads(&dir, policy);
 +    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
 +    assert!(old.write(0, &block(0, 3_000)).unwrap());
 +    old.flush().unwrap();
 +    drop(old);
-+    // New data beside the old sidecar, as a stop between the renames leaves.
-+    let (data, sidecar) = pair(&dir);
-+    let staged = data.with_extension("new");
-+    std::fs::write(&staged, vec![0_u8; 3_000]).unwrap();
-+    std::fs::rename(&staged, &data).unwrap();
-+    // The pair is junk and partial, so eviction would never take it; it must
-+    // not count against the budget.
++    std::fs::remove_file(&datas(&dir)[0]).unwrap();
++    // Partial, so eviction would never take it; it must not count.
 +    assert!(downloads
 +        .begin("shelf", OTHER, Some(3_000), BLOCK)
 +        .is_some());
-+    assert!(!data.exists() && !sidecar.exists(), "the junk pair stayed");
++    assert!(!sidecar_of(&dir).exists(), "the junk sidecar stayed");
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
