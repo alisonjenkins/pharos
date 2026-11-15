@@ -393,6 +393,24 @@ impl Pharos {
         }
     }
 
+    /// Whether a cover on the shelf page showing is still to come: asked
+    /// for and not here yet, or not asked for yet. A cover that failed is
+    /// not waited for.
+    fn page_covers_pending(&self, context: &Context) -> bool {
+        if !matches!(self.view, View::Library(_)) {
+            return false;
+        }
+        let pages = self.grid_pages(context);
+        let page = self.shelf_page.min(pages.len().saturating_sub(1));
+        pages
+            .get(page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| self.shelf.entries.get(index))
+            .filter(|entry| entry.image_tag.is_some())
+            .any(|entry| matches!(self.covers.state(&entry.id), None | Some(Cover::Loading)))
+    }
+
     /// Takes a cover that arrived: fits it to its tile, and hands it to the
     /// runtime in colour only when the panel can show colour.
     fn cover_arrived(&mut self, context: &mut Context, id: &str, bytes: &[u8]) {
@@ -1173,6 +1191,7 @@ impl KoboApp for Pharos {
             return;
         };
         let (_, work) = self.tasks.swap_remove(position);
+        let was_cover = matches!(work, Work::Cover { .. });
         if self.report_timer == Some(task) {
             self.report_timer = None;
         }
@@ -1182,6 +1201,12 @@ impl KoboApp for Pharos {
             TaskOutcome::Cancelled => {}
         }
         self.refresh_covers(context);
+        // The runtime waits out each panel update before it reads the next
+        // message, so a page whose covers were drawn as each arrived took one
+        // panel update per cover. They are drawn together once all are in.
+        if was_cover && self.page_covers_pending(context) {
+            return;
+        }
         self.show_if_changed(context);
     }
 }
