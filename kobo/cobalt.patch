@@ -808,6 +808,76 @@ index dbea710..73542f4 100644
      #[test]
      fn known_damage_does_not_hide_changes_elsewhere() {
          let (mut planner, mut frame) = started(32, 32);
+diff --git a/crates/kobo-image/src/lib.rs b/crates/kobo-image/src/lib.rs
+index 94c0621..34ad1d6 100644
+--- a/crates/kobo-image/src/lib.rs
++++ b/crates/kobo-image/src/lib.rs
+@@ -414,10 +414,17 @@ impl Picture {
+             )
+         };
+         checked_pixels(scaled_width, scaled_height)?;
++        // A picture already the width or height of its box needs cropping
++        // only. Resampling it to its own size changes nothing but costs a
++        // reader's slow processor most of the work of a real resize.
++        let unscaled = scaled_width == self.width && scaled_height == self.height;
+         let source = image::GrayImage::from_raw(self.width, self.height, self.grey.clone())
+             .ok_or_else(|| ImageError::Undecodable("the picture is not its own size".to_owned()))?;
+-        let scaled =
+-            image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3);
++        let scaled = if unscaled {
++            source
++        } else {
++            image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3)
++        };
+         let left = (scaled_width - width) / 2;
+         let top = (scaled_height - height) / 2;
+         let cropped = image::imageops::crop_imm(&scaled, left, top, width, height).to_image();
+@@ -427,8 +434,11 @@ impl Picture {
+                 RgbImage::from_raw(self.width, self.height, colour.clone()).ok_or_else(|| {
+                     ImageError::Undecodable("the colour is not its own size".to_owned())
+                 })?;
+-            let scaled =
+-                image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3);
++            let scaled = if unscaled {
++                source
++            } else {
++                image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3)
++            };
+             let cropped = image::imageops::crop_imm(&scaled, left, top, width, height).to_image();
+             picture.colour = Some(cropped.into_raw());
+         }
+@@ -890,6 +900,31 @@ mod tests {
+         assert_eq!(jpeg.grey(), decode(&tiny_jpeg()).expect("grey").grey());
+     }
+ 
++    #[test]
++    fn a_cover_already_its_box_width_is_cropped_not_resampled() {
++        // Rows 0..12, each a different grey and a different red: a
++        // resample would blend neighbouring rows, a crop keeps them exact.
++        let grey: Vec<u8> = (0u8..12).flat_map(|row| [row * 20; 4]).collect();
++        let rgb: Vec<u8> = (0u8..12)
++            .flat_map(|row| [row * 20, 7, 9].repeat(4))
++            .collect();
++        let picture = Picture::from_rgb(4, 12, rgb).expect("sized");
++        let picture = Picture {
++            grey: grey.clone(),
++            ..picture
++        };
++        let covered = picture.cover(4, 6).expect("cover");
++        assert_eq!((covered.width(), covered.height()), (4, 6));
++        assert_eq!(
++            covered.grey(),
++            &grey[3 * 4..9 * 4],
++            "the middle six rows, untouched"
++        );
++        let colour = covered.colour().expect("kept");
++        assert_eq!(colour[0], 60, "row 3's red, untouched");
++        assert_eq!(colour[colour.len() - 3], 160, "row 8's red, untouched");
++    }
++
+     #[test]
+     fn a_colour_picture_scales_both_planes_together_and_can_drop_one() {
+         let mut rgb = Vec::new();
 diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
 index b6e6ed5..811a2e3 100644
 --- a/crates/kobo-read/src/lib.rs
