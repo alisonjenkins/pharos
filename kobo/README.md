@@ -17,12 +17,15 @@ a placeholder: reading ebooks on the Kobo is not built yet.
 The home screen starts with what you were last doing, as the other Pharos
 apps do. **Continue listening** shows the albums and audiobooks you stopped
 part-way through, on this reader or any other device, newest first, one
-tile each. Tap one and it carries on from the track and the place you left;
-Back from the player shows its album, and Back from there returns home.
-**Continue reading** shows the books you have opened on this reader, the
-last one read first; tap one and it opens where you stopped, and closing it
-returns home. The libraries follow. A row holds one line of tiles, and when
-the panel has no room for both rows above the libraries, Continue reading is
+tile each. **Continue reading** shows the books you have opened on this
+reader, the last one read first. The libraries follow.
+
+As on every Pharos home screen, a tap opens the page and a hold carries on.
+Tap an album for its page, which has a **Resume track N at m:ss** button;
+hold it to play from where you left off at once. Tap a book for its detail
+page and **Read**; hold it to open the book where you stopped. Back, or
+closing the book, returns home. A row holds one line of tiles, and when the
+panel has no room for both rows above the libraries, Continue reading is
 left out first.
 
 Covers are fetched for the page on screen and the next one, two at a time,
