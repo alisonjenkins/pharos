@@ -692,3 +692,112 @@ fn the_shelf_screens_fit_the_smallest_reader_with_and_without_covers() {
     let problems = screen.validate(&CLARA_BW_METRICS);
     assert!(problems.is_empty(), "{problems:?}");
 }
+
+const BOOKS: &str = r#"{"Items":[
+    {"Id":"bk1","Name":"Book One","AlbumArtist":"Author A","PharosAudiobook":true,
+     "ProductionYear":2001,"RunTimeTicks":37250000000,"ImageTags":{"Primary":"t1"}}
+],"TotalRecordCount":1}"#;
+
+/// The audiobooks shelf, loaded.
+fn books_shelf(colour: bool) -> (AppRunner<Pharos>, Vec<Command>) {
+    let mut runner = AppRunner::new(Pharos::default()).showing_colour(colour);
+    let _ = runner.start();
+    let commands = runner.store_result(StoreResult::Loaded {
+        key: ACCOUNT_KEY.to_owned(),
+        value: Some(account().encode()),
+    });
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let _ = runner.task_outcome(views, ok(VIEWS));
+    let commands = runner.action(action_id("section-audiobooks"));
+    let (books, _) = asked(&commands, "ParentId=lib-books").expect("books");
+    let commands = runner.task_outcome(books, ok(BOOKS));
+    (runner, commands)
+}
+
+#[test]
+fn an_album_opens_on_a_masthead_with_its_artist_year_and_length() {
+    let (mut runner, _) = books_shelf(false);
+    let commands = runner.action(action_id("tile-0"));
+    let screen = last_screen(&commands).expect("a screen");
+    let text = screen_text(&screen);
+    for part in ["Book One", "Author A", "2001", "1:02:05"] {
+        assert!(text.contains(part), "{part} missing from {text}");
+    }
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+}
+
+#[test]
+fn the_masthead_shows_the_cover_already_held_or_the_one_that_arrives() {
+    let (mut runner, commands) = books_shelf(false);
+    let (cover, _) = cover_tasks(&commands)[0].clone();
+    // Opened while the cover is still on its way: no picture yet, no new fetch.
+    let commands = runner.action(action_id("tile-0"));
+    assert!(!screen_text(&last_screen(&commands).expect("a screen")).contains("Picture"));
+    assert!(
+        cover_tasks(&commands).is_empty(),
+        "the one on its way serves"
+    );
+    let commands = runner.task_outcome(cover, cover_bytes());
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen_text(&screen).contains("Picture"), "{screen:?}");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+    // And with the cover held, opening again needs no fetch.
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("tile-0"));
+    assert!(cover_tasks(&commands).is_empty());
+    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Picture"));
+}
+
+#[test]
+fn a_long_album_pages_under_the_masthead_and_every_page_fits() {
+    let (mut runner, _) = books_shelf(true);
+    let commands = runner.action(action_id("tile-0"));
+    let (tracks, _) = asked(&commands, "ParentId=bk1").expect("tracks");
+    let items: Vec<String> = (0..30)
+        .map(|index| {
+            format!(
+                r#"{{"Id":"c{index}","Name":"Chapter {index} with a longer name","RunTimeTicks":18700000000}}"#
+            )
+        })
+        .collect();
+    let commands = runner.task_outcome(
+        tracks,
+        ok(&format!(
+            r#"{{"Items":[{}],"TotalRecordCount":30}}"#,
+            items.join(",")
+        )),
+    );
+    let first = last_screen(&commands).expect("a screen");
+    assert!(screen_text(&first).contains("Author A"));
+    assert!(screen_text(&first).contains("Chapter 0"));
+    assert!(first.validate(&CLARA_BW_METRICS).is_empty());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last = screen_text(&first);
+    for _ in 0..12 {
+        let commands = runner.action(action_id("page-next"));
+        let Some(screen) = last_screen(&commands) else {
+            break;
+        };
+        let problems = screen.validate(&CLARA_BW_METRICS);
+        assert!(problems.is_empty(), "{problems:?}");
+        last = screen_text(&screen);
+        for index in 0..30 {
+            if last.contains(&format!("Chapter {index} with")) {
+                seen.insert(index);
+            }
+        }
+    }
+    assert!(last.contains("Chapter 29"), "the last page is reached");
+    assert!(!last.contains("Author A"), "later pages carry no masthead");
+    assert!(seen.len() >= 20, "{seen:?}");
+}
+
+#[test]
+fn playing_from_an_album_with_a_masthead_still_starts_the_chosen_track() {
+    let (_, commands) = playing();
+    let (_, task) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let Task::Post { body, .. } = task else {
+        panic!("a report is a POST");
+    };
+    assert!(body.contains("\"ItemId\":\"tr2\""), "{body}");
+}

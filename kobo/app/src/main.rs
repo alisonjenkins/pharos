@@ -14,8 +14,8 @@ use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
 use kobo_sdk::{
-    Glyph, Header, LogLevel, PictureHandle, Task, TaskError, TaskId, TaskOutcome, TilePicture,
-    TileShape, MAX_TASKS_IN_FLIGHT,
+    Glyph, Header, LogLevel, PictureHandle, Position, Task, TaskError, TaskId, TaskOutcome,
+    TilePicture, TileShape, MAX_TASKS_IN_FLIGHT,
 };
 use std::process::ExitCode;
 
@@ -29,8 +29,9 @@ const POLL_SECONDS: u32 = 3;
 /// How often a playing track's place is sent while nobody touches anything.
 const REPORT_SECONDS: u32 = 30;
 const MAX_JSON: u32 = 512 * 1024;
-/// Rows on one page of a list; the side of the panel turns to the next.
-const ROWS_PER_PAGE: usize = 7;
+/// How wide the cover is on an album's masthead, in millimetres: about what
+/// a tile is on the smallest reader, so the picture already held fits.
+const HERO_COVER_MM: u16 = 26;
 /// The most rows of a shelf that are fetched. A shelf loads whole, in blocks
 /// of [`api::PAGE`], because pharos cannot filter audiobooks from music on
 /// its side; this stops a huge library from being read forever.
@@ -287,6 +288,10 @@ impl Pharos {
     /// The covers worth having now: those on the page showing and the next
     /// one, as `(album id, cover tag)`. An album with no cover tag has none.
     fn wanted_covers(&self, context: &Context) -> (Vec<(String, String)>, usize) {
+        if let View::Album(album) = &self.view {
+            let tagged = album.image_tag.clone().map(|tag| (album.id.clone(), tag));
+            return (tagged.into_iter().collect(), 0);
+        }
         let View::Library(_) = self.view else {
             return (Vec::new(), 0);
         };
@@ -676,29 +681,87 @@ impl Pharos {
         self.view = View::Problem(why.into());
     }
 
-    /// The rows of `page` on the panel page `self.page`.
-    fn rows(page: &Page, at: usize, show_length: bool) -> Vec<(String, String, String, u16)> {
-        page.entries
+    /// The second line of a track row: who, and how long.
+    fn summary(entry: &Entry) -> String {
+        let mut summary = entry.by.clone();
+        if let Some(ms) = entry.runtime_ms {
+            if !summary.is_empty() {
+                summary.push_str(" · ");
+            }
+            summary.push_str(&api::clock(ms));
+        }
+        summary
+    }
+
+    /// The track rows at `indices`, numbered from one.
+    fn rows(page: &Page, indices: &[usize]) -> Vec<(String, String, String, u16)> {
+        indices
             .iter()
-            .enumerate()
-            .skip(at * ROWS_PER_PAGE)
-            .take(ROWS_PER_PAGE)
-            .map(|(index, entry)| {
-                let mut summary = entry.by.clone();
-                if let (true, Some(ms)) = (show_length, entry.runtime_ms) {
-                    if !summary.is_empty() {
-                        summary.push_str(" · ");
-                    }
-                    summary.push_str(&api::clock(ms));
-                }
-                (
+            .filter_map(|&index| {
+                let entry = page.entries.get(index)?;
+                Some((
                     format!("row-{index}"),
                     entry.name.clone(),
-                    summary,
+                    Self::summary(entry),
                     u16::try_from(index + 1).unwrap_or(u16::MAX),
-                )
+                ))
             })
             .collect()
+    }
+
+    /// The top of an album's first page: the cover beside the title, the
+    /// artist, the year and the length.
+    fn masthead(&self, album: &Entry) -> ScreenBuilder {
+        let mut facts = Vec::new();
+        if let Some(year) = album.year {
+            facts.push(("Year", year.to_string()));
+        }
+        if let Some(ms) = album.runtime_ms {
+            facts.push(("Length", api::clock(ms)));
+        }
+        let by = (!album.by.is_empty()).then(|| album.by.clone());
+        self.now_playing(ScreenBuilder::new("pharos-album").top_bar(self.kind.label()))
+            .hero(
+                self.cover_of(&album.id),
+                HERO_COVER_MM,
+                album.name.clone(),
+                by,
+                facts,
+            )
+    }
+
+    /// The tracks split into pages. The first page sits under the masthead,
+    /// so it holds fewer rows than the rest; its room is measured, not guessed.
+    fn track_pages(&self, context: &Context, album: &Entry) -> Vec<Vec<usize>> {
+        let summaries: Vec<String> = self.tracks.entries.iter().map(Self::summary).collect();
+        let sectioned: Vec<(Option<&str>, &str, &str)> = self
+            .tracks
+            .entries
+            .iter()
+            .zip(&summaries)
+            .map(|(entry, summary)| (None, entry.name.as_str(), summary.as_str()))
+            .collect();
+        let placed = self.masthead(album).build();
+        let under = context.paginate_rows_in_sections_under(
+            &sectioned,
+            false,
+            Position::AtTheFoot,
+            &placed,
+        );
+        let first = under.into_iter().next().unwrap_or_default();
+        let taken = first.len();
+        let rest: Vec<(&str, &str)> = sectioned
+            .iter()
+            .skip(taken)
+            .map(|&(_, name, summary)| (name, summary))
+            .collect();
+        let mut pages = vec![first];
+        for page in context.paginate_rows(&rest, false) {
+            if !page.is_empty() {
+                pages.push(page.into_iter().map(|index| index + taken).collect());
+            }
+        }
+        pages
     }
 
     fn screen(&self, context: &Context) -> Screen {
@@ -747,16 +810,26 @@ impl Pharos {
                 .build()
                 .with_own_back(true),
             View::Album(album) if self.tracks.entries.is_empty() => self
-                .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
+                .masthead(album)
                 .activity("Loading the tracks", None)
                 .build()
                 .with_own_back(true),
-            View::Album(album) => self
-                .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
-                .rows(Self::rows(&self.tracks, self.page, true))
-                .page_turns("page-back", "page-next")
-                .build()
-                .with_own_back(true),
+            View::Album(album) => {
+                let pages = self.track_pages(context, album);
+                let page = self.page.min(pages.len().saturating_sub(1));
+                let indices = pages.get(page).map_or(&[][..], Vec::as_slice);
+                // Only the first page has room for the masthead.
+                let screen = if page == 0 {
+                    self.masthead(album)
+                } else {
+                    self.now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
+                };
+                screen
+                    .rows(Self::rows(&self.tracks, indices))
+                    .page_turns("page-back", "page-next")
+                    .build()
+                    .with_own_back(true)
+            }
             View::Player => match &self.playing {
                 Some(playing) => playing.player.screen_for(context),
                 None => ScreenBuilder::new("pharos")
@@ -842,7 +915,7 @@ impl Pharos {
     fn turn(&mut self, context: &Context, forward: bool) {
         let pages = match &self.view {
             View::Library(_) => self.grid_pages(context).len().max(1),
-            View::Album(_) => self.tracks.entries.len().div_ceil(ROWS_PER_PAGE).max(1),
+            View::Album(album) => self.track_pages(context, album).len().max(1),
             _ => return,
         };
         let current = if matches!(self.view, View::Library(_)) {
