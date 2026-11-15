@@ -62,8 +62,6 @@ enum View {
     Home,
     /// A shelf of albums or audiobooks.
     Library(Kind),
-    /// What the Books section shows until it opens the ebook list.
-    BooksSoon,
     /// The ebook list and the reader.
     Books,
     Album(Entry),
@@ -454,7 +452,7 @@ impl Pharos {
         self.shelf_page = 0;
     }
 
-    /// Opens a section: albums load into a shelf, books show their placeholder.
+    /// Opens a section: albums load into a shelf, books open the ebook list.
     fn open_section(&mut self, context: &mut Context, kind: Kind) {
         let Some(library) = self
             .sections
@@ -466,7 +464,10 @@ impl Pharos {
             return;
         };
         if !kind.is_albums() {
-            self.view = View::BooksSoon;
+            if let Some(account) = &self.account {
+                self.reading.open(context, account);
+                self.view = View::Books;
+            }
             return;
         }
         self.clear_shelf();
@@ -819,14 +820,6 @@ impl Pharos {
                 )
                 .build(),
             View::Home => self.home_screen(),
-            View::BooksSoon => ScreenBuilder::new("pharos-books")
-                .top_bar("Books")
-                .text(
-                    "Reading books on this reader is coming. For now, read them in \
-                     Pharos on a phone or computer.",
-                )
-                .build()
-                .with_own_back(true),
             View::Library(kind) if self.shelf.entries.is_empty() => {
                 let screen =
                     self.now_playing(ScreenBuilder::new("pharos-library").top_bar(kind.label()));
@@ -838,16 +831,12 @@ impl Pharos {
                 screen.build().with_own_back(true)
             }
             View::Library(kind) => self
-                .now_playing(
-                    ScreenBuilder::new("pharos-library")
-                        .top_bar(format!(
-                            "{} · {} {}",
-                            kind.label(),
-                            self.shelf.entries.len(),
-                            kind.noun()
-                        ))
-                        .top_bar_action("books", "Books"),
-                )
+                .now_playing(ScreenBuilder::new("pharos-library").top_bar(format!(
+                    "{} · {} {}",
+                    kind.label(),
+                    self.shelf.entries.len(),
+                    kind.noun()
+                )))
                 .picture_tiles(Self::shape(*kind), self.tiles(context))
                 .page_turns("page-back", "page-next")
                 .build()
@@ -1039,7 +1028,7 @@ impl KoboApp for Pharos {
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
         if matches!(self.view, View::Books) {
             match self.reading.action(context, action) {
-                Leave::Back => self.view = View::Library(self.kind),
+                Leave::Back => self.view = View::Home,
                 Leave::SignOut => self.sign_out(context),
                 Leave::Stay => {}
             }
@@ -1074,18 +1063,13 @@ impl KoboApp for Pharos {
                     self.album = None;
                     self.page = 0;
                 }
-                View::Library(_) | View::BooksSoon => self.view = View::Home,
+                View::Library(_) => self.view = View::Home,
                 _ => {}
             }
         } else if action == action_id("retry") {
             match self.account {
                 Some(_) => self.load_views(context),
                 None => self.sign_in(context),
-            }
-        } else if action == action_id("books") {
-            if let Some(account) = &self.account {
-                self.reading.open(context, account);
-                self.view = View::Books;
             }
         } else if action == action_id("now-playing") && self.playing.is_some() {
             self.view = View::Player;
