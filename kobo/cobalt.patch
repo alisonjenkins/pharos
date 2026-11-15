@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ff9a0140..eadda66e 100644
+index ff9a014..557ad2a 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1559,6 +1559,18 @@ dependencies = [
@@ -22,7 +22,7 @@ index ff9a0140..eadda66e 100644
  name = "kobo-policy"
  version = "0.3.37"
 diff --git a/Cargo.toml b/Cargo.toml
-index 209fdaa9..68ff56b8 100644
+index 209fdaa..68ff56b 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -54,6 +54,7 @@ members = [
@@ -33,8 +33,516 @@ index 209fdaa9..68ff56b8 100644
      "examples/hn",
      "examples/books",
      "examples/launcher",
+diff --git a/apps/calibre-web/src/reading.rs b/apps/calibre-web/src/reading.rs
+index 8e3f1bb..ebf319f 100644
+--- a/apps/calibre-web/src/reading.rs
++++ b/apps/calibre-web/src/reading.rs
+@@ -1162,7 +1162,7 @@ mod tests {
+             at: 20,
+             ..Memory::default()
+         };
+-        assert!(reading.view.restore(&c, memory));
++        assert!(reading.view.restore(&mut c, memory));
+         reading.keep_position(&mut c);
+         let encoded = reading.write.clone().unwrap();
+         reading.store(
+diff --git a/crates/kobo-bookview/src/lib.rs b/crates/kobo-bookview/src/lib.rs
+index 9875021..f997913 100644
+--- a/crates/kobo-bookview/src/lib.rs
++++ b/crates/kobo-bookview/src/lib.rs
+@@ -49,7 +49,7 @@ pub mod offline;
+ pub mod positions;
+ 
+ use kobo_doc::{Block, Document, FORMULA_PICTURE_EM, FORMULA_PICTURE_PREFIX};
+-use kobo_read::{Memory, Outcome, Reader};
++use kobo_read::{Locator, Memory, Outcome, Reader};
+ use kobo_sdk::{
+     Context, DisplayMetrics, PictureHandle, Screen, Task, TaskId, TaskOutcome, TilePicture,
+ };
+@@ -90,6 +90,28 @@ pub const MAX_PICTURE_BYTES: u32 = 4 * 1024 * 1024;
+ /// The longest a picture's address may be.
+ const MAX_PICTURE_NAME: usize = 512;
+ 
++/// The bytes of the runtime's picture cache a document's pictures may fill.
++///
++/// Not all of it: the cache is the runtime's, and evicts the oldest picture
++/// when it is full, so a document that filled it would have its own page
++/// evicted to make room for an application's icons, or for the next page's
++/// plate. The rest is left for whatever else is on screen.
++const PLATE_BUDGET: usize = kobo_ui::DEFAULT_PICTURE_BUDGET / 4 * 3;
++
++/// How much further away a picture behind the reader counts than one ahead.
++///
++/// A book is mostly read forwards, so the next plate is worth decoding before
++/// the last one; but a page turned back is common enough that the plate just
++/// passed should not be the first to go.
++const BACKWARD_WEIGHT: u32 = 2;
++
++/// The bytes the runtime's cache charges for a picture of this size: one grey
++/// byte a pixel, and three more for colour when there is any.
++fn picture_cost(width: u32, height: u32, colour: bool) -> usize {
++    let pixels = usize::try_from(u64::from(width) * u64::from(height)).unwrap_or(usize::MAX);
++    pixels.saturating_mul(if colour { 4 } else { 1 })
++}
++
+ /// How long one pass may spend typesetting formulae.
+ ///
+ /// Chosen by subtraction from the runtime's 250 ms callback deadline. A pass
+@@ -160,9 +182,22 @@ pub struct BookView {
+     /// arrives late has to be merged into what was reserved at open, and the
+     /// reader takes the whole map or none of it.
+     reserved: BTreeMap<String, TilePicture>,
+-    /// Source bytes for pictures with room reserved and no pixels yet, in the
+-    /// order the text refers to them.
+-    plates: VecDeque<(String, Vec<u8>)>,
++    /// Pictures to decode next, nearest the place being read first.
++    plates: VecDeque<String>,
++    /// Source bytes for every picture with room reserved, kept for as long as
++    /// the document is open.
++    ///
++    /// A picture far from the page being read is handed back to the runtime
++    /// and decoded again from these when the reader comes near it. The
++    /// runtime's cache holds megabytes and a book carries hundreds of
++    /// megapixels, so decoding every plate once, down the book, left the
++    /// cache holding the last few and the pages near the start blank.
++    sources: BTreeMap<String, Vec<u8>>,
++    /// What the runtime is holding pixels for, by name, with the bytes it
++    /// charges for each.
++    held: BTreeMap<String, usize>,
++    /// The first block that refers to each picture.
++    at: BTreeMap<String, Locator>,
+     /// Formulae the document named and nothing has typeset yet, as the LaTeX
+     /// to set them from, in the order the text refers to them.
+     ///
+@@ -260,9 +295,9 @@ impl BookView {
+     /// Opens a document that has already been parsed.
+     ///
+     /// The pictures the container carried are taken off the document rather
+-    /// than left on it: the reader owns the document from here, and holding
+-    /// the scanned bytes as well as the decoded greyscale meant every plate
+-    /// was paid for twice.
++    /// than left on it: the reader owns the document from here, and the view
++    /// keeps each picture's bytes once, to decode it again whenever the reader
++    /// comes back near it.
+     pub fn open(&mut self, context: &mut Context, mut document: Document, memory: Memory) {
+         self.formulae_as_text = false;
+         // Whatever the last document handed over is about to be replaced, so
+@@ -306,11 +341,16 @@ impl BookView {
+             }
+         }
+         reader.set_pictures(self.reserved.clone(), &metrics);
++        self.at = reader
++            .pictures_at()
++            .into_iter()
++            .map(|(name, block)| (name.to_owned(), block))
++            .collect();
+         self.reader = Some(reader);
+         // Handed to the runtime rather than started here. Opening has already
+         // spent its parse and its pagination, and a plate on top of that is
+         // what puts a lifecycle callback past the watchdog's deadline.
+-        self.kick(context);
++        self.replan(context);
+         self.match_light(context);
+     }
+ 
+@@ -526,15 +566,15 @@ impl BookView {
+     /// back to page one of something they were halfway through.
+     ///
+     /// Answers whether there was a document to put back.
+-    pub fn restore(&mut self, context: &Context, memory: Memory) -> bool {
++    pub fn restore(&mut self, context: &mut Context, memory: Memory) -> bool {
+         let metrics = context.metrics();
+-        match self.reader.as_mut() {
+-            Some(reader) => {
+-                reader.restore(memory, &metrics);
+-                true
+-            }
+-            None => false,
+-        }
++        let Some(reader) = self.reader.as_mut() else {
++            return false;
++        };
++        reader.restore(memory, &metrics);
++        // Somewhere else in the book, so other pictures are the near ones.
++        self.replan(context);
++        true
+     }
+ 
+     /// Re-measure an open document after a panel or orientation change.
+@@ -583,6 +623,8 @@ impl BookView {
+             Outcome::Elsewhere => return None,
+             handled => handled,
+         };
++        // The page may have moved, so what is worth holding may have too.
++        self.replan(context);
+         if self.plating.is_none()
+             && (!self.plates.is_empty() || self.dithering.is_some() || !self.unset.is_empty())
+         {
+@@ -725,7 +767,7 @@ impl BookView {
+         if let Some(reader) = &mut self.reader {
+             reader.set_pictures(reserved, &metrics);
+         }
+-        self.kick(context);
++        self.replan(context);
+         true
+     }
+ 
+@@ -773,7 +815,7 @@ impl BookView {
+             TilePicture::new(handle, drawn_width, drawn_height),
+         );
+         self.handles.push(handle);
+-        self.plates.push_back((name.to_owned(), bytes.to_vec()));
++        self.sources.insert(name.to_owned(), bytes.to_vec());
+         true
+     }
+ 
+@@ -802,6 +844,99 @@ impl BookView {
+         }
+     }
+ 
++    /// The pictures worth holding decoded from where the reader is, nearest
++    /// first, as many as fit in [`PLATE_BUDGET`].
++    ///
++    /// The page being read comes first and always: those are the pictures
++    /// somebody is looking at, so they are kept even past the budget.
++    fn window(&self, colour: bool) -> Vec<String> {
++        let Some(reader) = &self.reader else {
++            return Vec::new();
++        };
++        let here = reader.memory().at;
++        let mut window: Vec<String> = reader
++            .pictures_on_page()
++            .into_iter()
++            .filter(|name| self.sources.contains_key(*name))
++            .map(str::to_owned)
++            .collect();
++        let mut used: usize = window.iter().map(|name| self.cost_of(name, colour)).sum();
++        let mut rest: Vec<(u32, &String)> = self
++            .sources
++            .keys()
++            .filter(|name| !window.contains(name))
++            .map(|name| {
++                let distance = self.at.get(name).map_or(u32::MAX, |&at| {
++                    if at >= here {
++                        at - here
++                    } else {
++                        (here - at).saturating_mul(BACKWARD_WEIGHT)
++                    }
++                });
++                (distance, name)
++            })
++            .collect();
++        rest.sort();
++        for (_, name) in rest {
++            let cost = self.cost_of(name, colour);
++            if used.saturating_add(cost) > PLATE_BUDGET {
++                break;
++            }
++            used += cost;
++            window.push(name.clone());
++        }
++        window
++    }
++
++    /// What a picture costs the runtime: what it was charged, once decoded,
++    /// and the room reserved for it before that.
++    fn cost_of(&self, name: &str, colour: bool) -> usize {
++        if let Some(&cost) = self.held.get(name) {
++            return cost;
++        }
++        self.reserved.get(name).map_or(0, |picture| {
++            picture_cost(picture.source.0, picture.source.1, colour)
++        })
++    }
++
++    /// [`BookView::plan`], then asks for the pipeline to carry it out.
++    fn replan(&mut self, context: &mut Context) {
++        self.plan(context);
++        self.kick(context);
++    }
++
++    /// Hands back the pictures far from the page being read and queues the
++    /// near ones that are not decoded yet, nearest first.
++    ///
++    /// Cheap enough to run on every pass: a sort of the book's picture names.
++    fn plan(&mut self, context: &mut Context) {
++        let window = self.window(context.panel_shows_colour());
++        let far: Vec<String> = self
++            .held
++            .keys()
++            .filter(|name| !window.contains(name))
++            .cloned()
++            .collect();
++        for name in far {
++            self.held.remove(&name);
++            if let Some(handle) = self.handed(&name) {
++                context.drop_picture(handle);
++            }
++        }
++        if self
++            .dithering
++            .as_ref()
++            .is_some_and(|(name, _)| !window.contains(name))
++        {
++            self.dithering = None;
++        }
++        let dithering = self.dithering.as_ref().map(|(name, _)| name.clone());
++        self.plates = window
++            .into_iter()
++            .filter(|name| !self.held.contains_key(name) && Some(name) != dithering.as_ref())
++            .collect();
++    }
++
+     /// Asks the runtime to carry the pipeline forward, if there is anything
+     /// left to carry and nothing already carrying it.
+     fn kick(&mut self, context: &mut Context) {
+@@ -848,6 +983,9 @@ impl BookView {
+                 .map(str::to_owned)
+                 .collect()
+         });
++        // The reader may have been moved without an action passing through
++        // here -- restored to a saved place, or reflowed.
++        self.plan(context);
+         // Formulae first, and their own pass. Typesetting one is a different
+         // shape of work from turning a photograph into sixteen greys -- small
+         // enough to do several of in the time one plate takes -- and mixing
+@@ -865,6 +1003,7 @@ impl BookView {
+             let (drawn_width, drawn_height) = (picture.width(), picture.height());
+             if let Some(reserved) = self.handed(&name) {
+                 let colour = picture.colour().map(<[u8]>::to_vec);
++                let cost = picture_cost(drawn_width, drawn_height, colour.is_some());
+                 if context
+                     .put_picture_shown(
+                         reserved,
+@@ -874,30 +1013,35 @@ impl BookView {
+                         colour,
+                     )
+                     .is_some()
+-                    && showing.contains(&name)
+                 {
+-                    on_this_page = true;
++                    self.held.insert(name.clone(), cost);
++                    on_this_page = showing.contains(&name);
+                 }
+             }
+         } else {
+-            self.wanted_first(&showing);
+             // The first half: the file. A plate that will not read costs
+             // nothing, so this goes past it rather than spending a whole round
+             // trip discovering there was nothing to draw, and stops on the
+             // first one that works.
+-            while let Some((name, bytes)) = self.plates.pop_front() {
++            while let Some(name) = self.plates.pop_front() {
+                 if self.handed(&name).is_none() {
+                     continue;
+                 }
++                let Some(bytes) = self.sources.get(&name) else {
++                    continue;
++                };
+                 // Read in colour only for a panel that will show it: a colour
+                 // read costs twice the memory of a grey one at its peak, and a
+                 // greyscale reader draws the same picture either way.
+                 let decoded = if context.panel_shows_colour() {
+-                    kobo_image::decode_colour(&bytes)
++                    kobo_image::decode_colour(bytes)
+                 } else {
+-                    kobo_image::decode(&bytes)
++                    kobo_image::decode(bytes)
+                 };
++                // A picture that will not read is forgotten, so it is not
++                // tried again every time the reader comes near it.
+                 let Ok(picture) = decoded else {
++                    self.sources.remove(&name);
+                     continue;
+                 };
+                 let (box_width, box_height) = if name.starts_with(FORMULA_PICTURE_PREFIX) {
+@@ -906,6 +1050,7 @@ impl BookView {
+                     (width, height)
+                 };
+                 let Ok(picture) = picture.fit(box_width, box_height) else {
++                    self.sources.remove(&name);
+                     continue;
+                 };
+                 self.dithering = Some((name, picture));
+@@ -976,18 +1121,6 @@ impl BookView {
+         self.unset = wanted.into_iter().chain(rest).collect();
+     }
+ 
+-    /// Moves the named plates to the front of the queue, keeping their order.
+-    fn wanted_first(&mut self, names: &[String]) {
+-        if names.is_empty() {
+-            return;
+-        }
+-        let (wanted, rest): (VecDeque<_>, VecDeque<_>) = self
+-            .plates
+-            .drain(..)
+-            .partition(|(name, _)| names.contains(name));
+-        self.plates = wanted.into_iter().chain(rest).collect();
+-    }
+-
+     /// The handle a plate was reserved against, if it was.
+     fn handed(&self, name: &str) -> Option<PictureHandle> {
+         self.reserved.get(name).map(|picture| picture.handle)
+@@ -1003,6 +1136,9 @@ impl BookView {
+             context.drop_picture(handle);
+         }
+         self.plates.clear();
++        self.sources.clear();
++        self.held.clear();
++        self.at.clear();
+         self.unset.clear();
+         self.offered.clear();
+         self.reserved.clear();
+@@ -1144,6 +1280,8 @@ mod tests {
+     }
+ 
+     use super::{picture_url, pictures_in, BookView, Step};
++    #[cfg(feature = "raster")]
++    use super::{picture_cost, PLATE_BUDGET};
+     use kobo_doc::{Block, Document};
+     use kobo_read::{Memory, Reader};
+     use kobo_sdk::{Command, Context, PictureHandle, Task, TaskError, TaskId, TaskOutcome};
+@@ -1529,6 +1667,138 @@ mod tests {
+         }
+     }
+ 
++    /// A book of `count` plates, a page or so of prose before each.
++    #[cfg(feature = "raster")]
++    fn plates(count: usize, plate: &[u8]) -> Document {
++        let mut blocks = Vec::new();
++        let mut images = BTreeMap::new();
++        for index in 0..count {
++            blocks.extend(prose(12));
++            let name = format!("plate-{index}.png");
++            images.insert(name.clone(), plate.to_vec());
++            blocks.push(Block::Picture {
++                name,
++                alt: "Four rabbits".to_owned(),
++                illustration: true,
++            });
++        }
++        Document {
++            blocks,
++            images,
++            ..Document::default()
++        }
++    }
++
++    /// Hands every picture command to a cache the size of the runtime's,
++    /// failing on the first picture it has to evict to make room.
++    #[cfg(feature = "raster")]
++    fn replay(commands: Vec<Command>, cache: &mut kobo_ui::PictureCache) {
++        for command in commands {
++            match command {
++                Command::PutPicture {
++                    handle,
++                    width,
++                    height,
++                    format,
++                    pixels,
++                } => {
++                    let evicted = cache
++                        .put_report_with(handle, width, height, format, pixels)
++                        .expect("a picture the cache will take");
++                    assert!(
++                        evicted.is_empty(),
++                        "the view outgrew the runtime's cache, which threw out {evicted:?}"
++                    );
++                }
++                Command::DropPicture(handle) => cache.remove(handle),
++                _ => {}
++            }
++        }
++    }
++
++    /// [`drain`], with every command replayed into `cache`.
++    #[cfg(feature = "raster")]
++    fn drain_into(view: &mut BookView, cache: &mut kobo_ui::PictureCache) {
++        let mut passes = 0;
++        while let Some(task) = view.plating {
++            let mut context = Context::default();
++            let _ = view.woke(&mut context, task, &TaskOutcome::Completed(Vec::new()));
++            replay(context.take_commands(), cache);
++            passes += 1;
++            assert!(passes < 10_000, "the pipeline never came to rest");
++        }
++    }
++
++    #[cfg(feature = "raster")]
++    fn on_page(view: &BookView) -> Vec<PictureHandle> {
++        view.reader
++            .as_ref()
++            .expect("a book")
++            .pictures_on_page()
++            .into_iter()
++            .filter_map(|name| view.handed(name))
++            .collect()
++    }
++
++    /// A book with more plates than the runtime's cache holds keeps the
++    /// pictures near the page being read, and gets the far ones back when the
++    /// reader goes to them.
++    ///
++    /// Decoding every plate once, down the book, filled the cache from the
++    /// front and had it throw out the first pages' plates to make room for
++    /// the last ones, so a book of illustrations opened on blank frames.
++    #[cfg(feature = "raster")]
++    #[test]
++    fn a_book_with_more_plates_than_the_cache_holds_keeps_the_ones_near_the_page() {
++        const COUNT: usize = 40;
++        let plate = plate_bytes();
++        let mut context = Context::default();
++        let mut cache = kobo_ui::PictureCache::default();
++        let mut view = BookView::new();
++        view.open(&mut context, plates(COUNT, &plate), Memory::default());
++        let book_costs: usize = view
++            .reserved
++            .values()
++            .map(|picture| picture_cost(picture.source.0, picture.source.1, false))
++            .sum();
++        assert!(
++            book_costs > kobo_ui::DEFAULT_PICTURE_BUDGET,
++            "{book_costs} bytes of plates fit the cache, so this tests nothing"
++        );
++        replay(context.take_commands(), &mut cache);
++        drain_into(&mut view, &mut cache);
++        assert!(cache.bytes_held() <= PLATE_BUDGET);
++
++        // Far down the book, onto a page with a plate on it.
++        let late = 12 + 13 * (COUNT - 3);
++        let mut context = Context::default();
++        assert!(view.restore(
++            &mut context,
++            Memory {
++                at: kobo_read::Locator::try_from(late).expect("a block"),
++                ..Memory::default()
++            }
++        ));
++        let mut turned = 0;
++        while on_page(&view).is_empty() {
++            assert!(view
++                .act(&mut context, kobo_sdk::action_id(kobo_read::action::BACK))
++                .is_some());
++            turned += 1;
++            assert!(turned < 4, "no page near the end of the book has a plate");
++        }
++        replay(context.take_commands(), &mut cache);
++        drain_into(&mut view, &mut cache);
++        let showing = on_page(&view);
++        for handle in &showing {
++            assert!(
++                kobo_ui::Pictures::get(&cache, *handle).is_some(),
++                "{handle:?} is on the page and was never decoded"
++            );
++        }
++        assert!(cache.bytes_held() <= PLATE_BUDGET);
++    }
++
+     fn handed(commands: &[Command]) -> Vec<(PictureHandle, u32, u32)> {
+         commands
+             .iter()
 diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
-index 6220e125..752dd9fd 100644
+index 6220e12..752dd9f 100644
 --- a/crates/kobo-cli/src/main.rs
 +++ b/crates/kobo-cli/src/main.rs
 @@ -106,6 +106,7 @@ const INSTALLED_PACKAGES: &[(&str, Option<&str>)] = &[
@@ -45,8 +553,45 @@ index 6220e125..752dd9fd 100644
      ("kobo-store", None),
  ];
  /// Applications released through Store, including the initial built-in copies
+diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
+index b6e6ed5..811a2e3 100644
+--- a/crates/kobo-read/src/lib.rs
++++ b/crates/kobo-read/src/lib.rs
+@@ -2602,6 +2602,32 @@ impl Reader {
+         wanted
+     }
+ 
++    /// Every picture the book refers to, with the first block that refers to it.
++    ///
++    /// What an application asks in order to keep decoded only the pictures
++    /// near the place being read.
++    #[must_use]
++    pub fn pictures_at(&self) -> BTreeMap<&str, Locator> {
++        let mut at = BTreeMap::new();
++        for (index, block) in self.document.blocks.iter().enumerate() {
++            if let (Block::Picture { name, .. }, Ok(block)) = (block, Locator::try_from(index)) {
++                at.entry(name.as_str()).or_insert(block);
++            }
++        }
++        for (index, rich) in &self.document.rich {
++            let Ok(block) = Locator::try_from(*index) else {
++                continue;
++            };
++            for span in &rich.spans {
++                if let Some(name) = &span.formula {
++                    let first = at.entry(name.as_str()).or_insert(block);
++                    *first = (*first).min(block);
++                }
++            }
++        }
++        at
++    }
++
+     /// Every picture the page being read refers to, in the order it does.
+     ///
+     /// The subset of [`Self::pictures_wanted`] that is actually on screen, and
 diff --git a/crates/kobod/src/app_store.rs b/crates/kobod/src/app_store.rs
-index fb5d8666..8c4a7ae5 100644
+index fb5d866..8c4a7ae 100644
 --- a/crates/kobod/src/app_store.rs
 +++ b/crates/kobod/src/app_store.rs
 @@ -127,6 +127,17 @@ const MANAGED_BUILTINS: &[BuiltinApp] = &[
@@ -68,7 +613,7 @@ index fb5d8666..8c4a7ae5 100644
          id: "sidekick",
          title: "Sidekick",
 diff --git a/crates/kobod/src/update.rs b/crates/kobod/src/update.rs
-index f136bcf2..bf8710d5 100644
+index f136bcf..bf8710d 100644
 --- a/crates/kobod/src/update.rs
 +++ b/crates/kobod/src/update.rs
 @@ -16,6 +16,9 @@
