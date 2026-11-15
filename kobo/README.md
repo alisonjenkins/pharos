@@ -26,7 +26,7 @@ sign-in as the music; the OPDS catalogue is not used because it needs an
 e-reader password the app does not hold.
 
 Readable: EPUB (also Kindle books, which Pharos serves as EPUB), plain text,
-Markdown and HTML, up to 16 MB and 64 downloaded books. PDF and comic books
+Markdown and HTML, up to 32 MB and 64 downloaded books. PDF and comic books
 (CBZ, CBR) show "This reader can't open PDF books yet" and download nothing.
 Reading progress is kept on the reader only; it is not reported to Pharos.
 

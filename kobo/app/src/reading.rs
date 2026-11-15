@@ -544,7 +544,7 @@ impl Reading {
         match outcome {
             TaskOutcome::Completed(piece) => match books::after_piece(bytes.len(), piece.len()) {
                 Piece::TooBig => {
-                    self.say(BannerLevel::Error, "This book is over the 16 MB limit.");
+                    self.say(BannerLevel::Error, books::TOO_BIG);
                 }
                 next => {
                     let mut bytes = bytes;
@@ -817,7 +817,7 @@ fn task_words(error: TaskError) -> &'static str {
     match error {
         TaskError::Offline => "The reader is offline. Turn on Wi-Fi and try again.",
         TaskError::NotFound => "Pharos has no file for this book.",
-        TaskError::TooLarge => "This book is over the 16 MB limit.",
+        TaskError::TooLarge => books::TOO_BIG,
         _ => "Pharos could not be reached. Try again.",
     }
 }
