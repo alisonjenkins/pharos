@@ -79,6 +79,23 @@ writing. To see the changes without writing anything, run
 `kobo/build.sh --setup --dry-run` instead. Anything after `--setup` goes to
 `kobo setup`.
 
+**If setup says `cobalt-launch.sh is not executable`:** the desktop mounted
+the Kobo's FAT drive with `showexec`. That option marks only `.exe`, `.bat`
+and `.com` files as runnable, so Cobalt's check of its launch script fails.
+This comes from the computer's mount, not the Kobo. Mount the drive yourself
+without `showexec`, then point setup at it:
+
+```sh
+udisksctl unmount -b /dev/sdX   # the KOBOeReader device, see lsblk
+sudo mkdir -p /mnt/kobo
+sudo mount -t vfat -o uid=$(id -u),gid=$(id -g),fmask=0022,dmask=0022,utf8,shortname=mixed,flush /dev/sdX /mnt/kobo
+nix shell nixpkgs#zig nixpkgs#rustup nixpkgs#gcc nixpkgs#lld --command kobo/build.sh --setup --volume /mnt/kobo
+sudo umount /mnt/kobo           # setup cannot eject a mount made with sudo
+```
+
+Unmounting by hand also skips setup's wait for Wi-Fi and SSH pairing. Once
+the Kobo is back on Wi-Fi, run `kobo/.cobalt/target/debug/kobo pair`.
+
 ### 2. Let the Kobo restart
 
 Follow what setup prints. Usually that is:
