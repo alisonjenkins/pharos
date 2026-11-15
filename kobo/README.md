@@ -5,8 +5,17 @@ A Pharos client for Kobo readers (tested target: Libra Colour), built as a
 Spec: `specs/047-kobo-app/`.
 
 What it does today: signs in with Quick Connect (a code to approve in the
-Pharos web UI), lists music albums and their tracks, and plays a track to
-Bluetooth headphones through Cobalt's player, telling Pharos where you are.
+Pharos web UI), shows a home screen with a section for each kind of library
+you can see (Music, Audiobooks, Books), and shows albums and audiobooks as a
+grid of covers. An album opens on its cover, artist, year and length above
+its tracks. Playing a track sends it to Bluetooth headphones through Cobalt's
+player, which shows the same cover, and tells Pharos where you are. Books is
+a placeholder: reading ebooks on the Kobo is not built yet.
+
+Covers are fetched for the page on screen and the next one, two at a time,
+and only that many are kept on the reader. Colour covers go to a colour
+panel (such as the Libra Colour) and grey ones to the rest. A cover that
+cannot be fetched leaves the tile's icon in its place.
 
 ## Layout
 
@@ -117,7 +126,7 @@ itself off if the reader restarts again straight away.
    **Cobalt**.
 2. Tap **Pharos** in the launcher.
 3. The app shows a six-digit code. In the Pharos web UI, open **Quick
-   Connect** and enter it. The Kobo then lists your albums.
+   Connect** and enter it. The Kobo then shows your libraries.
 
 The Kobo stays signed in. It appears on the Pharos devices page as
 "Pharos Kobo", and removing it there signs the Kobo out.
