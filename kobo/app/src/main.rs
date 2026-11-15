@@ -277,7 +277,8 @@ impl Pharos {
     /// The pixel size a cover is asked for and fitted to: the tile it fills.
     fn cover_size(&self, context: &Context) -> (u32, u32) {
         let metrics = context.metrics();
-        let shape = Self::shape(self.kind);
+        let kind = self.cover_kind();
+        let shape = Self::shape(kind);
         let margin = metrics.screen_margin();
         let columns = metrics.grid_columns_for_width(shape, metrics.width - 2 * margin);
         api::cover_px(
@@ -285,8 +286,18 @@ impl Pharos {
             margin,
             metrics.tenth_mm(20),
             columns,
-            self.kind.portrait(),
+            kind.portrait(),
         )
+    }
+
+    /// The kind whose tiles the covers on show fill: the ebook list's while
+    /// it shows, else the shelf's.
+    fn cover_kind(&self) -> Kind {
+        if matches!(self.view, View::Books) {
+            Kind::Books
+        } else {
+            self.kind
+        }
     }
 
     /// The cover for `id`, once the runtime holds it.
@@ -334,6 +345,10 @@ impl Pharos {
                 (wanted, per_page)
             }
             View::Library(_) => shelf_covers(),
+            View::Books => (
+                self.reading.wanted_covers(context),
+                self.reading.per_page(context),
+            ),
             _ => (Vec::new(), 0),
         };
         // The player keeps showing its cover whatever else is on screen.
@@ -418,6 +433,13 @@ impl Pharos {
     /// for and not here yet, or not asked for yet. A cover that failed is
     /// not waited for.
     fn page_covers_pending(&self, context: &Context) -> bool {
+        if matches!(self.view, View::Books) {
+            return self
+                .reading
+                .page_covers(context)
+                .iter()
+                .any(|id| matches!(self.covers.state(id), None | Some(Cover::Loading)));
+        }
         if !matches!(self.view, View::Library(_)) {
             return false;
         }
@@ -892,7 +914,7 @@ impl Pharos {
                 .compose(|screen| self.letter_picker(context, screen))
                 .build()
                 .with_own_back(true),
-            View::Books => self.reading.screen(),
+            View::Books => self.reading.screen(context, &|id| self.cover_of(id)),
             View::Album(album) if self.tracks.entries.is_empty() => self
                 .masthead(album)
                 .activity("Loading the tracks", None)
@@ -1164,6 +1186,7 @@ impl KoboApp for Pharos {
                 Leave::SignOut => self.sign_out(context),
                 Leave::Stay => {}
             }
+            self.refresh_covers(context);
             self.show(context);
             return;
         }
@@ -1283,6 +1306,7 @@ impl KoboApp for Pharos {
             if leave == Leave::SignOut {
                 self.sign_out(context);
             }
+            self.refresh_covers(context);
             self.show(context);
             return;
         }
