@@ -164,6 +164,22 @@ apps' data to `.adds/cobalt.recovery.N` on the Kobo first.
   `nix shell` as the install.
 - **The screen looks wrong or stays blank.** Hold the power button to
   restart. You are back in the Kobo's own reader with nothing to undo.
+- **`kobo pair` says the reader "did not answer as a Kobo".** Two causes have
+  been seen on firmware 4.45:
+  1. The computer does not know the Kobo's SSH host key yet, and pairing
+     refuses unknown hosts. Log in once by hand
+     (`ssh -i ~/.ssh/kobo_cobalt root@KOBO-IP`) and accept the key.
+  2. The firmware's `/etc/ssh/initial_ssh_setup.sh` ignores the command SSH
+     sends and always opens a shell, so every Cobalt command over Wi-Fi
+     hangs. Back the script up, then add this line just before its
+     `exec /bin/sh`:
+     `[ -n "$SSH_ORIGINAL_COMMAND" ] && exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"`.
+     A firmware update puts the original back.
+- **Root can still log in over SSH with a password.** Setup turns that off
+  once the Kobo is back on Wi-Fi after its restart. If the Kobo was offline
+  then, or you unmounted by hand, the step was skipped, and Cobalt has no
+  command to rerun it on its own. Check with
+  `ssh -o PubkeyAuthentication=no root@KOBO-IP`, which should be refused.
 
 Cobalt's full guide: [docs/INSTALL.md](https://github.com/BandarLabs/Cobalt/blob/5ac30a46efce23d7fa0d1cb12a499c9b57b816b0/docs/INSTALL.md).
 
