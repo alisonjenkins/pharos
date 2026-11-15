@@ -50,6 +50,10 @@ pub struct Entry {
     pub by: String,
     /// Length in milliseconds, when pharos sent one.
     pub runtime_ms: Option<u64>,
+    /// Release year, when pharos sent one.
+    pub year: Option<u32>,
+    /// Whether pharos marks the album as an audiobook (ADR-0132).
+    pub audiobook: bool,
 }
 
 /// A page of a listing and how many there are in all.
@@ -57,6 +61,63 @@ pub struct Entry {
 pub struct Page {
     pub entries: Vec<Entry>,
     pub total: usize,
+    /// How many rows the server sent, before any were dropped for lacking an
+    /// id. The next request starts this far on.
+    pub sent: usize,
+}
+
+/// A kind of library the home screen offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Kind {
+    Music,
+    Audiobooks,
+    Books,
+}
+
+impl Kind {
+    /// The name on the home screen and in the top bar.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Music => "Music",
+            Self::Audiobooks => "Audiobooks",
+            Self::Books => "Books",
+        }
+    }
+
+    /// What one entry of the kind is called, for a count.
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Music => "albums",
+            Self::Audiobooks => "audiobooks",
+            Self::Books => "books",
+        }
+    }
+
+    /// Whether the kind is a list of albums that can be opened and played.
+    #[must_use]
+    pub fn is_albums(self) -> bool {
+        !matches!(self, Self::Books)
+    }
+
+    /// Whether an album belongs under this kind. Pharos lists audiobooks
+    /// among albums, told apart only by their mark.
+    #[must_use]
+    pub fn keeps(self, entry: &Entry) -> bool {
+        match self {
+            Self::Music => !entry.audiobook,
+            Self::Audiobooks => entry.audiobook,
+            Self::Books => false,
+        }
+    }
+}
+
+/// One thing the home screen offers: a kind, and the library to list it from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Section {
+    pub kind: Kind,
+    pub library: String,
 }
 
 /// The value of `X-Emby-Authorization`: who is asking, and the token once
@@ -111,13 +172,22 @@ pub fn finish_body(secret: &str) -> String {
     ObjectBuilder::new().set("Secret", secret).build().to_json()
 }
 
-/// Albums in every music library the user can see, by name.
+/// The libraries the user can see.
 #[must_use]
-pub fn albums_url(server: &str, account: &Account, start: usize) -> String {
+pub fn views_url(server: &str, account: &Account) -> String {
+    format!("{server}/Users/{}/Views", query_escape(&account.user_id))
+}
+
+/// The albums under one library, by name. Audiobooks are albums too, so a
+/// server that ignores the library sends them with the music; `Kind::keeps`
+/// sorts them out.
+#[must_use]
+pub fn albums_url(server: &str, account: &Account, library: &str, start: usize) -> String {
     format!(
         "{server}/Users/{}/Items?IncludeItemTypes=MusicAlbum&Recursive=true\
-         &SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={PAGE}",
-        query_escape(&account.user_id)
+         &ParentId={}&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={PAGE}",
+        query_escape(&account.user_id),
+        query_escape(library)
     )
 }
 
@@ -226,6 +296,48 @@ pub fn parse_account(bytes: &[u8]) -> Option<Account> {
     Account::decode(&account.encode())
 }
 
+/// The sections the home screen shows, from `Users/{id}/Views`: music, then
+/// audiobooks, then books. A Books library holds both audiobooks and ebooks
+/// (ADR-0132); a library with no kind is mixed and listed as music. Videos
+/// and the like are left out. Where several libraries share a kind, the
+/// first one answers for it.
+#[must_use]
+pub fn parse_views(bytes: &[u8]) -> Option<Vec<Section>> {
+    let reply = parse(bytes)?;
+    let items = reply.get("Items").and_then(Value::as_array)?;
+    let mut sections: Vec<Section> = Vec::new();
+    let mut add = |kind: Kind, library: &str| {
+        if !sections.iter().any(|section| section.kind == kind) {
+            sections.push(Section {
+                kind,
+                library: library.to_owned(),
+            });
+        }
+    };
+    for item in items {
+        let Some(id) = text(item, "Id") else {
+            continue;
+        };
+        match text(item, "CollectionType")
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("music" | "mixed") | None => add(Kind::Music, id),
+            Some("books") => {
+                add(Kind::Audiobooks, id);
+                add(Kind::Books, id);
+            }
+            Some(_) => {}
+        }
+    }
+    sections.sort_by_key(|section| match section.kind {
+        Kind::Music => 0,
+        Kind::Audiobooks => 1,
+        Kind::Books => 2,
+    });
+    Some(sections)
+}
+
 /// A page of `Items`. Rows without an id are dropped; a missing name reads
 /// as "Untitled" so a row is never blank.
 #[must_use]
@@ -253,6 +365,15 @@ pub fn parse_page(bytes: &[u8]) -> Option<Page> {
                 name: text(item, "Name").unwrap_or("Untitled").to_owned(),
                 by: by.to_owned(),
                 runtime_ms,
+                year: item
+                    .get("ProductionYear")
+                    .and_then(Value::as_i64)
+                    .and_then(|year| u32::try_from(year).ok())
+                    .filter(|year| *year > 0),
+                audiobook: item
+                    .get("PharosAudiobook")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect();
@@ -261,7 +382,11 @@ pub fn parse_page(bytes: &[u8]) -> Option<Page> {
         .and_then(Value::as_i64)
         .and_then(|total| usize::try_from(total).ok())
         .unwrap_or(entries.len());
-    Some(Page { entries, total })
+    Some(Page {
+        entries,
+        total,
+        sent: items.len(),
+    })
 }
 
 /// "3:07", "1:02:05": a length as a listener reads it.
@@ -322,8 +447,9 @@ mod tests {
 
     #[test]
     fn listings_page_and_sort() {
-        let albums = albums_url("https://p.test", &account(), 50);
-        assert!(albums.contains("IncludeItemTypes=MusicAlbum"));
+        let albums = albums_url("https://p.test", &account(), "lib1", 50);
+        assert!(albums.starts_with("https://p.test/Users/u1/Items?IncludeItemTypes=MusicAlbum"));
+        assert!(albums.contains("&ParentId=lib1&"));
         assert!(albums.contains("StartIndex=50&Limit=50"));
         let tracks = tracks_url("https://p.test", &account(), "al1", 50);
         assert!(tracks.contains("ParentId=al1"));
@@ -360,6 +486,75 @@ mod tests {
         assert_eq!(page.entries[0].runtime_ms, Some(185_000));
         assert_eq!(page.entries[1].name, "Untitled");
         assert_eq!(page.entries[1].by, "Solo");
+        assert_eq!(page.sent, 3, "the row without an id was still sent");
+    }
+
+    #[test]
+    fn the_views_url_names_the_user() {
+        assert_eq!(
+            views_url("https://p.test", &account()),
+            "https://p.test/Users/u1/Views"
+        );
+    }
+
+    #[test]
+    fn views_become_sections_in_a_fixed_order() {
+        let bytes = br#"{"Items":[
+            {"Id":"v1","Name":"Films","CollectionType":"movies"},
+            {"Id":"v2","Name":"Reading","CollectionType":"books"},
+            {"Id":"v3","Name":"Songs","CollectionType":"music"},
+            {"Id":"v4","Name":"Other Songs","CollectionType":"music"},
+            {"Name":"no id","CollectionType":"music"}
+        ]}"#;
+        let sections = parse_views(bytes).unwrap_or_default();
+        let kinds: Vec<Kind> = sections.iter().map(|section| section.kind).collect();
+        assert_eq!(kinds, [Kind::Music, Kind::Audiobooks, Kind::Books]);
+        assert_eq!(sections[0].library, "v3", "the first music library answers");
+        assert_eq!(sections[1].library, "v2");
+        assert_eq!(sections[2].library, "v2");
+    }
+
+    #[test]
+    fn a_library_with_no_kind_is_music_and_videos_are_left_out() {
+        let bytes = br#"{"Items":[
+            {"Id":"v1","Name":"Everything","CollectionType":null},
+            {"Id":"v2","Name":"Shows","CollectionType":"tvshows"}
+        ]}"#;
+        let sections = parse_views(bytes).unwrap_or_default();
+        assert_eq!(
+            sections,
+            [Section {
+                kind: Kind::Music,
+                library: "v1".to_owned()
+            }]
+        );
+        assert_eq!(parse_views(br#"{"Items":[]}"#), Some(Vec::new()));
+        assert_eq!(parse_views(b"nope"), None);
+    }
+
+    #[test]
+    fn audiobooks_are_told_from_music_by_their_mark() {
+        let bytes = br#"{"Items":[
+            {"Id":"a","Name":"Album One","PharosAudiobook":true,"ProductionYear":2001},
+            {"Id":"b","Name":"Album Two","ProductionYear":0}
+        ],"TotalRecordCount":9}"#;
+        let page = parse_page(bytes).unwrap_or_default();
+        assert_eq!(page.sent, 2);
+        assert_eq!(page.entries[0].year, Some(2001));
+        assert_eq!(page.entries[1].year, None);
+        assert!(Kind::Audiobooks.keeps(&page.entries[0]));
+        assert!(!Kind::Music.keeps(&page.entries[0]));
+        assert!(Kind::Music.keeps(&page.entries[1]));
+        assert!(!Kind::Books.keeps(&page.entries[1]));
+        assert!(Kind::Music.is_albums() && !Kind::Books.is_albums());
+    }
+
+    #[test]
+    fn a_whole_albums_length_survives_the_json_numbers() {
+        // One hour is 3.6e10 ticks, well past 32 bits.
+        let page =
+            parse_page(br#"{"Items":[{"Id":"a","RunTimeTicks":36000000000}]}"#).unwrap_or_default();
+        assert_eq!(page.entries[0].runtime_ms, Some(3_600_000));
     }
 
     #[test]

@@ -65,6 +65,28 @@ fn started(saved: Option<&Account>) -> (AppRunner<Pharos>, Vec<Command>) {
     (runner, commands)
 }
 
+const VIEWS: &str = r#"{"Items":[
+    {"Id":"lib-music","Name":"Songs","CollectionType":"music"},
+    {"Id":"lib-books","Name":"Reading","CollectionType":"books"}
+]}"#;
+
+/// A signed-in runner whose home screen has loaded its sections.
+fn home() -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, commands) = started(Some(&account()));
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let commands = runner.task_outcome(views, ok(VIEWS));
+    (runner, commands)
+}
+
+/// A runner on the music shelf, with `ALBUMS` loaded.
+fn shelf() -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
+    let commands = runner.task_outcome(albums, ok(ALBUMS));
+    (runner, commands)
+}
+
 const ALBUMS: &str = r#"{"Items":[
     {"Id":"al1","Name":"First Album","AlbumArtist":"Band"},
     {"Id":"al2","Name":"Second Album","AlbumArtist":"Band"}
@@ -88,7 +110,7 @@ fn with_no_saved_account_it_asks_pharos_for_a_code() {
 }
 
 #[test]
-fn quick_connect_signs_in_keeps_the_account_and_lists_albums() {
+fn quick_connect_signs_in_keeps_the_account_and_asks_for_the_libraries() {
     let (mut runner, commands) = started(None);
     let (initiate, _) = asked(&commands, "/QuickConnect/Initiate").expect("initiate");
     let commands = runner.task_outcome(
@@ -116,10 +138,9 @@ fn quick_connect_signs_in_keeps_the_account_and_lists_albums() {
         command,
         Command::Store(StoreRequest::Save { key, value }) if key == ACCOUNT_KEY && *value == account().encode()
     )));
-    let (_, task) =
-        asked(&commands, "/Users/u1/Items?IncludeItemTypes=MusicAlbum").expect("albums");
+    let (_, task) = asked(&commands, "/Users/u1/Views").expect("views");
     let Task::Fetch { headers, .. } = task else {
-        panic!("albums is a GET");
+        panic!("views is a GET");
     };
     assert!(headers
         .iter()
@@ -127,17 +148,17 @@ fn quick_connect_signs_in_keeps_the_account_and_lists_albums() {
 }
 
 #[test]
-fn a_saved_account_goes_straight_to_the_albums() {
+fn a_saved_account_goes_straight_to_the_libraries() {
     let (_, commands) = started(Some(&account()));
     assert!(asked(&commands, "/QuickConnect").is_none());
-    assert!(asked(&commands, "IncludeItemTypes=MusicAlbum").is_some());
+    assert!(asked(&commands, "/Users/u1/Views").is_some());
 }
 
 #[test]
 fn a_rejected_token_is_forgotten_and_sign_in_starts_again() {
     let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
-    let commands = runner.task_outcome(albums, TaskOutcome::Failed(TaskError::Unauthorized));
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let commands = runner.task_outcome(views, TaskOutcome::Failed(TaskError::Unauthorized));
     assert!(commands.iter().any(|command| matches!(
         command,
         Command::Store(StoreRequest::Forget { key }) if key == ACCOUNT_KEY
@@ -158,9 +179,7 @@ fn an_expired_code_is_replaced() {
 
 /// Opens the first album and plays its first track.
 fn playing() -> (AppRunner<Pharos>, Vec<Command>) {
-    let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
-    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let (mut runner, _) = shelf();
     let commands = runner.action(action_id("row-0"));
     let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
     let _ = runner.task_outcome(tracks, ok(TRACKS));
@@ -197,6 +216,7 @@ fn signing_out_stops_playback_and_forgets_the_account() {
     let (mut runner, _) = playing();
     let _ = runner.action(ActionId::BACK);
     let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
     let commands = runner.action(action_id("sign-out"));
     assert!(asked(&commands, "/Sessions/Playing/Stopped").is_some());
     assert!(commands.iter().any(|command| matches!(
@@ -221,7 +241,11 @@ fn every_screen_fits_the_smallest_reader() {
         .collect::<Vec<_>>()
         .join(",");
     let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let commands = runner.task_outcome(views, ok(VIEWS));
+    screens.extend(last_screen(&commands));
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
     let commands = runner.task_outcome(
         albums,
         ok(&format!(r#"{{"Items":[{many}],"TotalRecordCount":20}}"#)),
@@ -233,7 +257,7 @@ fn every_screen_fits_the_smallest_reader() {
     let commands = runner.task_outcome(tracks, ok(TRACKS));
     screens.extend(last_screen(&commands));
 
-    assert_eq!(screens.len(), 5);
+    assert_eq!(screens.len(), 6);
     for (index, screen) in screens.iter().enumerate() {
         let problems = screen.validate(&CLARA_BW_METRICS);
         assert!(problems.is_empty(), "screen {index}: {problems:?}");
@@ -242,9 +266,7 @@ fn every_screen_fits_the_smallest_reader() {
 
 #[test]
 fn tracks_for_an_album_already_left_are_ignored() {
-    let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
-    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let (mut runner, _) = shelf();
     let commands = runner.action(action_id("row-0"));
     let (first, _) = asked(&commands, "ParentId=al1").expect("first album's tracks");
     let _ = runner.action(ActionId::BACK);
@@ -266,9 +288,7 @@ fn tracks_for_an_album_already_left_are_ignored() {
 
 #[test]
 fn an_album_longer_than_a_page_loads_all_its_tracks() {
-    let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
-    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let (mut runner, _) = shelf();
     let commands = runner.action(action_id("row-0"));
     let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
     let items: String = (0..50)
@@ -322,9 +342,7 @@ fn the_album_offers_a_way_back_to_the_player() {
 
 #[test]
 fn a_later_block_of_tracks_failing_leaves_the_player_alone() {
-    let (mut runner, commands) = started(Some(&account()));
-    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
-    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let (mut runner, _) = shelf();
     let commands = runner.action(action_id("row-0"));
     let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
     let commands = runner.task_outcome(
@@ -353,4 +371,91 @@ fn a_loading_album_still_offers_the_player() {
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("Loading the tracks"), "{screen}");
     assert!(screen.contains("Playing"), "{screen}");
+}
+
+#[test]
+fn the_home_screen_offers_a_section_for_each_kind_of_library() {
+    let (_, commands) = home();
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    for name in ["Music", "Audiobooks", "Books"] {
+        assert!(screen.contains(name), "{name} missing from {screen}");
+    }
+}
+
+#[test]
+fn an_account_with_no_libraries_is_told_so() {
+    let (mut runner, commands) = started(Some(&account()));
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let commands = runner.task_outcome(views, ok(r#"{"Items":[]}"#));
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("shows no music"), "{screen}");
+}
+
+#[test]
+fn the_audiobooks_section_keeps_only_audiobooks_and_music_only_music() {
+    let mixed = r#"{"Items":[
+        {"Id":"al1","Name":"Album One","AlbumArtist":"Artist A"},
+        {"Id":"bk1","Name":"Book One","AlbumArtist":"Author A","PharosAudiobook":true}
+    ],"TotalRecordCount":2}"#;
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-audiobooks"));
+    let (albums, _) = asked(&commands, "ParentId=lib-books").expect("albums");
+    let commands = runner.task_outcome(albums, ok(mixed));
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        screen.contains("Book One") && !screen.contains("Album One"),
+        "{screen}"
+    );
+
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
+    let commands = runner.task_outcome(albums, ok(mixed));
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        screen.contains("Album One") && !screen.contains("Book One"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_shelf_loads_every_block_even_when_a_block_keeps_nothing() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-audiobooks"));
+    let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
+    let commands = runner.task_outcome(
+        first,
+        ok(r#"{"Items":[{"Id":"a","Name":"Album One"}],"TotalRecordCount":2}"#),
+    );
+    let (second, _) = asked(&commands, "StartIndex=1&").expect("the next block is asked for");
+    let commands = runner.task_outcome(
+        second,
+        ok(r#"{"Items":[{"Id":"b","Name":"Book One","PharosAudiobook":true}],"TotalRecordCount":2}"#),
+    );
+    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Book One"));
+}
+
+#[test]
+fn a_shelf_block_for_a_shelf_already_left_is_ignored() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-music"));
+    let (stale, _) = asked(&commands, "ParentId=lib-music").expect("music");
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("section-audiobooks"));
+    let (fresh, _) = asked(&commands, "ParentId=lib-books").expect("audiobooks");
+    let _ = runner.task_outcome(stale, ok(ALBUMS));
+    let commands = runner.task_outcome(fresh, ok(r#"{"Items":[],"TotalRecordCount":0}"#));
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(!screen.contains("First Album"), "{screen}");
+}
+
+#[test]
+fn books_is_a_placeholder_and_back_returns_home() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen_text(&screen).contains("coming"));
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+    let commands = runner.action(ActionId::BACK);
+    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Audiobooks"));
 }
