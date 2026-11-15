@@ -569,13 +569,25 @@ fn a_cover_is_sent_grey_to_a_grey_panel_and_in_colour_to_a_colour_one() {
     assert_ne!((sent[0].2, sent[0].3), (64, 96));
 }
 
+/// Answers covers, first asked first, until the page is drawn with them.
+fn page_drawn(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Screen {
+    let mut pending = cover_tasks(commands);
+    while !pending.is_empty() {
+        let (task, _) = pending.remove(0);
+        let reply = runner.task_outcome(task, cover_bytes());
+        if let Some(screen) = last_screen(&reply) {
+            return screen;
+        }
+        pending.extend(cover_tasks(&reply));
+    }
+    panic!("the page was never drawn with its covers");
+}
+
 #[test]
 fn an_arrived_cover_replaces_the_glyph_on_its_tile() {
     let (mut runner, commands) = art_shelf(false, 3);
-    let (first, _) = cover_tasks(&commands)[0].clone();
     let before = screen_text(&last_screen(&commands).expect("a screen"));
-    let commands = runner.task_outcome(first, cover_bytes());
-    let after = screen_text(&last_screen(&commands).expect("a screen"));
+    let after = screen_text(&page_drawn(&mut runner, &commands));
     assert_ne!(before, after, "the tile now carries a picture");
     assert!(after.contains("picture: Some"), "{after}");
     assert!(before.contains("picture: None"), "{before}");
@@ -675,9 +687,7 @@ fn the_shelf_screens_fit_the_smallest_reader_with_and_without_covers() {
     let (mut runner, commands) = art_shelf(true, 40);
     let screen = last_screen(&commands).expect("a screen");
     assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
-    let (first, _) = cover_tasks(&commands)[0].clone();
-    let commands = runner.task_outcome(first, cover_bytes());
-    let screen = last_screen(&commands).expect("a screen");
+    let screen = page_drawn(&mut runner, &commands);
     let problems = screen.validate(&CLARA_BW_METRICS);
     assert!(problems.is_empty(), "{problems:?}");
 }
@@ -871,31 +881,34 @@ fn the_playing_cover_survives_paging_through_a_long_shelf() {
 mod book_flow;
 
 #[test]
-fn a_cover_for_a_page_not_on_show_does_not_redraw_the_panel() {
+fn a_page_s_covers_are_drawn_together_and_hidden_ones_draw_nothing() {
     let (mut runner, commands) = art_shelf(false, 120);
     let mut showing = last_screen(&commands).expect("the shelf");
     let mut pending: Vec<(TaskId, String)> = cover_tasks(&commands);
-    let (mut on_show, mut off_show) = (0, 0);
-    while let Some((task, url)) = pending.pop() {
+    pending.reverse();
+    let (mut on_show, mut redraws) = (0, 0);
+    while !pending.is_empty() {
+        let (task, url) = pending.remove(0);
         let album = url
             .split("/Items/a")
             .nth(1)
             .and_then(|rest| rest.split('/').next())
-            .expect("an album id");
-        let visible = screen_text(&showing).contains(&format!("\"Album {album}\""));
+            .expect("an album id")
+            .to_owned();
+        if screen_text(&showing).contains(&format!("\"Album {album}\"")) {
+            on_show += 1;
+        }
         let reply = runner.task_outcome(task, cover_bytes());
         if let Some(screen) = last_screen(&reply) {
-            assert!(visible, "album {album} is off the page yet redrew it");
+            redraws += 1;
             showing = screen;
-            on_show += 1;
-        } else {
-            assert!(!visible, "album {album} is on the page and was not drawn");
-            off_show += 1;
         }
         pending.extend(cover_tasks(&reply));
     }
-    assert!(
-        on_show > 0 && off_show > 0,
-        "{on_show} on show, {off_show} off"
+    assert!(on_show > 1, "the page shows several covers");
+    assert_eq!(
+        redraws, 1,
+        "the page is drawn once, when its last cover is in, and covers for \
+         other pages draw nothing"
     );
 }
