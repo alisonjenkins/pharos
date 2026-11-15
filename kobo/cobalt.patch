@@ -1,8 +1,16 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ff9a014..eadda66 100644
+index ff9a014..3bdfdab 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -1559,6 +1559,15 @@ dependencies = [
+@@ -990,6 +990,7 @@ dependencies = [
+ name = "kobo-audio"
+ version = "0.3.37"
+ dependencies = [
++ "kobo-abi",
+  "kobo-doc",
+  "kobo-protocol",
+  "rusty-opus",
+@@ -1559,6 +1560,15 @@ dependencies = [
   "kobo-zstory",
  ]
  
@@ -18,6 +26,14 @@ index ff9a014..eadda66 100644
  [[package]]
  name = "kobo-policy"
  version = "0.3.37"
+@@ -1937,6 +1947,7 @@ dependencies = [
+  "base64",
+  "kobo-abi",
+  "kobo-app-store",
++ "kobo-audio",
+  "kobo-frame-plan",
+  "kobo-hal",
+  "kobo-json",
 diff --git a/Cargo.toml b/Cargo.toml
 index 209fdaa..68ff56b 100644
 --- a/Cargo.toml
@@ -30,23 +46,40 @@ index 209fdaa..68ff56b 100644
      "examples/hn",
      "examples/books",
      "examples/launcher",
+diff --git a/crates/kobo-audio/Cargo.toml b/crates/kobo-audio/Cargo.toml
+index bb97921..8a10d2f 100644
+--- a/crates/kobo-audio/Cargo.toml
++++ b/crates/kobo-audio/Cargo.toml
+@@ -7,6 +7,7 @@ license.workspace = true
+ publish = false
+ 
+ [dependencies]
++kobo-abi = { path = "../kobo-abi" }
+ kobo-doc = { path = "../kobo-doc" }
+ kobo-protocol = { path = "../kobo-protocol" }
+ rusty-opus = { version = "1.0.2", optional = true }
 diff --git a/crates/kobo-audio/src/lib.rs b/crates/kobo-audio/src/lib.rs
-index 098fbfb..e387174 100644
+index 098fbfb..c78eb4e 100644
 --- a/crates/kobo-audio/src/lib.rs
 +++ b/crates/kobo-audio/src/lib.rs
-@@ -21,8 +21,11 @@ pub mod stretch;
+@@ -21,8 +21,16 @@ pub mod stretch;
  mod mp4;
  #[cfg(feature = "opus")]
  mod opus;
 +pub(crate) mod remote;
++mod store;
  mod tags;
  
 +pub use remote::{FetchFailure, RangeFetch, Remote, RemoteOptions, RemoteStats};
++pub use store::{
++    key_of, stable_url, BlockStore, DownloadPolicy, DownloadProgress, DownloadStats, Downloads,
++    RemoveOutcome, DEFAULT_BUDGET_BYTES, MIN_FREE_BYTES,
++};
 +
  use std::fmt;
  use std::fs::File;
  use std::io::{self, Cursor, Read, Seek};
-@@ -74,6 +77,9 @@ pub enum Fault {
+@@ -74,6 +82,9 @@ pub enum Fault {
      Unsupported,
      /// The file is a kind this crate plays, and is not well formed.
      Damaged,
@@ -56,7 +89,7 @@ index 098fbfb..e387174 100644
  }
  
  impl fmt::Display for Fault {
-@@ -82,6 +88,7 @@ impl fmt::Display for Fault {
+@@ -82,6 +93,7 @@ impl fmt::Display for Fault {
              Self::Unreadable => "the audio file could not be read",
              Self::Unsupported => "the audio file is a kind this reader cannot play",
              Self::Damaged => "the audio file is damaged",
@@ -64,7 +97,7 @@ index 098fbfb..e387174 100644
          })
      }
  }
-@@ -126,6 +133,42 @@ impl Container {
+@@ -126,6 +138,42 @@ impl Container {
          }
      }
  
@@ -107,7 +140,7 @@ index 098fbfb..e387174 100644
      /// The short name a row shows.
      #[must_use]
      pub const fn badge(self) -> &'static str {
-@@ -259,6 +302,8 @@ enum Source {
+@@ -259,6 +307,8 @@ enum Source {
          archive: Arc<Vec<u8>>,
          name: String,
      },
@@ -116,7 +149,7 @@ index 098fbfb..e387174 100644
  }
  
  impl Source {
-@@ -273,6 +318,7 @@ impl Source {
+@@ -273,6 +323,7 @@ impl Source {
                  let member = archive.read(name).map_err(|_| Fault::Damaged)?;
                  Ok(Box::new(Cursor::new(member)))
              }
@@ -124,7 +157,7 @@ index 098fbfb..e387174 100644
          }
      }
  
-@@ -283,6 +329,7 @@ impl Source {
+@@ -283,6 +334,7 @@ impl Source {
              // The compressed size is near enough for a bit rate: a member is
              // MP3, which does not compress.
              Self::Member { archive, .. } => u64::try_from(archive.len()).unwrap_or(u64::MAX),
@@ -132,7 +165,7 @@ index 098fbfb..e387174 100644
          }
      }
  }
-@@ -331,6 +378,8 @@ pub struct Book {
+@@ -331,6 +383,8 @@ pub struct Book {
      playing: Option<Playing>,
      /// Set once the last part has run out.
      finished: bool,
@@ -141,7 +174,7 @@ index 098fbfb..e387174 100644
  }
  
  /// A chunk of sound handed out by [`Book::read`].
-@@ -370,7 +419,9 @@ impl Book {
+@@ -370,7 +424,9 @@ impl Book {
      /// # Errors
      /// The name names no playable kind, or the bytes are damaged.
      pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self, Fault> {
@@ -152,7 +185,7 @@ index 098fbfb..e387174 100644
          if container == Container::Mp3z {
              return Self::open_archive(bytes, stem(name));
          }
-@@ -381,6 +432,40 @@ impl Book {
+@@ -381,6 +437,40 @@ impl Book {
          ))
      }
  
@@ -193,7 +226,7 @@ index 098fbfb..e387174 100644
      /// Opens a folder's files as one book called `title`, each file a chapter
      /// in the order given.
      ///
-@@ -467,6 +552,7 @@ impl Book {
+@@ -467,6 +557,7 @@ impl Book {
              current: 0,
              playing: None,
              finished: false,
@@ -201,7 +234,7 @@ index 098fbfb..e387174 100644
          }
      }
  
-@@ -483,6 +569,9 @@ impl Book {
+@@ -483,6 +574,9 @@ impl Book {
      /// Where the next sound handed out comes from, in the book's timeline.
      #[must_use]
      pub fn position_ms(&self) -> u32 {
@@ -211,7 +244,7 @@ index 098fbfb..e387174 100644
          let start = self.starts_ms.get(self.current).copied().unwrap_or(0);
          let within = self.playing.as_ref().map_or(0, |playing| {
              frames_to_ms(playing.position_frames, playing.rate)
-@@ -502,6 +591,23 @@ impl Book {
+@@ -502,6 +596,23 @@ impl Book {
      /// # Errors
      /// The part holding the position cannot be opened or seeked.
      pub fn seek(&mut self, position_ms: u32) -> Result<(), Fault> {
@@ -235,7 +268,7 @@ index 098fbfb..e387174 100644
          let wanted = position_ms.min(self.duration_ms);
          let index = self
              .starts_ms
-@@ -528,7 +634,10 @@ impl Book {
+@@ -528,7 +639,10 @@ impl Book {
                      track_id: Some(playing.track_id),
                  },
              )
@@ -247,7 +280,7 @@ index 098fbfb..e387174 100644
          playing.decoder.reset();
          let actual_ms = playing
              .time_base
-@@ -551,7 +660,11 @@ impl Book {
+@@ -551,7 +665,11 @@ impl Book {
                      rate: 48_000,
                  });
              }
@@ -260,7 +293,7 @@ index 098fbfb..e387174 100644
          }
          let mut given = 0;
          let mut rate = None;
-@@ -563,7 +676,22 @@ impl Book {
+@@ -563,7 +681,22 @@ impl Book {
                  // boundary so the caller can follow it.
                  break;
              }
@@ -284,7 +317,7 @@ index 098fbfb..e387174 100644
                  // This part has run out.
                  if self.current + 1 < self.parts.len() {
                      self.current += 1;
-@@ -611,6 +739,7 @@ fn fill(playing: &mut Playing) -> Result<bool, Fault> {
+@@ -611,6 +744,7 @@ fn fill(playing: &mut Playing) -> Result<bool, Fault> {
              Err(Symphonia::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                  return Ok(false);
              }
@@ -292,7 +325,7 @@ index 098fbfb..e387174 100644
              Err(Symphonia::ResetRequired) => {
                  playing.decoder.reset();
                  continue;
-@@ -716,12 +845,21 @@ fn open_part(part: &Part) -> Result<Playing, Fault> {
+@@ -716,12 +850,21 @@ fn open_part(part: &Part) -> Result<Playing, Fault> {
  fn probe_fault(error: Symphonia) -> Fault {
      match error {
          Symphonia::IoError(error) if error.kind() != io::ErrorKind::UnexpectedEof => {
@@ -317,10 +350,10 @@ index 098fbfb..e387174 100644
  fn part(source: Source, container: Container, title: &str) -> Result<Part, Fault> {
 diff --git a/crates/kobo-audio/src/remote.rs b/crates/kobo-audio/src/remote.rs
 new file mode 100644
-index 0000000..43b61a0
+index 0000000..3cfa016
 --- /dev/null
 +++ b/crates/kobo-audio/src/remote.rs
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,652 @@
 +//! A book read over the network in ranges, through a small shared cache.
 +//!
 +//! A multi-hour audiobook is hundreds of megabytes, and the reader has 1 GB
@@ -341,6 +374,8 @@ index 0000000..43b61a0
 +use std::time::{Duration, Instant};
 +
 +use symphonia::core::io::MediaSource;
++
++use crate::store::BlockStore;
 +
 +/// Why one range could not be fetched.
 +#[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -372,6 +407,10 @@ index 0000000..43b61a0
 +    pub retry_delays: Vec<Duration>,
 +    /// How long one block is retried before the network counts as lost.
 +    pub give_up_after: Duration,
++    /// How long the whole-file download rests after the network or the disk
++    /// failed it, before it tries again. Playback is not held up by this: the
++    /// blocks it needs are fetched whatever the download is doing.
++    pub background_pause: Duration,
 +}
 +
 +impl Default for RemoteOptions {
@@ -391,6 +430,9 @@ index 0000000..43b61a0
 +                Duration::from_secs(4),
 +            ],
 +            give_up_after: Duration::from_secs(30),
++            // Long enough that a reader out of Wi-Fi range is not asking the
++            // radio every few seconds for a download nobody is waiting on.
++            background_pause: Duration::from_secs(60),
 +        }
 +    }
 +}
@@ -403,6 +445,8 @@ index 0000000..43b61a0
 +    pub evictions: u64,
 +    pub resident_bytes: usize,
 +    pub peak_resident_bytes: usize,
++    /// Blocks read back from the download on disk.
++    pub disk_reads: u64,
 +}
 +
 +/// Why a read of a remote book failed, carried inside the `io::Error` the
@@ -461,6 +505,8 @@ index 0000000..43b61a0
 +    lost: bool,
 +    refused: bool,
 +    closed: bool,
++    /// Until when the whole-file download rests, if it does.
++    background_after: Option<Instant>,
 +    stats: RemoteStats,
 +}
 +
@@ -471,6 +517,8 @@ index 0000000..43b61a0
 +    cache: Mutex<Cache>,
 +    changed: Condvar,
 +    ahead_exited: AtomicBool,
++    /// The download on disk, when this book is being kept.
++    disk: Option<BlockStore>,
 +}
 +
 +/// One remote resource: its cache and the read-ahead thread that fills it.
@@ -500,6 +548,37 @@ index 0000000..43b61a0
 +        first: Vec<u8>,
 +        options: RemoteOptions,
 +    ) -> io::Result<Self> {
++        Self::start(fetch, total, first, options, None)
++    }
++
++    /// A resource kept on disk in `disk`: blocks already there are read from
++    /// it, and a background download fetches the rest, from the read position
++    /// on and then from the start. Its length and block size are the
++    /// download's own.
++    ///
++    /// # Errors
++    /// The read-ahead thread could not be started.
++    pub fn open_stored(
++        fetch: RangeFetch,
++        disk: BlockStore,
++        first: Vec<u8>,
++        options: RemoteOptions,
++    ) -> io::Result<Self> {
++        let options = RemoteOptions {
++            block_bytes: disk.block_bytes(),
++            ..options
++        };
++        let total = disk.total();
++        Self::start(fetch, total, first, options, Some(disk))
++    }
++
++    fn start(
++        fetch: RangeFetch,
++        total: u64,
++        first: Vec<u8>,
++        options: RemoteOptions,
++        disk: Option<BlockStore>,
++    ) -> io::Result<Self> {
 +        let options = RemoteOptions {
 +            block_bytes: options.block_bytes.max(1),
 +            resident_blocks: options.resident_blocks.max(1),
@@ -512,10 +591,16 @@ index 0000000..43b61a0
 +            cache: Mutex::new(Cache::default()),
 +            changed: Condvar::new(),
 +            ahead_exited: AtomicBool::new(false),
++            disk,
 +        });
 +        if !first.is_empty() && Some(first.len()) == shared.block_len(0) {
++            let bytes: Arc<[u8]> = first.into();
++            if let Some(disk) = &shared.disk {
++                // Best effort: a block that cannot be kept is still played.
++                let _kept = disk.write(0, &bytes);
++            }
 +            let mut cache = shared.lock();
-+            store(&shared, &mut cache, 0, first.into());
++            store(&shared, &mut cache, 0, bytes);
 +        }
 +        let ahead = Arc::clone(&shared);
 +        thread::Builder::new()
@@ -542,6 +627,7 @@ index 0000000..43b61a0
 +        {
 +            let mut cache = self.shared.lock();
 +            cache.lost = false;
++            cache.background_after = None;
 +        }
 +        self.shared.changed.notify_all();
 +        Reader {
@@ -608,6 +694,12 @@ index 0000000..43b61a0
 +                block.used = clock;
 +                return Ok(Arc::clone(&block.bytes));
 +            }
++            if let Some(disk) = self.disk.as_ref().filter(|disk| disk.has(index)) {
++                let bytes: Arc<[u8]> = disk.read(index)?.into();
++                cache.stats.disk_reads = cache.stats.disk_reads.saturating_add(1);
++                store(self, &mut cache, index, Arc::clone(&bytes));
++                return Ok(bytes);
++            }
 +            if cache.refused {
 +                return Err(RemoteFault::Refused.into_io());
 +            }
@@ -625,14 +717,35 @@ index 0000000..43b61a0
 +        }
 +    }
 +
-+    /// The first block in the read-ahead window not yet held.
-+    fn next_missing(&self, cache: &Cache) -> Option<u64> {
++    fn on_disk(&self, index: u64) -> bool {
++        self.disk.as_ref().is_some_and(|disk| disk.has(index))
++    }
++
++    /// The first block in the read-ahead window held neither in memory nor
++    /// on disk.
++    fn window_missing(&self, cache: &Cache) -> Option<u64> {
 +        let end = cache
 +            .wanted
 +            .saturating_add(self.options.ahead_blocks)
 +            .saturating_add(1)
 +            .min(self.block_count());
-+        (cache.wanted..end).find(|index| !cache.blocks.contains_key(index))
++        (cache.wanted..end).find(|index| !cache.blocks.contains_key(index) && !self.on_disk(*index))
++    }
++
++    /// The next block to fetch, and whether it is for the download rather
++    /// than for playback. Playback's come first.
++    fn next_missing(&self, cache: &Cache) -> Option<(u64, bool)> {
++        if let Some(index) = self.window_missing(cache) {
++            return Some((index, false));
++        }
++        let disk = self.disk.as_ref()?;
++        if cache
++            .background_after
++            .is_some_and(|after| Instant::now() < after)
++        {
++            return None;
++        }
++        disk.missing_from(cache.wanted).map(|index| (index, true))
 +    }
 +
 +    /// Whether `index` is in the window kept from eviction.
@@ -690,27 +803,65 @@ index 0000000..43b61a0
 +
 +fn read_ahead(shared: &Shared) {
 +    loop {
-+        let index = {
++        let (index, background) = {
 +            let mut cache = shared.lock();
 +            loop {
 +                if cache.closed {
 +                    return;
 +                }
 +                if !cache.lost && !cache.refused {
-+                    if let Some(index) = shared.next_missing(&cache) {
-+                        break index;
++                    if let Some(next) = shared.next_missing(&cache) {
++                        break next;
 +                    }
 +                }
-+                cache = shared
-+                    .changed
-+                    .wait(cache)
-+                    .unwrap_or_else(PoisonError::into_inner);
++                // A resting download wakes by itself; everything else waits
++                // to be told something changed.
++                let resting = cache
++                    .background_after
++                    .map(|after| after.saturating_duration_since(Instant::now()))
++                    .filter(|left| !left.is_zero());
++                cache = match resting {
++                    Some(left) => shared
++                        .changed
++                        .wait_timeout(cache, left)
++                        .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard),
++                    None => shared
++                        .changed
++                        .wait(cache)
++                        .unwrap_or_else(PoisonError::into_inner),
++                };
 +            }
 +        };
-+        let outcome = fetch_retrying(shared, index);
++        if background && !shared.disk.as_ref().is_some_and(BlockStore::has_room) {
++            shared.lock().background_after = Some(Instant::now() + shared.options.background_pause);
++            continue;
++        }
++        let outcome = fetch_retrying(shared, index, background);
++        let kept = match (&outcome, shared.disk.as_ref()) {
++            (Outcome::Got(bytes), Some(disk)) => match disk.write(index, bytes) {
++                Ok(kept) => kept,
++                Err(error) => {
++                    disk.note_write_failure(index, &error);
++                    false
++                }
++            },
++            _ => true,
++        };
 +        let mut cache = shared.lock();
 +        match outcome {
-+            Outcome::Got(bytes) => store(shared, &mut cache, index, bytes),
++            Outcome::Got(bytes) => {
++                if !kept {
++                    cache.background_after = Some(Instant::now() + shared.options.background_pause);
++                }
++                // A block fetched for the download alone is on disk and is
++                // read from there when playback arrives.
++                if !background || shared.disk.is_none() {
++                    store(shared, &mut cache, index, bytes);
++                }
++            }
++            Outcome::Lost if background => {
++                cache.background_after = Some(Instant::now() + shared.options.background_pause);
++            }
 +            Outcome::Lost => cache.lost = true,
 +            Outcome::Refused => cache.refused = true,
 +            Outcome::Closed => return,
@@ -721,7 +872,7 @@ index 0000000..43b61a0
 +    }
 +}
 +
-+fn fetch_retrying(shared: &Shared, index: u64) -> Outcome {
++fn fetch_retrying(shared: &Shared, index: u64, background: bool) -> Outcome {
 +    let Some(len) = shared.block_len(index) else {
 +        return Outcome::Refused;
 +    };
@@ -733,25 +884,6 @@ index 0000000..43b61a0
 +    let mut attempt = 0_usize;
 +    loop {
 +        let fetched = (shared.fetch)(offset, asked);
-+        {
-+            let mut cache = shared.lock();
-+            cache.stats.fetches = cache.stats.fetches.saturating_add(1);
-+            if cache.closed {
-+                return Outcome::Closed;
-+            }
-+            match fetched {
-+                Ok(bytes) if bytes.len() == len => return Outcome::Got(bytes.into()),
-+                Err(FetchFailure::Refused) => {
-+                    cache.stats.failed_fetches = cache.stats.failed_fetches.saturating_add(1);
-+                    return Outcome::Refused;
-+                }
-+                // A short or long body is a reply cut off or a server that
-+                // changed its mind about ranges; both may be passing.
-+                Ok(_) | Err(FetchFailure::Transient) => {
-+                    cache.stats.failed_fetches = cache.stats.failed_fetches.saturating_add(1);
-+                }
-+            }
-+        }
 +        let delay = shared
 +            .options
 +            .retry_delays
@@ -759,7 +891,35 @@ index 0000000..43b61a0
 +            .or_else(|| shared.options.retry_delays.last())
 +            .copied()
 +            .unwrap_or(Duration::ZERO);
-+        if started.elapsed().saturating_add(delay) > shared.options.give_up_after {
++        let gives_up = started.elapsed().saturating_add(delay) > shared.options.give_up_after;
++        {
++            let mut cache = shared.lock();
++            cache.stats.fetches = cache.stats.fetches.saturating_add(1);
++            if cache.closed {
++                return Outcome::Closed;
++            }
++            let failure = match &fetched {
++                Ok(bytes) if bytes.len() == len => None,
++                Err(FetchFailure::Refused) => Some("the server refused the range".to_owned()),
++                // A short or long body is a reply cut off or a server that
++                // changed its mind about ranges; both may be passing.
++                Ok(bytes) => Some(format!("got {} bytes, asked for {len}", bytes.len())),
++                Err(FetchFailure::Transient) => Some("the network failed".to_owned()),
++            };
++            if let Some(why) = failure {
++                cache.stats.failed_fetches = cache.stats.failed_fetches.saturating_add(1);
++                let refused = matches!(fetched, Err(FetchFailure::Refused));
++                if let Some(disk) = &shared.disk {
++                    disk.note_fetch_failure(offset, &why, refused || gives_up);
++                }
++                if refused {
++                    return Outcome::Refused;
++                }
++            } else if let Ok(bytes) = fetched {
++                return Outcome::Got(bytes.into());
++            }
++        }
++        if gives_up {
 +            return Outcome::Lost;
 +        }
 +        attempt = attempt.saturating_add(1);
@@ -771,7 +931,15 @@ index 0000000..43b61a0
 +            if cache.closed {
 +                return Outcome::Closed;
 +            }
-+            if !shared.protected(&cache, index) {
++            // Playback outranks the download: a block it is waiting for ends
++            // the wait on a far one, and one it has moved away from ends the
++            // wait on a near one.
++            let abandoned = if background {
++                shared.window_missing(&cache).is_some()
++            } else {
++                !shared.protected(&cache, index)
++            };
++            if abandoned {
 +                return Outcome::Moved;
 +            }
 +            let now = Instant::now();
@@ -840,10 +1008,10 @@ index 0000000..43b61a0
 +pub(crate) mod tests;
 diff --git a/crates/kobo-audio/src/remote/tests.rs b/crates/kobo-audio/src/remote/tests.rs
 new file mode 100644
-index 0000000..b8d252b
+index 0000000..c26bf97
 --- /dev/null
 +++ b/crates/kobo-audio/src/remote/tests.rs
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,286 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::{Read, Seek, SeekFrom};
@@ -872,6 +1040,7 @@ index 0000000..b8d252b
 +        behind_blocks: 1,
 +        retry_delays: vec![Duration::from_millis(1)],
 +        give_up_after: Duration::from_millis(200),
++        background_pause: Duration::from_millis(20),
 +    }
 +}
 +
@@ -1129,6 +1298,1318 @@ index 0000000..b8d252b
 +    );
 +    assert_eq!(remote.stats().fetches, 1);
 +}
+diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
+new file mode 100644
+index 0000000..c3a522d
+--- /dev/null
++++ b/crates/kobo-audio/src/store.rs
+@@ -0,0 +1,896 @@
++//! Downloads: a ranged stream kept on the reader's storage.
++//!
++//! A book from a ranged server is written block by block to a file the
++//! runtime owns, with a sidecar saying how long the file is and which blocks
++//! are present. The file is named by a hash of the URL without its `api_key`,
++//! so a new sign-in keeps the download. The sidecar is what lets a download
++//! survive a restart, a Wi-Fi drop or a power cut: a block counts only once
++//! it is on disk and the sidecar says so.
++//!
++//! The runtime, not the app, owns the files. An app's shelf is capped at a
++//! size far under an audiobook, and an app that could name a path could also
++//! name someone else's.
++
++use std::collections::{HashMap, HashSet};
++use std::fmt;
++use std::fs::{self, File, OpenOptions};
++use std::io;
++use std::os::unix::fs::FileExt;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++/// The most the downloads of all apps may add up to, counted by the full
++/// length of each book so a half-fetched one cannot overrun it later.
++pub const DEFAULT_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
++
++/// Free space on the volume below which nothing is started or continued.
++///
++/// The same card holds `KoboReader.sqlite`, the stock reader's whole library,
++/// and a database that cannot write comes back empty.
++pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
++
++/// Blocks written between saves of the sidecar. A power cut costs at most this
++/// many blocks of work, never a wrong block.
++const FLUSH_EVERY_BLOCKS: u32 = 16;
++
++const SIDECAR_MAGIC: &str = "pharos-download 1";
++const SIDECAR_SUFFIX: &str = "meta";
++const DATA_SUFFIX: &str = "dat";
++
++type FreeSpace = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
++type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
++type LogLine = Arc<dyn Fn(&str) + Send + Sync>;
++
++/// How much a download may take, and how the volume and the clock are read.
++/// Injectable so a test can say the card is nearly full without filling one.
++#[derive(Clone)]
++pub struct DownloadPolicy {
++    /// The cap on all downloads together.
++    pub budget_bytes: u64,
++    /// Nothing is written while the volume has less free than this.
++    pub min_free_bytes: u64,
++    /// Free bytes on the volume holding a path; `None` when it cannot be asked,
++    /// which counts as room.
++    pub free_space: FreeSpace,
++    /// Seconds since the epoch, for ordering downloads by when they were
++    /// last played.
++    pub now: Clock,
++}
++
++impl Default for DownloadPolicy {
++    fn default() -> Self {
++        Self {
++            budget_bytes: DEFAULT_BUDGET_BYTES,
++            min_free_bytes: MIN_FREE_BYTES,
++            free_space: Arc::new(kobo_abi::free_space),
++            now: Arc::new(|| {
++                SystemTime::now()
++                    .duration_since(UNIX_EPOCH)
++                    .map_or(0, |since| since.as_secs())
++            }),
++        }
++    }
++}
++
++impl fmt::Debug for DownloadPolicy {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("DownloadPolicy")
++            .field("budget_bytes", &self.budget_bytes)
++            .field("min_free_bytes", &self.min_free_bytes)
++            .finish_non_exhaustive()
++    }
++}
++
++/// What downloads have done since the runtime started.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct DownloadStats {
++    pub started: u64,
++    pub resumed: u64,
++    pub completed: u64,
++    pub evicted: u64,
++    pub removed: u64,
++    /// Starts and writes refused because the volume was under the floor.
++    pub skipped_low_space: u64,
++    /// Starts refused because the budget had no room left to make.
++    pub skipped_budget: u64,
++    pub fetch_failures: u64,
++    pub blocks_written: u64,
++    pub bytes_written: u64,
++}
++
++#[derive(Default)]
++struct Counters {
++    started: AtomicU64,
++    resumed: AtomicU64,
++    completed: AtomicU64,
++    evicted: AtomicU64,
++    removed: AtomicU64,
++    skipped_low_space: AtomicU64,
++    skipped_budget: AtomicU64,
++    fetch_failures: AtomicU64,
++    blocks_written: AtomicU64,
++    bytes_written: AtomicU64,
++}
++
++fn bump(counter: &AtomicU64, by: u64) {
++    counter.fetch_add(by, Ordering::Relaxed);
++}
++
++/// How far one download has got.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct DownloadProgress {
++    pub url: String,
++    pub have: u64,
++    pub total: u64,
++}
++
++/// What removing a download did.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum RemoveOutcome {
++    Removed,
++    Absent,
++    /// A book playing from it is open.
++    InUse,
++}
++
++/// The downloads directory of the whole runtime: one folder per app.
++#[derive(Clone)]
++pub struct Downloads {
++    root: PathBuf,
++    policy: DownloadPolicy,
++    open: Arc<Mutex<HashMap<PathBuf, usize>>>,
++    counters: Arc<Counters>,
++    log: LogLine,
++}
++
++impl fmt::Debug for Downloads {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Downloads")
++            .field("root", &self.root)
++            .field("policy", &self.policy)
++            .finish_non_exhaustive()
++    }
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct Meta {
++    total: u64,
++    block_bytes: u32,
++    played: u64,
++    complete: bool,
++    present: Vec<u8>,
++}
++
++impl Meta {
++    fn fresh(total: u64, block_bytes: u32, played: u64) -> Self {
++        let blocks = blocks_of(total, block_bytes);
++        let bytes = usize::try_from(blocks.div_ceil(8)).unwrap_or(0);
++        Self {
++            total,
++            block_bytes,
++            played,
++            complete: false,
++            present: vec![0; bytes],
++        }
++    }
++
++    fn blocks(&self) -> u64 {
++        blocks_of(self.total, self.block_bytes)
++    }
++
++    fn has(&self, index: u64) -> bool {
++        if self.complete {
++            return index < self.blocks();
++        }
++        let byte = usize::try_from(index / 8).unwrap_or(usize::MAX);
++        self.present
++            .get(byte)
++            .is_some_and(|bits| bits & (1 << (index % 8)) != 0)
++    }
++
++    fn set(&mut self, index: u64) {
++        let byte = usize::try_from(index / 8).unwrap_or(usize::MAX);
++        if let Some(bits) = self.present.get_mut(byte) {
++            *bits |= 1 << (index % 8);
++        }
++    }
++
++    fn block_len(&self, index: u64) -> Option<u64> {
++        let start = index.checked_mul(u64::from(self.block_bytes))?;
++        if start >= self.total {
++            return None;
++        }
++        Some((self.total - start).min(u64::from(self.block_bytes)))
++    }
++
++    fn count(&self) -> u64 {
++        (0..self.blocks()).filter(|index| self.has(*index)).count() as u64
++    }
++
++    fn have_bytes(&self) -> u64 {
++        if self.complete {
++            return self.total;
++        }
++        (0..self.blocks())
++            .filter(|index| self.has(*index))
++            .filter_map(|index| self.block_len(index))
++            .sum()
++    }
++
++    fn all_present(&self) -> bool {
++        self.count() == self.blocks()
++    }
++
++    fn encode(&self) -> String {
++        let mut bits = String::with_capacity(self.present.len() * 2);
++        for byte in &self.present {
++            bits.push_str(&format!("{byte:02x}"));
++        }
++        format!(
++            "{SIDECAR_MAGIC}\ntotal={}\nblock={}\nplayed={}\ncomplete={}\nbits={bits}\n",
++            self.total,
++            self.block_bytes,
++            self.played,
++            u8::from(self.complete),
++        )
++    }
++
++    fn decode(text: &str) -> Option<Self> {
++        let mut lines = text.lines();
++        if lines.next()? != SIDECAR_MAGIC {
++            return None;
++        }
++        let mut field = |name: &str| -> Option<String> {
++            let line = lines.next()?;
++            line.strip_prefix(name)?
++                .strip_prefix('=')
++                .map(str::to_owned)
++        };
++        let total: u64 = field("total")?.parse().ok()?;
++        let block_bytes: u32 = field("block")?.parse().ok()?;
++        let played: u64 = field("played")?.parse().ok()?;
++        let complete = match field("complete")?.as_str() {
++            "0" => false,
++            "1" => true,
++            _ => return None,
++        };
++        let bits = field("bits")?;
++        if block_bytes == 0 || total == 0 || bits.len() % 2 != 0 {
++            return None;
++        }
++        let present = (0..bits.len())
++            .step_by(2)
++            .map(|at| u8::from_str_radix(bits.get(at..at + 2)?, 16).ok())
++            .collect::<Option<Vec<u8>>>()?;
++        let meta = Self {
++            total,
++            block_bytes,
++            played,
++            complete,
++            present,
++        };
++        let expected = usize::try_from(meta.blocks().div_ceil(8)).ok()?;
++        (meta.present.len() == expected).then_some(meta)
++    }
++}
++
++fn blocks_of(total: u64, block_bytes: u32) -> u64 {
++    total.div_ceil(u64::from(block_bytes.max(1)))
++}
++
++/// The URL as a download is keyed: the query without the credential.
++///
++/// A sign-in again gives the same book a new `api_key`, and it must find the
++/// download it already has.
++#[must_use]
++pub fn stable_url(url: &str) -> String {
++    let url = url.split('#').next().unwrap_or(url);
++    let Some((base, query)) = url.split_once('?') else {
++        return url.to_owned();
++    };
++    let kept: Vec<&str> = query
++        .split('&')
++        .filter(|pair| {
++            let name = pair.split('=').next().unwrap_or(pair);
++            !(name.eq_ignore_ascii_case("api_key") || name.eq_ignore_ascii_case("apikey"))
++        })
++        .collect();
++    if kept.is_empty() {
++        base.to_owned()
++    } else {
++        format!("{base}?{}", kept.join("&"))
++    }
++}
++
++/// A name for a download that does not change between builds: FNV-1a over
++/// 128 bits of [`stable_url`]. It names a file; nothing secret depends on it.
++#[must_use]
++pub fn key_of(url: &str) -> String {
++    const OFFSET: u128 = 0x6c62_2723_e07b_b014_62b8_2175_6295_c58d;
++    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
++    let hash = stable_url(url).bytes().fold(OFFSET, |hash, byte| {
++        (hash ^ u128::from(byte)).wrapping_mul(PRIME)
++    });
++    format!("{hash:032x}")
++}
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++/// An app's name as a folder: one path segment, nothing that climbs.
++fn valid_app(app: &str) -> bool {
++    !app.is_empty()
++        && app.len() <= 64
++        && app
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
++}
++
++struct Entry {
++    key: String,
++    data: PathBuf,
++    sidecar: PathBuf,
++    meta: Meta,
++}
++
++impl Downloads {
++    #[must_use]
++    pub fn new(root: PathBuf, policy: DownloadPolicy) -> Self {
++        Self {
++            root,
++            policy,
++            open: Arc::default(),
++            counters: Arc::default(),
++            log: Arc::new(|line| eprintln!("{line}")),
++        }
++    }
++
++    /// Sends log lines to `log` instead of standard error.
++    #[must_use]
++    pub fn with_log(mut self, log: impl Fn(&str) + Send + Sync + 'static) -> Self {
++        self.log = Arc::new(log);
++        self
++    }
++
++    #[must_use]
++    pub fn stats(&self) -> DownloadStats {
++        let c = &self.counters;
++        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
++        DownloadStats {
++            started: get(&c.started),
++            resumed: get(&c.resumed),
++            completed: get(&c.completed),
++            evicted: get(&c.evicted),
++            removed: get(&c.removed),
++            skipped_low_space: get(&c.skipped_low_space),
++            skipped_budget: get(&c.skipped_budget),
++            fetch_failures: get(&c.fetch_failures),
++            blocks_written: get(&c.blocks_written),
++            bytes_written: get(&c.bytes_written),
++        }
++    }
++
++    fn say(&self, line: &str) {
++        (self.log)(line);
++    }
++
++    fn paths(&self, app: &str, key: &str) -> (PathBuf, PathBuf) {
++        let dir = self.root.join(app);
++        (
++            dir.join(format!("{key}.{DATA_SUFFIX}")),
++            dir.join(format!("{key}.{SIDECAR_SUFFIX}")),
++        )
++    }
++
++    fn read_meta(sidecar: &Path) -> Option<Meta> {
++        Meta::decode(&fs::read_to_string(sidecar).ok()?)
++    }
++
++    fn write_meta(sidecar: &Path, meta: &Meta) -> io::Result<()> {
++        let staging = sidecar.with_extension("tmp");
++        fs::write(&staging, meta.encode())?;
++        fs::rename(&staging, sidecar)
++    }
++
++    /// Every download of every app.
++    fn scan(&self) -> Vec<Entry> {
++        let mut found = Vec::new();
++        let Ok(apps) = fs::read_dir(&self.root) else {
++            return found;
++        };
++        for app in apps.flatten() {
++            let Ok(files) = fs::read_dir(app.path()) else {
++                continue;
++            };
++            for file in files.flatten() {
++                let sidecar = file.path();
++                if sidecar.extension().and_then(|ext| ext.to_str()) != Some(SIDECAR_SUFFIX) {
++                    continue;
++                }
++                let Some(key) = sidecar.file_stem().and_then(|stem| stem.to_str()) else {
++                    continue;
++                };
++                let Some(meta) = Self::read_meta(&sidecar) else {
++                    continue;
++                };
++                found.push(Entry {
++                    key: key.to_owned(),
++                    data: sidecar.with_extension(DATA_SUFFIX),
++                    sidecar: sidecar.clone(),
++                    meta,
++                });
++            }
++        }
++        found
++    }
++
++    fn is_open(&self, data: &Path) -> bool {
++        lock(&self.open).get(data).is_some_and(|count| *count > 0)
++    }
++
++    fn delete(entry: &Entry) {
++        let _ignored = fs::remove_file(&entry.data);
++        let _ignored = fs::remove_file(&entry.sidecar);
++    }
++
++    /// Frees the least recently played complete downloads that nothing has
++    /// open until `needed` more bytes fit in the budget. `false` when they
++    /// do not fit even then.
++    fn make_room(&self, needed: u64, keep: &Path) -> bool {
++        let budget = self.policy.budget_bytes;
++        if needed > budget {
++            return false;
++        }
++        let mut entries = self.scan();
++        let mut used: u64 = entries
++            .iter()
++            .filter(|entry| entry.data != keep)
++            .map(|entry| entry.meta.total)
++            .sum();
++        if used.saturating_add(needed) <= budget {
++            return true;
++        }
++        entries.retain(|entry| entry.meta.complete && entry.data != keep);
++        entries.sort_by_key(|entry| entry.meta.played);
++        for entry in entries {
++            if used.saturating_add(needed) <= budget {
++                break;
++            }
++            if self.is_open(&entry.data) {
++                continue;
++            }
++            Self::delete(&entry);
++            used = used.saturating_sub(entry.meta.total);
++            bump(&self.counters.evicted, 1);
++            self.say(&format!(
++                "downloads: evict key={} bytes={} played={} reason=over budget {budget} to fit {needed}",
++                entry.key, entry.meta.total, entry.meta.played
++            ));
++        }
++        used.saturating_add(needed) <= budget
++    }
++
++    /// The download of `url` for `app`, ready to be written and read; `None`
++    /// when the book is not to be kept on disk.
++    ///
++    /// `expected_total` is the length the server reported. `None` means the
++    /// network could not be asked, and an existing download is then used as
++    /// it stands. A download of another length or block size is a different
++    /// file and is replaced.
++    #[must_use]
++    pub fn begin(
++        &self,
++        app: &str,
++        url: &str,
++        expected_total: Option<u64>,
++        block_bytes: u32,
++    ) -> Option<BlockStore> {
++        if !valid_app(app) || block_bytes == 0 {
++            self.say(&format!(
++                "downloads: skip app={app:?} reason=unusable app name or block size {block_bytes}"
++            ));
++            return None;
++        }
++        let key = key_of(url);
++        let (data, sidecar) = self.paths(app, &key);
++        let existing = Self::read_meta(&sidecar).filter(|meta| {
++            let same = expected_total.is_none_or(|total| total == meta.total)
++                && (expected_total.is_none() || meta.block_bytes == block_bytes)
++                && data.is_file();
++            if !same {
++                self.say(&format!(
++                    "downloads: replace key={key} had_bytes={} server_bytes={expected_total:?} reason=length or block size changed",
++                    meta.total
++                ));
++            }
++            same
++        });
++        let now = (self.policy.now)();
++        let dir = self.root.join(app);
++        fs::create_dir_all(&dir)
++            .map_err(|error| {
++                self.say(&format!(
++                    "downloads: skip key={key} dir={} reason=cannot create: {error}",
++                    dir.display()
++                ));
++            })
++            .ok()?;
++        let (mut meta, fresh) = if let Some(meta) = existing {
++            (meta, false)
++        } else {
++            let _ignored = fs::remove_file(&data);
++            let _ignored = fs::remove_file(&sidecar);
++            let total = expected_total?;
++            if total == 0 {
++                return None;
++            }
++            self.admit(&key, &dir, &data, total)?;
++            (Meta::fresh(total, block_bytes, now), true)
++        };
++        meta.played = now;
++        let file = OpenOptions::new()
++            .create(true)
++            .truncate(false)
++            .read(true)
++            .write(true)
++            .open(&data)
++            .and_then(|file| {
++                if fresh {
++                    file.set_len(meta.total)?;
++                }
++                Ok(file)
++            })
++            .and_then(|file| Self::write_meta(&sidecar, &meta).map(|()| file))
++            .map_err(|error| {
++                self.say(&format!(
++                    "downloads: skip key={key} path={} reason=cannot create: {error}",
++                    data.display()
++                ));
++            })
++            .ok()?;
++        if fresh {
++            bump(&self.counters.started, 1);
++            self.say(&format!(
++                "downloads: start key={key} app={app} bytes={}",
++                meta.total
++            ));
++        } else {
++            bump(&self.counters.resumed, 1);
++            self.say(&format!(
++                "downloads: resume key={key} app={app} have={} bytes={}",
++                meta.have_bytes(),
++                meta.total
++            ));
++        }
++        *lock(&self.open).entry(data.clone()).or_insert(0) += 1;
++        Some(BlockStore {
++            file,
++            data,
++            sidecar,
++            key,
++            inner: Mutex::new(Inner {
++                meta,
++                unflushed: 0,
++                low_space_noted: false,
++            }),
++            downloads: self.clone(),
++        })
++    }
++
++    /// Whether a new download of `total` bytes may start: the volume has room
++    /// above the floor and the budget has room after evicting.
++    fn admit(&self, key: &str, dir: &Path, data: &Path, total: u64) -> Option<()> {
++        let free = (self.policy.free_space)(dir);
++        if free.is_some_and(|free| free < self.policy.min_free_bytes) {
++            bump(&self.counters.skipped_low_space, 1);
++            self.say(&format!(
++                "downloads: skip key={key} bytes={total} reason=low space free={free:?} floor={}",
++                self.policy.min_free_bytes
++            ));
++            return None;
++        }
++        if !self.make_room(total, data) {
++            bump(&self.counters.skipped_budget, 1);
++            self.say(&format!(
++                "downloads: skip key={key} bytes={total} reason=over budget {}",
++                self.policy.budget_bytes
++            ));
++            return None;
++        }
++        Some(())
++    }
++
++    /// How far each of `urls` has got, leaving out any with no download.
++    #[must_use]
++    pub fn progress(&self, app: &str, urls: &[String]) -> Vec<DownloadProgress> {
++        if !valid_app(app) {
++            return Vec::new();
++        }
++        let mut seen = HashSet::new();
++        urls.iter()
++            .filter_map(|url| {
++                let (_, sidecar) = self.paths(app, &key_of(url));
++                let meta = Self::read_meta(&sidecar)?;
++                seen.insert(sidecar).then(|| DownloadProgress {
++                    url: url.clone(),
++                    have: meta.have_bytes(),
++                    total: meta.total,
++                })
++            })
++            .collect()
++    }
++
++    /// Deletes the download of `url`, unless a book is playing from it.
++    #[must_use]
++    pub fn remove(&self, app: &str, url: &str) -> RemoveOutcome {
++        if !valid_app(app) {
++            return RemoveOutcome::Absent;
++        }
++        let key = key_of(url);
++        let (data, sidecar) = self.paths(app, &key);
++        if self.is_open(&data) {
++            self.say(&format!("downloads: remove refused key={key} reason=open"));
++            return RemoveOutcome::InUse;
++        }
++        let Some(meta) = Self::read_meta(&sidecar) else {
++            return RemoveOutcome::Absent;
++        };
++        Self::delete(&Entry {
++            key: key.clone(),
++            data,
++            sidecar,
++            meta: meta.clone(),
++        });
++        bump(&self.counters.removed, 1);
++        self.say(&format!(
++            "downloads: remove key={key} bytes={} have={}",
++            meta.total,
++            meta.have_bytes()
++        ));
++        RemoveOutcome::Removed
++    }
++}
++
++struct Inner {
++    meta: Meta,
++    unflushed: u32,
++    low_space_noted: bool,
++}
++
++/// One download, open: its blocks on disk and which of them are there.
++/// Dropping it saves the sidecar and lets the download be evicted again.
++pub struct BlockStore {
++    file: File,
++    data: PathBuf,
++    sidecar: PathBuf,
++    key: String,
++    inner: Mutex<Inner>,
++    downloads: Downloads,
++}
++
++impl fmt::Debug for BlockStore {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("BlockStore")
++            .field("key", &self.key)
++            .finish_non_exhaustive()
++    }
++}
++
++impl BlockStore {
++    fn inner(&self) -> MutexGuard<'_, Inner> {
++        lock(&self.inner)
++    }
++
++    #[must_use]
++    pub fn total(&self) -> u64 {
++        self.inner().meta.total
++    }
++
++    #[must_use]
++    pub fn block_bytes(&self) -> u32 {
++        self.inner().meta.block_bytes
++    }
++
++    #[must_use]
++    pub fn has(&self, index: u64) -> bool {
++        self.inner().meta.has(index)
++    }
++
++    #[must_use]
++    pub fn is_complete(&self) -> bool {
++        self.inner().meta.complete
++    }
++
++    #[must_use]
++    pub fn have_bytes(&self) -> u64 {
++        self.inner().meta.have_bytes()
++    }
++
++    /// The first block at or after `start` that is not on disk, wrapping to
++    /// the start of the file; `None` when every block is.
++    #[must_use]
++    pub fn missing_from(&self, start: u64) -> Option<u64> {
++        let inner = self.inner();
++        if inner.meta.complete {
++            return None;
++        }
++        let blocks = inner.meta.blocks();
++        let start = if start >= blocks { 0 } else { start };
++        (start..blocks)
++            .chain(0..start)
++            .find(|index| !inner.meta.has(*index))
++    }
++
++    /// Reads block `index` from disk.
++    ///
++    /// # Errors
++    /// The block is not on disk, or the file could not be read.
++    pub fn read(&self, index: u64) -> io::Result<Vec<u8>> {
++        let (len, at) = {
++            let inner = self.inner();
++            if !inner.meta.has(index) {
++                return Err(io::Error::new(
++                    io::ErrorKind::NotFound,
++                    "block not downloaded",
++                ));
++            }
++            let len = inner
++                .meta
++                .block_len(index)
++                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
++            (len, index * u64::from(inner.meta.block_bytes))
++        };
++        let mut bytes = vec![0; usize::try_from(len).map_err(|_| io::ErrorKind::InvalidInput)?];
++        self.file.read_exact_at(&mut bytes, at)?;
++        Ok(bytes)
++    }
++
++    /// Writes block `index` and marks it present. `false` when the volume is
++    /// under the free-space floor and the block was left unwritten.
++    ///
++    /// # Errors
++    /// The length is not the block's, or the file could not be written.
++    pub fn write(&self, index: u64, bytes: &[u8]) -> io::Result<bool> {
++        let (expected, at) = {
++            let inner = self.inner();
++            if inner.meta.has(index) {
++                return Ok(true);
++            }
++            (
++                inner.meta.block_len(index),
++                index.saturating_mul(u64::from(inner.meta.block_bytes)),
++            )
++        };
++        if expected != u64::try_from(bytes.len()).ok() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!(
++                    "block {index} is {} bytes, expected {expected:?}",
++                    bytes.len()
++                ),
++            ));
++        }
++        if !self.room_to_write() {
++            return Ok(false);
++        }
++        self.file.write_all_at(bytes, at)?;
++        let counters = &self.downloads.counters;
++        bump(&counters.blocks_written, 1);
++        bump(&counters.bytes_written, bytes.len() as u64);
++        let mut inner = self.inner();
++        inner.meta.set(index);
++        inner.unflushed += 1;
++        if inner.meta.all_present() {
++            drop(inner);
++            self.finish()?;
++        } else if inner.unflushed >= FLUSH_EVERY_BLOCKS {
++            drop(inner);
++            self.flush()?;
++        }
++        Ok(true)
++    }
++
++    /// Whether the volume has room for another block above the floor.
++    #[must_use]
++    pub fn has_room(&self) -> bool {
++        self.room_to_write()
++    }
++
++    /// Logs a block that could not be written to disk, with the cause.
++    pub fn note_write_failure(&self, index: u64, error: &io::Error) {
++        self.downloads.say(&format!(
++            "downloads: write failed key={} block={index} reason={error}",
++            self.key
++        ));
++    }
++
++    fn room_to_write(&self) -> bool {
++        let policy = &self.downloads.policy;
++        let dir = self.data.parent().unwrap_or(&self.data);
++        let free = (policy.free_space)(dir);
++        let low = free.is_some_and(|free| free < policy.min_free_bytes);
++        let mut inner = self.inner();
++        if low && !inner.low_space_noted {
++            bump(&self.downloads.counters.skipped_low_space, 1);
++            self.downloads.say(&format!(
++                "downloads: pause key={} have={} reason=low space free={free:?} floor={}",
++                self.key,
++                inner.meta.have_bytes(),
++                policy.min_free_bytes
++            ));
++        }
++        inner.low_space_noted = low;
++        !low
++    }
++
++    /// Saves the sidecar, after the blocks it names have reached the disk.
++    ///
++    /// # Errors
++    /// The file or the sidecar could not be written.
++    pub fn flush(&self) -> io::Result<()> {
++        self.file.sync_data()?;
++        let mut inner = self.inner();
++        inner.unflushed = 0;
++        Downloads::write_meta(&self.sidecar, &inner.meta)
++    }
++
++    /// Every block is present: checks the file is the length the server
++    /// said and marks the download complete.
++    fn finish(&self) -> io::Result<()> {
++        let length = self.file.metadata()?.len();
++        let total = self.total();
++        if length != total {
++            let mut inner = self.inner();
++            inner.meta.present.fill(0);
++            let _saved = Downloads::write_meta(&self.sidecar, &inner.meta);
++            self.downloads.say(&format!(
++                "downloads: verify failed key={} file_bytes={length} server_bytes={total}; refetching",
++                self.key
++            ));
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("download is {length} bytes, expected {total}"),
++            ));
++        }
++        self.inner().meta.complete = true;
++        self.flush()?;
++        bump(&self.downloads.counters.completed, 1);
++        self.downloads.say(&format!(
++            "downloads: complete key={} bytes={total}",
++            self.key
++        ));
++        Ok(())
++    }
++
++    /// Counts and logs a failed fetch of the block at `offset`. `gave_up` is
++    /// the last attempt at it, and the only one logged.
++    pub fn note_fetch_failure(&self, offset: u64, why: &str, gave_up: bool) {
++        bump(&self.downloads.counters.fetch_failures, 1);
++        if gave_up {
++            self.downloads.say(&format!(
++                "downloads: fetch failed key={} offset={offset} have={} reason={why}",
++                self.key,
++                self.have_bytes()
++            ));
++        }
++    }
++}
++
++impl Drop for BlockStore {
++    fn drop(&mut self) {
++        let _saved = self.flush();
++        let mut open = lock(&self.downloads.open);
++        if let Some(count) = open.get_mut(&self.data) {
++            *count = count.saturating_sub(1);
++            if *count == 0 {
++                open.remove(&self.data);
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
+new file mode 100644
+index 0000000..14dfa04
+--- /dev/null
++++ b/crates/kobo-audio/src/store/tests.rs
+@@ -0,0 +1,404 @@
++#![allow(clippy::unwrap_used, clippy::expect_used)]
++
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use super::{key_of, stable_url, DownloadPolicy, Downloads, Meta, RemoveOutcome};
++use crate::remote::tests::{quick, served};
++use crate::{FetchFailure, RangeFetch, Remote};
++
++const BLOCK: u32 = 1_024;
++
++fn pattern(len: usize) -> Arc<Vec<u8>> {
++    #[allow(clippy::cast_possible_truncation, reason = "a repeating byte pattern")]
++    Arc::new((0..len).map(|at| (at % 251) as u8).collect())
++}
++
++fn scratch(name: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("kobo-downloads-{name}-{}", std::process::id()));
++    let _ignored = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++/// A policy with a card as full as the test says and a clock it winds.
++struct Card {
++    free: Arc<AtomicU64>,
++    clock: Arc<AtomicU64>,
++}
++
++impl Card {
++    fn policy(budget: u64, floor: u64) -> (Self, DownloadPolicy) {
++        let free = Arc::new(AtomicU64::new(u64::MAX));
++        let clock = Arc::new(AtomicU64::new(1));
++        let policy = DownloadPolicy {
++            budget_bytes: budget,
++            min_free_bytes: floor,
++            free_space: {
++                let free = Arc::clone(&free);
++                Arc::new(move |_| Some(free.load(Ordering::SeqCst)))
++            },
++            now: {
++                let clock = Arc::clone(&clock);
++                Arc::new(move || clock.load(Ordering::SeqCst))
++            },
++        };
++        (Self { free, clock }, policy)
++    }
++}
++
++type Lines = Arc<Mutex<Vec<String>>>;
++
++fn downloads(dir: &Path, policy: DownloadPolicy) -> (Downloads, Lines) {
++    let lines: Lines = Arc::default();
++    let sink = Arc::clone(&lines);
++    let downloads = Downloads::new(dir.to_path_buf(), policy)
++        .with_log(move |line| sink.lock().unwrap().push(line.to_owned()));
++    (downloads, lines)
++}
++
++fn said(lines: &Lines, needle: &str) -> bool {
++    lines
++        .lock()
++        .unwrap()
++        .iter()
++        .any(|line| line.contains(needle))
++}
++
++fn eventually(what: &str, done: impl Fn() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while !done() {
++        assert!(Instant::now() < deadline, "never: {what}");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++
++/// Writes every block of a made-up book of `total` bytes.
++fn fill(downloads: &Downloads, url: &str, total: u64) {
++    let store = downloads.begin("shelf", url, Some(total), BLOCK).unwrap();
++    let bytes = pattern(usize::try_from(total).unwrap());
++    let mut at = 0;
++    let mut index = 0;
++    while at < bytes.len() {
++        let end = (at + BLOCK as usize).min(bytes.len());
++        assert!(store.write(index, &bytes[at..end]).unwrap());
++        at = end;
++        index += 1;
++    }
++    assert!(store.is_complete());
++}
++
++fn failing(calls: Arc<AtomicU64>) -> RangeFetch {
++    Arc::new(move |_, _| {
++        calls.fetch_add(1, Ordering::SeqCst);
++        Err(FetchFailure::Transient)
++    })
++}
++
++const URL: &str = "https://books.example/Audio/aaa/universal?api_key=old&static=true";
++
++#[test]
++fn the_key_ignores_the_credential_and_nothing_else() {
++    assert_eq!(
++        stable_url(URL),
++        "https://books.example/Audio/aaa/universal?static=true"
++    );
++    assert_eq!(
++        key_of(URL),
++        key_of("https://books.example/Audio/aaa/universal?static=true&ApiKey=new")
++    );
++    assert_eq!(
++        key_of("https://books.example/a?api_key=x"),
++        key_of("https://books.example/a")
++    );
++    assert_ne!(
++        key_of(URL),
++        key_of("https://books.example/Audio/bbb/universal?static=true")
++    );
++    assert_eq!(key_of(URL).len(), 32);
++}
++
++#[test]
++fn a_sidecar_round_trips_and_a_damaged_one_is_refused() {
++    let mut meta = Meta::fresh(10_000, BLOCK, 7);
++    meta.set(0);
++    meta.set(9);
++    assert_eq!(Meta::decode(&meta.encode()), Some(meta.clone()));
++    assert_eq!(meta.have_bytes(), 1_024 + (10_000 - 9 * 1_024));
++    assert_eq!(Meta::decode("pharos-download 1\ntotal=10\n"), None);
++    assert_eq!(
++        Meta::decode(&meta.encode().replace("bits=", "bits=00")),
++        None
++    );
++    assert_eq!(Meta::decode("garbage"), None);
++}
++
++#[test]
++fn a_book_is_downloaded_whole_then_opens_with_no_network() {
++    let dir = scratch("whole");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, lines) = downloads(&dir, policy);
++    let bytes = pattern(10_000);
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let store = downloads.begin("shelf", URL, Some(10_000), BLOCK).unwrap();
++    let remote = Remote::open_stored(
++        served(Arc::clone(&bytes), Arc::clone(&log)),
++        store,
++        Vec::new(),
++        quick(BLOCK),
++    )
++    .unwrap();
++    let mut first = vec![0; 100];
++    remote.reader().read_exact(&mut first).unwrap();
++    assert_eq!(first, bytes[..100]);
++    // Nobody asked for the rest: the download fetches it.
++    eventually("the download completes", || {
++        downloads.stats().completed == 1
++    });
++    drop(remote);
++
++    let after = downloads.stats();
++    assert_eq!((after.started, after.completed), (1, 1));
++    assert_eq!(after.bytes_written, 10_000);
++    assert!(said(&lines, "downloads: start"));
++    assert!(said(&lines, "downloads: complete"));
++
++    // The same book with a new token, offline: no request may be made.
++    let calls = Arc::new(AtomicU64::new(0));
++    let store = downloads
++        .begin(
++            "shelf",
++            "https://books.example/Audio/aaa/universal?api_key=new&static=true",
++            None,
++            BLOCK,
++        )
++        .unwrap();
++    assert!(store.is_complete());
++    let remote =
++        Remote::open_stored(failing(Arc::clone(&calls)), store, Vec::new(), quick(BLOCK)).unwrap();
++    let mut all = Vec::new();
++    remote.reader().read_to_end(&mut all).unwrap();
++    assert_eq!(all, *bytes);
++    std::thread::sleep(Duration::from_millis(50));
++    assert_eq!(
++        calls.load(Ordering::SeqCst),
++        0,
++        "a complete download made a request"
++    );
++    assert!(remote.stats().disk_reads > 0, "read from RAM only");
++}
++
++#[test]
++fn a_partial_download_survives_a_restart_and_fetches_only_the_rest() {
++    let dir = scratch("restart");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let bytes = pattern(10_000);
++    {
++        let (downloads, _lines) = downloads(&dir, policy.clone());
++        // A server that goes away after five blocks.
++        let good = served(Arc::clone(&bytes), Arc::default());
++        let served_blocks = Arc::new(AtomicU64::new(0));
++        let fetch: RangeFetch = {
++            let served_blocks = Arc::clone(&served_blocks);
++            Arc::new(move |offset, len| {
++                if served_blocks.fetch_add(1, Ordering::SeqCst) < 5 {
++                    good(offset, len)
++                } else {
++                    Err(FetchFailure::Transient)
++                }
++            })
++        };
++        let store = downloads.begin("shelf", URL, Some(10_000), BLOCK).unwrap();
++        let remote = Remote::open_stored(fetch, store, Vec::new(), quick(BLOCK)).unwrap();
++        let mut head = vec![0; 10];
++        remote.reader().read_exact(&mut head).unwrap();
++        eventually("five blocks land", || downloads.stats().blocks_written >= 5);
++    }
++
++    // The process "restarts": a new Downloads over the same folder. The old
++    // book saves its place when its last thread lets go of it.
++    let (downloads, lines) = downloads(&dir, policy);
++    eventually("the first run saves its place", || {
++        downloads
++            .progress("shelf", &[URL.to_owned()])
++            .first()
++            .is_some_and(|progress| progress.have == 5 * 1_024)
++    });
++    let progress = downloads.progress("shelf", &[URL.to_owned()]);
++    assert_eq!(progress.len(), 1);
++    assert_eq!((progress[0].have, progress[0].total), (5 * 1_024, 10_000));
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let store = downloads.begin("shelf", URL, Some(10_000), BLOCK).unwrap();
++    assert!(said(&lines, "downloads: resume"));
++    let remote = Remote::open_stored(
++        served(Arc::clone(&bytes), Arc::clone(&log)),
++        store,
++        Vec::new(),
++        quick(BLOCK),
++    )
++    .unwrap();
++    let mut all = Vec::new();
++    remote.reader().read_to_end(&mut all).unwrap();
++    assert_eq!(all, *bytes);
++    eventually("the download completes", || {
++        downloads.stats().completed == 1
++    });
++    let asked = log.lock().unwrap().clone();
++    assert!(
++        asked.iter().all(|offset| *offset >= 5 * 1_024),
++        "refetched a block already on disk: {asked:?}"
++    );
++}
++
++#[test]
++fn a_partial_download_offline_plays_what_it_has_and_stops_at_the_gap() {
++    let dir = scratch("gap");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let bytes = pattern(10_000);
++    let store = downloads.begin("shelf", URL, Some(10_000), BLOCK).unwrap();
++    for index in 0..3_u64 {
++        let at = usize::try_from(index).unwrap() * BLOCK as usize;
++        store.write(index, &bytes[at..at + BLOCK as usize]).unwrap();
++    }
++    drop(store);
++    let store = downloads.begin("shelf", URL, None, BLOCK).unwrap();
++    let remote =
++        Remote::open_stored(failing(Arc::default()), store, Vec::new(), quick(BLOCK)).unwrap();
++    let mut reader = remote.reader();
++    let mut present = vec![0; 3 * 1_024];
++    reader.read_exact(&mut present).unwrap();
++    assert_eq!(present, bytes[..3 * 1_024]);
++    let error = reader.read(&mut [0; 16]).unwrap_err();
++    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
++}
++
++#[test]
++fn nothing_starts_or_continues_under_the_free_space_floor() {
++    let dir = scratch("floor");
++    let floor = 2 * 1024 * 1024 * 1024;
++    let (card, policy) = Card::policy(u64::MAX, floor);
++    let (downloads, lines) = downloads(&dir, policy);
++
++    card.free.store(floor - 1, Ordering::SeqCst);
++    assert!(downloads.begin("shelf", URL, Some(5_000), BLOCK).is_none());
++    assert_eq!(downloads.stats().skipped_low_space, 1);
++    assert!(said(&lines, "reason=low space"));
++    assert_eq!(downloads.stats().started, 0);
++
++    card.free.store(floor, Ordering::SeqCst);
++    let store = downloads.begin("shelf", URL, Some(5_000), BLOCK).unwrap();
++    let bytes = pattern(5_000);
++    assert!(store.write(0, &bytes[..1_024]).unwrap());
++    card.free.store(floor - 1, Ordering::SeqCst);
++    assert!(
++        !store.write(1, &bytes[1_024..2_048]).unwrap(),
++        "wrote under the floor"
++    );
++    assert!(!store.has(1));
++    assert!(!store.has_room());
++    assert_eq!(downloads.stats().skipped_low_space, 2);
++    assert!(said(&lines, "downloads: pause"));
++    card.free.store(floor, Ordering::SeqCst);
++    assert!(store.write(1, &bytes[1_024..2_048]).unwrap());
++}
++
++#[test]
++fn the_budget_evicts_the_least_recently_played_complete_download() {
++    let dir = scratch("budget");
++    let (card, policy) = Card::policy(3_000, 0);
++    let (downloads, lines) = downloads(&dir, policy);
++    let urls: Vec<String> = ["old", "mid", "new"]
++        .iter()
++        .map(|name| format!("https://books.example/Audio/{name}/universal"))
++        .collect();
++    for (at, url) in urls.iter().enumerate() {
++        card.clock.store(10 + at as u64, Ordering::SeqCst);
++        fill(&downloads, url, 1_000);
++    }
++    let have = |url: &String| {
++        !downloads
++            .progress("shelf", std::slice::from_ref(url))
++            .is_empty()
++    };
++
++    // The oldest is open, so the next oldest goes instead.
++    card.clock.store(20, Ordering::SeqCst);
++    let held = downloads.begin("shelf", &urls[0], None, BLOCK).unwrap();
++    let fourth = "https://books.example/Audio/fourth/universal".to_owned();
++    let store = downloads
++        .begin("shelf", &fourth, Some(1_000), BLOCK)
++        .unwrap();
++    assert!(have(&urls[0]) && !have(&urls[1]) && have(&urls[2]));
++    assert_eq!(downloads.stats().evicted, 1);
++    assert!(said(&lines, "downloads: evict"));
++    assert!(said(&lines, "reason=over budget"));
++    drop(held);
++
++    // A half-fetched download is not evicted to make room.
++    assert!(!store.is_complete());
++    let fifth = "https://books.example/Audio/fifth/universal".to_owned();
++    let big = downloads.begin("shelf", &fifth, Some(2_500), BLOCK);
++    assert!(
++        big.is_none(),
++        "found room by evicting the open or the partial"
++    );
++    assert!(have(&fourth), "evicted a partial download");
++    assert_eq!(downloads.stats().skipped_budget, 1);
++    // Failing to make room left the complete ones evicted only as far as it went.
++    assert!(downloads.stats().evicted >= 2);
++}
++
++#[test]
++fn a_book_larger_than_the_budget_is_streamed_not_kept() {
++    let dir = scratch("toobig");
++    let (_card, policy) = Card::policy(2_000, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    assert!(downloads.begin("shelf", URL, Some(2_001), BLOCK).is_none());
++    assert_eq!(downloads.stats().skipped_budget, 1);
++}
++
++#[test]
++fn removing_a_download_deletes_it_unless_it_is_open() {
++    let dir = scratch("remove");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    fill(&downloads, URL, 3_000);
++    let open = downloads.begin("shelf", URL, None, BLOCK).unwrap();
++    assert_eq!(downloads.remove("shelf", URL), RemoveOutcome::InUse);
++    drop(open);
++    assert_eq!(downloads.remove("shelf", URL), RemoveOutcome::Removed);
++    assert_eq!(downloads.remove("shelf", URL), RemoveOutcome::Absent);
++    assert!(downloads.progress("shelf", &[URL.to_owned()]).is_empty());
++    assert_eq!(downloads.stats().removed, 1);
++    assert_eq!(downloads.remove("../etc", URL), RemoveOutcome::Absent);
++}
++
++#[test]
++fn a_server_that_changed_the_length_replaces_the_download() {
++    let dir = scratch("changed");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, lines) = downloads(&dir, policy);
++    fill(&downloads, URL, 3_000);
++    let store = downloads.begin("shelf", URL, Some(4_000), BLOCK).unwrap();
++    assert_eq!((store.total(), store.have_bytes()), (4_000, 0));
++    assert!(said(&lines, "reason=length or block size changed"));
++}
++
++#[test]
++fn a_failed_fetch_is_counted_and_logged_with_its_offset_and_cause() {
++    let dir = scratch("failure");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, lines) = downloads(&dir, policy);
++    let store = downloads.begin("shelf", URL, Some(10_000), BLOCK).unwrap();
++    let fetch: RangeFetch = Arc::new(|_, _| Err(FetchFailure::Refused));
++    let remote = Remote::open_stored(fetch, store, Vec::new(), quick(BLOCK)).unwrap();
++    let error = remote.reader().read(&mut [0; 8]).unwrap_err();
++    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++    assert!(downloads.stats().fetch_failures >= 1);
++    assert!(said(&lines, "offset=0 "), "{:?}", lines.lock().unwrap());
++    assert!(said(&lines, "reason=the server refused the range"));
++}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
 --- a/crates/kobo-audio/src/tests.rs
@@ -1278,19 +2759,21 @@ index 6220e12..752dd9f 100644
  ];
  /// Applications released through Store, including the initial built-in copies
 diff --git a/crates/kobo-hal/src/audio.rs b/crates/kobo-hal/src/audio.rs
-index 9f5ad70..39f0e47 100644
+index 9f5ad70..db3d018 100644
 --- a/crates/kobo-hal/src/audio.rs
 +++ b/crates/kobo-hal/src/audio.rs
-@@ -13,7 +13,7 @@
+@@ -13,7 +13,9 @@
  
  use kobo_audio::resample::Resampler;
  use kobo_audio::stretch::Stretcher;
 -use kobo_audio::{Book, Description, Fault};
-+use kobo_audio::{Book, Description, Fault, FetchFailure, RangeFetch, Remote, RemoteOptions};
++use kobo_audio::{
++    Book, Description, Downloads, Fault, FetchFailure, RangeFetch, Remote, RemoteOptions,
++};
  use kobo_protocol::{AudioPlaybackState, DeviceError, DeviceResult};
  use std::collections::VecDeque;
  use std::io::{Read, Write};
-@@ -72,10 +72,9 @@ const SINK_PATIENCE: Duration = Duration::from_secs(5);
+@@ -72,10 +74,9 @@ const SINK_PATIENCE: Duration = Duration::from_secs(5);
  const SINK_RETRY: Duration = Duration::from_millis(500);
  const IO_TIMEOUT: Duration = Duration::from_secs(3);
  const DATA_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -1304,7 +2787,7 @@ index 9f5ad70..39f0e47 100644
  
  const BACKEND_MARKERS: [&str; 8] = [
      // Clara BW 4.45.23697. Unlike many Android trees, Kobo installs the HAL
-@@ -106,9 +105,24 @@ impl Sockets {
+@@ -106,9 +107,24 @@ impl Sockets {
      }
  }
  
@@ -1332,7 +2815,75 @@ index 9f5ad70..39f0e47 100644
  
  /// Where a book comes from.
  #[derive(Clone, Debug)]
-@@ -500,8 +514,9 @@ impl Media {
+@@ -121,6 +137,13 @@ pub enum Source {
+         paths: Vec<PathBuf>,
+     },
+     Stream(String),
++    /// A stream that `app` may keep on the reader. Its blocks are written to
++    /// that app's downloads as they arrive and it plays from there when it
++    /// can, with no request at all once the whole of it is on disk.
++    AppStream {
++        app: String,
++        url: String,
++    },
+ }
+ 
+ /// One thing playback proved about the Bluetooth sink.
+@@ -192,14 +215,19 @@ impl Audio {
+     /// audio device connects, while applications must be able to discover the
+     /// capability before asking the user to pair one.
+     #[must_use]
+-    pub fn open(fetcher: Option<StreamFetcher>) -> Option<Self> {
++    pub fn open(fetcher: Option<StreamFetcher>, downloads: Option<Downloads>) -> Option<Self> {
+         if !BACKEND_MARKERS
+             .iter()
+             .any(|marker| Path::new(marker).exists())
+         {
+             return None;
+         }
+-        Some(Self::spawn(fetcher, Sockets::firmware(), SINK_PATIENCE))
++        Some(Self::spawn(
++            fetcher,
++            downloads,
++            Sockets::firmware(),
++            SINK_PATIENCE,
++        ))
+     }
+ 
+     /// A player with no stack behind it, and little patience for one: a
+@@ -207,15 +235,20 @@ impl Audio {
+     /// learn that.
+     #[cfg(test)]
+     fn simulated() -> Self {
+-        Self::spawn(None, Sockets::firmware(), Duration::from_millis(600))
++        Self::spawn(None, None, Sockets::firmware(), Duration::from_millis(600))
+     }
+ 
+     #[cfg(test)]
+     fn simulated_with(sockets: Sockets, patience: Duration) -> Self {
+-        Self::spawn(None, sockets, patience)
++        Self::spawn(None, None, sockets, patience)
+     }
+ 
+-    fn spawn(fetcher: Option<StreamFetcher>, sockets: Sockets, patience: Duration) -> Self {
++    fn spawn(
++        fetcher: Option<StreamFetcher>,
++        downloads: Option<Downloads>,
++        sockets: Sockets,
++        patience: Duration,
++    ) -> Self {
+         let (sender, receiver) = mpsc::channel();
+         let state = Arc::new(Mutex::new(State::default()));
+         let worker_state = Arc::clone(&state);
+@@ -224,6 +257,7 @@ impl Audio {
+                 &receiver,
+                 &worker_state,
+                 fetcher.as_ref(),
++                downloads.as_ref(),
+                 &sockets,
+                 patience,
+             );
+@@ -500,8 +534,9 @@ impl Media {
  fn fault_error(fault: Fault) -> DeviceError {
      match fault {
          Fault::Unreadable => DeviceError::NotFound,
@@ -1343,7 +2894,48 @@ index 9f5ad70..39f0e47 100644
      }
  }
  
-@@ -802,38 +817,88 @@ fn open_source(source: Source, fetcher: Option<&StreamFetcher>) -> Result<Book,
+@@ -518,6 +553,7 @@ struct SinkWait {
+ struct Worker<'a> {
+     state: &'a Mutex<State>,
+     fetcher: Option<&'a StreamFetcher>,
++    downloads: Option<&'a Downloads>,
+     sockets: &'a Sockets,
+     /// How long a Play waits for the sink.
+     patience: Duration,
+@@ -535,12 +571,14 @@ fn run(
+     receiver: &mpsc::Receiver<Command>,
+     state: &Mutex<State>,
+     fetcher: Option<&StreamFetcher>,
++    downloads: Option<&Downloads>,
+     sockets: &Sockets,
+     patience: Duration,
+ ) {
+     let mut worker = Worker {
+         state,
+         fetcher,
++        downloads,
+         sockets,
+         patience,
+         media: None,
+@@ -630,7 +668,7 @@ impl Worker<'_> {
+         self.paused_at = None;
+         self.media = None;
+         let speed = locked(self.state).speed_percent;
+-        match open_source(source, self.fetcher) {
++        match open_source(source, self.fetcher, self.downloads) {
+             Ok(book) => {
+                 let description = Arc::new(book.description().clone());
+                 let duration_ms = book.duration_ms();
+@@ -798,44 +836,171 @@ impl Worker<'_> {
+     }
+ }
+ 
+-fn open_source(source: Source, fetcher: Option<&StreamFetcher>) -> Result<Book, DeviceError> {
++fn open_source(
++    source: Source,
++    fetcher: Option<&StreamFetcher>,
++    downloads: Option<&Downloads>,
++) -> Result<Book, DeviceError> {
      match source {
          Source::File(path) => Book::open(&path).map_err(fault_error),
          Source::Parts { title, paths } => Book::open_parts(&title, &paths).map_err(fault_error),
@@ -1356,24 +2948,21 @@ index 9f5ad70..39f0e47 100644
 -                .unwrap_or("stream.mp3");
 -            Book::open_bytes(bytes, name).map_err(fault_error)
 -        }
-+        Source::Stream(url) => open_stream(&url, fetcher, &RemoteOptions::default()),
++        Source::Stream(url) => open_stream(&url, fetcher, &RemoteOptions::default(), None),
++        Source::AppStream { app, url } => open_stream(
++            &url,
++            fetcher,
++            &RemoteOptions::default(),
++            downloads.map(|downloads| Keep {
++                downloads,
++                app: &app,
++            }),
++        ),
      }
  }
  
 -fn fetch_stream(url: &str, fetcher: Option<&StreamFetcher>) -> Result<Vec<u8>, DeviceError> {
-+/// Opens a stream: through a block cache when the server sends ranges, or
-+/// held whole when it does not and the whole fits.
-+///
-+/// The first block is asked for as a range. A `206` with a total says ranges
-+/// work. A body shorter than the block is the whole file whatever the status.
-+/// A server that ignores ranges for a longer file answers too much, and the
-+/// whole is then asked for once, up to [`MAX_STREAM_BYTES`].
-+fn open_stream(
-+    url: &str,
-+    fetcher: Option<&StreamFetcher>,
-+    options: &RemoteOptions,
-+) -> Result<Book, DeviceError> {
-     let fetcher = fetcher.ok_or(DeviceError::Unreachable)?;
+-    let fetcher = fetcher.ok_or(DeviceError::Unreachable)?;
 -    let mut bytes = Vec::new();
 -    loop {
 -        let offset = u32::try_from(bytes.len()).map_err(|_| DeviceError::InvalidInput)?;
@@ -1381,39 +2970,116 @@ index 9f5ad70..39f0e47 100644
 -        let done = chunk.len() < FETCH_CHUNK as usize;
 -        if bytes.len().saturating_add(chunk.len()) > MAX_STREAM_BYTES {
 -            return Err(DeviceError::InvalidInput);
-+    let name = stream_name(url);
-+    let block = options.block_bytes;
-+    let whole = |bytes: Vec<u8>| {
-+        if bytes.is_empty() {
-+            return Err(DeviceError::NotFound);
-         }
+-        }
 -        bytes.extend_from_slice(&chunk);
 -        if done {
 -            break;
-+        Book::open_bytes(bytes, name).map_err(fault_error)
-+    };
-+    let first = match fetcher(url, 0, block) {
-+        Ok(first) => first,
-+        Err(DeviceError::StreamTooLong) => return whole(fetch_whole(url, fetcher)?),
-+        Err(error) => return Err(error),
-+    };
-+    let held = first.body.len() as u64;
-+    match (first.partial, first.total) {
-+        (true, Some(total)) if total > held => {
-+            let remote = Remote::open(ranged(fetcher, url), total, first.body, options.clone())
-+                .map_err(|_| DeviceError::Backend)?;
-+            Book::open_remote(remote, name).map_err(fault_error)
++/// Where a stream's blocks are kept, when it is being kept.
++#[derive(Clone, Copy)]
++struct Keep<'a> {
++    downloads: &'a Downloads,
++    app: &'a str,
++}
++
++/// Opens a stream: through a block cache when the server sends ranges, or
++/// held whole when it does not and the whole fits.
++///
++/// A download that is already complete is opened with no request at all. One
++/// that is partial is opened from the length it recorded when the server
++/// cannot be reached, so it plays as far as it goes.
++///
++/// Otherwise the first block is asked for as a range. A `206` with a total
++/// says ranges work. A body shorter than the block is the whole file whatever
++/// the status. A server that ignores ranges for a longer file answers too
++/// much, and the whole is then asked for once, up to [`MAX_STREAM_BYTES`].
++fn open_stream(
++    url: &str,
++    fetcher: Option<&StreamFetcher>,
++    options: &RemoteOptions,
++    keep: Option<Keep<'_>>,
++) -> Result<Book, DeviceError> {
++    let name = stream_name(url);
++    let held = keep.and_then(|keep| keep.downloads.progress(keep.app, &[url.to_owned()]).pop());
++    if let (Some(keep), Some(held)) = (keep, &held) {
++        if held.have == held.total {
++            return open_stored(keep, url, fetcher, options, name);
          }
-+        _ if held < u64::from(block) || first.total == Some(held) => whole(first.body),
-+        // Exactly one block with no total: there may be more, and nothing
-+        // says how much, so the whole is asked for.
-+        _ => whole(fetch_whole(url, fetcher)?),
      }
 -    if bytes.is_empty() {
 -        Err(DeviceError::NotFound)
 -    } else {
 -        Ok(bytes)
--    }
++    let Some(fetcher) = fetcher else {
++        return match keep.filter(|_| held.is_some()) {
++            Some(keep) => open_stored(keep, url, None, options, name),
++            None => Err(DeviceError::Unreachable),
++        };
++    };
++    let block = options.block_bytes;
++    let whole = |bytes: Vec<u8>| {
++        if bytes.is_empty() {
++            return Err(DeviceError::NotFound);
++        }
++        Book::open_bytes(bytes, name).map_err(fault_error)
++    };
++    let first = match fetcher(url, 0, block) {
++        Ok(first) => first,
++        Err(DeviceError::StreamTooLong) => return whole(fetch_whole(url, fetcher)?),
++        Err(DeviceError::Unreachable | DeviceError::TimedOut | DeviceError::ConnectionLost)
++            if keep.is_some() && held.is_some() =>
++        {
++            return open_stored(
++                keep.ok_or(DeviceError::Unreachable)?,
++                url,
++                Some(fetcher),
++                options,
++                name,
++            );
++        }
++        Err(error) => return Err(error),
++    };
++    let held_bytes = first.body.len() as u64;
++    match (first.partial, first.total) {
++        (true, Some(total)) if total > held_bytes => {
++            let fetch = ranged(fetcher, url);
++            let kept = keep.and_then(|keep| {
++                keep.downloads
++                    .begin(keep.app, url, Some(total), options.block_bytes)
++            });
++            let remote = match kept {
++                Some(store) => Remote::open_stored(fetch, store, first.body, options.clone()),
++                None => Remote::open(fetch, total, first.body, options.clone()),
++            }
++            .map_err(|_| DeviceError::Backend)?;
++            Book::open_remote(remote, name).map_err(fault_error)
++        }
++        _ if held_bytes < u64::from(block) || first.total == Some(held_bytes) => whole(first.body),
++        // Exactly one block with no total: there may be more, and nothing
++        // says how much, so the whole is asked for.
++        _ => whole(fetch_whole(url, fetcher)?),
+     }
+ }
+ 
++/// Opens the download already on disk. `fetcher` carries on filling it if the
++/// network is there; without one a gap ends playback as a lost connection.
++fn open_stored(
++    keep: Keep<'_>,
++    url: &str,
++    fetcher: Option<&StreamFetcher>,
++    options: &RemoteOptions,
++    name: &str,
++) -> Result<Book, DeviceError> {
++    let store = keep
++        .downloads
++        .begin(keep.app, url, None, options.block_bytes)
++        .ok_or(DeviceError::NotFound)?;
++    let fetch: RangeFetch = fetcher.map_or_else(
++        || Arc::new(|_, _| Err(FetchFailure::Transient)) as RangeFetch,
++        |fetcher| ranged(fetcher, url),
++    );
++    let remote = Remote::open_stored(fetch, store, Vec::new(), options.clone())
++        .map_err(|_| DeviceError::Backend)?;
++    Book::open_remote(remote, name).map_err(fault_error)
 +}
 +
 +/// The last segment of a stream's path, without its query: a name for the
@@ -1454,18 +3120,21 @@ index 9f5ad70..39f0e47 100644
 +        }
 +        Ok(_) | Err(_) => Err(FetchFailure::Refused),
 +    })
- }
- 
++}
++
  /// Records one new observation of the sink.
-@@ -1089,6 +1154,7 @@ fn io_error(error: std::io::Error) -> DeviceError {
+ fn record_sink(state: &Mutex<State>, connected: bool) {
+     let mut observed = locked(state);
+@@ -1089,14 +1254,16 @@ fn io_error(error: std::io::Error) -> DeviceError {
  #[cfg(test)]
  mod tests {
      use super::{next_deadline, Audio, Sockets, Source, BACKEND_MARKERS};
-+    use super::{open_stream, stream_name, Book, RemoteOptions, StreamFetcher, StreamReply};
++    use super::{open_stream, stream_name, Book, Keep, RemoteOptions, StreamFetcher, StreamReply};
      use super::{ACK_SUCCESS, COMMAND_CHECK_READY, COMMAND_GET_AUDIO_CONFIG, COMMAND_START};
      use super::{RESYNC_LIMIT, WRITE_PERIOD};
++    use kobo_audio::{DownloadPolicy, Downloads};
      use kobo_protocol::{AudioPlaybackState, DeviceError, DeviceResult};
-@@ -1096,7 +1162,7 @@ mod tests {
+     use std::io::{Read, Write};
      use std::os::unix::net::UnixListener;
      use std::path::PathBuf;
      use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1474,7 +3143,7 @@ index 9f5ad70..39f0e47 100644
      use std::time::{Duration, Instant};
  
      fn fixture(name: &str) -> PathBuf {
-@@ -1195,7 +1261,7 @@ mod tests {
+@@ -1195,7 +1362,7 @@ mod tests {
          let _ = audio.load(Source::File(fixture("cover.png")));
          assert_eq!(
              settled(&audio),
@@ -1483,7 +3152,7 @@ index 9f5ad70..39f0e47 100644
          );
          assert!(audio.detail().is_none());
          assert_eq!(audio.play(), DeviceResult::Failed(DeviceError::NotFound));
-@@ -1460,4 +1526,154 @@ mod tests {
+@@ -1460,4 +1627,240 @@ mod tests {
          let audio = Audio::simulated();
          drop(audio);
      }
@@ -1525,6 +3194,7 @@ index 9f5ad70..39f0e47 100644
 +            behind_blocks: 1,
 +            retry_delays: vec![Duration::from_millis(1)],
 +            give_up_after: Duration::from_millis(200),
++            background_pause: Duration::from_millis(20),
 +        }
 +    }
 +
@@ -1534,6 +3204,86 @@ index 9f5ad70..39f0e47 100644
 +        out
 +    }
 +
++    fn downloads_in(name: &str) -> Downloads {
++        let root = std::env::temp_dir().join(format!("kobo-hal-dl-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&root);
++        let policy = DownloadPolicy {
++            min_free_bytes: 0,
++            free_space: Arc::new(|_| Some(u64::MAX)),
++            ..DownloadPolicy::default()
++        };
++        Downloads::new(root, policy).with_log(|_| {})
++    }
++
++    #[test]
++    fn a_stream_plays_while_it_downloads_and_then_plays_with_no_request() {
++        let downloads = downloads_in("whole");
++        let keep = Keep {
++            downloads: &downloads,
++            app: "shelf",
++        };
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("stereo.mp3", true, &log);
++        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024), Some(keep))
++            .expect("opens");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(sound_of(&mut book), sound_of(&mut local));
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while downloads.stats().completed == 0 {
++            assert!(Instant::now() < deadline, "the download never completed");
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        drop(book);
++
++        // Offline, with a new sign-in token: nothing may be asked for.
++        let asked = Arc::new(Mutex::new(0_u32));
++        let counted = Arc::clone(&asked);
++        let dead: StreamFetcher = Arc::new(move |_url, _offset, _max| {
++            *counted.lock().expect("count") += 1;
++            Err(DeviceError::Unreachable)
++        });
++        let renewed = UNIVERSAL.replace("api_key=k", "api_key=renewed");
++        let mut again = open_stream(&renewed, Some(&dead), &small_blocks(1_024), Some(keep))
++            .expect("opens from disk");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(sound_of(&mut again), sound_of(&mut local));
++        // And with no network stack at all.
++        assert!(open_stream(&renewed, None, &small_blocks(1_024), Some(keep)).is_ok());
++        assert_eq!(*asked.lock().expect("count"), 0);
++    }
++
++    #[test]
++    fn a_partial_download_opens_offline_from_what_it_recorded() {
++        let downloads = downloads_in("partial");
++        let bytes = std::fs::read(fixture("stereo.mp3")).expect("fixture");
++        let store = downloads
++            .begin("shelf", UNIVERSAL, Some(bytes.len() as u64), 1_024)
++            .expect("kept");
++        // The start, and the end that the probe reads for tags on its first
++        // open, which is why a real partial download has it.
++        let blocks: Vec<&[u8]> = bytes.chunks(1_024).collect();
++        let tail = blocks.len() - 2;
++        for (index, block) in blocks.iter().enumerate() {
++            if index < 4 || index >= tail {
++                assert!(store.write(index as u64, block).expect("written"));
++            }
++        }
++        drop(store);
++        let dead: StreamFetcher = Arc::new(|_url, _offset, _max| Err(DeviceError::Unreachable));
++        let keep = Keep {
++            downloads: &downloads,
++            app: "shelf",
++        };
++        let book = open_stream(UNIVERSAL, Some(&dead), &small_blocks(1_024), Some(keep));
++        assert!(book.is_ok(), "{:?}", book.err());
++        // Nothing downloaded, nothing to play offline.
++        let other = UNIVERSAL.replace("abc", "other");
++        assert_eq!(
++            open_stream(&other, Some(&dead), &small_blocks(1_024), Some(keep)).err(),
++            Some(DeviceError::Unreachable)
++        );
++    }
++
 +    const UNIVERSAL: &str =
 +        "https://pharos.test/Audio/abc/universal?AudioCodec=mp3,aac,flac&api_key=k";
 +
@@ -1541,7 +3291,8 @@ index 9f5ad70..39f0e47 100644
 +    fn an_m4b_from_an_address_with_no_extension_streams_through_the_cache_with_its_chapters() {
 +        let log = Arc::new(Mutex::new(Vec::new()));
 +        let fetcher = server("chapters.m4b", true, &log);
-+        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048)).expect("opens");
++        let mut book =
++            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048), None).expect("opens");
 +        let mut local = Book::open(&fixture("chapters.m4b")).expect("opens");
 +        assert!(!book.description().chapters.is_empty());
 +        assert_eq!(book.description().chapters, local.description().chapters);
@@ -1554,7 +3305,8 @@ index 9f5ad70..39f0e47 100644
 +    fn a_ranged_mp3_plays_the_same_sound_as_the_file() {
 +        let log = Arc::new(Mutex::new(Vec::new()));
 +        let fetcher = server("stereo.mp3", true, &log);
-+        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024)).expect("opens");
++        let mut book =
++            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024), None).expect("opens");
 +        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
 +        assert_eq!(sound_of(&mut book), sound_of(&mut local));
 +    }
@@ -1563,7 +3315,8 @@ index 9f5ad70..39f0e47 100644
 +    fn a_server_that_ignores_ranges_is_read_whole_in_one_request() {
 +        let log = Arc::new(Mutex::new(Vec::new()));
 +        let fetcher = server("stereo.mp3", false, &log);
-+        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024)).expect("opens");
++        let mut book =
++            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024), None).expect("opens");
 +        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
 +        assert_eq!(sound_of(&mut book), sound_of(&mut local));
 +        assert_eq!(*log.lock().expect("log"), vec![0, 0]);
@@ -1588,7 +3341,7 @@ index 9f5ad70..39f0e47 100644
 +            })
 +        });
 +        assert_eq!(
-+            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048)).err(),
++            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048), None).err(),
 +            Some(DeviceError::NotFound)
 +        );
 +    }
@@ -1600,6 +3353,7 @@ index 9f5ad70..39f0e47 100644
 +            Arc::new(|_url, _offset, _max| Err(DeviceError::StreamTooLong));
 +        let audio = Audio::spawn(
 +            Some(fetcher),
++            None,
 +            Sockets::firmware(),
 +            Duration::from_millis(600),
 +        );
@@ -1616,6 +3370,7 @@ index 9f5ad70..39f0e47 100644
 +        let fetcher = server("chapters.m4b", true, &log);
 +        let audio = Audio::spawn(
 +            Some(fetcher),
++            None,
 +            Sockets::firmware(),
 +            Duration::from_millis(600),
 +        );
@@ -1915,11 +3670,158 @@ index e62a52c..c371ea3 100644
      #[test]
      fn a_plain_url_uses_the_default_port_and_root_path() {
          assert_eq!(
+diff --git a/crates/kobo-policy/src/services.rs b/crates/kobo-policy/src/services.rs
+index e2d51fa..7d667d6 100644
+--- a/crates/kobo-policy/src/services.rs
++++ b/crates/kobo-policy/src/services.rs
+@@ -386,6 +386,17 @@ impl DeviceServices {
+             | DeviceRequest::ReadAudioDetail
+             | DeviceRequest::SetAudioSpeed { .. }) => self.handle_audio(&request),
+             DeviceRequest::ListAudio => self.list_audio(),
++            // The simulator plays no streams, so it keeps none.
++            DeviceRequest::ListDownloads { .. } => self.refusal(Capability::BluetoothAudio).map_or(
++                DeviceResult::Downloads {
++                    entries: Vec::new(),
++                },
++                DeviceResult::Denied,
++            ),
++            DeviceRequest::RemoveDownload { .. } => self.refusal(Capability::BluetoothAudio).map_or(
++                DeviceResult::Failed(DeviceError::NotFound),
++                DeviceResult::Denied,
++            ),
+             // Only a real reader has an installation to replace, so nothing
+             // is downloaded or written here. The simulator answers the way a
+             // reader that finished installing would, which is what lets an
+@@ -932,7 +943,12 @@ pub fn request_capability(request: &DeviceRequest) -> Option<Capability> {
+         | DeviceRequest::StopAudio
+         | DeviceRequest::SetAudioVolume { .. }
+         | DeviceRequest::ReadAudioDetail
+-        | DeviceRequest::SetAudioSpeed { .. } => Capability::BluetoothAudio,
++        | DeviceRequest::SetAudioSpeed { .. }
++        // Kept streams are what a book loaded with `LoadAudio` leaves behind,
++        // so the same declaration answers for them, and they stay readable
++        // with the network off.
++        | DeviceRequest::ListDownloads { .. }
++        | DeviceRequest::RemoveDownload { .. } => Capability::BluetoothAudio,
+         DeviceRequest::ListAudio => Capability::Audio,
+         // An update is fetched from the network and applied to the
+         // installation the requester is already running from, so the network
+@@ -1050,6 +1066,41 @@ mod tests {
+         Declared::parse(names.iter().copied()).expect("valid declaration")
+     }
+ 
++    #[test]
++    fn downloads_follow_the_declaration_that_plays_streams() {
++        let url = "https://books.example/Audio/aaa/universal".to_owned();
++        let ask = DeviceRequest::ListDownloads {
++            urls: vec![url.clone()],
++        };
++        let remove = DeviceRequest::RemoveDownload { url };
++        let mut undeclared =
++            DeviceServices::new(declared(&[]), PowerPolicy::DEFAULT, Backends::with([]));
++        assert_eq!(
++            undeclared.handle(ask.clone()),
++            DeviceResult::Denied(DenyReason::NotDeclared)
++        );
++        assert_eq!(
++            undeclared.handle(remove.clone()),
++            DeviceResult::Denied(DenyReason::NotDeclared)
++        );
++        let mut services = DeviceServices::new(
++            declared(&["audio", "bluetooth-audio"]),
++            PowerPolicy::DEFAULT,
++            Backends::with([Capability::BluetoothAudio]),
++        );
++        // The simulator plays no streams, so it keeps none.
++        assert_eq!(
++            services.handle(ask),
++            DeviceResult::Downloads {
++                entries: Vec::new()
++            }
++        );
++        assert_eq!(
++            services.handle(remove),
++            DeviceResult::Failed(kobo_protocol::DeviceError::NotFound)
++        );
++    }
++
+     #[test]
+     fn a_capability_that_was_not_declared_is_refused_first() {
+         let mut services = DeviceServices::new(
 diff --git a/crates/kobo-protocol/src/lib.rs b/crates/kobo-protocol/src/lib.rs
-index cfd97b2..a452da6 100644
+index cfd97b2..cbed291 100644
 --- a/crates/kobo-protocol/src/lib.rs
 +++ b/crates/kobo-protocol/src/lib.rs
-@@ -2305,6 +2305,13 @@ pub enum DeviceError {
+@@ -144,6 +144,18 @@ pub const QUIET_TYPE_VERSION: u8 = 17;
+ /// change that matters to an owner.
+ pub const AUDIOBOOK_VERSION: u8 = 17;
+ 
++/// The protocol whose runtime keeps a stream on the reader and answers for
++/// it: [`DeviceRequest::ListDownloads`] and [`DeviceRequest::RemoveDownload`],
++/// answered with [`DeviceResult::Downloads`].
++///
++/// Playing an [`AudioSource::Stream`] is what starts a download; nothing here
++/// does. On tags of their own, so the version did not move: an older runtime
++/// refuses the frame rather than misreading it.
++pub const DOWNLOADS_VERSION: u8 = 18;
++
++/// How many addresses one [`DeviceRequest::ListDownloads`] may ask about.
++pub const MAX_DOWNLOAD_URLS: usize = 64;
++
+ /// The protocol a grid cell must be encoded at to carry a
+ /// [`kobo_ui::CellTone`], the three marks a word game prints on its tiles.
+ ///
+@@ -1524,6 +1536,17 @@ pub enum DeviceRequest {
+     /// acceptable and the next audio reading says what it kept. Requires
+     /// [`AUDIOBOOK_VERSION`].
+     SetAudioSpeed { percent: u16 },
++    /// Ask how much of each of these streams is kept on the reader. Answered
++    /// with [`DeviceResult::Downloads`], which names only those with some of
++    /// it kept. The query part of an address that names an `api_key` is
++    /// ignored, so a new sign-in finds what the old one downloaded. Requires
++    /// [`DOWNLOADS_VERSION`].
++    ListDownloads { urls: Vec<String> },
++    /// Delete what is kept of a stream. Answered with [`DeviceResult::Done`],
++    /// [`DeviceError::NotFound`] when nothing was kept, or
++    /// [`DenyReason::Busy`] while that stream is the loaded book. Requires
++    /// [`DOWNLOADS_VERSION`].
++    RemoveDownload { url: String },
+     /// Ask which of these runtime-owned credentials are installed.
+     ///
+     /// Presence only, never values. An application that spends several
+@@ -2003,6 +2026,9 @@ pub enum DeviceResult {
+     /// What the prepared audio source says about itself. Requires
+     /// [`AUDIOBOOK_VERSION`].
+     AudioDetail(AudioDetail),
++    /// How much of each asked-about stream is kept on the reader. Requires
++    /// [`DOWNLOADS_VERSION`].
++    Downloads { entries: Vec<DownloadEntry> },
+     /// The subset of a [`DeviceRequest::CheckSecrets`] list that is
+     /// installed on this reader. Names only: a stored value never
+     /// leaves the runtime, and an absent name says so by omission.
+@@ -2061,6 +2087,21 @@ impl LibraryEntry {
+     }
+ }
+ 
++/// How much of one stream is kept on the reader. Complete when `have` is
++/// `total`.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct DownloadEntry {
++    /// The address that was asked about, as it was asked.
++    pub url: String,
++    pub have: u64,
++    pub total: u64,
++}
++
++/// An address a download may be asked about or removed by.
++fn valid_download_url(url: &str) -> bool {
++    url.starts_with("https://") && url.len() <= MAX_URL_LEN && !url.chars().any(char::is_control)
++}
++
+ /// One audiobook the owner has on the reader.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct AudioEntry {
+@@ -2305,6 +2346,13 @@ pub enum DeviceError {
      Backend = 6,
      /// Downloaded bytes did not match the digest they were promised under.
      Integrity = 7,
@@ -1933,7 +3835,7 @@ index cfd97b2..a452da6 100644
  }
  
  impl DeviceError {
-@@ -2326,6 +2333,9 @@ impl DeviceError {
+@@ -2326,6 +2374,9 @@ impl DeviceError {
              Self::InvalidInput => "the data received was not usable",
              Self::Backend => "the reader could not complete the request",
              Self::Integrity => "the download did not match its published digest",
@@ -1943,7 +3845,7 @@ index cfd97b2..a452da6 100644
          }
      }
  }
-@@ -2348,6 +2358,9 @@ impl TryFrom<u8> for DeviceError {
+@@ -2348,6 +2399,9 @@ impl TryFrom<u8> for DeviceError {
              5 => Ok(Self::InvalidInput),
              6 => Ok(Self::Backend),
              7 => Ok(Self::Integrity),
@@ -1953,8 +3855,134 @@ index cfd97b2..a452da6 100644
              _ => Err(ProtocolError::InvalidValue("device error")),
          }
      }
+@@ -3516,6 +3570,31 @@ fn encode_device_request(
+             output.push(56);
+             push_u16(output, *percent);
+         }
++        DeviceRequest::ListDownloads { .. } | DeviceRequest::RemoveDownload { .. }
++            if version < DOWNLOADS_VERSION =>
++        {
++            return Err(ProtocolError::UnsupportedVersion(version));
++        }
++        DeviceRequest::ListDownloads { urls }
++            if urls.len() <= MAX_DOWNLOAD_URLS
++                && urls.iter().all(|url| valid_download_url(url)) =>
++        {
++            output.push(63);
++            push_u16(
++                output,
++                u16::try_from(urls.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
++            );
++            for url in urls {
++                push_string(output, url)?;
++            }
++        }
++        DeviceRequest::RemoveDownload { url } if valid_download_url(url) => {
++            output.push(64);
++            push_string(output, url)?;
++        }
++        DeviceRequest::ListDownloads { .. } | DeviceRequest::RemoveDownload { .. } => {
++            return Err(ProtocolError::InvalidValue("download address"));
++        }
+         DeviceRequest::CheckSecrets { names } if !names.is_empty() && valid_secret_names(names) => {
+             output.push(51);
+             output.push(u8::try_from(names.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+@@ -3973,6 +4052,28 @@ fn decode_device_request(
+             }
+             Ok(DeviceRequest::SetTimeZone { zone })
+         }
++        63 if version >= DOWNLOADS_VERSION => {
++            let count = usize::from(reader.u16()?);
++            if count > MAX_DOWNLOAD_URLS {
++                return Err(ProtocolError::InvalidValue("download address"));
++            }
++            let mut urls = Vec::with_capacity(count);
++            for _ in 0..count {
++                let url = reader.string()?;
++                if !valid_download_url(&url) {
++                    return Err(ProtocolError::InvalidValue("download address"));
++                }
++                urls.push(url);
++            }
++            Ok(DeviceRequest::ListDownloads { urls })
++        }
++        64 if version >= DOWNLOADS_VERSION => {
++            let url = reader.string()?;
++            if !valid_download_url(&url) {
++                return Err(ProtocolError::InvalidValue("download address"));
++            }
++            Ok(DeviceRequest::RemoveDownload { url })
++        }
+         _ => Err(ProtocolError::InvalidValue("device request")),
+     }
+ }
+@@ -4296,6 +4397,29 @@ fn encode_device_result(
+             );
+             output.extend_from_slice(&detail.cover);
+         }
++        DeviceResult::Downloads { .. } if version < DOWNLOADS_VERSION => {
++            return Err(ProtocolError::UnsupportedVersion(version));
++        }
++        DeviceResult::Downloads { entries }
++            if entries.len() <= MAX_DOWNLOAD_URLS
++                && entries
++                    .iter()
++                    .all(|entry| valid_download_url(&entry.url) && entry.have <= entry.total) =>
++        {
++            output.push(26);
++            push_u16(
++                output,
++                u16::try_from(entries.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
++            );
++            for entry in entries {
++                push_string(output, &entry.url)?;
++                push_u64(output, entry.have);
++                push_u64(output, entry.total);
++            }
++        }
++        DeviceResult::Downloads { .. } => {
++            return Err(ProtocolError::InvalidValue("download listing"));
++        }
+         DeviceResult::Secrets { present } if valid_secret_names(present) => {
+             output.push(21);
+             output.push(u8::try_from(present.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+@@ -4565,6 +4689,7 @@ fn decode_device_result(
+                 offset_minutes,
+             })
+         }
++        26 if version >= DOWNLOADS_VERSION => decode_downloads(reader),
+         _ => Err(ProtocolError::InvalidValue("device result")),
+     }
+ }
+@@ -4649,6 +4774,26 @@ fn decode_library_result(reader: &mut Reader<'_>) -> Result<DeviceResult, Protoc
+     Ok(DeviceResult::Library { entries, truncated })
+ }
+ 
++fn decode_downloads(reader: &mut Reader<'_>) -> Result<DeviceResult, ProtocolError> {
++    let count = usize::from(reader.u16()?);
++    if count > MAX_DOWNLOAD_URLS {
++        return Err(ProtocolError::InvalidValue("download listing"));
++    }
++    let mut entries = Vec::with_capacity(count);
++    for _ in 0..count {
++        let entry = DownloadEntry {
++            url: reader.string()?,
++            have: reader.u64()?,
++            total: reader.u64()?,
++        };
++        if !valid_download_url(&entry.url) || entry.have > entry.total {
++            return Err(ProtocolError::InvalidValue("download listing"));
++        }
++        entries.push(entry);
++    }
++    Ok(DeviceResult::Downloads { entries })
++}
++
+ fn decode_audio_library(reader: &mut Reader<'_>) -> Result<DeviceResult, ProtocolError> {
+     let count = usize::from(reader.u16()?);
+     if count > MAX_AUDIO_ENTRIES {
 diff --git a/crates/kobo-protocol/src/tests.rs b/crates/kobo-protocol/src/tests.rs
-index 97eefa2..c9ff04c 100644
+index 97eefa2..8f6c69d 100644
 --- a/crates/kobo-protocol/src/tests.rs
 +++ b/crates/kobo-protocol/src/tests.rs
 @@ -18,6 +18,9 @@ fn a_shared_failure_code_never_blames_a_part_of_the_system_it_cannot_know_about(
@@ -1979,6 +4007,138 @@ index 97eefa2..c9ff04c 100644
          ) {
              assert!(
                  !described.contains("credential")
+@@ -1971,3 +1977,131 @@ fn a_notice_without_a_title_or_with_a_runaway_one_is_refused_at_both_ends() {
+         assert!(encode(&frame).is_err());
+     }
+ }
++
++#[test]
++fn downloads_travel_both_ways_on_tags_of_their_own() {
++    let url = "https://books.example/Audio/aaa/universal?api_key=k".to_owned();
++    for (message, tag) in [
++        (
++            Message::DeviceRequest(DeviceRequest::ListDownloads {
++                urls: vec![
++                    url.clone(),
++                    "https://books.example/Audio/bbb/universal".to_owned(),
++                ],
++            }),
++            63,
++        ),
++        (
++            Message::DeviceRequest(DeviceRequest::ListDownloads { urls: Vec::new() }),
++            63,
++        ),
++        (
++            Message::DeviceRequest(DeviceRequest::RemoveDownload { url: url.clone() }),
++            64,
++        ),
++        (
++            Message::DeviceResult(DeviceResult::Downloads {
++                entries: vec![
++                    DownloadEntry {
++                        url: url.clone(),
++                        have: 5,
++                        total: 10,
++                    },
++                    DownloadEntry {
++                        url: "https://books.example/Audio/bbb/universal".to_owned(),
++                        have: 7,
++                        total: 7,
++                    },
++                ],
++            }),
++            26,
++        ),
++    ] {
++        let frame = Frame {
++            version: DOWNLOADS_VERSION,
++            request_id: 4,
++            message,
++        };
++        let bytes = encode(&frame).expect("encode");
++        assert!(bytes.contains(&tag), "tag {tag} is not on the wire");
++        assert_eq!(decode(&bytes).expect("decode"), frame);
++    }
++}
++
++#[test]
++fn downloads_are_refused_below_their_version_and_when_malformed() {
++    let url = "https://books.example/Audio/aaa/universal".to_owned();
++    let below = DOWNLOADS_VERSION - 1;
++    for message in [
++        Message::DeviceRequest(DeviceRequest::ListDownloads {
++            urls: vec![url.clone()],
++        }),
++        Message::DeviceRequest(DeviceRequest::RemoveDownload { url: url.clone() }),
++        Message::DeviceResult(DeviceResult::Downloads {
++            entries: Vec::new(),
++        }),
++    ] {
++        let frame = Frame {
++            version: below,
++            request_id: 4,
++            message,
++        };
++        assert_eq!(
++            encode(&frame).err(),
++            Some(ProtocolError::UnsupportedVersion(below))
++        );
++        // A frame built at the new version and relabelled as the old one is
++        // refused on reading, not misread as something else.
++        let mut bytes = encode(&Frame {
++            version: DOWNLOADS_VERSION,
++            ..frame
++        })
++        .expect("encode");
++        let at = bytes.iter().position(|byte| *byte == DOWNLOADS_VERSION);
++        if let Some(at) = at {
++            bytes[at] = below;
++            assert!(decode(&bytes).is_err());
++        }
++    }
++    for bad in [
++        "http://books.example/a",
++        "file:///etc/passwd",
++        "https://books.example/a\nb",
++    ] {
++        for message in [
++            Message::DeviceRequest(DeviceRequest::RemoveDownload {
++                url: bad.to_owned(),
++            }),
++            Message::DeviceRequest(DeviceRequest::ListDownloads {
++                urls: vec![bad.to_owned()],
++            }),
++        ] {
++            let frame = Frame {
++                version: DOWNLOADS_VERSION,
++                request_id: 4,
++                message,
++            };
++            assert!(encode(&frame).is_err(), "{bad}");
++        }
++    }
++    let too_many = Frame {
++        version: DOWNLOADS_VERSION,
++        request_id: 4,
++        message: Message::DeviceRequest(DeviceRequest::ListDownloads {
++            urls: vec![url; MAX_DOWNLOAD_URLS + 1],
++        }),
++    };
++    assert!(encode(&too_many).is_err());
++    let impossible = Frame {
++        version: DOWNLOADS_VERSION,
++        request_id: 4,
++        message: Message::DeviceResult(DeviceResult::Downloads {
++            entries: vec![DownloadEntry {
++                url: "https://books.example/a".to_owned(),
++                have: 9,
++                total: 3,
++            }],
++        }),
++    };
++    assert!(encode(&impossible).is_err());
++}
 diff --git a/crates/kobo-sdk/src/audio.rs b/crates/kobo-sdk/src/audio.rs
 index fa08894..d51d2dd 100644
 --- a/crates/kobo-sdk/src/audio.rs
@@ -2012,6 +4172,80 @@ index fa08894..d51d2dd 100644
          DeviceError::NotFound => "The audio source is no longer on this device",
          DeviceError::TimedOut => "The Bluetooth audio service stopped responding",
          DeviceError::Backend => "This audio file could not be decoded",
+diff --git a/crates/kobo-sdk/src/lib.rs b/crates/kobo-sdk/src/lib.rs
+index 7d672a0..325656c 100644
+--- a/crates/kobo-sdk/src/lib.rs
++++ b/crates/kobo-sdk/src/lib.rs
+@@ -25,18 +25,20 @@ mod suspend;
+ pub use kobo_protocol::{
+     is_valid_key, AppInfo, AppLinkState, AudioChapter, AudioDetail, AudioEntry, AudioPlaybackState,
+     AudioSource, BatteryDetail, BluetoothDevice, BluetoothDeviceKind, Credential, DenyReason,
+-    DeviceError, DeviceIdentity, DeviceRequest, DeviceResult, DictionaryEntry, Frame, Header,
+-    LibraryEntry, Lifecycle, LogLevel, Message, RemoteInstallOutcome, SecretHeader, ShellError,
+-    ShellEvent, ShellRequest, StoreError, StoreRequest, StoreResult, StreamError, Task, TaskError,
+-    TaskId, TaskOutcome, UpdateChannel, UpdateMethod, WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS,
+-    MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES,
+-    MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES,
+-    MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK, MAX_STORE_KEYS, MAX_STORE_VALUE,
+-    MAX_TASK_BYTES, MAX_URL_LEN,
++    DeviceError, DeviceIdentity, DeviceRequest, DeviceResult, DictionaryEntry, DownloadEntry,
++    Frame, Header, LibraryEntry, Lifecycle, LogLevel, Message, RemoteInstallOutcome, SecretHeader,
++    ShellError, ShellEvent, ShellRequest, StoreError, StoreRequest, StoreResult, StreamError, Task,
++    TaskError, TaskId, TaskOutcome, UpdateChannel, UpdateMethod, WifiNetwork, CACHE_PREFIX,
++    MAX_CACHE_KEYS, MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME, MAX_HEADER_VALUE,
++    MAX_INLINE_PICTURE_BYTES, MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES,
++    MAX_RADIO_DEVICES, MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK, MAX_STORE_KEYS,
++    MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
+ };
+ /// The runtime's notices, as the launcher shows them.
+ pub use kobo_protocol::{Notice, NoticeList, NoticeTarget, MAX_NOTICES, NOTICES_VERSION};
+ pub use kobo_protocol::{SecretTarget, TextOutcome, TEXT_ENTRY_VERSION};
++/// Streams kept on the reader, and what to ask about them.
++pub use kobo_protocol::{DOWNLOADS_VERSION, MAX_DOWNLOAD_URLS};
+ /// The three marks a word game prints on a tile and on its key.
+ pub use kobo_ui::CellTone;
+ pub use kobo_ui::QuoteRole;
+@@ -2805,6 +2807,40 @@ impl Device<'_> {
+         true
+     }
+ 
++    /// Asks how much of each of these streams is kept on the reader, answered
++    /// with [`DeviceResult::Downloads`], which names only those with some of
++    /// it kept. Playing a stream is what keeps it. An `api_key` in the address
++    /// does not matter, so a new sign-in finds what the old one kept.
++    ///
++    /// Returns `false` without queueing for a list that is too long or holds
++    /// an address that is not HTTPS or is too long.
++    pub fn list_downloads(&mut self, urls: Vec<String>) -> bool {
++        if urls.len() > MAX_DOWNLOAD_URLS
++            || !urls
++                .iter()
++                .all(|url| url.starts_with("https://") && url.len() <= MAX_URL_LEN)
++        {
++            return false;
++        }
++        self.request(DeviceRequest::ListDownloads { urls });
++        true
++    }
++
++    /// Deletes what is kept of a stream. Answered with
++    /// [`DeviceResult::Done`], [`DeviceError::NotFound`] when nothing was
++    /// kept, or [`DenyReason::Busy`] while it is the loaded book.
++    ///
++    /// Returns `false` without queueing for an address that is not HTTPS or is
++    /// too long.
++    pub fn remove_download(&mut self, url: impl Into<String>) -> bool {
++        let url = url.into();
++        if !url.starts_with("https://") || url.len() > MAX_URL_LEN {
++            return false;
++        }
++        self.request(DeviceRequest::RemoveDownload { url });
++        true
++    }
++
+     /// Lists the audiobooks on the reader, answered with
+     /// [`DeviceResult::AudioLibrary`]: every file the runtime can play, and
+     /// every folder of files that reads as one book.
 diff --git a/crates/kobo-sim/src/lib.rs b/crates/kobo-sim/src/lib.rs
 index 9c6cf3c..3704e69 100644
 --- a/crates/kobo-sim/src/lib.rs
@@ -2027,6 +4261,18 @@ index 9c6cf3c..3704e69 100644
              }),
          )
      }))
+diff --git a/crates/kobod/Cargo.toml b/crates/kobod/Cargo.toml
+index 834bba9..7edf1ee 100644
+--- a/crates/kobod/Cargo.toml
++++ b/crates/kobod/Cargo.toml
+@@ -13,6 +13,7 @@ path = "src/main.rs"
+ [dependencies]
+ kobo-abi = { path = "../kobo-abi" }
+ kobo-app-store = { path = "../kobo-app-store" }
++kobo-audio = { path = "../kobo-audio" }
+ kobo-frame-plan = { path = "../kobo-frame-plan" }
+ kobo-hal = { path = "../kobo-hal", default-features = false }
+ kobo-json = { path = "../kobo-json" }
 diff --git a/crates/kobod/src/app_link.rs b/crates/kobod/src/app_link.rs
 index c605485..a65d361 100644
 --- a/crates/kobod/src/app_link.rs
@@ -2074,10 +4320,24 @@ index fb5d866..8c4a7ae 100644
          id: "sidekick",
          title: "Sidekick",
 diff --git a/crates/kobod/src/device.rs b/crates/kobod/src/device.rs
-index 3328b02..4467b36 100644
+index 3328b02..cddc1a8 100644
 --- a/crates/kobod/src/device.rs
 +++ b/crates/kobod/src/device.rs
-@@ -2516,30 +2516,40 @@ fn host_applications(
+@@ -110,6 +110,13 @@ const STATE_ROOT: &str = "/mnt/onboard/.adds/cobalt/state";
+ /// Nothing here can stop the device booting.
+ const DATA_ROOT: &str = "/mnt/onboard/.adds/cobalt/data";
+ 
++/// Where streams an app plays are kept, one directory per app.
++///
++/// Apart from the app's data, whose shelf is capped far below an audiobook
++/// and counts every file under it. The runtime owns these files, so an app
++/// can ask about a download and remove it but never name a path.
++const DOWNLOADS_ROOT: &str = "/mnt/onboard/.adds/cobalt/downloads";
++
+ fn app_data_root(name: &str) -> PathBuf {
+     Path::new(DATA_ROOT).join(name)
+ }
+@@ -2516,32 +2523,46 @@ fn host_applications(
      };
      backends.push(Capability::Library);
      let audio_fetcher: kobo_hal::audio::StreamFetcher = Arc::new(|url, offset, max_bytes| {
@@ -2140,8 +4400,68 @@ index 3328b02..4467b36 100644
 +                }
 +            })
      });
-     let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher));
+-    let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher));
++    let downloads = kobo_audio::Downloads::new(
++        PathBuf::from(DOWNLOADS_ROOT),
++        kobo_audio::DownloadPolicy::default(),
++    );
++    let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher), Some(downloads.clone()));
      if audio.is_some() {
+         backends.push(Capability::Audio);
+         backends.push(Capability::BluetoothAudio);
+@@ -3802,9 +3823,12 @@ fn host_applications(
+                                                         .holds(Capability::Network)
+                                                         && services.may(Capability::Network)
+                                                     {
+-                                                        audio.load(kobo_hal::audio::Source::Stream(
+-                                                            url.clone(),
+-                                                        ))
++                                                        audio.load(
++                                                            kobo_hal::audio::Source::AppStream {
++                                                                app: apps[index].name.clone(),
++                                                                url: url.clone(),
++                                                            },
++                                                        )
+                                                     } else {
+                                                         kobo_protocol::DeviceResult::Denied(
+                                                             kobo_protocol::DenyReason::NotDeclared,
+@@ -3822,6 +3846,36 @@ fn host_applications(
+                                             },
+                                         )
+                                     }
++                                    kobo_protocol::DeviceRequest::ListDownloads { urls } => {
++                                        kobo_protocol::DeviceResult::Downloads {
++                                            entries: downloads
++                                                .progress(&apps[index].name, urls)
++                                                .into_iter()
++                                                .map(|kept| kobo_protocol::DownloadEntry {
++                                                    url: kept.url,
++                                                    have: kept.have,
++                                                    total: kept.total,
++                                                })
++                                                .collect(),
++                                        }
++                                    }
++                                    kobo_protocol::DeviceRequest::RemoveDownload { url } => {
++                                        match downloads.remove(&apps[index].name, url) {
++                                            kobo_audio::RemoveOutcome::Removed => {
++                                                kobo_protocol::DeviceResult::Done
++                                            }
++                                            kobo_audio::RemoveOutcome::Absent => {
++                                                kobo_protocol::DeviceResult::Failed(
++                                                    kobo_protocol::DeviceError::NotFound,
++                                                )
++                                            }
++                                            kobo_audio::RemoveOutcome::InUse => {
++                                                kobo_protocol::DeviceResult::Denied(
++                                                    kobo_protocol::DenyReason::Busy,
++                                                )
++                                            }
++                                        }
++                                    }
+                                     kobo_protocol::DeviceRequest::ReadAudioDetail => {
+                                         audio.as_ref().map_or(
+                                             kobo_protocol::DeviceResult::Denied(
 diff --git a/crates/kobod/src/update.rs b/crates/kobod/src/update.rs
 index f136bcf..bf8710d 100644
 --- a/crates/kobod/src/update.rs
@@ -2199,10 +4519,18 @@ index 64eb841..4b98450 100644
              {
                  self.unplayable = Some(*error);
 diff --git a/examples/settings/src/main.rs b/examples/settings/src/main.rs
-index 2caa63a..d8a4062 100644
+index 2caa63a..22a9390 100644
 --- a/examples/settings/src/main.rs
 +++ b/examples/settings/src/main.rs
-@@ -2493,7 +2493,10 @@ const fn failure_words(error: DeviceError) -> &'static str {
+@@ -2375,6 +2375,7 @@ impl KoboApp for Settings {
+             | DeviceResult::LibraryDocument { .. }
+             | DeviceResult::AudioLibrary { .. }
+             | DeviceResult::AudioDetail(_)
++            | DeviceResult::Downloads { .. }
+             | DeviceResult::Secrets { .. }
+             // Answered above, before anything else looks at it.
+             | DeviceResult::TimeZone { .. }
+@@ -2493,7 +2494,10 @@ const fn failure_words(error: DeviceError) -> &'static str {
          }
          DeviceError::TimedOut => "That took too long. Try again.",
          DeviceError::Unreachable => "That could not be reached. Check Wi-Fi, then try again.",
