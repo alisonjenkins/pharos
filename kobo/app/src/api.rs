@@ -132,12 +132,18 @@ pub fn tracks_url(server: &str, account: &Account, album: &str, start: usize) ->
     )
 }
 
-/// The track as MP3, which every reader's decoder plays. The runtime fetches
-/// streams without credentials, so the token rides in the query (ADR-0136).
+/// Every codec the reader's decoder plays, as pharos's probe names them.
+/// A source in one of these is sent as stored, which pharos serves in byte
+/// ranges; anything else comes back as a live MP3 encode, which has no
+/// ranges and so must fit in one download (B1449).
+pub const DECODES: &str = "mp3,aac,flac,opus,vorbis,pcm_s16le";
+
+/// The track as the reader can decode it. The runtime fetches streams
+/// without credentials, so the token rides in the query (ADR-0136).
 #[must_use]
 pub fn stream_url(server: &str, account: &Account, track: &str) -> String {
     format!(
-        "{server}/Audio/{}/universal?AudioCodec=mp3&Container=mp3&api_key={}",
+        "{server}/Audio/{}/universal?AudioCodec={DECODES}&api_key={}",
         query_escape(track),
         query_escape(&account.token)
     )
@@ -312,12 +318,20 @@ mod tests {
     }
 
     #[test]
-    fn the_stream_asks_for_mp3_and_carries_the_token() {
+    fn the_stream_asks_for_every_codec_the_reader_decodes_and_carries_the_token() {
         let url = stream_url("https://p.test", &account(), "id9");
         assert_eq!(
             url,
-            "https://p.test/Audio/id9/universal?AudioCodec=mp3&Container=mp3&api_key=t0k"
+            "https://p.test/Audio/id9/universal\
+             ?AudioCodec=mp3,aac,flac,opus,vorbis,pcm_s16le&api_key=t0k"
         );
+    }
+
+    #[test]
+    fn an_audiobook_codec_is_taken_as_stored() {
+        // An M4B is AAC: asking for MP3 alone made pharos encode it live,
+        // and a live encode cannot be fetched in ranges (B1449).
+        assert!(DECODES.split(',').any(|codec| codec == "aac"));
     }
 
     #[test]
