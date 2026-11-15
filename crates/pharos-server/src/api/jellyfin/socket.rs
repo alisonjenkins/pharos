@@ -70,7 +70,7 @@ fn device_id_from_query(qs: &str) -> Option<String> {
 
 /// Minimal percent-decode for a query value (deviceIds are usually plain, but
 /// may contain `%XX` escapes). Avoids pulling in a urlencoding crate.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

@@ -354,3 +354,370 @@ fn a_loading_album_still_offers_the_player() {
     assert!(screen.contains("Loading the tracks"), "{screen}");
     assert!(screen.contains("Playing"), "{screen}");
 }
+
+fn device_requests(commands: &[Command]) -> Vec<DeviceRequest> {
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Device(request) => Some(request.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn saved(commands: &[Command], wanted: &str) -> Option<Vec<u8>> {
+    commands.iter().find_map(|command| match command {
+        Command::Store(StoreRequest::Save { key, value }) if key == wanted => Some(value.clone()),
+        _ => None,
+    })
+}
+
+fn forgotten(commands: &[Command], wanted: &str) -> bool {
+    commands.iter().any(
+        |command| matches!(command, Command::Store(StoreRequest::Forget { key }) if key == wanted),
+    )
+}
+
+/// The runner with an album's tracks listed, and what the runtime then said
+/// about their downloads: `first` and `second` as (have, total).
+fn album_with_downloads(
+    first: Option<(u64, u64)>,
+    second: Option<(u64, u64)>,
+) -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, commands) = started(Some(&account()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let commands = runner.task_outcome(tracks, ok(TRACKS));
+    let urls = device_requests(&commands)
+        .into_iter()
+        .find_map(|request| match request {
+            DeviceRequest::ListDownloads { urls } => Some(urls),
+            _ => None,
+        })
+        .expect("the runtime is asked what is downloaded");
+    assert_eq!(urls.len(), 2);
+    assert!(urls[0].contains("/Audio/tr1/universal") && urls[1].contains("/Audio/tr2/universal"));
+    let entries = [first, second]
+        .iter()
+        .zip(&urls)
+        .filter_map(|(kept, url)| {
+            kept.map(|(have, total)| kobo_sdk::DownloadEntry {
+                url: url.clone(),
+                have,
+                total,
+            })
+        })
+        .collect();
+    let commands = runner.device_result(DeviceResult::Downloads { entries });
+    (runner, commands)
+}
+
+#[test]
+fn downloaded_tracks_are_marked_and_the_album_is_saved_for_listing_offline() {
+    let (_, commands) = album_with_downloads(Some((900, 900)), Some((300, 1_000)));
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+    let text = screen_text(&screen);
+    assert!(text.contains("Downloaded"), "{text}");
+    assert!(text.contains("30%"), "{text}");
+    assert!(text.contains("Remove downloads"), "{text}");
+    let value = saved(&commands, OFFLINE_KEY).expect("the album is saved");
+    let text = String::from_utf8(value).expect("text");
+    assert!(
+        text.contains("First Album") && text.contains("Opening"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_album_with_nothing_downloaded_says_nothing_and_is_not_saved() {
+    let (_, commands) = album_with_downloads(None, None);
+    if let Some(screen) = last_screen(&commands) {
+        let text = screen_text(&screen);
+        assert!(
+            !text.contains("Downloaded") && !text.contains("Remove downloads"),
+            "{text}"
+        );
+    }
+    assert!(saved(&commands, OFFLINE_KEY).is_none());
+}
+
+#[test]
+fn removing_downloads_asks_for_each_kept_track_and_then_asks_again() {
+    let (mut runner, _) = album_with_downloads(Some((900, 900)), None);
+    let commands = runner.action(action_id("remove-downloads"));
+    let requests = device_requests(&commands);
+    assert!(matches!(
+        &requests[0],
+        DeviceRequest::RemoveDownload { url } if url.contains("/Audio/tr1/universal")
+    ));
+    assert_eq!(requests.len(), 2, "only the kept track is removed");
+    assert!(matches!(requests[1], DeviceRequest::ListDownloads { .. }));
+    // Nothing is kept once the runtime says so: the album is forgotten.
+    let _ = runner.device_result(DeviceResult::Done);
+    let commands = runner.device_result(DeviceResult::Downloads {
+        entries: Vec::new(),
+    });
+    assert!(forgotten(&commands, OFFLINE_KEY));
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(!text.contains("Remove downloads"), "{text}");
+}
+
+fn offline_library() -> Vec<u8> {
+    let mut offline = Offline::default();
+    offline.keep(
+        &Entry {
+            id: "al1".to_owned(),
+            name: "First Album".to_owned(),
+            by: "Band".to_owned(),
+            runtime_ms: None,
+        },
+        &[Entry {
+            id: "tr1".to_owned(),
+            name: "Opening".to_owned(),
+            by: String::new(),
+            runtime_ms: Some(187_000),
+        }],
+    );
+    offline.encode()
+}
+
+/// Start-up as the runtime delivers it: the saved albums, the unsent places,
+/// then the account.
+fn started_with_saved(
+    library: Option<Vec<u8>>,
+    unsent: Option<Vec<u8>>,
+) -> (AppRunner<Pharos>, Vec<Command>) {
+    let mut runner = AppRunner::new(Pharos::default());
+    let _ = runner.start();
+    for (key, value) in [(OFFLINE_KEY, library), (UNSENT_KEY, unsent)] {
+        let _ = runner.store_result(StoreResult::Loaded {
+            key: key.to_owned(),
+            value,
+        });
+    }
+    let commands = runner.store_result(StoreResult::Loaded {
+        key: ACCOUNT_KEY.to_owned(),
+        value: Some(account().encode()),
+    });
+    (runner, commands)
+}
+
+#[test]
+fn with_the_server_out_of_reach_the_downloaded_albums_are_listed_and_play() {
+    let (mut runner, commands) = started_with_saved(Some(offline_library()), None);
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let commands = runner.task_outcome(albums, TaskOutcome::Failed(TaskError::Offline));
+    let screen = last_screen(&commands).expect("a screen");
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("First Album") && text.contains("Downloaded"),
+        "{text}"
+    );
+    assert!(text.contains("offline"), "{text}");
+    assert!(!text.contains("could not be reached"), "{text}");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+
+    // Opening it needs no server: the tracks were saved with it.
+    let commands = runner.action(action_id("row-0"));
+    assert!(
+        spawns(&commands)
+            .iter()
+            .all(|(_, task)| url_of(task).is_none()),
+        "asked the server: {commands:?}"
+    );
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen_text(&screen).contains("Opening"));
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+    let commands = runner.action(action_id("row-0"));
+    // The player is up and playing from the saved listing; it reads the
+    // audio and Bluetooth state before it loads the stream.
+    assert!(device_requests(&commands).contains(&DeviceRequest::ReadAudio));
+}
+
+#[test]
+fn with_the_server_out_of_reach_and_nothing_downloaded_it_says_so() {
+    let (mut runner, commands) = started_with_saved(None, None);
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let commands = runner.task_outcome(albums, TaskOutcome::Failed(TaskError::Offline));
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("offline"), "{text}");
+}
+
+#[test]
+fn a_place_the_server_did_not_hear_is_kept_and_sent_when_it_answers() {
+    let (mut runner, commands) = playing();
+    let (report, _) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let commands = runner.task_outcome(report, TaskOutcome::Failed(TaskError::Offline));
+    let value = saved(&commands, UNSENT_KEY).expect("the place is kept");
+    assert_eq!(String::from_utf8(value).expect("text"), "tr2\t0\n");
+
+    // A fresh start with the place in the store: the first answer from the
+    // server sends it, and a sent place is forgotten.
+    let (mut runner, commands) = started_with_saved(None, Some(b"tr9\t123456\n".to_vec()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let commands = runner.task_outcome(albums, ok(ALBUMS));
+    let (replay, task) = asked(&commands, "/Sessions/Playing/Stopped").expect("sent");
+    let Task::Post { body, .. } = task else {
+        panic!("a report is a POST");
+    };
+    assert!(
+        body.contains("\"ItemId\":\"tr9\"") && body.contains("1234560000"),
+        "{body}"
+    );
+    let commands = runner.task_outcome(replay, ok(""));
+    assert!(forgotten(&commands, UNSENT_KEY));
+}
+
+#[test]
+fn a_place_that_fails_to_send_stays_kept() {
+    let (mut runner, commands) = started_with_saved(None, Some(b"tr9\t5\n".to_vec()));
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let commands = runner.task_outcome(albums, ok(ALBUMS));
+    let (replay, _) = asked(&commands, "/Sessions/Playing/Stopped").expect("sent");
+    let commands = runner.task_outcome(replay, TaskOutcome::Failed(TaskError::TimedOut));
+    assert!(!forgotten(&commands, UNSENT_KEY));
+}
+
+#[test]
+fn signing_out_forgets_the_saved_albums_and_unsent_places() {
+    let (mut runner, _) = started_with_saved(Some(offline_library()), Some(b"tr9\t5\n".to_vec()));
+    let commands = runner.action(action_id("sign-out"));
+    assert!(forgotten(&commands, OFFLINE_KEY) && forgotten(&commands, UNSENT_KEY));
+}
+
+fn stopped_body(commands: &[Command]) -> Option<(TaskId, String)> {
+    let (id, task) = asked(commands, "/Sessions/Playing/Stopped")?;
+    let Task::Post { body, .. } = task else {
+        return None;
+    };
+    Some((id, body))
+}
+
+#[test]
+fn a_report_queued_by_sign_out_that_fails_later_keeps_nothing_for_the_next_account() {
+    let (mut runner, _) = playing();
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("sign-out"));
+    let (stopped, _) = stopped_body(&commands).expect("the stop is reported");
+    let commands = runner.task_outcome(stopped, TaskOutcome::Failed(TaskError::Offline));
+    assert!(saved(&commands, UNSENT_KEY).is_none());
+    assert!(runner.app_mut().unsent.is_empty());
+}
+
+#[test]
+fn a_report_queued_by_sign_out_that_succeeds_later_starts_no_replay() {
+    let (mut runner, _) = playing();
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("sign-out"));
+    let (stopped, _) = stopped_body(&commands).expect("the stop is reported");
+    runner.app_mut().unsent = Unsent::decode(b"tr9\t5\n");
+    let commands = runner.task_outcome(stopped, ok(""));
+    assert!(
+        asked(&commands, "/Sessions/Playing").is_none(),
+        "the old account's report must not send the new account's places"
+    );
+}
+
+/// Answers the downloads question asked last, after the older requests, which
+/// the runtime answers first.
+fn answer_last_downloads(
+    runner: &mut AppRunner<Pharos>,
+    entries: Vec<kobo_sdk::DownloadEntry>,
+) -> Vec<Command> {
+    while runner.outstanding_requests() > 1 {
+        let _ = runner.device_result(DeviceResult::Done);
+    }
+    runner.device_result(DeviceResult::Downloads { entries })
+}
+
+fn library_of(album: &str, track: &str) -> Vec<u8> {
+    let entry = |id: &str| Entry {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        by: String::new(),
+        runtime_ms: None,
+    };
+    let mut offline = Offline::default();
+    offline.keep(&entry(album), &[entry(track)]);
+    offline.encode()
+}
+
+#[test]
+fn a_saved_album_is_not_forgotten_while_only_the_playing_track_was_asked_about() {
+    let (mut runner, commands) = started_with_saved(Some(library_of("al2", "b1")), None);
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let _ = runner.action(action_id("row-1"));
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-1"));
+    let (tracks, _) = asked(&commands, "ParentId=al2").expect("tracks");
+    let _ = runner.task_outcome(
+        tracks,
+        ok(r#"{"Items":[{"Id":"b1","Name":"b1"}],"TotalRecordCount":1}"#),
+    );
+    // The question was about the playing track alone; b1 was never asked.
+    let commands = answer_last_downloads(&mut runner, Vec::new());
+    assert!(!forgotten(&commands, OFFLINE_KEY));
+    assert!(runner.app_mut().offline.contains("al2"));
+}
+
+#[test]
+fn an_older_report_arriving_does_not_forget_a_newer_kept_place() {
+    let (mut runner, commands) = playing();
+    let (started, _) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-0"));
+    let (stopped, body) = stopped_body(&commands).expect("the first track is stopped");
+    assert!(body.contains("\"ItemId\":\"tr2\""), "{body}");
+    let commands = runner.task_outcome(stopped, TaskOutcome::Failed(TaskError::Offline));
+    assert!(saved(&commands, UNSENT_KEY).is_some());
+    // The earlier report for the same track gets through afterwards.
+    let _ = runner.task_outcome(started, ok(""));
+    assert_eq!(runner.app_mut().unsent.places().len(), 1);
+}
+
+#[test]
+fn an_answer_to_an_older_downloads_question_is_not_applied_to_the_newer_one() {
+    let (mut runner, commands) = started_with_saved(Some(library_of("al2", "b1")), None);
+    let (albums, _) = asked(&commands, "MusicAlbum").expect("albums");
+    let _ = runner.task_outcome(albums, ok(ALBUMS));
+    let commands = runner.action(action_id("row-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(action_id("row-1"));
+    let (tracks, _) = asked(&commands, "ParentId=al2").expect("tracks");
+    let _ = runner.task_outcome(
+        tracks,
+        ok(r#"{"Items":[{"Id":"b1","Name":"b1"}],"TotalRecordCount":1}"#),
+    );
+    // The first album's answer comes first; the second album's tracks were
+    // not in that question.
+    let commands = runner.device_result(DeviceResult::Downloads {
+        entries: Vec::new(),
+    });
+    assert!(!forgotten(&commands, OFFLINE_KEY));
+    assert!(runner.app_mut().offline.contains("al2"));
+}
+
+#[test]
+fn signing_out_cancels_the_downloads_timer_so_the_next_account_polls() {
+    let (mut runner, _) = album_with_downloads(Some((900, 900)), None);
+    let timer = runner.app_mut().downloads_timer.expect("polling");
+    let commands = runner.action(ActionId::BACK);
+    assert!(commands.iter().all(|c| !matches!(c, Command::Cancel(_))));
+    let commands = runner.action(action_id("sign-out"));
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, Command::Cancel(id) if *id == timer)));
+    assert!(runner.app_mut().downloads_timer.is_none());
+}
