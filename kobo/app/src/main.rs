@@ -1,7 +1,8 @@
 //! Pharos on a Kobo (spec 047, ADR-0136).
 //!
-//! Signs in to the owner's pharos with a Quick Connect code, lists the music
-//! albums, and plays a track through the runtime's Bluetooth audio, telling
+//! Signs in to the owner's pharos with a Quick Connect code, shows a home
+//! screen with a section for each kind of library the owner can see, lists
+//! the albums and audiobooks in one, and plays a track through the runtime's Bluetooth audio, telling
 //! pharos where the listener is so any other device can carry on.
 //!
 //! The server address is fixed when the package is built
@@ -9,10 +10,10 @@
 
 mod api;
 
-use api::{Account, Entry, Page, Report};
+use api::{Account, Entry, Kind, Page, Report, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
-use kobo_sdk::{Header, LogLevel, Task, TaskError, TaskId, TaskOutcome};
+use kobo_sdk::{Glyph, Header, LogLevel, Task, TaskError, TaskId, TaskOutcome};
 use std::process::ExitCode;
 
 const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
@@ -27,6 +28,10 @@ const REPORT_SECONDS: u32 = 30;
 const MAX_JSON: u32 = 512 * 1024;
 /// Rows on one page of a list; the side of the panel turns to the next.
 const ROWS_PER_PAGE: usize = 7;
+/// The most rows of a shelf that are fetched. A shelf loads whole, in blocks
+/// of [`api::PAGE`], because pharos cannot filter audiobooks from music on
+/// its side; this stops a huge library from being read forever.
+const MAX_SHELF: usize = 2_000;
 
 #[derive(Debug)]
 enum View {
@@ -36,7 +41,12 @@ enum View {
     SignIn {
         code: Option<String>,
     },
-    Albums,
+    /// The sections: one for each kind of library the owner can see.
+    Home,
+    /// A shelf of albums or audiobooks.
+    Library(Kind),
+    /// Where ebooks will be; reading them is not built yet.
+    Books,
     Album(Entry),
     Player,
     Problem(String),
@@ -53,7 +63,10 @@ enum Work {
         secret: String,
     },
     Finish,
-    Albums {
+    Views,
+    /// One block of a shelf's albums, from `start` rows into the listing.
+    Shelf {
+        kind: Kind,
         start: usize,
     },
     /// One block of an album's tracks, from `start`.
@@ -75,7 +88,17 @@ struct Pharos {
     view: View,
     account: Option<Account>,
     tasks: Vec<(TaskId, Work)>,
-    albums: Page,
+    /// The sections, once pharos has said which libraries there are.
+    sections: Option<Vec<Section>>,
+    /// The kind of album the shelf holds, which is the one last opened.
+    kind: Kind,
+    /// The albums of that kind loaded so far.
+    shelf: Page,
+    /// How many rows of the listing have been asked for, kept or not.
+    shelf_sent: usize,
+    /// Whether the whole listing has been read.
+    shelf_done: bool,
+    shelf_page: usize,
     tracks: Page,
     page: usize,
     /// The album whose tracks are loaded, for Back from the player.
@@ -90,7 +113,12 @@ impl Default for Pharos {
             view: View::Opening,
             account: None,
             tasks: Vec::new(),
-            albums: Page::default(),
+            sections: None,
+            kind: Kind::Music,
+            shelf: Page::default(),
+            shelf_sent: 0,
+            shelf_done: false,
+            shelf_page: 0,
             tracks: Page::default(),
             page: 0,
             album: None,
@@ -162,17 +190,66 @@ impl Pharos {
     fn sign_out(&mut self, context: &mut Context) {
         self.stop_playing(context);
         self.account = None;
-        self.albums = Page::default();
+        self.sections = None;
+        self.clear_shelf();
         context.store().forget(ACCOUNT_KEY);
         self.sign_in(context);
     }
 
-    fn load_albums(&mut self, context: &mut Context, start: usize) {
+    fn load_views(&mut self, context: &mut Context) {
         let Some(account) = &self.account else {
             return;
         };
-        let url = api::albums_url(SERVER, account, start);
-        self.fetch(context, url, Work::Albums { start });
+        let url = api::views_url(SERVER, account);
+        self.view = View::Home;
+        self.sections = None;
+        self.fetch(context, url, Work::Views);
+    }
+
+    fn clear_shelf(&mut self) {
+        self.shelf = Page::default();
+        self.shelf_sent = 0;
+        self.shelf_done = false;
+        self.shelf_page = 0;
+    }
+
+    /// Opens a section: albums load into a shelf, books show their placeholder.
+    fn open_section(&mut self, context: &mut Context, kind: Kind) {
+        let Some(library) = self
+            .sections
+            .iter()
+            .flatten()
+            .find(|section| section.kind == kind)
+            .map(|section| section.library.clone())
+        else {
+            return;
+        };
+        if !kind.is_albums() {
+            self.view = View::Books;
+            return;
+        }
+        self.clear_shelf();
+        self.kind = kind;
+        self.view = View::Library(kind);
+        self.load_shelf(context, &library, 0);
+    }
+
+    fn load_shelf(&mut self, context: &mut Context, library: &str, start: usize) {
+        let Some(account) = &self.account else {
+            return;
+        };
+        let url = api::albums_url(SERVER, account, library, start);
+        let kind = self.kind;
+        self.fetch(context, url, Work::Shelf { kind, start });
+    }
+
+    /// The library the open shelf is listed from.
+    fn shelf_library(&self) -> Option<String> {
+        self.sections
+            .iter()
+            .flatten()
+            .find(|section| section.kind == self.kind)
+            .map(|section| section.library.clone())
     }
 
     fn open_album(&mut self, context: &mut Context, album: Entry) {
@@ -282,22 +359,42 @@ impl Pharos {
                     context.log(LogLevel::Info, "pharos: signed in");
                     context.store().save(ACCOUNT_KEY, account.encode());
                     self.account = Some(account);
-                    self.view = View::Albums;
-                    self.load_albums(context, 0);
+                    self.load_views(context);
                 }
                 None => self.problem("Pharos approved the code but sent no sign-in."),
             },
-            Work::Albums { start } => match api::parse_page(bytes) {
-                Some(page) => {
-                    if start == 0 {
-                        self.albums = page;
-                    } else {
-                        self.albums.entries.extend(page.entries);
-                        self.albums.total = page.total;
-                    }
-                }
-                None => self.problem("Pharos sent a list this app could not read."),
+            Work::Views => match api::parse_views(bytes) {
+                Some(sections) => self.sections = Some(sections),
+                None => self.problem("Pharos sent a list of libraries this app could not read."),
             },
+            Work::Shelf { kind, start } => {
+                // A reply for a shelf the reader has since left is stale.
+                if !matches!(self.view, View::Library(open) if open == kind)
+                    || self.kind != kind
+                    || start != self.shelf_sent
+                {
+                    return;
+                }
+                match api::parse_page(bytes) {
+                    Some(page) => {
+                        self.shelf_sent += page.sent;
+                        self.shelf.total = page.total;
+                        self.shelf
+                            .entries
+                            .extend(page.entries.into_iter().filter(|entry| kind.keeps(entry)));
+                        self.shelf_done = page.sent == 0
+                            || self.shelf_sent >= page.total
+                            || self.shelf_sent >= MAX_SHELF;
+                        if !self.shelf_done {
+                            if let Some(library) = self.shelf_library() {
+                                let next = self.shelf_sent;
+                                self.load_shelf(context, &library, next);
+                            }
+                        }
+                    }
+                    None => self.problem("Pharos sent a list this app could not read."),
+                }
+            }
             Work::Tracks { album, start } => {
                 // A reply for an album the reader has since left is stale.
                 if self.album.as_ref().is_none_or(|open| open.id != album)
@@ -353,6 +450,9 @@ impl Pharos {
             }
             // A lost report only costs the server a moment of the listener's place.
             (Work::Report(_) | Work::ReportTimer, _) => {}
+            // The shelf keeps what loaded, and the rest is read when it is
+            // opened again.
+            (Work::Shelf { start, .. }, _) if start > 0 => self.shelf_done = true,
             // A later block of tracks fails in the background, maybe while the
             // listener is in the player: keep what loaded, and opening the
             // album again fetches the rest.
@@ -410,20 +510,36 @@ impl Pharos {
                      and enter this code.",
                 )
                 .build(),
-            View::Albums if self.albums.entries.is_empty() => self
-                .now_playing(ScreenBuilder::new("pharos-albums").top_bar("Music"))
-                .activity("Loading your albums", None)
-                .button("sign-out", "Sign out")
-                .build(),
-            View::Albums => self
-                .now_playing(
-                    ScreenBuilder::new("pharos-albums")
-                        .top_bar(format!("Music · {} albums", self.albums.total)),
+            View::Home => self.home_screen(),
+            View::Books => ScreenBuilder::new("pharos-books")
+                .top_bar("Books")
+                .text(
+                    "Reading books on this reader is coming. For now, read them in \
+                     Pharos on a phone or computer.",
                 )
-                .rows(Self::rows(&self.albums, self.page, false))
+                .build()
+                .with_own_back(true),
+            View::Library(kind) if self.shelf.entries.is_empty() => {
+                let screen =
+                    self.now_playing(ScreenBuilder::new("pharos-library").top_bar(kind.label()));
+                let screen = if self.shelf_done {
+                    screen.text(format!("No {} here yet.", kind.noun()))
+                } else {
+                    screen.activity(format!("Loading your {}", kind.noun()), None)
+                };
+                screen.build().with_own_back(true)
+            }
+            View::Library(kind) => self
+                .now_playing(ScreenBuilder::new("pharos-library").top_bar(format!(
+                    "{} · {} {}",
+                    kind.label(),
+                    self.shelf.entries.len(),
+                    kind.noun()
+                )))
+                .rows(Self::rows(&self.shelf, self.shelf_page, false))
                 .page_turns("page-back", "page-next")
-                .bottom_action("sign-out", "Sign out")
-                .build(),
+                .build()
+                .with_own_back(true),
             View::Album(album) if self.tracks.entries.is_empty() => self
                 .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
                 .activity("Loading the tracks", None)
@@ -449,6 +565,30 @@ impl Pharos {
         }
     }
 
+    /// One tile for each kind of library the owner can see.
+    fn home_screen(&self) -> Screen {
+        let screen = self.now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"));
+        let screen = match &self.sections {
+            None => screen.activity("Loading your libraries", None),
+            Some(sections) if sections.is_empty() => {
+                screen.text("Pharos shows no music, audiobooks or books for this account.")
+            }
+            Some(sections) => screen.tiles(sections.iter().map(|section| {
+                let glyph = match section.kind {
+                    Kind::Music => Glyph::Music,
+                    Kind::Audiobooks => Glyph::Headphones,
+                    Kind::Books => Glyph::Books,
+                };
+                (
+                    format!("section-{}", section.kind.label().to_lowercase()),
+                    section.kind.label(),
+                    glyph,
+                )
+            })),
+        };
+        screen.bottom_action("sign-out", "Sign out").build()
+    }
+
     /// Adds the way back to the player while something plays: Back from the
     /// player keeps the track going, and choosing it again would restart it.
     fn now_playing(&self, screen: ScreenBuilder) -> ScreenBuilder {
@@ -468,29 +608,17 @@ impl Pharos {
         (0..visible).find(|index| action == action_id(&format!("row-{index}")))
     }
 
-    fn turn(&mut self, context: &mut Context, forward: bool) {
-        let page = match &self.view {
-            View::Albums => &self.albums,
-            View::Album(_) => &self.tracks,
+    fn turn(&mut self, forward: bool) {
+        let (page, current) = match &self.view {
+            View::Library(_) => (&self.shelf, &mut self.shelf_page),
+            View::Album(_) => (&self.tracks, &mut self.page),
             _ => return,
         };
         let pages = page.entries.len().div_ceil(ROWS_PER_PAGE).max(1);
-        if forward && self.page + 1 < pages {
-            self.page += 1;
-        } else if !forward && self.page > 0 {
-            self.page -= 1;
-        }
-        // Fetch the next block of albums before the reader reaches its end.
-        let loaded = self.albums.entries.len();
-        if matches!(self.view, View::Albums)
-            && loaded < self.albums.total
-            && (self.page + 2) * ROWS_PER_PAGE >= loaded
-            && !self
-                .tasks
-                .iter()
-                .any(|(_, work)| matches!(work, Work::Albums { .. }))
-        {
-            self.load_albums(context, loaded);
+        if forward && *current + 1 < pages {
+            *current += 1;
+        } else if !forward && *current > 0 {
+            *current -= 1;
         }
     }
 }
@@ -501,7 +629,8 @@ fn work_label(work: &Work) -> &'static str {
         Work::Wait { .. } => "wait",
         Work::Poll { .. } => "poll",
         Work::Finish => "finish",
-        Work::Albums { .. } => "albums",
+        Work::Views => "views",
+        Work::Shelf { .. } => "shelf",
         Work::Tracks { .. } => "tracks",
         Work::Report(report) => report.label(),
         Work::ReportTimer => "report-timer",
@@ -522,8 +651,7 @@ impl KoboApp for Pharos {
             match value.as_deref().and_then(Account::decode) {
                 Some(account) => {
                     self.account = Some(account);
-                    self.view = View::Albums;
-                    self.load_albums(context, 0);
+                    self.load_views(context);
                 }
                 None => self.sign_in(context),
             }
@@ -535,7 +663,10 @@ impl KoboApp for Pharos {
         if matches!(self.view, View::Player) {
             if action == ActionId::BACK {
                 // Backing out keeps the track playing, as the player says.
-                self.view = self.album.clone().map_or(View::Albums, View::Album);
+                self.view = self
+                    .album
+                    .clone()
+                    .map_or(View::Library(self.kind), View::Album);
                 self.show(context);
                 return;
             }
@@ -551,17 +682,18 @@ impl KoboApp for Pharos {
             }
         }
         if action == ActionId::BACK {
-            if let View::Album(_) = self.view {
-                self.view = View::Albums;
-                self.album = None;
-                self.page = 0;
+            match self.view {
+                View::Album(_) => {
+                    self.view = View::Library(self.kind);
+                    self.album = None;
+                    self.page = 0;
+                }
+                View::Library(_) | View::Books => self.view = View::Home,
+                _ => {}
             }
         } else if action == action_id("retry") {
             match self.account {
-                Some(_) => {
-                    self.view = View::Albums;
-                    self.load_albums(context, 0);
-                }
+                Some(_) => self.load_views(context),
                 None => self.sign_in(context),
             }
         } else if action == action_id("now-playing") && self.playing.is_some() {
@@ -569,19 +701,27 @@ impl KoboApp for Pharos {
         } else if action == action_id("sign-out") {
             self.sign_out(context);
         } else if action == action_id("page-next") {
-            self.turn(context, true);
+            self.turn(true);
         } else if action == action_id("page-back") {
-            self.turn(context, false);
+            self.turn(false);
         } else {
             let visible = match &self.view {
-                View::Albums => self.albums.entries.len(),
+                View::Library(_) => self.shelf.entries.len(),
                 View::Album(_) => self.tracks.entries.len(),
                 _ => 0,
             };
+            if matches!(self.view, View::Home) {
+                let kinds = [Kind::Music, Kind::Audiobooks, Kind::Books];
+                if let Some(kind) = kinds.into_iter().find(|kind| {
+                    action == action_id(&format!("section-{}", kind.label().to_lowercase()))
+                }) {
+                    self.open_section(context, kind);
+                }
+            }
             if let Some(index) = Self::row_index(action, visible) {
                 match &self.view {
-                    View::Albums => {
-                        if let Some(album) = self.albums.entries.get(index).cloned() {
+                    View::Library(_) => {
+                        if let Some(album) = self.shelf.entries.get(index).cloned() {
                             self.open_album(context, album);
                         }
                     }
