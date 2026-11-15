@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..847181e
+index 0000000..1da0b90
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1201 @@
+@@ -0,0 +1,1205 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -2191,10 +2191,14 @@ index 0000000..847181e
 +        total: u64,
 +    ) -> Option<()> {
 +        let free = (self.policy.free_space)(dir);
-+        if free.is_some_and(|free| free < self.policy.min_free_bytes) {
++        // The file is allocated in full when it is created (FAT has no sparse
++        // files), so the floor must hold after that, not just before. A
++        // resume has its file already and never comes here.
++        let needed = self.policy.min_free_bytes.saturating_add(total);
++        if free.is_some_and(|free| free < needed) {
 +            bump(&self.counters.skipped_low_space, 1);
 +            self.say(&format!(
-+                "downloads: skip key={key} bytes={total} reason=low space free={free:?} floor={}",
++                "downloads: skip key={key} bytes={total} reason=low space free={free:?} floor={} need={needed}",
 +                self.policy.min_free_bytes
 +            ));
 +            return None;
@@ -2517,10 +2521,10 @@ index 0000000..847181e
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..e93be83
+index 0000000..df0b1b0
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,720 @@
+@@ -0,0 +1,741 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -2813,7 +2817,10 @@ index 0000000..e93be83
 +    assert!(said(&lines, "reason=low space"));
 +    assert_eq!(downloads.stats().started, 0);
 +
-+    card.free.store(floor, Ordering::SeqCst);
++    // Room for the file itself above the floor: it is allocated in full.
++    card.free.store(floor + 4_999, Ordering::SeqCst);
++    assert!(downloads.begin("shelf", URL, Some(5_000), BLOCK).is_none());
++    card.free.store(floor + 5_000, Ordering::SeqCst);
 +    let store = downloads.begin("shelf", URL, Some(5_000), BLOCK).unwrap();
 +    let bytes = pattern(5_000);
 +    assert!(store.write(0, &bytes[..1_024]).unwrap());
@@ -2824,7 +2831,7 @@ index 0000000..e93be83
 +    );
 +    assert!(!store.has(1));
 +    assert!(!store.has_room());
-+    assert_eq!(downloads.stats().skipped_low_space, 2);
++    assert_eq!(downloads.stats().skipped_low_space, 3);
 +    assert!(said(&lines, "downloads: pause"));
 +    card.free.store(floor, Ordering::SeqCst);
 +    assert!(store.write(1, &bytes[1_024..2_048]).unwrap());
@@ -3240,6 +3247,24 @@ index 0000000..e93be83
 +    assert_eq!(reopened.total(), 3_000);
 +    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +    assert_eq!(datas(&dir).len(), 1, "the new generation was not swept");
++}
++
++#[test]
++fn a_resume_of_an_already_allocated_file_is_not_asked_for_its_length_again() {
++    let dir = scratch("resume-allocated");
++    let floor = 1_000;
++    let (card, policy) = Card::policy(u64::MAX, floor);
++    let (downloads, _lines) = downloads(&dir, policy);
++    card.free.store(floor + 3_000, Ordering::SeqCst);
++    let store = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(store.write(0, &block(0, 3_000)).unwrap());
++    store.flush().unwrap();
++    drop(store);
++    // The file now holds its 3 000 bytes, so the volume is at the floor.
++    card.free.store(floor, Ordering::SeqCst);
++    let resumed = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(resumed.has(0));
++    assert!(resumed.has_room());
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
