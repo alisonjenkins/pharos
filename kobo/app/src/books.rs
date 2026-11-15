@@ -94,6 +94,8 @@ pub struct Book {
     /// Pharos's tag for the cover, present only when there is a cover to
     /// fetch.
     pub image_tag: Option<String>,
+    /// The description, as plain text; empty when Pharos sent none.
+    pub overview: String,
 }
 
 impl Book {
@@ -117,12 +119,12 @@ pub struct BookPage {
 }
 
 /// Books in every library the user can see, by name. `People` carries the
-/// author and `Path` the file's extension.
+/// author, `Path` the file's extension and `Overview` the description.
 #[must_use]
 pub fn list_url(server: &str, account: &Account, start: usize) -> String {
     format!(
         "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true\
-         &SortBy=SortName&SortOrder=Ascending&Fields=Path,People\
+         &SortBy=SortName&SortOrder=Ascending&Fields=Path,People,Overview\
          &StartIndex={start}&Limit={PAGE}",
         query_escape(&account.user_id)
     )
@@ -185,6 +187,12 @@ pub fn parse_page(bytes: &[u8]) -> Option<BookPage> {
                     .and_then(Value::as_str)
                     .filter(|tag| !tag.is_empty())
                     .map(str::to_owned),
+                overview: item
+                    .get("Overview")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
             })
         })
         .collect();
@@ -358,6 +366,7 @@ mod tests {
             author: "Author A".to_owned(),
             support: support(path),
             image_tag: None,
+            overview: String::new(),
         }
     }
 
@@ -376,7 +385,7 @@ mod tests {
         assert!(url.starts_with("https://p.test/Users/u1/Items?"));
         assert!(url.contains("IncludeItemTypes=Book"));
         assert!(url.contains("SortBy=SortName&SortOrder=Ascending"));
-        assert!(url.contains("Fields=Path,People"));
+        assert!(url.contains("Fields=Path,People,Overview"));
         assert!(url.contains("StartIndex=50&Limit=50"));
     }
 
@@ -459,6 +468,17 @@ mod tests {
         assert_eq!(page.books[0].image_tag.as_deref(), Some("c0"));
         assert_eq!(page.books[1].image_tag, None, "an empty tag is no cover");
         assert_eq!(parse_page(b"not json"), None);
+    }
+
+    #[test]
+    fn a_page_reads_each_book_s_description() {
+        let bytes = br#"{"Items":[
+            {"Id":"a","Name":"Book One","Path":"/b/one.epub","Overview":"  A tale.\n"},
+            {"Id":"b","Name":"Book Two","Path":"/b/two.epub"}
+        ],"TotalRecordCount":2}"#;
+        let page = parse_page(bytes).unwrap_or_default();
+        assert_eq!(page.books[0].overview, "A tale.");
+        assert_eq!(page.books[1].overview, "", "no description is empty");
     }
 
     #[test]
