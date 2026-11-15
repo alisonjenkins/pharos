@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..1628b18
+index 0000000..4fc4be8
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1192 @@
+@@ -0,0 +1,1212 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1771,8 +1771,7 @@ index 0000000..1628b18
 +        let staging = sidecar.with_extension("tmp");
 +        Self::write_synced(&staging, &meta.encode())?;
 +        fs::rename(&staging, sidecar)?;
-+        Self::sync_dir(sidecar);
-+        Ok(())
++        Self::sync_dir(sidecar)
 +    }
 +
 +    /// Writes `text` to `path` and has it on disk before returning, so a
@@ -1784,11 +1783,18 @@ index 0000000..1628b18
 +    }
 +
 +    /// Has the rename that just put `published` in its folder reach the disk.
-+    /// Best effort: a volume that cannot sync a folder is no worse off than
-+    /// before.
-+    fn sync_dir(published: &Path) {
-+        if let Some(dir) = published.parent() {
-+            let _ignored = File::open(dir).and_then(|dir| dir.sync_all());
++    ///
++    /// Linux FAT syncs a folder like any file, so a failure is real and is
++    /// returned. Only `EINVAL`, which a filesystem that cannot sync a folder
++    /// answers, is taken as there being nothing to do.
++    fn sync_dir(published: &Path) -> io::Result<()> {
++        const EINVAL: i32 = 22;
++        let Some(dir) = published.parent() else {
++            return Ok(());
++        };
++        match File::open(dir).and_then(|dir| dir.sync_all()) {
++            Err(error) if error.raw_os_error() == Some(EINVAL) => Ok(()),
++            result => result,
 +        }
 +    }
 +
@@ -2104,6 +2110,7 @@ index 0000000..1628b18
 +        meta.generation = Self::new_generation();
 +        let data = Self::data_of(sidecar, meta.generation);
 +        let staged = sidecar.with_extension("tmp");
++        let old = fs::read(sidecar).ok();
 +        let prepared = OpenOptions::new()
 +            .create_new(true)
 +            .read(true)
@@ -2114,11 +2121,24 @@ index 0000000..1628b18
 +            .and_then(|file| Self::write_synced(&staged, &meta.encode()).map(|()| file))
 +            .and_then(|file| self.step("rename-sidecar").map(|()| file))
 +            .and_then(|file| fs::rename(&staged, sidecar).map(|()| file));
-+        match prepared {
-+            Ok(file) => {
-+                Self::sync_dir(sidecar);
-+                Ok((file, data))
-+            }
++        let committed = prepared.and_then(|file| {
++            // The commit must reach the disk to count. If it cannot be made
++            // to, the old sidecar goes back and the old download serves.
++            self.step("sync-dir")
++                .and_then(|()| Self::sync_dir(sidecar))
++                .map(|()| file)
++                .inspect_err(|_| match &old {
++                    Some(bytes) => {
++                        let _ignored =
++                            fs::write(&staged, bytes).and_then(|()| fs::rename(&staged, sidecar));
++                    }
++                    None => {
++                        let _ignored = fs::remove_file(sidecar);
++                    }
++                })
++        });
++        match committed {
++            Ok(file) => Ok((file, data)),
 +            Err(error) => {
 +                let _ignored = fs::remove_file(&data);
 +                let _ignored = fs::remove_file(&staged);
@@ -2508,10 +2528,10 @@ index 0000000..1628b18
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..4ddf66e
+index 0000000..eb57dc0
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,697 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3185,6 +3205,29 @@ index 0000000..4ddf66e
 +        .begin("shelf", OTHER, Some(3_000), BLOCK)
 +        .is_some());
 +    assert!(!sidecar_of(&dir).exists(), "the junk sidecar stayed");
++}
++
++#[test]
++fn a_folder_sync_that_fails_fails_the_replacement_and_the_old_download_still_serves() {
++    let dir = scratch("sync-dir-fails");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (plain, _lines) = downloads(&dir, policy);
++    let old = plain.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    old.flush().unwrap();
++    drop(old);
++    let failing = plain.clone().with_fault(|step| {
++        if step == "sync-dir" {
++            Err(std::io::Error::other("injected"))
++        } else {
++            Ok(())
++        }
++    });
++    assert!(failing.begin("shelf", URL, Some(4_000), BLOCK).is_none());
++    assert_eq!(datas(&dir).len(), 1, "the failed replacement left a file");
++    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("kept");
++    assert_eq!(reopened.total(), 3_000);
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
