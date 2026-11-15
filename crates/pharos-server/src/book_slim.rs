@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -484,7 +485,7 @@ pub async fn get_or_slim(
         );
         return original;
     }
-    let tmp = slim.with_extension(format!("epub.tmp{}", std::process::id()));
+    let tmp = tmp_path_for(&slim);
     let (src_owned, tmp_owned) = (original.clone(), tmp.clone());
     let packed = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -539,9 +540,25 @@ pub async fn get_or_slim(
     slim
 }
 
+/// A scratch path beside `slim` that no other re-pack uses. Two requests for
+/// the same book and box can both miss the cache and re-pack at once (there
+/// are [`SLIM_SLOTS`] slots); a shared name would let one truncate the
+/// other's half-written file and rename a broken EPUB into the cache.
+fn tmp_path_for(slim: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    slim.with_extension(format!("epub.tmp{}-{n}", std::process::id()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn two_repacks_of_one_book_never_share_a_scratch_file() {
+        let slim = std::path::Path::new("/c/slim/book-1-2-3x4.epub");
+        assert_ne!(super::tmp_path_for(slim), super::tmp_path_for(slim));
+    }
+
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::HashSet;
