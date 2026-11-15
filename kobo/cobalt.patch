@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..1da0b90
+index 0000000..0843c34
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1205 @@
+@@ -0,0 +1,1217 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1788,10 +1788,11 @@ index 0000000..1da0b90
 +    /// returned. Only `EINVAL`, which a filesystem that cannot sync a folder
 +    /// answers, is taken as there being nothing to do.
 +    fn sync_dir(published: &Path) -> io::Result<()> {
++        published.parent().map_or(Ok(()), Self::sync_folder)
++    }
++
++    fn sync_folder(dir: &Path) -> io::Result<()> {
 +        const EINVAL: i32 = 22;
-+        let Some(dir) = published.parent() else {
-+            return Ok(());
-+        };
 +        match File::open(dir).and_then(|dir| dir.sync_all()) {
 +            Err(error) if error.raw_os_error() == Some(EINVAL) => Ok(()),
 +            result => result,
@@ -1843,10 +1844,21 @@ index 0000000..1da0b90
 +    /// replacement left behind, or one that stopped before its sidecar
 +    /// landed, and staged sidecars. A data file a store has open stays; it is
 +    /// swept on a later pass.
++    ///
++    /// The folder is synced first and nothing is deleted if that fails: only
++    /// once it has succeeded is every rename before it durable, so a file no
++    /// sidecar names is one no sidecar the disk may yet keep names either.
 +    fn sweep(&self, open: &OpenMap, dir: &Path) {
 +        let Ok(listing) = fs::read_dir(dir) else {
 +            return;
 +        };
++        if let Err(error) = self.step("sync-dir").and_then(|()| Self::sync_folder(dir)) {
++            self.say(&format!(
++                "downloads: sweep skipped dir={} reason=cannot sync: {error}",
++                dir.display()
++            ));
++            return;
++        }
 +        let files: Vec<PathBuf> = listing.flatten().map(|file| file.path()).collect();
 +        let ext = |path: &Path| {
 +            path.extension()
@@ -2521,10 +2533,10 @@ index 0000000..1da0b90
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..df0b1b0
+index 0000000..f81a066
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,756 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3206,7 +3218,7 @@ index 0000000..df0b1b0
 +/// An old download of 3 000 bytes with block 0, and a replacement of 4 000
 +/// bytes whose folder sync fails. Returns the folder, the plain `Downloads`
 +/// and the old sidecar's text from before the replacement.
-+fn replacement_whose_folder_sync_fails(name: &str) -> (PathBuf, Downloads, Vec<u8>) {
++fn replacement_whose_folder_sync_fails(name: &str) -> (PathBuf, Downloads, Downloads, Vec<u8>) {
 +    let dir = scratch(name);
 +    let (_card, policy) = Card::policy(u64::MAX, 0);
 +    let (plain, _lines) = downloads(&dir, policy);
@@ -3223,12 +3235,12 @@ index 0000000..df0b1b0
 +        }
 +    });
 +    assert!(failing.begin("shelf", URL, Some(4_000), BLOCK).is_none());
-+    (dir, plain, before)
++    (dir, plain, failing, before)
 +}
 +
 +#[test]
 +fn a_folder_sync_that_fails_reports_it_and_deletes_nothing() {
-+    let (dir, plain, _before) = replacement_whose_folder_sync_fails("sync-dir-fails");
++    let (dir, plain, _failing, _before) = replacement_whose_folder_sync_fails("sync-dir-fails");
 +    assert_eq!(datas(&dir).len(), 2, "a generation was deleted");
 +    // The sidecar on disk names the new generation, and that serves.
 +    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("new pair");
@@ -3239,7 +3251,7 @@ index 0000000..df0b1b0
 +
 +#[test]
 +fn a_replacement_whose_rename_never_reached_the_disk_leaves_the_old_pair_serving() {
-+    let (dir, plain, before) = replacement_whose_folder_sync_fails("sync-dir-lost");
++    let (dir, plain, _failing, before) = replacement_whose_folder_sync_fails("sync-dir-lost");
 +    assert_eq!(datas(&dir).len(), 2);
 +    // As after a power cut: the disk kept the old sidecar.
 +    std::fs::write(sidecar_of(&dir), before).unwrap();
@@ -3265,6 +3277,21 @@ index 0000000..df0b1b0
 +    let resumed = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
 +    assert!(resumed.has(0));
 +    assert!(resumed.has_room());
++}
++
++#[test]
++fn nothing_is_swept_while_the_folder_cannot_be_synced() {
++    let (dir, plain, failing, before) = replacement_whose_folder_sync_fails("sweep-unsynced");
++    // The old store is closed, so the old generation could be swept; the
++    // commit rename is not known to be durable, so it must not be.
++    let opened = failing.begin("shelf", URL, None, BLOCK).expect("new pair");
++    drop(opened);
++    assert_eq!(datas(&dir).len(), 2, "swept before the rename was durable");
++    // The disk kept the old sidecar, as after a power cut.
++    std::fs::write(sidecar_of(&dir), before).unwrap();
++    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("old pair");
++    assert_eq!(reopened.total(), 3_000);
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
