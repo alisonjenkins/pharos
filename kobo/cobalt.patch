@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..0843c34
+index 0000000..37a26a0
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1217 @@
+@@ -0,0 +1,1239 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -2403,6 +2403,15 @@ index 0000000..0843c34
 +        if !self.room_to_write() {
 +            return Ok(false);
 +        }
++        // A full run of blocks with no sidecar saved: try to save it before
++        // writing more, and write nothing while it cannot be, so a power cut
++        // never costs more than the run.
++        if self.inner().unflushed >= FLUSH_EVERY_BLOCKS {
++            if let Err(error) = self.flush() {
++                self.note_save_failure(&error);
++                return Ok(false);
++            }
++        }
 +        self.file.write_all_at(bytes, at)?;
 +        let counters = &self.downloads.counters;
 +        bump(&counters.blocks_written, 1);
@@ -2415,7 +2424,11 @@ index 0000000..0843c34
 +            self.finish()?;
 +        } else if inner.unflushed >= FLUSH_EVERY_BLOCKS {
 +            drop(inner);
-+            self.flush()?;
++            // The block is on disk and counted; a failed save is retried
++            // before the next one is written.
++            if let Err(error) = self.flush() {
++                self.note_save_failure(&error);
++            }
 +        }
 +        Ok(true)
 +    }
@@ -2462,8 +2475,16 @@ index 0000000..0843c34
 +        // would be saved as there with its data possibly not on disk.
 +        let mut inner = self.inner();
 +        self.file.sync_data()?;
++        self.save(&inner)?;
 +        inner.unflushed = 0;
-+        self.save(&inner)
++        Ok(())
++    }
++
++    fn note_save_failure(&self, error: &io::Error) {
++        self.downloads.say(&format!(
++            "downloads: save failed key={} reason={error}; blocks are not kept until it saves",
++            self.key
++        ));
 +    }
 +
 +    /// Writes the sidecar, unless a replacement has put another generation
@@ -2471,6 +2492,7 @@ index 0000000..0843c34
 +    /// replacement's commit cannot land between the check and the write.
 +    fn save(&self, inner: &Inner) -> io::Result<()> {
 +        let _open = lock(&self.downloads.open);
++        self.downloads.step("save-sidecar")?;
 +        Downloads::write_meta(&self.sidecar, &inner.meta)
 +    }
 +
@@ -2533,10 +2555,10 @@ index 0000000..0843c34
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..f81a066
+index 0000000..ad72e16
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,794 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3292,6 +3314,44 @@ index 0000000..f81a066
 +    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("old pair");
 +    assert_eq!(reopened.total(), 3_000);
 +    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
++}
++
++#[test]
++fn blocks_stop_going_to_disk_when_the_sidecar_cannot_be_saved_and_resume_when_it_can() {
++    use std::sync::atomic::AtomicBool;
++    let dir = scratch("save-fails");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (plain, lines) = downloads(&dir, policy);
++    let failing = Arc::new(AtomicBool::new(true));
++    let switch = Arc::clone(&failing);
++    let downloads = plain.with_fault(move |step| {
++        if step == "save-sidecar" && switch.load(Ordering::SeqCst) {
++            Err(std::io::Error::other("injected"))
++        } else {
++            Ok(())
++        }
++    });
++    let total = 40 * u64::from(BLOCK);
++    let store = downloads.begin("shelf", URL, Some(total), BLOCK).unwrap();
++    // Opening saved the sidecar before the fault was reached by any flush.
++    let bytes = pattern(usize::try_from(total).unwrap());
++    let chunk = |index: usize| &bytes[index * BLOCK as usize..(index + 1) * BLOCK as usize];
++    let mut kept = 0;
++    for index in 0..30_u64 {
++        if store
++            .write(index, chunk(usize::try_from(index).unwrap()))
++            .unwrap()
++        {
++            kept += 1;
++        }
++    }
++    assert_eq!(kept, 16, "blocks went to disk with no sidecar saved");
++    assert!(!store.has(16));
++    assert!(said(&lines, "downloads: save failed"));
++    failing.store(false, Ordering::SeqCst);
++    assert!(store.write(16, chunk(16)).unwrap());
++    assert!(store.has(16));
++    assert!(store.write(17, chunk(17)).unwrap());
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
