@@ -329,6 +329,20 @@ impl RemuxTarget {
     }
 }
 
+/// First entry of the client's `AudioCodec` list (in its order) that
+/// `audio_remux` can emit, else AAC.
+fn remux_target(acceptable: &[String]) -> RemuxTarget {
+    acceptable
+        .iter()
+        .find_map(|c| match c.to_ascii_lowercase().as_str() {
+            "aac" => Some(RemuxTarget::Aac),
+            "mp3" => Some(RemuxTarget::Mp3),
+            "opus" => Some(RemuxTarget::Opus),
+            _ => None,
+        })
+        .unwrap_or(RemuxTarget::Aac)
+}
+
 /// Records the `/Audio/{id}/universal` routing decision: one log line and
 /// one `pharos_audio_universal_total{route,target}` increment (`target` is
 /// `none` on the direct route).
@@ -402,7 +416,7 @@ async fn audio_universal(
 
     // Remux. AAC is the lowest-common-denominator and always present
     // in modern ffmpeg.
-    let target = RemuxTarget::Aac;
+    let target = remux_target(&acceptable);
     let reason = if needs_downmix {
         "downmix"
     } else {
@@ -1768,6 +1782,35 @@ mod tests {
         // Garbage / start past EOF.
         assert!(capped_window("bytes=abc", total, cap).is_none());
         assert!(capped_window("bytes=2000000000-", total, cap).is_none());
+    }
+
+    fn codecs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// B1448 / V1422 — the remux target is what the client asked for.
+    #[test]
+    fn remux_target_follows_the_client_list() {
+        assert_eq!(remux_target(&codecs(&["mp3"])), RemuxTarget::Mp3);
+        assert_eq!(remux_target(&codecs(&["opus"])), RemuxTarget::Opus);
+        assert_eq!(
+            remux_target(&codecs(&["flac", "mp3", "aac"])),
+            RemuxTarget::Mp3
+        );
+        assert_eq!(
+            remux_target(&codecs(&["aac", "mp3"])),
+            RemuxTarget::Aac,
+            "client order wins"
+        );
+        assert_eq!(remux_target(&codecs(&["MP3"])), RemuxTarget::Mp3);
+        assert_eq!(remux_target(&codecs(&["Opus", "AAC"])), RemuxTarget::Opus);
+    }
+
+    #[test]
+    fn remux_target_defaults_to_aac() {
+        assert_eq!(remux_target(&[]), RemuxTarget::Aac);
+        assert_eq!(remux_target(&codecs(&["wma"])), RemuxTarget::Aac);
+        assert_eq!(remux_target(&codecs(&["flac", "wma"])), RemuxTarget::Aac);
     }
 
     #[test]
