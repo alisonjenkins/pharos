@@ -11,9 +11,12 @@ use kobo_json::{ObjectBuilder, Value};
 
 /// The store key of the downloaded-books record.
 pub const KEY: &str = "books-v1";
-/// The most a downloaded book may be: the whole file is held in memory to
-/// parse it, on a reader shared with the stock software.
-pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// The most a downloaded book may be: the most Cobalt's shelf takes in one
+/// file. The whole file is held in memory to parse it, on a reader shared
+/// with the stock software.
+pub const MAX_BYTES: usize = kobo_sdk::MAX_SHELF_DOWNLOAD;
+/// [`MAX_BYTES`] in the words the reader shows.
+pub const TOO_BIG: &str = "This book is over the 32 MB limit.";
 /// How much of a book one request fetches.
 pub const CHUNK: u32 = 256 * 1024;
 /// Downloaded books kept at once, so the record below stays small.
@@ -452,6 +455,7 @@ mod tests {
         assert_eq!(after_piece(chunk, 0), Piece::Whole);
         assert_eq!(after_piece(MAX_BYTES - chunk, chunk), Piece::More);
         assert_eq!(after_piece(MAX_BYTES, 1), Piece::TooBig);
+        assert_eq!(MAX_BYTES, 32 * 1024 * 1024, "TOO_BIG names this size");
         assert_eq!(after_piece(0, chunk + 1), Piece::TooBig);
     }
 
