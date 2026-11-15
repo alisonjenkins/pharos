@@ -801,3 +801,80 @@ fn playing_from_an_album_with_a_masthead_still_starts_the_chosen_track() {
     };
     assert!(body.contains("\"ItemId\":\"tr2\""), "{body}");
 }
+
+#[test]
+fn the_player_shows_the_album_cover_when_it_is_held() {
+    let (mut runner, commands) = books_shelf(false);
+    let (cover, _) = cover_tasks(&commands)[0].clone();
+    let _ = runner.task_outcome(cover, cover_bytes());
+    let commands = runner.action(action_id("tile-0"));
+    let (tracks, _) = asked(&commands, "ParentId=bk1").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let commands = runner.action(action_id("row-0"));
+    let screen = last_screen(&commands).expect("the player");
+    assert!(screen_text(&screen).contains("Picture"), "{screen:?}");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+}
+
+#[test]
+fn a_cover_that_arrives_after_play_starts_reaches_the_player() {
+    let (mut runner, commands) = books_shelf(false);
+    let (cover, _) = cover_tasks(&commands)[0].clone();
+    let (tracks, _) = asked(&runner.action(action_id("tile-0")), "ParentId=bk1").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let commands = runner.action(action_id("row-0"));
+    assert!(!screen_text(&last_screen(&commands).expect("the player")).contains("Picture"));
+    let commands = runner.task_outcome(cover, cover_bytes());
+    let screen = last_screen(&commands).expect("the player again");
+    assert!(screen_text(&screen).contains("Picture"), "{screen:?}");
+}
+
+/// Answers every cover on its way, and the ones those start, with a picture.
+/// Returns the commands last produced and the handles dropped on the way.
+fn settle(
+    runner: &mut AppRunner<Pharos>,
+    mut commands: Vec<Command>,
+) -> (Vec<Command>, Vec<PictureHandle>) {
+    let mut dropped = Vec::new();
+    while !cover_tasks(&commands).is_empty() {
+        let mut next = Vec::new();
+        for (task, _) in cover_tasks(&commands) {
+            let reply = runner.task_outcome(task, cover_bytes());
+            dropped.extend(drops(&reply));
+            next.extend(reply);
+        }
+        commands = next;
+    }
+    (commands, dropped)
+}
+
+#[test]
+fn the_playing_cover_survives_paging_through_a_long_shelf() {
+    let (mut runner, commands) = art_shelf(false, 120);
+    let _ = settle(&mut runner, commands);
+    let commands = runner.action(action_id("tile-0"));
+    let (tracks, _) = asked(&commands, "ParentId=a0").expect("tracks");
+    let _ = runner.task_outcome(tracks, ok(TRACKS));
+    let commands = runner.action(action_id("row-0"));
+    // The report goes through, leaving the player's two timers running.
+    let (report, _) = asked(&commands, "/Sessions/Playing").expect("started report");
+    let _ = runner.task_outcome(report, ok("{}"));
+    let _ = runner.action(ActionId::BACK);
+    let commands = runner.action(ActionId::BACK);
+    let mut dropped = Vec::new();
+    let (_, more) = settle(&mut runner, commands);
+    dropped.extend(more);
+    for _ in 0..14 {
+        let commands = runner.action(action_id("page-next"));
+        dropped.extend(drops(&commands));
+        let (_, more) = settle(&mut runner, commands.clone());
+        dropped.extend(more);
+    }
+    assert!(!dropped.is_empty(), "other covers were let go");
+    // Handles are numbered from one in the order covers arrive; the first
+    // to arrive is the album now playing.
+    assert!(
+        !dropped.contains(&PictureHandle(1)),
+        "the cover the player holds was kept"
+    );
+}

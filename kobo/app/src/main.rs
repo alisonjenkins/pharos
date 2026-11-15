@@ -98,6 +98,8 @@ enum Work {
 
 struct Playing {
     player: AudioPlayer,
+    /// The album the track belongs to, whose cover the player shows.
+    album: Entry,
     track: String,
     sound_reported: bool,
 }
@@ -288,21 +290,31 @@ impl Pharos {
     /// The covers worth having now: those on the page showing and the next
     /// one, as `(album id, cover tag)`. An album with no cover tag has none.
     fn wanted_covers(&self, context: &Context) -> (Vec<(String, String)>, usize) {
-        if let View::Album(album) = &self.view {
-            let tagged = album.image_tag.clone().map(|tag| (album.id.clone(), tag));
-            return (tagged.into_iter().collect(), 0);
-        }
-        let View::Library(_) = self.view else {
-            return (Vec::new(), 0);
+        let tagged = |entry: &Entry| Some((entry.id.clone(), entry.image_tag.clone()?));
+        let (mut wanted, per_page) = match &self.view {
+            View::Album(album) => (tagged(album).into_iter().collect::<Vec<_>>(), 0),
+            View::Library(_) => {
+                let pages = self.grid_pages(context);
+                let page = self.shelf_page.min(pages.len().saturating_sub(1));
+                let wanted = api::wanted(&pages, page)
+                    .into_iter()
+                    .filter_map(|index| self.shelf.entries.get(index))
+                    .filter_map(tagged)
+                    .collect();
+                (wanted, pages.first().map_or(0, Vec::len))
+            }
+            _ => (Vec::new(), 0),
         };
-        let pages = self.grid_pages(context);
-        let page = self.shelf_page.min(pages.len().saturating_sub(1));
-        let per_page = pages.first().map_or(0, Vec::len);
-        let wanted = api::wanted(&pages, page)
-            .into_iter()
-            .filter_map(|index| self.shelf.entries.get(index))
-            .filter_map(|entry| Some((entry.id.clone(), entry.image_tag.clone()?)))
-            .collect();
+        // The player keeps showing its cover whatever else is on screen.
+        if let Some(cover) = self
+            .playing
+            .as_ref()
+            .and_then(|playing| tagged(&playing.album))
+        {
+            if !wanted.contains(&cover) {
+                wanted.push(cover);
+            }
+        }
         (wanted, per_page)
     }
 
@@ -311,8 +323,14 @@ impl Pharos {
     fn refresh_covers(&mut self, context: &mut Context) {
         let (wanted, per_page) = self.wanted_covers(context);
         self.covers.set_capacity(MIN_COVERS.max(per_page * 3));
-        self.covers
-            .set_pinned(self.album.iter().map(|album| album.id.clone()).collect());
+        // What is on show and what is playing keep their covers.
+        let pinned = self
+            .album
+            .iter()
+            .chain(self.playing.iter().map(|playing| &playing.album))
+            .map(|album| album.id.clone())
+            .collect();
+        self.covers.set_pinned(pinned);
         // Last wanted first, so the page showing is the newest and the last
         // to be pushed out.
         for (id, _) in wanted.iter().rev() {
@@ -400,6 +418,16 @@ impl Pharos {
         );
         if shown.is_none() {
             self.cover_failed(context, id, "the runtime would not take the picture");
+            return;
+        }
+        // A track started before its cover arrived picks it up now.
+        let cover = self.cover_of(id);
+        if let Some(playing) = self
+            .playing
+            .as_mut()
+            .filter(|playing| playing.album.id == id)
+        {
+            playing.player.set_cover(cover);
         }
     }
 
@@ -495,13 +523,16 @@ impl Pharos {
         let mut player = AudioPlayer::stream(url, &entry.name)
             .metadata(metadata)
             .owns_back(true);
+        player.set_cover(self.cover_of(&album.id));
         let track = entry.id.clone();
+        let album = album.clone();
         self.stop_playing(context);
         player.start(context);
         player.play(context);
         context.log(LogLevel::Info, format!("pharos: play track={track}"));
         self.playing = Some(Playing {
             player,
+            album,
             track,
             sound_reported: false,
         });
