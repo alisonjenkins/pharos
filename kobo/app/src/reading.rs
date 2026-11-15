@@ -8,6 +8,7 @@
 
 use crate::api::{self, Account};
 use crate::books::{self, Book, BookPage, Kind, Piece, Saved, Shelf, Support};
+use crate::letters;
 use crate::MAX_JSON;
 use kobo_bookview::{BookView, Step};
 use kobo_read::{Memory, Outcome};
@@ -16,7 +17,6 @@ use kobo_sdk::{
     ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
     TileShape, TileState,
 };
-
 
 /// Where the caller goes after the Books screens handled something.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +74,8 @@ pub struct Reading {
     list_task: Option<(TaskId, usize)>,
     list_failed: Option<String>,
     page: usize,
+    /// Whether the letters to jump the list to are showing (V1442).
+    picking_letter: bool,
     mode: Mode,
     notice: Option<(BannerLevel, String)>,
     /// The book being downloaded, opened or removed.
@@ -102,6 +104,7 @@ impl Reading {
             list_task: None,
             list_failed: None,
             page: 0,
+            picking_letter: false,
             mode: Mode::List,
             notice: None,
             current: None,
@@ -233,7 +236,15 @@ impl Reading {
         &self,
         context: &Context,
         cover: &dyn Fn(&str) -> Option<TilePicture>,
-    ) -> Vec<(String, String, String, Glyph, String, Option<TilePicture>, TileState)> {
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Glyph,
+        String,
+        Option<TilePicture>,
+        TileState,
+    )> {
         self.page_books(context)
             .into_iter()
             .filter_map(|index| {
@@ -259,6 +270,51 @@ impl Reading {
                 ))
             })
             .collect()
+    }
+
+    /// Where each letter starts in the list (V1442).
+    fn letter_starts(&self) -> Vec<(char, usize)> {
+        letters::starts(self.list.books.iter().map(|book| book.title.as_str()))
+    }
+
+    /// The letters the list holds, over it while the reader picks one.
+    fn letter_picker(&self, context: &Context, screen: ScreenBuilder) -> ScreenBuilder {
+        if !self.picking_letter {
+            return screen;
+        }
+        let showing = self
+            .page_books(context)
+            .first()
+            .and_then(|&index| self.list.books.get(index))
+            .map(|book| letters::letter_of(&book.title));
+        letters::picker(screen, &self.letter_starts(), showing)
+    }
+
+    /// Answers the letter picker: a letter turns to the page its first book
+    /// is on, and Back closes it. Whether the action was its.
+    fn pick_letter(&mut self, context: &Context, action: ActionId) -> bool {
+        if self.mode != Mode::List {
+            return false;
+        }
+        if action == action_id("letters") {
+            self.picking_letter = true;
+            return true;
+        }
+        if !self.picking_letter {
+            return false;
+        }
+        self.picking_letter = false;
+        if action == ActionId::BACK {
+            return true;
+        }
+        if let Some(index) = letters::chosen(action, &self.letter_starts()) {
+            if let Some(page) = letters::page_holding(&self.pages(context), index) {
+                self.page = page;
+            }
+            return true;
+        }
+        // Anything else on the screen closes the picker and does its own job.
+        false
     }
 
     fn banner(&self, screen: ScreenBuilder) -> ScreenBuilder {
@@ -298,11 +354,7 @@ impl Reading {
     }
 
     #[must_use]
-    pub fn screen(
-        &self,
-        context: &Context,
-        cover: &dyn Fn(&str) -> Option<TilePicture>,
-    ) -> Screen {
+    pub fn screen(&self, context: &Context, cover: &dyn Fn(&str) -> Option<TilePicture>) -> Screen {
         if self.opened {
             let title = self
                 .current
@@ -344,7 +396,9 @@ impl Reading {
             });
         }
         let mut screen = self.banner(
-            ScreenBuilder::new("pharos-books").top_bar(format!("Books · {}", self.list.total)),
+            ScreenBuilder::new("pharos-books")
+                .top_bar(format!("Books · {}", self.list.total))
+                .top_bar_action("letters", "A–Z"),
         );
         if self.load == Load::Blocked {
             screen = screen
@@ -356,7 +410,8 @@ impl Reading {
         }
         own(screen
             .contextual_picture_tiles(TileShape::Portrait, self.tiles(context, cover))
-            .page_turns("books-page-back", "books-page-next"))
+            .page_turns("books-page-back", "books-page-next")
+            .compose(|screen| self.letter_picker(context, screen)))
     }
 
     /// The answer to loading the book list record.
@@ -551,7 +606,15 @@ impl Reading {
         if let Some((task, start)) = self.list_task {
             if task == id {
                 self.list_task = None;
-                return Some(self.listed(start, outcome));
+                let before = if start == 0 { 0 } else { self.list.books.len() };
+                let leave = self.listed(start, outcome);
+                // The whole list, so every letter is there to jump to; a
+                // block that added nothing ends it rather than asking again.
+                let loaded = self.list.books.len();
+                if leave == Leave::Stay && loaded > before && loaded < self.list.total {
+                    self.load_list(context, loaded);
+                }
+                return Some(leave);
             }
         }
         if let Job::Downloading { task, .. } = &self.job {
@@ -696,6 +759,9 @@ impl Reading {
             return Leave::Stay;
         }
         if self.busy() {
+            return Leave::Stay;
+        }
+        if self.pick_letter(context, action) {
             return Leave::Stay;
         }
         if action == ActionId::BACK {
