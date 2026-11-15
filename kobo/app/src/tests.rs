@@ -1,5 +1,5 @@
 use super::*;
-use kobo_sdk::{AppRunner, Command, StoreRequest, CLARA_BW_METRICS};
+use kobo_sdk::{AppRunner, Command, PictureFormat, PictureHandle, StoreRequest, CLARA_BW_METRICS};
 
 /// Every task a batch of commands spawned, with what it asked for.
 fn spawns(commands: &[Command]) -> Vec<(TaskId, Task)> {
@@ -180,7 +180,7 @@ fn an_expired_code_is_replaced() {
 /// Opens the first album and plays its first track.
 fn playing() -> (AppRunner<Pharos>, Vec<Command>) {
     let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("row-0"));
+    let commands = runner.action(action_id("tile-0"));
     let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
     let _ = runner.task_outcome(tracks, ok(TRACKS));
     let commands = runner.action(action_id("row-1"));
@@ -251,7 +251,7 @@ fn every_screen_fits_the_smallest_reader() {
         ok(&format!(r#"{{"Items":[{many}],"TotalRecordCount":20}}"#)),
     );
     screens.extend(last_screen(&commands));
-    let commands = runner.action(action_id("row-0"));
+    let commands = runner.action(action_id("tile-0"));
     screens.extend(last_screen(&commands));
     let (tracks, _) = asked(&commands, "ParentId=a0").expect("tracks");
     let commands = runner.task_outcome(tracks, ok(TRACKS));
@@ -267,10 +267,10 @@ fn every_screen_fits_the_smallest_reader() {
 #[test]
 fn tracks_for_an_album_already_left_are_ignored() {
     let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("row-0"));
+    let commands = runner.action(action_id("tile-0"));
     let (first, _) = asked(&commands, "ParentId=al1").expect("first album's tracks");
     let _ = runner.action(ActionId::BACK);
-    let commands = runner.action(action_id("row-1"));
+    let commands = runner.action(action_id("tile-1"));
     let (second, _) = asked(&commands, "ParentId=al2").expect("second album's tracks");
     let _ = runner.task_outcome(
         second,
@@ -289,7 +289,7 @@ fn tracks_for_an_album_already_left_are_ignored() {
 #[test]
 fn an_album_longer_than_a_page_loads_all_its_tracks() {
     let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("row-0"));
+    let commands = runner.action(action_id("tile-0"));
     let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
     let items: String = (0..50)
         .map(|index| format!(r#"{{"Id":"t{index}","Name":"Track {index}"}}"#))
@@ -343,7 +343,7 @@ fn the_album_offers_a_way_back_to_the_player() {
 #[test]
 fn a_later_block_of_tracks_failing_leaves_the_player_alone() {
     let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("row-0"));
+    let commands = runner.action(action_id("tile-0"));
     let (first, _) = asked(&commands, "StartIndex=0&").expect("first block");
     let commands = runner.task_outcome(
         first,
@@ -363,7 +363,7 @@ fn a_loading_album_still_offers_the_player() {
     let (mut runner, _) = playing();
     let _ = runner.action(ActionId::BACK);
     let _ = runner.action(ActionId::BACK);
-    let commands = runner.action(action_id("row-1"));
+    let commands = runner.action(action_id("tile-1"));
     assert!(
         asked(&commands, "ParentId=al2").is_some(),
         "the second album loads"
@@ -458,4 +458,237 @@ fn books_is_a_placeholder_and_back_returns_home() {
     assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
     let commands = runner.action(ActionId::BACK);
     assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Audiobooks"));
+}
+
+/// `count` albums, each with a cover tag, named `Album n`.
+fn albums_with_art(count: usize) -> String {
+    let items: Vec<String> = (0..count)
+        .map(|index| {
+            format!(
+                r#"{{"Id":"a{index}","Name":"Album {index}","AlbumArtist":"Artist A","ImageTags":{{"Primary":"t{index}"}}}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"Items":[{}],"TotalRecordCount":{count}}}"#,
+        items.join(",")
+    )
+}
+
+/// A small picture, as the JPEG or PNG a cover reply would carry.
+fn cover_bytes() -> TaskOutcome {
+    let rgb: Vec<u8> = (0u32..64 * 96)
+        .flat_map(|n| [u8::try_from(n % 251).unwrap_or(0), 90, 200])
+        .collect();
+    TaskOutcome::Completed(kobo_image::encode_png_rgb(64, 96, &rgb).expect("a png"))
+}
+
+/// A runner on the music shelf holding `count` albums with covers, and the
+/// commands the shelf produced.
+fn art_shelf(colour: bool, count: usize) -> (AppRunner<Pharos>, Vec<Command>) {
+    let mut runner = AppRunner::new(Pharos::default()).showing_colour(colour);
+    let _ = runner.start();
+    let commands = runner.store_result(StoreResult::Loaded {
+        key: ACCOUNT_KEY.to_owned(),
+        value: Some(account().encode()),
+    });
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let _ = runner.task_outcome(views, ok(VIEWS));
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
+    let commands = runner.task_outcome(albums, ok(&albums_with_art(count)));
+    (runner, commands)
+}
+
+fn cover_tasks(commands: &[Command]) -> Vec<(TaskId, String)> {
+    spawns(commands)
+        .into_iter()
+        .filter_map(|(id, task)| {
+            let url = url_of(&task)?;
+            url.contains("/Images/Primary")
+                .then(|| (id, url.to_owned()))
+        })
+        .collect()
+}
+
+fn puts(commands: &[Command]) -> Vec<(PictureHandle, PictureFormat, u32, u32)> {
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::PutPicture {
+                handle,
+                format,
+                width,
+                height,
+                ..
+            } => Some((*handle, *format, *width, *height)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn drops(commands: &[Command]) -> Vec<PictureHandle> {
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::DropPicture(handle) => Some(*handle),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_shelf_asks_for_covers_with_the_sign_in_and_a_bounded_few_at_once() {
+    let (_, commands) = art_shelf(false, 40);
+    let covers = cover_tasks(&commands);
+    assert_eq!(covers.len(), MAX_COVER_TASKS, "two at a time, no more");
+    let (_, url) = &covers[0];
+    assert!(url.starts_with(&format!("{SERVER}/Items/a0/Images/Primary?fillWidth=")));
+    assert!(url.contains("&quality=80&format=jpg&tag=t0"), "{url}");
+    let (_, task) = asked(&commands, "/Items/a0/Images/Primary").expect("first cover");
+    let Task::Fetch { headers, .. } = task else {
+        panic!("a cover is a GET");
+    };
+    assert!(headers
+        .iter()
+        .any(|header| header.name == "X-Emby-Authorization"
+            && header.value.contains("Token=\"t0k\"")));
+}
+
+#[test]
+fn an_album_with_no_cover_tag_is_not_asked_for_one() {
+    let (_, commands) = shelf();
+    assert!(cover_tasks(&commands).is_empty());
+}
+
+#[test]
+fn a_cover_is_sent_grey_to_a_grey_panel_and_in_colour_to_a_colour_one() {
+    let (mut runner, commands) = art_shelf(false, 3);
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let commands = runner.task_outcome(first, cover_bytes());
+    let sent = puts(&commands);
+    assert_eq!(sent.len(), 1, "{commands:?}");
+    assert_eq!(sent[0].1, PictureFormat::Grey);
+
+    let (mut runner, commands) = art_shelf(true, 3);
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let commands = runner.task_outcome(first, cover_bytes());
+    let sent = puts(&commands);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, PictureFormat::Rgb);
+    // The picture is fitted to its tile, so it is not the size it arrived at.
+    assert_ne!((sent[0].2, sent[0].3), (64, 96));
+}
+
+#[test]
+fn an_arrived_cover_replaces_the_glyph_on_its_tile() {
+    let (mut runner, commands) = art_shelf(false, 3);
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let before = screen_text(&last_screen(&commands).expect("a screen"));
+    let commands = runner.task_outcome(first, cover_bytes());
+    let after = screen_text(&last_screen(&commands).expect("a screen"));
+    assert_ne!(before, after, "the tile now carries a picture");
+    assert!(after.contains("picture: Some"), "{after}");
+    assert!(before.contains("picture: None"), "{before}");
+}
+
+#[test]
+fn a_cover_for_a_shelf_already_left_is_dropped_and_its_reply_ignored() {
+    let (mut runner, commands) = art_shelf(false, 3);
+    let covers = cover_tasks(&commands);
+    let commands = runner.action(ActionId::BACK);
+    for (task, _) in &covers {
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel(id) if id == task)),
+            "the cover on its way is cancelled"
+        );
+    }
+    let commands = runner.task_outcome(covers[0].0, cover_bytes());
+    assert!(puts(&commands).is_empty(), "a stale reply is not sent on");
+}
+
+#[test]
+fn a_cover_that_fails_keeps_its_glyph_is_not_asked_again_and_does_not_end_the_session() {
+    let (mut runner, commands) = art_shelf(false, 6);
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let commands = runner.task_outcome(first, TaskOutcome::Failed(TaskError::NotFound));
+    assert!(
+        last_screen(&commands).is_none_or(|screen| {
+            let text = screen_text(&screen);
+            text.contains("Album 0") && !text.contains("could not be reached")
+        }),
+        "the shelf stays up"
+    );
+    assert!(
+        cover_tasks(&commands)
+            .iter()
+            .all(|(_, url)| !url.contains("/a0/")),
+        "a failed cover is not retried"
+    );
+    let logged = commands
+        .iter()
+        .filter(|command| matches!(command, Command::Log { message, .. } if message.contains("cover a0")))
+        .count();
+    assert_eq!(logged, 1);
+    // Not even a refused sign-in on a cover signs the reader out.
+    let (second, _) = cover_tasks(&commands)
+        .into_iter()
+        .next()
+        .expect("the next cover starts");
+    let commands = runner.task_outcome(second, TaskOutcome::Failed(TaskError::Unauthorized));
+    assert!(asked(&commands, "/QuickConnect/Initiate").is_none());
+    // And bytes that are no picture fail the same way.
+    let (third, _) = cover_tasks(&commands)
+        .into_iter()
+        .next()
+        .expect("another cover starts");
+    let commands = runner.task_outcome(third, ok("not an image"));
+    assert!(puts(&commands).is_empty());
+}
+
+#[test]
+fn paging_through_hundreds_of_albums_keeps_the_held_covers_bounded() {
+    let (mut runner, mut commands) = art_shelf(false, 120);
+    let mut held: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut most = 0;
+    let mut dropped_any = false;
+    for _ in 0..14 {
+        // Answer every cover on its way until none is.
+        while !cover_tasks(&commands).is_empty() {
+            let mut next = Vec::new();
+            for (task, _) in cover_tasks(&commands) {
+                let reply = runner.task_outcome(task, cover_bytes());
+                held.extend(puts(&reply).iter().map(|put| put.0 .0));
+                for dropped in drops(&reply) {
+                    dropped_any = true;
+                    held.remove(&dropped.0);
+                }
+                next.extend(reply);
+            }
+            commands = next;
+        }
+        most = most.max(held.len());
+        commands = runner.action(action_id("page-next"));
+        for dropped in drops(&commands) {
+            dropped_any = true;
+            held.remove(&dropped.0);
+        }
+    }
+    assert!(dropped_any, "old covers were let go");
+    assert!(most <= 40, "held {most} covers at once");
+    assert!(most >= 9, "a page of covers was held, got {most}");
+}
+
+#[test]
+fn the_shelf_screens_fit_the_smallest_reader_with_and_without_covers() {
+    let (mut runner, commands) = art_shelf(true, 40);
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+    let (first, _) = cover_tasks(&commands)[0].clone();
+    let commands = runner.task_outcome(first, cover_bytes());
+    let screen = last_screen(&commands).expect("a screen");
+    let problems = screen.validate(&CLARA_BW_METRICS);
+    assert!(problems.is_empty(), "{problems:?}");
 }
