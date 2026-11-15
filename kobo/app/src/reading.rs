@@ -13,11 +13,10 @@ use kobo_bookview::{BookView, Step};
 use kobo_read::{Memory, Outcome};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Context, Glyph, Header, Screen, ScreenBuilder, ShelfDownload,
-    ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome,
+    ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
+    TileShape, TileState,
 };
 
-/// Books in a list page: the rows that fit the smallest reader.
-const ROWS_PER_PAGE: usize = 7;
 
 /// Where the caller goes after the Books screens handled something.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,38 +175,88 @@ impl Reading {
         self.shelf.get(&book.id).is_some()
     }
 
-    fn rows(&self) -> Vec<(String, String, String, Glyph, String)> {
-        self.list
-            .books
-            .iter()
-            .enumerate()
-            .skip(self.page * ROWS_PER_PAGE)
-            .take(ROWS_PER_PAGE)
-            .map(|(index, book)| {
-                let mut summary = book.author.clone();
-                let mark = match book.support {
-                    Support::Cannot(_) => Some("Can't open here"),
-                    Support::Reads(_) if self.downloaded(book) => Some("Downloaded"),
-                    Support::Reads(_) => None,
+    /// The list split into the pages of covers this panel holds.
+    fn pages(&self, context: &Context) -> Vec<Vec<usize>> {
+        context.paginate_tiles(self.list.books.len(), TileShape::Portrait, false)
+    }
+
+    /// The books on the page showing, by their place in the list.
+    fn page_books(&self, context: &Context) -> Vec<usize> {
+        let pages = self.pages(context);
+        let page = self.page.min(pages.len().saturating_sub(1));
+        pages.get(page).cloned().unwrap_or_default()
+    }
+
+    /// The covers worth having now, as `(book id, cover tag)`: the page
+    /// showing first, then the next one, so turning finds them ready. Only
+    /// while the list is what is showing.
+    #[must_use]
+    pub fn wanted_covers(&self, context: &Context) -> Vec<(String, String)> {
+        if self.opened || self.mode != Mode::List || self.busy() {
+            return Vec::new();
+        }
+        let pages = self.pages(context);
+        let page = self.page.min(pages.len().saturating_sub(1));
+        api::wanted(&pages, page)
+            .into_iter()
+            .filter_map(|index| self.list.books.get(index))
+            .filter_map(|book| Some((book.id.clone(), book.image_tag.clone()?)))
+            .collect()
+    }
+
+    /// The covers on the page showing that are tagged, for the app to tell
+    /// whether all of them are in yet.
+    #[must_use]
+    pub fn page_covers(&self, context: &Context) -> Vec<String> {
+        if self.opened || self.mode != Mode::List || self.busy() {
+            return Vec::new();
+        }
+        self.page_books(context)
+            .into_iter()
+            .filter_map(|index| self.list.books.get(index))
+            .filter(|book| book.image_tag.is_some())
+            .map(|book| book.id.clone())
+            .collect()
+    }
+
+    /// How many covers one page holds.
+    #[must_use]
+    pub fn per_page(&self, context: &Context) -> usize {
+        self.pages(context).first().map_or(0, Vec::len)
+    }
+
+    /// The tiles of the page showing. A book this reader cannot open says
+    /// so under its title, in place of its author, and stays tappable so a
+    /// tap can say why; a downloaded one carries the held mark and its menu.
+    #[allow(clippy::type_complexity)]
+    fn tiles(
+        &self,
+        context: &Context,
+        cover: &dyn Fn(&str) -> Option<TilePicture>,
+    ) -> Vec<(String, String, String, Glyph, String, Option<TilePicture>, TileState)> {
+        self.page_books(context)
+            .into_iter()
+            .filter_map(|index| {
+                let book = self.list.books.get(index)?;
+                let downloaded = self.downloaded(book);
+                let subtitle = match book.support {
+                    Support::Cannot(_) => "Can't open here".to_owned(),
+                    Support::Reads(_) => book.author.clone(),
                 };
-                if let Some(mark) = mark {
-                    if !summary.is_empty() {
-                        summary.push_str(" · ");
-                    }
-                    summary.push_str(mark);
-                }
-                let menu = if self.downloaded(book) {
-                    format!("book-menu-{index}")
+                let (menu, state) = if downloaded {
+                    (format!("book-menu-{index}"), TileState::Held)
                 } else {
-                    String::new()
+                    (String::new(), TileState::Normal)
                 };
-                (
+                Some((
                     format!("book-{index}"),
                     book.title.clone(),
-                    summary,
+                    subtitle,
                     Glyph::Book,
                     menu,
-                )
+                    cover(&book.id),
+                    state,
+                ))
             })
             .collect()
     }
@@ -249,7 +298,11 @@ impl Reading {
     }
 
     #[must_use]
-    pub fn screen(&self) -> Screen {
+    pub fn screen(
+        &self,
+        context: &Context,
+        cover: &dyn Fn(&str) -> Option<TilePicture>,
+    ) -> Screen {
         if self.opened {
             let title = self
                 .current
@@ -302,7 +355,7 @@ impl Reading {
                 .banner_action("books-reload", "Try again");
         }
         own(screen
-            .rows_with_menu(self.rows())
+            .contextual_picture_tiles(TileShape::Portrait, self.tiles(context, cover))
             .page_turns("books-page-back", "books-page-next"))
     }
 
@@ -673,9 +726,7 @@ impl Reading {
     }
 
     fn row_action(&mut self, context: &mut Context, action: ActionId) {
-        let first = self.page * ROWS_PER_PAGE;
-        let end = self.list.books.len().min(first + ROWS_PER_PAGE);
-        for index in first..end {
+        for index in self.page_books(context) {
             if action == action_id(&format!("book-{index}")) {
                 self.begin(context, index);
             } else if action == action_id(&format!("book-menu-{index}")) {
@@ -685,7 +736,9 @@ impl Reading {
     }
 
     fn turn(&mut self, context: &mut Context, forward: bool) {
-        let pages = self.list.books.len().div_ceil(ROWS_PER_PAGE).max(1);
+        let pages = self.pages(context);
+        let per_page = pages.first().map_or(1, Vec::len).max(1);
+        let pages = pages.len().max(1);
         if forward && self.page + 1 < pages {
             self.page += 1;
         } else if !forward && self.page > 0 {
@@ -693,7 +746,7 @@ impl Reading {
         }
         // Fetch the next block before the reader reaches the end of this one.
         let loaded = self.list.books.len();
-        if loaded < self.list.total && (self.page + 2) * ROWS_PER_PAGE >= loaded {
+        if loaded < self.list.total && (self.page + 2) * per_page >= loaded {
             self.load_list(context, loaded);
         }
     }
