@@ -6,6 +6,7 @@
 //! book is a record in the `books-v1` list and a file under that name. Where
 //! the reader stopped is kept in the same record, as `calibre-web` does.
 
+use crate::about;
 use crate::api::{self, Account};
 use crate::books::{self, Book, BookPage, Kind, Piece, Saved, Shelf, Support};
 use crate::letters;
@@ -45,6 +46,8 @@ enum Mode {
     List,
     /// The menu of the book at this index in the list.
     Menu(usize),
+    /// A page of the description of the book at this index.
+    About { index: usize, page: usize },
 }
 
 /// The one piece of work that may be running.
@@ -376,9 +379,29 @@ impl Reading {
                 if !book.author.is_empty() {
                     screen = screen.text(book.author.clone());
                 }
-                return own(screen
+                let teaser = about::teaser(&book.overview, about::TEASER_CHARS);
+                if let Some((shown, _)) = &teaser {
+                    screen = screen.text(shown.clone());
+                }
+                screen = screen
                     .primary_button("book-read", "Read")
-                    .button("book-remove", "Remove download"));
+                    .button("book-remove", "Remove download");
+                if matches!(teaser, Some((_, true))) {
+                    screen = screen.button("book-about", "About this book");
+                }
+                return own(screen);
+            }
+        }
+        if let Mode::About { index, page } = self.mode {
+            if let Some(book) = self.list.books.get(index) {
+                return own(about::screen(
+                    context,
+                    "pharos-book-about",
+                    &book.title,
+                    &book.overview,
+                    page,
+                    ("book-about-back", "book-about-next"),
+                ));
             }
         }
         if let Some(why) = &self.list_failed {
@@ -765,10 +788,11 @@ impl Reading {
             return Leave::Stay;
         }
         if action == ActionId::BACK {
-            if self.mode == Mode::List {
-                return Leave::Back;
-            }
-            self.mode = Mode::List;
+            self.mode = match self.mode {
+                Mode::List => return Leave::Back,
+                Mode::Menu(_) => Mode::List,
+                Mode::About { index, .. } => Mode::Menu(index),
+            };
         } else if action == action_id("books-retry") {
             self.list_failed = None;
             self.load_list(context, 0);
@@ -785,6 +809,14 @@ impl Reading {
             }
         } else if action == action_id("book-remove") {
             self.remove(context);
+        } else if action == action_id("book-about") {
+            if let Mode::Menu(index) = self.mode {
+                self.mode = Mode::About { index, page: 0 };
+            }
+        } else if action == action_id("book-about-next") {
+            self.turn_about(context, true);
+        } else if action == action_id("book-about-back") {
+            self.turn_about(context, false);
         } else {
             self.row_action(context, action);
         }
@@ -815,6 +847,22 @@ impl Reading {
         if loaded < self.list.total && (self.page + 2) * per_page >= loaded {
             self.load_list(context, loaded);
         }
+    }
+
+    fn turn_about(&mut self, context: &Context, forward: bool) {
+        let Mode::About { index, page } = self.mode else {
+            return;
+        };
+        let Some(book) = self.list.books.get(index) else {
+            return;
+        };
+        let pages = about::page_count(context, &book.overview);
+        let page = if forward {
+            (page + 1).min(pages.saturating_sub(1))
+        } else {
+            page.saturating_sub(1)
+        };
+        self.mode = Mode::About { index, page };
     }
 
     /// Opens the book at `index`, downloading it first if it is not here.
