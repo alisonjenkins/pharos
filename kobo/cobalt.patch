@@ -47,10 +47,10 @@ index 8e3f1bb..ebf319f 100644
          let encoded = reading.write.clone().unwrap();
          reading.store(
 diff --git a/crates/kobo-bookview/src/lib.rs b/crates/kobo-bookview/src/lib.rs
-index 9875021..f997913 100644
+index 9875021..3e5a85d 100644
 --- a/crates/kobo-bookview/src/lib.rs
 +++ b/crates/kobo-bookview/src/lib.rs
-@@ -49,7 +49,7 @@ pub mod offline;
+@@ -49,20 +49,28 @@ pub mod offline;
  pub mod positions;
  
  use kobo_doc::{Block, Document, FORMULA_PICTURE_EM, FORMULA_PICTURE_PREFIX};
@@ -59,7 +59,34 @@ index 9875021..f997913 100644
  use kobo_sdk::{
      Context, DisplayMetrics, PictureHandle, Screen, Task, TaskId, TaskOutcome, TilePicture,
  };
-@@ -90,6 +90,28 @@ pub const MAX_PICTURE_BYTES: u32 = 4 * 1024 * 1024;
+ 
+-/// The most pictures one document may have room reserved for.
++/// The most pictures one document may fetch from the web.
+ ///
+-/// Every one costs a handle in the runtime and a decode on a processor that
+-/// takes about a quarter of a second over each. An illustrated children's book
+-/// is a few dozen; a paper is a dozen. A container that names four hundred is
+-/// either a gallery or a mistake, and either way the sixty-fifth plate is not
+-/// the thing standing between somebody and the page they wanted.
++/// Every one is a download over the reader's only radio and a decode on a
++/// processor that takes about a quarter of a second over each. A paper is a
++/// dozen. A page that names four hundred is either a gallery or a mistake,
++/// and either way the sixty-fifth plate is not the thing standing between
++/// somebody and the page they wanted.
+ pub const MAX_PICTURES: usize = 64;
+ 
++/// The most pictures a book may carry in its own container.
++///
++/// These cost no download, and only the ones near the page being read are
++/// decoded at a time, so the ceiling is on handles and on the reservations
++/// pagination measures, not on memory. An illustrated textbook runs to a few
++/// hundred figures; past this, a book is a photo album.
++const MAX_BOOK_PICTURES: usize = 512;
++
+ /// The handle illustrations are numbered from.
+ ///
+ /// An application draws other things through the same runtime -- a shelf of
+@@ -90,6 +98,28 @@ pub const MAX_PICTURE_BYTES: u32 = 4 * 1024 * 1024;
  /// The longest a picture's address may be.
  const MAX_PICTURE_NAME: usize = 512;
  
@@ -88,7 +115,7 @@ index 9875021..f997913 100644
  /// How long one pass may spend typesetting formulae.
  ///
  /// Chosen by subtraction from the runtime's 250 ms callback deadline. A pass
-@@ -160,9 +182,22 @@ pub struct BookView {
+@@ -160,9 +190,22 @@ pub struct BookView {
      /// arrives late has to be merged into what was reserved at open, and the
      /// reader takes the whole map or none of it.
      reserved: BTreeMap<String, TilePicture>,
@@ -114,7 +141,7 @@ index 9875021..f997913 100644
      /// Formulae the document named and nothing has typeset yet, as the LaTeX
      /// to set them from, in the order the text refers to them.
      ///
-@@ -260,9 +295,9 @@ impl BookView {
+@@ -260,9 +303,9 @@ impl BookView {
      /// Opens a document that has already been parsed.
      ///
      /// The pictures the container carried are taken off the document rather
@@ -127,7 +154,15 @@ index 9875021..f997913 100644
      pub fn open(&mut self, context: &mut Context, mut document: Document, memory: Memory) {
          self.formulae_as_text = false;
          // Whatever the last document handed over is about to be replaced, so
-@@ -306,11 +341,16 @@ impl BookView {
+@@ -299,18 +342,23 @@ impl BookView {
+                 }
+                 continue;
+             }
+-            if self.reserved.len() < MAX_PICTURES {
++            if self.reserved.len() < MAX_BOOK_PICTURES {
+                 if let Some(bytes) = images.get(&name) {
+                     self.reserve(&name, bytes, &metrics);
+                 }
              }
          }
          reader.set_pictures(self.reserved.clone(), &metrics);
@@ -145,7 +180,7 @@ index 9875021..f997913 100644
          self.match_light(context);
      }
  
-@@ -526,15 +566,15 @@ impl BookView {
+@@ -526,15 +574,15 @@ impl BookView {
      /// back to page one of something they were halfway through.
      ///
      /// Answers whether there was a document to put back.
@@ -169,7 +204,7 @@ index 9875021..f997913 100644
      }
  
      /// Re-measure an open document after a panel or orientation change.
-@@ -583,6 +623,8 @@ impl BookView {
+@@ -583,6 +631,8 @@ impl BookView {
              Outcome::Elsewhere => return None,
              handled => handled,
          };
@@ -178,7 +213,7 @@ index 9875021..f997913 100644
          if self.plating.is_none()
              && (!self.plates.is_empty() || self.dithering.is_some() || !self.unset.is_empty())
          {
-@@ -725,7 +767,7 @@ impl BookView {
+@@ -725,7 +775,7 @@ impl BookView {
          if let Some(reader) = &mut self.reader {
              reader.set_pictures(reserved, &metrics);
          }
@@ -187,7 +222,7 @@ index 9875021..f997913 100644
          true
      }
  
-@@ -773,7 +815,7 @@ impl BookView {
+@@ -773,16 +823,16 @@ impl BookView {
              TilePicture::new(handle, drawn_width, drawn_height),
          );
          self.handles.push(handle);
@@ -196,7 +231,24 @@ index 9875021..f997913 100644
          true
      }
  
-@@ -802,6 +844,99 @@ impl BookView {
+     /// Whether there is room for one more picture of the kind `name` is.
+     ///
+     /// Two ceilings, because the two kinds cost different things. A plate is
+-    /// a megabyte fetched over the radio and decoded from an arbitrary file,
+-    /// and sixty-four of them is as many as the runtime should be asked to
+-    /// hold. A formula is three and a half kilobytes this machine can make
++    /// decoded from an arbitrary file, and only the ones near the page are
++    /// held decoded; fetched ones are capped again at [`MAX_PICTURES`] where
++    /// they arrive. A formula is three and a half kilobytes this machine can make
+     /// for itself, and a paper wants hundreds: measured over a 163-page paper
+     /// carrying 231 of them, all of the mathematics together came to 764 KB.
+     ///
+@@ -798,10 +848,103 @@ impl BookView {
+         held < if formula {
+             kobo_doc::MAX_FORMULA_PICTURES
+         } else {
+-            MAX_PICTURES
++            MAX_BOOK_PICTURES
          }
      }
  
@@ -296,7 +348,7 @@ index 9875021..f997913 100644
      /// Asks the runtime to carry the pipeline forward, if there is anything
      /// left to carry and nothing already carrying it.
      fn kick(&mut self, context: &mut Context) {
-@@ -848,6 +983,9 @@ impl BookView {
+@@ -848,6 +991,9 @@ impl BookView {
                  .map(str::to_owned)
                  .collect()
          });
@@ -306,7 +358,7 @@ index 9875021..f997913 100644
          // Formulae first, and their own pass. Typesetting one is a different
          // shape of work from turning a photograph into sixteen greys -- small
          // enough to do several of in the time one plate takes -- and mixing
-@@ -865,6 +1003,7 @@ impl BookView {
+@@ -865,6 +1011,7 @@ impl BookView {
              let (drawn_width, drawn_height) = (picture.width(), picture.height());
              if let Some(reserved) = self.handed(&name) {
                  let colour = picture.colour().map(<[u8]>::to_vec);
@@ -314,7 +366,7 @@ index 9875021..f997913 100644
                  if context
                      .put_picture_shown(
                          reserved,
-@@ -874,30 +1013,35 @@ impl BookView {
+@@ -874,30 +1021,35 @@ impl BookView {
                          colour,
                      )
                      .is_some()
@@ -356,7 +408,7 @@ index 9875021..f997913 100644
                      continue;
                  };
                  let (box_width, box_height) = if name.starts_with(FORMULA_PICTURE_PREFIX) {
-@@ -906,6 +1050,7 @@ impl BookView {
+@@ -906,6 +1058,7 @@ impl BookView {
                      (width, height)
                  };
                  let Ok(picture) = picture.fit(box_width, box_height) else {
@@ -364,7 +416,7 @@ index 9875021..f997913 100644
                      continue;
                  };
                  self.dithering = Some((name, picture));
-@@ -976,18 +1121,6 @@ impl BookView {
+@@ -976,18 +1129,6 @@ impl BookView {
          self.unset = wanted.into_iter().chain(rest).collect();
      }
  
@@ -383,7 +435,7 @@ index 9875021..f997913 100644
      /// The handle a plate was reserved against, if it was.
      fn handed(&self, name: &str) -> Option<PictureHandle> {
          self.reserved.get(name).map(|picture| picture.handle)
-@@ -1003,6 +1136,9 @@ impl BookView {
+@@ -1003,6 +1144,9 @@ impl BookView {
              context.drop_picture(handle);
          }
          self.plates.clear();
@@ -393,7 +445,7 @@ index 9875021..f997913 100644
          self.unset.clear();
          self.offered.clear();
          self.reserved.clear();
-@@ -1144,6 +1280,8 @@ mod tests {
+@@ -1144,6 +1288,8 @@ mod tests {
      }
  
      use super::{picture_url, pictures_in, BookView, Step};
@@ -402,7 +454,7 @@ index 9875021..f997913 100644
      use kobo_doc::{Block, Document};
      use kobo_read::{Memory, Reader};
      use kobo_sdk::{Command, Context, PictureHandle, Task, TaskError, TaskId, TaskOutcome};
-@@ -1529,6 +1667,138 @@ mod tests {
+@@ -1529,6 +1675,158 @@ mod tests {
          }
      }
  
@@ -538,6 +590,26 @@ index 9875021..f997913 100644
 +        assert!(cache.bytes_held() <= PLATE_BUDGET);
 +    }
 +
++    /// A book carrying more plates than a web page may fetch still has room
++    /// for every one of them.
++    ///
++    /// The fetch ceiling used to cap the book's own pictures too, so an
++    /// illustrated book past its sixty-fourth plate showed only captions.
++    #[cfg(feature = "raster")]
++    #[test]
++    fn a_book_past_the_fetch_ceiling_keeps_room_for_its_last_plate() {
++        let count = super::MAX_PICTURES + 8;
++        let plate = plate_bytes();
++        let mut context = Context::default();
++        let mut view = BookView::new();
++        view.open(&mut context, plates(count, &plate), Memory::default());
++        let last = format!("plate-{}.png", count - 1);
++        assert!(
++            view.handed(&last).is_some(),
++            "the book's last plate had no room reserved"
++        );
++    }
++
      fn handed(commands: &[Command]) -> Vec<(PictureHandle, u32, u32)> {
          commands
              .iter()
@@ -553,6 +625,29 @@ index 6220e12..752dd9f 100644
      ("kobo-store", None),
  ];
  /// Applications released through Store, including the initial built-in copies
+diff --git a/crates/kobo-doc/src/epub.rs b/crates/kobo-doc/src/epub.rs
+index 1b120a5..88f97a7 100644
+--- a/crates/kobo-doc/src/epub.rs
++++ b/crates/kobo-doc/src/epub.rs
+@@ -623,12 +623,12 @@ fn read_ncx(xml: &str, base: &str) -> Vec<(String, String, Option<String>, u8)>
+ 
+ /// The most bytes of pictures carried out of one book.
+ ///
+-/// An illustrated Gutenberg edition runs to twenty-five megabytes of plates,
+-/// and this device shares its memory with the reader it is pretending not to
+-/// be. Eight is enough for the illustrations of a novel at the size this panel
+-/// can show, and is the point past which a book of photographs stops being
+-/// something to open on a reader.
+-const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
++/// An illustrated Gutenberg edition runs to twenty-five megabytes of plates.
++/// The book view keeps these compressed and decodes only the few near the
++/// page being read, so what they cost is their file size, once. Thirty-two is
++/// the largest book the shelf will hold, so no book that opens loses its
++/// pictures to this ceiling.
++const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+ 
+ /// The most bytes one picture may take.
+ ///
 diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
 index b6e6ed5..811a2e3 100644
 --- a/crates/kobo-read/src/lib.rs
