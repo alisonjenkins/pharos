@@ -4,7 +4,7 @@
   "short_label": "Pharos",
   "summary": "Listen to music and audiobooks and read ebooks from your own Pharos server.",
   "version": "0.2.0",
-  "release_notes": "Home screen with Music, Audiobooks and Books; cover grids; album masthead with cover, artist, year and length; cover on the player.",
+  "release_notes": "Home screen with Music, Audiobooks and Books; cover grids; album masthead with cover, artist, year and length; cover on the player; download and read ebooks.",
   "glyph": "headphones",
   "capabilities": ["network", "audio", "bluetooth-audio", "bluetooth-control"]
 }
