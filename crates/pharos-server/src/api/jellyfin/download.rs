@@ -196,6 +196,23 @@ pub(crate) async fn serve_item_file(
         _ => item.path.clone(),
     };
 
+    // B1451 — `maxWidth` / `maxHeight` on an EPUB ask for a copy whose
+    // pictures fit that box (a Kobo takes at most 32 MB and 2 MB a picture).
+    // The original stays untouched; any failure serves it.
+    let serve_path = match crate::book_slim::SlimBox::from_query(req.query_string()) {
+        Some(bx) if content_type_for(&serve_path) == "application/epub+zip" => {
+            crate::book_slim::get_or_slim(
+                state.books.as_ref(),
+                id,
+                item.edition.as_deref(),
+                &serve_path,
+                bx,
+            )
+            .await
+        }
+        _ => serve_path,
+    };
+
     let file = open_named_file(&serve_path).await.map_err(|e| {
         // Carry the offending path AND the underlying io error — "not found"
         // alone cannot distinguish a deleted file from a dead NFS mount, which
