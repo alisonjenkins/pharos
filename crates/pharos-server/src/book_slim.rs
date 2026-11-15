@@ -205,28 +205,47 @@ fn scale_picture(
 
     let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits.clone());
-    let (w, h) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let (w, h) = decoder.dimensions();
     if w > MAX_DIMENSION || h > MAX_DIMENSION {
         return Err(format!("{w}x{h} exceeds the {MAX_DIMENSION} decode edge"));
     }
-    if w <= bx.width && h <= bx.height {
+    // The box is about the picture as SHOWN: a camera's quarter turn swaps
+    // the stored edges (an 800x1200 stored picture turned 90° is 1200 wide).
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let (shown_w, shown_h) = if quarter_turned(orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    };
+    if shown_w <= bx.width && shown_h <= bx.height {
         return Ok(None);
     }
     if format == ImageFormat::Gif {
-        let frames = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
-            .map_err(|e| e.to_string())?
+        let mut gif =
+            image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        // Frame iteration allocates the whole canvas, so the budget applies
+        // here too, not only to the decode below.
+        gif.set_limits(limits.clone()).map_err(|e| e.to_string())?;
+        // A frame that fails (the canvas over budget) is an error, not a frame.
+        let frames = gif
             .into_frames()
             .take(2)
-            .count();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .len();
         if frames > 1 {
             return Ok(None);
         }
     }
 
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-    reader.limits(limits);
-    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
-    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    // `from_decoder` does not charge the output buffer to `max_alloc`, so
+    // reserve it by hand (as `ImageReader::decode` does) before decoding.
+    let mut limits = limits;
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| format!("{w}x{h} needs more than the decode budget: {e}"))?;
+    decoder.set_limits(limits).map_err(|e| e.to_string())?;
     let mut picture = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     picture.apply_orientation(orientation);
     if picture.width() <= bx.width && picture.height() <= bx.height {
@@ -540,6 +559,15 @@ pub async fn get_or_slim(
     slim
 }
 
+/// Whether `o` turns the picture a quarter (90° or 270°), swapping its edges.
+fn quarter_turned(o: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation as O;
+    matches!(
+        o,
+        O::Rotate90 | O::Rotate270 | O::Rotate90FlipH | O::Rotate270FlipH
+    )
+}
+
 /// A scratch path beside `slim` that no other re-pack uses. Two requests for
 /// the same book and box can both miss the cache and re-pack at once (there
 /// are [`SLIM_SLOTS`] slots); a shared name would let one truncate the
@@ -553,6 +581,54 @@ fn tmp_path_for(slim: &Path) -> PathBuf {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_quarter_turned_picture_is_judged_by_its_shown_edges() {
+        use image::ImageEncoder;
+        // Stored 800x1200, EXIF orientation 6 (turn 90°): shown 1200x800,
+        // which is wider than a 1000x1600 box.
+        let exif: Vec<u8> = vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, // TIFF header, IFD at 8
+            1, 0, // one entry
+            0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, // Orientation = 6
+            0, 0, 0, 0, // no next IFD
+        ];
+        let stored = image::RgbImage::from_pixel(800, 1200, image::Rgb([200, 30, 30]));
+        let mut jpeg = Vec::new();
+        let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 90);
+        enc.set_exif_metadata(exif).unwrap();
+        enc.write_image(stored.as_raw(), 800, 1200, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let bx = SlimBox {
+            width: 1000,
+            height: 1600,
+        };
+        let out = scale_picture(&jpeg, ImageFormat::Jpeg, bx)
+            .unwrap()
+            .expect("a picture shown wider than the box is scaled");
+        let shown = image::load_from_memory(&out).unwrap();
+        assert!(shown.width() <= 1000 && shown.height() <= 1600);
+        assert!(shown.width() > shown.height(), "the turn is applied");
+    }
+
+    #[test]
+    fn a_gif_whose_canvas_is_over_budget_is_refused_before_it_is_drawn() {
+        // A 12000x12000 logical screen (576 MB as RGBA, over the 256 MiB
+        // budget) holding one 1x1 frame.
+        let mut gif: Vec<u8> = b"GIF89a".to_vec();
+        gif.extend_from_slice(&12_000u16.to_le_bytes());
+        gif.extend_from_slice(&12_000u16.to_le_bytes());
+        gif.extend_from_slice(&[0x80, 0, 0]); // 2-colour global table
+        gif.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]); // 1x1 frame
+        gif.extend_from_slice(&[2, 2, 0x44, 0x01, 0]); // LZW data
+        gif.push(0x3B);
+        let bx = SlimBox {
+            width: 100,
+            height: 100,
+        };
+        assert!(scale_picture(&gif, ImageFormat::Gif, bx).is_err());
+    }
+
     #[test]
     fn two_repacks_of_one_book_never_share_a_scratch_file() {
         let slim = std::path::Path::new("/c/slim/book-1-2-3x4.epub");
