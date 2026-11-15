@@ -81,7 +81,7 @@ fn the_list_shows_titles_authors_and_what_cannot_be_opened() {
     assert!(screen.contains("Book One"), "{screen}");
     assert!(screen.contains("Author A"), "{screen}");
     assert!(screen.contains("Can't open here"), "{screen}");
-    assert!(!screen.contains("Downloaded"), "{screen}");
+    assert!(!screen.contains("Held"), "{screen}");
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn a_book_downloads_saves_opens_and_is_marked_downloaded() {
     });
     let commands = runner.action(ActionId::BACK);
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("Downloaded"), "{screen}");
+    assert!(screen.contains("Held"), "the downloaded mark: {screen}");
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn a_downloaded_book_reopens_from_the_shelf_and_its_menu_removes_it() {
     });
     let commands = runner.task_outcome(list, ok(BOOKS));
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("Downloaded"), "{screen}");
+    assert!(screen.contains("Held"), "the downloaded mark: {screen}");
 
     let commands = runner.action(action_id("book-0"));
     assert!(asked(&commands, "/Download").is_none(), "nothing to fetch");
@@ -277,5 +277,48 @@ fn the_books_screens_fit_the_smallest_reader() {
     for (index, screen) in screens.iter().enumerate() {
         let problems = screen.validate(&CLARA_BW_METRICS);
         assert!(problems.is_empty(), "screen {index}: {problems:?}");
+    }
+}
+
+#[test]
+fn the_books_list_is_a_grid_of_covers_drawn_together_and_dropped_on_leaving() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    });
+    let listing = r#"{"Items":[
+        {"Id":"b1","Name":"Book One","Path":"/b/one.txt","ImageTags":{"Primary":"c1"}},
+        {"Id":"b2","Name":"Book Two","Path":"/b/two.txt","ImageTags":{"Primary":"c2"}},
+        {"Id":"b3","Name":"Book Three","Path":"/b/three.txt"}
+    ],"TotalRecordCount":3}"#;
+    let commands = runner.task_outcome(list, ok(listing));
+    let screen = screen_text(&last_screen(&commands).expect("the grid"));
+    assert!(screen.contains("TileGrid"), "covers, not rows: {screen}");
+    assert!(screen.contains("Portrait"), "{screen}");
+    let covers = cover_tasks(&commands);
+    assert_eq!(covers.len(), 2, "a cover for each tagged book: {covers:?}");
+    assert!(covers[0].1.contains("/Items/b1/Images/Primary"), "{covers:?}");
+    let drawn = page_drawn(&mut runner, &commands);
+    let text = screen_text(&drawn);
+    assert_eq!(text.matches("picture: Some").count(), 2, "{text}");
+    let problems = drawn.validate(&CLARA_BW_METRICS);
+    assert!(problems.is_empty(), "fits the smallest reader: {problems:?}");
+    // Leaving the books drops the covers still wanted for them.
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let commands = runner.task_outcome(list, ok(listing));
+    let covers = cover_tasks(&commands);
+    let commands = runner.action(ActionId::BACK);
+    for (task, _) in &covers {
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel(id) if id == task)),
+            "{commands:?}"
+        );
     }
 }
