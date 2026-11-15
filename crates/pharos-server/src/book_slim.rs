@@ -231,9 +231,10 @@ fn scale_picture(
         let frames = gif
             .into_frames()
             .take(2)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .len();
+            // Count and drop each frame before the next is drawn, so two
+            // canvases are never held at once.
+            .try_fold(0usize, |n, frame| frame.map(|_| n + 1))
+            .map_err(|e| e.to_string())?;
         if frames > 1 {
             return Ok(None);
         }
