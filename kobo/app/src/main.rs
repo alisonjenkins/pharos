@@ -301,18 +301,35 @@ impl Pharos {
     /// one, as `(album id, cover tag)`. An album with no cover tag has none.
     fn wanted_covers(&self, context: &Context) -> (Vec<(String, String)>, usize) {
         let tagged = |entry: &Entry| Some((entry.id.clone(), entry.image_tag.clone()?));
+        let shelf_covers = || {
+            let pages = self.grid_pages(context);
+            let page = self.shelf_page.min(pages.len().saturating_sub(1));
+            let wanted: Vec<(String, String)> = api::wanted(&pages, page)
+                .into_iter()
+                .filter_map(|index| self.shelf.entries.get(index))
+                .filter_map(tagged)
+                .collect();
+            (wanted, pages.first().map_or(0, Vec::len))
+        };
         let (mut wanted, per_page) = match &self.view {
-            View::Album(album) => (tagged(album).into_iter().collect::<Vec<_>>(), 0),
-            View::Library(_) => {
-                let pages = self.grid_pages(context);
-                let page = self.shelf_page.min(pages.len().saturating_sub(1));
-                let wanted = api::wanted(&pages, page)
+            // The shelf stays behind an open album, so its covers on the way
+            // keep coming, after the album's own: Back finds them drawn
+            // instead of asking for them again.
+            View::Album(album) => {
+                let (behind, per_page) = shelf_covers();
+                let own = tagged(album);
+                let wanted = own
+                    .clone()
                     .into_iter()
-                    .filter_map(|index| self.shelf.entries.get(index))
-                    .filter_map(tagged)
+                    .chain(
+                        behind
+                            .into_iter()
+                            .filter(|cover| own.as_ref() != Some(cover)),
+                    )
                     .collect();
-                (wanted, pages.first().map_or(0, Vec::len))
+                (wanted, per_page)
             }
+            View::Library(_) => shelf_covers(),
             _ => (Vec::new(), 0),
         };
         // The player keeps showing its cover whatever else is on screen.
