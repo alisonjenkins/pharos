@@ -1008,7 +1008,7 @@ index 0000000..3cfa016
 +pub(crate) mod tests;
 diff --git a/crates/kobo-audio/src/remote/tests.rs b/crates/kobo-audio/src/remote/tests.rs
 new file mode 100644
-index 0000000..c26bf97
+index 0000000..3bfc5a2
 --- /dev/null
 +++ b/crates/kobo-audio/src/remote/tests.rs
 @@ -0,0 +1,286 @@
@@ -1074,10 +1074,10 @@ index 0000000..c26bf97
 +    let mut tail = vec![0; 100];
 +    reader.read_exact(&mut tail).unwrap();
 +    assert_eq!(tail, bytes[39_900..]);
-+    assert_eq!(
-+        log.lock().unwrap().first(),
-+        Some(&(9 * 4_096)),
-+        "asked the end first"
++    // Block zero may have been asked first: the tail is what matters.
++    assert!(
++        log.lock().unwrap().contains(&(9 * 4_096)),
++        "asked for the end"
 +    );
 +
 +    reader.seek(SeekFrom::Start(0)).unwrap();
@@ -1300,10 +1300,10 @@ index 0000000..c26bf97
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..c3a522d
+index 0000000..12531c8
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,1005 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1446,10 +1446,27 @@ index 0000000..c3a522d
 +pub struct Downloads {
 +    root: PathBuf,
 +    policy: DownloadPolicy,
-+    open: Arc<Mutex<HashMap<PathBuf, usize>>>,
++    open: Arc<Mutex<OpenMap>>,
 +    counters: Arc<Counters>,
 +    log: LogLine,
 +}
++
++/// A download that some [`BlockStore`] has open.
++struct Open {
++    /// How many stores hold it.
++    count: usize,
++    /// What every store on the download shares, so a store that outlives its
++    /// book (the read-ahead worker is not joined) never saves an older state
++    /// over a newer one.
++    state: Arc<Mutex<Inner>>,
++    total: u64,
++    block_bytes: u32,
++}
++
++/// The open downloads by data file. Opening a download, removing one and
++/// evicting one all take this lock, so none can slip between another's check
++/// and act.
++type OpenMap = HashMap<PathBuf, Open>;
 +
 +impl fmt::Debug for Downloads {
 +    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1733,8 +1750,8 @@ index 0000000..c3a522d
 +        found
 +    }
 +
-+    fn is_open(&self, data: &Path) -> bool {
-+        lock(&self.open).get(data).is_some_and(|count| *count > 0)
++    fn is_open(open: &OpenMap, data: &Path) -> bool {
++        open.get(data).is_some_and(|entry| entry.count > 0)
 +    }
 +
 +    fn delete(entry: &Entry) {
@@ -1745,7 +1762,7 @@ index 0000000..c3a522d
 +    /// Frees the least recently played complete downloads that nothing has
 +    /// open until `needed` more bytes fit in the budget. `false` when they
 +    /// do not fit even then.
-+    fn make_room(&self, needed: u64, keep: &Path) -> bool {
++    fn make_room(&self, open: &OpenMap, needed: u64, keep: &Path) -> bool {
 +        let budget = self.policy.budget_bytes;
 +        if needed > budget {
 +            return false;
@@ -1765,7 +1782,7 @@ index 0000000..c3a522d
 +            if used.saturating_add(needed) <= budget {
 +                break;
 +            }
-+            if self.is_open(&entry.data) {
++            if Self::is_open(open, &entry.data) {
 +                continue;
 +            }
 +            Self::delete(&entry);
@@ -1802,20 +1819,148 @@ index 0000000..c3a522d
 +        }
 +        let key = key_of(url);
 +        let (data, sidecar) = self.paths(app, &key);
-+        let existing = Self::read_meta(&sidecar).filter(|meta| {
-+            let same = expected_total.is_none_or(|total| total == meta.total)
-+                && (expected_total.is_none() || meta.block_bytes == block_bytes)
-+                && data.is_file();
-+            if !same {
-+                self.say(&format!(
-+                    "downloads: replace key={key} had_bytes={} server_bytes={expected_total:?} reason=length or block size changed",
-+                    meta.total
-+                ));
-+            }
-+            same
-+        });
++        let mut open = lock(&self.open);
 +        let now = (self.policy.now)();
++        let fits = |total: u64, block: u32| {
++            expected_total.is_none_or(|expected| expected == total)
++                && (expected_total.is_none() || block == block_bytes)
++                && data.is_file()
++        };
++        // A download already open is the state of record, not the sidecar,
++        // which may be behind it.
++        let shared = open
++            .get(&data)
++            .filter(|entry| fits(entry.total, entry.block_bytes))
++            .map(|entry| Arc::clone(&entry.state));
++        let from_disk = if shared.is_none() {
++            let existing = Self::read_meta(&sidecar).filter(|meta| {
++                let same = fits(meta.total, meta.block_bytes);
++                if !same {
++                    self.say(&format!(
++                        "downloads: replace key={key} had_bytes={} server_bytes={expected_total:?} reason=length or block size changed",
++                        meta.total
++                    ));
++                }
++                same
++            });
++            let (mut meta, fresh) = match existing {
++                Some(meta) => (meta, false),
++                None => (
++                    self.create(&open, app, &key, expected_total, block_bytes)?,
++                    true,
++                ),
++            };
++            meta.played = now;
++            Some((meta, fresh))
++        } else {
++            None
++        };
++        let file = self.open_file(&key, &data, &sidecar, from_disk.as_ref())?;
++        let fresh = from_disk.as_ref().is_some_and(|(_, fresh)| *fresh);
++        // The open lock comes after a store's own lock everywhere, so no
++        // store's state is locked while it is held.
++        let (total, block) = match (&shared, &from_disk) {
++            (Some(_), _) => open
++                .get(&data)
++                .map(|entry| (entry.total, entry.block_bytes))?,
++            (None, Some((meta, _))) => (meta.total, meta.block_bytes),
++            (None, None) => return None,
++        };
++        let state = match (shared, from_disk) {
++            (Some(state), _) => state,
++            (None, Some((meta, _))) => Arc::new(Mutex::new(Inner {
++                meta,
++                unflushed: 0,
++                low_space_noted: false,
++            })),
++            (None, None) => return None,
++        };
++        let entry = open.entry(data.clone()).or_insert_with(|| Open {
++            count: 0,
++            state: Arc::clone(&state),
++            total,
++            block_bytes: block,
++        });
++        entry.count += 1;
++        entry.state = Arc::clone(&state);
++        entry.total = total;
++        entry.block_bytes = block;
++        drop(open);
++        let have = {
++            let mut inner = lock(&state);
++            inner.meta.played = now;
++            inner.meta.have_bytes()
++        };
++        self.announce(&key, app, fresh, have, total);
++        Some(BlockStore {
++            file,
++            data,
++            sidecar,
++            key,
++            inner: state,
++            downloads: self.clone(),
++        })
++    }
++
++    /// The data file, sized and with its sidecar written when `made` holds a
++    /// new or resumed download's metadata; as it stands when the download is
++    /// already open.
++    fn open_file(
++        &self,
++        key: &str,
++        data: &Path,
++        sidecar: &Path,
++        made: Option<&(Meta, bool)>,
++    ) -> Option<File> {
++        OpenOptions::new()
++            .create(true)
++            .truncate(false)
++            .read(true)
++            .write(true)
++            .open(data)
++            .and_then(|file| match made {
++                Some((meta, true)) => file.set_len(meta.total).map(|()| file),
++                _ => Ok(file),
++            })
++            .and_then(|file| match made {
++                Some((meta, _)) => Self::write_meta(sidecar, meta).map(|()| file),
++                None => Ok(file),
++            })
++            .map_err(|error| {
++                self.say(&format!(
++                    "downloads: skip key={key} path={} reason=cannot create: {error}",
++                    data.display()
++                ));
++            })
++            .ok()
++    }
++
++    fn announce(&self, key: &str, app: &str, fresh: bool, have: u64, total: u64) {
++        if fresh {
++            bump(&self.counters.started, 1);
++            self.say(&format!(
++                "downloads: start key={key} app={app} bytes={total}"
++            ));
++        } else {
++            bump(&self.counters.resumed, 1);
++            self.say(&format!(
++                "downloads: resume key={key} app={app} have={have} bytes={total}"
++            ));
++        }
++    }
++
++    /// Clears what is on disk for `key` and admits a new download of
++    /// `expected_total` bytes in its place: its first metadata.
++    fn create(
++        &self,
++        open: &OpenMap,
++        app: &str,
++        key: &str,
++        expected_total: Option<u64>,
++        block_bytes: u32,
++    ) -> Option<Meta> {
 +        let dir = self.root.join(app);
++        let (data, sidecar) = self.paths(app, key);
 +        fs::create_dir_all(&dir)
 +            .map_err(|error| {
 +                self.say(&format!(
@@ -1824,71 +1969,19 @@ index 0000000..c3a522d
 +                ));
 +            })
 +            .ok()?;
-+        let (mut meta, fresh) = if let Some(meta) = existing {
-+            (meta, false)
-+        } else {
-+            let _ignored = fs::remove_file(&data);
-+            let _ignored = fs::remove_file(&sidecar);
-+            let total = expected_total?;
-+            if total == 0 {
-+                return None;
-+            }
-+            self.admit(&key, &dir, &data, total)?;
-+            (Meta::fresh(total, block_bytes, now), true)
-+        };
-+        meta.played = now;
-+        let file = OpenOptions::new()
-+            .create(true)
-+            .truncate(false)
-+            .read(true)
-+            .write(true)
-+            .open(&data)
-+            .and_then(|file| {
-+                if fresh {
-+                    file.set_len(meta.total)?;
-+                }
-+                Ok(file)
-+            })
-+            .and_then(|file| Self::write_meta(&sidecar, &meta).map(|()| file))
-+            .map_err(|error| {
-+                self.say(&format!(
-+                    "downloads: skip key={key} path={} reason=cannot create: {error}",
-+                    data.display()
-+                ));
-+            })
-+            .ok()?;
-+        if fresh {
-+            bump(&self.counters.started, 1);
-+            self.say(&format!(
-+                "downloads: start key={key} app={app} bytes={}",
-+                meta.total
-+            ));
-+        } else {
-+            bump(&self.counters.resumed, 1);
-+            self.say(&format!(
-+                "downloads: resume key={key} app={app} have={} bytes={}",
-+                meta.have_bytes(),
-+                meta.total
-+            ));
++        let _ignored = fs::remove_file(&data);
++        let _ignored = fs::remove_file(&sidecar);
++        let total = expected_total?;
++        if total == 0 {
++            return None;
 +        }
-+        *lock(&self.open).entry(data.clone()).or_insert(0) += 1;
-+        Some(BlockStore {
-+            file,
-+            data,
-+            sidecar,
-+            key,
-+            inner: Mutex::new(Inner {
-+                meta,
-+                unflushed: 0,
-+                low_space_noted: false,
-+            }),
-+            downloads: self.clone(),
-+        })
++        self.admit(open, key, &dir, &data, total)?;
++        Some(Meta::fresh(total, block_bytes, 0))
 +    }
 +
 +    /// Whether a new download of `total` bytes may start: the volume has room
 +    /// above the floor and the budget has room after evicting.
-+    fn admit(&self, key: &str, dir: &Path, data: &Path, total: u64) -> Option<()> {
++    fn admit(&self, open: &OpenMap, key: &str, dir: &Path, data: &Path, total: u64) -> Option<()> {
 +        let free = (self.policy.free_space)(dir);
 +        if free.is_some_and(|free| free < self.policy.min_free_bytes) {
 +            bump(&self.counters.skipped_low_space, 1);
@@ -1898,7 +1991,7 @@ index 0000000..c3a522d
 +            ));
 +            return None;
 +        }
-+        if !self.make_room(total, data) {
++        if !self.make_room(open, total, data) {
 +            bump(&self.counters.skipped_budget, 1);
 +            self.say(&format!(
 +                "downloads: skip key={key} bytes={total} reason=over budget {}",
@@ -1937,7 +2030,8 @@ index 0000000..c3a522d
 +        }
 +        let key = key_of(url);
 +        let (data, sidecar) = self.paths(app, &key);
-+        if self.is_open(&data) {
++        let open = lock(&self.open);
++        if Self::is_open(&open, &data) {
 +            self.say(&format!("downloads: remove refused key={key} reason=open"));
 +            return RemoveOutcome::InUse;
 +        }
@@ -1973,7 +2067,7 @@ index 0000000..c3a522d
 +    data: PathBuf,
 +    sidecar: PathBuf,
 +    key: String,
-+    inner: Mutex<Inner>,
++    inner: Arc<Mutex<Inner>>,
 +    downloads: Downloads,
 +}
 +
@@ -2140,6 +2234,21 @@ index 0000000..c3a522d
 +        self.file.sync_data()?;
 +        let mut inner = self.inner();
 +        inner.unflushed = 0;
++        self.save(&inner)
++    }
++
++    /// Writes the sidecar, unless a newer open of the download has replaced
++    /// this one's state: a store left over from a replaced book must not put
++    /// its older sidecar over the new book's. Held under the open lock so a
++    /// replacement cannot land between the check and the write.
++    fn save(&self, inner: &Inner) -> io::Result<()> {
++        let open = lock(&self.downloads.open);
++        let current = open
++            .get(&self.data)
++            .is_some_and(|entry| Arc::ptr_eq(&entry.state, &self.inner));
++        if !current {
++            return Ok(());
++        }
 +        Downloads::write_meta(&self.sidecar, &inner.meta)
 +    }
 +
@@ -2151,7 +2260,7 @@ index 0000000..c3a522d
 +        if length != total {
 +            let mut inner = self.inner();
 +            inner.meta.present.fill(0);
-+            let _saved = Downloads::write_meta(&self.sidecar, &inner.meta);
++            let _saved = self.save(&inner);
 +            self.downloads.say(&format!(
 +                "downloads: verify failed key={} file_bytes={length} server_bytes={total}; refetching",
 +                self.key
@@ -2189,9 +2298,9 @@ index 0000000..c3a522d
 +    fn drop(&mut self) {
 +        let _saved = self.flush();
 +        let mut open = lock(&self.downloads.open);
-+        if let Some(count) = open.get_mut(&self.data) {
-+            *count = count.saturating_sub(1);
-+            if *count == 0 {
++        if let Some(entry) = open.get_mut(&self.data) {
++            entry.count = entry.count.saturating_sub(1);
++            if entry.count == 0 {
 +                open.remove(&self.data);
 +            }
 +        }
@@ -2202,10 +2311,10 @@ index 0000000..c3a522d
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..14dfa04
+index 0000000..29c09de
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,466 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -2610,6 +2719,68 @@ index 0000000..14dfa04
 +    assert!(said(&lines, "offset=0 "), "{:?}", lines.lock().unwrap());
 +    assert!(said(&lines, "reason=the server refused the range"));
 +}
++
++fn block(index: usize, total: usize) -> Vec<u8> {
++    let bytes = pattern(total);
++    let at = index * BLOCK as usize;
++    bytes[at..(at + BLOCK as usize).min(total)].to_vec()
++}
++
++#[test]
++fn an_older_store_still_open_does_not_overwrite_the_progress_of_a_newer_one() {
++    let dir = scratch("older-store-progress");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    // The first book's read-ahead worker has not exited when the next opens.
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    let new = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(new.write(1, &block(1, 3_000)).unwrap());
++    new.flush().unwrap();
++    drop(new);
++    drop(old);
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).unwrap();
++    assert!(
++        reopened.has(0) && reopened.has(1),
++        "have {}",
++        reopened.have_bytes()
++    );
++}
++
++#[test]
++fn an_older_store_still_open_does_not_undo_a_completed_download() {
++    let dir = scratch("older-store-complete");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    let new = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    for index in 0..3_usize {
++        assert!(new.write(index as u64, &block(index, 3_000)).unwrap());
++    }
++    assert!(new.is_complete());
++    drop(new);
++    drop(old);
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).unwrap();
++    assert!(reopened.is_complete());
++}
++
++#[test]
++fn a_replaced_download_is_not_overwritten_by_the_store_of_the_one_it_replaced() {
++    let dir = scratch("older-store-replaced");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    let new = downloads.begin("shelf", URL, Some(4_000), BLOCK).unwrap();
++    assert!(new.write(1, &block(1, 4_000)).unwrap());
++    new.flush().unwrap();
++    drop(new);
++    drop(old);
++    let reopened = downloads.begin("shelf", URL, Some(4_000), BLOCK).unwrap();
++    assert_eq!(reopened.total(), 4_000);
++    assert!(reopened.has(1), "have {}", reopened.have_bytes());
++}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
 --- a/crates/kobo-audio/src/tests.rs
@@ -2759,7 +2930,7 @@ index 6220e12..752dd9f 100644
  ];
  /// Applications released through Store, including the initial built-in copies
 diff --git a/crates/kobo-hal/src/audio.rs b/crates/kobo-hal/src/audio.rs
-index 9f5ad70..db3d018 100644
+index 9f5ad70..16638a5 100644
 --- a/crates/kobo-hal/src/audio.rs
 +++ b/crates/kobo-hal/src/audio.rs
 @@ -13,7 +13,9 @@
@@ -2926,7 +3097,7 @@ index 9f5ad70..db3d018 100644
              Ok(book) => {
                  let description = Arc::new(book.description().clone());
                  let duration_ms = book.duration_ms();
-@@ -798,44 +836,171 @@ impl Worker<'_> {
+@@ -798,44 +836,176 @@ impl Worker<'_> {
      }
  }
  
@@ -3040,12 +3211,17 @@ index 9f5ad70..db3d018 100644
 +    };
 +    let held_bytes = first.body.len() as u64;
 +    match (first.partial, first.total) {
-+        (true, Some(total)) if total > held_bytes => {
++        // A file of one block or less is the whole first reply; it still goes
++        // through the downloads when it is to be kept.
++        (true, Some(total)) if total > held_bytes || (keep.is_some() && total == held_bytes) => {
 +            let fetch = ranged(fetcher, url);
 +            let kept = keep.and_then(|keep| {
 +                keep.downloads
 +                    .begin(keep.app, url, Some(total), options.block_bytes)
 +            });
++            if kept.is_none() && total == held_bytes {
++                return whole(first.body);
++            }
 +            let remote = match kept {
 +                Some(store) => Remote::open_stored(fetch, store, first.body, options.clone()),
 +                None => Remote::open(fetch, total, first.body, options.clone()),
@@ -3125,7 +3301,7 @@ index 9f5ad70..db3d018 100644
  /// Records one new observation of the sink.
  fn record_sink(state: &Mutex<State>, connected: bool) {
      let mut observed = locked(state);
-@@ -1089,14 +1254,16 @@ fn io_error(error: std::io::Error) -> DeviceError {
+@@ -1089,14 +1259,16 @@ fn io_error(error: std::io::Error) -> DeviceError {
  #[cfg(test)]
  mod tests {
      use super::{next_deadline, Audio, Sockets, Source, BACKEND_MARKERS};
@@ -3143,7 +3319,7 @@ index 9f5ad70..db3d018 100644
      use std::time::{Duration, Instant};
  
      fn fixture(name: &str) -> PathBuf {
-@@ -1195,7 +1362,7 @@ mod tests {
+@@ -1195,7 +1367,7 @@ mod tests {
          let _ = audio.load(Source::File(fixture("cover.png")));
          assert_eq!(
              settled(&audio),
@@ -3152,7 +3328,7 @@ index 9f5ad70..db3d018 100644
          );
          assert!(audio.detail().is_none());
          assert_eq!(audio.play(), DeviceResult::Failed(DeviceError::NotFound));
-@@ -1460,4 +1627,240 @@ mod tests {
+@@ -1460,4 +1632,265 @@ mod tests {
          let audio = Audio::simulated();
          drop(audio);
      }
@@ -3250,6 +3426,31 @@ index 9f5ad70..db3d018 100644
 +        // And with no network stack at all.
 +        assert!(open_stream(&renewed, None, &small_blocks(1_024), Some(keep)).is_ok());
 +        assert_eq!(*asked.lock().expect("count"), 0);
++    }
++
++    #[test]
++    fn a_stream_of_one_block_or_less_is_kept_too() {
++        let downloads = downloads_in("one-block");
++        let keep = Keep {
++            downloads: &downloads,
++            app: "shelf",
++        };
++        let size = std::fs::metadata(fixture("stereo.mp3"))
++            .expect("fixture")
++            .len();
++        let options = small_blocks(u32::try_from(size).expect("small") + 1_000);
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("stereo.mp3", true, &log);
++        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &options, Some(keep)).expect("opens");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(sound_of(&mut book), sound_of(&mut local));
++        drop(book);
++        let held = downloads.progress("shelf", &[UNIVERSAL.to_owned()]);
++        assert_eq!(held.len(), 1, "kept for offline");
++        assert_eq!(held[0].have, size);
++
++        let dead: StreamFetcher = Arc::new(|_url, _offset, _max| Err(DeviceError::Unreachable));
++        assert!(open_stream(UNIVERSAL, Some(&dead), &options, Some(keep)).is_ok());
 +    }
 +
 +    #[test]
