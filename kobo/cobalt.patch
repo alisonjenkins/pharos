@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..a0592ce
+index 0000000..dbe189b
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1036 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1922,27 +1922,51 @@ index 0000000..a0592ce
 +        sidecar: &Path,
 +        made: Option<&(Meta, bool)>,
 +    ) -> Option<File> {
++        match made {
++            Some((meta, true)) => Self::install(data, sidecar, meta),
++            Some((meta, false)) => Self::open_data(data)
++                .and_then(|file| Self::write_meta(sidecar, meta).map(|()| file)),
++            None => Self::open_data(data),
++        }
++        .map_err(|error| {
++            self.say(&format!(
++                "downloads: skip key={key} path={} reason=cannot create: {error}",
++                data.display()
++            ));
++        })
++        .ok()
++    }
++
++    fn open_data(data: &Path) -> io::Result<File> {
 +        OpenOptions::new()
 +            .create(true)
 +            .truncate(false)
 +            .read(true)
 +            .write(true)
 +            .open(data)
-+            .and_then(|file| match made {
-+                Some((meta, true)) => file.set_len(meta.total).map(|()| file),
-+                _ => Ok(file),
-+            })
-+            .and_then(|file| match made {
-+                Some((meta, _)) => Self::write_meta(sidecar, meta).map(|()| file),
-+                None => Ok(file),
-+            })
-+            .map_err(|error| {
-+                self.say(&format!(
-+                    "downloads: skip key={key} path={} reason=cannot create: {error}",
-+                    data.display()
-+                ));
-+            })
-+            .ok()
++    }
++
++    /// Puts a new download in place of whatever is at `data` and `sidecar`.
++    /// Both are prepared under other names and renamed over the old pair, so
++    /// a failure before that leaves the old download as it was.
++    fn install(data: &Path, sidecar: &Path, meta: &Meta) -> io::Result<File> {
++        let staged_data = data.with_extension("new");
++        let staged_sidecar = sidecar.with_extension("tmp");
++        let prepared = OpenOptions::new()
++            .create(true)
++            .truncate(true)
++            .read(true)
++            .write(true)
++            .open(&staged_data)
++            .and_then(|file| file.set_len(meta.total).map(|()| file))
++            .and_then(|file| fs::write(&staged_sidecar, meta.encode()).map(|()| file))
++            .and_then(|file| fs::rename(&staged_data, data).map(|()| file))
++            .and_then(|file| fs::rename(&staged_sidecar, sidecar).map(|()| file));
++        if prepared.is_err() {
++            let _ignored = fs::remove_file(&staged_data);
++            let _ignored = fs::remove_file(&staged_sidecar);
++        }
++        prepared
 +    }
 +
 +    fn announce(&self, key: &str, app: &str, fresh: bool, have: u64, total: u64) {
@@ -1987,10 +2011,10 @@ index 0000000..a0592ce
 +            clear();
 +            return None;
 +        };
-+        // A refusal leaves what is there: a store still open on it saves
-+        // its sidecar again, which must find its data file.
++        // Nothing on disk is touched yet: a store still open on it saves its
++        // sidecar again, which must find its data file. `install` swaps the
++        // files only once the new pair is ready.
 +        self.admit(open, key, &dir, &data, total)?;
-+        clear();
 +        Some(Meta::fresh(total, block_bytes, 0))
 +    }
 +
@@ -2328,10 +2352,10 @@ index 0000000..a0592ce
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..f06ddde
+index 0000000..752daa6
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,534 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -2842,6 +2866,29 @@ index 0000000..f06ddde
 +    drop(old);
 +    let reopened = downloads.begin("shelf", URL, None, BLOCK).expect("kept");
 +    assert!(reopened.has(0));
++}
++
++#[test]
++fn a_replacement_that_cannot_be_prepared_leaves_the_old_download_readable() {
++    let dir = scratch("replacement-unprepared");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    old.flush().unwrap();
++    // The replacement is admitted, then cannot write its sidecar: a folder
++    // sits where the sidecar is staged.
++    let staging = dir.join("shelf").join(format!("{}.tmp", key_of(URL)));
++    std::fs::create_dir(&staging).unwrap();
++    assert!(downloads.begin("shelf", URL, Some(4_000), BLOCK).is_none());
++    let held = downloads.progress("shelf", &[URL.to_owned()]);
++    assert_eq!((held[0].have, held[0].total), (u64::from(BLOCK), 3_000));
++    assert_eq!(old.read(0).unwrap(), block(0, 3_000));
++    std::fs::remove_dir(&staging).unwrap();
++    drop(old);
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).expect("kept");
++    assert!(reopened.has(0));
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
