@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..37a26a0
+index 0000000..b9f5438
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1239 @@
+@@ -0,0 +1,1249 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1764,14 +1764,14 @@ index 0000000..37a26a0
 +    /// another generation: a store left over from a replaced book must not
 +    /// put its older state over the new book's. The caller holds the open
 +    /// lock, which the replacement's commit also takes.
-+    fn write_meta(sidecar: &Path, meta: &Meta) -> io::Result<()> {
++    fn write_meta(&self, sidecar: &Path, meta: &Meta) -> io::Result<()> {
 +        if Self::read_meta(sidecar).is_some_and(|disk| disk.generation != meta.generation) {
 +            return Ok(());
 +        }
 +        let staging = sidecar.with_extension("tmp");
 +        Self::write_synced(&staging, &meta.encode())?;
 +        fs::rename(&staging, sidecar)?;
-+        Self::sync_dir(sidecar)
++        self.sync_dir(sidecar)
 +    }
 +
 +    /// Writes `text` to `path` and has it on disk before returning, so a
@@ -1787,14 +1787,24 @@ index 0000000..37a26a0
 +    /// Linux FAT syncs a folder like any file, so a failure is real and is
 +    /// returned. Only `EINVAL`, which a filesystem that cannot sync a folder
 +    /// answers, is taken as there being nothing to do.
-+    fn sync_dir(published: &Path) -> io::Result<()> {
-+        published.parent().map_or(Ok(()), Self::sync_folder)
++    fn sync_dir(&self, published: &Path) -> io::Result<()> {
++        published
++            .parent()
++            .map_or(Ok(()), |dir| self.sync_folder(dir))
 +    }
 +
-+    fn sync_folder(dir: &Path) -> io::Result<()> {
++    /// `EINVAL` is unexpected on the Kobo's FAT, which does sync folders, so
++    /// it is logged each time it is taken as success.
++    fn sync_folder(&self, dir: &Path) -> io::Result<()> {
 +        const EINVAL: i32 = 22;
 +        match File::open(dir).and_then(|dir| dir.sync_all()) {
-+            Err(error) if error.raw_os_error() == Some(EINVAL) => Ok(()),
++            Err(error) if error.raw_os_error() == Some(EINVAL) => {
++                self.say(&format!(
++                    "downloads: folder sync unsupported dir={} reason={error}; taken as done",
++                    dir.display()
++                ));
++                Ok(())
++            }
 +            result => result,
 +        }
 +    }
@@ -1852,7 +1862,7 @@ index 0000000..37a26a0
 +        let Ok(listing) = fs::read_dir(dir) else {
 +            return;
 +        };
-+        if let Err(error) = self.step("sync-dir").and_then(|()| Self::sync_folder(dir)) {
++        if let Err(error) = self.step("sync-dir").and_then(|()| self.sync_folder(dir)) {
 +            self.say(&format!(
 +                "downloads: sweep skipped dir={} reason=cannot sync: {error}",
 +                dir.display()
@@ -2077,7 +2087,7 @@ index 0000000..37a26a0
 +        match (made, data) {
 +            (Some((meta, true)), _) => self.install(sidecar, meta),
 +            (Some((meta, false)), Some(data)) => Self::open_data(&data)
-+                .and_then(|file| Self::write_meta(sidecar, meta).map(|()| (file, data))),
++                .and_then(|file| self.write_meta(sidecar, meta).map(|()| (file, data))),
 +            (None, Some(data)) => Self::open_data(&data).map(|file| (file, data)),
 +            (Some(_) | None, None) => Err(io::Error::from(io::ErrorKind::NotFound)),
 +        }
@@ -2144,7 +2154,7 @@ index 0000000..37a26a0
 +        // the disk keeps if the rename is lost, it names a data file that is
 +        // still there. The old generation is swept once this has succeeded.
 +        self.step("sync-dir")
-+            .and_then(|()| Self::sync_dir(sidecar))?;
++            .and_then(|()| self.sync_dir(sidecar))?;
 +        Ok((file, data))
 +    }
 +
@@ -2493,7 +2503,7 @@ index 0000000..37a26a0
 +    fn save(&self, inner: &Inner) -> io::Result<()> {
 +        let _open = lock(&self.downloads.open);
 +        self.downloads.step("save-sidecar")?;
-+        Downloads::write_meta(&self.sidecar, &inner.meta)
++        self.downloads.write_meta(&self.sidecar, &inner.meta)
 +    }
 +
 +    /// Every block is present: checks the file is the length the server
@@ -2555,10 +2565,10 @@ index 0000000..37a26a0
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..ad72e16
+index 0000000..5660ca1
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,821 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3352,6 +3362,33 @@ index 0000000..ad72e16
 +    assert!(store.write(16, chunk(16)).unwrap());
 +    assert!(store.has(16));
 +    assert!(store.write(17, chunk(17)).unwrap());
++}
++
++#[test]
++fn another_books_admission_sweeps_nothing_while_the_folder_cannot_be_synced() {
++    const OTHER: &str = "https://books.example/Audio/bbb/universal?api_key=old&static=true";
++    let (dir, plain, failing, before) = replacement_whose_folder_sync_fails("sweep-other");
++    // The old store is closed. A different book in the same folder is
++    // admitted, which sweeps, while the folder still cannot be synced.
++    let _other = failing.begin("shelf", OTHER, Some(3_000), BLOCK);
++    let key = key_of(URL);
++    let ours = || {
++        datas(&dir)
++            .into_iter()
++            .filter(|path| {
++                path.file_name()
++                    .unwrap()
++                    .to_str()
++                    .unwrap()
++                    .starts_with(&key)
++            })
++            .count()
++    };
++    assert_eq!(ours(), 2, "swept before the rename was durable");
++    std::fs::write(sidecar_of(&dir), before).unwrap();
++    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("old pair");
++    assert_eq!(reopened.total(), 3_000);
++    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
