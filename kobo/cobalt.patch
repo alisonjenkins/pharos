@@ -626,7 +626,7 @@ index 6220e12..752dd9f 100644
  ];
  /// Applications released through Store, including the initial built-in copies
 diff --git a/crates/kobo-doc/src/epub.rs b/crates/kobo-doc/src/epub.rs
-index 1b120a5..88f97a7 100644
+index 1b120a5..2da5cf2 100644
 --- a/crates/kobo-doc/src/epub.rs
 +++ b/crates/kobo-doc/src/epub.rs
 @@ -623,12 +623,12 @@ fn read_ncx(xml: &str, base: &str) -> Vec<(String, String, Option<String>, u8)>
@@ -641,10 +641,10 @@ index 1b120a5..88f97a7 100644
 -const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 +/// An illustrated Gutenberg edition runs to twenty-five megabytes of plates.
 +/// The book view keeps these compressed and decodes only the few near the
-+/// page being read, so what they cost is their file size, once. Thirty-two is
++/// page being read, so what they cost is their file size, once. Sixty-four is
 +/// the largest book the shelf will hold, so no book that opens loses its
 +/// pictures to this ceiling.
-+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
++const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
  
  /// The most bytes one picture may take.
  ///
