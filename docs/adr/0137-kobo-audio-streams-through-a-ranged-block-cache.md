@@ -53,8 +53,11 @@ So the blocks are kept.
   named by a 128-bit FNV-1a hash of the URL without its `api_key` (a new
   sign-in keeps the download). Beside it a sidecar records the length, the
   block size, when it was last played, which blocks are present and which
-  data file (by inode) it describes, so a sidecar left beside another file is
-  discarded. A block
+  generation of the data file it describes: the file is named
+  `<hash>.<generation>.data`, a replacement writes its own beside the old one,
+  and renaming the sidecar is the single commit, after which files no sidecar
+  names are swept. (An inode would not do: FAT renumbers them on every
+  remount.) A block
   counts only once it is on disk; the sidecar is saved every 16 blocks and on
   close, after the data is synced. The RAM cache stays the hot layer and the
   file is the backing store. The folder is not the app's shelf: a shelf is
