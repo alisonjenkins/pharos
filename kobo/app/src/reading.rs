@@ -27,7 +27,6 @@ const DETAIL_COVER_MM: u16 = 26;
 /// smallest reader's text before the rest moves to its About pages.
 const DETAIL_TEASER_CHARS: usize = 480;
 
-
 /// Where the caller goes after the Books screens handled something.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Leave {
@@ -99,6 +98,13 @@ pub struct Reading {
     write: Option<Vec<u8>>,
     /// A change came while a write was out; write again when it lands.
     dirty: bool,
+    /// Books on the reader that are not in the list loaded so far, asked
+    /// for by id so the home screen can show them (V1445).
+    known: Vec<Book>,
+    known_task: Option<TaskId>,
+    /// Whether the open book came from the home screen, which closing it
+    /// returns to.
+    from_home: bool,
 }
 
 impl Reading {
@@ -123,6 +129,9 @@ impl Reading {
             opened: false,
             write: None,
             dirty: false,
+            known: Vec::new(),
+            known_task: None,
+            from_home: false,
         }
     }
 
@@ -134,16 +143,81 @@ impl Reading {
 
     /// Shows the Books screens for `account`, loading what they need once.
     pub fn open(&mut self, context: &mut Context, account: &Account) {
-        self.account = Some(account.clone());
+        self.prepare(context, account);
         self.mode = Mode::List;
         self.notice = None;
+        self.from_home = false;
+        if self.list.books.is_empty() {
+            self.load_list(context, 0);
+        }
+    }
+
+    /// Reads the record of downloaded books, if it has not been, so the home
+    /// screen knows what was read here.
+    pub fn prepare(&mut self, context: &mut Context, account: &Account) {
+        self.account = Some(account.clone());
         if self.load == Load::Unloaded {
             self.load = Load::Loading;
             context.store().load(books::KEY);
         }
-        if self.list.books.is_empty() {
-            self.load_list(context, 0);
+    }
+
+    /// The book `id`, from the list or from those asked for by id.
+    fn book(&self, id: &str) -> Option<&Book> {
+        self.list
+            .books
+            .iter()
+            .chain(&self.known)
+            .find(|book| book.id == id)
+    }
+
+    /// The books read on this reader, the most recently read first, as far
+    /// as pharos has described them (V1445).
+    #[must_use]
+    pub fn recent(&self) -> Vec<Book> {
+        self.shelf
+            .recent()
+            .filter_map(|saved| self.book(&saved.id).cloned())
+            .collect()
+    }
+
+    /// Asks pharos about the books read here that it has not described yet.
+    pub fn fetch_known(&mut self, context: &mut Context) {
+        if self.known_task.is_some() {
+            return;
         }
+        let Some(account) = &self.account else {
+            return;
+        };
+        let missing: Vec<&str> = self
+            .shelf
+            .recent()
+            .map(|saved| saved.id.as_str())
+            .filter(|id| self.book(id).is_none())
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.known_task = context.spawn(Task::Fetch {
+            url: books::by_ids_url(self.server, account, &missing),
+            offset: 0,
+            max_bytes: MAX_JSON,
+            credential: None,
+            headers: self.headers(),
+        });
+    }
+
+    /// Opens the book `id`, read here before, from the home screen: where
+    /// the reader stopped, and closing it goes back home. `false` when it
+    /// is not one of [`Self::recent`].
+    pub fn continue_book(&mut self, context: &mut Context, account: &Account, id: &str) -> bool {
+        let Some(book) = self.recent().into_iter().find(|book| book.id == id) else {
+            return false;
+        };
+        self.open(context, account);
+        self.from_home = true;
+        self.begin_book(context, book);
+        true
     }
 
     fn headers(&self) -> Vec<Header> {
@@ -603,6 +677,20 @@ impl Reading {
         id: TaskId,
         outcome: &TaskOutcome,
     ) -> Option<Leave> {
+        if self.known_task == Some(id) {
+            self.known_task = None;
+            match outcome {
+                TaskOutcome::Completed(bytes) => {
+                    if let Some(page) = books::parse_page(bytes) {
+                        self.known = page.books;
+                    }
+                }
+                TaskOutcome::Failed(TaskError::Unauthorized) => return Some(Leave::SignOut),
+                // The home screen does without them until the next try.
+                TaskOutcome::Failed(_) | TaskOutcome::Cancelled => {}
+            }
+            return Some(Leave::Stay);
+        }
         if let Some((task, start)) = self.list_task {
             if task == id {
                 self.list_task = None;
@@ -739,6 +827,9 @@ impl Reading {
     pub fn action(&mut self, context: &mut Context, action: ActionId) -> Leave {
         if self.opened {
             self.act_in_book(context, action);
+            if !self.opened && std::mem::take(&mut self.from_home) {
+                return Leave::Back;
+            }
             return Leave::Stay;
         }
         if action == action_id("books-cancel") {
@@ -834,9 +925,13 @@ impl Reading {
 
     /// Opens the book at `index`, downloading it first if it is not here.
     fn begin(&mut self, context: &mut Context, index: usize) {
-        let Some(book) = self.list.books.get(index).cloned() else {
-            return;
-        };
+        if let Some(book) = self.list.books.get(index).cloned() {
+            self.begin_book(context, book);
+        }
+    }
+
+    /// Opens `book`, downloading it first if it is not here.
+    fn begin_book(&mut self, context: &mut Context, book: Book) {
         self.mode = Mode::List;
         self.notice = None;
         if let Support::Cannot(why) = book.support {

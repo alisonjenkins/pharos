@@ -130,6 +130,17 @@ pub fn list_url(server: &str, account: &Account, start: usize) -> String {
     )
 }
 
+/// The books named by `ids`, with what [`list_url`] asks for of each.
+#[must_use]
+pub fn by_ids_url(server: &str, account: &Account, ids: &[&str]) -> String {
+    let ids: Vec<String> = ids.iter().map(|id| query_escape(id)).collect();
+    format!(
+        "{server}/Users/{}/Items?Ids={}&Fields=Path,People,Overview",
+        query_escape(&account.user_id),
+        ids.join(",")
+    )
+}
+
 /// The book's file. The runtime fetches it in pieces, with the account's
 /// header on each.
 #[must_use]
@@ -273,16 +284,29 @@ impl Shelf {
         self.saved.retain(|saved| saved.file != file);
     }
 
-    /// Keeps where the reader stopped. A position too big to keep is dropped
-    /// rather than the record being refused.
+    /// Keeps where the reader stopped, and moves the book to the end, where
+    /// the most recently read one is (V1445). A position too big to keep is
+    /// dropped rather than the record being refused.
     pub fn remember(&mut self, id: &str, memory: String) {
-        if let Some(saved) = self.saved.iter_mut().find(|saved| saved.id == id) {
-            saved.memory = if memory.len() <= MAX_MEMORY {
-                memory
-            } else {
-                String::new()
-            };
-        }
+        let Some(at) = self.saved.iter().position(|saved| saved.id == id) else {
+            return;
+        };
+        let mut saved = self.saved.remove(at);
+        saved.memory = if memory.len() <= MAX_MEMORY {
+            memory
+        } else {
+            String::new()
+        };
+        self.saved.push(saved);
+    }
+
+    /// The books opened on this reader, the most recently read first. A book
+    /// downloaded and never opened has no place kept, and is not one.
+    pub fn recent(&self) -> impl Iterator<Item = &Saved> {
+        self.saved
+            .iter()
+            .rev()
+            .filter(|saved| !saved.memory.is_empty())
     }
 
     #[must_use]
@@ -547,5 +571,35 @@ mod tests {
         );
         shelf.remove("book-a.epub");
         assert_eq!(shelf.get("a"), None);
+    }
+
+    #[test]
+    fn the_last_book_read_comes_first_and_an_unopened_one_not_at_all() {
+        let mut shelf = Shelf::default();
+        assert!(shelf.insert(saved("a", "at 2\n")));
+        assert!(shelf.insert(saved("b", "at 9\n")));
+        assert!(shelf.insert(saved("c", "")));
+        let order = |shelf: &Shelf| {
+            shelf
+                .recent()
+                .map(|saved| saved.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&shelf), ["b", "a"]);
+        shelf.remember("a", "at 3\n".to_owned());
+        assert_eq!(order(&shelf), ["a", "b"]);
+        // The order is the record's, so it survives a restart.
+        assert_eq!(
+            Shelf::decode(&shelf.encode()).as_ref().map(order),
+            Some(order(&shelf))
+        );
+    }
+
+    #[test]
+    fn books_are_asked_for_by_id_with_their_details() {
+        assert_eq!(
+            by_ids_url("https://p", &account(), &["b1", "b 2"]),
+            "https://p/Users/u1/Items?Ids=b1,b%202&Fields=Path,People,Overview"
+        );
     }
 }
