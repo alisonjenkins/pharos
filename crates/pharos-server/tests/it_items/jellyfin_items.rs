@@ -2269,3 +2269,92 @@ async fn items_under_a_books_library_are_books_only() {
         [("Intro to Widgets".to_owned(), "Series".to_owned())]
     );
 }
+
+/// B1454 / V1440 — an album listing under a library's `ParentId` lists only
+/// the albums whose tracks that library owns, the innermost library winning,
+/// so a Books library nested in a music root lists its audiobooks alone.
+#[actix_web::test]
+async fn an_album_listing_is_scoped_to_its_parent_library() {
+    use pharos_core::{LibraryKind, LibraryStore as _, MediaProbe};
+    let (state, token, uid) = seed().await;
+    let music = "a".repeat(32);
+    let books = "b".repeat(32);
+    let stores = &state.stores;
+    stores
+        .upsert_library("Sound", "/media", LibraryKind::Music, &music)
+        .await
+        .unwrap();
+    stores
+        .upsert_library("Reading", "/media/Books", LibraryKind::Books, &books)
+        .await
+        .unwrap();
+    for (id, path, album) in [
+        (1, "/media/Band/Record/01.mp3", "A Record"),
+        (2, "/media/Band/Record/02.mp3", "A Record"),
+        (3, "/media/Books/Narrator/Tale/01.mp3", "A Tale"),
+    ] {
+        stores
+            .put(MediaItem {
+                id,
+                path: path.into(),
+                title: format!("t{id}"),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    album: Some(album.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    stores.backfill_library_ids().await.unwrap();
+    state.set_libraries(stores.libraries().await.unwrap());
+    let app = test::init_service(build_app(state.clone())).await;
+    let albums = |parent: Option<&str>| {
+        let app = &app;
+        let token = token.clone();
+        let mut uri = format!(
+            "/Users/{}/Items?IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=SortName",
+            uid.0.simple()
+        );
+        if let Some(parent) = parent {
+            uri.push_str(&format!("&ParentId={parent}"));
+        }
+        async move {
+            let req = test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request();
+            let v: serde_json::Value =
+                serde_json::from_slice(&test::call_and_read_body(app, req).await).unwrap();
+            let names = v["Items"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{uri}: {v}"))
+                .iter()
+                .map(|i| {
+                    (
+                        i["Name"].as_str().unwrap().to_owned(),
+                        i["PharosAudiobook"].as_bool().unwrap_or(false),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (names, v["TotalRecordCount"].as_u64())
+        }
+    };
+    assert_eq!(
+        albums(Some(&books)).await,
+        (vec![("A Tale".to_owned(), true)], Some(1)),
+        "a Books library lists its audiobooks, not the music around it"
+    );
+    assert_eq!(
+        albums(Some(&music)).await,
+        (vec![("A Record".to_owned(), false)], Some(1)),
+        "a music root leaves out the Books library nested in it"
+    );
+    assert_eq!(
+        albums(None).await.1,
+        Some(2),
+        "with no ParentId every album is listed, as before"
+    );
+}
