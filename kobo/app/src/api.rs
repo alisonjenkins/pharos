@@ -12,6 +12,10 @@ pub const DEVICE_ID: &str = "pharos-kobo";
 /// How many rows one request asks for. One panel page shows fewer, and the
 /// rest are turned to without another round trip.
 pub const PAGE: u32 = 50;
+/// How many albums one shelf request asks for. Pharos groups every track into
+/// albums on each request, whatever the page size, so fewer, larger pages
+/// cost the server less; at a few KB a row this stays under the reply cap.
+pub const SHELF_PAGE: u32 = 100;
 
 /// Ticks are 100 ns: what Jellyfin positions are counted in.
 const TICKS_PER_MS: u64 = 10_000;
@@ -195,7 +199,7 @@ pub fn views_url(server: &str, account: &Account) -> String {
 pub fn albums_url(server: &str, account: &Account, library: &str, start: usize) -> String {
     format!(
         "{server}/Users/{}/Items?IncludeItemTypes=MusicAlbum&Recursive=true\
-         &ParentId={}&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={PAGE}",
+         &ParentId={}&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={SHELF_PAGE}",
         query_escape(&account.user_id),
         query_escape(library)
     )
@@ -669,7 +673,7 @@ mod tests {
         let albums = albums_url("https://p.test", &account(), "lib1", 50);
         assert!(albums.starts_with("https://p.test/Users/u1/Items?IncludeItemTypes=MusicAlbum"));
         assert!(albums.contains("&ParentId=lib1&"));
-        assert!(albums.contains("StartIndex=50&Limit=50"));
+        assert!(albums.contains("StartIndex=50&Limit=100"));
         let tracks = tracks_url("https://p.test", &account(), "al1", 50);
         assert!(tracks.contains("ParentId=al1"));
         assert!(tracks.contains("StartIndex=50&Limit=50"));

@@ -36,8 +36,9 @@ const MAX_JSON: u32 = 512 * 1024;
 /// a tile is on the smallest reader, so the picture already held fits.
 const HERO_COVER_MM: u16 = 26;
 /// The most rows of a shelf that are fetched. A shelf loads whole, in blocks
-/// of [`api::PAGE`], because pharos cannot filter audiobooks from music on
-/// its side; this stops a huge library from being read forever.
+/// of [`api::SHELF_PAGE`]. Pharos scopes albums to the library asked for
+/// (B1454), and `Kind::keeps` still sorts audiobooks from music for a server
+/// that does not; this stops a huge library from being read forever.
 const MAX_SHELF: usize = 2_000;
 /// The largest cover reply taken. A cover is sized to a tile, so this is
 /// many times what one needs.
