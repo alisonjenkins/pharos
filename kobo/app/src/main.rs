@@ -10,10 +10,13 @@
 
 mod api;
 
-use api::{Account, Entry, Kind, Page, Report, Section};
+use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
-use kobo_sdk::{Glyph, Header, LogLevel, Task, TaskError, TaskId, TaskOutcome};
+use kobo_sdk::{
+    Glyph, Header, LogLevel, PictureHandle, Task, TaskError, TaskId, TaskOutcome, TilePicture,
+    TileShape, MAX_TASKS_IN_FLIGHT,
+};
 use std::process::ExitCode;
 
 const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
@@ -32,6 +35,16 @@ const ROWS_PER_PAGE: usize = 7;
 /// of [`api::PAGE`], because pharos cannot filter audiobooks from music on
 /// its side; this stops a huge library from being read forever.
 const MAX_SHELF: usize = 2_000;
+/// The largest cover reply taken. A cover is sized to a tile, so this is
+/// many times what one needs.
+const MAX_COVER: u32 = 1024 * 1024;
+/// How many covers are fetched at once. The runtime runs four tasks in all,
+/// and the sign-in poll, the playing report and the player need the rest.
+const MAX_COVER_TASKS: usize = 2;
+/// The fewest covers held. The runtime keeps every picture until told
+/// otherwise, so the held covers are bounded to a few pages of tiles: at
+/// least this, or three pages when a panel shows more than a few tiles.
+const MIN_COVERS: usize = 24;
 
 #[derive(Debug)]
 enum View {
@@ -69,6 +82,10 @@ enum Work {
         kind: Kind,
         start: usize,
     },
+    /// The cover of one album.
+    Cover {
+        id: String,
+    },
     /// One block of an album's tracks, from `start`.
     Tracks {
         album: String,
@@ -99,6 +116,7 @@ struct Pharos {
     /// Whether the whole listing has been read.
     shelf_done: bool,
     shelf_page: usize,
+    covers: CoverCache,
     tracks: Page,
     page: usize,
     /// The album whose tracks are loaded, for Back from the player.
@@ -119,6 +137,7 @@ impl Default for Pharos {
             shelf_sent: 0,
             shelf_done: false,
             shelf_page: 0,
+            covers: CoverCache::new(MIN_COVERS),
             tracks: Page::default(),
             page: 0,
             album: None,
@@ -192,6 +211,7 @@ impl Pharos {
         self.account = None;
         self.sections = None;
         self.clear_shelf();
+        self.drop_covers(context);
         context.store().forget(ACCOUNT_KEY);
         self.sign_in(context);
     }
@@ -204,6 +224,186 @@ impl Pharos {
         self.view = View::Home;
         self.sections = None;
         self.fetch(context, url, Work::Views);
+    }
+
+    /// Lets go of every cover and stops the ones on their way.
+    fn drop_covers(&mut self, context: &mut Context) {
+        let covering: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|(_, work)| matches!(work, Work::Cover { .. }))
+            .map(|(task, _)| *task)
+            .collect();
+        for task in covering {
+            context.cancel(task);
+            self.tasks.retain(|(id, _)| *id != task);
+        }
+        for handle in self.covers.clear() {
+            context.drop_picture(PictureHandle(handle));
+        }
+    }
+
+    /// The tile shape a kind's shelf is drawn in.
+    fn shape(kind: Kind) -> TileShape {
+        if kind.portrait() {
+            TileShape::Portrait
+        } else {
+            TileShape::Square
+        }
+    }
+
+    /// The tiles of the shelf, split into the pages this panel holds.
+    fn grid_pages(&self, context: &Context) -> Vec<Vec<usize>> {
+        context.paginate_tiles(self.shelf.entries.len(), Self::shape(self.kind), false)
+    }
+
+    /// The pixel size a cover is asked for and fitted to: the tile it fills.
+    fn cover_size(&self, context: &Context) -> (u32, u32) {
+        let metrics = context.metrics();
+        let shape = Self::shape(self.kind);
+        let margin = metrics.screen_margin();
+        let columns = metrics.grid_columns_for_width(shape, metrics.width - 2 * margin);
+        api::cover_px(
+            metrics.width,
+            margin,
+            metrics.tenth_mm(20),
+            columns,
+            self.kind.portrait(),
+        )
+    }
+
+    /// The cover for `id`, once the runtime holds it.
+    fn cover_of(&self, id: &str) -> Option<TilePicture> {
+        match self.covers.state(id)? {
+            Cover::Ready {
+                handle,
+                width,
+                height,
+            } => Some(TilePicture::new(PictureHandle(handle), width, height)),
+            Cover::Loading | Cover::Failed => None,
+        }
+    }
+
+    /// The covers worth having now: those on the page showing and the next
+    /// one, as `(album id, cover tag)`. An album with no cover tag has none.
+    fn wanted_covers(&self, context: &Context) -> (Vec<(String, String)>, usize) {
+        let View::Library(_) = self.view else {
+            return (Vec::new(), 0);
+        };
+        let pages = self.grid_pages(context);
+        let page = self.shelf_page.min(pages.len().saturating_sub(1));
+        let per_page = pages.first().map_or(0, Vec::len);
+        let wanted = api::wanted(&pages, page)
+            .into_iter()
+            .filter_map(|index| self.shelf.entries.get(index))
+            .filter_map(|entry| Some((entry.id.clone(), entry.image_tag.clone()?)))
+            .collect();
+        (wanted, per_page)
+    }
+
+    /// Brings the covers in line with what is showing: keeps those still
+    /// wanted, stops those no longer wanted, and starts the next few.
+    fn refresh_covers(&mut self, context: &mut Context) {
+        let (wanted, per_page) = self.wanted_covers(context);
+        self.covers.set_capacity(MIN_COVERS.max(per_page * 3));
+        self.covers
+            .set_pinned(self.album.iter().map(|album| album.id.clone()).collect());
+        // Last wanted first, so the page showing is the newest and the last
+        // to be pushed out.
+        for (id, _) in wanted.iter().rev() {
+            self.covers.touch(id);
+        }
+        let stale: Vec<(TaskId, String)> = self
+            .tasks
+            .iter()
+            .filter_map(|(task, work)| match work {
+                Work::Cover { id } if !wanted.iter().any(|(wanted, _)| wanted == id) => {
+                    Some((*task, id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (task, id) in stale {
+            context.cancel(task);
+            self.tasks.retain(|(held, _)| *held != task);
+            self.covers.release(&id);
+        }
+        let (width, height) = self.cover_size(context);
+        let mut fetching = self
+            .tasks
+            .iter()
+            .filter(|(_, work)| matches!(work, Work::Cover { .. }))
+            .count();
+        for (id, tag) in &wanted {
+            if self.covers.state(id).is_some() {
+                continue;
+            }
+            // Leave a task free for everything that is not a cover.
+            if fetching >= MAX_COVER_TASKS || context.tasks_in_flight() + 1 >= MAX_TASKS_IN_FLIGHT {
+                break;
+            }
+            let url = api::image_url(SERVER, id, Some(tag), width, height);
+            let Some(task) = context.spawn(Task::Fetch {
+                url,
+                offset: 0,
+                max_bytes: MAX_COVER,
+                credential: None,
+                headers: self.header(),
+            }) else {
+                break;
+            };
+            self.tasks.push((task, Work::Cover { id: id.clone() }));
+            for handle in self.covers.begin(id) {
+                context.drop_picture(PictureHandle(handle));
+            }
+            fetching += 1;
+        }
+    }
+
+    /// Takes a cover that arrived: fits it to its tile, and hands it to the
+    /// runtime in colour only when the panel can show colour.
+    fn cover_arrived(&mut self, context: &mut Context, id: &str, bytes: &[u8]) {
+        if self.covers.state(id) != Some(Cover::Loading) {
+            return;
+        }
+        let (width, height) = self.cover_size(context);
+        let colour = context.panel_shows_colour();
+        let decoded = if colour {
+            kobo_image::decode_colour(bytes)
+        } else {
+            kobo_image::decode(bytes)
+        };
+        let picture = match decoded.and_then(|picture| picture.cover(width, height)) {
+            Ok(picture) => picture,
+            Err(error) => return self.cover_failed(context, id, &error.to_string()),
+        };
+        let (width, height) = (picture.width(), picture.height());
+        let rgb = if colour {
+            picture.colour().map(<[u8]>::to_vec)
+        } else {
+            None
+        };
+        let Some(handle) = self.covers.ready(id, width, height) else {
+            return;
+        };
+        let shown = context.put_picture_shown(
+            PictureHandle(handle),
+            width,
+            height,
+            picture.into_grey(),
+            rgb,
+        );
+        if shown.is_none() {
+            self.cover_failed(context, id, "the runtime would not take the picture");
+        }
+    }
+
+    /// A cover that cannot be had keeps its glyph. It is logged the first
+    /// time only, and not asked for again while it stays held.
+    fn cover_failed(&mut self, context: &mut Context, id: &str, why: &str) {
+        if self.covers.failed(id) {
+            context.log(LogLevel::Info, format!("pharos: cover {id} skipped: {why}"));
+        }
     }
 
     fn clear_shelf(&mut self) {
@@ -367,34 +567,8 @@ impl Pharos {
                 Some(sections) => self.sections = Some(sections),
                 None => self.problem("Pharos sent a list of libraries this app could not read."),
             },
-            Work::Shelf { kind, start } => {
-                // A reply for a shelf the reader has since left is stale.
-                if !matches!(self.view, View::Library(open) if open == kind)
-                    || self.kind != kind
-                    || start != self.shelf_sent
-                {
-                    return;
-                }
-                match api::parse_page(bytes) {
-                    Some(page) => {
-                        self.shelf_sent += page.sent;
-                        self.shelf.total = page.total;
-                        self.shelf
-                            .entries
-                            .extend(page.entries.into_iter().filter(|entry| kind.keeps(entry)));
-                        self.shelf_done = page.sent == 0
-                            || self.shelf_sent >= page.total
-                            || self.shelf_sent >= MAX_SHELF;
-                        if !self.shelf_done {
-                            if let Some(library) = self.shelf_library() {
-                                let next = self.shelf_sent;
-                                self.load_shelf(context, &library, next);
-                            }
-                        }
-                    }
-                    None => self.problem("Pharos sent a list this app could not read."),
-                }
-            }
+            Work::Cover { id } => self.cover_arrived(context, &id, bytes),
+            Work::Shelf { kind, start } => self.shelf_arrived(context, kind, start, bytes),
             Work::Tracks { album, start } => {
                 // A reply for an album the reader has since left is stale.
                 if self.album.as_ref().is_none_or(|open| open.id != album)
@@ -437,12 +611,44 @@ impl Pharos {
         }
     }
 
+    /// Takes one block of a shelf and asks for the next until the listing is
+    /// read.
+    fn shelf_arrived(&mut self, context: &mut Context, kind: Kind, start: usize, bytes: &[u8]) {
+        // A reply for a shelf the reader has since left is stale.
+        if !matches!(self.view, View::Library(open) if open == kind)
+            || self.kind != kind
+            || start != self.shelf_sent
+        {
+            return;
+        }
+        match api::parse_page(bytes) {
+            Some(page) => {
+                self.shelf_sent += page.sent;
+                self.shelf.total = page.total;
+                self.shelf
+                    .entries
+                    .extend(page.entries.into_iter().filter(|entry| kind.keeps(entry)));
+                self.shelf_done =
+                    page.sent == 0 || self.shelf_sent >= page.total || self.shelf_sent >= MAX_SHELF;
+                if !self.shelf_done {
+                    if let Some(library) = self.shelf_library() {
+                        let next = self.shelf_sent;
+                        self.load_shelf(context, &library, next);
+                    }
+                }
+            }
+            None => self.problem("Pharos sent a list this app could not read."),
+        }
+    }
+
     fn failed(&mut self, context: &mut Context, work: Work, error: TaskError) {
         context.log(
             LogLevel::Info,
             format!("pharos: {} failed: {error:?}", work_label(&work)),
         );
         match (work, error) {
+            // A cover that fails keeps its glyph and nothing else changes.
+            (Work::Cover { id }, error) => self.cover_failed(context, &id, &format!("{error:?}")),
             (_, TaskError::Unauthorized) if self.account.is_some() => {
                 // Signed out on the server (the device removed, or the
                 // password changed): forget the token and sign in again.
@@ -536,7 +742,7 @@ impl Pharos {
                     self.shelf.entries.len(),
                     kind.noun()
                 )))
-                .rows(Self::rows(&self.shelf, self.shelf_page, false))
+                .picture_tiles(Self::shape(*kind), self.tiles(context))
                 .page_turns("page-back", "page-next")
                 .build()
                 .with_own_back(true),
@@ -565,6 +771,35 @@ impl Pharos {
         }
     }
 
+    /// The tiles of the shelf page showing, each with its cover when it has
+    /// arrived and its glyph until then.
+    fn tiles(&self, context: &Context) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
+        let pages = self.grid_pages(context);
+        let page = self.shelf_page.min(pages.len().saturating_sub(1));
+        pages
+            .get(page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let entry = self.shelf.entries.get(index)?;
+                Some((
+                    format!("tile-{index}"),
+                    entry.name.clone(),
+                    Self::glyph(self.kind),
+                    self.cover_of(&entry.id),
+                ))
+            })
+            .collect()
+    }
+
+    fn glyph(kind: Kind) -> Glyph {
+        match kind {
+            Kind::Music => Glyph::Music,
+            Kind::Audiobooks => Glyph::Headphones,
+            Kind::Books => Glyph::Books,
+        }
+    }
+
     /// One tile for each kind of library the owner can see.
     fn home_screen(&self) -> Screen {
         let screen = self.now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"));
@@ -574,15 +809,10 @@ impl Pharos {
                 screen.text("Pharos shows no music, audiobooks or books for this account.")
             }
             Some(sections) => screen.tiles(sections.iter().map(|section| {
-                let glyph = match section.kind {
-                    Kind::Music => Glyph::Music,
-                    Kind::Audiobooks => Glyph::Headphones,
-                    Kind::Books => Glyph::Books,
-                };
                 (
                     format!("section-{}", section.kind.label().to_lowercase()),
                     section.kind.label(),
-                    glyph,
+                    Self::glyph(section.kind),
                 )
             })),
         };
@@ -604,17 +834,22 @@ impl Pharos {
         context.set_screen(screen);
     }
 
-    fn row_index(action: ActionId, visible: usize) -> Option<usize> {
-        (0..visible).find(|index| action == action_id(&format!("row-{index}")))
+    /// Which of `visible` things an action named `{prefix}-{index}` chose.
+    fn indexed(action: ActionId, prefix: &str, visible: usize) -> Option<usize> {
+        (0..visible).find(|index| action == action_id(&format!("{prefix}-{index}")))
     }
 
-    fn turn(&mut self, forward: bool) {
-        let (page, current) = match &self.view {
-            View::Library(_) => (&self.shelf, &mut self.shelf_page),
-            View::Album(_) => (&self.tracks, &mut self.page),
+    fn turn(&mut self, context: &Context, forward: bool) {
+        let pages = match &self.view {
+            View::Library(_) => self.grid_pages(context).len().max(1),
+            View::Album(_) => self.tracks.entries.len().div_ceil(ROWS_PER_PAGE).max(1),
             _ => return,
         };
-        let pages = page.entries.len().div_ceil(ROWS_PER_PAGE).max(1);
+        let current = if matches!(self.view, View::Library(_)) {
+            &mut self.shelf_page
+        } else {
+            &mut self.page
+        };
         if forward && *current + 1 < pages {
             *current += 1;
         } else if !forward && *current > 0 {
@@ -631,6 +866,7 @@ fn work_label(work: &Work) -> &'static str {
         Work::Finish => "finish",
         Work::Views => "views",
         Work::Shelf { .. } => "shelf",
+        Work::Cover { .. } => "cover",
         Work::Tracks { .. } => "tracks",
         Work::Report(report) => report.label(),
         Work::ReportTimer => "report-timer",
@@ -701,9 +937,9 @@ impl KoboApp for Pharos {
         } else if action == action_id("sign-out") {
             self.sign_out(context);
         } else if action == action_id("page-next") {
-            self.turn(true);
+            self.turn(context, true);
         } else if action == action_id("page-back") {
-            self.turn(false);
+            self.turn(context, false);
         } else {
             let visible = match &self.view {
                 View::Library(_) => self.shelf.entries.len(),
@@ -718,18 +954,23 @@ impl KoboApp for Pharos {
                     self.open_section(context, kind);
                 }
             }
-            if let Some(index) = Self::row_index(action, visible) {
-                match &self.view {
-                    View::Library(_) => {
+            match &self.view {
+                View::Library(_) => {
+                    if let Some(index) = Self::indexed(action, "tile", visible) {
                         if let Some(album) = self.shelf.entries.get(index).cloned() {
                             self.open_album(context, album);
                         }
                     }
-                    View::Album(_) => self.play(context, index),
-                    _ => {}
                 }
+                View::Album(_) => {
+                    if let Some(index) = Self::indexed(action, "row", visible) {
+                        self.play(context, index);
+                    }
+                }
+                _ => {}
             }
         }
+        self.refresh_covers(context);
         self.show(context);
     }
 
@@ -774,6 +1015,7 @@ impl KoboApp for Pharos {
             TaskOutcome::Failed(error) => self.failed(context, work, error),
             TaskOutcome::Cancelled => {}
         }
+        self.refresh_covers(context);
         self.show(context);
     }
 }
