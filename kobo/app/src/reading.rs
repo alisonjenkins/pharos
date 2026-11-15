@@ -76,6 +76,7 @@ enum Job {
     Removing(String),
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent flags, each documented
 pub struct Reading {
     server: &'static str,
     version: &'static str,
@@ -108,6 +109,10 @@ pub struct Reading {
     /// Whether the open book came from the home screen, which closing it
     /// returns to.
     from_home: bool,
+    /// The book whose detail page the home screen opened, which need not be
+    /// in the list loaded so far. While set, the detail and About pages
+    /// show it rather than a book of the list.
+    home_book: Option<Book>,
 }
 
 impl Reading {
@@ -136,6 +141,7 @@ impl Reading {
             known: Vec::new(),
             known_task: None,
             from_home: false,
+            home_book: None,
         }
     }
 
@@ -151,6 +157,7 @@ impl Reading {
         self.mode = Mode::List;
         self.notice = None;
         self.from_home = false;
+        self.home_book = None;
         if self.list.books.is_empty() {
             self.load_list(context, 0);
         }
@@ -224,6 +231,27 @@ impl Reading {
         true
     }
 
+    /// Opens the detail page of the book `id`, read here before, from the
+    /// home screen; Back from it, or closing the book read from it, goes
+    /// back home. `false` when it is not one of [`Self::recent`].
+    pub fn show_book(&mut self, context: &mut Context, account: &Account, id: &str) -> bool {
+        let Some(book) = self.recent().into_iter().find(|book| book.id == id) else {
+            return false;
+        };
+        self.open(context, account);
+        self.from_home = true;
+        self.home_book = Some(book);
+        self.mode = Mode::Menu(0);
+        true
+    }
+
+    /// The book a detail or About page at `index` shows.
+    fn detail_book(&self, index: usize) -> Option<&Book> {
+        self.home_book
+            .as_ref()
+            .or_else(|| self.list.books.get(index))
+    }
+
     fn headers(&self) -> Vec<Header> {
         let token = self.account.as_ref().map(|account| account.token.as_str());
         vec![Header::new(
@@ -287,17 +315,17 @@ impl Reading {
         }
         let detail = match self.mode {
             Mode::List => None,
-            Mode::Menu(index) | Mode::About { index, .. } => Some(index),
+            Mode::Menu(index) | Mode::About { index, .. } => self.detail_book(index),
         };
         let pages = self.pages(context);
         let page = self.page.min(pages.len().saturating_sub(1));
         let listed = api::wanted(&pages, page)
             .into_iter()
-            .filter(|index| Some(*index) != detail);
+            .filter_map(|index| self.list.books.get(index))
+            .filter(|book| detail.is_none_or(|detail| detail.id != book.id));
         detail
             .into_iter()
             .chain(listed)
-            .filter_map(|index| self.list.books.get(index))
             .filter_map(|book| Some((book.id.clone(), book.image_tag.clone()?)))
             .collect()
     }
@@ -465,12 +493,12 @@ impl Reading {
             return screen;
         }
         if let Mode::Menu(index) = self.mode {
-            if let Some(book) = self.list.books.get(index) {
+            if let Some(book) = self.detail_book(index) {
                 return own(self.detail(book, cover(&book.id)));
             }
         }
         if let Mode::About { index, page } = self.mode {
-            if let Some(book) = self.list.books.get(index) {
+            if let Some(book) = self.detail_book(index) {
                 return own(about::screen(
                     context,
                     "pharos-book-about",
@@ -637,6 +665,7 @@ impl Reading {
                 StoreResult::ShelfRemoved { name } if *name == file => {
                     self.shelf.remove(&file);
                     self.mode = Mode::List;
+                    self.home_book = None;
                     self.say(BannerLevel::Success, "Download removed.");
                     self.save(context);
                 }
@@ -914,6 +943,11 @@ impl Reading {
         if action == ActionId::BACK {
             self.mode = match self.mode {
                 Mode::List => return Leave::Back,
+                Mode::Menu(_) if self.home_book.is_some() => {
+                    self.home_book = None;
+                    self.from_home = false;
+                    return Leave::Back;
+                }
                 Mode::Menu(_) => Mode::List,
                 Mode::About { index, .. } => Mode::Menu(index),
             };
@@ -929,7 +963,10 @@ impl Reading {
             self.turn(context, false);
         } else if action == action_id("book-read") {
             if let Mode::Menu(index) = self.mode {
-                self.begin(context, index);
+                match self.home_book.take() {
+                    Some(book) => self.begin_book(context, book),
+                    None => self.begin(context, index),
+                }
             }
         } else if action == action_id("book-remove") {
             self.remove(context);
@@ -978,7 +1015,7 @@ impl Reading {
         let Mode::About { index, page } = self.mode else {
             return;
         };
-        let Some(book) = self.list.books.get(index) else {
+        let Some(book) = self.detail_book(index) else {
             return;
         };
         let pages = about::page_count(context, &book.overview);
@@ -1052,9 +1089,7 @@ impl Reading {
             return;
         };
         let Some(saved) = self
-            .list
-            .books
-            .get(index)
+            .detail_book(index)
             .and_then(|book| self.shelf.get(&book.id))
             .cloned()
         else {

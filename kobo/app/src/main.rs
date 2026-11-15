@@ -20,7 +20,7 @@ use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
 use kobo_sdk::{
     Glyph, Header, LogLevel, PictureHandle, Position, Task, TaskError, TaskId, TaskOutcome,
-    TilePicture, TileShape, MAX_TASKS_IN_FLIGHT,
+    TilePicture, TileShape, TileState, MAX_TASKS_IN_FLIGHT,
 };
 use reading::{Leave, Reading};
 use std::process::ExitCode;
@@ -122,6 +122,7 @@ struct Playing {
     sound_reported: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent flags, each documented
 struct Pharos {
     view: View,
     account: Option<Account>,
@@ -159,6 +160,9 @@ struct Pharos {
     /// The track to carry on from, and where, once the open album's tracks
     /// arrive: set when the album was opened from Continue listening.
     resume_at: Option<(String, u64)>,
+    /// Whether that track plays as soon as it has loaded: a hold on the tile
+    /// or the Resume button, not the tap that only opened the album.
+    resume_now: bool,
     /// Whether the open album came from the home screen, which Back returns to.
     album_from_home: bool,
 }
@@ -187,6 +191,7 @@ impl Default for Pharos {
             reading: Reading::new(SERVER, VERSION),
             listening: Vec::new(),
             resume_at: None,
+            resume_now: false,
             album_from_home: false,
         }
     }
@@ -257,6 +262,7 @@ impl Pharos {
         self.sections = None;
         self.listening.clear();
         self.resume_at = None;
+        self.resume_now = false;
         self.album_from_home = false;
         self.clear_shelf();
         self.drop_covers(context);
@@ -724,6 +730,7 @@ impl Pharos {
         self.page = 0;
         self.about = None;
         self.resume_at = None;
+        self.resume_now = false;
         self.album_from_home = false;
         self.album = Some(album.clone());
         self.load_tracks(context, album.id.clone(), 0);
@@ -899,7 +906,8 @@ impl Pharos {
     }
 
     /// Plays the track the album was opened to carry on from, once it has
-    /// loaded; forgets it when the album turns out not to hold it.
+    /// loaded and the listener has asked to; forgets it when the album turns
+    /// out not to hold it.
     fn carry_on(&mut self, context: &mut Context, more: bool) {
         let Some((track, at)) = self.resume_at.clone() else {
             return;
@@ -910,8 +918,9 @@ impl Pharos {
             .iter()
             .position(|entry| entry.id == track)
         {
-            Some(index) => {
+            Some(index) if self.resume_now => {
                 self.resume_at = None;
+                self.resume_now = false;
                 self.play_from(context, index, Some(at));
             }
             None if !more => {
@@ -921,7 +930,7 @@ impl Pharos {
                 );
                 self.resume_at = None;
             }
-            None => {}
+            Some(_) | None => {}
         }
     }
 
@@ -1046,8 +1055,23 @@ impl Pharos {
             by,
             facts,
         );
-        match teaser {
+        let screen = match teaser {
             Some((shown, _)) => screen.text(shown),
+            None => screen,
+        };
+        // Opened from Continue listening: the way to carry on, on the page,
+        // as well as the hold on the home tile.
+        match &self.resume_at {
+            Some((track, at)) => {
+                let number = self
+                    .tracks
+                    .entries
+                    .iter()
+                    .position(|entry| entry.id == *track)
+                    .map(|index| format!("track {} ", index + 1))
+                    .unwrap_or_default();
+                screen.primary_button("resume", format!("Resume {number}at {}", api::clock(*at)))
+            }
             None => screen,
         }
     }
@@ -1250,7 +1274,19 @@ impl Pharos {
     }
 
     /// The tiles of the home screen's Continue listening row.
-    fn listening_tiles(&self, count: usize) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
+    #[allow(clippy::type_complexity)]
+    fn listening_tiles(
+        &self,
+        count: usize,
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Glyph,
+        String,
+        Option<TilePicture>,
+        TileState,
+    )> {
         self.listening
             .iter()
             .take(count)
@@ -1264,15 +1300,30 @@ impl Pharos {
                 (
                     format!("listen-{index}"),
                     resumed.album.name.clone(),
+                    resumed.album.by.clone(),
                     glyph,
+                    format!("listen-hold-{index}"),
                     self.cover_of(&format!("{HOME_COVER}{}", resumed.album.id)),
+                    TileState::Normal,
                 )
             })
             .collect()
     }
 
     /// The tiles of the Continue reading row, with each book's id.
-    fn reading_tiles(&self, count: usize) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
+    #[allow(clippy::type_complexity)]
+    fn reading_tiles(
+        &self,
+        count: usize,
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Glyph,
+        String,
+        Option<TilePicture>,
+        TileState,
+    )> {
         self.reading
             .recent()
             .into_iter()
@@ -1282,8 +1333,11 @@ impl Pharos {
                 (
                     format!("read-{index}"),
                     book.title.clone(),
+                    book.author.clone(),
                     Glyph::Book,
+                    format!("read-hold-{index}"),
                     self.cover_of(&format!("{HOME_COVER}{}", book.id)),
+                    TileState::Normal,
                 )
             })
             .collect()
@@ -1314,12 +1368,12 @@ impl Pharos {
         if listening > 0 {
             screen = screen
                 .section("Continue listening")
-                .picture_tiles(TileShape::Square, self.listening_tiles(listening));
+                .contextual_picture_tiles(TileShape::Square, self.listening_tiles(listening));
         }
         if reading > 0 {
             screen = screen
                 .section("Continue reading")
-                .picture_tiles(TileShape::Square, self.reading_tiles(reading));
+                .contextual_picture_tiles(TileShape::Square, self.reading_tiles(reading));
         }
         if listening + reading > 0 {
             screen = screen.section("Libraries");
@@ -1385,11 +1439,14 @@ impl Pharos {
         }
     }
 
-    /// Answers a tap on a recent tile: an album carries on from where it was
-    /// left, a book opens where the reader stopped. Whether it was one.
+    /// Answers a recent tile, as every Pharos home screen does: a tap opens
+    /// the album's or the book's page, which offers Resume or Read, and a
+    /// hold carries on at once. Whether the action was one.
     fn open_recent(&mut self, context: &mut Context, action: ActionId) -> bool {
         let (listening, reading) = self.home_rows(context);
-        if let Some(index) = Self::indexed(action, "listen", listening) {
+        let tapped = Self::indexed(action, "listen", listening).map(|index| (index, false));
+        let held = Self::indexed(action, "listen-hold", listening).map(|index| (index, true));
+        if let Some((index, now)) = tapped.or(held) {
             if let Some(resumed) = self.listening.get(index).cloned() {
                 self.kind = if resumed.album.audiobook {
                     Kind::Audiobooks
@@ -1399,24 +1456,32 @@ impl Pharos {
                 context.log(
                     LogLevel::Info,
                     format!(
-                        "pharos: home continue album={} track={} at_ms={}",
+                        "pharos: home open album={} track={} at_ms={} play_now={now}",
                         resumed.album.id, resumed.track, resumed.position_ms
                     ),
                 );
                 self.open_album(context, resumed.album);
                 self.resume_at = Some((resumed.track, resumed.position_ms));
+                self.resume_now = now;
                 self.album_from_home = true;
             }
             return true;
         }
-        if let Some(index) = Self::indexed(action, "read", reading) {
+        let tapped = Self::indexed(action, "read", reading).map(|index| (index, false));
+        let held = Self::indexed(action, "read-hold", reading).map(|index| (index, true));
+        if let Some((index, now)) = tapped.or(held) {
             let book = self.reading.recent().into_iter().nth(index);
             if let (Some(book), Some(account)) = (book, self.account.clone()) {
                 context.log(
                     LogLevel::Info,
-                    format!("pharos: home continue book={}", book.id),
+                    format!("pharos: home open book={} read_now={now}", book.id),
                 );
-                if self.reading.continue_book(context, &account, &book.id) {
+                let opened = if now {
+                    self.reading.continue_book(context, &account, &book.id)
+                } else {
+                    self.reading.show_book(context, &account, &book.id)
+                };
+                if opened {
                     self.view = View::Books;
                 }
             }
@@ -1606,6 +1671,10 @@ impl KoboApp for Pharos {
                 Some(_) => self.load_views(context),
                 None => self.sign_in(context),
             }
+        } else if action == action_id("resume") && matches!(self.view, View::Album(_)) {
+            self.resume_now = true;
+            let more = self.tracks.total == 0 || self.tracks.entries.len() < self.tracks.total;
+            self.carry_on(context, more);
         } else if action == action_id("about") && matches!(self.view, View::Album(_)) {
             self.about = Some(0);
         } else if action == action_id("now-playing") && self.playing.is_some() {

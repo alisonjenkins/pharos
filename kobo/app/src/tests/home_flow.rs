@@ -117,19 +117,34 @@ fn a_described_audiobook_gets_its_glyph_and_cover() {
     assert!(text.contains("Picture"), "{text}");
 }
 
-#[test]
-fn a_tile_carries_on_from_the_track_and_place_it_was_left() {
-    let (mut runner, _) = listening();
-    let commands = runner.action(action_id("listen-0"));
-    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
-    let commands = runner.task_outcome(tracks, ok(TRACKS));
-    let (_, task) = asked(&commands, "/Sessions/Playing").expect("started report");
+/// Asserts `commands` started `tr2` ten minutes in.
+fn started_ten_minutes_in(commands: &[Command]) {
+    let (_, task) = asked(commands, "/Sessions/Playing").expect("started report");
     let Task::Post { body, .. } = task else {
         panic!("a report is a POST");
     };
     assert!(body.contains("\"ItemId\":\"tr2\""), "{body}");
     let played = format!("{commands:?}");
     assert!(played.contains("600"), "starts ten minutes in: {played}");
+}
+
+#[test]
+fn a_tap_opens_the_album_with_a_resume_button_and_plays_nothing_yet() {
+    let (mut runner, _) = listening();
+    let commands = runner.action(action_id("listen-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let commands = runner.task_outcome(tracks, ok(TRACKS));
+    assert!(
+        asked(&commands, "/Sessions/Playing").is_none(),
+        "a tap only opens"
+    );
+    let screen = last_screen(&commands).expect("a screen");
+    let text = screen_text(&screen);
+    assert!(text.contains("Resume track 2 at 10:00"), "{text}");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
+
+    let commands = runner.action(action_id("resume"));
+    started_ten_minutes_in(&commands);
 
     // Back from the player is the album; Back from the album is home.
     let _ = runner.action(ActionId::BACK);
@@ -140,6 +155,28 @@ fn a_tile_carries_on_from_the_track_and_place_it_was_left() {
         asked(&commands, "/Items/Resume").is_some(),
         "home asks again, so what played here comes first"
     );
+}
+
+#[test]
+fn a_hold_carries_on_from_the_track_and_place_it_was_left() {
+    let (mut runner, commands) = listening();
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("menu: Some"), "the tile has a hold: {text}");
+    let commands = runner.action(action_id("listen-hold-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let commands = runner.task_outcome(tracks, ok(TRACKS));
+    started_ten_minutes_in(&commands);
+}
+
+#[test]
+fn resume_pressed_before_the_tracks_arrive_plays_when_they_do() {
+    let (mut runner, _) = listening();
+    let commands = runner.action(action_id("listen-0"));
+    let (tracks, _) = asked(&commands, "ParentId=al1").expect("tracks");
+    let commands = runner.action(action_id("resume"));
+    assert!(asked(&commands, "/Sessions/Playing").is_none());
+    let commands = runner.task_outcome(tracks, ok(TRACKS));
+    started_ten_minutes_in(&commands);
 }
 
 #[test]
@@ -179,17 +216,21 @@ fn a_failed_resume_list_leaves_the_libraries_alone() {
     );
 }
 
-#[test]
-fn books_read_here_continue_from_the_home_screen_and_close_back_to_it() {
+/// The home screen with `b1` read on this reader and described.
+fn reading() -> AppRunner<Pharos> {
     let (mut runner, commands) = signed_in(Some(record("at 2\n")));
     let (known, _) = asked(&commands, "Ids=b1&").expect("only the book read is asked about");
     let commands = runner.task_outcome(known, ok(BOOKS));
     let text = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(text.contains("Continue reading"), "{text}");
     assert!(text.contains("Book One"), "{text}");
+    assert!(text.contains("Author A"), "{text}");
+    runner
+}
 
-    let commands = runner.action(action_id("read-0"));
-    assert!(asked(&commands, "/Download").is_none(), "nothing to fetch");
+/// Delivers `b1` from the shelf, asserts it opened, and closes it.
+fn read_and_close(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Vec<Command> {
+    assert!(asked(commands, "/Download").is_none(), "nothing to fetch");
     assert!(commands.iter().any(|command| matches!(
         command,
         Command::Store(StoreRequest::ShelfRead { name, .. }) if name == "book-b1.txt"
@@ -202,7 +243,50 @@ fn books_read_here_continue_from_the_home_screen_and_close_back_to_it() {
     });
     let text = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(text.contains("Some prose to read"), "{text}");
+    runner.action(ActionId::BACK)
+}
+
+#[test]
+fn a_tap_on_a_book_opens_its_detail_page_and_back_goes_home() {
+    let mut runner = reading();
+    let commands = runner.action(action_id("read-0"));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, Command::Store(StoreRequest::ShelfRead { .. }))),
+        "a tap only opens the page"
+    );
+    let screen = last_screen(&commands).expect("a screen");
+    let text = screen_text(&screen);
+    assert!(
+        text.contains("pharos-book-detail") || text.contains("Book One"),
+        "{text}"
+    );
+    assert!(text.contains("Read"), "{text}");
+    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
     let commands = runner.action(ActionId::BACK);
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("Continue reading"), "Back goes home: {text}");
+}
+
+#[test]
+fn reading_from_the_detail_page_closes_back_home() {
+    let mut runner = reading();
+    let _ = runner.action(action_id("read-0"));
+    let commands = runner.action(action_id("book-read"));
+    let commands = read_and_close(&mut runner, &commands);
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        text.contains("Continue reading"),
+        "closing goes home: {text}"
+    );
+}
+
+#[test]
+fn a_hold_on_a_book_opens_it_where_it_stopped_and_closing_goes_home() {
+    let mut runner = reading();
+    let commands = runner.action(action_id("read-hold-0"));
+    let commands = read_and_close(&mut runner, &commands);
     let text = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(
         text.contains("Continue reading"),
