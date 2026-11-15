@@ -1,7 +1,8 @@
 //! Pharos on a Kobo (spec 047, ADR-0136).
 //!
 //! Signs in to the owner's pharos with a Quick Connect code, shows a home
-//! screen with a section for each kind of library the owner can see, lists
+//! screen with what the owner was last listening to and reading (V1445) and a
+//! section for each kind of library the owner can see, lists
 //! the albums and audiobooks in one, and plays a track through the runtime's Bluetooth audio, telling
 //! pharos where the listener is so any other device can carry on.
 //!
@@ -14,7 +15,7 @@ mod books;
 mod letters;
 mod reading;
 
-use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Section};
+use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Resumed, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
 use kobo_sdk::{
@@ -51,6 +52,11 @@ const MAX_COVER_TASKS: usize = 2;
 /// otherwise, so the held covers are bounded to a few pages of tiles: at
 /// least this, or three pages when a panel shows more than a few tiles.
 const MIN_COVERS: usize = 24;
+/// What the home screen's covers are held under, ahead of the item's id. Its
+/// tiles are square, as small as a tile comes, so both recent rows and the
+/// libraries share one panel; held apart, a cover sized for them never
+/// stands in on a shelf or the book grid, whose tiles are bigger.
+const HOME_COVER: &str = "home/";
 
 #[derive(Debug)]
 enum View {
@@ -60,7 +66,8 @@ enum View {
     SignIn {
         code: Option<String>,
     },
-    /// The sections: one for each kind of library the owner can see.
+    /// What the owner was last listening to and reading, then the sections:
+    /// one for each kind of library the owner can see.
     Home,
     /// A shelf of albums or audiobooks.
     Library(Kind),
@@ -83,6 +90,12 @@ enum Work {
     },
     Finish,
     Views,
+    /// The part-played tracks, for the home screen's Continue listening row.
+    Listening,
+    /// Pharos's description of one album in that row.
+    ListeningAlbum {
+        id: String,
+    },
     /// One block of a shelf's albums, from `start` rows into the listing.
     Shelf {
         kind: Kind,
@@ -140,6 +153,14 @@ struct Pharos {
     playing: Option<Playing>,
     report_timer: Option<TaskId>,
     reading: Reading,
+    /// The albums and audiobooks the owner stopped part-way through, newest
+    /// first (V1445).
+    listening: Vec<Resumed>,
+    /// The track to carry on from, and where, once the open album's tracks
+    /// arrive: set when the album was opened from Continue listening.
+    resume_at: Option<(String, u64)>,
+    /// Whether the open album came from the home screen, which Back returns to.
+    album_from_home: bool,
 }
 
 impl Default for Pharos {
@@ -164,6 +185,9 @@ impl Default for Pharos {
             playing: None,
             report_timer: None,
             reading: Reading::new(SERVER, VERSION),
+            listening: Vec::new(),
+            resume_at: None,
+            album_from_home: false,
         }
     }
 }
@@ -231,6 +255,9 @@ impl Pharos {
         self.stop_playing(context);
         self.account = None;
         self.sections = None;
+        self.listening.clear();
+        self.resume_at = None;
+        self.album_from_home = false;
         self.clear_shelf();
         self.drop_covers(context);
         self.reading.reset(context);
@@ -243,9 +270,107 @@ impl Pharos {
             return;
         };
         let url = api::views_url(SERVER, account);
+        let account = account.clone();
         self.view = View::Home;
         self.sections = None;
         self.fetch(context, url, Work::Views);
+        self.reading.prepare(context, &account);
+        self.go_home(context);
+    }
+
+    /// Shows the home screen, asking pharos again what was played last, so
+    /// a track listened to here, or anywhere else, comes first.
+    fn go_home(&mut self, context: &mut Context) {
+        self.view = View::Home;
+        let Some(account) = &self.account else {
+            return;
+        };
+        if self
+            .tasks
+            .iter()
+            .any(|(_, work)| matches!(work, Work::Listening))
+        {
+            return;
+        }
+        let url = api::resume_audio_url(SERVER, account);
+        self.fetch(context, url, Work::Listening);
+        self.reading.fetch_known(context);
+    }
+
+    /// How many tiles one row of the home screen holds.
+    fn home_columns(context: &Context) -> usize {
+        let metrics = context.metrics();
+        let margin = metrics.screen_margin();
+        metrics
+            .grid_columns_for_width(TileShape::Square, metrics.width - 2 * margin)
+            .max(1)
+    }
+
+    /// Takes the part-played albums. An album already described keeps its
+    /// description; the rest on show are described one at a time.
+    fn listening_arrived(&mut self, context: &mut Context, bytes: &[u8]) {
+        let Some(mut resumed) = api::parse_resumed(bytes) else {
+            context.log(LogLevel::Info, "pharos: resume list unreadable");
+            return;
+        };
+        for fresh in &mut resumed {
+            if let Some(known) = self
+                .listening
+                .iter()
+                .find(|known| known.described && known.album.id == fresh.album.id)
+            {
+                fresh.album = known.album.clone();
+                fresh.described = true;
+            }
+        }
+        context.log(
+            LogLevel::Info,
+            format!("pharos: home listening albums={}", resumed.len()),
+        );
+        self.listening = resumed;
+        self.describe_next(context);
+    }
+
+    /// Asks pharos about the next album on the home screen that only its
+    /// track has named, for its cover and whether it is an audiobook.
+    fn describe_next(&mut self, context: &mut Context) {
+        if self
+            .tasks
+            .iter()
+            .any(|(_, work)| matches!(work, Work::ListeningAlbum { .. }))
+        {
+            return;
+        }
+        let Some(account) = &self.account else {
+            return;
+        };
+        let Some(next) = self
+            .listening
+            .iter()
+            .take(Self::home_columns(context))
+            .find(|resumed| !resumed.described)
+        else {
+            return;
+        };
+        let id = next.album.id.clone();
+        let url = api::item_url(SERVER, account, &id);
+        self.fetch(context, url, Work::ListeningAlbum { id });
+    }
+
+    /// Settles one album of the row: described when pharos answered, as the
+    /// track named it when it did not.
+    fn album_described(&mut self, context: &mut Context, id: &str, album: Option<Entry>) {
+        if let Some(resumed) = self
+            .listening
+            .iter_mut()
+            .find(|resumed| resumed.album.id == id)
+        {
+            if let Some(album) = album.filter(|album| album.id == id) {
+                resumed.album = album;
+            }
+            resumed.described = true;
+        }
+        self.describe_next(context);
     }
 
     /// Lets go of every cover and stops the ones on their way.
@@ -279,10 +404,16 @@ impl Pharos {
         context.paginate_tiles(self.shelf.entries.len(), Self::shape(self.kind), false)
     }
 
-    /// The pixel size a cover is asked for and fitted to: the tile it fills.
-    fn cover_size(&self, context: &Context) -> (u32, u32) {
+    /// The pixel size the cover held as `key` is asked for and fitted to:
+    /// the tile it fills. A home screen cover fills a square tile wherever
+    /// the reader has gone by the time it comes.
+    fn cover_size(&self, context: &Context, key: &str) -> (u32, u32) {
         let metrics = context.metrics();
-        let kind = self.cover_kind();
+        let kind = if key.starts_with(HOME_COVER) {
+            Kind::Music
+        } else {
+            self.cover_kind()
+        };
         let shape = Self::shape(kind);
         let margin = metrics.screen_margin();
         let columns = metrics.grid_columns_for_width(shape, metrics.width - 2 * margin);
@@ -350,6 +481,15 @@ impl Pharos {
                 (wanted, per_page)
             }
             View::Library(_) => shelf_covers(),
+            View::Home => {
+                let wanted: Vec<(String, String)> = self
+                    .home_covers(context)
+                    .into_iter()
+                    .filter_map(|(id, tag)| Some((id, tag?)))
+                    .collect();
+                let count = wanted.len();
+                (wanted, count)
+            }
             View::Books => (
                 self.reading.wanted_covers(context),
                 self.reading.per_page(context),
@@ -402,7 +542,6 @@ impl Pharos {
             self.tasks.retain(|(held, _)| *held != task);
             self.covers.release(&id);
         }
-        let (width, height) = self.cover_size(context);
         let mut fetching = self
             .tasks
             .iter()
@@ -416,7 +555,9 @@ impl Pharos {
             if fetching >= MAX_COVER_TASKS || context.tasks_in_flight() + 1 >= MAX_TASKS_IN_FLIGHT {
                 break;
             }
-            let url = api::image_url(SERVER, id, Some(tag), width, height);
+            let (width, height) = self.cover_size(context, id);
+            let item = id.strip_prefix(HOME_COVER).unwrap_or(id);
+            let url = api::image_url(SERVER, item, Some(tag), width, height);
             let Some(task) = context.spawn(Task::Fetch {
                 url,
                 offset: 0,
@@ -445,6 +586,11 @@ impl Pharos {
                 .iter()
                 .any(|id| matches!(self.covers.state(id), None | Some(Cover::Loading)));
         }
+        if matches!(self.view, View::Home) {
+            return self.home_covers(context).iter().any(|(id, tag)| {
+                tag.is_some() && matches!(self.covers.state(id), None | Some(Cover::Loading))
+            });
+        }
         if !matches!(self.view, View::Library(_)) {
             return false;
         }
@@ -465,7 +611,7 @@ impl Pharos {
         if self.covers.state(id) != Some(Cover::Loading) {
             return;
         }
-        let (width, height) = self.cover_size(context);
+        let (width, height) = self.cover_size(context, id);
         let colour = context.panel_shows_colour();
         let decoded = if colour {
             kobo_image::decode_colour(bytes)
@@ -577,6 +723,8 @@ impl Pharos {
         self.tracks = Page::default();
         self.page = 0;
         self.about = None;
+        self.resume_at = None;
+        self.album_from_home = false;
         self.album = Some(album.clone());
         self.load_tracks(context, album.id.clone(), 0);
         self.view = View::Album(album);
@@ -591,6 +739,11 @@ impl Pharos {
     }
 
     fn play(&mut self, context: &mut Context, index: usize) {
+        self.play_from(context, index, None);
+    }
+
+    /// Plays the track at `index`, from `at` when carrying on.
+    fn play_from(&mut self, context: &mut Context, index: usize, at: Option<u64>) {
         let (Some(entry), Some(account), View::Album(album)) =
             (self.tracks.entries.get(index), &self.account, &self.view)
         else {
@@ -609,13 +762,19 @@ impl Pharos {
         let mut player = AudioPlayer::stream(url, &entry.name)
             .metadata(metadata)
             .owns_back(true);
+        if let Some(ms) = at {
+            player = player.resuming_at(std::time::Duration::from_millis(ms));
+        }
         player.set_cover(self.cover_of(&album.id));
         let track = entry.id.clone();
         let album = album.clone();
         self.stop_playing(context);
         player.start(context);
         player.play(context);
-        context.log(LogLevel::Info, format!("pharos: play track={track}"));
+        context.log(
+            LogLevel::Info,
+            format!("pharos: play track={track} from_ms={}", at.unwrap_or(0)),
+        );
         self.playing = Some(Playing {
             player,
             album,
@@ -689,6 +848,10 @@ impl Pharos {
                 Some(sections) => self.sections = Some(sections),
                 None => self.problem("Pharos sent a list of libraries this app could not read."),
             },
+            Work::Listening => self.listening_arrived(context, bytes),
+            Work::ListeningAlbum { id } => {
+                self.album_described(context, &id, api::parse_item(bytes));
+            }
             Work::Cover { id } => self.cover_arrived(context, &id, bytes),
             Work::Shelf { kind, start } => self.shelf_arrived(context, kind, start, bytes),
             Work::Tracks { album, start } => {
@@ -705,9 +868,11 @@ impl Pharos {
                         self.tracks.entries.extend(page.entries);
                         // An album is small: fetch the rest straight away.
                         let loaded = self.tracks.entries.len();
-                        if got > 0 && loaded < self.tracks.total {
+                        let more = got > 0 && loaded < self.tracks.total;
+                        if more {
                             self.load_tracks(context, album, loaded);
                         }
+                        self.carry_on(context, more);
                     }
                     None => self.problem("Pharos sent a list this app could not read."),
                 }
@@ -730,6 +895,33 @@ impl Pharos {
                     self.report_timer = self.sleep(context, REPORT_SECONDS, Work::ReportTimer);
                 }
             }
+        }
+    }
+
+    /// Plays the track the album was opened to carry on from, once it has
+    /// loaded; forgets it when the album turns out not to hold it.
+    fn carry_on(&mut self, context: &mut Context, more: bool) {
+        let Some((track, at)) = self.resume_at.clone() else {
+            return;
+        };
+        match self
+            .tracks
+            .entries
+            .iter()
+            .position(|entry| entry.id == track)
+        {
+            Some(index) => {
+                self.resume_at = None;
+                self.play_from(context, index, Some(at));
+            }
+            None if !more => {
+                context.log(
+                    LogLevel::Info,
+                    format!("pharos: resume track={track} not in its album"),
+                );
+                self.resume_at = None;
+            }
+            None => {}
         }
     }
 
@@ -776,8 +968,12 @@ impl Pharos {
                 // password changed): forget the token and sign in again.
                 self.sign_out(context);
             }
-            // A lost report only costs the server a moment of the listener's place.
-            (Work::Report(_) | Work::ReportTimer, _) => {}
+            // A lost report only costs the server a moment of the listener's
+            // place, and the home screen does without its Continue listening
+            // row until it is shown again.
+            (Work::Report(_) | Work::ReportTimer | Work::Listening, _) => {}
+            // The album keeps the name its track gave it, and the glyph.
+            (Work::ListeningAlbum { id }, _) => self.album_described(context, &id, None),
             // The shelf keeps what loaded, and the rest is read when it is
             // opened again.
             (Work::Shelf { start, .. }, _) if start > 0 => self.shelf_done = true,
@@ -905,7 +1101,7 @@ impl Pharos {
                      and enter this code.",
                 )
                 .build(),
-            View::Home => self.home_screen(),
+            View::Home => self.home_screen(context),
             View::Library(kind) if self.shelf.entries.is_empty() => {
                 let screen =
                     self.now_playing(ScreenBuilder::new("pharos-library").top_bar(kind.label()));
@@ -1053,9 +1249,112 @@ impl Pharos {
         }
     }
 
-    /// One tile for each kind of library the owner can see.
-    fn home_screen(&self) -> Screen {
-        let screen = self.now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"));
+    /// The tiles of the home screen's Continue listening row.
+    fn listening_tiles(&self, count: usize) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
+        self.listening
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, resumed)| {
+                let glyph = if resumed.album.audiobook {
+                    Glyph::Headphones
+                } else {
+                    Glyph::Music
+                };
+                (
+                    format!("listen-{index}"),
+                    resumed.album.name.clone(),
+                    glyph,
+                    self.cover_of(&format!("{HOME_COVER}{}", resumed.album.id)),
+                )
+            })
+            .collect()
+    }
+
+    /// The tiles of the Continue reading row, with each book's id.
+    fn reading_tiles(&self, count: usize) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
+        self.reading
+            .recent()
+            .into_iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, book)| {
+                (
+                    format!("read-{index}"),
+                    book.title.clone(),
+                    Glyph::Book,
+                    self.cover_of(&format!("{HOME_COVER}{}", book.id)),
+                )
+            })
+            .collect()
+    }
+
+    /// How many tiles each recent row shows: one row's worth, and a row left
+    /// out, reading first, when the screen would not fit the panel with it.
+    /// The layout engine is the judge, as it is of every other screen.
+    fn home_rows(&self, context: &Context) -> (usize, usize) {
+        let columns = Self::home_columns(context);
+        let listening = self.listening.len().min(columns);
+        let reading = self.reading.recent().len().min(columns);
+        let metrics = context.metrics();
+        [(listening, reading), (listening, 0), (0, reading)]
+            .into_iter()
+            .find(|&(listening, reading)| {
+                self.home_with(listening, reading)
+                    .validate(&metrics)
+                    .is_empty()
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// The top of the home screen: its bar and the recent rows that have
+    /// something in them.
+    fn recent_rows(&self, listening: usize, reading: usize) -> ScreenBuilder {
+        let mut screen = self.now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"));
+        if listening > 0 {
+            screen = screen
+                .section("Continue listening")
+                .picture_tiles(TileShape::Square, self.listening_tiles(listening));
+        }
+        if reading > 0 {
+            screen = screen
+                .section("Continue reading")
+                .picture_tiles(TileShape::Square, self.reading_tiles(reading));
+        }
+        if listening + reading > 0 {
+            screen = screen.section("Libraries");
+        }
+        screen
+    }
+
+    /// The covers on the home screen, as `(id, cover tag)`.
+    fn home_covers(&self, context: &Context) -> Vec<(String, Option<String>)> {
+        let (listening, reading) = self.home_rows(context);
+        self.listening
+            .iter()
+            .take(listening)
+            .map(|resumed| (resumed.album.id.clone(), resumed.album.image_tag.clone()))
+            .chain(
+                self.reading
+                    .recent()
+                    .into_iter()
+                    .take(reading)
+                    .map(|book| (book.id, book.image_tag)),
+            )
+            .map(|(id, tag)| (format!("{HOME_COVER}{id}"), tag))
+            .collect()
+    }
+
+    /// What was last listened to and read, then one tile for each kind of
+    /// library the owner can see (V1445).
+    fn home_screen(&self, context: &Context) -> Screen {
+        let (listening, reading) = self.home_rows(context);
+        self.home_with(listening, reading)
+    }
+
+    /// The home screen with this many tiles in each recent row.
+    fn home_with(&self, listening: usize, reading: usize) -> Screen {
+        let screen = self.recent_rows(listening, reading);
         let screen = match &self.sections {
             None => screen.activity("Loading your libraries", None),
             Some(sections) if sections.is_empty() => {
@@ -1070,6 +1369,60 @@ impl Pharos {
             })),
         };
         screen.bottom_action("sign-out", "Sign out").build()
+    }
+
+    /// Answers a tap on the home screen: a recent tile, or a section.
+    fn home_action(&mut self, context: &mut Context, action: ActionId) {
+        if self.open_recent(context, action) {
+            return;
+        }
+        let kinds = [Kind::Music, Kind::Audiobooks, Kind::Books];
+        if let Some(kind) = kinds
+            .into_iter()
+            .find(|kind| action == action_id(&format!("section-{}", kind.label().to_lowercase())))
+        {
+            self.open_section(context, kind);
+        }
+    }
+
+    /// Answers a tap on a recent tile: an album carries on from where it was
+    /// left, a book opens where the reader stopped. Whether it was one.
+    fn open_recent(&mut self, context: &mut Context, action: ActionId) -> bool {
+        let (listening, reading) = self.home_rows(context);
+        if let Some(index) = Self::indexed(action, "listen", listening) {
+            if let Some(resumed) = self.listening.get(index).cloned() {
+                self.kind = if resumed.album.audiobook {
+                    Kind::Audiobooks
+                } else {
+                    Kind::Music
+                };
+                context.log(
+                    LogLevel::Info,
+                    format!(
+                        "pharos: home continue album={} track={} at_ms={}",
+                        resumed.album.id, resumed.track, resumed.position_ms
+                    ),
+                );
+                self.open_album(context, resumed.album);
+                self.resume_at = Some((resumed.track, resumed.position_ms));
+                self.album_from_home = true;
+            }
+            return true;
+        }
+        if let Some(index) = Self::indexed(action, "read", reading) {
+            let book = self.reading.recent().into_iter().nth(index);
+            if let (Some(book), Some(account)) = (book, self.account.clone()) {
+                context.log(
+                    LogLevel::Info,
+                    format!("pharos: home continue book={}", book.id),
+                );
+                if self.reading.continue_book(context, &account, &book.id) {
+                    self.view = View::Books;
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// Adds the way back to the player while something plays: Back from the
@@ -1137,6 +1490,8 @@ fn work_label(work: &Work) -> &'static str {
         Work::Poll { .. } => "poll",
         Work::Finish => "finish",
         Work::Views => "views",
+        Work::Listening => "listening",
+        Work::ListeningAlbum { .. } => "listening-album",
         Work::Shelf { .. } => "shelf",
         Work::Cover { .. } => "cover",
         Work::Tracks { .. } => "tracks",
@@ -1170,6 +1525,8 @@ impl KoboApp for Pharos {
     fn on_load(&mut self, context: &mut Context, key: &str, result: StoreResult) {
         if key == books::KEY {
             self.reading.loaded(&result);
+            self.reading.fetch_known(context);
+            self.refresh_covers(context);
             self.show(context);
         } else {
             self.on_store(context, result);
@@ -1194,7 +1551,7 @@ impl KoboApp for Pharos {
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
         if matches!(self.view, View::Books) {
             match self.reading.action(context, action) {
-                Leave::Back => self.view = View::Home,
+                Leave::Back => self.go_home(context),
                 Leave::SignOut => self.sign_out(context),
                 Leave::Stay => {}
             }
@@ -1232,11 +1589,16 @@ impl KoboApp for Pharos {
             match self.view {
                 View::Album(_) if self.about.is_some() => self.about = None,
                 View::Album(_) => {
-                    self.view = View::Library(self.kind);
                     self.album = None;
                     self.page = 0;
+                    self.resume_at = None;
+                    if std::mem::take(&mut self.album_from_home) {
+                        self.go_home(context);
+                    } else {
+                        self.view = View::Library(self.kind);
+                    }
                 }
-                View::Library(_) => self.view = View::Home,
+                View::Library(_) => self.go_home(context),
                 _ => {}
             }
         } else if action == action_id("retry") {
@@ -1261,12 +1623,7 @@ impl KoboApp for Pharos {
                 _ => 0,
             };
             if matches!(self.view, View::Home) {
-                let kinds = [Kind::Music, Kind::Audiobooks, Kind::Books];
-                if let Some(kind) = kinds.into_iter().find(|kind| {
-                    action == action_id(&format!("section-{}", kind.label().to_lowercase()))
-                }) {
-                    self.open_section(context, kind);
-                }
+                self.home_action(context, action);
             }
             match &self.view {
                 View::Library(_) => {
