@@ -611,6 +611,36 @@ fn a_cover_for_a_shelf_already_left_is_dropped_and_its_reply_ignored() {
 }
 
 #[test]
+fn opening_an_album_keeps_the_shelf_covers_coming_and_back_finds_them() {
+    let (mut runner, commands) = art_shelf(false, 6);
+    let covers = cover_tasks(&commands);
+    let commands = runner.action(action_id("tile-1"));
+    for (task, _) in &covers {
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel(id) if id == task)),
+            "a shelf cover on its way is not cancelled by opening an album: {commands:?}"
+        );
+    }
+    // The album's own cover is not asked twice: the shelf already has it coming.
+    let mut pending = covers;
+    pending.extend(cover_tasks(&commands));
+    while !pending.is_empty() {
+        let (task, _) = pending.remove(0);
+        let reply = runner.task_outcome(task, cover_bytes());
+        pending.extend(cover_tasks(&reply));
+    }
+    let commands = runner.action(ActionId::BACK);
+    assert!(
+        cover_tasks(&commands).is_empty(),
+        "Back draws the covers already in, asking for none again"
+    );
+    let text = screen_text(&last_screen(&commands).expect("the shelf"));
+    assert!(!text.contains("picture: None"), "{text}");
+}
+
+#[test]
 fn a_cover_that_fails_keeps_its_glyph_is_not_asked_again_and_does_not_end_the_session() {
     let (mut runner, commands) = art_shelf(false, 6);
     let (first, _) = cover_tasks(&commands)[0].clone();
