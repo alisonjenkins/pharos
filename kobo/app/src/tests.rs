@@ -878,3 +878,5 @@ fn the_playing_cover_survives_paging_through_a_long_shelf() {
         "the cover the player holds was kept"
     );
 }
+
+mod book_flow;
