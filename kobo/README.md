@@ -14,6 +14,17 @@ pages of its own. Playing a track sends it to Bluetooth headphones through Cobal
 player, which shows the same cover, and tells Pharos where you are. Books is
 a placeholder: reading ebooks on the Kobo is not built yet.
 
+The home screen starts with what you were last doing, as the other Pharos
+apps do. **Continue listening** shows the albums and audiobooks you stopped
+part-way through, on this reader or any other device, newest first, one
+tile each. Tap one and it carries on from the track and the place you left;
+Back from the player shows its album, and Back from there returns home.
+**Continue reading** shows the books you have opened on this reader, the
+last one read first; tap one and it opens where you stopped, and closing it
+returns home. The libraries follow. A row holds one line of tiles, and when
+the panel has no room for both rows above the libraries, Continue reading is
+left out first.
+
 Covers are fetched for the page on screen and the next one, two at a time,
 and only that many are kept on the reader. Colour covers go to a colour
 panel (such as the Libra Colour) and grey ones to the rest. A cover that
