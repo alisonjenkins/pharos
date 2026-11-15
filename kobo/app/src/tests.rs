@@ -942,3 +942,62 @@ fn a_page_s_covers_are_drawn_together_and_hidden_ones_draw_nothing() {
          other pages draw nothing"
     );
 }
+
+/// A music shelf of `a` albums under A, then `m` under M, then `z` whose
+/// names start with an article before a Z.
+fn lettered_shelf(a: usize, m: usize, z: usize) -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
+    let items: Vec<String> = (0..a + m + z)
+        .map(|index| {
+            let name = if index < a {
+                format!("Apple {index}")
+            } else if index < a + m {
+                format!("Mango {index}")
+            } else {
+                format!("The Zest {index}")
+            };
+            format!(r#"{{"Id":"a{index}","Name":"{name}","AlbumArtist":"Band"}}"#)
+        })
+        .collect();
+    let total = items.len();
+    let listing = format!(
+        r#"{{"Items":[{}],"TotalRecordCount":{total}}}"#,
+        items.join(",")
+    );
+    let commands = runner.task_outcome(albums, ok(&listing));
+    (runner, commands)
+}
+
+#[test]
+fn the_shelf_jumps_to_the_first_album_under_a_letter() {
+    let (mut runner, _) = lettered_shelf(30, 30, 30);
+    let commands = runner.action(action_id("letters"));
+    let picker = screen_text(&last_screen(&commands).expect("the picker"));
+    assert!(picker.contains("Jump to a letter"), "{picker}");
+    for offered in ["\"A\"", "\"M\"", "\"Z\""] {
+        assert!(picker.contains(offered), "{offered} is offered: {picker}");
+    }
+    assert!(
+        !picker.contains("\"B\""),
+        "a letter with no album is not offered"
+    );
+    let commands = runner.action(action_id("letter-Z"));
+    let shelf = screen_text(&last_screen(&commands).expect("the shelf"));
+    assert!(!shelf.contains("Jump to a letter"), "the picker closes");
+    assert!(
+        shelf.contains("The Zest 60"),
+        "the first Z album shows: {shelf}"
+    );
+    assert!(
+        !shelf.contains("Apple 29"),
+        "the shelf turned to the page Z starts on"
+    );
+    // Back from the picker leaves the shelf where it was.
+    let _ = runner.action(action_id("letters"));
+    let commands = runner.action(ActionId::BACK);
+    let shelf = screen_text(&last_screen(&commands).expect("the shelf"));
+    assert!(!shelf.contains("Jump to a letter"));
+    assert!(shelf.contains("The Zest 60"), "{shelf}");
+}
