@@ -556,51 +556,51 @@ pub fn parse_views(bytes: &[u8]) -> Option<Vec<Section>> {
     Some(sections)
 }
 
-/// A page of `Items`. Rows without an id are dropped; a missing name reads
-/// as "Untitled" so a row is never blank.
+/// One row of `Items`, or `None` when it has no id. A missing name reads as
+/// "Untitled" so a row is never blank.
+fn entry_of(item: &Value) -> Option<Entry> {
+    let by = text(item, "AlbumArtist")
+        .or_else(|| {
+            item.get("Artists")
+                .and_then(Value::as_array)
+                .and_then(|artists| artists.first())
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    let runtime_ms = item
+        .get("RunTimeTicks")
+        .and_then(Value::as_i64)
+        .and_then(|ticks| u64::try_from(ticks).ok())
+        .map(|ticks| ticks / TICKS_PER_MS);
+    Some(Entry {
+        id: text(item, "Id")?.to_owned(),
+        name: text(item, "Name").unwrap_or("Untitled").to_owned(),
+        by: by.to_owned(),
+        runtime_ms,
+        year: item
+            .get("ProductionYear")
+            .and_then(Value::as_i64)
+            .and_then(|year| u32::try_from(year).ok())
+            .filter(|year| *year > 0),
+        audiobook: item
+            .get("PharosAudiobook")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        image_tag: item
+            .get("ImageTags")
+            .and_then(|tags| text(tags, "Primary"))
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned),
+        overview: text(item, "Overview").unwrap_or_default().trim().to_owned(),
+    })
+}
+
+/// A page of `Items`. Rows without an id are dropped.
 #[must_use]
 pub fn parse_page(bytes: &[u8]) -> Option<Page> {
     let reply = parse(bytes)?;
     let items = reply.get("Items").and_then(Value::as_array)?;
-    let entries: Vec<Entry> = items
-        .iter()
-        .filter_map(|item| {
-            let by = text(item, "AlbumArtist")
-                .or_else(|| {
-                    item.get("Artists")
-                        .and_then(Value::as_array)
-                        .and_then(|artists| artists.first())
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or_default();
-            let runtime_ms = item
-                .get("RunTimeTicks")
-                .and_then(Value::as_i64)
-                .and_then(|ticks| u64::try_from(ticks).ok())
-                .map(|ticks| ticks / TICKS_PER_MS);
-            Some(Entry {
-                id: text(item, "Id")?.to_owned(),
-                name: text(item, "Name").unwrap_or("Untitled").to_owned(),
-                by: by.to_owned(),
-                runtime_ms,
-                year: item
-                    .get("ProductionYear")
-                    .and_then(Value::as_i64)
-                    .and_then(|year| u32::try_from(year).ok())
-                    .filter(|year| *year > 0),
-                audiobook: item
-                    .get("PharosAudiobook")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                image_tag: item
-                    .get("ImageTags")
-                    .and_then(|tags| text(tags, "Primary"))
-                    .filter(|tag| !tag.is_empty())
-                    .map(str::to_owned),
-                overview: text(item, "Overview").unwrap_or_default().trim().to_owned(),
-            })
-        })
-        .collect();
+    let entries: Vec<Entry> = items.iter().filter_map(entry_of).collect();
     let total = reply
         .get("TotalRecordCount")
         .and_then(Value::as_i64)
@@ -611,6 +611,96 @@ pub fn parse_page(bytes: &[u8]) -> Option<Page> {
         total,
         sent: items.len(),
     })
+}
+
+/// One item, from `Users/{id}/Items/{item}`.
+#[must_use]
+pub fn parse_item(bytes: &[u8]) -> Option<Entry> {
+    entry_of(&parse(bytes)?)
+}
+
+/// How many part-played tracks the home screen asks for. Several tracks of
+/// one album fold into one tile, so this is more than a row of tiles.
+pub const RESUME_LIMIT: u32 = 24;
+/// The most albums kept from them.
+pub const MAX_RESUMED: usize = 8;
+
+/// The tracks the user stopped part-way through, newest first (V1445):
+/// what the home screen's Continue listening row is made from.
+#[must_use]
+pub fn resume_audio_url(server: &str, account: &Account) -> String {
+    format!(
+        "{server}/Users/{}/Items/Resume?MediaTypes=Audio&Limit={RESUME_LIMIT}",
+        query_escape(&account.user_id)
+    )
+}
+
+/// One item, as the user sees it. An album's id is pharos's own, which the
+/// item route answers like any other.
+#[must_use]
+pub fn item_url(server: &str, account: &Account, item: &str) -> String {
+    format!(
+        "{server}/Users/{}/Items/{}",
+        query_escape(&account.user_id),
+        query_escape(item)
+    )
+}
+
+/// An album the user stopped part-way through, and where.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Resumed {
+    /// The album, first as the track names it, then as pharos describes it
+    /// once [`Self::described`].
+    pub album: Entry,
+    /// Whether `album` is pharos's own description, with its cover and its
+    /// audiobook mark, rather than what the track said.
+    pub described: bool,
+    /// The track to carry on from.
+    pub track: String,
+    pub position_ms: u64,
+}
+
+/// The part-played tracks from `Items/Resume`, folded to one per album and
+/// kept in the server's order, newest first. A track with no album, or no
+/// place to carry on from, is left out.
+#[must_use]
+pub fn parse_resumed(bytes: &[u8]) -> Option<Vec<Resumed>> {
+    let reply = parse(bytes)?;
+    let items = reply.get("Items").and_then(Value::as_array)?;
+    let mut resumed: Vec<Resumed> = Vec::new();
+    for item in items {
+        let (Some(track), Some(album)) = (text(item, "Id"), text(item, "AlbumId")) else {
+            continue;
+        };
+        let position_ms = item
+            .get("UserData")
+            .and_then(|data| data.get("PlaybackPositionTicks"))
+            .and_then(Value::as_i64)
+            .and_then(|ticks| u64::try_from(ticks).ok())
+            .map_or(0, |ticks| ticks / TICKS_PER_MS);
+        if position_ms == 0 || resumed.iter().any(|known| known.album.id == album) {
+            continue;
+        }
+        resumed.push(Resumed {
+            album: Entry {
+                id: album.to_owned(),
+                name: text(item, "Album").unwrap_or("Untitled").to_owned(),
+                by: text(item, "AlbumArtist").unwrap_or_default().to_owned(),
+                runtime_ms: None,
+                year: None,
+                audiobook: false,
+                image_tag: None,
+                overview: String::new(),
+            },
+            described: false,
+            track: track.to_owned(),
+            position_ms,
+        });
+        if resumed.len() >= MAX_RESUMED {
+            break;
+        }
+    }
+    Some(resumed)
 }
 
 /// "3:07", "1:02:05": a length as a listener reads it.
@@ -931,5 +1021,66 @@ mod tests {
         assert_eq!(clock(187_000), "3:07");
         assert_eq!(clock(3_725_000), "1:02:05");
         assert_eq!(clock(0), "0:00");
+    }
+
+    #[test]
+    fn resumed_tracks_fold_to_one_per_album_newest_first() {
+        let reply = br#"{"Items":[
+            {"Id":"t3","AlbumId":"al2","Album":"Later","AlbumArtist":"B",
+             "UserData":{"PlaybackPositionTicks":6000000000}},
+            {"Id":"t1","AlbumId":"al1","Album":"Earlier",
+             "UserData":{"PlaybackPositionTicks":10000}},
+            {"Id":"t2","AlbumId":"al2","UserData":{"PlaybackPositionTicks":5}},
+            {"Id":"t4","UserData":{"PlaybackPositionTicks":50000}},
+            {"Id":"t5","AlbumId":"al3","UserData":{"PlaybackPositionTicks":0}}
+        ]}"#;
+        let resumed = parse_resumed(reply).expect("parsed");
+        let albums: Vec<(&str, &str, u64)> = resumed
+            .iter()
+            .map(|r| (r.album.id.as_str(), r.track.as_str(), r.position_ms))
+            .collect();
+        assert_eq!(albums, vec![("al2", "t3", 600_000), ("al1", "t1", 1)]);
+        assert_eq!(resumed[0].album.name, "Later");
+        assert_eq!(resumed[0].album.by, "B");
+        assert!(!resumed[0].described);
+    }
+
+    #[test]
+    fn resumed_albums_are_capped() {
+        let items: Vec<String> = (0..20)
+            .map(|i| {
+                format!(r#"{{"Id":"t{i}","AlbumId":"a{i}","UserData":{{"PlaybackPositionTicks":99999}}}}"#)
+            })
+            .collect();
+        let reply = format!(r#"{{"Items":[{}]}}"#, items.join(","));
+        assert_eq!(
+            parse_resumed(reply.as_bytes()).map(|r| r.len()),
+            Some(MAX_RESUMED)
+        );
+    }
+
+    #[test]
+    fn a_single_item_parses_like_a_row() {
+        let entry = parse_item(
+            br#"{"Id":"al1","Name":"N","PharosAudiobook":true,"ImageTags":{"Primary":"x"}}"#,
+        )
+        .expect("an item");
+        assert!(entry.audiobook);
+        assert_eq!(entry.image_tag.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn the_resume_url_asks_for_audio_only() {
+        let url = resume_audio_url(
+            "https://p",
+            &Account {
+                user_id: "u 1".to_owned(),
+                token: "t".to_owned(),
+            },
+        );
+        assert_eq!(
+            url,
+            format!("https://p/Users/u%201/Items/Resume?MediaTypes=Audio&Limit={RESUME_LIMIT}")
+        );
     }
 }
