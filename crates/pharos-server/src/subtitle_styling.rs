@@ -1366,12 +1366,18 @@ fn line_signals(s: &pharos_transcode::subtitle_signals::LineSignals) -> LineSign
 
 /// A sidecar file as a source candidate. Its codec comes from the extension,
 /// its language and SDH/forced flags from the dotted name tokens.
-fn sidecar_candidate(index: u32, path: &std::path::Path) -> SubtitleCandidate {
+fn sidecar_candidate(index: u32, path: &std::path::Path, media_stem: &str) -> SubtitleCandidate {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     let lower = name.to_ascii_lowercase();
+    // Only the part after the media file's stem describes the track: a title
+    // word such as "Full" in the stem must not make a signs file look full.
+    let suffix = lower
+        .strip_prefix(&media_stem.to_ascii_lowercase())
+        .filter(|_| !media_stem.is_empty())
+        .unwrap_or(&lower);
     let codec = match lower.rsplit_once('.').map(|(_, e)| e) {
         Some("ass") => "ass",
         Some("ssa") => "ssa",
@@ -1386,7 +1392,7 @@ fn sidecar_candidate(index: u32, path: &std::path::Path) -> SubtitleCandidate {
         hearing_impaired: has_token(&["sdh", "hi", "cc"]),
         is_default: has_token(&["default"]),
         forced: has_token(&["forced"]),
-        signs_only: is_signs_only_title(name),
+        signs_only: is_signs_only_title(suffix),
         sidecar: Some(path.to_path_buf()),
     }
 }
@@ -1410,9 +1416,14 @@ async fn candidates_for(item: &MediaItem) -> Vec<SubtitleCandidate> {
         })
         .collect();
     let base = sidecar_base_index(&item.probe);
+    let stem = item
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     for (offset, (path, _)) in discover_sidecars(&item.path).await.iter().enumerate() {
         let index = base.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-        out.push(sidecar_candidate(index, path));
+        out.push(sidecar_candidate(index, path, stem));
     }
     out
 }
@@ -1643,6 +1654,23 @@ mod tests {
         assert_eq!(chosen(&[signs.clone(), full]), Some(4));
         // Alone, it is still styled: better than nothing.
         assert_eq!(chosen(&[signs]), Some(3));
+    }
+
+    /// A word in the media file's own name does not decide what its sidecar
+    /// holds.
+    #[test]
+    fn a_sidecar_is_classified_by_its_name_after_the_media_stem() {
+        let stem = "Full.Moon.S01E01";
+        let signs = sidecar_candidate(
+            5,
+            std::path::Path::new("/m/Full.Moon.S01E01.signs.en.ass"),
+            stem,
+        );
+        assert!(signs.signs_only);
+        let full = sidecar_candidate(6, std::path::Path::new("/m/Full.Moon.S01E01.en.ass"), stem);
+        assert!(!full.signs_only);
+        let elsewhere = sidecar_candidate(7, std::path::Path::new("/m/Subs/signs.en.ass"), stem);
+        assert!(elsewhere.signs_only);
     }
 
     #[test]
@@ -2409,7 +2437,7 @@ mod tests {
 
     #[test]
     fn sidecar_names_give_language_and_flags() {
-        let c = |n: &str| sidecar_candidate(100, std::path::Path::new(n));
+        let c = |n: &str| sidecar_candidate(100, std::path::Path::new(n), "");
         let a = c("/m/Show.en.sdh.ass");
         assert_eq!(
             (
