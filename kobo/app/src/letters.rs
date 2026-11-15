@@ -11,6 +11,8 @@ pub const LETTERS: [char; 27] = [
     'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
 ];
 
+use kobo_sdk::{action_id, ActionId, ScreenBuilder};
+
 const ARTICLES: [&str; 3] = ["the", "a", "an"];
 
 /// The letter `name` is filed under.
@@ -54,6 +56,38 @@ pub fn starts<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(char, usize)
 #[must_use]
 pub fn page_holding(pages: &[Vec<usize>], index: usize) -> Option<usize> {
     pages.iter().position(|page| page.contains(&index))
+}
+
+/// Lays the letters of `starts` over `screen` for the reader to pick one,
+/// with `showing` (the letter of the page on show) marked.
+#[must_use]
+pub fn picker(
+    screen: ScreenBuilder,
+    starts: &[(char, usize)],
+    showing: Option<char>,
+) -> ScreenBuilder {
+    let cells: Vec<(String, String, bool)> = starts
+        .iter()
+        .map(|&(letter, _)| {
+            (
+                format!("letter-{letter}"),
+                letter.to_string(),
+                Some(letter) == showing,
+            )
+        })
+        .collect();
+    screen.modal("Jump to a letter", |modal| {
+        modal.grid_with_selection(7, false, cells)
+    })
+}
+
+/// Where the letter `action` picked starts, when it picked one of `starts`.
+#[must_use]
+pub fn chosen(action: ActionId, starts: &[(char, usize)]) -> Option<usize> {
+    starts
+        .iter()
+        .find(|&&(letter, _)| action == action_id(&format!("letter-{letter}")))
+        .map(|&(_, index)| index)
 }
 
 #[cfg(test)]

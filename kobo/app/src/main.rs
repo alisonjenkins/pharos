@@ -1211,20 +1211,7 @@ impl Pharos {
             .and_then(|page| page.first())
             .and_then(|&index| self.shelf.entries.get(index))
             .map(|entry| letters::letter_of(&entry.name));
-        let cells: Vec<(String, String, bool)> = self
-            .letter_starts()
-            .into_iter()
-            .map(|(letter, _)| {
-                (
-                    format!("letter-{letter}"),
-                    letter.to_string(),
-                    Some(letter) == showing,
-                )
-            })
-            .collect();
-        screen.modal("Jump to a letter", |modal| {
-            modal.grid_with_selection(7, false, cells)
-        })
+        letters::picker(screen, &self.letter_starts(), showing)
     }
 
     /// Answers the letter picker: a letter turns the shelf to the page its
@@ -1244,11 +1231,7 @@ impl Pharos {
         if action == ActionId::BACK {
             return true;
         }
-        let chosen = self
-            .letter_starts()
-            .into_iter()
-            .find(|&(letter, _)| action == action_id(&format!("letter-{letter}")));
-        if let Some((_, index)) = chosen {
+        if let Some(index) = letters::chosen(action, &self.letter_starts()) {
             if let Some(page) = letters::page_holding(&self.grid_pages(context), index) {
                 self.shelf_page = page;
             }

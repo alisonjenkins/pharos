@@ -206,7 +206,10 @@ fn a_downloaded_book_reopens_from_the_shelf_and_its_menu_removes_it() {
     assert!(reader.owns_back, "Back in a book must stay in Pharos");
     let commands = runner.action(ActionId::BACK);
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("Book One"), "Back returns to the list: {screen}");
+    assert!(
+        screen.contains("Book One"),
+        "Back returns to the list: {screen}"
+    );
     let _ = runner.store_result(StoreResult::Saved {
         key: books::KEY.to_owned(),
     });
@@ -307,12 +310,18 @@ fn the_books_list_is_a_grid_of_covers_drawn_together_and_dropped_on_leaving() {
     assert!(screen.contains("Portrait"), "{screen}");
     let covers = cover_tasks(&commands);
     assert_eq!(covers.len(), 2, "a cover for each tagged book: {covers:?}");
-    assert!(covers[0].1.contains("/Items/b1/Images/Primary"), "{covers:?}");
+    assert!(
+        covers[0].1.contains("/Items/b1/Images/Primary"),
+        "{covers:?}"
+    );
     let drawn = page_drawn(&mut runner, &commands);
     let text = screen_text(&drawn);
     assert_eq!(text.matches("picture: Some").count(), 2, "{text}");
     let problems = drawn.validate(&CLARA_BW_METRICS);
-    assert!(problems.is_empty(), "fits the smallest reader: {problems:?}");
+    assert!(
+        problems.is_empty(),
+        "fits the smallest reader: {problems:?}"
+    );
     // Leaving the books drops the covers still wanted for them.
     let (mut runner, _) = home();
     let commands = runner.action(action_id("section-books"));
@@ -328,6 +337,47 @@ fn the_books_list_is_a_grid_of_covers_drawn_together_and_dropped_on_leaving() {
             "{commands:?}"
         );
     }
+}
+
+#[test]
+fn the_books_list_loads_whole_and_jumps_to_a_letter() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    });
+    let block = |from: usize, to: usize, total: usize| {
+        let items: Vec<String> = (from..to)
+            .map(|index| {
+                let title = if index < 40 {
+                    format!("Apple {index}")
+                } else {
+                    format!("The Zest {index}")
+                };
+                format!(r#"{{"Id":"b{index}","Name":"{title}","Path":"/b/{index}.txt"}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"Items":[{}],"TotalRecordCount":{total}}}"#,
+            items.join(",")
+        )
+    };
+    let commands = runner.task_outcome(list, ok(&block(0, 30, 60)));
+    let (rest, _) = asked(&commands, "StartIndex=30").expect("the rest is asked for at once");
+    let _ = runner.task_outcome(rest, ok(&block(30, 60, 60)));
+    let commands = runner.action(action_id("letters"));
+    let picker = screen_text(&last_screen(&commands).expect("the picker"));
+    assert!(picker.contains("Jump to a letter"), "{picker}");
+    let commands = runner.action(action_id("letter-Z"));
+    let list = screen_text(&last_screen(&commands).expect("the list"));
+    assert!(!list.contains("Jump to a letter"), "the picker closes");
+    assert!(
+        list.contains("The Zest 40"),
+        "the first Z book shows: {list}"
+    );
+    assert!(!list.contains("Apple 0\""), "{list}");
 }
 
 #[test]
