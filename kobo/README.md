@@ -8,7 +8,9 @@ What it does today: signs in with Quick Connect (a code to approve in the
 Pharos web UI), shows a home screen with a section for each kind of library
 you can see (Music, Audiobooks, Books), and shows albums and audiobooks as a
 grid of covers. An album opens on its cover, artist, year and length above
-its tracks. Playing a track sends it to Bluetooth headphones through Cobalt's
+its tracks. An audiobook shows the first lines of its description under
+that; when there is more, **About** in the top bar opens the whole text on
+pages of its own. Playing a track sends it to Bluetooth headphones through Cobalt's
 player, which shows the same cover, and tells Pharos where you are. Books is
 a placeholder: reading ebooks on the Kobo is not built yet.
 
@@ -20,8 +22,8 @@ cannot be fetched leaves the tile's icon in its place.
 It also reads books. Choose **Books** on the home screen for your Pharos
 books by name, with authors; a book that is on the reader says
 **Downloaded**. Open one to download it (progress is shown) and read it;
-the reader remembers where you stopped. A book's `⋮` menu removes its
-download. Books come from Pharos's `/Items/{id}/Download`, with the same
+the reader remembers where you stopped. A book's `⋮` menu shows the first lines of its description, removes its
+download, and opens the whole description with **About this book**. Books come from Pharos's `/Items/{id}/Download`, with the same
 sign-in as the music; the OPDS catalogue is not used because it needs an
 e-reader password the app does not hold.
 
