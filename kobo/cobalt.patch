@@ -47,7 +47,7 @@ index 8e3f1bb..ebf319f 100644
          let encoded = reading.write.clone().unwrap();
          reading.store(
 diff --git a/crates/kobo-bookview/src/lib.rs b/crates/kobo-bookview/src/lib.rs
-index 9875021..3e5a85d 100644
+index 9875021..418b6bc 100644
 --- a/crates/kobo-bookview/src/lib.rs
 +++ b/crates/kobo-bookview/src/lib.rs
 @@ -49,20 +49,28 @@ pub mod offline;
@@ -454,7 +454,7 @@ index 9875021..3e5a85d 100644
      use kobo_doc::{Block, Document};
      use kobo_read::{Memory, Reader};
      use kobo_sdk::{Command, Context, PictureHandle, Task, TaskError, TaskId, TaskOutcome};
-@@ -1529,6 +1675,158 @@ mod tests {
+@@ -1529,6 +1675,199 @@ mod tests {
          }
      }
  
@@ -518,6 +518,47 @@ index 9875021..3e5a85d 100644
 +            passes += 1;
 +            assert!(passes < 10_000, "the pipeline never came to rest");
 +        }
++    }
++
++    /// On a colour panel a colour plate reaches the runtime in colour.
++    #[cfg(feature = "raster")]
++    #[test]
++    fn a_colour_plate_on_a_colour_panel_is_sent_in_colour() {
++        struct Quiet;
++        impl kobo_sdk::KoboApp for Quiet {
++            fn on_start(&mut self, _context: &mut Context) {}
++            fn on_action(&mut self, _context: &mut Context, _action: kobo_sdk::ActionId) {}
++        }
++        let runner = kobo_sdk::AppRunner::new(Quiet).showing_colour(true);
++        let (width, height) = (1200_u32, 2000_u32);
++        let rgb: Vec<u8> = (0..width * height).flat_map(|_| [200, 40, 40]).collect();
++        let plate = kobo_image::encode_png_rgb(width, height, &rgb).expect("a colour plate");
++
++        let mut context = runner.context();
++        assert!(context.panel_shows_colour());
++        let mut view = BookView::new();
++        view.open(&mut context, illustrated(&plate), Memory::default());
++        let mut commands = context.take_commands();
++        let mut passes = 0;
++        while let Some(task) = view.plating {
++            let mut context = runner.context();
++            let _ = view.woke(&mut context, task, &TaskOutcome::Completed(Vec::new()));
++            commands.extend(context.take_commands());
++            passes += 1;
++            assert!(passes < 10_000, "the pipeline never came to rest");
++        }
++        let formats: Vec<_> = commands
++            .iter()
++            .filter_map(|command| match command {
++                Command::PutPicture { format, .. } => Some(*format),
++                _ => None,
++            })
++            .collect();
++        assert!(!formats.is_empty(), "no picture was sent");
++        assert!(
++            formats.contains(&kobo_sdk::PictureFormat::Rgb),
++            "the plate was sent as {formats:?}"
++        );
 +    }
 +
 +    #[cfg(feature = "raster")]
