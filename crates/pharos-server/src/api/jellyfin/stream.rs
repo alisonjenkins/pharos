@@ -310,6 +310,54 @@ fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool
         .unwrap_or(false)
 }
 
+/// Audio codecs `audio_remux` can emit (B1448).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemuxTarget {
+    Aac,
+    Mp3,
+    Opus,
+}
+
+impl RemuxTarget {
+    /// Stable metric/log string; also the name `audio_remux` accepts.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Aac => "aac",
+            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
+        }
+    }
+}
+
+/// Records the `/Audio/{id}/universal` routing decision: one log line and
+/// one `pharos_audio_universal_total{route,target}` increment (`target` is
+/// `none` on the direct route).
+fn record_audio_universal(
+    id: impl std::fmt::Display,
+    target: Option<RemuxTarget>,
+    reason: &str,
+    source_codec: &str,
+    requested: &[String],
+) {
+    let route = if target.is_some() { "remux" } else { "direct" };
+    let target_label = target.map_or("none", RemuxTarget::label);
+    tracing::info!(
+        item = %id,
+        route,
+        reason,
+        source_codec,
+        requested = ?requested,
+        target = target_label,
+        "audio universal routing"
+    );
+    metrics::counter!(
+        "pharos_audio_universal_total",
+        "route" => route,
+        "target" => target_label
+    )
+    .increment(1);
+}
+
 /// P11 — `/Audio/{id}/universal`. Parses `AudioCodec` (CSV of
 /// acceptable codecs) + `MaxStreamingBitrate` and either streams the
 /// source directly (when its codec is acceptable) or remuxes via
@@ -348,17 +396,19 @@ async fn audio_universal(
     {
         // Direct path — defer to the existing delivery (StartTimeTicks
         // + Range honoured by `deliver_stream`).
+        record_audio_universal(id, None, "source_accepted", source_codec, &acceptable);
         return deliver_stream(&state, &req, path.id_str()).await;
     }
 
-    // Remux. Pick the first acceptable target the server knows how to
-    // emit. AAC is the lowest-common-denominator and always present
+    // Remux. AAC is the lowest-common-denominator and always present
     // in modern ffmpeg.
-    let target = acceptable
-        .iter()
-        .find(|c| matches!(c.to_ascii_lowercase().as_str(), "aac"))
-        .cloned()
-        .unwrap_or_else(|| "aac".to_string());
+    let target = RemuxTarget::Aac;
+    let reason = if needs_downmix {
+        "downmix"
+    } else {
+        "codec_not_accepted"
+    };
+    record_audio_universal(id, Some(target), reason, source_codec, &acceptable);
     // A remuxed/downmixed stream is a live ffmpeg pipe (chunked, no
     // Content-Length) so the browser can't byte-range seek it; jellyfin-web
     // instead re-requests this URL with a new `StartTimeTicks` on every seek
@@ -368,7 +418,7 @@ async fn audio_universal(
     let start_ticks = parse_start_time_ticks(qs);
     audio_remux(
         &item,
-        &target,
+        target.label(),
         bitrate,
         max_channels,
         start_ticks,
@@ -1313,6 +1363,7 @@ impl StreamPath {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use metrics_util::debugging::DebuggingRecorder;
     use pharos_core::{MediaItem, MediaKind, MediaProbe};
 
     /// V234 — a burned subtitle on a packed source no longer downmixes the
@@ -1717,6 +1768,58 @@ mod tests {
         // Garbage / start past EOF.
         assert!(capped_window("bytes=abc", total, cap).is_none());
         assert!(capped_window("bytes=2000000000-", total, cap).is_none());
+    }
+
+    #[test]
+    fn remux_target_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            [RemuxTarget::Aac, RemuxTarget::Mp3, RemuxTarget::Opus]
+                .iter()
+                .map(|t| t.label())
+                .collect();
+        assert_eq!(labels.len(), 3);
+        assert!(!labels.contains("none"), "`none` is reserved for direct");
+    }
+
+    /// B1448 / V1422 — the universal-audio routing decision is observable.
+    #[test]
+    fn audio_universal_decision_is_counted_with_route_and_target() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let req = vec!["mp3".to_string()];
+        record_audio_universal(7, None, "source_accepted", "mp3", &req);
+        record_audio_universal(
+            7,
+            Some(RemuxTarget::Mp3),
+            "codec_not_accepted",
+            "flac",
+            &req,
+        );
+        record_audio_universal(7, Some(RemuxTarget::Aac), "downmix", "aac", &req);
+        let seen: Vec<(String, String)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_audio_universal_total")
+            .map(|(k, ..)| {
+                let label = |n: &str| {
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == n)
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default()
+                };
+                (label("route"), label("target"))
+            })
+            .collect();
+        for want in [("direct", "none"), ("remux", "mp3"), ("remux", "aac")] {
+            assert!(
+                seen.contains(&(want.0.to_string(), want.1.to_string())),
+                "missing {want:?} in {seen:?}"
+            );
+        }
+        assert_eq!(seen.len(), 3, "{seen:?}");
     }
 
     #[::core::prelude::v1::test]
