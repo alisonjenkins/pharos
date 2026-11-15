@@ -12,8 +12,8 @@ const PROSE: &str = "Chapter one.\n\nSome prose to read.";
 
 /// Signed in, with the Books list shown and the downloaded-books record empty.
 fn books() -> (AppRunner<Pharos>, Vec<Command>) {
-    let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("books"));
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
     let (list, task) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
     let Task::Fetch { headers, .. } = task else {
         panic!("the list is a GET");
@@ -57,10 +57,21 @@ fn wrote(commands: &[Command]) -> Option<(String, Vec<u8>)> {
 }
 
 #[test]
-fn the_music_shelf_offers_the_books() {
+fn the_books_section_opens_the_book_list_and_back_returns_home() {
+    let (_, commands) = books();
+    let screen = last_screen(&commands).expect("a screen");
+    assert!(screen_text(&screen).contains("Book One"));
+    let (mut runner, _) = books();
+    let commands = runner.action(ActionId::BACK);
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("Audiobooks"), "{screen}");
+}
+
+#[test]
+fn the_shelves_no_longer_carry_a_books_action() {
     let (_, commands) = shelf();
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("Books"), "{screen}");
+    assert!(!screen.contains("Books"), "{screen}");
 }
 
 #[test]
@@ -159,8 +170,8 @@ fn a_downloaded_book_reopens_from_the_shelf_and_its_menu_removes_it() {
         }],
     }
     .encode();
-    let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("books"));
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
     let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
     let _ = runner.store_result(StoreResult::Loaded {
         key: books::KEY.to_owned(),
@@ -217,8 +228,8 @@ fn a_damaged_saved_copy_is_downloaded_again_on_the_next_open() {
         }],
     }
     .encode();
-    let (mut runner, _) = shelf();
-    let commands = runner.action(action_id("books"));
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
     let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
     let _ = runner.store_result(StoreResult::Loaded {
         key: books::KEY.to_owned(),
