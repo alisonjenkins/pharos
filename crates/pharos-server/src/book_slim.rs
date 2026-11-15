@@ -241,7 +241,6 @@ fn scale_picture(
 
     // `from_decoder` does not charge the output buffer to `max_alloc`, so
     // reserve it by hand (as `ImageReader::decode` does) before decoding.
-    let mut limits = limits;
     limits
         .reserve(decoder.total_bytes())
         .map_err(|e| format!("{w}x{h} needs more than the decode budget: {e}"))?;
