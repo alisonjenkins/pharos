@@ -685,6 +685,31 @@ index b6e6ed5..811a2e3 100644
      /// Every picture the page being read refers to, in the order it does.
      ///
      /// The subset of [`Self::pictures_wanted`] that is actually on screen, and
+diff --git a/crates/kobo-sdk/src/lib.rs b/crates/kobo-sdk/src/lib.rs
+index 7d672a0..92608f3 100644
+--- a/crates/kobo-sdk/src/lib.rs
++++ b/crates/kobo-sdk/src/lib.rs
+@@ -2088,12 +2088,14 @@ impl AppShelf<'_> {
+ 
+ /// The most an application may pull back into memory in one download.
+ ///
+-/// The device has 256 MB of RAM for everything, so a shelf that allows a
+-/// quarter of a gigabyte on the card must not allow the same figure in a
+-/// `Vec`. A book that is genuinely larger than this has to be read in pieces
+-/// by whatever knows how to page it, and this ceiling is where that decision
+-/// gets forced rather than discovered by an out-of-memory kill.
+-pub const MAX_SHELF_DOWNLOAD: usize = 32 * 1024 * 1024;
++/// A shelf that allows a quarter of a gigabyte on the card must not allow the
++/// same figure in a `Vec`. A Libra Colour has about 780 MB available with an
++/// application running, and a book read from memory costs its own size plus
++/// its pictures kept compressed, so sixty-four leaves room for both several
++/// times over. A book that is genuinely larger than this has to be read in
++/// pieces by whatever knows how to page it, and this ceiling is where that
++/// decision gets forced rather than discovered by an out-of-memory kill.
++pub const MAX_SHELF_DOWNLOAD: usize = 64 * 1024 * 1024;
+ 
+ /// How a transfer answered the last result it was shown.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 diff --git a/crates/kobo-ui/src/lib.rs b/crates/kobo-ui/src/lib.rs
 index b834cea..cefd140 100644
 --- a/crates/kobo-ui/src/lib.rs
