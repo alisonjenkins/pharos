@@ -59,7 +59,7 @@ index bb97921..8a10d2f 100644
  kobo-protocol = { path = "../kobo-protocol" }
  rusty-opus = { version = "1.0.2", optional = true }
 diff --git a/crates/kobo-audio/src/lib.rs b/crates/kobo-audio/src/lib.rs
-index 098fbfb..c78eb4e 100644
+index 098fbfb..e0a162f 100644
 --- a/crates/kobo-audio/src/lib.rs
 +++ b/crates/kobo-audio/src/lib.rs
 @@ -21,8 +21,16 @@ pub mod stretch;
@@ -185,7 +185,7 @@ index 098fbfb..c78eb4e 100644
          if container == Container::Mp3z {
              return Self::open_archive(bytes, stem(name));
          }
-@@ -381,6 +437,40 @@ impl Book {
+@@ -381,6 +437,50 @@ impl Book {
          ))
      }
  
@@ -193,9 +193,9 @@ index 098fbfb..c78eb4e 100644
 +    /// from its opening bytes, or failing that from `name`.
 +    ///
 +    /// # Errors
-+    /// The kind is not one this crate plays (an `.mp3z` needs the whole
-+    /// archive, so it is not streamed), the bytes are damaged, or the network
-+    /// went away before the book's headers were read.
++    /// The kind is not one this crate plays, an `.mp3z` is larger than an
++    /// archive may be, the bytes are damaged, or the network went away before
++    /// the book's headers (for an `.mp3z`, all of it) were read.
 +    pub fn open_remote(remote: Remote, name: &str) -> Result<Self, Fault> {
 +        let remote = Arc::new(remote);
 +        let mut head = [0_u8; 64];
@@ -215,7 +215,17 @@ index 098fbfb..c78eb4e 100644
 +            .or_else(|| Container::from_name(name))
 +            .ok_or(Fault::Unsupported)?;
 +        if container == Container::Mp3z {
-+            return Err(Fault::Unsupported);
++            // An archive is read whole before it opens, from the cache or the
++            // network, and is not streamed.
++            if remote.total() > MAX_ARCHIVE_BYTES as u64 {
++                return Err(Fault::Unsupported);
++            }
++            let mut bytes = Vec::new();
++            remote
++                .reader()
++                .read_to_end(&mut bytes)
++                .map_err(|error| io_fault(&error))?;
++            return Self::open_archive(bytes, stem(name));
 +        }
 +        Ok(Self::from_parts(
 +            vec![part(Source::Remote(remote), container, &stem(name))?],
@@ -226,7 +236,7 @@ index 098fbfb..c78eb4e 100644
      /// Opens a folder's files as one book called `title`, each file a chapter
      /// in the order given.
      ///
-@@ -467,6 +557,7 @@ impl Book {
+@@ -467,6 +567,7 @@ impl Book {
              current: 0,
              playing: None,
              finished: false,
@@ -234,7 +244,7 @@ index 098fbfb..c78eb4e 100644
          }
      }
  
-@@ -483,6 +574,9 @@ impl Book {
+@@ -483,6 +584,9 @@ impl Book {
      /// Where the next sound handed out comes from, in the book's timeline.
      #[must_use]
      pub fn position_ms(&self) -> u32 {
@@ -244,7 +254,7 @@ index 098fbfb..c78eb4e 100644
          let start = self.starts_ms.get(self.current).copied().unwrap_or(0);
          let within = self.playing.as_ref().map_or(0, |playing| {
              frames_to_ms(playing.position_frames, playing.rate)
-@@ -502,6 +596,23 @@ impl Book {
+@@ -502,6 +606,23 @@ impl Book {
      /// # Errors
      /// The part holding the position cannot be opened or seeked.
      pub fn seek(&mut self, position_ms: u32) -> Result<(), Fault> {
@@ -268,7 +278,7 @@ index 098fbfb..c78eb4e 100644
          let wanted = position_ms.min(self.duration_ms);
          let index = self
              .starts_ms
-@@ -528,7 +639,10 @@ impl Book {
+@@ -528,7 +649,10 @@ impl Book {
                      track_id: Some(playing.track_id),
                  },
              )
@@ -280,7 +290,7 @@ index 098fbfb..c78eb4e 100644
          playing.decoder.reset();
          let actual_ms = playing
              .time_base
-@@ -551,7 +665,11 @@ impl Book {
+@@ -551,7 +675,11 @@ impl Book {
                      rate: 48_000,
                  });
              }
@@ -293,7 +303,7 @@ index 098fbfb..c78eb4e 100644
          }
          let mut given = 0;
          let mut rate = None;
-@@ -563,7 +681,22 @@ impl Book {
+@@ -563,7 +691,22 @@ impl Book {
                  // boundary so the caller can follow it.
                  break;
              }
@@ -317,7 +327,7 @@ index 098fbfb..c78eb4e 100644
                  // This part has run out.
                  if self.current + 1 < self.parts.len() {
                      self.current += 1;
-@@ -611,6 +744,7 @@ fn fill(playing: &mut Playing) -> Result<bool, Fault> {
+@@ -611,6 +754,7 @@ fn fill(playing: &mut Playing) -> Result<bool, Fault> {
              Err(Symphonia::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                  return Ok(false);
              }
@@ -325,7 +335,7 @@ index 098fbfb..c78eb4e 100644
              Err(Symphonia::ResetRequired) => {
                  playing.decoder.reset();
                  continue;
-@@ -716,12 +850,21 @@ fn open_part(part: &Part) -> Result<Playing, Fault> {
+@@ -716,12 +860,21 @@ fn open_part(part: &Part) -> Result<Playing, Fault> {
  fn probe_fault(error: Symphonia) -> Fault {
      match error {
          Symphonia::IoError(error) if error.kind() != io::ErrorKind::UnexpectedEof => {
@@ -1300,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..12531c8
+index 0000000..a0592ce
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1012 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1969,13 +1979,18 @@ index 0000000..12531c8
 +                ));
 +            })
 +            .ok()?;
-+        let _ignored = fs::remove_file(&data);
-+        let _ignored = fs::remove_file(&sidecar);
-+        let total = expected_total?;
-+        if total == 0 {
++        let clear = || {
++            let _ignored = fs::remove_file(&data);
++            let _ignored = fs::remove_file(&sidecar);
++        };
++        let Some(total) = expected_total.filter(|total| *total > 0) else {
++            clear();
 +            return None;
-+        }
++        };
++        // A refusal leaves what is there: a store still open on it saves
++        // its sidecar again, which must find its data file.
 +        self.admit(open, key, &dir, &data, total)?;
++        clear();
 +        Some(Meta::fresh(total, block_bytes, 0))
 +    }
 +
@@ -2231,8 +2246,10 @@ index 0000000..12531c8
 +    /// # Errors
 +    /// The file or the sidecar could not be written.
 +    pub fn flush(&self) -> io::Result<()> {
-+        self.file.sync_data()?;
++        // The lock comes first: a block marked present while the sync runs
++        // would be saved as there with its data possibly not on disk.
 +        let mut inner = self.inner();
++        self.file.sync_data()?;
 +        inner.unflushed = 0;
 +        self.save(&inner)
 +    }
@@ -2311,10 +2328,10 @@ index 0000000..12531c8
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..29c09de
+index 0000000..f06ddde
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,511 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -2325,7 +2342,7 @@ index 0000000..29c09de
 +
 +use super::{key_of, stable_url, DownloadPolicy, Downloads, Meta, RemoveOutcome};
 +use crate::remote::tests::{quick, served};
-+use crate::{FetchFailure, RangeFetch, Remote};
++use crate::{Book, FetchFailure, RangeFetch, Remote};
 +
 +const BLOCK: u32 = 1_024;
 +
@@ -2780,6 +2797,51 @@ index 0000000..29c09de
 +    let reopened = downloads.begin("shelf", URL, Some(4_000), BLOCK).unwrap();
 +    assert_eq!(reopened.total(), 4_000);
 +    assert!(reopened.has(1), "have {}", reopened.have_bytes());
++}
++
++#[test]
++fn a_kept_mp3z_opens_from_the_first_reply_and_again_from_disk() {
++    let dir = scratch("mp3z");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let member =
++        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/stereo.mp3")).unwrap();
++    let archive = kobo_doc::zip::stored(&[("001.mp3".to_owned(), member)]).unwrap();
++    let len = archive.len() as u64;
++    let block = u32::try_from(len).unwrap() + 1_000;
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let store = downloads.begin("shelf", URL, Some(len), block).unwrap();
++    let remote = Remote::open_stored(
++        served(Arc::new(archive.clone()), Arc::clone(&log)),
++        store,
++        archive,
++        quick(block),
++    )
++    .unwrap();
++    let book = Book::open_remote(remote, "shelf.mp3z").expect("opens from the first reply");
++    assert!(book.description().duration_ms > 0);
++    drop(book);
++
++    let dead: RangeFetch = Arc::new(|_, _| Err(FetchFailure::Transient));
++    let store = downloads.begin("shelf", URL, None, block).unwrap();
++    assert!(store.is_complete());
++    let remote = Remote::open_stored(dead, store, Vec::new(), quick(block)).unwrap();
++    assert!(Book::open_remote(remote, "shelf.mp3z").is_ok());
++}
++
++#[test]
++fn a_replacement_that_is_not_admitted_leaves_the_old_download_in_place() {
++    let dir = scratch("replacement-refused");
++    let (_card, policy) = Card::policy(3_500, 0);
++    let (downloads, _lines) = downloads(&dir, policy);
++    let old = downloads.begin("shelf", URL, Some(3_000), BLOCK).unwrap();
++    assert!(old.write(0, &block(0, 3_000)).unwrap());
++    old.flush().unwrap();
++    // The server now says the book is longer than the budget allows.
++    assert!(downloads.begin("shelf", URL, Some(4_000), BLOCK).is_none());
++    drop(old);
++    let reopened = downloads.begin("shelf", URL, None, BLOCK).expect("kept");
++    assert!(reopened.has(0));
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
