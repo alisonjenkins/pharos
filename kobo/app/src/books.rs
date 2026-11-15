@@ -91,6 +91,9 @@ pub struct Book {
     /// Empty when Pharos sent no author.
     pub author: String,
     pub support: Support,
+    /// Pharos's tag for the cover, present only when there is a cover to
+    /// fetch.
+    pub image_tag: Option<String>,
 }
 
 impl Book {
@@ -176,6 +179,12 @@ pub fn parse_page(bytes: &[u8]) -> Option<BookPage> {
                     .to_owned(),
                 author: author_of(item),
                 support: support(item.get("Path").and_then(Value::as_str).unwrap_or_default()),
+                image_tag: item
+                    .get("ImageTags")
+                    .and_then(|tags| tags.get("Primary"))
+                    .and_then(Value::as_str)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned),
             })
         })
         .collect();
@@ -348,6 +357,7 @@ mod tests {
             title: "Book One".to_owned(),
             author: "Author A".to_owned(),
             support: support(path),
+            image_tag: None,
         }
     }
 
@@ -429,10 +439,12 @@ mod tests {
     fn a_page_reads_authors_paths_and_totals_and_drops_rows_without_ids() {
         let bytes = br#"{"Items":[
             {"Id":"a","Name":"Book One","Path":"/b/one.epub",
+             "ImageTags":{"Primary":"c0"},
              "People":[{"Name":"Editor E","Type":"Editor"},
                        {"Name":"Author A","Type":"Author"},
                        {"Name":"Author B","Type":"Author"}]},
-            {"Id":"b","Path":"/b/two.pdf","AlbumArtist":"Author C"},
+            {"Id":"b","Path":"/b/two.pdf","AlbumArtist":"Author C",
+             "ImageTags":{"Primary":""}},
             {"Name":"no id"}
         ],"TotalRecordCount":120}"#;
         let page = parse_page(bytes).unwrap_or_default();
@@ -444,6 +456,8 @@ mod tests {
         assert_eq!(page.books[1].title, "Untitled");
         assert_eq!(page.books[1].author, "Author C");
         assert!(matches!(page.books[1].support, Support::Cannot(_)));
+        assert_eq!(page.books[0].image_tag.as_deref(), Some("c0"));
+        assert_eq!(page.books[1].image_tag, None, "an empty tag is no cover");
         assert_eq!(parse_page(b"not json"), None);
     }
 
