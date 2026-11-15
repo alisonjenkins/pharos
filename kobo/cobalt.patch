@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..b9f5438
+index 0000000..bd430d8
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1249 @@
+@@ -0,0 +1,1275 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -2043,6 +2043,7 @@ index 0000000..b9f5438
 +            (None, Some((meta, _))) => Arc::new(Mutex::new(Inner {
 +                meta,
 +                unflushed: 0,
++                pending: 0,
 +                low_space_noted: false,
 +            })),
 +            (None, None) => return None,
@@ -2293,7 +2294,11 @@ index 0000000..b9f5438
 +
 +struct Inner {
 +    meta: Meta,
++    /// Blocks marked present since the sidecar was last saved.
 +    unflushed: u32,
++    /// Blocks reserved by a write that has not finished. They count against
++    /// the limit so stores sharing the download cannot all pass it at once.
++    pending: u32,
 +    low_space_noted: bool,
 +}
 +
@@ -2415,18 +2420,39 @@ index 0000000..b9f5438
 +        }
 +        // A full run of blocks with no sidecar saved: try to save it before
 +        // writing more, and write nothing while it cannot be, so a power cut
-+        // never costs more than the run.
-+        if self.inner().unflushed >= FLUSH_EVERY_BLOCKS {
++        // never costs more than the run. The slot is taken under the lock, so
++        // stores sharing the download cannot all pass the limit together; the
++        // lock is not held across the write itself.
++        loop {
++            let mut inner = self.inner();
++            if inner.unflushed.saturating_add(inner.pending) < FLUSH_EVERY_BLOCKS {
++                inner.pending += 1;
++                break;
++            }
++            if inner.unflushed == 0 {
++                // Only writes in flight fill the run: nothing to save yet.
++                return Ok(false);
++            }
++            drop(inner);
 +            if let Err(error) = self.flush() {
 +                self.note_save_failure(&error);
 +                return Ok(false);
 +            }
 +        }
-+        self.file.write_all_at(bytes, at)?;
++        let written = self
++            .downloads
++            .step("before-write")
++            .and_then(|()| self.file.write_all_at(bytes, at));
++        if let Err(error) = written {
++            let mut inner = self.inner();
++            inner.pending = inner.pending.saturating_sub(1);
++            return Err(error);
++        }
 +        let counters = &self.downloads.counters;
 +        bump(&counters.blocks_written, 1);
 +        bump(&counters.bytes_written, bytes.len() as u64);
 +        let mut inner = self.inner();
++        inner.pending = inner.pending.saturating_sub(1);
 +        inner.meta.set(index);
 +        inner.unflushed += 1;
 +        if inner.meta.all_present() {
@@ -2565,10 +2591,10 @@ index 0000000..b9f5438
 +mod tests;
 diff --git a/crates/kobo-audio/src/store/tests.rs b/crates/kobo-audio/src/store/tests.rs
 new file mode 100644
-index 0000000..5660ca1
+index 0000000..e1eb219
 --- /dev/null
 +++ b/crates/kobo-audio/src/store/tests.rs
-@@ -0,0 +1,821 @@
+@@ -0,0 +1,883 @@
 +#![allow(clippy::unwrap_used, clippy::expect_used)]
 +
 +use std::io::Read;
@@ -3389,6 +3415,68 @@ index 0000000..5660ca1
 +    let reopened = plain.begin("shelf", URL, None, BLOCK).expect("old pair");
 +    assert_eq!(reopened.total(), 3_000);
 +    assert_eq!(reopened.read(0).unwrap(), block(0, 3_000));
++}
++
++#[test]
++fn two_stores_cannot_together_write_past_the_unsaved_limit() {
++    use std::sync::atomic::{AtomicBool, AtomicUsize};
++    let dir = scratch("two-stores-limit");
++    let (_card, policy) = Card::policy(u64::MAX, 0);
++    let (plain, _lines) = downloads(&dir, policy);
++    let arrivals = Arc::new(AtomicUsize::new(0));
++    let first_waiting = Arc::new(AtomicBool::new(false));
++    let released = Arc::new(AtomicBool::new(false));
++    let armed = Arc::new(AtomicBool::new(false));
++    let (a, w, r, armed_in) = (
++        Arc::clone(&arrivals),
++        Arc::clone(&first_waiting),
++        Arc::clone(&released),
++        Arc::clone(&armed),
++    );
++    let downloads = plain.with_fault(move |step| {
++        match step {
++            "save-sidecar" => return Err(std::io::Error::other("injected")),
++            // The first writer to reach the disk waits for the other to be
++            // through (or to arrive), so both have passed the limit check.
++            "before-write" if armed_in.load(Ordering::SeqCst) => {
++                if a.fetch_add(1, Ordering::SeqCst) == 0 {
++                    w.store(true, Ordering::SeqCst);
++                    let deadline = Instant::now() + Duration::from_secs(5);
++                    while !r.load(Ordering::SeqCst) && Instant::now() < deadline {
++                        std::thread::sleep(Duration::from_millis(1));
++                    }
++                } else {
++                    r.store(true, Ordering::SeqCst);
++                }
++            }
++            _ => {}
++        }
++        Ok(())
++    });
++    let total = 40 * u64::from(BLOCK);
++    let one = downloads.begin("shelf", URL, Some(total), BLOCK).unwrap();
++    let two = downloads.begin("shelf", URL, Some(total), BLOCK).unwrap();
++    let bytes = pattern(usize::try_from(total).unwrap());
++    let chunk = |index: usize| bytes[index * BLOCK as usize..(index + 1) * BLOCK as usize].to_vec();
++    // One short of the limit, with every save failing.
++    for index in 0..15_u64 {
++        assert!(one
++            .write(index, &chunk(usize::try_from(index).unwrap()))
++            .unwrap());
++    }
++    armed.store(true, Ordering::SeqCst);
++    let racer = {
++        let block15 = chunk(15);
++        std::thread::spawn(move || one.write(15, &block15).unwrap())
++    };
++    while !first_waiting.load(Ordering::SeqCst) {
++        std::thread::sleep(Duration::from_millis(1));
++    }
++    let second = two.write(16, &chunk(16)).unwrap();
++    released.store(true, Ordering::SeqCst);
++    let first = racer.join().unwrap();
++    let on_disk = usize::from(first) + usize::from(second);
++    assert_eq!(15 + on_disk, 16, "past the limit with no sidecar saved");
 +}
 diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
 index cb8d722..f045baa 100644
