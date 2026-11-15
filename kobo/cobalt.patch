@@ -1310,10 +1310,10 @@ index 0000000..3bfc5a2
 +}
 diff --git a/crates/kobo-audio/src/store.rs b/crates/kobo-audio/src/store.rs
 new file mode 100644
-index 0000000..7167b80
+index 0000000..84a21fa
 --- /dev/null
 +++ b/crates/kobo-audio/src/store.rs
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1128 @@
 +//! Downloads: a ranged stream kept on the reader's storage.
 +//!
 +//! A book from a ranged server is written block by block to a file the
@@ -1330,7 +1330,7 @@ index 0000000..7167b80
 +use std::collections::{HashMap, HashSet};
 +use std::fmt;
 +use std::fs::{self, File, OpenOptions};
-+use std::io;
++use std::io::{self, Write};
 +use std::os::unix::fs::{FileExt, MetadataExt};
 +use std::path::{Path, PathBuf};
 +use std::sync::atomic::{AtomicU64, Ordering};
@@ -1745,8 +1745,27 @@ index 0000000..7167b80
 +
 +    fn write_meta(sidecar: &Path, meta: &Meta) -> io::Result<()> {
 +        let staging = sidecar.with_extension("tmp");
-+        fs::write(&staging, meta.encode())?;
-+        fs::rename(&staging, sidecar)
++        Self::write_synced(&staging, &meta.encode())?;
++        fs::rename(&staging, sidecar)?;
++        Self::sync_dir(sidecar);
++        Ok(())
++    }
++
++    /// Writes `text` to `path` and has it on disk before returning, so a
++    /// rename of it never publishes a file whose contents can still be lost.
++    fn write_synced(path: &Path, text: &str) -> io::Result<()> {
++        let mut file = File::create(path)?;
++        file.write_all(text.as_bytes())?;
++        file.sync_all()
++    }
++
++    /// Has the rename that just put `published` in its folder reach the disk.
++    /// Best effort: a volume that cannot sync a folder is no worse off than
++    /// before.
++    fn sync_dir(published: &Path) {
++        if let Some(dir) = published.parent() {
++            let _ignored = File::open(dir).and_then(|dir| dir.sync_all());
++        }
 +    }
 +
 +    /// Every download of every app.
@@ -2009,9 +2028,10 @@ index 0000000..7167b80
 +            .write(true)
 +            .open(&staged_data)
 +            .and_then(|file| file.set_len(meta.total).map(|()| file))
++            .and_then(|file| file.sync_all().map(|()| file))
 +            .and_then(|file| {
 +                meta.file_id = file.metadata()?.ino();
-+                fs::write(&staged_sidecar, meta.encode()).map(|()| file)
++                Self::write_synced(&staged_sidecar, &meta.encode()).map(|()| file)
 +            })
 +            .and_then(|file| self.step("rename-data").map(|()| file));
 +        let file = match prepared {
@@ -2037,6 +2057,7 @@ index 0000000..7167b80
 +            let _ignored = fs::remove_file(sidecar);
 +            return Err(error);
 +        }
++        Self::sync_dir(sidecar);
 +        Ok(file)
 +    }
 +
