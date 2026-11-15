@@ -10,7 +10,7 @@ use pharos_jellyfin_api::dto::sidecar_base_index;
 use pharos_styling::DIRECTOR_VERSION;
 
 use crate::api::jellyfin::subtitles::discover_sidecars;
-use crate::subtitle_styling::signature;
+use crate::subtitle_styling::{is_signs_only_title, signature};
 
 /// The styled track's subtitle index: one past the last sidecar (FR-017), so
 /// it never collides with a real stream and B71's contiguous rule holds.
@@ -80,7 +80,14 @@ pub async fn default_pick<S: SubtitleStylingStore>(
         );
         return None;
     };
-    if row.source_index != source {
+    let reason = if row.source_index == source {
+        "plan made from the default subtitle"
+    } else if signs_only_embedded(item, source) {
+        // B1447: a fansub release flags its Signs/Songs track default and the
+        // job styled the full track beside it. The styled track carries those
+        // signs too, so it shows wherever the signs track would have.
+        "default subtitle is signs only; plan made from the full track"
+    } else {
         tracing::info!(
             item = %item.id,
             source,
@@ -90,7 +97,7 @@ pub async fn default_pick<S: SubtitleStylingStore>(
             "default subtitle styled pick"
         );
         return None;
-    }
+    };
     let count = discover_sidecars(&item.path).await.len();
     let index = styled_index(&item.probe, u32::try_from(count).unwrap_or(u32::MAX));
     tracing::info!(
@@ -99,10 +106,20 @@ pub async fn default_pick<S: SubtitleStylingStore>(
         plan_source = row.source_index,
         styled = index,
         verdict = "styled",
-        reason = "plan made from the default subtitle",
+        reason,
         "default subtitle styled pick"
     );
     Some(index)
+}
+
+/// Whether embedded stream `source` is a signs/songs-only track: flagged
+/// forced, or titled so ([`is_signs_only_title`]).
+fn signs_only_embedded(item: &MediaItem, source: u32) -> bool {
+    item.probe
+        .subtitle_tracks
+        .iter()
+        .find(|t| t.stream_index == source)
+        .is_some_and(|t| t.is_forced || t.title.as_deref().is_some_and(is_signs_only_title))
 }
 
 /// The item's styling row when its plan can still be served: it has a plan,

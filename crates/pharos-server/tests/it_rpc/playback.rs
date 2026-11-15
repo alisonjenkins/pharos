@@ -1221,6 +1221,15 @@ async fn the_styled_track_is_the_default_where_its_source_would_show() {
         .await
         .unwrap();
     assert_eq!(other.subtitle, Some(2), "{other:?}");
+
+    // B1447: when the default is a signs/songs-only track, a plan made from
+    // the full track beside it is still the default.
+    item.probe.subtitle_tracks[0].title = Some("Signs/Songs".into());
+    fx.state.stores.put(item.clone()).await.unwrap();
+    let (_g, signs) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(signs.subtitle, Some(styled_slot), "{signs:?}");
 }
 
 const HDR_MOVIE: u64 = 302;
