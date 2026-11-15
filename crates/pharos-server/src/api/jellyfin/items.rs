@@ -3976,7 +3976,26 @@ async fn maybe_list_music(
         }
         true
     };
-    let mut aggs = aggregate_albums(all.iter(), keep, |i| state.is_audiobook(i));
+    // B1454 — a library ParentId scopes the albums to the tracks that library
+    // owns, so a Books library lists its audiobooks rather than every album.
+    let (scope, library) = album_library_scope(state, q.parent_id.as_deref());
+    scope.record();
+    let in_scope = |i: &MediaItem| match library.as_deref() {
+        Some(wire_id) => library_parent_id(state, i).as_deref() == Some(wire_id),
+        None => true,
+    };
+    let mut aggs = aggregate_albums(
+        all.iter(),
+        |i| in_scope(i) && keep(i),
+        |i| state.is_audiobook(i),
+    );
+    tracing::debug!(
+        parent_id = q.parent_id.as_deref().unwrap_or(""),
+        scope = scope.label(),
+        library = library.as_deref().unwrap_or(""),
+        albums = aggs.len(),
+        "album listing scope"
+    );
     if !exclude_ids.is_empty() {
         aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
     }
@@ -3992,6 +4011,61 @@ async fn maybe_list_music(
         total,
         q.start_index,
     )))
+}
+
+/// B1454 / V1440 — how an album-only listing's `ParentId` scopes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlbumScope {
+    /// No `ParentId`: every album the user can see.
+    All,
+    /// `ParentId` names a library: only albums whose tracks it owns.
+    Library,
+    /// `ParentId` names something else, which this listing does not scope by.
+    NotALibrary,
+}
+
+impl AlbumScope {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::All, Self::Library, Self::NotALibrary];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Library => "library",
+            Self::NotALibrary => "not_a_library",
+        }
+    }
+
+    fn record(self) {
+        metrics::counter!("pharos_album_list_scope_total", "scope" => self.label()).increment(1);
+    }
+}
+
+/// The scope of an album listing under `parent_id`, and the wire id of the
+/// library it names. A typed library or a bare media root both count, matched
+/// the way [`library_parent_id`] names an item's library.
+pub(crate) fn album_library_scope(
+    state: &AppState,
+    parent_id: Option<&str>,
+) -> (AlbumScope, Option<String>) {
+    let Some(raw) = parent_id else {
+        return (AlbumScope::All, None);
+    };
+    let canonical = canonical_wire_id(raw);
+    let pid: &str = canonical.as_ref();
+    if pid.is_empty() || pid == "00000000000000000000000000000000" {
+        return (AlbumScope::All, None);
+    }
+    let named = state.libraries().iter().any(|l| l.wire_id == pid)
+        || state
+            .media_roots
+            .iter()
+            .any(|r| library_id_for_root(r) == pid);
+    if named {
+        (AlbumScope::Library, Some(pid.to_owned()))
+    } else {
+        (AlbumScope::NotALibrary, None)
+    }
 }
 
 async fn list_items(
@@ -8752,5 +8826,39 @@ mod sort_field_tests {
     #[test]
     fn chain_folds_an_unknown_token_into_sort_name() {
         assert_eq!(sort_chain("SortName,Bogus", &[], false).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod album_scope_tests {
+    use super::AlbumScope;
+
+    #[test]
+    fn album_scope_labels_are_distinct_and_stable() {
+        let labels: Vec<_> = AlbumScope::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels, ["all", "library", "not_a_library"]);
+    }
+
+    #[test]
+    fn a_scope_is_counted_under_its_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || AlbumScope::Library.record());
+        let counted: Vec<_> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == "pharos_album_list_scope_total")
+            .map(|(ck, .., v)| {
+                let scope = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "scope")
+                    .map(|l| l.value().to_owned());
+                (scope, matches!(v, DebugValue::Counter(1)))
+            })
+            .collect();
+        assert_eq!(counted, [(Some("library".to_owned()), true)]);
     }
 }
