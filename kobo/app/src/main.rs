@@ -445,7 +445,12 @@ impl Pharos {
         } else {
             kobo_image::decode(bytes)
         };
-        let picture = match decoded.and_then(|picture| picture.cover(width, height)) {
+        // Fitted whole, not cropped to the tile: most audiobook art is square,
+        // and filling a tall tile with it cut a third off its sides. The
+        // runtime centres a picture that is not the tile's shape.
+        let picture = match decoded.and_then(|picture| {
+            picture.prepare(width, height, kobo_image::FitMode::ContainEnlarging)
+        }) {
             Ok(picture) => picture,
             Err(error) => return self.cover_failed(context, id, &error.to_string()),
         };
