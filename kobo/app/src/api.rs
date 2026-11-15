@@ -57,6 +57,9 @@ pub struct Entry {
     /// Pharos's tag for the cover, present only when there is a cover to
     /// fetch.
     pub image_tag: Option<String>,
+    /// The description, as plain text; empty when pharos sent none, as it
+    /// does for music albums and tracks.
+    pub overview: String,
 }
 
 /// A page of a listing and how many there are in all.
@@ -190,12 +193,13 @@ pub fn views_url(server: &str, account: &Account) -> String {
 
 /// The albums under one library, by name. Audiobooks are albums too, so a
 /// server that ignores the library sends them with the music; `Kind::keeps`
-/// sorts them out.
+/// sorts them out. `Overview` carries an audiobook's description.
 #[must_use]
 pub fn albums_url(server: &str, account: &Account, library: &str, start: usize) -> String {
     format!(
         "{server}/Users/{}/Items?IncludeItemTypes=MusicAlbum&Recursive=true\
-         &ParentId={}&SortBy=SortName&SortOrder=Ascending&StartIndex={start}&Limit={PAGE}",
+         &ParentId={}&SortBy=SortName&SortOrder=Ascending&Fields=Overview\
+         &StartIndex={start}&Limit={PAGE}",
         query_escape(&account.user_id),
         query_escape(library)
     )
@@ -599,6 +603,7 @@ pub fn parse_page(bytes: &[u8]) -> Option<Page> {
                     .and_then(|tags| text(tags, "Primary"))
                     .filter(|tag| !tag.is_empty())
                     .map(str::to_owned),
+                overview: text(item, "Overview").unwrap_or_default().trim().to_owned(),
             })
         })
         .collect();
@@ -683,6 +688,7 @@ mod tests {
         let albums = albums_url("https://p.test", &account(), "lib1", 50);
         assert!(albums.starts_with("https://p.test/Users/u1/Items?IncludeItemTypes=MusicAlbum"));
         assert!(albums.contains("&ParentId=lib1&"));
+        assert!(albums.contains("&Fields=Overview&"));
         assert!(albums.contains("StartIndex=50&Limit=50"));
         let tracks = tracks_url("https://p.test", &account(), "al1", 50);
         assert!(tracks.contains("ParentId=al1"));
@@ -780,6 +786,17 @@ mod tests {
         assert!(Kind::Music.keeps(&page.entries[1]));
         assert!(!Kind::Books.keeps(&page.entries[1]));
         assert!(Kind::Music.is_albums() && !Kind::Books.is_albums());
+    }
+
+    #[test]
+    fn an_audiobook_carries_its_description_and_music_none() {
+        let bytes = br#"{"Items":[
+            {"Id":"a","Name":"Album One","PharosAudiobook":true,"Overview":" Read aloud. "},
+            {"Id":"b","Name":"Album Two"}
+        ]}"#;
+        let page = parse_page(bytes).unwrap_or_default();
+        assert_eq!(page.entries[0].overview, "Read aloud.");
+        assert_eq!(page.entries[1].overview, "");
     }
 
     #[test]
