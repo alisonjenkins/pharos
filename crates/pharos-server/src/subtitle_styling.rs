@@ -103,6 +103,10 @@ pub struct SubtitleCandidate {
     pub hearing_impaired: bool,
     pub is_default: bool,
     pub forced: bool,
+    /// The track's title or file name says it carries only signs and songs
+    /// (B1447): a fansub release ships one beside its full dialogue track,
+    /// and does not always flag it forced.
+    pub signs_only: bool,
     /// The file, for a sidecar; `None` for an embedded stream.
     pub sidecar: Option<PathBuf>,
 }
@@ -124,6 +128,20 @@ impl SubtitleCandidate {
     }
 }
 
+/// Whether a subtitle title (or sidecar file name) names a signs/songs-only
+/// track, e.g. "Signs/Songs", "Signs & Songs", "Songs-Signs", "Forced". A
+/// title that also says "full" or "dialogue" ("Full Subtitles + Signs") is a
+/// full track and is not one.
+pub fn is_signs_only_title(title: &str) -> bool {
+    let words: Vec<String> = title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |names: &[&str]| words.iter().any(|w| names.contains(&w.as_str()));
+    has(&["sign", "signs", "song", "songs", "forced"]) && !has(&["full", "dialogue", "dialog"])
+}
+
 fn is_english(language: Option<&str>) -> bool {
     let Some(l) = language else { return false };
     let l = l.trim().to_ascii_lowercase();
@@ -141,7 +159,9 @@ fn is_untagged(language: Option<&str>) -> bool {
 }
 
 /// The source track (FR-016): a full English text track, never a forced one,
-/// or an untagged one when it is the only text track. Among those, hearing
+/// or an untagged one when it is the only text track. Among those, a track
+/// whose title says signs/songs only comes last (B1447: it carries a few
+/// dozen dialogue lines, and its default flag used to win), then hearing
 /// impaired first (its sound tags feed the director), then ASS/SSA over the
 /// rest (italics and positions survive), then the default flag, then the
 /// lowest index. Image codecs are never chosen.
@@ -154,7 +174,15 @@ pub fn choose_source(candidates: &[SubtitleCandidate]) -> Option<&SubtitleCandid
             is_english(c.language.as_deref())
                 || (text_tracks == 1 && is_untagged(c.language.as_deref()))
         })
-        .min_by_key(|c| (!c.hearing_impaired, !c.is_ass(), !c.is_default, c.index))
+        .min_by_key(|c| {
+            (
+                c.signs_only,
+                !c.hearing_impaired,
+                !c.is_ass(),
+                !c.is_default,
+                c.index,
+            )
+        })
 }
 
 /// The audio stream the subtitles are timed to (FR-012): the default track
@@ -1358,6 +1386,7 @@ fn sidecar_candidate(index: u32, path: &std::path::Path) -> SubtitleCandidate {
         hearing_impaired: has_token(&["sdh", "hi", "cc"]),
         is_default: has_token(&["default"]),
         forced: has_token(&["forced"]),
+        signs_only: is_signs_only_title(name),
         sidecar: Some(path.to_path_buf()),
     }
 }
@@ -1376,6 +1405,7 @@ async fn candidates_for(item: &MediaItem) -> Vec<SubtitleCandidate> {
             hearing_impaired: t.is_hearing_impaired,
             is_default: t.is_default,
             forced: t.is_forced,
+            signs_only: t.title.as_deref().is_some_and(is_signs_only_title),
             sidecar: None,
         })
         .collect();
@@ -1527,6 +1557,7 @@ mod tests {
             hearing_impaired: false,
             is_default: false,
             forced: false,
+            signs_only: false,
             sidecar: None,
         }
     }
@@ -1599,6 +1630,43 @@ mod tests {
         default_srt.is_default = true;
         assert_eq!(chosen(&[srt.clone(), default_srt]), Some(9));
         assert_eq!(chosen(&[sub(8, Some("eng"), "subrip"), srt]), Some(2));
+    }
+
+    /// B1447 — a fansub release's default "Signs/Songs" ASS track that is not
+    /// flagged forced must not beat the full dialogue track beside it.
+    #[test]
+    fn a_signs_only_track_loses_to_the_full_track_even_when_default() {
+        let mut signs = sub(3, Some("eng"), "ass");
+        signs.is_default = true;
+        signs.signs_only = true;
+        let full = sub(4, Some("eng"), "ass");
+        assert_eq!(chosen(&[signs.clone(), full]), Some(4));
+        // Alone, it is still styled: better than nothing.
+        assert_eq!(chosen(&[signs]), Some(3));
+    }
+
+    #[test]
+    fn signs_only_titles_are_recognised() {
+        for t in [
+            "Signs/Songs",
+            "Signs & Songs",
+            "signs",
+            "Songs-Signs [Group]",
+            "English (Forced)",
+            "Show.S01E02.signs.en.ass",
+        ] {
+            assert!(is_signs_only_title(t), "{t}");
+        }
+        for t in [
+            "Full Subtitles",
+            "Full Subtitles + Signs",
+            "Dialogue & Signs",
+            "English",
+            "SDH",
+            "Designs",
+        ] {
+            assert!(!is_signs_only_title(t), "{t}");
+        }
     }
 
     fn audio(index: u32, lang: Option<&str>, default: bool) -> AudioTrack {
