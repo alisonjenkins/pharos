@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ff9a0140..eadda66e 100644
+index ff9a014..eadda66 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1559,6 +1559,15 @@ dependencies = [
@@ -19,7 +19,7 @@ index ff9a0140..eadda66e 100644
  name = "kobo-policy"
  version = "0.3.37"
 diff --git a/Cargo.toml b/Cargo.toml
-index 209fdaa9..68ff56b8 100644
+index 209fdaa..68ff56b 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -54,6 +54,7 @@ members = [
@@ -30,8 +30,1243 @@ index 209fdaa9..68ff56b8 100644
      "examples/hn",
      "examples/books",
      "examples/launcher",
+diff --git a/crates/kobo-audio/src/lib.rs b/crates/kobo-audio/src/lib.rs
+index 098fbfb..e387174 100644
+--- a/crates/kobo-audio/src/lib.rs
++++ b/crates/kobo-audio/src/lib.rs
+@@ -21,8 +21,11 @@ pub mod stretch;
+ mod mp4;
+ #[cfg(feature = "opus")]
+ mod opus;
++pub(crate) mod remote;
+ mod tags;
+ 
++pub use remote::{FetchFailure, RangeFetch, Remote, RemoteOptions, RemoteStats};
++
+ use std::fmt;
+ use std::fs::File;
+ use std::io::{self, Cursor, Read, Seek};
+@@ -74,6 +77,9 @@ pub enum Fault {
+     Unsupported,
+     /// The file is a kind this crate plays, and is not well formed.
+     Damaged,
++    /// A remote book's network went away and stayed away. The book keeps its
++    /// place; the next read tries again from there.
++    Disconnected,
+ }
+ 
+ impl fmt::Display for Fault {
+@@ -82,6 +88,7 @@ impl fmt::Display for Fault {
+             Self::Unreadable => "the audio file could not be read",
+             Self::Unsupported => "the audio file is a kind this reader cannot play",
+             Self::Damaged => "the audio file is damaged",
++            Self::Disconnected => "the network was lost while streaming the audio",
+         })
+     }
+ }
+@@ -126,6 +133,42 @@ impl Container {
+         }
+     }
+ 
++    /// The container the opening bytes of a file say it is, if they say.
++    ///
++    /// A stream's address often names no container, as `/Audio/{id}/universal`
++    /// does, and a server sends the original file, so the bytes are the only
++    /// honest answer. A zip is not recognised: an `.mp3z` is known by name.
++    #[must_use]
++    pub fn sniff(head: &[u8]) -> Option<Self> {
++        let at = |range: std::ops::Range<usize>| head.get(range);
++        if at(4..8) == Some(b"ftyp") {
++            return Some(Self::Mp4);
++        }
++        if head.starts_with(b"fLaC") {
++            return Some(Self::Flac);
++        }
++        if head.starts_with(b"OggS") {
++            // The first page's first packet names the codec, 28 bytes in.
++            return Some(if at(28..36) == Some(b"OpusHead") {
++                Self::Opus
++            } else {
++                Self::Ogg
++            });
++        }
++        if head.starts_with(b"RIFF") && at(8..12) == Some(b"WAVE") {
++            return Some(Self::Wav);
++        }
++        if head.starts_with(b"ID3") {
++            return Some(Self::Mp3);
++        }
++        match head {
++            // An MPEG audio frame sync with a layer set. Layer zero is ADTS
++            // AAC, which the probe finds by itself.
++            [0xFF, second, ..] if second & 0xE0 == 0xE0 && second & 0x06 != 0 => Some(Self::Mp3),
++            _ => None,
++        }
++    }
++
+     /// The short name a row shows.
+     #[must_use]
+     pub const fn badge(self) -> &'static str {
+@@ -259,6 +302,8 @@ enum Source {
+         archive: Arc<Vec<u8>>,
+         name: String,
+     },
++    /// A file read over the network in ranges. Every open shares one cache.
++    Remote(Arc<Remote>),
+ }
+ 
+ impl Source {
+@@ -273,6 +318,7 @@ impl Source {
+                 let member = archive.read(name).map_err(|_| Fault::Damaged)?;
+                 Ok(Box::new(Cursor::new(member)))
+             }
++            Self::Remote(remote) => Ok(Box::new(remote.reader())),
+         }
+     }
+ 
+@@ -283,6 +329,7 @@ impl Source {
+             // The compressed size is near enough for a bit rate: a member is
+             // MP3, which does not compress.
+             Self::Member { archive, .. } => u64::try_from(archive.len()).unwrap_or(u64::MAX),
++            Self::Remote(remote) => remote.total(),
+         }
+     }
+ }
+@@ -331,6 +378,8 @@ pub struct Book {
+     playing: Option<Playing>,
+     /// Set once the last part has run out.
+     finished: bool,
++    /// Where to pick up after a remote part lost its network mid-read.
++    resume_ms: Option<u32>,
+ }
+ 
+ /// A chunk of sound handed out by [`Book::read`].
+@@ -370,7 +419,9 @@ impl Book {
+     /// # Errors
+     /// The name names no playable kind, or the bytes are damaged.
+     pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self, Fault> {
+-        let container = Container::from_name(name).ok_or(Fault::Unsupported)?;
++        let container = Container::sniff(&bytes)
++            .or_else(|| Container::from_name(name))
++            .ok_or(Fault::Unsupported)?;
+         if container == Container::Mp3z {
+             return Self::open_archive(bytes, stem(name));
+         }
+@@ -381,6 +432,40 @@ impl Book {
+         ))
+     }
+ 
++    /// Opens a file read over the network through `remote`. Its kind comes
++    /// from its opening bytes, or failing that from `name`.
++    ///
++    /// # Errors
++    /// The kind is not one this crate plays (an `.mp3z` needs the whole
++    /// archive, so it is not streamed), the bytes are damaged, or the network
++    /// went away before the book's headers were read.
++    pub fn open_remote(remote: Remote, name: &str) -> Result<Self, Fault> {
++        let remote = Arc::new(remote);
++        let mut head = [0_u8; 64];
++        let mut reader = remote.reader();
++        let mut filled = 0;
++        while filled < head.len() {
++            let read = reader
++                .read(head.get_mut(filled..).unwrap_or_default())
++                .map_err(|error| io_fault(&error))?;
++            if read == 0 {
++                break;
++            }
++            filled += read;
++        }
++        drop(reader);
++        let container = Container::sniff(head.get(..filled).unwrap_or_default())
++            .or_else(|| Container::from_name(name))
++            .ok_or(Fault::Unsupported)?;
++        if container == Container::Mp3z {
++            return Err(Fault::Unsupported);
++        }
++        Ok(Self::from_parts(
++            vec![part(Source::Remote(remote), container, &stem(name))?],
++            None,
++        ))
++    }
++
+     /// Opens a folder's files as one book called `title`, each file a chapter
+     /// in the order given.
+     ///
+@@ -467,6 +552,7 @@ impl Book {
+             current: 0,
+             playing: None,
+             finished: false,
++            resume_ms: None,
+         }
+     }
+ 
+@@ -483,6 +569,9 @@ impl Book {
+     /// Where the next sound handed out comes from, in the book's timeline.
+     #[must_use]
+     pub fn position_ms(&self) -> u32 {
++        if let (None, Some(resume_ms)) = (&self.playing, self.resume_ms) {
++            return resume_ms;
++        }
+         let start = self.starts_ms.get(self.current).copied().unwrap_or(0);
+         let within = self.playing.as_ref().map_or(0, |playing| {
+             frames_to_ms(playing.position_frames, playing.rate)
+@@ -502,6 +591,23 @@ impl Book {
+     /// # Errors
+     /// The part holding the position cannot be opened or seeked.
+     pub fn seek(&mut self, position_ms: u32) -> Result<(), Fault> {
++        match self.seek_part(position_ms) {
++            Ok(()) => {
++                self.resume_ms = None;
++                Ok(())
++            }
++            Err(Fault::Disconnected) => {
++                // A part half-seeked would play from wherever its reader
++                // stopped; the next read seeks here again instead.
++                self.playing = None;
++                self.resume_ms = Some(position_ms.min(self.duration_ms));
++                Err(Fault::Disconnected)
++            }
++            Err(fault) => Err(fault),
++        }
++    }
++
++    fn seek_part(&mut self, position_ms: u32) -> Result<(), Fault> {
+         let wanted = position_ms.min(self.duration_ms);
+         let index = self
+             .starts_ms
+@@ -528,7 +634,10 @@ impl Book {
+                     track_id: Some(playing.track_id),
+                 },
+             )
+-            .map_err(|_| Fault::Damaged)?;
++            .map_err(|error| match error {
++                Symphonia::IoError(error) => io_fault(&error),
++                _ => Fault::Damaged,
++            })?;
+         playing.decoder.reset();
+         let actual_ms = playing
+             .time_base
+@@ -551,7 +660,11 @@ impl Book {
+                     rate: 48_000,
+                 });
+             }
+-            self.playing = Some(open_part(&self.parts[self.current])?);
++            if let Some(resume_ms) = self.resume_ms {
++                self.seek(resume_ms)?;
++            } else {
++                self.playing = Some(open_part(&self.parts[self.current])?);
++            }
+         }
+         let mut given = 0;
+         let mut rate = None;
+@@ -563,7 +676,22 @@ impl Book {
+                 // boundary so the caller can follow it.
+                 break;
+             }
+-            if playing.pending.is_empty() && !fill(playing)? {
++            let more = if playing.pending.is_empty() {
++                match fill(playing) {
++                    Ok(more) => more,
++                    Err(Fault::Disconnected) => {
++                        // The decoder may be mid-packet; the part is opened
++                        // afresh from here when the network is back.
++                        self.resume_ms = Some(self.position_ms());
++                        self.playing = None;
++                        return Err(Fault::Disconnected);
++                    }
++                    Err(fault) => return Err(fault),
++                }
++            } else {
++                true
++            };
++            if !more {
+                 // This part has run out.
+                 if self.current + 1 < self.parts.len() {
+                     self.current += 1;
+@@ -611,6 +739,7 @@ fn fill(playing: &mut Playing) -> Result<bool, Fault> {
+             Err(Symphonia::IoError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                 return Ok(false);
+             }
++            Err(Symphonia::IoError(error)) => return Err(io_fault(&error)),
+             Err(Symphonia::ResetRequired) => {
+                 playing.decoder.reset();
+                 continue;
+@@ -716,12 +845,21 @@ fn open_part(part: &Part) -> Result<Playing, Fault> {
+ fn probe_fault(error: Symphonia) -> Fault {
+     match error {
+         Symphonia::IoError(error) if error.kind() != io::ErrorKind::UnexpectedEof => {
+-            Fault::Unreadable
++            io_fault(&error)
+         }
+         _ => Fault::Damaged,
+     }
+ }
+ 
++/// What a failed read means: a remote source says whether its network went
++/// away or its server refused; anything else could not be read.
++fn io_fault(error: &io::Error) -> Fault {
++    match remote::RemoteFault::of(error) {
++        Some(remote::RemoteFault::Lost) => Fault::Disconnected,
++        Some(remote::RemoteFault::Refused) | None => Fault::Unreadable,
++    }
++}
++
+ /// Reads what a file says about itself, and how long it plays, without
+ /// decoding any of its sound.
+ fn part(source: Source, container: Container, title: &str) -> Result<Part, Fault> {
+diff --git a/crates/kobo-audio/src/remote.rs b/crates/kobo-audio/src/remote.rs
+new file mode 100644
+index 0000000..43b61a0
+--- /dev/null
++++ b/crates/kobo-audio/src/remote.rs
+@@ -0,0 +1,517 @@
++//! A book read over the network in ranges, through a small shared cache.
++//!
++//! A multi-hour audiobook is hundreds of megabytes, and the reader has 1 GB
++//! for everything, so the file is never held whole. It is read in fixed
++//! blocks, at most [`RemoteOptions::resident_blocks`] of them held at once,
++//! and a background thread keeps the blocks after the listener's place
++//! fetched so the audio thread is not the one waiting on Wi-Fi.
++//!
++//! Reads are random access: an MPEG-4 book often keeps its index at the end,
++//! and the probe reads that before the first sound.
++
++use std::collections::HashMap;
++use std::fmt;
++use std::io::{self, Read, Seek, SeekFrom};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
++use std::thread;
++use std::time::{Duration, Instant};
++
++use symphonia::core::io::MediaSource;
++
++/// Why one range could not be fetched.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum FetchFailure {
++    /// Worth asking again: the network or the server may come back.
++    Transient,
++    /// The server answered and will not give this range: a refusal, a
++    /// missing file, or a whole-document reply where a range was asked for.
++    Refused,
++}
++
++/// Fetches `len` bytes of the resource starting at `offset`. Answers exactly
++/// `len` bytes, or fewer only for the last block.
++pub type RangeFetch = Arc<dyn Fn(u64, u32) -> Result<Vec<u8>, FetchFailure> + Send + Sync>;
++
++/// How the cache is shaped and how patient it is with the network.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct RemoteOptions {
++    pub block_bytes: u32,
++    /// The most blocks held at once. `block_bytes * resident_blocks` is the
++    /// whole of what a remote book costs in memory.
++    pub resident_blocks: usize,
++    /// Blocks after the read position the background thread keeps fetched.
++    pub ahead_blocks: u64,
++    /// Blocks before the read position kept from eviction, for short skips
++    /// back.
++    pub behind_blocks: u64,
++    /// Waits between attempts at a block; the last repeats.
++    pub retry_delays: Vec<Duration>,
++    /// How long one block is retried before the network counts as lost.
++    pub give_up_after: Duration,
++}
++
++impl Default for RemoteOptions {
++    fn default() -> Self {
++        Self {
++            block_bytes: 256 * 1024,
++            // 8 MiB resident: flat memory for any length of book.
++            resident_blocks: 32,
++            // About 6 MiB, which is several minutes of a spoken-word book:
++            // long enough to ride out a Wi-Fi power-save nap.
++            ahead_blocks: 24,
++            behind_blocks: 2,
++            retry_delays: vec![
++                Duration::from_millis(500),
++                Duration::from_secs(1),
++                Duration::from_secs(2),
++                Duration::from_secs(4),
++            ],
++            give_up_after: Duration::from_secs(30),
++        }
++    }
++}
++
++/// What the cache has done, for tests and for whoever diagnoses a stall.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct RemoteStats {
++    pub fetches: u64,
++    pub failed_fetches: u64,
++    pub evictions: u64,
++    pub resident_bytes: usize,
++    pub peak_resident_bytes: usize,
++}
++
++/// Why a read of a remote book failed, carried inside the `io::Error` the
++/// decoder sees so the book can tell it from damage.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum RemoteFault {
++    /// The network stayed away past the retry budget.
++    Lost,
++    /// The server refused a range.
++    Refused,
++}
++
++impl fmt::Display for RemoteFault {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Lost => "the network was lost while streaming",
++            Self::Refused => "the server refused a range of the stream",
++        })
++    }
++}
++
++impl std::error::Error for RemoteFault {}
++
++impl RemoteFault {
++    fn into_io(self) -> io::Error {
++        let kind = match self {
++            Self::Lost => io::ErrorKind::NotConnected,
++            Self::Refused => io::ErrorKind::PermissionDenied,
++        };
++        io::Error::new(kind, self)
++    }
++
++    /// The fault an `io::Error` from a remote reader carries, if any.
++    pub(crate) fn of(error: &io::Error) -> Option<Self> {
++        error
++            .get_ref()
++            .and_then(|inner| inner.downcast_ref::<Self>())
++            .copied()
++    }
++}
++
++struct Block {
++    bytes: Arc<[u8]>,
++    /// The cache clock when this block was last read or stored.
++    used: u64,
++}
++
++#[derive(Default)]
++struct Cache {
++    blocks: HashMap<u64, Block>,
++    clock: u64,
++    /// The block the most recent read wanted; read-ahead starts here.
++    wanted: u64,
++    /// Set when a block could not be had within the retry budget. Cleared
++    /// when a new reader opens, which is a listener pressing Play again.
++    lost: bool,
++    refused: bool,
++    closed: bool,
++    stats: RemoteStats,
++}
++
++struct Shared {
++    fetch: RangeFetch,
++    total: u64,
++    options: RemoteOptions,
++    cache: Mutex<Cache>,
++    changed: Condvar,
++    ahead_exited: AtomicBool,
++}
++
++/// One remote resource: its cache and the read-ahead thread that fills it.
++/// Dropping it stops the thread.
++pub struct Remote {
++    shared: Arc<Shared>,
++}
++
++impl fmt::Debug for Remote {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Remote")
++            .field("total", &self.shared.total)
++            .finish_non_exhaustive()
++    }
++}
++
++impl Remote {
++    /// A resource `total` bytes long, read through `fetch`. `first` is the
++    /// opening block if the caller already fetched it, as the request that
++    /// found out the total did.
++    ///
++    /// # Errors
++    /// The read-ahead thread could not be started.
++    pub fn open(
++        fetch: RangeFetch,
++        total: u64,
++        first: Vec<u8>,
++        options: RemoteOptions,
++    ) -> io::Result<Self> {
++        let options = RemoteOptions {
++            block_bytes: options.block_bytes.max(1),
++            resident_blocks: options.resident_blocks.max(1),
++            ..options
++        };
++        let shared = Arc::new(Shared {
++            fetch,
++            total,
++            options,
++            cache: Mutex::new(Cache::default()),
++            changed: Condvar::new(),
++            ahead_exited: AtomicBool::new(false),
++        });
++        if !first.is_empty() && Some(first.len()) == shared.block_len(0) {
++            let mut cache = shared.lock();
++            store(&shared, &mut cache, 0, first.into());
++        }
++        let ahead = Arc::clone(&shared);
++        thread::Builder::new()
++            .name("audio-read-ahead".to_owned())
++            .spawn(move || {
++                read_ahead(&ahead);
++                ahead.ahead_exited.store(true, Ordering::SeqCst);
++            })?;
++        Ok(Self { shared })
++    }
++
++    #[must_use]
++    pub fn total(&self) -> u64 {
++        self.shared.total
++    }
++
++    #[must_use]
++    pub fn stats(&self) -> RemoteStats {
++        self.shared.lock().stats
++    }
++
++    /// A new reader at the start, sharing this cache.
++    pub(crate) fn reader(&self) -> Reader {
++        {
++            let mut cache = self.shared.lock();
++            cache.lost = false;
++        }
++        self.shared.changed.notify_all();
++        Reader {
++            shared: Arc::clone(&self.shared),
++            position: 0,
++        }
++    }
++
++    /// Whether the read-ahead thread has returned.
++    #[cfg(test)]
++    pub(crate) fn exit_flag(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
++        let shared = Arc::clone(&self.shared);
++        Arc::new(move || shared.ahead_exited.load(Ordering::SeqCst))
++    }
++}
++
++impl Drop for Remote {
++    fn drop(&mut self) {
++        // Not joined: the thread may be inside a fetch that only the
++        // transport's own timeout ends, and the audio thread dropping a book
++        // must not wait on Wi-Fi. It returns as soon as that fetch does.
++        self.shared.lock().closed = true;
++        self.shared.changed.notify_all();
++    }
++}
++
++impl Shared {
++    fn lock(&self) -> MutexGuard<'_, Cache> {
++        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++
++    fn block_count(&self) -> u64 {
++        self.total.div_ceil(u64::from(self.options.block_bytes))
++    }
++
++    fn block_start(&self, index: u64) -> u64 {
++        index.saturating_mul(u64::from(self.options.block_bytes))
++    }
++
++    /// How long block `index` is, or `None` past the end.
++    fn block_len(&self, index: u64) -> Option<usize> {
++        let start = self.block_start(index);
++        if start >= self.total {
++            return None;
++        }
++        let len = (self.total - start).min(u64::from(self.options.block_bytes));
++        usize::try_from(len).ok()
++    }
++
++    /// Block `index`, waiting for the read-ahead thread to fetch it.
++    fn block(&self, index: u64) -> io::Result<Arc<[u8]>> {
++        // A safety net for a read-ahead thread that has died: it always
++        // answers within the retry budget otherwise.
++        let deadline = Instant::now() + self.options.give_up_after + Duration::from_secs(15);
++        let mut cache = self.lock();
++        if cache.wanted != index {
++            cache.wanted = index;
++            self.changed.notify_all();
++        }
++        loop {
++            cache.clock = cache.clock.wrapping_add(1);
++            let clock = cache.clock;
++            if let Some(block) = cache.blocks.get_mut(&index) {
++                block.used = clock;
++                return Ok(Arc::clone(&block.bytes));
++            }
++            if cache.refused {
++                return Err(RemoteFault::Refused.into_io());
++            }
++            if cache.lost || cache.closed {
++                return Err(RemoteFault::Lost.into_io());
++            }
++            let now = Instant::now();
++            if now >= deadline {
++                return Err(RemoteFault::Lost.into_io());
++            }
++            cache = self
++                .changed
++                .wait_timeout(cache, deadline - now)
++                .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard);
++        }
++    }
++
++    /// The first block in the read-ahead window not yet held.
++    fn next_missing(&self, cache: &Cache) -> Option<u64> {
++        let end = cache
++            .wanted
++            .saturating_add(self.options.ahead_blocks)
++            .saturating_add(1)
++            .min(self.block_count());
++        (cache.wanted..end).find(|index| !cache.blocks.contains_key(index))
++    }
++
++    /// Whether `index` is in the window kept from eviction.
++    fn protected(&self, cache: &Cache, index: u64) -> bool {
++        let low = cache.wanted.saturating_sub(self.options.behind_blocks);
++        let high = cache.wanted.saturating_add(self.options.ahead_blocks);
++        (low..=high).contains(&index)
++    }
++}
++
++/// Stores a fetched block, evicting the least recently used outside the
++/// window around the read position first.
++fn store(shared: &Shared, cache: &mut Cache, index: u64, bytes: Arc<[u8]>) {
++    while cache.blocks.len() >= shared.options.resident_blocks {
++        let victim = cache
++            .blocks
++            .iter()
++            .filter(|(at, _)| !shared.protected(cache, **at))
++            .min_by_key(|(_, block)| block.used)
++            .or_else(|| cache.blocks.iter().min_by_key(|(_, block)| block.used))
++            .map(|(at, _)| *at);
++        let Some(victim) = victim else { break };
++        if let Some(evicted) = cache.blocks.remove(&victim) {
++            cache.stats.resident_bytes = cache
++                .stats
++                .resident_bytes
++                .saturating_sub(evicted.bytes.len());
++            cache.stats.evictions = cache.stats.evictions.saturating_add(1);
++        }
++    }
++    cache.clock = cache.clock.wrapping_add(1);
++    cache.stats.resident_bytes = cache.stats.resident_bytes.saturating_add(bytes.len());
++    cache.stats.peak_resident_bytes = cache
++        .stats
++        .peak_resident_bytes
++        .max(cache.stats.resident_bytes);
++    let used = cache.clock;
++    if let Some(replaced) = cache.blocks.insert(index, Block { bytes, used }) {
++        cache.stats.resident_bytes = cache
++            .stats
++            .resident_bytes
++            .saturating_sub(replaced.bytes.len());
++    }
++}
++
++/// What a fetch with retries came to.
++enum Outcome {
++    Got(Arc<[u8]>),
++    Lost,
++    Refused,
++    Closed,
++    /// The reader moved away from this block while it was being retried.
++    Moved,
++}
++
++fn read_ahead(shared: &Shared) {
++    loop {
++        let index = {
++            let mut cache = shared.lock();
++            loop {
++                if cache.closed {
++                    return;
++                }
++                if !cache.lost && !cache.refused {
++                    if let Some(index) = shared.next_missing(&cache) {
++                        break index;
++                    }
++                }
++                cache = shared
++                    .changed
++                    .wait(cache)
++                    .unwrap_or_else(PoisonError::into_inner);
++            }
++        };
++        let outcome = fetch_retrying(shared, index);
++        let mut cache = shared.lock();
++        match outcome {
++            Outcome::Got(bytes) => store(shared, &mut cache, index, bytes),
++            Outcome::Lost => cache.lost = true,
++            Outcome::Refused => cache.refused = true,
++            Outcome::Closed => return,
++            Outcome::Moved => {}
++        }
++        drop(cache);
++        shared.changed.notify_all();
++    }
++}
++
++fn fetch_retrying(shared: &Shared, index: u64) -> Outcome {
++    let Some(len) = shared.block_len(index) else {
++        return Outcome::Refused;
++    };
++    let Ok(asked) = u32::try_from(len) else {
++        return Outcome::Refused;
++    };
++    let offset = shared.block_start(index);
++    let started = Instant::now();
++    let mut attempt = 0_usize;
++    loop {
++        let fetched = (shared.fetch)(offset, asked);
++        {
++            let mut cache = shared.lock();
++            cache.stats.fetches = cache.stats.fetches.saturating_add(1);
++            if cache.closed {
++                return Outcome::Closed;
++            }
++            match fetched {
++                Ok(bytes) if bytes.len() == len => return Outcome::Got(bytes.into()),
++                Err(FetchFailure::Refused) => {
++                    cache.stats.failed_fetches = cache.stats.failed_fetches.saturating_add(1);
++                    return Outcome::Refused;
++                }
++                // A short or long body is a reply cut off or a server that
++                // changed its mind about ranges; both may be passing.
++                Ok(_) | Err(FetchFailure::Transient) => {
++                    cache.stats.failed_fetches = cache.stats.failed_fetches.saturating_add(1);
++                }
++            }
++        }
++        let delay = shared
++            .options
++            .retry_delays
++            .get(attempt)
++            .or_else(|| shared.options.retry_delays.last())
++            .copied()
++            .unwrap_or(Duration::ZERO);
++        if started.elapsed().saturating_add(delay) > shared.options.give_up_after {
++            return Outcome::Lost;
++        }
++        attempt = attempt.saturating_add(1);
++        // Waited on the condition rather than slept, so dropping the book
++        // ends the wait at once.
++        let until = Instant::now() + delay;
++        let mut cache = shared.lock();
++        loop {
++            if cache.closed {
++                return Outcome::Closed;
++            }
++            if !shared.protected(&cache, index) {
++                return Outcome::Moved;
++            }
++            let now = Instant::now();
++            if now >= until {
++                break;
++            }
++            cache = shared
++                .changed
++                .wait_timeout(cache, until - now)
++                .map_or_else(|poisoned| poisoned.into_inner().0, |(guard, _)| guard);
++        }
++    }
++}
++
++/// One position in a remote resource. Several share one cache.
++pub(crate) struct Reader {
++    shared: Arc<Shared>,
++    position: u64,
++}
++
++impl Read for Reader {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        if buf.is_empty() || self.position >= self.shared.total {
++            return Ok(0);
++        }
++        let block_bytes = u64::from(self.shared.options.block_bytes);
++        let index = self.position / block_bytes;
++        let block = self.shared.block(index)?;
++        let within = usize::try_from(self.position % block_bytes)
++            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
++        let available = block.get(within..).unwrap_or_default();
++        let count = available.len().min(buf.len());
++        if let (Some(into), Some(from)) = (buf.get_mut(..count), available.get(..count)) {
++            into.copy_from_slice(from);
++        }
++        self.position = self.position.saturating_add(count as u64);
++        Ok(count)
++    }
++}
++
++impl Seek for Reader {
++    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
++        let target = match to {
++            SeekFrom::Start(at) => Some(at),
++            SeekFrom::End(delta) => self.shared.total.checked_add_signed(delta),
++            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
++        };
++        let target = target
++            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?;
++        self.position = target;
++        Ok(target)
++    }
++}
++
++impl MediaSource for Reader {
++    fn is_seekable(&self) -> bool {
++        true
++    }
++
++    fn byte_len(&self) -> Option<u64> {
++        Some(self.shared.total)
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests;
+diff --git a/crates/kobo-audio/src/remote/tests.rs b/crates/kobo-audio/src/remote/tests.rs
+new file mode 100644
+index 0000000..b8d252b
+--- /dev/null
++++ b/crates/kobo-audio/src/remote/tests.rs
+@@ -0,0 +1,285 @@
++#![allow(clippy::unwrap_used, clippy::expect_used)]
++
++use std::io::{Read, Seek, SeekFrom};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use super::{FetchFailure, RangeFetch, Remote, RemoteFault, RemoteOptions};
++
++/// A server that honours ranges over `bytes`, logging every offset asked.
++pub(crate) fn served(bytes: Arc<Vec<u8>>, log: Arc<Mutex<Vec<u64>>>) -> RangeFetch {
++    Arc::new(move |offset, len| {
++        log.lock().unwrap().push(offset);
++        let start = usize::try_from(offset).unwrap();
++        let end = (start + len as usize).min(bytes.len());
++        Ok(bytes.get(start..end).unwrap_or_default().to_vec())
++    })
++}
++
++/// Small blocks and no patience, so a test sees many blocks and no waits.
++pub(crate) fn quick(block_bytes: u32) -> RemoteOptions {
++    RemoteOptions {
++        block_bytes,
++        resident_blocks: 8,
++        ahead_blocks: 4,
++        behind_blocks: 1,
++        retry_delays: vec![Duration::from_millis(1)],
++        give_up_after: Duration::from_millis(200),
++    }
++}
++
++fn pattern(len: usize) -> Arc<Vec<u8>> {
++    #[allow(clippy::cast_possible_truncation, reason = "a repeating byte pattern")]
++    Arc::new((0..len).map(|at| (at % 251) as u8).collect())
++}
++
++fn eventually(what: &str, done: impl Fn() -> bool) {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while !done() {
++        assert!(Instant::now() < deadline, "never: {what}");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++}
++
++#[test]
++fn the_end_can_be_read_before_the_start() {
++    // An M4B with its index at the end is probed exactly like this.
++    let bytes = pattern(40_000);
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let remote = Remote::open(
++        served(Arc::clone(&bytes), Arc::clone(&log)),
++        40_000,
++        Vec::new(),
++        quick(4_096),
++    )
++    .unwrap();
++    let mut reader = remote.reader();
++    reader.seek(SeekFrom::End(-100)).unwrap();
++    let mut tail = vec![0; 100];
++    reader.read_exact(&mut tail).unwrap();
++    assert_eq!(tail, bytes[39_900..]);
++    assert_eq!(
++        log.lock().unwrap().first(),
++        Some(&(9 * 4_096)),
++        "asked the end first"
++    );
++
++    reader.seek(SeekFrom::Start(0)).unwrap();
++    let mut head = vec![0; 5_000];
++    reader.read_exact(&mut head).unwrap();
++    assert_eq!(head, bytes[..5_000]);
++    let mut rest = Vec::new();
++    reader.read_to_end(&mut rest).unwrap();
++    assert_eq!(rest, bytes[5_000..]);
++}
++
++#[test]
++fn several_readers_share_one_cache_each_at_its_own_place() {
++    let bytes = pattern(20_000);
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let remote = Remote::open(
++        served(Arc::clone(&bytes), Arc::clone(&log)),
++        20_000,
++        Vec::new(),
++        quick(4_096),
++    )
++    .unwrap();
++    let mut first = remote.reader();
++    let mut second = remote.reader();
++    let mut a = vec![0; 3_000];
++    let mut b = vec![0; 3_000];
++    first.read_exact(&mut a).unwrap();
++    second.read_exact(&mut b).unwrap();
++    assert_eq!(a, b);
++    assert_eq!(a, bytes[..3_000]);
++    let block_zero = log
++        .lock()
++        .unwrap()
++        .iter()
++        .filter(|offset| **offset == 0)
++        .count();
++    assert_eq!(block_zero, 1, "the second reader fetched block 0 again");
++}
++
++#[test]
++fn a_seeded_first_block_is_not_fetched_again() {
++    let bytes = pattern(10_000);
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let remote = Remote::open(
++        served(Arc::clone(&bytes), Arc::clone(&log)),
++        10_000,
++        bytes[..4_096].to_vec(),
++        quick(4_096),
++    )
++    .unwrap();
++    let mut all = Vec::new();
++    remote.reader().read_to_end(&mut all).unwrap();
++    assert_eq!(all, *bytes);
++    assert!(
++        !log.lock().unwrap().contains(&0),
++        "{:?}",
++        log.lock().unwrap()
++    );
++}
++
++#[test]
++fn the_blocks_after_the_read_position_are_fetched_without_being_read() {
++    let bytes = pattern(100 * 1_024);
++    let log = Arc::new(Mutex::new(Vec::new()));
++    let remote = Remote::open(
++        served(bytes, Arc::clone(&log)),
++        100 * 1_024,
++        Vec::new(),
++        quick(1_024),
++    )
++    .unwrap();
++    let mut one = [0; 1];
++    remote.reader().read_exact(&mut one).unwrap();
++    // Block 0 plus the four ahead of it, and no further.
++    eventually("read-ahead filled its window", || {
++        log.lock().unwrap().len() >= 5
++    });
++    std::thread::sleep(Duration::from_millis(50));
++    let mut asked = log.lock().unwrap().clone();
++    asked.sort_unstable();
++    assert_eq!(asked, vec![0, 1_024, 2_048, 3_072, 4_096]);
++}
++
++#[test]
++fn three_hundred_megabytes_read_in_order_never_hold_more_than_eight_mebibytes() {
++    const TOTAL: u64 = 300 * 1_000 * 1_000;
++    // Every byte of a block is its block number, so no 300 MB buffer exists.
++    let fetch: RangeFetch = Arc::new(|offset, len| {
++        #[allow(clippy::cast_possible_truncation, reason = "a marker byte")]
++        let marker = (offset / (256 * 1_024)) as u8;
++        let len = u64::from(len).min(TOTAL - offset);
++        Ok(vec![marker; usize::try_from(len).unwrap()])
++    });
++    let options = RemoteOptions::default();
++    let remote = Remote::open(fetch, TOTAL, Vec::new(), options).unwrap();
++    let mut reader = remote.reader();
++    let mut buffer = vec![0; 64 * 1_024];
++    let mut read_total = 0_u64;
++    loop {
++        let read = reader.read(&mut buffer).unwrap();
++        if read == 0 {
++            break;
++        }
++        #[allow(clippy::cast_possible_truncation, reason = "a marker byte")]
++        let marker = (read_total / (256 * 1_024)) as u8;
++        assert_eq!(buffer[0], marker, "at {read_total}");
++        read_total += read as u64;
++    }
++    assert_eq!(read_total, TOTAL);
++    let stats = remote.stats();
++    assert!(
++        stats.peak_resident_bytes <= 8 * 1_024 * 1_024,
++        "held {} bytes at once",
++        stats.peak_resident_bytes
++    );
++    assert!(stats.evictions > 1_000, "{stats:?}");
++}
++
++#[test]
++fn the_read_ahead_thread_returns_once_the_remote_is_dropped() {
++    let bytes = pattern(50_000);
++    let remote = Remote::open(
++        served(bytes, Arc::new(Mutex::new(Vec::new()))),
++        50_000,
++        Vec::new(),
++        quick(1_024),
++    )
++    .unwrap();
++    let mut one = [0; 1];
++    remote.reader().read_exact(&mut one).unwrap();
++    let exited = remote.exit_flag();
++    assert!(
++        !exited(),
++        "the thread stopped before the remote was dropped"
++    );
++    drop(remote);
++    eventually("the read-ahead thread exits", || exited());
++}
++
++#[test]
++fn a_dropped_remote_ends_a_retry_wait_at_once() {
++    let fetch: RangeFetch = Arc::new(|_, _| Err(FetchFailure::Transient));
++    let options = RemoteOptions {
++        retry_delays: vec![Duration::from_secs(60)],
++        give_up_after: Duration::from_secs(600),
++        ..quick(1_024)
++    };
++    let remote = Remote::open(fetch, 10_000, Vec::new(), options).unwrap();
++    let exited = remote.exit_flag();
++    eventually("a first attempt", || remote.stats().fetches >= 1);
++    drop(remote);
++    eventually("the read-ahead thread exits mid-wait", || exited());
++}
++
++#[test]
++fn a_fetch_that_fails_a_few_times_then_recovers_is_read_through() {
++    let bytes = pattern(20_000);
++    let failures = Arc::new(AtomicUsize::new(3));
++    let fetch: RangeFetch = {
++        let bytes = Arc::clone(&bytes);
++        let failures = Arc::clone(&failures);
++        Arc::new(move |offset, len| {
++            if offset == 8_192
++                && failures
++                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
++                        left.checked_sub(1)
++                    })
++                    .is_ok()
++            {
++                return Err(FetchFailure::Transient);
++            }
++            let start = usize::try_from(offset).unwrap();
++            Ok(bytes[start..(start + len as usize).min(bytes.len())].to_vec())
++        })
++    };
++    let remote = Remote::open(fetch, 20_000, Vec::new(), quick(4_096)).unwrap();
++    let mut all = Vec::new();
++    remote.reader().read_to_end(&mut all).unwrap();
++    assert_eq!(all, *bytes);
++    assert_eq!(remote.stats().failed_fetches, 3);
++}
++
++#[test]
++fn a_network_that_stays_away_is_reported_lost_and_a_new_reader_tries_again() {
++    let bytes = pattern(20_000);
++    let down = Arc::new(AtomicBool::new(true));
++    let fetch: RangeFetch = {
++        let bytes = Arc::clone(&bytes);
++        let down = Arc::clone(&down);
++        Arc::new(move |offset, len| {
++            if down.load(Ordering::SeqCst) {
++                return Err(FetchFailure::Transient);
++            }
++            let start = usize::try_from(offset).unwrap();
++            Ok(bytes[start..(start + len as usize).min(bytes.len())].to_vec())
++        })
++    };
++    let remote = Remote::open(fetch, 20_000, Vec::new(), quick(4_096)).unwrap();
++    let mut buffer = [0; 10];
++    let error = remote.reader().read(&mut buffer).unwrap_err();
++    assert_eq!(RemoteFault::of(&error), Some(RemoteFault::Lost), "{error}");
++    down.store(false, Ordering::SeqCst);
++    let mut all = Vec::new();
++    remote.reader().read_to_end(&mut all).unwrap();
++    assert_eq!(all, *bytes);
++}
++
++#[test]
++fn a_refused_range_is_not_retried() {
++    let fetch: RangeFetch = Arc::new(|_, _| Err(FetchFailure::Refused));
++    let remote = Remote::open(fetch, 20_000, Vec::new(), quick(4_096)).unwrap();
++    let mut buffer = [0; 10];
++    let error = remote.reader().read(&mut buffer).unwrap_err();
++    assert_eq!(
++        RemoteFault::of(&error),
++        Some(RemoteFault::Refused),
++        "{error}"
++    );
++    assert_eq!(remote.stats().fetches, 1);
++}
+diff --git a/crates/kobo-audio/src/tests.rs b/crates/kobo-audio/src/tests.rs
+index cb8d722..f045baa 100644
+--- a/crates/kobo-audio/src/tests.rs
++++ b/crates/kobo-audio/src/tests.rs
+@@ -350,3 +350,131 @@ fn what_is_not_a_book_is_refused_by_name_or_by_content() {
+         Some(Fault::Damaged)
+     );
+ }
++
++mod remote {
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::{Arc, Mutex};
++
++    use super::{decode_all, fixture, Book, Container, Fault};
++    use crate::remote::tests::{quick, served};
++    use crate::{FetchFailure, RangeFetch, Remote};
++
++    fn remote_of(name: &str, block_bytes: u32) -> (Remote, Arc<Mutex<Vec<u64>>>) {
++        let bytes = Arc::new(std::fs::read(fixture(name)).expect("fixture"));
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let total = bytes.len() as u64;
++        let remote = Remote::open(
++            served(bytes, Arc::clone(&log)),
++            total,
++            Vec::new(),
++            quick(block_bytes),
++        )
++        .expect("remote");
++        (remote, log)
++    }
++
++    #[test]
++    fn an_mp3_streamed_in_ranges_plays_the_same_sound_as_the_file() {
++        let (remote, _) = remote_of("stereo.mp3", 1_024);
++        let mut streamed = Book::open_remote(remote, "universal").expect("opens");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(
++            streamed.description().chapters,
++            local.description().chapters
++        );
++        assert_eq!(streamed.duration_ms(), local.duration_ms());
++        assert_eq!(decode_all(&mut streamed), decode_all(&mut local));
++    }
++
++    #[test]
++    fn an_m4b_at_an_address_with_no_extension_is_known_by_its_bytes_and_keeps_its_chapters() {
++        let (remote, log) = remote_of("chapters.m4b", 2_048);
++        let mut streamed = Book::open_remote(remote, "universal").expect("opens");
++        let mut local = Book::open(&fixture("chapters.m4b")).expect("opens");
++        assert!(!streamed.description().chapters.is_empty());
++        assert_eq!(
++            streamed.description().chapters,
++            local.description().chapters
++        );
++        assert_eq!(streamed.description().title, local.description().title);
++        let (sound, _) = decode_all(&mut streamed);
++        assert_eq!(sound, decode_all(&mut local).0);
++        // The index is at the end of this file, past the sound.
++        let last_block = 21_946 / 2_048 * 2_048;
++        assert!(log.lock().expect("log").contains(&last_block));
++    }
++
++    #[test]
++    fn every_kind_is_known_by_its_opening_bytes() {
++        for (name, container) in [
++            ("stereo.mp3", Container::Mp3),
++            ("chapters.m4b", Container::Mp4),
++            ("lossless.flac", Container::Flac),
++            ("vorbis.ogg", Container::Ogg),
++            ("opus.opus", Container::Opus),
++            ("pcm.wav", Container::Wav),
++        ] {
++            let bytes = std::fs::read(fixture(name)).expect("fixture");
++            assert_eq!(Container::sniff(&bytes), Some(container), "{name}");
++        }
++        assert_eq!(Container::sniff(b"PK\x03\x04"), None);
++        assert_eq!(Container::sniff(b"\x89PNG"), None);
++    }
++
++    #[test]
++    fn bytes_named_wrongly_open_as_what_they_are() {
++        let bytes = std::fs::read(fixture("chapters.m4b")).expect("fixture");
++        let book = Book::open_bytes(bytes, "stream.mp3").expect("opens");
++        assert!(!book.description().chapters.is_empty());
++    }
++
++    #[test]
++    fn a_network_lost_mid_book_pauses_it_in_place_and_it_carries_on_when_back() {
++        let bytes = Arc::new(std::fs::read(fixture("stereo.mp3")).expect("fixture"));
++        let down = Arc::new(AtomicBool::new(false));
++        let fetch: RangeFetch = {
++            let bytes = Arc::clone(&bytes);
++            let down = Arc::clone(&down);
++            Arc::new(move |offset, len| {
++                if down.load(Ordering::SeqCst) {
++                    return Err(FetchFailure::Transient);
++                }
++                let start = usize::try_from(offset).expect("offset");
++                Ok(bytes[start..(start + len as usize).min(bytes.len())].to_vec())
++            })
++        };
++        let total = bytes.len() as u64;
++        let options = crate::RemoteOptions {
++            resident_blocks: 4,
++            ahead_blocks: 1,
++            behind_blocks: 0,
++            ..quick(1_024)
++        };
++        let remote = Remote::open(fetch, total, Vec::new(), options).expect("remote");
++        let mut book = Book::open_remote(remote, "universal").expect("opens");
++        let mut out = Vec::new();
++        book.read(4_096, &mut out).expect("the start plays");
++        down.store(true, Ordering::SeqCst);
++        let lost_at = loop {
++            match book.read(4_096, &mut out) {
++                Ok(sound) => assert!(sound.frames > 0, "finished without the network"),
++                Err(fault) => {
++                    assert_eq!(fault, Fault::Disconnected);
++                    break book.position_ms();
++                }
++            }
++        };
++        assert!(lost_at > 0 && lost_at < book.duration_ms(), "{lost_at}");
++        down.store(false, Ordering::SeqCst);
++        let sound = book.read(1_024, &mut out).expect("plays again");
++        assert!(sound.frames > 0);
++        // Picked up near where it stopped, not at the start.
++        assert!(
++            book.position_ms() + 200 >= lost_at,
++            "{} < {lost_at}",
++            book.position_ms()
++        );
++        while book.read(4_096, &mut out).expect("plays on").frames > 0 {}
++        assert!(book.is_finished());
++    }
++}
 diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
-index 6220e125..752dd9fd 100644
+index 6220e12..752dd9f 100644
 --- a/crates/kobo-cli/src/main.rs
 +++ b/crates/kobo-cli/src/main.rs
 @@ -106,6 +106,7 @@ const INSTALLED_PACKAGES: &[(&str, Option<&str>)] = &[
@@ -42,8 +1277,782 @@ index 6220e125..752dd9fd 100644
      ("kobo-store", None),
  ];
  /// Applications released through Store, including the initial built-in copies
+diff --git a/crates/kobo-hal/src/audio.rs b/crates/kobo-hal/src/audio.rs
+index 9f5ad70..39f0e47 100644
+--- a/crates/kobo-hal/src/audio.rs
++++ b/crates/kobo-hal/src/audio.rs
+@@ -13,7 +13,7 @@
+ 
+ use kobo_audio::resample::Resampler;
+ use kobo_audio::stretch::Stretcher;
+-use kobo_audio::{Book, Description, Fault};
++use kobo_audio::{Book, Description, Fault, FetchFailure, RangeFetch, Remote, RemoteOptions};
+ use kobo_protocol::{AudioPlaybackState, DeviceError, DeviceResult};
+ use std::collections::VecDeque;
+ use std::io::{Read, Write};
+@@ -72,10 +72,9 @@ const SINK_PATIENCE: Duration = Duration::from_secs(5);
+ const SINK_RETRY: Duration = Duration::from_millis(500);
+ const IO_TIMEOUT: Duration = Duration::from_secs(3);
+ const DATA_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+-/// The largest stream cached before playing. A stream is fetched whole
+-/// because the runtime's fetch is a range of bytes, not a socket.
+-const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+-const FETCH_CHUNK: u32 = 512 * 1024;
++/// The largest stream held whole, which is only done when its server will
++/// not send ranges. A server that does is read through a block cache instead.
++const MAX_STREAM_BYTES: u32 = 64 * 1024 * 1024;
+ 
+ const BACKEND_MARKERS: [&str; 8] = [
+     // Clara BW 4.45.23697. Unlike many Android trees, Kobo installs the HAL
+@@ -106,9 +105,24 @@ impl Sockets {
+     }
+ }
+ 
+-/// Bounded range fetch used by stream sources. The runtime injects its own TLS
+-/// transport, keeping credentials and sockets out of SDK applications.
+-pub type StreamFetcher = Arc<dyn Fn(&str, u32, u32) -> Result<Vec<u8>, DeviceError> + Send + Sync>;
++/// Bounded range fetch used by stream sources: `(url, offset, max_bytes)`.
++/// The runtime injects its own TLS transport, keeping credentials and sockets
++/// out of SDK applications.
++///
++/// A server that ignores the range and sends more than `max_bytes` is
++/// [`DeviceError::StreamTooLong`].
++pub type StreamFetcher =
++    Arc<dyn Fn(&str, u64, u32) -> Result<StreamReply, DeviceError> + Send + Sync>;
++
++/// One reply to a [`StreamFetcher`].
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
++pub struct StreamReply {
++    pub body: Vec<u8>,
++    /// The server answered with the range asked for (`206`).
++    pub partial: bool,
++    /// The whole resource's length, when the reply said.
++    pub total: Option<u64>,
++}
+ 
+ /// Where a book comes from.
+ #[derive(Clone, Debug)]
+@@ -500,8 +514,9 @@ impl Media {
+ fn fault_error(fault: Fault) -> DeviceError {
+     match fault {
+         Fault::Unreadable => DeviceError::NotFound,
+-        Fault::Unsupported => DeviceError::InvalidInput,
++        Fault::Unsupported => DeviceError::Unsupported,
+         Fault::Damaged => DeviceError::Backend,
++        Fault::Disconnected => DeviceError::ConnectionLost,
+     }
+ }
+ 
+@@ -802,38 +817,88 @@ fn open_source(source: Source, fetcher: Option<&StreamFetcher>) -> Result<Book,
+     match source {
+         Source::File(path) => Book::open(&path).map_err(fault_error),
+         Source::Parts { title, paths } => Book::open_parts(&title, &paths).map_err(fault_error),
+-        Source::Stream(url) => {
+-            let bytes = fetch_stream(&url, fetcher)?;
+-            let name = url
+-                .rsplit('/')
+-                .next()
+-                .filter(|name| kobo_audio::Container::from_name(name).is_some())
+-                .unwrap_or("stream.mp3");
+-            Book::open_bytes(bytes, name).map_err(fault_error)
+-        }
++        Source::Stream(url) => open_stream(&url, fetcher, &RemoteOptions::default()),
+     }
+ }
+ 
+-fn fetch_stream(url: &str, fetcher: Option<&StreamFetcher>) -> Result<Vec<u8>, DeviceError> {
++/// Opens a stream: through a block cache when the server sends ranges, or
++/// held whole when it does not and the whole fits.
++///
++/// The first block is asked for as a range. A `206` with a total says ranges
++/// work. A body shorter than the block is the whole file whatever the status.
++/// A server that ignores ranges for a longer file answers too much, and the
++/// whole is then asked for once, up to [`MAX_STREAM_BYTES`].
++fn open_stream(
++    url: &str,
++    fetcher: Option<&StreamFetcher>,
++    options: &RemoteOptions,
++) -> Result<Book, DeviceError> {
+     let fetcher = fetcher.ok_or(DeviceError::Unreachable)?;
+-    let mut bytes = Vec::new();
+-    loop {
+-        let offset = u32::try_from(bytes.len()).map_err(|_| DeviceError::InvalidInput)?;
+-        let chunk = fetcher(url, offset, FETCH_CHUNK)?;
+-        let done = chunk.len() < FETCH_CHUNK as usize;
+-        if bytes.len().saturating_add(chunk.len()) > MAX_STREAM_BYTES {
+-            return Err(DeviceError::InvalidInput);
++    let name = stream_name(url);
++    let block = options.block_bytes;
++    let whole = |bytes: Vec<u8>| {
++        if bytes.is_empty() {
++            return Err(DeviceError::NotFound);
+         }
+-        bytes.extend_from_slice(&chunk);
+-        if done {
+-            break;
++        Book::open_bytes(bytes, name).map_err(fault_error)
++    };
++    let first = match fetcher(url, 0, block) {
++        Ok(first) => first,
++        Err(DeviceError::StreamTooLong) => return whole(fetch_whole(url, fetcher)?),
++        Err(error) => return Err(error),
++    };
++    let held = first.body.len() as u64;
++    match (first.partial, first.total) {
++        (true, Some(total)) if total > held => {
++            let remote = Remote::open(ranged(fetcher, url), total, first.body, options.clone())
++                .map_err(|_| DeviceError::Backend)?;
++            Book::open_remote(remote, name).map_err(fault_error)
+         }
++        _ if held < u64::from(block) || first.total == Some(held) => whole(first.body),
++        // Exactly one block with no total: there may be more, and nothing
++        // says how much, so the whole is asked for.
++        _ => whole(fetch_whole(url, fetcher)?),
+     }
+-    if bytes.is_empty() {
+-        Err(DeviceError::NotFound)
+-    } else {
+-        Ok(bytes)
+-    }
++}
++
++/// The last segment of a stream's path, without its query: a name for the
++/// title and for a container the bytes do not reveal.
++fn stream_name(url: &str) -> &str {
++    let path = url.split(['?', '#']).next().unwrap_or(url);
++    path.rsplit('/')
++        .next()
++        .filter(|name| !name.is_empty())
++        .unwrap_or("stream")
++}
++
++/// The whole of a stream from a server that does not send ranges.
++fn fetch_whole(url: &str, fetcher: &StreamFetcher) -> Result<Vec<u8>, DeviceError> {
++    let reply = fetcher(url, 0, MAX_STREAM_BYTES)?;
++    // A ranged server stops at the ceiling; one that is not would have been
++    // refused by the transport. Either way the file does not end here.
++    if reply.body.len() >= MAX_STREAM_BYTES as usize
++        || reply
++            .total
++            .is_some_and(|total| total > reply.body.len() as u64)
++    {
++        return Err(DeviceError::StreamTooLong);
++    }
++    Ok(reply.body)
++}
++
++/// The cache's fetch over the runtime's: what may pass is retried, and a
++/// whole-document reply to a range past the start is a server that has
++/// stopped sending ranges, which no retry mends.
++fn ranged(fetcher: &StreamFetcher, url: &str) -> RangeFetch {
++    let fetcher = Arc::clone(fetcher);
++    let url = url.to_owned();
++    Arc::new(move |offset, len| match fetcher(&url, offset, len) {
++        Ok(reply) if reply.partial || offset == 0 => Ok(reply.body),
++        Err(DeviceError::Unreachable | DeviceError::TimedOut | DeviceError::ConnectionLost) => {
++            Err(FetchFailure::Transient)
++        }
++        Ok(_) | Err(_) => Err(FetchFailure::Refused),
++    })
+ }
+ 
+ /// Records one new observation of the sink.
+@@ -1089,6 +1154,7 @@ fn io_error(error: std::io::Error) -> DeviceError {
+ #[cfg(test)]
+ mod tests {
+     use super::{next_deadline, Audio, Sockets, Source, BACKEND_MARKERS};
++    use super::{open_stream, stream_name, Book, RemoteOptions, StreamFetcher, StreamReply};
+     use super::{ACK_SUCCESS, COMMAND_CHECK_READY, COMMAND_GET_AUDIO_CONFIG, COMMAND_START};
+     use super::{RESYNC_LIMIT, WRITE_PERIOD};
+     use kobo_protocol::{AudioPlaybackState, DeviceError, DeviceResult};
+@@ -1096,7 +1162,7 @@ mod tests {
+     use std::os::unix::net::UnixListener;
+     use std::path::PathBuf;
+     use std::sync::atomic::{AtomicUsize, Ordering};
+-    use std::sync::Arc;
++    use std::sync::{Arc, Mutex};
+     use std::time::{Duration, Instant};
+ 
+     fn fixture(name: &str) -> PathBuf {
+@@ -1195,7 +1261,7 @@ mod tests {
+         let _ = audio.load(Source::File(fixture("cover.png")));
+         assert_eq!(
+             settled(&audio),
+-            DeviceResult::Failed(DeviceError::InvalidInput)
++            DeviceResult::Failed(DeviceError::Unsupported)
+         );
+         assert!(audio.detail().is_none());
+         assert_eq!(audio.play(), DeviceResult::Failed(DeviceError::NotFound));
+@@ -1460,4 +1526,154 @@ mod tests {
+         let audio = Audio::simulated();
+         drop(audio);
+     }
++
++    /// A server over a fixture. With `ranges` it answers each range with a
++    /// `206`; without, every request gets the whole file as a `200`, which
++    /// the transport refuses past the ceiling asked for.
++    fn server(name: &str, ranges: bool, log: &Arc<Mutex<Vec<u64>>>) -> StreamFetcher {
++        let bytes = std::fs::read(fixture(name)).expect("fixture");
++        let log = Arc::clone(log);
++        Arc::new(move |_url, offset, max_bytes| {
++            log.lock().expect("log").push(offset);
++            let total = bytes.len() as u64;
++            if !ranges {
++                if bytes.len() > max_bytes as usize {
++                    return Err(DeviceError::StreamTooLong);
++                }
++                return Ok(StreamReply {
++                    body: bytes.clone(),
++                    partial: false,
++                    total: Some(total),
++                });
++            }
++            let start = usize::try_from(offset).expect("offset").min(bytes.len());
++            let end = (start + max_bytes as usize).min(bytes.len());
++            Ok(StreamReply {
++                body: bytes[start..end].to_vec(),
++                partial: true,
++                total: Some(total),
++            })
++        })
++    }
++
++    fn small_blocks(block_bytes: u32) -> RemoteOptions {
++        RemoteOptions {
++            block_bytes,
++            resident_blocks: 8,
++            ahead_blocks: 4,
++            behind_blocks: 1,
++            retry_delays: vec![Duration::from_millis(1)],
++            give_up_after: Duration::from_millis(200),
++        }
++    }
++
++    fn sound_of(book: &mut Book) -> Vec<i16> {
++        let mut out = Vec::new();
++        while book.read(4_096, &mut out).expect("sound").frames > 0 {}
++        out
++    }
++
++    const UNIVERSAL: &str =
++        "https://pharos.test/Audio/abc/universal?AudioCodec=mp3,aac,flac&api_key=k";
++
++    #[test]
++    fn an_m4b_from_an_address_with_no_extension_streams_through_the_cache_with_its_chapters() {
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("chapters.m4b", true, &log);
++        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048)).expect("opens");
++        let mut local = Book::open(&fixture("chapters.m4b")).expect("opens");
++        assert!(!book.description().chapters.is_empty());
++        assert_eq!(book.description().chapters, local.description().chapters);
++        assert_eq!(sound_of(&mut book), sound_of(&mut local));
++        let asked = log.lock().expect("log").clone();
++        assert!(asked.len() > 2, "not read in ranges: {asked:?}");
++    }
++
++    #[test]
++    fn a_ranged_mp3_plays_the_same_sound_as_the_file() {
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("stereo.mp3", true, &log);
++        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024)).expect("opens");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(sound_of(&mut book), sound_of(&mut local));
++    }
++
++    #[test]
++    fn a_server_that_ignores_ranges_is_read_whole_in_one_request() {
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("stereo.mp3", false, &log);
++        let mut book = open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(1_024)).expect("opens");
++        let mut local = Book::open(&fixture("stereo.mp3")).expect("opens");
++        assert_eq!(sound_of(&mut book), sound_of(&mut local));
++        assert_eq!(*log.lock().expect("log"), vec![0, 0]);
++    }
++
++    #[test]
++    fn a_later_range_answered_with_the_whole_file_is_refused_rather_than_misread() {
++        let bytes = std::fs::read(fixture("chapters.m4b")).expect("fixture");
++        let fetcher: StreamFetcher = Arc::new(move |_url, offset, max_bytes| {
++            let total = bytes.len() as u64;
++            if offset > 0 {
++                return Ok(StreamReply {
++                    body: bytes.clone(),
++                    partial: false,
++                    total: Some(total),
++                });
++            }
++            Ok(StreamReply {
++                body: bytes[..max_bytes as usize].to_vec(),
++                partial: true,
++                total: Some(total),
++            })
++        });
++        assert_eq!(
++            open_stream(UNIVERSAL, Some(&fetcher), &small_blocks(2_048)).err(),
++            Some(DeviceError::NotFound)
++        );
++    }
++
++    #[test]
++    fn a_stream_too_long_to_hold_from_a_server_without_ranges_says_so() {
++        // A hundred-megabyte book whose server sends it whole every time.
++        let fetcher: StreamFetcher =
++            Arc::new(|_url, _offset, _max| Err(DeviceError::StreamTooLong));
++        let audio = Audio::spawn(
++            Some(fetcher),
++            Sockets::firmware(),
++            Duration::from_millis(600),
++        );
++        let _ = audio.load(Source::Stream(UNIVERSAL.to_owned()));
++        assert_eq!(
++            settled(&audio),
++            DeviceResult::Failed(DeviceError::StreamTooLong)
++        );
++    }
++
++    #[test]
++    fn a_stream_loads_through_the_worker_with_its_description() {
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let fetcher = server("chapters.m4b", true, &log);
++        let audio = Audio::spawn(
++            Some(fetcher),
++            Sockets::firmware(),
++            Duration::from_millis(600),
++        );
++        let _ = audio.load(Source::Stream(UNIVERSAL.to_owned()));
++        assert!(matches!(
++            settled(&audio),
++            DeviceResult::Audio {
++                state: AudioPlaybackState::Ready,
++                ..
++            }
++        ));
++        let detail = audio.detail().expect("described");
++        assert_eq!(detail.title.as_deref(), Some("The Quiet Shelf"));
++    }
++
++    #[test]
++    fn a_stream_is_named_by_its_last_path_segment_without_its_query() {
++        assert_eq!(stream_name(UNIVERSAL), "universal");
++        assert_eq!(stream_name("https://host/books/moon.m4b?t=1"), "moon.m4b");
++        assert_eq!(stream_name("https://host/"), "stream");
++    }
+ }
+diff --git a/crates/kobo-net/src/lib.rs b/crates/kobo-net/src/lib.rs
+index e62a52c..c371ea3 100644
+--- a/crates/kobo-net/src/lib.rs
++++ b/crates/kobo-net/src/lib.rs
+@@ -554,7 +554,96 @@ pub fn fetch(url: &str, max_bytes: u32) -> Result<Vec<u8>, TaskError> {
+         false,
+         &cancel,
+     )
+-    .map(|fetched| fetched.body)
++    .map(|(fetched, _)| fetched.body)
++}
++
++/// What a ranged reply says about the whole resource, beside its body.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub struct Span {
++    /// The server answered `206` with a `Content-Range`, so it honours ranges.
++    pub partial: bool,
++    /// The whole resource's length, from `Content-Range: bytes a-b/TOTAL`, or
++    /// from `Content-Length` on a whole-document `200`.
++    pub total: Option<u64>,
++}
++
++/// A body fetched by [`fetch_range`] and what the reply said about the rest.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Ranged {
++    pub body: Vec<u8>,
++    pub span: Span,
++}
++
++/// [`fetch_from`] with a 64-bit offset, also answering whether the server
++/// honoured the range and how long the whole resource is.
++///
++/// A player that reads a multi-hour book in pieces needs both: offsets past
++/// 4 GiB, and the total so it can seek to the end, where an MPEG-4 file
++/// often keeps its index.
++///
++/// # Errors
++///
++/// The same distinctions [`fetch`] makes. A server that ignores the range and
++/// sends more than `max_bytes` is [`TaskError::TooLarge`].
++pub fn fetch_range(url: &str, offset: u64, max_bytes: u32) -> Result<Ranged, TaskError> {
++    let cancel = AtomicBool::new(false);
++    get(
++        url,
++        Some(offset),
++        max_bytes,
++        None,
++        &[],
++        RequestOptions::default(),
++        false,
++        &cancel,
++    )
++    .map(|(fetched, span)| Ranged {
++        body: fetched.body,
++        span,
++    })
++}
++
++/// Reads [`Span`] from a response's headers. A reply that is not HTTP, or
++/// whose range header does not parse, says nothing: an unknown total is the
++/// honest answer, and the caller falls back to reading the whole document.
++#[must_use]
++pub fn span_of(response: &[u8]) -> Span {
++    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
++    let mut parsed = httparse::Response::new(&mut headers);
++    if !matches!(parsed.parse(response), Ok(httparse::Status::Complete(_))) {
++        return Span::default();
++    }
++    let status = parsed.code.unwrap_or(0);
++    let headers = parsed.headers;
++    match status {
++        206 => {
++            let total = header(headers, "content-range").and_then(range_total);
++            Span {
++                partial: total.is_some(),
++                total,
++            }
++        }
++        200 => Span {
++            partial: false,
++            total: content_length(headers)
++                .ok()
++                .flatten()
++                .and_then(|length| u64::try_from(length).ok()),
++        },
++        // `bytes */TOTAL` on a range past the end still names the length.
++        416 => Span {
++            partial: true,
++            total: header(headers, "content-range").and_then(range_total),
++        },
++        _ => Span::default(),
++    }
++}
++
++/// The `TOTAL` of `bytes a-b/TOTAL` or `bytes */TOTAL`; `None` for `*`.
++fn range_total(value: &str) -> Option<u64> {
++    let rest = value.trim().strip_prefix("bytes")?.trim_start();
++    let (_, total) = rest.rsplit_once('/')?;
++    total.trim().parse().ok()
+ }
+ 
+ /// Fetches `url` starting `offset` bytes in, returning at most `max_bytes`.
+@@ -719,7 +808,7 @@ fn fetch_checked(
+     }
+     get(
+         url,
+-        Some(offset),
++        Some(u64::from(offset)),
+         max_bytes,
+         credential,
+         headers,
+@@ -727,6 +816,7 @@ fn fetch_checked(
+         refusals,
+         cancel,
+     )
++    .map(|(fetched, _)| fetched)
+ }
+ 
+ /// The one implementation behind [`fetch`] and [`fetch_from`].
+@@ -737,14 +827,14 @@ fn fetch_checked(
+ )]
+ fn get(
+     url: &str,
+-    offset: Option<u32>,
++    offset: Option<u64>,
+     max_bytes: u32,
+     credential: Option<(&str, &str)>,
+     headers: &[(&str, &str)],
+     options: RequestOptions,
+     refusals: bool,
+     cancel: &AtomicBool,
+-) -> Result<Fetched, TaskError> {
++) -> Result<(Fetched, Span), TaskError> {
+     let mut target = url.to_string();
+     let mut forwarded = headers;
+     for _ in 0..=MAX_REDIRECTS {
+@@ -764,18 +854,24 @@ fn get(
+             if let Some(refusal) =
+                 Refusal::from_response(&response, &refusal::secrets_of(credential))?
+             {
+-                return Ok(Fetched {
+-                    body: refusal.envelope(),
+-                    address: target,
+-                });
++                return Ok((
++                    Fetched {
++                        body: refusal.envelope(),
++                        address: target,
++                    },
++                    Span::default(),
++                ));
+             }
+         }
+         if options.report_rate_limit {
+             if let RateLimit::Limited(delay) = rate_limit(&response)? {
+-                return Ok(Fetched {
+-                    body: rate_limit_envelope(delay),
+-                    address: target,
+-                });
++                return Ok((
++                    Fetched {
++                        body: rate_limit_envelope(delay),
++                        address: target,
++                    },
++                    Span::default(),
++                ));
+             }
+         }
+         match split_response(&response, max_bytes)? {
+@@ -783,10 +879,13 @@ fn get(
+                 return if body.len() > max_bytes as usize {
+                     Err(TaskError::TooLarge)
+                 } else {
+-                    Ok(Fetched {
+-                        body: body.to_vec(),
+-                        address: target,
+-                    })
++                    Ok((
++                        Fetched {
++                            body: body.to_vec(),
++                            address: target,
++                        },
++                        span_of(&response),
++                    ))
+                 };
+             }
+             Response::Redirect(location) => {
+@@ -841,7 +940,7 @@ enum Method<'a> {
+     Get {
+         /// Where to start reading, as a byte offset, or `None` to ask for the
+         /// whole document with no range header at all.
+-        offset: Option<u32>,
++        offset: Option<u64>,
+         /// The runtime-owned credential, kept separate from application
+         /// headers so redirect handling retains its provenance.
+         credential: Option<(&'a str, &'a str)>,
+@@ -1319,7 +1418,7 @@ fn request_head(
+             // 256 KB of a 738 KB novel without a range is answered with the
+             // whole novel, and then rejected by the ceiling.
+             if let Some(start) = offset {
+-                let last = u64::from(*start) + u64::from(max_bytes.saturating_sub(1));
++                let last = start.saturating_add(u64::from(max_bytes.saturating_sub(1)));
+                 write!(head, "Range: bytes={start}-{last}\r\n")
+                     .expect("writing to a String cannot fail");
+             }
+@@ -2567,8 +2666,8 @@ mod tests {
+     }
+ 
+     use super::{
+-        fetch, head, message_end, parse, post, resolve_redirect, split_response, stays_open,
+-        Address, Cow, Method, Response,
++        fetch, head, message_end, parse, post, resolve_redirect, span_of, split_response,
++        stays_open, Address, Cow, Method, Response, Span,
+     };
+     use kobo_protocol::TaskError;
+ 
+@@ -2660,6 +2759,60 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn a_partial_answer_names_the_whole_resource_length() {
++        let response =
++            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/7340032000\r\nContent-Length: 5\r\n\r\nCHAP1";
++        assert_eq!(
++            span_of(response),
++            Span {
++                partial: true,
++                total: Some(7_340_032_000),
++            }
++        );
++    }
++
++    #[test]
++    fn a_whole_document_answer_is_not_partial_and_its_length_is_the_total() {
++        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nCHAP1";
++        assert_eq!(
++            span_of(response),
++            Span {
++                partial: false,
++                total: Some(5),
++            }
++        );
++    }
++
++    #[test]
++    fn a_partial_answer_without_a_readable_range_is_not_trusted_as_ranged() {
++        // Without the total there is nothing to seek against, so the caller
++        // has to treat the server as one that does not do ranges.
++        for range in ["bytes 0-4/*", "items 0-4/9", "bytes 0-4"] {
++            let response =
++                format!("HTTP/1.1 206 Partial Content\r\nContent-Range: {range}\r\nContent-Length: 5\r\n\r\nCHAP1");
++            assert_eq!(span_of(response.as_bytes()), Span::default(), "{range}");
++        }
++    }
++
++    #[test]
++    fn a_range_past_four_gibibytes_is_asked_for_exactly() {
++        let request = head(
++            &book(),
++            &Method::Get {
++                offset: Some(5_000_000_000),
++                credential: None,
++                headers: &[],
++                streaming: false,
++            },
++            262_144,
++        );
++        assert!(
++            request.contains("\r\nRange: bytes=5000000000-5000262143\r\n"),
++            "{request}"
++        );
++    }
++
+     #[test]
+     fn a_plain_url_uses_the_default_port_and_root_path() {
+         assert_eq!(
+diff --git a/crates/kobo-protocol/src/lib.rs b/crates/kobo-protocol/src/lib.rs
+index cfd97b2..a452da6 100644
+--- a/crates/kobo-protocol/src/lib.rs
++++ b/crates/kobo-protocol/src/lib.rs
+@@ -2305,6 +2305,13 @@ pub enum DeviceError {
+     Backend = 6,
+     /// Downloaded bytes did not match the digest they were promised under.
+     Integrity = 7,
++    /// A stream too long to hold whole, from a server that will not send it
++    /// in ranges.
++    StreamTooLong = 8,
++    /// The network went away mid-stream and did not come back in time.
++    ConnectionLost = 9,
++    /// What arrived is a kind of file the reader does not play.
++    Unsupported = 10,
+ }
+ 
+ impl DeviceError {
+@@ -2326,6 +2333,9 @@ impl DeviceError {
+             Self::InvalidInput => "the data received was not usable",
+             Self::Backend => "the reader could not complete the request",
+             Self::Integrity => "the download did not match its published digest",
++            Self::StreamTooLong => "the stream is too long to play without range support",
++            Self::ConnectionLost => "the network connection was lost",
++            Self::Unsupported => "the file is a kind the reader does not support",
+         }
+     }
+ }
+@@ -2348,6 +2358,9 @@ impl TryFrom<u8> for DeviceError {
+             5 => Ok(Self::InvalidInput),
+             6 => Ok(Self::Backend),
+             7 => Ok(Self::Integrity),
++            8 => Ok(Self::StreamTooLong),
++            9 => Ok(Self::ConnectionLost),
++            10 => Ok(Self::Unsupported),
+             _ => Err(ProtocolError::InvalidValue("device error")),
+         }
+     }
+diff --git a/crates/kobo-protocol/src/tests.rs b/crates/kobo-protocol/src/tests.rs
+index 97eefa2..c9ff04c 100644
+--- a/crates/kobo-protocol/src/tests.rs
++++ b/crates/kobo-protocol/src/tests.rs
+@@ -18,6 +18,9 @@ fn a_shared_failure_code_never_blames_a_part_of_the_system_it_cannot_know_about(
+         DeviceError::InvalidInput,
+         DeviceError::Backend,
+         DeviceError::Integrity,
++        DeviceError::StreamTooLong,
++        DeviceError::ConnectionLost,
++        DeviceError::Unsupported,
+     ] {
+         let described = failure.describe();
+         assert!(
+@@ -26,7 +29,10 @@ fn a_shared_failure_code_never_blames_a_part_of_the_system_it_cannot_know_about(
+         );
+         if !matches!(
+             failure,
+-            DeviceError::Authentication | DeviceError::Unreachable | DeviceError::NotFound
++            DeviceError::Authentication
++                | DeviceError::Unreachable
++                | DeviceError::NotFound
++                | DeviceError::ConnectionLost
+         ) {
+             assert!(
+                 !described.contains("credential")
+diff --git a/crates/kobo-sdk/src/audio.rs b/crates/kobo-sdk/src/audio.rs
+index fa08894..d51d2dd 100644
+--- a/crates/kobo-sdk/src/audio.rs
++++ b/crates/kobo-sdk/src/audio.rs
+@@ -1586,7 +1586,11 @@ impl AudioPlayer {
+                 }
+                 // A sink that went away leaves the book paused where it
+                 // was. The complaint is shown; the place is kept.
+-                if *error == DeviceError::Unreachable && self.loaded == LoadState::Loaded {
++                if matches!(
++                    error,
++                    DeviceError::Unreachable | DeviceError::ConnectionLost
++                ) && self.loaded == LoadState::Loaded
++                {
+                     if self.playback == AudioPlaybackState::Playing {
+                         self.paused_since = Some(Instant::now());
+                     }
+@@ -1925,7 +1929,14 @@ fn audio_error(error: DeviceError) -> &'static str {
+         DeviceError::Unreachable => {
+             "Connect Bluetooth headphones or a speaker, then press Play again"
+         }
+-        DeviceError::InvalidInput => "This reader cannot play this kind of audio file",
++        DeviceError::Unsupported => "This reader cannot play this kind of audio file",
++        DeviceError::InvalidInput => "The audio source sent something this reader cannot use",
++        DeviceError::StreamTooLong => {
++            "This audio is too long to stream from its server. Download it to the reader instead"
++        }
++        DeviceError::ConnectionLost => {
++            "The network connection was lost. Press Play to carry on from where it stopped"
++        }
+         DeviceError::NotFound => "The audio source is no longer on this device",
+         DeviceError::TimedOut => "The Bluetooth audio service stopped responding",
+         DeviceError::Backend => "This audio file could not be decoded",
+diff --git a/crates/kobo-sim/src/lib.rs b/crates/kobo-sim/src/lib.rs
+index 9c6cf3c..3704e69 100644
+--- a/crates/kobo-sim/src/lib.rs
++++ b/crates/kobo-sim/src/lib.rs
+@@ -4409,8 +4409,9 @@ fn simulated_audio_opener(app: &str) -> kobo_policy::services::AudioOpener {
+             })
+             .map_err(|fault| match fault {
+                 kobo_audio::Fault::Unreadable => kobo_protocol::DeviceError::NotFound,
+-                kobo_audio::Fault::Unsupported => kobo_protocol::DeviceError::InvalidInput,
++                kobo_audio::Fault::Unsupported => kobo_protocol::DeviceError::Unsupported,
+                 kobo_audio::Fault::Damaged => kobo_protocol::DeviceError::Backend,
++                kobo_audio::Fault::Disconnected => kobo_protocol::DeviceError::ConnectionLost,
+             }),
+         )
+     }))
+diff --git a/crates/kobod/src/app_link.rs b/crates/kobod/src/app_link.rs
+index c605485..a65d361 100644
+--- a/crates/kobod/src/app_link.rs
++++ b/crates/kobod/src/app_link.rs
+@@ -1322,6 +1322,9 @@ fn failure_code(error: DeviceError) -> &'static str {
+         DeviceError::InvalidInput => "invalid-input",
+         DeviceError::Backend => "backend",
+         DeviceError::Integrity => "integrity",
++        DeviceError::StreamTooLong => "stream-too-long",
++        DeviceError::ConnectionLost => "connection-lost",
++        DeviceError::Unsupported => "unsupported",
+     }
+ }
+ 
+@@ -1338,6 +1341,9 @@ fn parse_device_error(value: &str) -> Option<DeviceError> {
+         "invalid-input" => DeviceError::InvalidInput,
+         "backend" => DeviceError::Backend,
+         "integrity" => DeviceError::Integrity,
++        "stream-too-long" => DeviceError::StreamTooLong,
++        "connection-lost" => DeviceError::ConnectionLost,
++        "unsupported" => DeviceError::Unsupported,
+         _ => return None,
+     })
+ }
 diff --git a/crates/kobod/src/app_store.rs b/crates/kobod/src/app_store.rs
-index fb5d8666..8c4a7ae5 100644
+index fb5d866..8c4a7ae 100644
 --- a/crates/kobod/src/app_store.rs
 +++ b/crates/kobod/src/app_store.rs
 @@ -127,6 +127,17 @@ const MANAGED_BUILTINS: &[BuiltinApp] = &[
@@ -64,8 +2073,77 @@ index fb5d8666..8c4a7ae5 100644
      BuiltinApp {
          id: "sidekick",
          title: "Sidekick",
+diff --git a/crates/kobod/src/device.rs b/crates/kobod/src/device.rs
+index 3328b02..4467b36 100644
+--- a/crates/kobod/src/device.rs
++++ b/crates/kobod/src/device.rs
+@@ -2516,30 +2516,40 @@ fn host_applications(
+     };
+     backends.push(Capability::Library);
+     let audio_fetcher: kobo_hal::audio::StreamFetcher = Arc::new(|url, offset, max_bytes| {
+-        kobo_net::fetch_from(url, offset, max_bytes, None, &[]).map_err(|error| match error {
+-            // A reader with no route and a service that will not answer are
+-            // different things everywhere else, but `DeviceError` is the radio
+-            // vocabulary and has one word for both. Unreachable is the honest
+-            // one: from the player's point of view the bytes cannot be got.
+-            kobo_protocol::TaskError::Offline
+-            | kobo_protocol::TaskError::Unreachable
+-            | kobo_protocol::TaskError::RateLimited(_) => kobo_protocol::DeviceError::Unreachable,
+-            kobo_protocol::TaskError::TimedOut => kobo_protocol::DeviceError::TimedOut,
+-            kobo_protocol::TaskError::NotFound => kobo_protocol::DeviceError::NotFound,
+-            kobo_protocol::TaskError::TooLarge => kobo_protocol::DeviceError::InvalidInput,
+-            kobo_protocol::TaskError::Denied => kobo_protocol::DeviceError::Backend,
+-            // Unreachable today: a plain fetch names no credential, so the
+-            // runtime never has one to be missing. Spelled out rather than
+-            // caught by a wildcard so that giving fetch a credential later
+-            // fails here instead of quietly reporting the wrong thing.
+-            //
+-            // A refusal to authenticate is not unreachable in the same way:
+-            // the host answered, and what it said was that this stream is not
+-            // for whoever asked.
+-            kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
+-                kobo_protocol::DeviceError::Authentication
+-            }
+-        })
++        kobo_net::fetch_range(url, offset, max_bytes)
++            .map(|ranged| kobo_hal::audio::StreamReply {
++                body: ranged.body,
++                partial: ranged.span.partial,
++                total: ranged.span.total,
++            })
++            .map_err(|error| match error {
++                // A reader with no route and a service that will not answer are
++                // different things everywhere else, but `DeviceError` is the radio
++                // vocabulary and has one word for both. Unreachable is the honest
++                // one: from the player's point of view the bytes cannot be got.
++                kobo_protocol::TaskError::Offline
++                | kobo_protocol::TaskError::Unreachable
++                | kobo_protocol::TaskError::RateLimited(_) => {
++                    kobo_protocol::DeviceError::Unreachable
++                }
++                kobo_protocol::TaskError::TimedOut => kobo_protocol::DeviceError::TimedOut,
++                kobo_protocol::TaskError::NotFound => kobo_protocol::DeviceError::NotFound,
++                // A ranged request is answered with at most what it asked for,
++                // so more is a server sending the whole file regardless.
++                kobo_protocol::TaskError::TooLarge => kobo_protocol::DeviceError::StreamTooLong,
++                kobo_protocol::TaskError::Denied => kobo_protocol::DeviceError::Backend,
++                // Unreachable today: a plain fetch names no credential, so the
++                // runtime never has one to be missing. Spelled out rather than
++                // caught by a wildcard so that giving fetch a credential later
++                // fails here instead of quietly reporting the wrong thing.
++                //
++                // A refusal to authenticate is not unreachable in the same way:
++                // the host answered, and what it said was that this stream is not
++                // for whoever asked.
++                kobo_protocol::TaskError::NoCredential | kobo_protocol::TaskError::Unauthorized => {
++                    kobo_protocol::DeviceError::Authentication
++                }
++            })
+     });
+     let audio = kobo_hal::audio::Audio::open(Some(audio_fetcher));
+     if audio.is_some() {
 diff --git a/crates/kobod/src/update.rs b/crates/kobod/src/update.rs
-index f136bcf2..bf8710d5 100644
+index f136bcf..bf8710d 100644
 --- a/crates/kobod/src/update.rs
 +++ b/crates/kobod/src/update.rs
 @@ -16,6 +16,9 @@
@@ -95,3 +2173,59 @@ index f136bcf2..bf8710d5 100644
      // Traced before it is returned, because the reply an owner sees is one of
      // seven shared codes and several failures here map to the same one. An
      // update that could not be downloaded and an update whose archive would
+diff --git a/examples/audiobook/src/main.rs b/examples/audiobook/src/main.rs
+index 64eb841..4b98450 100644
+--- a/examples/audiobook/src/main.rs
++++ b/examples/audiobook/src/main.rs
+@@ -424,7 +424,7 @@ impl Audiobook {
+     /// every control would do nothing.
+     fn unplayable_screen(&self) -> Screen {
+         let advice = match self.unplayable {
+-            Some(DeviceError::InvalidInput) => {
++            Some(DeviceError::InvalidInput | DeviceError::Unsupported) => {
+                 "This reader cannot play this kind of file. Audiobooks plays MP3, M4B, M4A, OGG, \
+                  Opus, FLAC and WAV."
+             }
+@@ -1934,7 +1934,10 @@ impl KoboApp for Audiobook {
+         {
+             if matches!(
+                 error,
+-                DeviceError::Backend | DeviceError::InvalidInput | DeviceError::NotFound
++                DeviceError::Backend
++                    | DeviceError::InvalidInput
++                    | DeviceError::Unsupported
++                    | DeviceError::NotFound
+             ) && self.stage == Stage::Player
+             {
+                 self.unplayable = Some(*error);
+diff --git a/examples/settings/src/main.rs b/examples/settings/src/main.rs
+index 2caa63a..d8a4062 100644
+--- a/examples/settings/src/main.rs
++++ b/examples/settings/src/main.rs
+@@ -2493,7 +2493,10 @@ const fn failure_words(error: DeviceError) -> &'static str {
+         }
+         DeviceError::TimedOut => "That took too long. Try again.",
+         DeviceError::Unreachable => "That could not be reached. Check Wi-Fi, then try again.",
+-        DeviceError::InvalidInput => "What came back could not be used. Try again later.",
++        DeviceError::InvalidInput | DeviceError::Unsupported | DeviceError::StreamTooLong => {
++            "What came back could not be used. Try again later."
++        }
++        DeviceError::ConnectionLost => "The connection was lost. Check Wi-Fi, then try again.",
+         DeviceError::Backend => "The reader could not finish that. Try again.",
+         DeviceError::Integrity => {
+             "The download did not match what was published, so it was not used. Try again later."
+diff --git a/examples/store/src/main.rs b/examples/store/src/main.rs
+index e226084..f3f9726 100644
+--- a/examples/store/src/main.rs
++++ b/examples/store/src/main.rs
+@@ -1457,6 +1457,10 @@ fn app_failure(error: DeviceError) -> &'static str {
+         DeviceError::Integrity => {
+             "The downloaded app could not be verified. Refresh the app list and try again."
+         }
++        // Audio streaming errors; an app install never reports them.
++        DeviceError::StreamTooLong | DeviceError::ConnectionLost | DeviceError::Unsupported => {
++            "Couldn't finish the download. Check Wi-Fi and try again."
++        }
+     }
+ }
+ 
