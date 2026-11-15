@@ -20,10 +20,12 @@ panel (such as the Libra Colour) and grey ones to the rest. A cover that
 cannot be fetched leaves the tile's icon in its place.
 
 It also reads books. Choose **Books** on the home screen for your Pharos
-books by name, with authors; a book that is on the reader says
-**Downloaded**. Open one to download it (progress is shown) and read it;
-the reader remembers where you stopped. A book's `⋮` menu shows the first lines of its description, removes its
-download, and opens the whole description with **About this book**. Books come from Pharos's `/Items/{id}/Download`, with the same
+books as a grid of covers; a book that is on the reader carries a mark.
+Tap one for its detail page: the cover, author and the start of its
+description, with **Download and read** (or **Read** once it is on the
+reader), **Remove download**, and **About this book** for the whole
+description. Downloading shows its progress, and the reader remembers
+where you stopped. Books come from Pharos's `/Items/{id}/Download`, with the same
 sign-in as the music; the OPDS catalogue is not used because it needs an
 e-reader password the app does not hold.
 
