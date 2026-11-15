@@ -915,6 +915,65 @@ index b6e6ed5..811a2e3 100644
      /// Every picture the page being read refers to, in the order it does.
      ///
      /// The subset of [`Self::pictures_wanted`] that is actually on screen, and
+diff --git a/crates/kobo-sdk/src/builder.rs b/crates/kobo-sdk/src/builder.rs
+index d2e8c26..ec846f0 100644
+--- a/crates/kobo-sdk/src/builder.rs
++++ b/crates/kobo-sdk/src/builder.rs
+@@ -6,9 +6,9 @@ use crate::{
+     Emphasis, Failure, FieldKind, Fold, FontHandle, Freeform, Glyph, InlineFormula, LayoutIssue,
+     LayoutIssueKind, NavBar, Node, NodeId, OptionRow, Overlay, OverlayKind, ParagraphPresentation,
+     Percent, QuoteRole, RichTextSpan, Row, RowLead, RowState, Screen, ScreenAccent, ScreenBuilder,
+-    SlotWidth, Space, StandardState, Tile, TilePicture, TileShape, TopBar, TransferFailure,
+-    JOIN_WIFI, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_OPTIONS,
+-    MAX_QUOTE_DEPTH, MAX_ROWS, MAX_SELECTION_ACTIONS, MAX_STEPS, MAX_TERMINAL_ROWS,
++    SlotWidth, Space, StandardState, Tile, TilePicture, TileShape, TileState, TopBar,
++    TransferFailure, JOIN_WIFI, MAX_BAND_SLOTS, MAX_CELLS, MAX_CHOICE_OPTIONS, MAX_COLUMNS,
++    MAX_OPTIONS, MAX_QUOTE_DEPTH, MAX_ROWS, MAX_SELECTION_ACTIONS, MAX_STEPS, MAX_TERMINAL_ROWS,
+ };
+ 
+ impl ScreenBuilder {
+@@ -1913,6 +1913,41 @@ impl ScreenBuilder {
+         self
+     }
+ 
++    /// [`Self::picture_tiles`] whose tiles may each carry a second line, a
++    /// state mark and a hold menu, as [`Self::contextual_tiles`] does. An
++    /// empty subtitle or menu name means none.
++    ///
++    /// The menu must also be reachable from a visible control; holding is a
++    /// convenience, never the only route to it.
++    #[must_use]
++    pub fn contextual_picture_tiles<I, N, L, S, M>(mut self, shape: TileShape, tiles: I) -> Self
++    where
++        I: IntoIterator<Item = (N, L, S, Glyph, M, Option<TilePicture>, TileState)>,
++        N: AsRef<str>,
++        L: Into<String>,
++        S: Into<String>,
++        M: AsRef<str>,
++    {
++        let id = self.next_id();
++        let tiles = tiles
++            .into_iter()
++            .map(|(name, label, subtitle, glyph, menu, picture, state)| {
++                let mut tile = Tile::new(self.register(name.as_ref()), label, glyph)
++                    .with_subtitle(subtitle)
++                    .with_state(state);
++                if !menu.as_ref().is_empty() {
++                    tile = tile.with_menu(self.register(menu.as_ref()));
++                }
++                match picture {
++                    Some(picture) => tile.with_picture(picture),
++                    None => tile,
++                }
++            })
++            .collect();
++        self.nodes.push(Node::TileGrid { id, tiles, shape });
++        self
++    }
++
+     /// Shows one picture, as large as the width and `max_height_mm` allow.
+     ///
+     /// The height is a physical measurement rather than a pixel count so that
 diff --git a/crates/kobo-sdk/src/lib.rs b/crates/kobo-sdk/src/lib.rs
 index 7d672a0..92608f3 100644
 --- a/crates/kobo-sdk/src/lib.rs
