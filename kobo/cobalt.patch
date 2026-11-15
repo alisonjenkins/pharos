@@ -689,6 +689,125 @@ index 1b120a5..2da5cf2 100644
  
  /// The most bytes one picture may take.
  ///
+diff --git a/crates/kobo-frame-plan/src/lib.rs b/crates/kobo-frame-plan/src/lib.rs
+index dbea710..73542f4 100644
+--- a/crates/kobo-frame-plan/src/lib.rs
++++ b/crates/kobo-frame-plan/src/lib.rs
+@@ -153,20 +153,21 @@ impl FramePlanner {
+                     true,
+                 )
+             } else {
++                let regions = changed
++                    .into_iter()
++                    .map(|region| FrameRegion {
++                        region,
++                        waveform: if surface.region_has_colour(region) {
++                            PanelWaveform::Colour
++                        } else if self.two_level_transition(surface, region) {
++                            PanelWaveform::Du
++                        } else {
++                            PanelWaveform::Gl16
++                        },
++                    })
++                    .collect();
+                 (
+-                    changed
+-                        .into_iter()
+-                        .map(|region| FrameRegion {
+-                            region,
+-                            waveform: if surface.region_has_colour(region) {
+-                                PanelWaveform::Colour
+-                            } else if self.two_level_transition(surface, region) {
+-                                PanelWaveform::Du
+-                            } else {
+-                                PanelWaveform::Gl16
+-                            },
+-                        })
+-                        .collect(),
++                    Self::coalesce_slow(surface, regions),
+                     self.dirty.saturating_add(flipped),
+                     false,
+                 )
+@@ -554,6 +555,35 @@ impl FramePlanner {
+             .reduce(Self::union)
+     }
+ 
++    /// Folds a frame's regions into one when any of them needs a grey or
++    /// colour waveform.
++    ///
++    /// The controller runs one such update at a time, and each takes about
++    /// 350 ms on a Libra Colour whatever its size: a grid page of six covers
++    /// sent as six regions took two seconds, where one update over a whole
++    /// row of them took the same 360 ms as a single cover. Repainting the
++    /// unchanged pixels between them costs nothing visible. Frames of only
++    /// two-level changes keep their regions, which the fast waveform clears
++    /// quickly enough on its own.
++    fn coalesce_slow(surface: &Surface, regions: Vec<FrameRegion>) -> Vec<FrameRegion> {
++        if regions.len() < 2
++            || regions
++                .iter()
++                .all(|update| update.waveform == PanelWaveform::Du)
++        {
++            return regions;
++        }
++        let Some(region) = Self::bounding_region(&regions) else {
++            return regions;
++        };
++        let waveform = if surface.region_has_colour(region) {
++            PanelWaveform::Colour
++        } else {
++            PanelWaveform::Gl16
++        };
++        vec![FrameRegion { region, waveform }]
++    }
++
+     fn limit_regions(regions: &mut Vec<Rect>) {
+         while regions.len() > MAX_FRAME_REGIONS {
+             let mut best = None;
+@@ -929,6 +959,43 @@ mod tests {
+         assert_eq!(update.dirty, 2);
+     }
+ 
++    #[test]
++    fn distant_grey_changes_are_one_update() {
++        // A grid page: covers far apart, each a grey picture.
++        let (planner, mut frame) = started(256, 64);
++        for (left, top) in [(8, 8), (200, 8), (8, 40), (200, 40)] {
++            for y in top..top + 16 {
++                for x in left..left + 32 {
++                    frame.pixels[y * 256 + x] = 128;
++                }
++            }
++        }
++        let update = planner.plan(&frame).expect("four tiles");
++        assert_eq!(update.regions.len(), 1, "{:?}", update.regions);
++        let only = update.regions[0];
++        assert_eq!(only.waveform, PanelWaveform::Gl16);
++        assert!(only.region.x <= 8 && only.region.x + only.region.width >= 232);
++        assert!(only.region.y <= 8 && only.region.y + only.region.height >= 56);
++        assert!(!update.full, "folding regions must not flash the panel");
++        assert_eq!(update.dirty, 4 * 16 * 32);
++    }
++
++    #[test]
++    fn distant_colour_changes_are_one_colour_update() {
++        let (planner, mut frame) = started(256, 64);
++        for left in [8, 200] {
++            for y in 8..40 {
++                for x in left..left + 32 {
++                    frame.blend_colour(x, y, [0xFF, 0x88, 0x33], 255);
++                }
++            }
++        }
++        let update = planner.plan(&frame).expect("two colour tiles");
++        assert_eq!(update.regions.len(), 1, "{:?}", update.regions);
++        assert_eq!(update.regions[0].waveform, PanelWaveform::Colour);
++        assert!(!update.full);
++    }
++
+     #[test]
+     fn known_damage_does_not_hide_changes_elsewhere() {
+         let (mut planner, mut frame) = started(32, 32);
 diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
 index b6e6ed5..811a2e3 100644
 --- a/crates/kobo-read/src/lib.rs
