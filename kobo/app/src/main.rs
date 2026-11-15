@@ -229,6 +229,12 @@ impl Pharos {
     fn sign_out(&mut self, context: &mut Context) {
         self.stop_playing(context);
         self.generation = self.generation.saturating_add(1);
+        // Its answer would be dropped as the old account's, and a timer id
+        // left here would stop the next account's polling from arming.
+        if let Some(timer) = self.downloads_timer.take() {
+            context.cancel(timer);
+        }
+        self.asked.clear();
         self.account = None;
         self.albums = Page::default();
         context.store().forget(ACCOUNT_KEY);
@@ -966,7 +972,16 @@ impl KoboApp for Pharos {
         result: DeviceResult,
     ) {
         match (&request, &result) {
-            (DeviceRequest::ListDownloads { .. }, DeviceResult::Downloads { entries }) => {
+            (DeviceRequest::ListDownloads { urls }, DeviceResult::Downloads { entries }) => {
+                // Answers come in order. One to a question that a newer one
+                // has replaced says nothing about what is asked now.
+                if self.asked.iter().map(|(url, _)| url).ne(urls.iter()) {
+                    context.log(
+                        LogLevel::Info,
+                        "pharos: answer to an older downloads question ignored".to_owned(),
+                    );
+                    return;
+                }
                 self.heard_downloads(context, entries);
                 if matches!(self.view, View::Album(_)) {
                     self.show(context);
