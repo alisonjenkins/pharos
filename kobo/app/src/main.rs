@@ -8,11 +8,14 @@
 //! (`PHAROS_KOBO_SERVER`); the reader has one owner and one server.
 
 mod api;
+mod offline;
 
 use api::{Account, Entry, Page, Report};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
 use kobo_sdk::prelude::*;
 use kobo_sdk::{Header, LogLevel, Task, TaskError, TaskId, TaskOutcome};
+use offline::{Offline, Place, Unsent};
+use std::collections::HashMap;
 use std::process::ExitCode;
 
 const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
@@ -21,9 +24,16 @@ const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
 };
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ACCOUNT_KEY: &str = "account";
+/// The albums with downloads and their tracks, for listing with no server.
+const OFFLINE_KEY: &str = "offline";
+/// Places the listener reached that the server has not heard yet.
+const UNSENT_KEY: &str = "unsent";
 const POLL_SECONDS: u32 = 3;
 /// How often a playing track's place is sent while nobody touches anything.
 const REPORT_SECONDS: u32 = 30;
+/// How often the downloads of the open album are asked after, so the marks
+/// and percentages follow a download that is still running.
+const DOWNLOAD_POLL_SECONDS: u32 = 10;
 const MAX_JSON: u32 = 512 * 1024;
 /// Rows on one page of a list; the side of the panel turns to the next.
 const ROWS_PER_PAGE: usize = 7;
@@ -61,8 +71,39 @@ enum Work {
         album: String,
         start: usize,
     },
-    Report(Report),
+    /// A playing-session call, with the place it was made at so a failure can
+    /// keep that place for later.
+    Report {
+        report: Report,
+        track: String,
+        position_ms: u64,
+        issued: u64,
+    },
     ReportTimer,
+    /// A place kept from when the server was out of reach, sent now.
+    Replay {
+        track: String,
+        issued: u64,
+    },
+    DownloadsTimer,
+}
+
+/// How much of a track is on the reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Kept {
+    have: u64,
+    total: u64,
+}
+
+impl Kept {
+    fn label(self) -> String {
+        if self.have >= self.total {
+            "Downloaded".to_owned()
+        } else {
+            let percent = self.have.saturating_mul(100) / self.total.max(1);
+            format!("{percent}%")
+        }
+    }
 }
 
 struct Playing {
@@ -74,7 +115,13 @@ struct Playing {
 struct Pharos {
     view: View,
     account: Option<Account>,
-    tasks: Vec<(TaskId, Work)>,
+    /// Each task with the account generation it was started under.
+    tasks: Vec<(TaskId, Work, u64)>,
+    /// Counts sign-outs: an answer to a task from an earlier account is
+    /// dropped, not applied to the next one.
+    generation: u64,
+    /// Counts the reports sent, to tell which of two is the later.
+    issued: u64,
     albums: Page,
     tracks: Page,
     page: usize,
@@ -82,6 +129,18 @@ struct Pharos {
     album: Option<Entry>,
     playing: Option<Playing>,
     report_timer: Option<TaskId>,
+    /// The albums with downloads, as last saved.
+    offline: Offline,
+    /// The albums on screen are the saved ones because the server did not
+    /// answer.
+    offline_mode: bool,
+    /// Places not yet sent to the server.
+    unsent: Unsent,
+    /// What is on the reader, by track id, as of the last answer.
+    downloads: HashMap<String, Kept>,
+    /// The addresses of the last question, with the track each stands for.
+    asked: Vec<(String, String)>,
+    downloads_timer: Option<TaskId>,
 }
 
 impl Default for Pharos {
@@ -90,12 +149,20 @@ impl Default for Pharos {
             view: View::Opening,
             account: None,
             tasks: Vec::new(),
+            generation: 0,
+            issued: 0,
             albums: Page::default(),
             tracks: Page::default(),
             page: 0,
             album: None,
             playing: None,
             report_timer: None,
+            offline: Offline::default(),
+            offline_mode: false,
+            unsent: Unsent::default(),
+            downloads: HashMap::new(),
+            asked: Vec::new(),
+            downloads_timer: None,
         }
     }
 }
@@ -111,7 +178,7 @@ impl Pharos {
 
     fn track(&mut self, context: &mut Context, task: Option<TaskId>, work: Work) {
         if let Some(task) = task {
-            self.tasks.push((task, work));
+            self.tasks.push((task, work, self.generation));
         } else {
             context.log(
                 LogLevel::Info,
@@ -161,9 +228,23 @@ impl Pharos {
 
     fn sign_out(&mut self, context: &mut Context) {
         self.stop_playing(context);
+        self.generation = self.generation.saturating_add(1);
+        // Its answer would be dropped as the old account's, and a timer id
+        // left here would stop the next account's polling from arming.
+        if let Some(timer) = self.downloads_timer.take() {
+            context.cancel(timer);
+        }
+        self.asked.clear();
         self.account = None;
         self.albums = Page::default();
         context.store().forget(ACCOUNT_KEY);
+        // Another account's library and places are not this one's.
+        self.offline = Offline::default();
+        self.unsent = Unsent::default();
+        self.offline_mode = false;
+        self.downloads.clear();
+        context.store().forget(OFFLINE_KEY);
+        context.store().forget(UNSENT_KEY);
         self.sign_in(context);
     }
 
@@ -182,8 +263,17 @@ impl Pharos {
         self.tracks = Page::default();
         self.page = 0;
         self.album = Some(album.clone());
-        self.load_tracks(context, album.id.clone(), 0);
+        match self
+            .offline_mode
+            .then(|| self.offline.tracks(&album.id))
+            .flatten()
+        {
+            Some(saved) => self.tracks = saved,
+            None => self.load_tracks(context, album.id.clone(), 0),
+        }
         self.view = View::Album(album);
+        self.refresh_downloads(context);
+        self.arm_downloads_timer(context);
     }
 
     fn load_tracks(&mut self, context: &mut Context, album: String, start: usize) {
@@ -226,6 +316,9 @@ impl Pharos {
         self.view = View::Player;
         self.report(context, Report::Started);
         self.report_timer = self.sleep(context, REPORT_SECONDS, Work::ReportTimer);
+        // Playing is what starts the download; ask how it is getting on.
+        self.refresh_downloads(context);
+        self.arm_downloads_timer(context);
     }
 
     fn stop_playing(&mut self, context: &mut Context) {
@@ -251,9 +344,187 @@ impl Pharos {
         let paused = !playing.player.is_playing();
         playing.sound_reported = !paused;
         let body = api::report_body(&playing.track, position_ms, paused);
-        self.post(context, report.url(SERVER), body, Work::Report(report));
+        self.issued = self.issued.saturating_add(1);
+        let work = Work::Report {
+            report,
+            track: playing.track.clone(),
+            position_ms,
+            issued: self.issued,
+        };
+        self.post(context, report.url(SERVER), body, work);
     }
 
+    /// Sends the places kept from when the server was out of reach, as the
+    /// end of a session each. The track playing now is left: its own reports
+    /// are newer than anything kept.
+    fn replay_unsent(&mut self, context: &mut Context) {
+        let playing = self.playing.as_ref().map(|playing| playing.track.clone());
+        let waiting: Vec<Place> = self
+            .unsent
+            .places()
+            .iter()
+            .filter(|place| Some(&place.track) != playing.as_ref())
+            .cloned()
+            .collect();
+        for place in waiting {
+            let sending = self.tasks.iter().any(|(_, work, generation)| {
+                *generation == self.generation
+                    && matches!(work, Work::Replay { track, .. } if *track == place.track)
+            });
+            if sending {
+                continue;
+            }
+            let body = api::report_body(&place.track, place.position_ms, true);
+            self.post(
+                context,
+                Report::Stopped.url(SERVER),
+                body,
+                Work::Replay {
+                    track: place.track,
+                    issued: place.issued,
+                },
+            );
+        }
+    }
+
+    fn save_unsent(&self, context: &mut Context) {
+        if self.unsent.is_empty() {
+            context.store().forget(UNSENT_KEY);
+        } else {
+            context.store().save(UNSENT_KEY, self.unsent.encode());
+        }
+    }
+
+    /// The tracks on screen whose downloads are worth asking after: from the
+    /// panel page on, and the one playing.
+    fn download_questions(&self) -> Vec<(String, String)> {
+        let Some(account) = &self.account else {
+            return Vec::new();
+        };
+        let mut tracks: Vec<&str> = self
+            .tracks
+            .entries
+            .iter()
+            .skip(self.page * ROWS_PER_PAGE)
+            .take(kobo_sdk::MAX_DOWNLOAD_URLS)
+            .map(|entry| entry.id.as_str())
+            .collect();
+        if let Some(playing) = &self.playing {
+            if !tracks.contains(&playing.track.as_str()) {
+                tracks.pop();
+                tracks.push(playing.track.as_str());
+            }
+        }
+        tracks
+            .into_iter()
+            .map(|id| (api::stream_url(SERVER, account, id), id.to_owned()))
+            .collect()
+    }
+
+    fn refresh_downloads(&mut self, context: &mut Context) {
+        let questions = self.download_questions();
+        if questions.is_empty() {
+            return;
+        }
+        let urls = questions.iter().map(|(url, _)| url.clone()).collect();
+        if context.device().list_downloads(urls) {
+            self.asked = questions;
+        }
+    }
+
+    fn arm_downloads_timer(&mut self, context: &mut Context) {
+        if self.downloads_timer.is_none() {
+            self.downloads_timer = self.sleep(context, DOWNLOAD_POLL_SECONDS, Work::DownloadsTimer);
+        }
+    }
+
+    /// Notes what the runtime says is on the reader and keeps the album's
+    /// names for listing with no server while any of it is.
+    fn heard_downloads(&mut self, context: &mut Context, entries: &[kobo_sdk::DownloadEntry]) {
+        let asked = std::mem::take(&mut self.asked);
+        for (_, track) in &asked {
+            self.downloads.remove(track);
+        }
+        for entry in entries {
+            if let Some((_, track)) = asked.iter().find(|(url, _)| *url == entry.url) {
+                self.downloads.insert(
+                    track.clone(),
+                    Kept {
+                        have: entry.have,
+                        total: entry.total,
+                    },
+                );
+            }
+        }
+        self.asked = asked;
+        self.save_offline(context);
+    }
+
+    fn save_offline(&mut self, context: &mut Context) {
+        let Some(album) = self.album.clone() else {
+            return;
+        };
+        // Only a whole album says anything about what is kept of it.
+        if self.tracks.entries.is_empty() || self.tracks.entries.len() < self.tracks.total {
+            return;
+        }
+        let any = self.tracks.entries.iter().any(|track| {
+            self.downloads
+                .get(&track.id)
+                .is_some_and(|kept| kept.have > 0)
+        });
+        // Every track of the album was among those asked about, not just as
+        // many: the playing track of another album takes a slot.
+        let checked_all = self
+            .tracks
+            .entries
+            .iter()
+            .all(|track| self.asked.iter().any(|(_, asked)| *asked == track.id));
+        let changed = if any {
+            self.offline.keep(&album, &self.tracks.entries)
+        } else {
+            checked_all && self.offline.forget(&album.id)
+        };
+        if changed {
+            if self.offline.is_empty() {
+                context.store().forget(OFFLINE_KEY);
+            } else {
+                context.store().save(OFFLINE_KEY, self.offline.encode());
+            }
+        }
+    }
+
+    /// The server did not answer, but albums with downloads are saved: list
+    /// those.
+    fn go_offline(&mut self) {
+        self.offline_mode = true;
+        self.albums = self.offline.page();
+        self.page = 0;
+        self.view = View::Albums;
+    }
+
+    fn remove_downloads(&mut self, context: &mut Context) {
+        let Some(account) = &self.account else {
+            return;
+        };
+        let urls: Vec<String> = self
+            .tracks
+            .entries
+            .iter()
+            .filter(|track| {
+                self.downloads
+                    .get(&track.id)
+                    .is_some_and(|kept| kept.have > 0)
+            })
+            .map(|track| api::stream_url(SERVER, account, &track.id))
+            .collect();
+        for url in urls {
+            let _queued = context.device().remove_download(url);
+        }
+        self.refresh_downloads(context);
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn completed(&mut self, context: &mut Context, work: Work, bytes: &[u8]) {
         match work {
             Work::Initiate => match api::parse_initiate(bytes) {
@@ -289,6 +560,8 @@ impl Pharos {
             },
             Work::Albums { start } => match api::parse_page(bytes) {
                 Some(page) => {
+                    self.offline_mode = false;
+                    self.replay_unsent(context);
                     if start == 0 {
                         self.albums = page;
                     } else {
@@ -314,16 +587,46 @@ impl Pharos {
                         let loaded = self.tracks.entries.len();
                         if got > 0 && loaded < self.tracks.total {
                             self.load_tracks(context, album, loaded);
+                        } else {
+                            self.refresh_downloads(context);
                         }
                     }
                     None => self.problem("Pharos sent a list this app could not read."),
                 }
             }
-            Work::Report(report) => {
+            Work::Report {
+                report,
+                track,
+                issued,
+                ..
+            } => {
                 context.log(
                     LogLevel::Info,
                     format!("pharos: report {} sent", report.label()),
                 );
+                // The server hears this track again, so a kept place for it
+                // from this report or before is stale; the others are news
+                // to it.
+                if self.unsent.sent(&track, issued) {
+                    self.save_unsent(context);
+                }
+                self.replay_unsent(context);
+            }
+            Work::Replay { track, issued } => {
+                context.log(
+                    LogLevel::Info,
+                    format!("pharos: kept place sent track={track}"),
+                );
+                if self.unsent.sent(&track, issued) {
+                    self.save_unsent(context);
+                }
+            }
+            Work::DownloadsTimer => {
+                self.downloads_timer = None;
+                if matches!(self.view, View::Album(_) | View::Player) {
+                    self.refresh_downloads(context);
+                    self.arm_downloads_timer(context);
+                }
             }
             Work::ReportTimer => {
                 if self
@@ -351,8 +654,27 @@ impl Pharos {
                 // password changed): forget the token and sign in again.
                 self.sign_out(context);
             }
-            // A lost report only costs the server a moment of the listener's place.
-            (Work::Report(_) | Work::ReportTimer, _) => {}
+            // A report the server did not hear keeps the place, to send when it
+            // answers again. The next one carries a newer place anyway.
+            (
+                Work::Report {
+                    track,
+                    position_ms,
+                    issued,
+                    ..
+                },
+                _,
+            ) => {
+                if self.unsent.note(&track, position_ms, issued) {
+                    self.save_unsent(context);
+                }
+            }
+            (Work::ReportTimer | Work::DownloadsTimer | Work::Replay { .. }, _) => {}
+            // Albums with downloads are still there with the server away.
+            (
+                Work::Albums { start: 0 },
+                TaskError::Offline | TaskError::Unreachable | TaskError::TimedOut,
+            ) if !self.offline.is_empty() => self.go_offline(),
             // A later block of tracks fails in the background, maybe while the
             // listener is in the player: keep what loaded, and opening the
             // album again fetches the rest.
@@ -370,20 +692,32 @@ impl Pharos {
         self.view = View::Problem(why.into());
     }
 
-    /// The rows of `page` on the panel page `self.page`.
-    fn rows(page: &Page, at: usize, show_length: bool) -> Vec<(String, String, String, u16)> {
+    /// The rows of `page` on the panel page `self.page`. `tracks` says they are
+    /// tracks, which show their length and how much of them is on the reader;
+    /// an album with any of its tracks saved says so.
+    fn rows(&self, page: &Page, tracks: bool) -> Vec<(String, String, String, u16)> {
         page.entries
             .iter()
             .enumerate()
-            .skip(at * ROWS_PER_PAGE)
+            .skip(self.page * ROWS_PER_PAGE)
             .take(ROWS_PER_PAGE)
             .map(|(index, entry)| {
                 let mut summary = entry.by.clone();
-                if let (true, Some(ms)) = (show_length, entry.runtime_ms) {
+                let mut add = |part: &str| {
                     if !summary.is_empty() {
                         summary.push_str(" · ");
                     }
-                    summary.push_str(&api::clock(ms));
+                    summary.push_str(part);
+                };
+                if let (true, Some(ms)) = (tracks, entry.runtime_ms) {
+                    add(&api::clock(ms));
+                }
+                if tracks {
+                    if let Some(kept) = self.downloads.get(&entry.id).filter(|kept| kept.have > 0) {
+                        add(&kept.label());
+                    }
+                } else if self.offline.contains(&entry.id) {
+                    add("Downloaded");
                 }
                 (
                     format!("row-{index}"),
@@ -415,12 +749,21 @@ impl Pharos {
                 .activity("Loading your albums", None)
                 .button("sign-out", "Sign out")
                 .build(),
+            View::Albums if self.offline_mode => self
+                .now_playing(ScreenBuilder::new("pharos-albums").top_bar(format!(
+                    "Downloaded · {} albums · offline",
+                    self.albums.total
+                )))
+                .rows(self.rows(&self.albums, false))
+                .page_turns("page-back", "page-next")
+                .bottom_action("retry", "Try the server again")
+                .build(),
             View::Albums => self
                 .now_playing(
                     ScreenBuilder::new("pharos-albums")
                         .top_bar(format!("Music · {} albums", self.albums.total)),
                 )
-                .rows(Self::rows(&self.albums, self.page, false))
+                .rows(self.rows(&self.albums, false))
                 .page_turns("page-back", "page-next")
                 .bottom_action("sign-out", "Sign out")
                 .build(),
@@ -429,12 +772,24 @@ impl Pharos {
                 .activity("Loading the tracks", None)
                 .build()
                 .with_own_back(true),
-            View::Album(album) => self
-                .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
-                .rows(Self::rows(&self.tracks, self.page, true))
-                .page_turns("page-back", "page-next")
+            View::Album(album) => {
+                let screen = self
+                    .now_playing(ScreenBuilder::new("pharos-album").top_bar(album.name.clone()))
+                    .rows(self.rows(&self.tracks, true))
+                    .page_turns("page-back", "page-next");
+                let kept = self.tracks.entries.iter().any(|track| {
+                    self.downloads
+                        .get(&track.id)
+                        .is_some_and(|kept| kept.have > 0)
+                });
+                if kept {
+                    screen.bottom_action("remove-downloads", "Remove downloads")
+                } else {
+                    screen
+                }
                 .build()
-                .with_own_back(true),
+                .with_own_back(true)
+            }
             View::Player => match &self.playing {
                 Some(playing) => playing.player.screen_for(context),
                 None => ScreenBuilder::new("pharos")
@@ -488,7 +843,7 @@ impl Pharos {
             && !self
                 .tasks
                 .iter()
-                .any(|(_, work)| matches!(work, Work::Albums { .. }))
+                .any(|(_, work, _)| matches!(work, Work::Albums { .. }))
         {
             self.load_albums(context, loaded);
         }
@@ -503,19 +858,33 @@ fn work_label(work: &Work) -> &'static str {
         Work::Finish => "finish",
         Work::Albums { .. } => "albums",
         Work::Tracks { .. } => "tracks",
-        Work::Report(report) => report.label(),
+        Work::Report { report, .. } => report.label(),
         Work::ReportTimer => "report-timer",
+        Work::Replay { .. } => "replay",
+        Work::DownloadsTimer => "downloads-timer",
     }
 }
 
 impl KoboApp for Pharos {
     fn on_start(&mut self, context: &mut Context) {
+        // The account last: answers come in order, and a server that does
+        // not answer must find the saved albums already read.
+        context.store().load(OFFLINE_KEY);
+        context.store().load(UNSENT_KEY);
         context.store().load(ACCOUNT_KEY);
         self.show(context);
     }
 
     fn on_store(&mut self, context: &mut Context, result: StoreResult) {
         if let StoreResult::Loaded { key, value } = result {
+            if key == OFFLINE_KEY {
+                self.offline = value.as_deref().map(Offline::decode).unwrap_or_default();
+                return;
+            }
+            if key == UNSENT_KEY {
+                self.unsent = value.as_deref().map(Unsent::decode).unwrap_or_default();
+                return;
+            }
             if key != ACCOUNT_KEY {
                 return;
             }
@@ -556,9 +925,12 @@ impl KoboApp for Pharos {
                 self.album = None;
                 self.page = 0;
             }
+        } else if action == action_id("remove-downloads") {
+            self.remove_downloads(context);
         } else if action == action_id("retry") {
             match self.account {
                 Some(_) => {
+                    self.offline_mode = false;
                     self.view = View::Albums;
                     self.load_albums(context, 0);
                 }
@@ -599,6 +971,32 @@ impl KoboApp for Pharos {
         request: DeviceRequest,
         result: DeviceResult,
     ) {
+        match (&request, &result) {
+            (DeviceRequest::ListDownloads { urls }, DeviceResult::Downloads { entries }) => {
+                // Answers come in order. One to a question that a newer one
+                // has replaced says nothing about what is asked now.
+                if self.asked.iter().map(|(url, _)| url).ne(urls.iter()) {
+                    context.log(
+                        LogLevel::Info,
+                        "pharos: answer to an older downloads question ignored".to_owned(),
+                    );
+                    return;
+                }
+                self.heard_downloads(context, entries);
+                if matches!(self.view, View::Album(_)) {
+                    self.show(context);
+                }
+                return;
+            }
+            (DeviceRequest::ListDownloads { .. } | DeviceRequest::RemoveDownload { .. }, other) => {
+                context.log(
+                    LogLevel::Info,
+                    format!("pharos: downloads call answered {other:?}"),
+                );
+                return;
+            }
+            _ => {}
+        }
         if let Some(playing) = self.playing.as_mut() {
             if playing.player.on_device_result(context, &request, &result) {
                 // The first moment sound really runs is worth a report: the
@@ -622,12 +1020,25 @@ impl KoboApp for Pharos {
                 return;
             }
         }
-        let Some(position) = self.tasks.iter().position(|(id, _)| *id == task) else {
+        let Some(position) = self.tasks.iter().position(|(id, _, _)| *id == task) else {
             return;
         };
-        let (_, work) = self.tasks.swap_remove(position);
+        let (_, work, generation) = self.tasks.swap_remove(position);
         if self.report_timer == Some(task) {
             self.report_timer = None;
+        }
+        if self.downloads_timer == Some(task) {
+            self.downloads_timer = None;
+        }
+        if generation != self.generation {
+            context.log(
+                LogLevel::Info,
+                format!(
+                    "pharos: {} from a signed-out account ignored",
+                    work_label(&work)
+                ),
+            );
+            return;
         }
         match outcome {
             TaskOutcome::Completed(bytes) => self.completed(context, work, &bytes),

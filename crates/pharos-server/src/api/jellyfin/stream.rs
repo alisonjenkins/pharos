@@ -560,7 +560,8 @@ fn parse_audio_codec_list(qs: &str) -> Vec<String> {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
             if k.eq_ignore_ascii_case("AudioCodec") && !v.is_empty() {
-                return v
+                // A client may send the list's commas encoded (`%2C`).
+                return super::socket::percent_decode(v)
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -1909,6 +1910,14 @@ mod tests {
         assert_eq!(
             parse_audio_codec_list("AudioCodec= aac , , mp3 "),
             vec!["aac", "mp3"]
+        );
+    }
+
+    #[test]
+    fn parse_audio_codec_list_decodes_an_encoded_comma() {
+        assert_eq!(
+            parse_audio_codec_list("AudioCodec=mp3%2Copus"),
+            vec!["mp3", "opus"]
         );
     }
 
