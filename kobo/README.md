@@ -17,6 +17,19 @@ and only that many are kept on the reader. Colour covers go to a colour
 panel (such as the Libra Colour) and grey ones to the rest. A cover that
 cannot be fetched leaves the tile's icon in its place.
 
+It also reads books. Choose **Books** at the top of a music or audiobooks shelf for your
+Pharos books by name, with authors; a book that is on the reader says
+**Downloaded**. Open one to download it (progress is shown) and read it;
+the reader remembers where you stopped. A book's `⋮` menu removes its
+download. Books come from Pharos's `/Items/{id}/Download`, with the same
+sign-in as the music; the OPDS catalogue is not used because it needs an
+e-reader password the app does not hold.
+
+Readable: EPUB (also Kindle books, which Pharos serves as EPUB), plain text,
+Markdown and HTML, up to 16 MB and 64 downloaded books. PDF and comic books
+(CBZ, CBR) show "This reader can't open PDF books yet" and download nothing.
+Reading progress is kept on the reader only; it is not reported to Pharos.
+
 ## Layout
 
 | Path | What |
