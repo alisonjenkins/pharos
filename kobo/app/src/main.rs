@@ -10,6 +10,7 @@
 
 mod api;
 mod books;
+mod letters;
 mod reading;
 
 use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Section};
@@ -122,6 +123,8 @@ struct Pharos {
     /// Whether the whole listing has been read.
     shelf_done: bool,
     shelf_page: usize,
+    /// Whether the letters to jump the shelf to are showing (V1442).
+    picking_letter: bool,
     covers: CoverCache,
     /// The screen last handed to the runtime, so a task that changes nothing
     /// on it does not make the runtime draw the whole panel again.
@@ -147,6 +150,7 @@ impl Default for Pharos {
             shelf_sent: 0,
             shelf_done: false,
             shelf_page: 0,
+            picking_letter: false,
             covers: CoverCache::new(MIN_COVERS),
             shown: None,
             tracks: Page::default(),
@@ -489,6 +493,7 @@ impl Pharos {
         self.shelf_sent = 0;
         self.shelf_done = false;
         self.shelf_page = 0;
+        self.picking_letter = false;
     }
 
     /// Opens a section: albums load into a shelf, books open the ebook list.
@@ -876,8 +881,10 @@ impl Pharos {
                     self.shelf.entries.len(),
                     kind.noun()
                 )))
+                .top_bar_action("letters", "A–Z")
                 .picture_tiles(Self::shape(*kind), self.tiles(context))
                 .page_turns("page-back", "page-next")
+                .compose(|screen| self.letter_picker(context, screen))
                 .build()
                 .with_own_back(true),
             View::Books => self.reading.screen(),
@@ -935,6 +942,71 @@ impl Pharos {
                 ))
             })
             .collect()
+    }
+
+    /// Where each letter starts on the shelf (V1442).
+    fn letter_starts(&self) -> Vec<(char, usize)> {
+        letters::starts(self.shelf.entries.iter().map(|entry| entry.name.as_str()))
+    }
+
+    /// The letters the shelf holds, over the shelf while the reader picks
+    /// one. The letter of the page showing is marked.
+    fn letter_picker(&self, context: &Context, screen: ScreenBuilder) -> ScreenBuilder {
+        if !self.picking_letter {
+            return screen;
+        }
+        let pages = self.grid_pages(context);
+        let page = self.shelf_page.min(pages.len().saturating_sub(1));
+        let showing = pages
+            .get(page)
+            .and_then(|page| page.first())
+            .and_then(|&index| self.shelf.entries.get(index))
+            .map(|entry| letters::letter_of(&entry.name));
+        let cells: Vec<(String, String, bool)> = self
+            .letter_starts()
+            .into_iter()
+            .map(|(letter, _)| {
+                (
+                    format!("letter-{letter}"),
+                    letter.to_string(),
+                    Some(letter) == showing,
+                )
+            })
+            .collect();
+        screen.modal("Jump to a letter", |modal| {
+            modal.grid_with_selection(7, false, cells)
+        })
+    }
+
+    /// Answers the letter picker: a letter turns the shelf to the page its
+    /// first album is on, and Back closes it. Whether the action was its.
+    fn pick_letter(&mut self, context: &Context, action: ActionId) -> bool {
+        if !matches!(self.view, View::Library(_)) {
+            return false;
+        }
+        if action == action_id("letters") {
+            self.picking_letter = true;
+            return true;
+        }
+        if !self.picking_letter {
+            return false;
+        }
+        self.picking_letter = false;
+        if action == ActionId::BACK {
+            return true;
+        }
+        let chosen = self
+            .letter_starts()
+            .into_iter()
+            .find(|&(letter, _)| action == action_id(&format!("letter-{letter}")));
+        if let Some((_, index)) = chosen {
+            if let Some(page) = letters::page_holding(&self.grid_pages(context), index) {
+                self.shelf_page = page;
+            }
+            return true;
+        }
+        // Anything else on the screen closes the picker and does its own job.
+        false
     }
 
     fn glyph(kind: Kind) -> Glyph {
@@ -1110,6 +1182,11 @@ impl KoboApp for Pharos {
                     return;
                 }
             }
+        }
+        if self.pick_letter(context, action) {
+            self.refresh_covers(context);
+            self.show(context);
+            return;
         }
         if action == ActionId::BACK {
             match self.view {
