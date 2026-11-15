@@ -1,4 +1,5 @@
-//! The Books screens: the list, a book's menu, the download, and the reader.
+//! The Books screens: the list, a book's detail page, the download, and the
+//! reader.
 //!
 //! A book is downloaded in pieces (`GET /Items/{id}/Download`, with the
 //! account's header), checked, written to the app's shelf, and opened with
@@ -17,6 +18,14 @@ use kobo_sdk::{
     ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
     TileShape, TileState,
 };
+
+/// How wide the cover is on a book's detail page, in millimetres: the same as
+/// an album's masthead, so the two detail pages look alike.
+const DETAIL_COVER_MM: u16 = 26;
+/// The most characters of a description on a book's detail page. Only a few
+/// buttons sit beneath it, so it can run to about eight lines of the
+/// smallest reader's text before the rest moves to its About pages.
+const DETAIL_TEASER_CHARS: usize = 480;
 
 
 /// Where the caller goes after the Books screens handled something.
@@ -190,18 +199,26 @@ impl Reading {
         pages.get(page).cloned().unwrap_or_default()
     }
 
-    /// The covers worth having now, as `(book id, cover tag)`: the page
-    /// showing first, then the next one, so turning finds them ready. Only
-    /// while the list is what is showing.
+    /// The covers worth having now, as `(book id, cover tag)`: an open
+    /// detail page's first, then the list page showing and the next one, so
+    /// turning, or going back to the list, finds them ready.
     #[must_use]
     pub fn wanted_covers(&self, context: &Context) -> Vec<(String, String)> {
-        if self.opened || self.mode != Mode::List || self.busy() {
+        if self.opened || self.busy() {
             return Vec::new();
         }
+        let detail = match self.mode {
+            Mode::List => None,
+            Mode::Menu(index) | Mode::About { index, .. } => Some(index),
+        };
         let pages = self.pages(context);
         let page = self.page.min(pages.len().saturating_sub(1));
-        api::wanted(&pages, page)
+        let listed = api::wanted(&pages, page)
             .into_iter()
+            .filter(|index| Some(*index) != detail);
+        detail
+            .into_iter()
+            .chain(listed)
             .filter_map(|index| self.list.books.get(index))
             .filter_map(|book| Some((book.id.clone(), book.image_tag.clone()?)))
             .collect()
@@ -322,22 +339,7 @@ impl Reading {
         }
         if let Mode::Menu(index) = self.mode {
             if let Some(book) = self.list.books.get(index) {
-                let mut screen =
-                    self.banner(ScreenBuilder::new("pharos-book-menu").top_bar(book.title.clone()));
-                if !book.author.is_empty() {
-                    screen = screen.text(book.author.clone());
-                }
-                let teaser = about::teaser(&book.overview, about::TEASER_CHARS);
-                if let Some((shown, _)) = &teaser {
-                    screen = screen.text(shown.clone());
-                }
-                screen = screen
-                    .primary_button("book-read", "Read")
-                    .button("book-remove", "Remove download");
-                if matches!(teaser, Some((_, true))) {
-                    screen = screen.button("book-about", "About this book");
-                }
-                return own(screen);
+                return own(self.detail(book, cover(&book.id)));
             }
         }
         if let Mode::About { index, page } = self.mode {
@@ -380,6 +382,36 @@ impl Reading {
         own(screen
             .contextual_picture_tiles(TileShape::Portrait, self.tiles(context, cover))
             .page_turns("books-page-back", "books-page-next"))
+    }
+
+    /// A book's detail page: its cover beside the title and author, the
+    /// start of its description, and what can be done with it.
+    fn detail(&self, book: &Book, cover: Option<TilePicture>) -> ScreenBuilder {
+        let by = (!book.author.is_empty()).then(|| book.author.clone());
+        let downloaded = self.downloaded(book);
+        let facts = if downloaded {
+            vec![("On this reader", "Downloaded".to_owned())]
+        } else {
+            Vec::new()
+        };
+        let mut screen = self
+            .banner(ScreenBuilder::new("pharos-book-detail").top_bar("Books"))
+            .hero(cover, DETAIL_COVER_MM, book.title.clone(), by, facts);
+        let teaser = about::teaser(&book.overview, DETAIL_TEASER_CHARS);
+        if let Some((shown, _)) = &teaser {
+            screen = screen.text(shown.clone());
+        }
+        screen = match book.support {
+            Support::Cannot(why) => screen.text(why),
+            Support::Reads(_) if downloaded => screen
+                .primary_button("book-read", "Read")
+                .button("book-remove", "Remove download"),
+            Support::Reads(_) => screen.primary_button("book-read", "Download and read"),
+        };
+        if matches!(teaser, Some((_, true))) {
+            screen = screen.button("book-about", "About this book");
+        }
+        screen
     }
 
     /// The answer to loading the book list record.
@@ -759,9 +791,10 @@ impl Reading {
 
     fn row_action(&mut self, context: &mut Context, action: ActionId) {
         for index in self.page_books(context) {
-            if action == action_id(&format!("book-{index}")) {
-                self.begin(context, index);
-            } else if action == action_id(&format!("book-menu-{index}")) {
+            if action == action_id(&format!("book-{index}"))
+                || action == action_id(&format!("book-menu-{index}"))
+            {
+                self.notice = None;
                 self.mode = Mode::Menu(index);
             }
         }

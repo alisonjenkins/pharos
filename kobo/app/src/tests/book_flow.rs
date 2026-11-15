@@ -29,10 +29,17 @@ fn books() -> (AppRunner<Pharos>, Vec<Command>) {
     (runner, commands)
 }
 
+/// Taps the book at `index`, which opens its detail page, then its Read
+/// button; returns the commands of the Read.
+fn read(runner: &mut AppRunner<Pharos>, index: usize) -> Vec<Command> {
+    let _ = runner.action(action_id(&format!("book-{index}")));
+    runner.action(action_id("book-read"))
+}
+
 /// Taps the first book and delivers `body` as its whole file; returns the
 /// commands of the delivery.
 fn downloaded(runner: &mut AppRunner<Pharos>, body: &str) -> Vec<Command> {
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(runner, 0);
     let (download, task) = asked(&commands, "/Items/b1/Download").expect("download");
     let Task::Fetch {
         headers, offset, ..
@@ -142,7 +149,7 @@ fn a_file_that_is_not_the_format_promised_is_refused_before_it_is_saved() {
 #[test]
 fn a_full_piece_asks_for_the_next_from_where_it_ended() {
     let (mut runner, _) = books();
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(&mut runner, 0);
     let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
     let piece = "x".repeat(books::CHUNK as usize);
     let commands = runner.task_outcome(download, ok(&piece));
@@ -153,7 +160,7 @@ fn a_full_piece_asks_for_the_next_from_where_it_ended() {
 #[test]
 fn a_rejected_token_while_downloading_signs_in_again() {
     let (mut runner, _) = books();
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(&mut runner, 0);
     let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
     let commands = runner.task_outcome(download, TaskOutcome::Failed(TaskError::Unauthorized));
     assert!(asked(&commands, "/QuickConnect/Initiate").is_some());
@@ -181,7 +188,7 @@ fn a_downloaded_book_reopens_from_the_shelf_and_its_menu_removes_it() {
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("Held"), "the downloaded mark: {screen}");
 
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(&mut runner, 0);
     assert!(asked(&commands, "/Download").is_none(), "nothing to fetch");
     assert!(commands.iter().any(|command| matches!(
         command,
@@ -240,14 +247,14 @@ fn a_damaged_saved_copy_is_downloaded_again_on_the_next_open() {
         value: Some(record),
     });
     let _ = runner.task_outcome(list, ok(BOOKS));
-    let _ = runner.action(action_id("book-0"));
+    let _ = read(&mut runner, 0);
     let _ = runner.store_result(StoreResult::ShelfRead {
         name: "book-b1.txt".to_owned(),
         offset: 0,
         size: 3,
         bytes: b"Bad".to_vec(),
     });
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(&mut runner, 0);
     assert!(asked(&commands, "/Items/b1/Download").is_some());
 }
 
@@ -257,7 +264,7 @@ fn the_books_screens_fit_the_smallest_reader() {
     let mut screens: Vec<Screen> = last_screen(&commands).into_iter().collect();
     let commands = runner.action(action_id("book-1"));
     screens.extend(last_screen(&commands));
-    let commands = runner.action(action_id("book-0"));
+    let commands = read(&mut runner, 0);
     screens.extend(last_screen(&commands));
     let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
     let commands = runner.task_outcome(download, ok(PROSE));
@@ -321,4 +328,93 @@ fn the_books_list_is_a_grid_of_covers_drawn_together_and_dropped_on_leaving() {
             "{commands:?}"
         );
     }
+}
+
+#[test]
+fn a_tap_opens_the_book_s_detail_page_before_anything_downloads() {
+    let (mut runner, _) = books();
+    let commands = runner.action(action_id("book-0"));
+    assert!(asked(&commands, "/Download").is_none(), "a tap only opens it");
+    let detail = last_screen(&commands).expect("a screen");
+    let text = screen_text(&detail);
+    for part in ["Book One", "Author A", "Download and read"] {
+        assert!(text.contains(part), "{part} missing from {text}");
+    }
+    assert!(!text.contains("Remove download"), "not downloaded: {text}");
+    assert!(detail.validate(&CLARA_BW_METRICS).is_empty());
+    let commands = runner.action(ActionId::BACK);
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("TileGrid"), "Back returns to the grid: {text}");
+}
+
+#[test]
+fn a_book_this_reader_cannot_open_says_why_on_its_detail_page() {
+    let (mut runner, _) = books();
+    let text = screen_text(&last_screen(&runner.action(action_id("book-1"))).expect("a screen"));
+    assert!(text.contains("can't open PDF books yet"), "{text}");
+    assert!(!text.contains("book-read"), "nothing to read: {text}");
+}
+
+#[test]
+fn a_downloaded_book_s_detail_page_reads_and_removes() {
+    let record = books::Shelf {
+        saved: vec![books::Saved {
+            id: "b1".to_owned(),
+            file: "book-b1.txt".to_owned(),
+            size: PROSE.len(),
+            memory: String::new(),
+        }],
+    }
+    .encode();
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: Some(record),
+    });
+    // The longest teaser, the downloaded fact and every button at once.
+    let listing = format!(
+        r#"{{"Items":[{{"Id":"b1","Name":"Book One","Path":"/b/one.txt",
+            "People":[{{"Name":"Author A","Type":"Author"}}],"Overview":"{}"}}],
+            "TotalRecordCount":1}}"#,
+        "A made-up description that runs on. ".repeat(20)
+    );
+    let _ = runner.task_outcome(list, ok(&listing));
+    for open in ["book-0", "book-menu-0"] {
+        let detail = last_screen(&runner.action(action_id(open))).expect("a screen");
+        let text = screen_text(&detail);
+        for part in ["Downloaded", "\"Read\"", "Remove download", "About this book"] {
+            assert!(text.contains(part), "{open}: {part} missing from {text}");
+        }
+        assert!(detail.validate(&CLARA_BW_METRICS).is_empty());
+        let _ = runner.action(ActionId::BACK);
+    }
+}
+
+#[test]
+fn an_open_detail_page_keeps_its_cover_wanted() {
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    });
+    let listing = r#"{"Items":[
+        {"Id":"b1","Name":"Book One","Path":"/b/one.txt","ImageTags":{"Primary":"c1"}}
+    ],"TotalRecordCount":1}"#;
+    let commands = runner.task_outcome(list, ok(listing));
+    let covers = cover_tasks(&commands);
+    assert_eq!(covers.len(), 1, "{covers:?}");
+    let commands = runner.action(action_id("book-0"));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel(id) if *id == covers[0].0)),
+        "the detail page's cover is still on its way: {commands:?}"
+    );
+    let commands = runner.task_outcome(covers[0].0, cover_bytes());
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("Picture"), "the cover beside the title: {text}");
 }
