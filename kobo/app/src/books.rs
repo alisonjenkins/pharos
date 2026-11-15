@@ -1,0 +1,513 @@
+//! Books as plain values: the listing, the download address, which files this
+//! reader can open, and the record of what is downloaded. Nothing here touches
+//! the runtime, so all of it is tested on the host.
+//!
+//! Pharos serves books through the same Jellyfin-compatible API as music. Its
+//! OPDS catalogue wants HTTP Basic with an e-reader password, which this app
+//! never holds; the Quick Connect token it does hold works on `/Items`.
+
+use crate::api::{query_escape, Account, PAGE};
+use kobo_json::{ObjectBuilder, Value};
+
+/// The store key of the downloaded-books record.
+pub const KEY: &str = "books-v1";
+/// The most a downloaded book may be: the whole file is held in memory to
+/// parse it, on a reader shared with the stock software.
+pub const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// How much of a book one request fetches.
+pub const CHUNK: u32 = 256 * 1024;
+/// Downloaded books kept at once, so the record below stays small.
+pub const MAX_DOWNLOADED: usize = 64;
+/// The largest a reading position may be and still be kept.
+const MAX_MEMORY: usize = 16 * 1024;
+/// The largest the whole downloaded-books record may be.
+const RECORD_LIMIT: usize = 192 * 1024;
+
+/// What this reader can do with a book's file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Support {
+    /// Opens, saved under this extension.
+    Reads(Kind),
+    /// Does not open; the words say why.
+    Cannot(&'static str),
+}
+
+/// The formats `kobo-doc` reads that Pharos serves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Kind {
+    Epub,
+    Text,
+    Markdown,
+    Html,
+}
+
+impl Kind {
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Epub => "epub",
+            Self::Text => "txt",
+            Self::Markdown => "md",
+            Self::Html => "html",
+        }
+    }
+}
+
+/// Which readable kind the item's `Path` names. Pharos hands a Kindle book
+/// over as the EPUB it converted, and `Path` says so, so those read as EPUB.
+#[must_use]
+pub fn support(path: &str) -> Support {
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "epub" | "azw" | "azw3" | "mobi" | "kfx" => Support::Reads(Kind::Epub),
+        "txt" => Support::Reads(Kind::Text),
+        "md" | "markdown" => Support::Reads(Kind::Markdown),
+        "htm" | "html" | "xhtml" => Support::Reads(Kind::Html),
+        "pdf" => Support::Cannot("This reader can't open PDF books yet."),
+        "cbz" | "cbr" | "cbt" | "cb7" => Support::Cannot("This reader can't open comic books yet."),
+        _ => Support::Cannot("This reader can't open this kind of book yet."),
+    }
+}
+
+/// Whether downloaded bytes are what `kind` promised. An EPUB is a zip; a
+/// Kindle book Pharos could not convert arrives as itself, and the parser
+/// would take those bytes for prose and show garbage.
+#[must_use]
+pub fn is_what_it_claims(kind: Kind, bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (kind != Kind::Epub || bytes.starts_with(b"PK\x03\x04"))
+}
+
+/// One book in the listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Book {
+    pub id: String,
+    pub title: String,
+    /// Empty when Pharos sent no author.
+    pub author: String,
+    pub support: Support,
+}
+
+impl Book {
+    /// The name of the book's file on the shelf, or `None` when its id could
+    /// not be used as one or the book cannot be read.
+    #[must_use]
+    pub fn file(&self) -> Option<String> {
+        let Support::Reads(kind) = self.support else {
+            return None;
+        };
+        let name = format!("book-{}.{}", self.id.to_ascii_lowercase(), kind.extension());
+        kobo_sdk::is_valid_key(&name).then_some(name)
+    }
+}
+
+/// A page of the listing and how many books there are in all.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BookPage {
+    pub books: Vec<Book>,
+    pub total: usize,
+}
+
+/// Books in every library the user can see, by name. `People` carries the
+/// author and `Path` the file's extension.
+#[must_use]
+pub fn list_url(server: &str, account: &Account, start: usize) -> String {
+    format!(
+        "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true\
+         &SortBy=SortName&SortOrder=Ascending&Fields=Path,People\
+         &StartIndex={start}&Limit={PAGE}",
+        query_escape(&account.user_id)
+    )
+}
+
+/// The book's file. The runtime fetches it in pieces, with the account's
+/// header on each.
+#[must_use]
+pub fn download_url(server: &str, book: &str) -> String {
+    format!("{server}/Items/{}/Download", query_escape(book))
+}
+
+fn author_of(item: &Value) -> String {
+    let named = |value: &Value| {
+        value
+            .get("Name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    };
+    let authors: Vec<String> = item
+        .get("People")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|person| person.get("Type").and_then(Value::as_str) == Some("Author"))
+        .filter_map(named)
+        .collect();
+    if authors.is_empty() {
+        item.get("AlbumArtist")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        authors.join(", ")
+    }
+}
+
+/// A page of `Items`. Rows without an id are dropped; a missing name reads as
+/// "Untitled" so a row is never blank.
+#[must_use]
+pub fn parse_page(bytes: &[u8]) -> Option<BookPage> {
+    let reply = kobo_json::parse(std::str::from_utf8(bytes).ok()?).ok()?;
+    let items = reply.get("Items").and_then(Value::as_array)?;
+    let books: Vec<Book> = items
+        .iter()
+        .filter_map(|item| {
+            Some(Book {
+                id: item.get("Id").and_then(Value::as_str)?.to_owned(),
+                title: item
+                    .get("Name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled")
+                    .to_owned(),
+                author: author_of(item),
+                support: support(item.get("Path").and_then(Value::as_str).unwrap_or_default()),
+            })
+        })
+        .collect();
+    let total = reply
+        .get("TotalRecordCount")
+        .and_then(Value::as_i64)
+        .and_then(|total| usize::try_from(total).ok())
+        .unwrap_or(books.len());
+    Some(BookPage { books, total })
+}
+
+/// What to do after one piece of a download arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Piece {
+    /// A full piece came: ask for the next.
+    More,
+    /// A short piece came: the file is whole.
+    Whole,
+    /// The file is past what the reader can hold.
+    TooBig,
+}
+
+/// A piece is full when the file may go on. A file that is an exact multiple
+/// of the piece size ends with an empty piece, which the runtime reports as
+/// the end of the file.
+#[must_use]
+pub fn after_piece(received_before: usize, piece: usize) -> Piece {
+    let total = received_before.saturating_add(piece);
+    if piece > CHUNK as usize || total > MAX_BYTES {
+        Piece::TooBig
+    } else if piece == CHUNK as usize {
+        Piece::More
+    } else {
+        Piece::Whole
+    }
+}
+
+/// A downloaded book: which file, how big it should be, and where the reader
+/// stopped (`kobo_read::Memory`, encoded).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Saved {
+    pub id: String,
+    pub file: String,
+    pub size: usize,
+    pub memory: String,
+}
+
+/// Every downloaded book, as kept across restarts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Shelf {
+    pub saved: Vec<Saved>,
+}
+
+impl Shelf {
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&Saved> {
+        self.saved.iter().find(|saved| saved.id == id)
+    }
+
+    /// Adds a book, replacing an earlier download of the same one and keeping
+    /// where the reader had stopped. Refuses past [`MAX_DOWNLOADED`].
+    pub fn insert(&mut self, mut saved: Saved) -> bool {
+        if let Some(old) = self.saved.iter_mut().find(|old| old.id == saved.id) {
+            if old.file == saved.file {
+                saved.memory.clone_from(&old.memory);
+            }
+            *old = saved;
+            true
+        } else if self.saved.len() < MAX_DOWNLOADED {
+            self.saved.push(saved);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove(&mut self, file: &str) {
+        self.saved.retain(|saved| saved.file != file);
+    }
+
+    /// Keeps where the reader stopped. A position too big to keep is dropped
+    /// rather than the record being refused.
+    pub fn remember(&mut self, id: &str, memory: String) {
+        if let Some(saved) = self.saved.iter_mut().find(|saved| saved.id == id) {
+            saved.memory = if memory.len() <= MAX_MEMORY {
+                memory
+            } else {
+                String::new()
+            };
+        }
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let books = self
+            .saved
+            .iter()
+            .map(|saved| {
+                ObjectBuilder::new()
+                    .set("id", saved.id.as_str())
+                    .set("file", saved.file.as_str())
+                    .set("size", saved.size.to_string())
+                    .set("memory", saved.memory.as_str())
+                    .build()
+            })
+            .collect();
+        ObjectBuilder::new()
+            .set("version", "1")
+            .set("books", Value::Array(books))
+            .build()
+            .to_json()
+            .into_bytes()
+    }
+
+    /// `None` for a record this app cannot trust. The caller then leaves the
+    /// stored one alone rather than writing an empty shelf over it.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > RECORD_LIMIT {
+            return None;
+        }
+        let record = kobo_json::parse(std::str::from_utf8(bytes).ok()?).ok()?;
+        if record.get("version").and_then(Value::as_str) != Some("1") {
+            return None;
+        }
+        let books = record.get("books").and_then(Value::as_array)?;
+        if books.len() > MAX_DOWNLOADED {
+            return None;
+        }
+        let mut shelf = Self::default();
+        for book in books {
+            let text = |key: &str| book.get(key).and_then(Value::as_str);
+            let saved = Saved {
+                id: text("id")?.to_owned(),
+                file: text("file")?.to_owned(),
+                size: text("size")?.parse().ok()?,
+                memory: text("memory")?.to_owned(),
+            };
+            if !kobo_sdk::is_valid_key(&saved.file) || saved.size == 0 || saved.size > MAX_BYTES {
+                return None;
+            }
+            if !shelf.insert(saved) {
+                return None;
+            }
+        }
+        Some(shelf)
+    }
+
+    /// Whether the encoded record fits where it is kept.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.encode().len() <= RECORD_LIMIT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account() -> Account {
+        Account {
+            user_id: "u1".to_owned(),
+            token: "t0k".to_owned(),
+        }
+    }
+
+    fn book(id: &str, path: &str) -> Book {
+        Book {
+            id: id.to_owned(),
+            title: "Book One".to_owned(),
+            author: "Author A".to_owned(),
+            support: support(path),
+        }
+    }
+
+    fn saved(id: &str, memory: &str) -> Saved {
+        Saved {
+            id: id.to_owned(),
+            file: format!("book-{id}.epub"),
+            size: 10,
+            memory: memory.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_listing_asks_for_books_by_name_with_authors_and_paths() {
+        let url = list_url("https://p.test", &account(), 50);
+        assert!(url.starts_with("https://p.test/Users/u1/Items?"));
+        assert!(url.contains("IncludeItemTypes=Book"));
+        assert!(url.contains("SortBy=SortName&SortOrder=Ascending"));
+        assert!(url.contains("Fields=Path,People"));
+        assert!(url.contains("StartIndex=50&Limit=50"));
+    }
+
+    #[test]
+    fn the_download_is_the_items_file_and_carries_no_token() {
+        assert_eq!(
+            download_url("https://p.test", "ab12"),
+            "https://p.test/Items/ab12/Download"
+        );
+        assert_eq!(
+            download_url("https://p.test", "a/b"),
+            "https://p.test/Items/a%2Fb/Download"
+        );
+    }
+
+    #[test]
+    fn epubs_and_kindle_conversions_read_and_pdfs_and_comics_say_why_not() {
+        assert_eq!(support("/b/Book One.EPUB"), Support::Reads(Kind::Epub));
+        assert_eq!(support("/b/Book One.azw3"), Support::Reads(Kind::Epub));
+        assert_eq!(support("/b/notes.txt"), Support::Reads(Kind::Text));
+        assert_eq!(support("/b/notes.md"), Support::Reads(Kind::Markdown));
+        assert_eq!(support("/b/page.xhtml"), Support::Reads(Kind::Html));
+        assert_eq!(
+            support("/b/Book One.pdf"),
+            Support::Cannot("This reader can't open PDF books yet.")
+        );
+        assert_eq!(
+            support("/b/Comic One.cbz"),
+            Support::Cannot("This reader can't open comic books yet.")
+        );
+        assert!(matches!(support(""), Support::Cannot(_)));
+        assert!(matches!(support("/b/no-extension"), Support::Cannot(_)));
+    }
+
+    #[test]
+    fn only_a_zip_is_an_epub_and_nothing_empty_is_a_book() {
+        assert!(is_what_it_claims(Kind::Epub, b"PK\x03\x04rest"));
+        assert!(!is_what_it_claims(Kind::Epub, b"%PDF-1.7"));
+        assert!(!is_what_it_claims(Kind::Epub, b""));
+        assert!(is_what_it_claims(Kind::Text, b"Some prose."));
+        assert!(!is_what_it_claims(Kind::Text, b""));
+    }
+
+    #[test]
+    fn a_readable_book_gets_a_valid_shelf_name_and_others_get_none() {
+        assert_eq!(
+            book("AB12", "/b/x.epub").file().as_deref(),
+            Some("book-ab12.epub")
+        );
+        assert_eq!(
+            book("ab12", "/b/x.txt").file().as_deref(),
+            Some("book-ab12.txt")
+        );
+        assert_eq!(book("ab12", "/b/x.pdf").file(), None);
+        assert_eq!(book("../x", "/b/x.epub").file(), None);
+        assert_eq!(book(&"a".repeat(80), "/b/x.epub").file(), None);
+    }
+
+    #[test]
+    fn a_page_reads_authors_paths_and_totals_and_drops_rows_without_ids() {
+        let bytes = br#"{"Items":[
+            {"Id":"a","Name":"Book One","Path":"/b/one.epub",
+             "People":[{"Name":"Editor E","Type":"Editor"},
+                       {"Name":"Author A","Type":"Author"},
+                       {"Name":"Author B","Type":"Author"}]},
+            {"Id":"b","Path":"/b/two.pdf","AlbumArtist":"Author C"},
+            {"Name":"no id"}
+        ],"TotalRecordCount":120}"#;
+        let page = parse_page(bytes).unwrap_or_default();
+        assert_eq!(page.total, 120);
+        assert_eq!(page.books.len(), 2);
+        assert_eq!(page.books[0].title, "Book One");
+        assert_eq!(page.books[0].author, "Author A, Author B");
+        assert_eq!(page.books[0].support, Support::Reads(Kind::Epub));
+        assert_eq!(page.books[1].title, "Untitled");
+        assert_eq!(page.books[1].author, "Author C");
+        assert!(matches!(page.books[1].support, Support::Cannot(_)));
+        assert_eq!(parse_page(b"not json"), None);
+    }
+
+    #[test]
+    fn a_download_goes_on_while_pieces_are_full_and_stops_at_the_limit() {
+        let chunk = CHUNK as usize;
+        assert_eq!(after_piece(0, chunk), Piece::More);
+        assert_eq!(after_piece(chunk, 10), Piece::Whole);
+        assert_eq!(after_piece(chunk, 0), Piece::Whole);
+        assert_eq!(after_piece(MAX_BYTES - chunk, chunk), Piece::More);
+        assert_eq!(after_piece(MAX_BYTES, 1), Piece::TooBig);
+        assert_eq!(after_piece(0, chunk + 1), Piece::TooBig);
+    }
+
+    #[test]
+    fn the_record_round_trips_and_junk_is_refused() {
+        let mut shelf = Shelf::default();
+        assert!(shelf.insert(saved("a", "at 2\n")));
+        assert!(shelf.insert(saved("b", "")));
+        assert_eq!(Shelf::decode(&shelf.encode()), Some(shelf.clone()));
+        assert_eq!(Shelf::decode(b"{}"), None);
+        assert_eq!(Shelf::decode(b"not json"), None);
+        let future = String::from_utf8(shelf.encode())
+            .unwrap_or_default()
+            .replace("\"version\":\"1\"", "\"version\":\"99\"");
+        assert_eq!(Shelf::decode(future.as_bytes()), None);
+        let escaped = String::from_utf8(shelf.encode())
+            .unwrap_or_default()
+            .replace("book-a.epub", "../a.epub");
+        assert_eq!(Shelf::decode(escaped.as_bytes()), None);
+    }
+
+    #[test]
+    fn downloading_again_keeps_the_place_and_the_shelf_has_a_limit() {
+        let mut shelf = Shelf::default();
+        assert!(shelf.insert(saved("a", "at 2\n")));
+        assert!(shelf.insert(Saved {
+            size: 20,
+            memory: String::new(),
+            ..saved("a", "")
+        }));
+        assert_eq!(shelf.saved.len(), 1);
+        assert_eq!(
+            shelf.get("a").map(|saved| saved.memory.as_str()),
+            Some("at 2\n")
+        );
+        assert_eq!(shelf.get("a").map(|saved| saved.size), Some(20));
+        for index in 0..MAX_DOWNLOADED {
+            let _ = shelf.insert(saved(&format!("x{index}"), ""));
+        }
+        assert_eq!(shelf.saved.len(), MAX_DOWNLOADED);
+        assert!(!shelf.insert(saved("one-too-many", "")));
+        assert!(shelf.fits());
+    }
+
+    #[test]
+    fn removing_forgets_the_book_and_a_huge_place_is_dropped_not_kept() {
+        let mut shelf = Shelf::default();
+        assert!(shelf.insert(saved("a", "")));
+        shelf.remember("a", "x".repeat(MAX_MEMORY + 1));
+        assert_eq!(shelf.get("a").map(|saved| saved.memory.len()), Some(0));
+        shelf.remember("a", "at 3\n".to_owned());
+        assert_eq!(
+            shelf.get("a").map(|saved| saved.memory.as_str()),
+            Some("at 3\n")
+        );
+        shelf.remove("book-a.epub");
+        assert_eq!(shelf.get("a"), None);
+    }
+}

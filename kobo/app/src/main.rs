@@ -9,6 +9,8 @@
 //! (`PHAROS_KOBO_SERVER`); the reader has one owner and one server.
 
 mod api;
+mod books;
+mod reading;
 
 use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
@@ -17,6 +19,7 @@ use kobo_sdk::{
     Glyph, Header, LogLevel, PictureHandle, Position, Task, TaskError, TaskId, TaskOutcome,
     TilePicture, TileShape, MAX_TASKS_IN_FLIGHT,
 };
+use reading::{Leave, Reading};
 use std::process::ExitCode;
 
 const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
@@ -59,7 +62,9 @@ enum View {
     Home,
     /// A shelf of albums or audiobooks.
     Library(Kind),
-    /// Where ebooks will be; reading them is not built yet.
+    /// What the Books section shows until it opens the ebook list.
+    BooksSoon,
+    /// The ebook list and the reader.
     Books,
     Album(Entry),
     Player,
@@ -126,6 +131,7 @@ struct Pharos {
     album: Option<Entry>,
     playing: Option<Playing>,
     report_timer: Option<TaskId>,
+    reading: Reading,
 }
 
 impl Default for Pharos {
@@ -146,6 +152,7 @@ impl Default for Pharos {
             album: None,
             playing: None,
             report_timer: None,
+            reading: Reading::new(SERVER, VERSION),
         }
     }
 }
@@ -215,6 +222,7 @@ impl Pharos {
         self.sections = None;
         self.clear_shelf();
         self.drop_covers(context);
+        self.reading.reset(context);
         context.store().forget(ACCOUNT_KEY);
         self.sign_in(context);
     }
@@ -458,7 +466,7 @@ impl Pharos {
             return;
         };
         if !kind.is_albums() {
-            self.view = View::Books;
+            self.view = View::BooksSoon;
             return;
         }
         self.clear_shelf();
@@ -811,7 +819,7 @@ impl Pharos {
                 )
                 .build(),
             View::Home => self.home_screen(),
-            View::Books => ScreenBuilder::new("pharos-books")
+            View::BooksSoon => ScreenBuilder::new("pharos-books")
                 .top_bar("Books")
                 .text(
                     "Reading books on this reader is coming. For now, read them in \
@@ -830,16 +838,21 @@ impl Pharos {
                 screen.build().with_own_back(true)
             }
             View::Library(kind) => self
-                .now_playing(ScreenBuilder::new("pharos-library").top_bar(format!(
-                    "{} · {} {}",
-                    kind.label(),
-                    self.shelf.entries.len(),
-                    kind.noun()
-                )))
+                .now_playing(
+                    ScreenBuilder::new("pharos-library")
+                        .top_bar(format!(
+                            "{} · {} {}",
+                            kind.label(),
+                            self.shelf.entries.len(),
+                            kind.noun()
+                        ))
+                        .top_bar_action("books", "Books"),
+                )
                 .picture_tiles(Self::shape(*kind), self.tiles(context))
                 .page_turns("page-back", "page-next")
                 .build()
                 .with_own_back(true),
+            View::Books => self.reading.screen(),
             View::Album(album) if self.tracks.entries.is_empty() => self
                 .masthead(album)
                 .activity("Loading the tracks", None)
@@ -999,7 +1012,40 @@ impl KoboApp for Pharos {
         }
     }
 
+    fn on_load(&mut self, context: &mut Context, key: &str, result: StoreResult) {
+        if key == books::KEY {
+            self.reading.loaded(&result);
+            self.show(context);
+        } else {
+            self.on_store(context, result);
+        }
+    }
+
+    fn on_save(&mut self, context: &mut Context, key: &str, result: StoreResult) {
+        if key == books::KEY {
+            self.reading.saved(context, &result);
+            self.show(context);
+        } else {
+            self.on_store(context, result);
+        }
+    }
+
+    fn on_shelf(&mut self, context: &mut Context, _name: &str, result: StoreResult) {
+        if self.reading.shelf(context, &result) {
+            self.show(context);
+        }
+    }
+
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
+        if matches!(self.view, View::Books) {
+            match self.reading.action(context, action) {
+                Leave::Back => self.view = View::Library(self.kind),
+                Leave::SignOut => self.sign_out(context),
+                Leave::Stay => {}
+            }
+            self.show(context);
+            return;
+        }
         if matches!(self.view, View::Player) {
             if action == ActionId::BACK {
                 // Backing out keeps the track playing, as the player says.
@@ -1028,13 +1074,18 @@ impl KoboApp for Pharos {
                     self.album = None;
                     self.page = 0;
                 }
-                View::Library(_) | View::Books => self.view = View::Home,
+                View::Library(_) | View::BooksSoon => self.view = View::Home,
                 _ => {}
             }
         } else if action == action_id("retry") {
             match self.account {
                 Some(_) => self.load_views(context),
                 None => self.sign_in(context),
+            }
+        } else if action == action_id("books") {
+            if let Some(account) = &self.account {
+                self.reading.open(context, account);
+                self.view = View::Books;
             }
         } else if action == action_id("now-playing") && self.playing.is_some() {
             self.view = View::Player;
@@ -1106,6 +1157,13 @@ impl KoboApp for Pharos {
                 }
                 return;
             }
+        }
+        if let Some(leave) = self.reading.task(context, task, &outcome) {
+            if leave == Leave::SignOut {
+                self.sign_out(context);
+            }
+            self.show(context);
+            return;
         }
         let Some(position) = self.tasks.iter().position(|(id, _)| *id == task) else {
             return;
