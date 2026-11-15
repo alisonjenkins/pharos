@@ -522,6 +522,19 @@ pub async fn get_or_slim(
             return original;
         }
     };
+    // The cache key came from the file as it was BEFORE the wait for a slot;
+    // a book replaced meanwhile must not be stored under the old key.
+    let unchanged = tokio::fs::metadata(&original)
+        .await
+        .is_ok_and(|m| m.len() == d.source_bytes && m.modified().ok() == meta.modified().ok());
+    if !unchanged {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        d.conclude(
+            SlimOutcome::Failed,
+            "the source changed while it was re-packed",
+        );
+        return original;
+    }
     let slimmed_bytes = tokio::fs::metadata(&tmp)
         .await
         .map_or(u64::MAX, |m| m.len());
