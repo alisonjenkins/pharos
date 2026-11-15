@@ -869,3 +869,33 @@ fn the_playing_cover_survives_paging_through_a_long_shelf() {
 }
 
 mod book_flow;
+
+#[test]
+fn a_cover_for_a_page_not_on_show_does_not_redraw_the_panel() {
+    let (mut runner, commands) = art_shelf(false, 120);
+    let mut showing = last_screen(&commands).expect("the shelf");
+    let mut pending: Vec<(TaskId, String)> = cover_tasks(&commands);
+    let (mut on_show, mut off_show) = (0, 0);
+    while let Some((task, url)) = pending.pop() {
+        let album = url
+            .split("/Items/a")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .expect("an album id");
+        let visible = screen_text(&showing).contains(&format!("\"Album {album}\""));
+        let reply = runner.task_outcome(task, cover_bytes());
+        if let Some(screen) = last_screen(&reply) {
+            assert!(visible, "album {album} is off the page yet redrew it");
+            showing = screen;
+            on_show += 1;
+        } else {
+            assert!(!visible, "album {album} is on the page and was not drawn");
+            off_show += 1;
+        }
+        pending.extend(cover_tasks(&reply));
+    }
+    assert!(
+        on_show > 0 && off_show > 0,
+        "{on_show} on show, {off_show} off"
+    );
+}
