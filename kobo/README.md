@@ -61,7 +61,7 @@ steps rather than Cobalt's own installer, whose releases do not carry Pharos.
 On a Linux machine with Nix, from the repository root:
 
 ```sh
-nix shell nixpkgs#zig nixpkgs#rustup nixpkgs#gcc --command kobo/build.sh --setup
+nix shell nixpkgs#zig nixpkgs#rustup nixpkgs#gcc nixpkgs#lld --command kobo/build.sh --setup
 ```
 
 `build.sh` builds Cobalt with the patch and the app, runs the app's tests,
@@ -132,7 +132,7 @@ releases on this build, because they would remove Pharos.
 With the Kobo plugged in and connected:
 
 ```sh
-nix shell nixpkgs#zig nixpkgs#rustup nixpkgs#gcc --command kobo/build.sh --setup --undo
+nix shell nixpkgs#zig nixpkgs#rustup nixpkgs#gcc nixpkgs#lld --command kobo/build.sh --setup --undo
 ```
 
 This removes Cobalt and its menu entry, and turns SSH off again. It moves the
