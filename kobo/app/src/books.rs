@@ -51,6 +51,9 @@ pub enum Kind {
     Text,
     Markdown,
     Html,
+    /// A book of page pictures (CBZ): how a PDF arrives, drawn by Pharos for
+    /// this panel (V1461).
+    Pages,
 }
 
 impl Kind {
@@ -58,7 +61,7 @@ impl Kind {
     #[must_use]
     pub const fn max_bytes(self) -> usize {
         match self {
-            Self::Epub => MAX_EPUB_BYTES,
+            Self::Epub | Self::Pages => MAX_EPUB_BYTES,
             Self::Text | Self::Markdown | Self::Html => MAX_BYTES,
         }
     }
@@ -67,7 +70,7 @@ impl Kind {
     #[must_use]
     pub const fn too_big(self) -> &'static str {
         match self {
-            Self::Epub => EPUB_TOO_BIG,
+            Self::Epub | Self::Pages => EPUB_TOO_BIG,
             Self::Text | Self::Markdown | Self::Html => TOO_BIG,
         }
     }
@@ -79,6 +82,7 @@ impl Kind {
             Self::Text => "txt",
             Self::Markdown => "md",
             Self::Html => "html",
+            Self::Pages => "cbz",
         }
     }
 }
@@ -98,7 +102,7 @@ pub fn support(path: &str) -> Support {
         "txt" => Support::Reads(Kind::Text),
         "md" | "markdown" => Support::Reads(Kind::Markdown),
         "htm" | "html" | "xhtml" => Support::Reads(Kind::Html),
-        "pdf" => Support::Cannot("This reader can't open PDF books yet."),
+        "pdf" => Support::Reads(Kind::Pages),
         "cbz" | "cbr" | "cbt" | "cb7" => Support::Cannot("This reader can't open comic books yet."),
         _ => Support::Cannot("This reader can't open this kind of book yet."),
     }
@@ -119,7 +123,8 @@ pub fn is_kindle(path: &str) -> bool {
 /// would take those bytes for prose and show garbage.
 #[must_use]
 pub fn is_what_it_claims(kind: Kind, bytes: &[u8]) -> bool {
-    !bytes.is_empty() && (kind != Kind::Epub || bytes.starts_with(b"PK\x03\x04"))
+    !bytes.is_empty()
+        && (!matches!(kind, Kind::Epub | Kind::Pages) || bytes.starts_with(b"PK\x03\x04"))
 }
 
 /// One book in the listing.
@@ -217,6 +222,19 @@ pub fn by_ids_url(server: &str, account: &Account, ids: &[&str]) -> String {
 #[must_use]
 pub fn download_url(server: &str, book: &str) -> String {
     format!("{server}/Items/{}/Download", query_escape(book))
+}
+
+/// A PDF's pages drawn by Pharos as pictures fitting a `width` x `height`
+/// panel, in grey throughout when the panel shows no colour (V1460). Fetched
+/// in pieces like [`download_url`]; each piece names the same box, so each
+/// is cut from the one copy the server drew.
+#[must_use]
+pub fn pages_url(server: &str, book: &str, width: u32, height: u32, colour: bool) -> String {
+    let grey = if colour { "" } else { "&grey=true" };
+    format!(
+        "{}?pages=pictures&maxWidth={width}&maxHeight={height}{grey}",
+        download_url(server, book)
+    )
 }
 
 /// The book's first pages as plain text, with the account's header.
@@ -538,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn epubs_and_kindle_conversions_read_and_pdfs_and_comics_say_why_not() {
+    fn epubs_kindle_conversions_and_pdfs_read_and_comics_say_why_not() {
         assert_eq!(support("/b/Book One.EPUB"), Support::Reads(Kind::Epub));
         assert_eq!(support("/b/Book One.azw3"), Support::Reads(Kind::Epub));
         assert_eq!(
@@ -548,10 +566,8 @@ mod tests {
         assert_eq!(support("/b/notes.txt"), Support::Reads(Kind::Text));
         assert_eq!(support("/b/notes.md"), Support::Reads(Kind::Markdown));
         assert_eq!(support("/b/page.xhtml"), Support::Reads(Kind::Html));
-        assert_eq!(
-            support("/b/Book One.pdf"),
-            Support::Cannot("This reader can't open PDF books yet.")
-        );
+        assert_eq!(support("/b/Book One.PDF"), Support::Reads(Kind::Pages));
+        assert_eq!(Kind::Pages.extension(), "cbz");
         assert_eq!(
             support("/b/Comic One.cbz"),
             Support::Cannot("This reader can't open comic books yet.")
@@ -567,6 +583,21 @@ mod tests {
         assert!(!is_what_it_claims(Kind::Epub, b""));
         assert!(is_what_it_claims(Kind::Text, b"Some prose."));
         assert!(!is_what_it_claims(Kind::Text, b""));
+        // A PDF the server did not draw would arrive as itself.
+        assert!(is_what_it_claims(Kind::Pages, b"PK\x03\x04rest"));
+        assert!(!is_what_it_claims(Kind::Pages, b"%PDF-1.7"));
+    }
+
+    #[test]
+    fn a_pdf_is_asked_for_as_pages_drawn_for_the_panel() {
+        assert_eq!(
+            pages_url("https://p.test", "ab12", 1264, 1680, true),
+            "https://p.test/Items/ab12/Download?pages=pictures&maxWidth=1264&maxHeight=1680"
+        );
+        assert_eq!(
+            pages_url("https://p.test", "a/b", 1072, 1448, false),
+            "https://p.test/Items/a%2Fb/Download?pages=pictures&maxWidth=1072&maxHeight=1448&grey=true"
+        );
     }
 
     #[test]
@@ -579,7 +610,11 @@ mod tests {
             book("ab12", "/b/x.txt").file().as_deref(),
             Some("book-ab12.txt")
         );
-        assert_eq!(book("ab12", "/b/x.pdf").file(), None);
+        assert_eq!(book("ab12", "/b/x.cbr").file(), None);
+        assert_eq!(
+            book("ab12", "/b/x.pdf").file().as_deref(),
+            Some("book-ab12.cbz")
+        );
         assert_eq!(book("../x", "/b/x.epub").file(), None);
         assert_eq!(book(&"a".repeat(80), "/b/x.epub").file(), None);
     }
@@ -592,7 +627,7 @@ mod tests {
              "People":[{"Name":"Editor E","Type":"Editor"},
                        {"Name":"Author A","Type":"Author"},
                        {"Name":"Author B","Type":"Author"}]},
-            {"Id":"b","Path":"/b/two.pdf","AlbumArtist":"Author C",
+            {"Id":"b","Path":"/b/two.cbr","AlbumArtist":"Author C",
              "ImageTags":{"Primary":""}},
             {"Name":"no id"}
         ],"TotalRecordCount":120}"#;

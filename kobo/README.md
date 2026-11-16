@@ -44,8 +44,13 @@ sign-in as the music; the OPDS catalogue is not used because it needs an
 e-reader password the app does not hold.
 
 Readable: EPUB (also Kindle books, which Pharos serves as EPUB), plain text,
-Markdown and HTML, up to 64 MB and 64 downloaded books. PDF and comic books
-(CBZ, CBR) show "This reader can't open PDF books yet" and download nothing.
+Markdown and HTML, up to 64 MB and 64 downloaded books. A PDF downloads as
+its pages, drawn by Pharos to fit this reader's screen (in colour on a colour
+panel), and opens in Cobalt's page viewer. Pages turn as in any book, and
+**Reading** holds zoom, fit width, the page list and Go to page. Pages
+are read off the card one at a time, with the next ones read ahead, so a long
+PDF opens as quickly as a short one (ADR-0144). Comic books (CBZ, CBR) show
+"This reader can't open comic books yet" and download nothing.
 Reading progress is kept on the reader only; it is not reported to Pharos.
 Books no client can open, such as a Kindle book locked with DRM, are left
 out of the grid altogether.
