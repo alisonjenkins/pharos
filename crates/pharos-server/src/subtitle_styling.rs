@@ -112,7 +112,7 @@ pub struct SubtitleCandidate {
 }
 
 impl SubtitleCandidate {
-    fn is_text(&self) -> bool {
+    pub(crate) fn is_text(&self) -> bool {
         self.codec
             .as_deref()
             .is_some_and(|c| !c.is_empty() && !is_image_subtitle_codec(c))
@@ -1403,7 +1403,7 @@ fn sidecar_candidate(index: u32, path: &std::path::Path, media_stem: &str) -> Su
 
 /// Every subtitle track of `item` the job could style: its embedded streams,
 /// then its sidecar files at `sidecar_base_index` + position.
-async fn candidates_for(item: &MediaItem) -> Vec<SubtitleCandidate> {
+pub(crate) async fn candidates_for(item: &MediaItem) -> Vec<SubtitleCandidate> {
     let mut out: Vec<SubtitleCandidate> = item
         .probe
         .subtitle_tracks
@@ -1435,7 +1435,7 @@ async fn candidates_for(item: &MediaItem) -> Vec<SubtitleCandidate> {
 /// The source track's script text: a sidecar from disk as it is (the styling
 /// reader takes SRT, WebVTT and ASS), an embedded ASS stream as ASS, any
 /// other embedded text stream as WebVTT, both through the subtitle cache.
-async fn read_source(
+pub(crate) async fn read_source(
     cache: Option<&SubtitleCache>,
     item: &MediaItem,
     source: &SubtitleCandidate,

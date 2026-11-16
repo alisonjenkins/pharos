@@ -72,6 +72,7 @@ pub mod sessions;
 pub mod stale_artwork;
 pub mod state;
 pub mod styled_track;
+pub mod subtitle_check;
 pub mod subtitle_styling;
 #[cfg(feature = "postgres")]
 pub mod sync_distributed;
