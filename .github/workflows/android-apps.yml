@@ -17,14 +17,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # One instant for both apps: versionCode as the scripts count it (minutes
+  # since 2026-01-01 UTC), versionName the same minute as a date, which is
+  # also the release tag Obtainium compares against. Taken from the run's
+  # creation time, which a re-run keeps, so a re-run updates the same release.
+  version:
+    name: pick the version
+    if: github.repository == 'alisonjenkins/pharos'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      code: ${{ steps.version.outputs.code }}
+    steps:
+      - name: Pick the version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          created=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+          now=$(date -u -d "$created" +%s)
+          code=$(( (now - 1767225600) / 60 ))
+          name=$(date -u -d "@$now" +%Y.%m.%d.%H%M)
+          printf 'code=%s\nname=%s\n' "$code" "$name" >>"$GITHUB_OUTPUT"
+          printf 'event=android_version code=%s name=%s run_created=%s sha=%s\n' "$code" "$name" "$created" "$GITHUB_SHA" >&2
+
   build:
     name: build and sign APKs
     if: github.repository == 'alisonjenkins/pharos'
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 180
-    outputs:
-      version_name: ${{ steps.version.outputs.name }}
-      version_code: ${{ steps.version.outputs.code }}
+    needs: version
     steps:
       - uses: actions/checkout@v7
 
@@ -32,19 +57,6 @@ jobs:
         with:
           max-jobs: 2
           cores: 16
-
-      # One instant for both apps: versionCode as the scripts count it
-      # (minutes since 2026-01-01 UTC), versionName the same minute as a
-      # date, which is also the release tag Obtainium compares against.
-      - name: Pick the version
-        id: version
-        run: |
-          set -euo pipefail
-          now=$(date -u +%s)
-          code=$(( (now - 1767225600) / 60 ))
-          name=$(date -u -d "@$now" +%Y.%m.%d.%H%M)
-          printf 'code=%s\nname=%s\n' "$code" "$name" >>"$GITHUB_OUTPUT"
-          printf 'event=android_version code=%s name=%s sha=%s\n' "$code" "$name" "$GITHUB_SHA" >&2
 
       - name: Write the signing key
         env:
@@ -74,16 +86,16 @@ jobs:
 
       - name: Build the TV APK
         env:
-          PHAROS_ANDROID_VERSION_CODE: ${{ steps.version.outputs.code }}
-          PHAROS_ANDROID_VERSION_NAME: ${{ steps.version.outputs.name }}
-          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-tv-${{ steps.version.outputs.name }}.apk
+          PHAROS_ANDROID_VERSION_CODE: ${{ needs.version.outputs.code }}
+          PHAROS_ANDROID_VERSION_NAME: ${{ needs.version.outputs.name }}
+          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-tv-${{ needs.version.outputs.name }}.apk
         run: nix run .#android-apk -- --release
 
       - name: Build the phone APK
         env:
-          PHAROS_ANDROID_VERSION_CODE: ${{ steps.version.outputs.code }}
-          PHAROS_ANDROID_VERSION_NAME: ${{ steps.version.outputs.name }}
-          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-phone-${{ steps.version.outputs.name }}.apk
+          PHAROS_ANDROID_VERSION_CODE: ${{ needs.version.outputs.code }}
+          PHAROS_ANDROID_VERSION_NAME: ${{ needs.version.outputs.name }}
+          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-phone-${{ needs.version.outputs.name }}.apk
         run: nix run .#android-phone-apk -- --release
 
       # A different key would make every friend's update fail to install, so
@@ -120,21 +132,21 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: android-apks-${{ steps.version.outputs.name }}
+          name: android-apks-${{ needs.version.outputs.name }}
           path: ${{ runner.temp }}/apks/*.apk
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: publish GitHub Release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v7
         with:
-          name: android-apks-${{ needs.build.outputs.version_name }}
+          name: android-apks-${{ needs.version.outputs.name }}
           path: apks
 
       # Re-running the job updates the same release instead of failing on an
@@ -143,8 +155,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          NAME: ${{ needs.build.outputs.version_name }}
-          CODE: ${{ needs.build.outputs.version_code }}
+          NAME: ${{ needs.version.outputs.name }}
+          CODE: ${{ needs.version.outputs.code }}
         run: |
           set -euo pipefail
           tag="apps-v$NAME"
