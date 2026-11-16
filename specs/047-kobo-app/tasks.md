@@ -25,3 +25,8 @@
 ## Slice 4 - Ebooks
 
 - [ ] T047-12 Download a book and open it with `kobo-bookview` (FR-010).
+
+## Slice 5 - PDFs
+
+- [x] T047-13 Pharos draws a PDF's pages as a CBZ for the panel; the Kobo reads it off the card a page at a time in Cobalt's comic viewer (ADR-0144, V1460–V1462).
+- [ ] T047-14 Install on a Kobo and read a long PDF; check page-turn time and memory. Needs the owner's go.
