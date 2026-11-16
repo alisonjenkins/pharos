@@ -142,6 +142,10 @@ struct Pharos {
     shelf_sent: usize,
     /// Whether the whole listing has been read.
     shelf_done: bool,
+    /// How many albums the shelf's top bar counts. It catches up when the
+    /// screen is drawn for something else, so a later block of albums
+    /// landing behind the page showing draws nothing of its own.
+    shelf_counted: usize,
     shelf_page: usize,
     /// Whether the letters to jump the shelf to are showing (V1442).
     picking_letter: bool,
@@ -186,6 +190,7 @@ impl Default for Pharos {
             shelf: Page::default(),
             shelf_sent: 0,
             shelf_done: false,
+            shelf_counted: 0,
             shelf_page: 0,
             picking_letter: false,
             covers: CoverCache::new(MIN_COVERS),
@@ -607,6 +612,27 @@ impl Pharos {
             || self.page_covers_pending(context)
     }
 
+    /// Whether the screen showing still waits on what it shows: the home
+    /// screen on its rows and covers, a shelf on its first albums and the
+    /// covers of the page showing.
+    fn screen_loading(&self, context: &Context) -> bool {
+        match self.view {
+            View::Home => self.home_loading(context),
+            View::Library(_) => self.shelf_loading(context),
+            _ => false,
+        }
+    }
+
+    /// Whether the shelf has nothing to show yet but is asking, or a cover
+    /// on the page showing is still to come.
+    fn shelf_loading(&self, context: &Context) -> bool {
+        let asking = self
+            .tasks
+            .iter()
+            .any(|(_, work)| matches!(work, Work::Shelf { .. }));
+        (asking && self.shelf.entries.is_empty()) || self.page_covers_pending(context)
+    }
+
     /// Whether a cover on the shelf page showing is still to come: asked
     /// for and not here yet, or not asked for yet. A cover that failed is
     /// not waited for.
@@ -698,10 +724,33 @@ impl Pharos {
         }
     }
 
+    /// Asks for the shelf's next block of albums, unless it has them all,
+    /// one is on the way, or a page waits to be drawn: that wait holds a
+    /// task slot, and the page's covers are wanted before the albums on
+    /// pages not on show.
+    fn more_shelf(&mut self, context: &mut Context) {
+        let asking = self
+            .tasks
+            .iter()
+            .any(|(_, work)| matches!(work, Work::Shelf { .. }));
+        if self.shelf_done
+            || asking
+            || self.draw_wait.is_some()
+            || !matches!(self.view, View::Library(_))
+        {
+            return;
+        }
+        if let Some(library) = self.shelf_library() {
+            let next = self.shelf_sent;
+            self.load_shelf(context, &library, next);
+        }
+    }
+
     fn clear_shelf(&mut self) {
         self.shelf = Page::default();
         self.shelf_sent = 0;
         self.shelf_done = false;
+        self.shelf_counted = 0;
         self.shelf_page = 0;
         self.picking_letter = false;
     }
@@ -980,12 +1029,7 @@ impl Pharos {
                     .extend(page.entries.into_iter().filter(|entry| kind.keeps(entry)));
                 self.shelf_done =
                     page.sent == 0 || self.shelf_sent >= page.total || self.shelf_sent >= MAX_SHELF;
-                if !self.shelf_done {
-                    if let Some(library) = self.shelf_library() {
-                        let next = self.shelf_sent;
-                        self.load_shelf(context, &library, next);
-                    }
-                }
+                self.more_shelf(context);
             }
             None => self.problem("Pharos sent a list this app could not read."),
         }
@@ -1167,7 +1211,7 @@ impl Pharos {
                 .now_playing(ScreenBuilder::new("pharos-library").top_bar(format!(
                     "{} · {} {}",
                     kind.label(),
-                    self.shelf.entries.len(),
+                    self.shelf_counted,
                     kind.noun()
                 )))
                 .top_bar_action("letters", "A–Z")
@@ -1529,6 +1573,8 @@ impl Pharos {
 
     fn show(&mut self, context: &mut Context) {
         self.end_draw_wait(context);
+        self.more_shelf(context);
+        self.shelf_counted = self.shelf.entries.len();
         let screen = self.screen(context);
         self.shown = Some(screen.clone());
         context.set_screen(screen);
@@ -1542,10 +1588,18 @@ impl Pharos {
     /// after handing Back over.
     fn show_if_changed(&mut self, context: &mut Context) {
         self.end_draw_wait(context);
+        self.more_shelf(context);
         let screen = self.screen(context);
         if self.shown.as_ref() == Some(&screen) {
             return;
         }
+        let counted = self.shelf.entries.len();
+        let screen = if self.shelf_counted == counted {
+            screen
+        } else {
+            self.shelf_counted = counted;
+            self.screen(context)
+        };
         self.shown = Some(screen.clone());
         context.set_screen(screen);
     }
@@ -1565,6 +1619,18 @@ impl Pharos {
             context.cancel(task);
             self.tasks.retain(|(held, _)| *held != task);
         }
+    }
+
+    /// Draws what input asked for. A page opened or turned to waits for its
+    /// albums and covers and is drawn once with them, not once bare and again
+    /// as they land (B1458). Back is always answered at once: the runtime
+    /// waits on a screen for it.
+    fn answer_input(&mut self, context: &mut Context, action: ActionId) {
+        if action != ActionId::BACK && self.screen_loading(context) && self.begin_draw_wait(context)
+        {
+            return;
+        }
+        self.show(context);
     }
 
     /// Which of `visible` things an action named `{prefix}-{index}` chose.
@@ -1772,7 +1838,7 @@ impl KoboApp for Pharos {
             }
         }
         self.refresh_covers(context);
-        self.show(context);
+        self.answer_input(context, action);
     }
 
     fn on_device_result(
@@ -1845,6 +1911,10 @@ impl KoboApp for Pharos {
         // The home screen is drawn once, when what it lists and the covers
         // it shows are all in, not once per answer on the way (B1457).
         if !waited && matches!(self.view, View::Home) && self.home_loading(context) {
+            return;
+        }
+        // A shelf page is drawn once its albums and covers are in.
+        if !waited && matches!(self.view, View::Library(_)) && self.shelf_loading(context) {
             return;
         }
         self.show_if_changed(context);
