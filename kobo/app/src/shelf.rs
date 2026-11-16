@@ -6,8 +6,6 @@
 //! carries, filters and menus) stays with the caller, which builds its tiles
 //! from [`Shelf::page_tiles`].
 
-#![allow(dead_code)] // adopted by the album shelf and the book list next
-
 use crate::letters;
 use kobo_sdk::{action_id, ActionId, Context, ScreenBuilder, TileShape};
 
@@ -70,12 +68,9 @@ impl<T> Shelf<T> {
         self.open(self.shape);
     }
 
-    /// Forgets the entries and the place in the listing, to read it again
-    /// from the first row. The letters stay as they are.
-    pub fn restart(&mut self) {
-        let picking = self.picking;
-        self.clear();
-        self.picking = picking;
+    /// Draws the tiles in another shape, over the entries held.
+    pub fn set_shape(&mut self, shape: TileShape) {
+        self.shape = shape;
     }
 
     #[must_use]
@@ -141,15 +136,6 @@ impl<T> Shelf<T> {
     #[must_use]
     pub fn page_number(&self) -> usize {
         self.page
-    }
-
-    /// Shows the first page again.
-    pub fn first_page(&mut self) {
-        self.page = 0;
-    }
-
-    pub fn stop_picking(&mut self) {
-        self.picking = false;
     }
 }
 
@@ -368,12 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn clearing_keeps_the_shape_and_restarting_keeps_the_letters() {
+    fn opening_empties_the_shelf_and_clearing_keeps_the_shape() {
         let mut shelf = filled(3);
         shelf.picking = true;
-        shelf.restart();
-        assert!(shelf.entries.is_empty() && shelf.picking);
         shelf.open(TileShape::Portrait);
+        assert!(shelf.entries.is_empty());
         assert!(!shelf.picking);
         shelf.clear();
         assert_eq!(shelf.shape(), TileShape::Portrait);
@@ -395,8 +380,6 @@ mod tests {
         assert_eq!(shelf.page_number(), pages.len() - 1);
         shelf.turn(&context, false);
         assert_eq!(shelf.page_number(), pages.len() - 2);
-        shelf.first_page();
-        assert_eq!(shelf.page_indices(&context), pages[0]);
     }
 
     #[test]
