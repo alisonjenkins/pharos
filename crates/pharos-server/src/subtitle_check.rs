@@ -53,7 +53,7 @@ use tokio::sync::Semaphore;
 /// Bumped when the probe picker, the rules or the request change, so every
 /// track is checked again.
 pub const CHECK_VERSION: u32 = 1;
-/// FR-007: each probe's window is padded this much on each side.
+/// FR-007: each probe's window ends this much after the cue.
 pub const PAD_MS: u64 = 2_000;
 /// FR-015a: an aligner failure is retried no sooner than this (seconds), as
 /// the karaoke queue's `RETRY_AFTER`.
@@ -281,11 +281,14 @@ fn now_secs() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// A probe's window, padded (FR-007).
+/// A probe's window (FR-007): the cue's own start, so the aligner's offset is
+/// measured from it, and the end padded by [`PAD_MS`]. A padded start would
+/// shift every offset by the pad, and the aligner zeroes an offset under
+/// 400 ms before the pad could be taken off again.
 fn window(p: &Probe) -> (u64, u64) {
     let start = u64::try_from(p.start_ms).unwrap_or(0);
     let end = u64::try_from(p.end_ms).unwrap_or(0);
-    (start.saturating_sub(PAD_MS), end.saturating_add(PAD_MS))
+    (start, end.saturating_add(PAD_MS))
 }
 
 /// Scores in thousandths to `f32`; a line with no score is NaN, which the
@@ -322,8 +325,13 @@ struct Measured {
 impl Measured {
     fn scores_json(&self) -> Option<String> {
         let c = self.stage1.as_ref()?;
-        let finite = |v: &[f32]| -> Vec<Option<f32>> {
-            v.iter().map(|s| s.is_finite().then_some(*s)).collect()
+        let finite = |v: &[f32]| -> Vec<Option<f64>> {
+            v.iter()
+                .map(|s| {
+                    s.is_finite()
+                        .then(|| (f64::from(*s) * 1000.0).round() / 1000.0)
+                })
+                .collect()
         };
         Some(
             serde_json::json!({
@@ -682,6 +690,7 @@ mod tests {
         busy: AtomicUsize,
         healthy: bool,
         calls: Mutex<Vec<(String, usize)>>,
+        starts: Mutex<Vec<u64>>,
     }
 
     impl Fake {
@@ -694,6 +703,7 @@ mod tests {
                 busy: AtomicUsize::new(0),
                 healthy: true,
                 calls: Mutex::default(),
+                starts: Mutex::default(),
             }
         }
         fn calls(&self) -> Vec<(String, usize)> {
@@ -720,7 +730,12 @@ mod tests {
             // Probes and decoys alternate: the probe request comes first.
             let is_decoy = calls.iter().filter(|(n, _)| *n == name).count() % 2 == 1;
             calls.push((name, lines.len()));
+            let call = calls.len() - 1;
             drop(calls);
+            self.starts
+                .lock()
+                .unwrap()
+                .extend(lines.iter().map(|l| l.0));
             if self
                 .fail
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -932,6 +947,17 @@ mod tests {
         let r = row(&lib, 1).await;
         assert_eq!(r.verdict.as_deref(), Some("unknown"));
         assert_eq!(r.reason, "aligner_error:request: connection refused");
+    }
+
+    #[tokio::test]
+    async fn probes_are_sent_from_their_own_start_so_the_offset_is_theirs() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let fake = Fake::new(900, 250);
+        job(&lib, &fake).run_pass().await;
+        let starts = fake.starts.lock().unwrap().clone();
+        // Every cue starts one second into its minute: no start padding.
+        assert!(starts.iter().all(|s| s % 60_000 == 1_000), "{starts:?}");
     }
 
     #[tokio::test]
