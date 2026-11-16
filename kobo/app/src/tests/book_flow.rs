@@ -616,3 +616,52 @@ fn backing_out_while_the_opening_loads_cancels_it() {
     let text = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(text.contains("Read the opening"), "{text}");
 }
+
+const EPUB_LIST: &str =
+    r#"{"Items":[{"Id":"b1","Name":"Book One","Path":"/b/one.epub"}],"TotalRecordCount":1}"#;
+
+#[test]
+fn each_book_step_logs_its_time_on_the_main_thread() {
+    let (mut runner, _) = books_from(EPUB_LIST);
+    let _ = runner.action(action_id("book-0"));
+    let tap = runner.action(action_id("book-read"));
+    assert!(logged(&tap, "pharos: book step=read-tap ms="), "{tap:?}");
+    let (download, _) = asked(&tap, "/Items/b1/Download").expect("download");
+    let piece = format!("PK\u{3}\u{4}{}", "x".repeat(books::CHUNK as usize - 4));
+    let more = runner.task_outcome(download, ok(&piece));
+    assert!(
+        logged(&more, "pharos: book step=piece ms=") && logged(&more, " bytes=0"),
+        "{more:?}"
+    );
+    let (last, _) = asked(&more, "/Items/b1/Download").expect("next piece");
+    let done = runner.task_outcome(last, ok("tail"));
+    assert!(logged(&done, "pharos: book step=piece ms="), "{done:?}");
+    assert!(logged(&done, "pharos: book step=open ms="), "{done:?}");
+    assert!(logged(&done, "pharos: book step=finish ms="), "{done:?}");
+}
+
+#[test]
+fn a_book_that_will_not_open_logs_why_before_it_says_so() {
+    let (mut runner, _) = books_from(EPUB_LIST);
+    let commands = downloaded(&mut runner, "%PDF-1.7");
+    assert!(
+        logged(
+            &commands,
+            "pharos: book open refused id=b1 bytes=8 kind=an EPUB head=255044462d312e37 why=not what it claims"
+        ),
+        "{commands:?}"
+    );
+    let (mut runner, _) = books_from(EPUB_LIST);
+    let commands = downloaded(&mut runner, "PK\u{3}\u{4}junk");
+    assert!(
+        logged(
+            &commands,
+            "pharos: book open refused id=b1 bytes=8 kind=an EPUB head=504b03046a756e6b why="
+        ),
+        "{commands:?}"
+    );
+    assert!(
+        !logged(&commands, "Book One"),
+        "no title in the log: {commands:?}"
+    );
+}

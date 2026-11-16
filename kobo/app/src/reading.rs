@@ -16,10 +16,11 @@ use crate::MAX_JSON;
 use kobo_bookview::{BookView, Step};
 use kobo_read::{Memory, Outcome};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Glyph, Header, Screen, ScreenBuilder, ShelfDownload,
-    ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
-    TileShape, TileState,
+    action_id, ActionId, BannerLevel, Context, Glyph, Header, LogLevel, Screen, ScreenBuilder,
+    ShelfDownload, ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome,
+    TilePicture, TileShape, TileState,
 };
+use std::time::Instant;
 
 /// How wide the cover is on a book's detail page, in millimetres: the same as
 /// an album's masthead, so the two detail pages look alike.
@@ -989,20 +990,29 @@ impl Reading {
             return;
         };
         let whole = bytes.len() == saved.size && books::is_what_it_claims(kind, bytes);
-        if whole
-            && self
-                .view
-                .open_bytes(
-                    context,
-                    &saved.file,
-                    bytes,
-                    Memory::decode(saved.memory.as_bytes()),
-                )
-                .is_ok()
-        {
+        let mut why = "not whole or not what it claims".to_owned();
+        let opening = Instant::now();
+        let opened = whole && {
+            let result = self.view.open_bytes(
+                context,
+                &saved.file,
+                bytes,
+                Memory::decode(saved.memory.as_bytes()),
+            );
+            step_taken(context, "open", opening, bytes.len());
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    why = error.to_string();
+                    false
+                }
+            }
+        };
+        if opened {
             self.opened = true;
             self.notice = None;
         } else {
+            refused(context, &book.id, kind, bytes, &why);
             self.damaged_copy(
                 "The downloaded book is incomplete or unreadable. Open it again to download it.",
                 true,
@@ -1107,9 +1117,11 @@ impl Reading {
     }
 
     fn piece(&mut self, context: &mut Context, outcome: &TaskOutcome) -> Leave {
+        let started = Instant::now();
         let Job::Downloading { bytes, .. } = std::mem::take(&mut self.job) else {
             return Leave::Stay;
         };
+        let held = bytes.len();
         match outcome {
             TaskOutcome::Completed(piece) => match books::after_piece(bytes.len(), piece.len()) {
                 Piece::TooBig => {
@@ -1130,6 +1142,7 @@ impl Reading {
             TaskOutcome::Failed(error) => self.say(BannerLevel::Error, task_words(*error)),
             TaskOutcome::Cancelled => self.say(BannerLevel::Info, "Download cancelled."),
         }
+        step_taken(context, "piece", started, held);
         Leave::Stay
     }
 
@@ -1160,6 +1173,13 @@ impl Reading {
     }
 
     fn finish_download(&mut self, context: &mut Context, bytes: Vec<u8>) {
+        let started = Instant::now();
+        let size = bytes.len();
+        self.finish_download_steps(context, bytes);
+        step_taken(context, "finish", started, size);
+    }
+
+    fn finish_download_steps(&mut self, context: &mut Context, bytes: Vec<u8>) {
         let (Some(book), Some(file)) = (
             self.current.as_ref(),
             self.current.as_ref().and_then(Book::file),
@@ -1170,6 +1190,7 @@ impl Reading {
             return;
         };
         if !books::is_what_it_claims(kind, &bytes) {
+            refused(context, &book.id, kind, &bytes, "not what it claims");
             let why = if book.kindle {
                 "Pharos couldn't convert this Kindle book to an EPUB. It may be locked with DRM."
                     .to_owned()
@@ -1182,11 +1203,13 @@ impl Reading {
             self.say(BannerLevel::Error, why);
             return;
         }
-        if self
+        let opening = Instant::now();
+        let opened = self
             .view
-            .open_bytes(context, &file, &bytes, Memory::default())
-            .is_err()
-        {
+            .open_bytes(context, &file, &bytes, Memory::default());
+        step_taken(context, "open", opening, bytes.len());
+        if let Err(error) = opened {
+            refused(context, &book.id, kind, &bytes, &error.to_string());
             self.say(
                 BannerLevel::Error,
                 "This download is not a readable book. Check the file on Pharos.",
@@ -1260,12 +1283,14 @@ impl Reading {
         } else if action == action_id("books-page-back") {
             self.turn(context, false);
         } else if action == action_id("book-read") {
+            let started = Instant::now();
             if let Mode::Menu(index) = self.mode {
                 match self.home_book.take() {
                     Some(book) => self.begin_book(context, book),
                     None => self.begin(context, index),
                 }
             }
+            step_taken(context, "read-tap", started, 0);
         } else if action == action_id("book-remove") {
             self.remove(context);
         } else if action == action_id("book-about") {
@@ -1502,6 +1527,33 @@ impl Reading {
             self.save(context);
         }
     }
+}
+
+/// Records how long a step took on the main thread, for the frame log.
+fn step_taken(context: &mut Context, step: &str, started: Instant, bytes: usize) {
+    let ms = started.elapsed().as_millis();
+    context.log(
+        LogLevel::Info,
+        format!("pharos: book step={step} ms={ms} bytes={bytes}"),
+    );
+}
+
+/// Records why a book's bytes were not opened: its id, size and claimed
+/// format, the first bytes as hex, and the reason. Never a title or a name.
+fn refused(context: &mut Context, id: &str, kind: Kind, bytes: &[u8], why: &str) {
+    let head = bytes.iter().take(8).fold(String::new(), |mut hex, byte| {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
+    context.log(
+        LogLevel::Info,
+        format!(
+            "pharos: book open refused id={id} bytes={} kind={} head={head} why={why}",
+            bytes.len(),
+            kind_words(kind),
+        ),
+    );
 }
 
 fn own(screen: ScreenBuilder) -> Screen {
