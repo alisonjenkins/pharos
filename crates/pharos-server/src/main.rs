@@ -2028,6 +2028,18 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     {
         state = state.with_subtitle_styling(subtitle_styling);
     }
+    // Spec 040 — check each text subtitle track against its video with the
+    // aligner, after karaoke and viewers' transcodes; log and store only
+    // until `[subtitle_check].apply`.
+    pharos_server::subtitle_check::spawn(
+        state.stores.clone(),
+        state.is_bg_leader.clone(),
+        state.bg_io.clone(),
+        state.subtitles.clone(),
+        state.transcode_scheduler.clone(),
+        state.lyrics.aligner(),
+        &cfg.subtitle_check,
+    );
     // T81 — resolve real cast portraits from TMDB when a key is configured.
     // Gated on the key: with none, this library's people rows keep their
     // legacy (unreachable) thumb paths and the /Persons image route 404s to a
