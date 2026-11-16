@@ -77,15 +77,16 @@ fn with_list<R>(f: impl FnOnce(&mut Vec<KeptVideo>) -> R) -> R {
     })
 }
 
-fn save() {
+fn save() -> Result<(), String> {
     let text = with_list(|list| serde_json::to_string(list));
     let result = text.map_err(|e| e.to_string()).and_then(|t| {
         local_storage().and_then(|s| s.set_item(RECORDS_KEY, &t).map_err(|e| describe(&e)))
     });
-    match result {
+    match &result {
         Ok(()) => LAST_SAVE_MS.with(|c| c.set(js_sys::Date::now())),
         Err(e) => warn(&format!("pharos: video record not saved error={e}")),
     }
+    result
 }
 
 /// Changes the record of `item`; false when it is gone (removed meanwhile).
@@ -469,7 +470,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     }) {
         return Err(Stop::Gone);
     }
-    save();
+    let _ = save();
 
     let todo = missing_files(&all, &cached);
     let mut done = all.len() - todo.len();
@@ -518,7 +519,7 @@ fn publish(user: &str, item: &str, done: usize, total: u32, bytes: u64, force: b
         v.state = KeptState::Downloading { done, total, bytes };
     });
     if alive && (force || progress_due(LAST_SAVE_MS.with(Cell::get), js_sys::Date::now())) {
-        save();
+        let _ = save();
     }
 }
 
@@ -567,7 +568,7 @@ async fn run(user: String, item: String, resume: bool) {
                 v.state = KeptState::Ready;
                 v.estimated_bytes = bytes;
             }) {
-                save();
+                let _ = save();
                 info(&format!(
                     "pharos: video keep ready item={item} bytes={bytes}"
                 ));
@@ -581,7 +582,7 @@ async fn run(user: String, item: String, resume: bool) {
                 "pharos: video keep failed item={item} reason={reason}"
             ));
             if update(&user, &item, |v| v.state = KeptState::Failed { reason }) {
-                save();
+                let _ = save();
             }
         }
     }
@@ -605,8 +606,10 @@ impl VideoStore for WebVideoStore {
             return Err(KeepVideoRefusal::Host(e));
         }
         let (user, item) = (request.user.clone(), request.item.clone());
+        let mut previous = None;
         let started = with_list(|list| {
             check_not_kept(list, &user, &item)?;
+            previous = find(list, &user, &item).cloned();
             let mut record = new_record(&request, js_sys::Date::new_0().to_iso_string().into());
             if let Some(old) = find(list, &user, &item) {
                 record.files = old.files.clone();
@@ -620,7 +623,22 @@ impl VideoStore for WebVideoStore {
             ));
             return Err(refusal);
         }
-        save();
+        if let Err(e) = save() {
+            // Undo: without a saved record a closed page would lose the
+            // download and its files.
+            with_list(|l| {
+                take(l, &user, &item);
+                if let Some(old) = previous {
+                    l.insert(0, old);
+                }
+            });
+            warn(&format!(
+                "pharos: video keep refused item={item} reason={e}"
+            ));
+            return Err(KeepVideoRefusal::Host(format!(
+                "the download record could not be saved: {e}"
+            )));
+        }
         request_persist();
         wasm_bindgen_futures::spawn_local(run(user, item, false));
         Ok(())
@@ -630,7 +648,7 @@ impl VideoStore for WebVideoStore {
         let Some(record) = with_list(|l| take(l, user, item)) else {
             return;
         };
-        save();
+        let _ = save();
         info(&format!(
             "pharos: video keep remove item={item} files={}",
             record.files.len()
@@ -644,7 +662,7 @@ impl VideoStore for WebVideoStore {
 
     fn save_position(&self, user: &str, item: &str, position_ms: u64) {
         if update(user, item, |v| v.position_ms = position_ms) {
-            save();
+            let _ = save();
         }
     }
 
