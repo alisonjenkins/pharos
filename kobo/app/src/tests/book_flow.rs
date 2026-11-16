@@ -1030,3 +1030,29 @@ fn a_download_that_cannot_be_asked_for_removes_what_it_wrote() {
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("could not start"), "{screen}");
 }
+
+#[test]
+fn signing_out_mid_download_cancels_the_fetch_and_removes_the_part() {
+    const LIST: &str = r#"{"Items":[{"Id":"b1","Name":"Book One","Path":"/b/one.txt"}],
+        "TotalRecordCount":2}"#;
+    let (mut runner, commands) = books_from(LIST);
+    let (rest, _) = asked(&commands, "StartIndex=1").expect("the rest of the list");
+    let commands = read(&mut runner, 0);
+    let piece = "x".repeat(books::CHUNK as usize);
+    let commands = piece_written(&mut runner, &commands, &piece);
+    let (next, _) = asked(&commands, "/Items/b1/Download").expect("the next piece");
+    let commands = runner.task_outcome(rest, TaskOutcome::Failed(TaskError::Unauthorized));
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel(task) if *task == next)),
+        "the fetch under way is cancelled: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::ShelfRemove { name }) if name == "book-b1.txt"
+        )),
+        "the part on the shelf is removed: {commands:?}"
+    );
+}
