@@ -172,6 +172,7 @@ fn push_cue(script: &mut Script, start: i64, end: i64, lines: &[&str], keep_brac
         alignment: parsed.alignment,
         text: parsed.text,
         runs: parsed.runs,
+        positioned: parsed.positioned,
     });
 }
 

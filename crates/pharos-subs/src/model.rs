@@ -110,6 +110,9 @@ pub struct Event {
     /// Visible text; `'\n'` is a hard line break, `'\u{a0}'` a non-breaking space.
     pub text: String,
     pub runs: Vec<Run>,
+    /// A `\pos` or `\move` override was present: the event is placed by hand,
+    /// as signs and typesetting are. The renderer does not honour either tag.
+    pub positioned: bool,
 }
 
 /// Counters for things the parser could not honour.

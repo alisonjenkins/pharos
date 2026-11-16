@@ -8,6 +8,7 @@ pub(crate) struct ParsedText {
     pub text: String,
     pub runs: Vec<Run>,
     pub alignment: Option<u8>,
+    pub positioned: bool,
 }
 
 /// Parses `raw` (the Text field of a Dialogue line) into visible text and runs.
@@ -16,6 +17,7 @@ pub(crate) fn parse_text(raw: &str, wrap_style: u8, stats: &mut ParseStats) -> P
     let mut runs: Vec<Run> = Vec::new();
     let mut cur = Overrides::default();
     let mut alignment = None;
+    let mut positioned = false;
     let mut run_open = 0usize; // text length where the current run started
 
     let flush = |text: &String, runs: &mut Vec<Run>, cur: &Overrides, run_open: &mut usize| {
@@ -39,7 +41,7 @@ pub(crate) fn parse_text(raw: &str, wrap_style: u8, stats: &mut ParseStats) -> P
                 if let Some(rel) = raw.get(i..).and_then(|s| s.find('}')) {
                     flush(&text, &mut runs, &cur, &mut run_open);
                     let block = raw.get(i + 1..i + rel).unwrap_or("");
-                    parse_block(block, &mut cur, &mut alignment, stats);
+                    parse_block(block, &mut cur, &mut alignment, &mut positioned, stats);
                     i += rel + 1;
                 } else {
                     text.push('{');
@@ -80,6 +82,7 @@ pub(crate) fn parse_text(raw: &str, wrap_style: u8, stats: &mut ParseStats) -> P
         text,
         runs,
         alignment,
+        positioned,
     }
 }
 
@@ -87,6 +90,7 @@ fn parse_block(
     block: &str,
     cur: &mut Overrides,
     alignment: &mut Option<u8>,
+    positioned: &mut bool,
     stats: &mut ParseStats,
 ) {
     let mut depth = 0i32;
@@ -98,7 +102,9 @@ fn parse_block(
             b')' => depth -= 1,
             b'\\' if depth <= 0 => {
                 if let Some(s) = start {
-                    apply_tag(block.get(s..i).unwrap_or(""), cur, alignment, stats);
+                    let tag = block.get(s..i).unwrap_or("");
+                    *positioned |= is_position_tag(tag);
+                    apply_tag(tag, cur, alignment, stats);
                 }
                 start = Some(i + 1);
             }
@@ -106,8 +112,18 @@ fn parse_block(
         }
     }
     if let Some(s) = start {
-        apply_tag(block.get(s..).unwrap_or(""), cur, alignment, stats);
+        let tag = block.get(s..).unwrap_or("");
+        *positioned |= is_position_tag(tag);
+        apply_tag(tag, cur, alignment, stats);
     }
+}
+
+/// `\pos(x,y)` or `\move(...)`, with optional space before the bracket.
+fn is_position_tag(tag: &str) -> bool {
+    ["pos", "move"].iter().any(|name| {
+        tag.strip_prefix(name)
+            .is_some_and(|rest| rest.trim_start().starts_with('('))
+    })
 }
 
 fn num(s: &str) -> Option<f32> {
