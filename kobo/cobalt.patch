@@ -667,10 +667,90 @@ index 6220e12..752dd9f 100644
  ];
  /// Applications released through Store, including the initial built-in copies
 diff --git a/crates/kobo-doc/src/epub.rs b/crates/kobo-doc/src/epub.rs
-index 1b120a5..8618a04 100644
+index 1b120a5..c99e36d 100644
 --- a/crates/kobo-doc/src/epub.rs
 +++ b/crates/kobo-doc/src/epub.rs
-@@ -623,12 +623,12 @@ fn read_ncx(xml: &str, base: &str) -> Vec<(String, String, Option<String>, u8)>
+@@ -128,11 +128,49 @@ fn name_the_book(builder: &mut Builder, package: &Package) {
+ /// [`Fault::Archive`] when the bytes are not a readable zip, and
+ /// [`Fault::NotABook`] when they are but no readable text could be found.
+ pub fn parse(bytes: &[u8]) -> Result<Document, Fault> {
+-    let archive = Archive::open(bytes)?;
+-    let package_at = find_package(&archive).ok_or(Fault::NotABook)?;
++    parse_archive(&Archive::open(bytes)?, false)
++}
++
++/// Reads an EPUB from the parts of it that were read off the card.
++///
++/// The parts must hold the archive's tail, its central directory and every
++/// member [`needed_to_open`] says yes to. A picture whose bytes were not read
++/// is not an error: it is left in [`Document::places`], to be read when it is
++/// first drawn.
++///
++/// # Errors
++///
++/// As [`parse`].
++pub fn parse_pieces(pieces: &zip::Pieces) -> Result<Document, Fault> {
++    parse_archive(&Archive::open_pieces(pieces)?, true)
++}
++
++/// Whether a member must be read before a book can be opened from its parts.
++///
++/// Everything is, except what only a picture or a sound is made of: those are
++/// most of a large book's bytes and none of its text. Judged by the name
++/// rather than the manifest, because the decision is made before the package
++/// has been read, from the directory alone. A member wrongly called a picture
++/// costs a missing picture; one wrongly not called one costs only bytes.
++#[must_use]
++pub fn needed_to_open(name: &str) -> bool {
++    const MEDIA: &[&str] = &[
++        "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "jxl", "mp3",
++        "mp4", "m4a", "m4v", "aac", "ogg", "oga", "ogv", "webm", "wav", "opus",
++    ];
++    let leaf = name.rsplit('/').next().unwrap_or(name);
++    !leaf.rsplit_once('.').is_some_and(|(_, extension)| {
++        MEDIA
++            .iter()
++            .any(|media| extension.eq_ignore_ascii_case(media))
++    })
++}
++
++fn parse_archive(archive: &Archive<'_>, sparse: bool) -> Result<Document, Fault> {
++    let package_at = find_package(archive).ok_or(Fault::NotABook)?;
+     let package = read_package(&text_of(&archive.read(&package_at)?));
+     let base = directory_of(&package_at);
+-    let publisher_styles = stylesheets_of(&archive, &package, &base);
++    let publisher_styles = stylesheets_of(archive, &package, &base);
+ 
+     let mut builder = Builder::new();
+     name_the_book(&mut builder, &package);
+@@ -238,17 +276,23 @@ pub fn parse(bytes: &[u8]) -> Result<Document, Fault> {
+     if parts == 0 {
+         return Err(Fault::NotABook);
+     }
+-    builder.set_contents(contents_of(&archive, &package, &base, &starts, &anchors));
++    builder.set_contents(contents_of(archive, &package, &base, &starts, &anchors));
+     builder.set_anchors(anchors);
+     builder.set_links(links);
+-    builder.set_images(images_of(&archive, &builder));
++    builder.set_images(images_of(archive, &builder));
+     builder.set_fonts(fonts_of(
+-        &archive,
++        archive,
+         &package,
+         &base,
+         &publisher_styles.font_families,
+     ));
++    let places = if sparse {
++        places_of(archive, &builder)
++    } else {
++        BTreeMap::new()
++    };
+     let mut document = builder.finish();
++    document.places = places;
+     // The formulae the chapters referred to, which no archive member
+     // corresponds to and which nothing has drawn yet.
+     document.formulae = formulae;
+@@ -623,12 +667,12 @@ fn read_ncx(xml: &str, base: &str) -> Vec<(String, String, Option<String>, u8)>
  
  /// The most bytes of pictures carried out of one book.
  ///
@@ -689,7 +769,39 @@ index 1b120a5..8618a04 100644
  
  /// The most bytes one picture may take.
  ///
-@@ -693,7 +693,15 @@ fn strip_toc(xml: &str) -> String {
+@@ -665,6 +709,31 @@ fn images_of(archive: &Archive<'_>, builder: &Builder) -> BTreeMap<String, Vec<u
+     images
+ }
+ 
++/// Where each picture the book refers to is, for those whose bytes were not
++/// read with the rest of it.
++///
++/// No total ceiling, unlike [`images_of`]: nothing here is held, and whatever
++/// draws the pictures reads and drops them one at a time.
++fn places_of(archive: &Archive<'_>, builder: &Builder) -> BTreeMap<String, zip::Location> {
++    let mut places = BTreeMap::new();
++    for block in builder.blocks() {
++        let Block::Picture { name, .. } = block else {
++            continue;
++        };
++        if builder.has_image(name) || places.contains_key(name) {
++            continue;
++        }
++        let Some(place) = archive.locate(name) else {
++            continue;
++        };
++        if place.unpacked() > MAX_ONE_IMAGE_BYTES {
++            continue;
++        }
++        places.insert(name.clone(), place);
++    }
++    places
++}
++
+ /// Removes a table of contents printed into the middle of the book.
+ ///
+ /// A book's contents is navigation, not prose, and the reader now has the real
+@@ -693,7 +762,15 @@ fn strip_toc(xml: &str) -> String {
          let inside = &tail[1..end];
          let name = element_name(inside);
          if !inside.starts_with('/') && is_contents_element(inside) {
@@ -706,7 +818,106 @@ index 1b120a5..8618a04 100644
              continue;
          }
          out.push_str(&tail[..=end]);
-@@ -2096,6 +2104,40 @@ mod tests {
+@@ -1749,6 +1826,98 @@ mod tests {
+         ])
+     }
+ 
++    /// A book with one picture in each chapter, as a large illustrated book
++    /// is in miniature.
++    fn an_illustrated_book() -> Vec<u8> {
++        let package = opf(
++            r#"<itemref idref="one"/><itemref idref="two"/>"#,
++            r#"<item id="one" href="one.xhtml" media-type="application/xhtml+xml"/>
++               <item id="two" href="two.xhtml" media-type="application/xhtml+xml"/>
++               <item id="p1" href="images/1.png" media-type="image/png"/>
++               <item id="p2" href="images/2.jpg" media-type="image/jpeg"/>"#,
++        );
++        archive(&[
++            ("mimetype", b"application/epub+zip"),
++            ("META-INF/container.xml", CONTAINER_XML.as_bytes()),
++            ("OEBPS/book.opf", package.as_bytes()),
++            (
++                "OEBPS/one.xhtml",
++                b"<html><body><h1>One</h1><p>Words.</p><img src=\"images/1.png\" alt=\"a\"/></body></html>",
++            ),
++            ("OEBPS/images/1.png", b"\x89PNG\r\n\x1a\nfirst picture"),
++            (
++                "OEBPS/two.xhtml",
++                b"<html><body><h1>Two</h1><p>More.</p><img src=\"images/2.jpg\" alt=\"b\"/></body></html>",
++            ),
++            ("OEBPS/images/2.jpg", b"\xff\xd8\xffsecond picture"),
++        ])
++    }
++
++    /// What a reader holding only the parts [`needed_to_open`] asks for has.
++    fn needed_parts(bytes: &[u8]) -> zip::Pieces {
++        let whole = Archive::open(bytes).expect("a readable archive");
++        let mut pieces = zip::Pieces::new(bytes.len());
++        let (directory, _) = zip::directory_of(bytes, 0).expect("a directory");
++        pieces.insert(directory, bytes[directory..].to_vec());
++        for (name, place) in whole.locations() {
++            if needed_to_open(name) {
++                pieces.insert(place.at, bytes[place.at..place.end].to_vec());
++            }
++        }
++        pieces
++    }
++
++    #[test]
++    fn a_book_opened_from_its_parts_reads_as_the_whole_one_does() {
++        let bytes = an_illustrated_book();
++        let pieces = needed_parts(&bytes);
++        assert!(pieces.held() < bytes.len());
++        let whole = parse(&bytes).expect("the whole book parses");
++        let parted = parse_pieces(&pieces).expect("the parts parse");
++        assert_eq!(parted.blocks, whole.blocks);
++        assert_eq!(parted.title, whole.title);
++        assert_eq!(parted.contents, whole.contents);
++        assert!(parted.images.is_empty(), "no picture was read");
++        assert_eq!(
++            parted.places.keys().collect::<Vec<_>>(),
++            whole.images.keys().collect::<Vec<_>>()
++        );
++        assert!(whole.places.is_empty(), "a whole book needs no places");
++    }
++
++    #[test]
++    fn a_place_reads_back_as_the_picture_it_names() {
++        let bytes = an_illustrated_book();
++        let whole = parse(&bytes).expect("the whole book parses");
++        let parted = parse_pieces(&needed_parts(&bytes)).expect("the parts parse");
++        for (name, place) in &parted.places {
++            let read = zip::unpack(&bytes[place.at..place.end], place).expect("unpacks");
++            assert_eq!(Some(&read), whole.images.get(name), "{name}");
++        }
++    }
++
++    #[test]
++    fn only_pictures_and_sounds_are_left_on_the_card() {
++        assert!(needed_to_open("OEBPS/book.opf"));
++        assert!(needed_to_open("OEBPS/one.xhtml"));
++        assert!(needed_to_open("OEBPS/fonts/serif.otf"));
++        assert!(needed_to_open("OEBPS/images/diagram.svg"));
++        assert!(needed_to_open("mimetype"));
++        assert!(!needed_to_open("OEBPS/images/1.PNG"));
++        assert!(!needed_to_open("OEBPS/images/plate.jpeg"));
++        assert!(!needed_to_open("OEBPS/audio/reading.mp3"));
++        assert!(needed_to_open("OEBPS/png/readme"));
++    }
++
++    #[test]
++    fn a_book_whose_text_was_not_read_does_not_open() {
++        let bytes = an_illustrated_book();
++        let mut pieces = zip::Pieces::new(bytes.len());
++        let (directory, _) = zip::directory_of(&bytes, 0).expect("a directory");
++        pieces.insert(directory, bytes[directory..].to_vec());
++        assert!(parse_pieces(&pieces).is_err());
++    }
++
+     #[test]
+     fn a_book_comes_back_in_its_reading_order() {
+         let document = parse(&a_book()).expect("a readable book");
+@@ -2096,6 +2265,40 @@ mod tests {
          );
      }
  
@@ -747,6 +958,623 @@ index 1b120a5..8618a04 100644
      #[test]
      fn a_class_that_merely_starts_with_toc_is_not_a_contents() {
          // `class` is a list of words and a contents is one of them. Matching
+diff --git a/crates/kobo-doc/src/lib.rs b/crates/kobo-doc/src/lib.rs
+index 7a43abf..93b1882 100644
+--- a/crates/kobo-doc/src/lib.rs
++++ b/crates/kobo-doc/src/lib.rs
+@@ -506,6 +506,14 @@ pub struct Document {
+     ///
+     /// [`images`]: Document::images
+     pub formulae: BTreeMap<String, String>,
++    /// Where in the archive each picture lives, for a book opened from parts
++    /// of its file rather than all of it ([`epub::parse_pieces`]).
++    ///
++    /// A name here is not in [`images`]: its bytes were never read, and are
++    /// read from `at..end` of the file when the picture is first drawn.
++    ///
++    /// [`images`]: Document::images
++    pub places: BTreeMap<String, zip::Location>,
+     /// Outline fonts embedded by the publisher, keyed by their resolved
+     /// archive name.
+     ///
+@@ -701,6 +709,10 @@ impl Builder {
+     }
+ 
+     /// Records the pictures the book refers to.
++    pub(crate) fn has_image(&self, name: &str) -> bool {
++        self.document.images.contains_key(name)
++    }
++
+     pub(crate) fn set_images(&mut self, images: BTreeMap<String, Vec<u8>>) {
+         self.document.images = images;
+     }
+diff --git a/crates/kobo-doc/src/zip.rs b/crates/kobo-doc/src/zip.rs
+index 4fa657b..5c28dd0 100644
+--- a/crates/kobo-doc/src/zip.rs
++++ b/crates/kobo-doc/src/zip.rs
+@@ -74,21 +74,272 @@ impl std::fmt::Display for Fault {
+ 
+ impl std::error::Error for Fault {}
+ 
+-#[derive(Clone, Copy)]
+-struct Entry {
+-    /// Offset of the *local* header, which is where the data can be found.
+-    at: usize,
++/// Where one member lives in its archive, and how it was packed.
++///
++/// Enough to read the member again later from a copy of `at..end` alone,
++/// which is how a book too large to hold in memory has its pictures read off
++/// the card one at a time.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Location {
++    /// Offset of the member's *local* header.
++    pub at: usize,
++    /// Where the next member's header (or the central directory) begins.
++    /// Everything this member wrote lies in `at..end`.
++    pub end: usize,
+     method: u16,
+     packed: usize,
+     unpacked: usize,
+ }
+ 
+-/// An archive held in memory, with its table of contents read.
++impl Location {
++    /// The size the member claims to unpack to.
++    #[must_use]
++    pub const fn unpacked(&self) -> usize {
++        self.unpacked
++    }
++}
++
++/// Parts of an archive's bytes, each at its offset in the whole.
++///
++/// For an archive too large to load: the end record, the central directory
++/// and the members actually needed are read into this, and the rest is never
++/// held at all.
++#[derive(Clone, Debug, Default)]
++pub struct Pieces {
++    len: usize,
++    parts: BTreeMap<usize, Vec<u8>>,
++}
++
++impl Pieces {
++    /// Nothing yet of an archive `len` bytes long.
++    #[must_use]
++    pub fn new(len: usize) -> Self {
++        Self {
++            len,
++            parts: BTreeMap::new(),
++        }
++    }
++
++    /// The length of the whole archive.
++    #[must_use]
++    pub const fn len(&self) -> usize {
++        self.len
++    }
++
++    /// Whether the whole archive is empty.
++    #[must_use]
++    pub const fn is_empty(&self) -> bool {
++        self.len == 0
++    }
++
++    /// Adds the bytes found at `at`. A part reaching past the end of the
++    /// archive is cut to it.
++    pub fn insert(&mut self, at: usize, mut bytes: Vec<u8>) {
++        let room = self.len.saturating_sub(at);
++        bytes.truncate(room);
++        if bytes.is_empty() {
++            return;
++        }
++        self.parts.insert(at, bytes);
++    }
++
++    /// How many bytes all the parts hold together.
++    #[must_use]
++    pub fn held(&self) -> usize {
++        self.parts.values().map(Vec::len).sum()
++    }
++
++    /// `len` bytes from `at`, when one part holds all of them.
++    fn get(&self, at: usize, len: usize) -> Option<&[u8]> {
++        let end = at.checked_add(len)?;
++        self.parts
++            .range(..=at)
++            .rev()
++            .find_map(|(start, bytes)| bytes.get(at - start..end.checked_sub(*start)?))
++    }
++
++    /// Everything from `at` to the end of the part holding it.
++    fn from(&self, at: usize) -> Option<&[u8]> {
++        self.parts
++            .range(..=at)
++            .rev()
++            .find_map(|(start, bytes)| bytes.get(at - start..))
++            .filter(|rest| !rest.is_empty())
++    }
++}
++
++/// Where an archive's bytes come from: all of it, or the parts that were read.
++#[derive(Clone, Copy)]
++enum Source<'a> {
++    Whole(&'a [u8]),
++    Pieces(&'a Pieces),
++}
++
++impl<'a> Source<'a> {
++    fn get(self, at: usize, len: usize) -> Option<&'a [u8]> {
++        match self {
++            Self::Whole(bytes) => bytes.get(at..at.checked_add(len)?),
++            Self::Pieces(pieces) => pieces.get(at, len),
++        }
++    }
++
++    /// The bytes a member begins with. For a whole archive that is all of
++    /// the rest of it, so a member whose offsets disagree with its
++    /// neighbours' still reads exactly as it always did.
++    fn member(self, location: &Location) -> Option<&'a [u8]> {
++        match self {
++            Self::Whole(bytes) => bytes.get(location.at..),
++            Self::Pieces(pieces) => pieces
++                .get(location.at, location.end.checked_sub(location.at)?)
++                .or_else(|| pieces.from(location.at)),
++        }
++    }
++
++    fn u16_at(self, at: usize) -> Option<u16> {
++        self.get(at, 2).and_then(|field| u16_at(field, 0))
++    }
++
++    fn u32_at(self, at: usize) -> Option<u32> {
++        self.get(at, 4).and_then(|field| u32_at(field, 0))
++    }
++
++    fn end_of_directory(self) -> Option<usize> {
++        match self {
++            Self::Whole(bytes) => find_end_of_directory(bytes),
++            Self::Pieces(pieces) => {
++                let (start, tail) = pieces.parts.iter().next_back()?;
++                if start + tail.len() != pieces.len {
++                    return None;
++                }
++                find_end_of_directory(tail).map(|at| start + at)
++            }
++        }
++    }
++}
++
++/// An archive with its table of contents read.
+ pub struct Archive<'a> {
+-    bytes: &'a [u8],
++    source: Source<'a>,
+     /// Sorted, so that looking for a member by a path that differs only in
+     /// case (which EPUBs written on Windows do) has somewhere to start.
+-    entries: BTreeMap<String, Entry>,
++    entries: BTreeMap<String, Location>,
++}
++
++/// The longest tail of an archive its end record can be found in.
++pub const MAX_TAIL: usize = END_OF_DIRECTORY_LEN + 0xffff;
++
++/// Where the central directory is, found from the archive's last
++/// [`MAX_TAIL`] bytes, read from `tail_at`.
++///
++/// Returns its offset and its length.
++///
++/// # Errors
++///
++/// [`Fault::NotAnArchive`] when the tail holds no end record, and
++/// [`Fault::Damaged`] when the directory it names is not inside the archive.
++pub fn directory_of(tail: &[u8], tail_at: usize) -> Result<(usize, usize), Fault> {
++    let end = find_end_of_directory(tail).ok_or(Fault::NotAnArchive)?;
++    let len = u32_at(tail, end + 12).ok_or(Fault::Damaged)? as usize;
++    let at = u32_at(tail, end + 16).ok_or(Fault::Damaged)? as usize;
++    if at.checked_add(len).is_none_or(|stop| stop > tail_at + end) {
++        return Err(Fault::Damaged);
++    }
++    Ok((at, len))
++}
++
++/// Unpacks a member from bytes beginning at its local header.
++///
++/// # Errors
++///
++/// As [`Archive::read`].
++pub fn unpack(bytes: &[u8], location: &Location) -> Result<Vec<u8>, Fault> {
++    if location.unpacked > MAX_UNPACKED {
++        return Err(Fault::TooLarge);
++    }
++    // The local header repeats the name and the extra field, and its
++    // *lengths* are the authoritative ones: a writer is allowed to put
++    // different extra fields in the two places, so the central directory's
++    // lengths cannot be used to find the data.
++    let from = data_start(bytes)?;
++    let packed = bytes
++        .get(from..from.checked_add(location.packed).ok_or(Fault::Damaged)?)
++        .ok_or(Fault::Damaged)?;
++
++    match location.method {
++        STORED => Ok(packed.to_vec()),
++        DEFLATED => {
++            // The limit is the smaller of what the entry claims and what
++            // is allowed, so a member claiming four gigabytes cannot make
++            // the decompressor reserve four gigabytes before failing.
++            let limit = location.unpacked.clamp(1, MAX_UNPACKED);
++            miniz_oxide::inflate::decompress_to_vec_with_limit(packed, limit)
++                .map_err(|_| Fault::Damaged)
++        }
++        _ => Err(Fault::Unsupported),
++    }
++}
++
++/// Where a member's data begins, from bytes beginning at its local header.
++fn data_start(bytes: &[u8]) -> Result<usize, Fault> {
++    if u32_at(bytes, 0) != Some(LOCAL_HEADER) {
++        return Err(Fault::Damaged);
++    }
++    let name_len = u16_at(bytes, 26).ok_or(Fault::Damaged)? as usize;
++    let extra_len = u16_at(bytes, 28).ok_or(Fault::Damaged)? as usize;
++    Ok(LOCAL_HEADER_LEN + name_len + extra_len)
++}
++
++/// Unpacks at most `want` bytes from the start of a member, given only the
++/// first part of it from its local header on.
++///
++/// Enough to read a picture's header without reading the picture. Returns
++/// fewer than `want` bytes when the part given runs out first.
++///
++/// # Errors
++///
++/// [`Fault::Damaged`] when the header is not a local header or the data does
++/// not inflate, and [`Fault::Unsupported`] for a method other than stored or
++/// deflated.
++pub fn unpack_prefix(bytes: &[u8], location: &Location, want: usize) -> Result<Vec<u8>, Fault> {
++    let from = data_start(bytes)?;
++    let packed = bytes.get(from..).ok_or(Fault::Damaged)?;
++    let packed = &packed[..packed.len().min(location.packed)];
++    let want = want.min(location.unpacked);
++    match location.method {
++        STORED => Ok(packed[..packed.len().min(want)].to_vec()),
++        DEFLATED => {
++            use miniz_oxide::inflate::stream::{inflate, InflateState};
++            use miniz_oxide::{DataFormat, MZError, MZFlush};
++            let mut state = InflateState::new_boxed(DataFormat::Raw);
++            let mut out = vec![0; want];
++            let mut read = 0;
++            let mut written = 0;
++            // Each call may stop short of either end, so keep feeding it
++            // until the input is spent, the output is full, or it ends.
++            while read < packed.len() && written < want {
++                let result = inflate(
++                    &mut state,
++                    &packed[read..],
++                    &mut out[written..],
++                    MZFlush::None,
++                );
++                read += result.bytes_consumed;
++                written += result.bytes_written;
++                match result.status {
++                    Ok(miniz_oxide::MZStatus::StreamEnd) => break,
++                    Ok(_) | Err(MZError::Buf) => {
++                        if result.bytes_consumed == 0 && result.bytes_written == 0 {
++                            break;
++                        }
++                    }
++                    Err(_) => return Err(Fault::Damaged),
++                }
++            }
++            out.truncate(written);
++            Ok(out)
++        }
++        _ => Err(Fault::Unsupported),
++    }
+ }
+ 
+ /// Writes an ordinary ZIP archive whose members are stored without another
+@@ -180,39 +431,54 @@ impl<'a> Archive<'a> {
+     /// [`Fault::Damaged`] when one is found but does not point at a directory
+     /// inside the file.
+     pub fn open(bytes: &'a [u8]) -> Result<Self, Fault> {
+-        let end = find_end_of_directory(bytes).ok_or(Fault::NotAnArchive)?;
+-        let count = u16_at(bytes, end + 10).ok_or(Fault::Damaged)? as usize;
+-        let mut at = u32_at(bytes, end + 16).ok_or(Fault::Damaged)? as usize;
++        Self::read_directory(Source::Whole(bytes))
++    }
++
++    /// Reads the table of contents from the parts of an archive that were
++    /// read. They must include its tail and its central directory; a member
++    /// whose bytes are not among them reads as [`Fault::Damaged`].
++    ///
++    /// # Errors
++    ///
++    /// As [`Archive::open`].
++    pub fn open_pieces(pieces: &'a Pieces) -> Result<Self, Fault> {
++        Self::read_directory(Source::Pieces(pieces))
++    }
++
++    fn read_directory(source: Source<'a>) -> Result<Self, Fault> {
++        let end = source.end_of_directory().ok_or(Fault::NotAnArchive)?;
++        let count = source.u16_at(end + 10).ok_or(Fault::Damaged)? as usize;
++        let directory = source.u32_at(end + 16).ok_or(Fault::Damaged)? as usize;
++        let mut at = directory;
+ 
+         let mut entries = BTreeMap::new();
+         for _ in 0..count.min(MAX_ENTRIES) {
+-            if u32_at(bytes, at) != Some(CENTRAL_HEADER) {
++            if source.u32_at(at) != Some(CENTRAL_HEADER) {
+                 // The count in the record is a claim like any other. Stopping
+                 // at the first thing that is not an entry keeps whatever was
+                 // read before it, which is how a truncated download still
+                 // yields the chapters that did arrive.
+                 break;
+             }
+-            let method = u16_at(bytes, at + 10).ok_or(Fault::Damaged)?;
+-            let packed = u32_at(bytes, at + 20).ok_or(Fault::Damaged)? as usize;
+-            let unpacked = u32_at(bytes, at + 24).ok_or(Fault::Damaged)? as usize;
+-            let name_len = u16_at(bytes, at + 28).ok_or(Fault::Damaged)? as usize;
+-            let extra_len = u16_at(bytes, at + 30).ok_or(Fault::Damaged)? as usize;
+-            let comment_len = u16_at(bytes, at + 32).ok_or(Fault::Damaged)? as usize;
+-            let offset = u32_at(bytes, at + 42).ok_or(Fault::Damaged)? as usize;
++            let method = source.u16_at(at + 10).ok_or(Fault::Damaged)?;
++            let packed = source.u32_at(at + 20).ok_or(Fault::Damaged)? as usize;
++            let unpacked = source.u32_at(at + 24).ok_or(Fault::Damaged)? as usize;
++            let name_len = source.u16_at(at + 28).ok_or(Fault::Damaged)? as usize;
++            let extra_len = source.u16_at(at + 30).ok_or(Fault::Damaged)? as usize;
++            let comment_len = source.u16_at(at + 32).ok_or(Fault::Damaged)? as usize;
++            let offset = source.u32_at(at + 42).ok_or(Fault::Damaged)? as usize;
+ 
+             let name_at = at + CENTRAL_HEADER_LEN;
+-            let name = bytes
+-                .get(name_at..name_at + name_len)
+-                .ok_or(Fault::Damaged)?;
++            let name = source.get(name_at, name_len).ok_or(Fault::Damaged)?;
+             // A member name is text in the archive's own encoding. It is only
+             // ever compared against names from the archive's own manifest, so
+             // an unrepresentable byte matters less than refusing the book.
+             let name = String::from_utf8_lossy(name).into_owned();
+             entries.insert(
+                 normalise(&name),
+-                Entry {
++                Location {
+                     at: offset,
++                    end: directory,
+                     method,
+                     packed,
+                     unpacked,
+@@ -220,7 +486,33 @@ impl<'a> Archive<'a> {
+             );
+             at = name_at + name_len + extra_len + comment_len;
+         }
+-        Ok(Self { bytes, entries })
++        // Each member ends where the next one begins. Members are written one
++        // after another, so the next header along bounds this one's data and
++        // anything a writer put after it.
++        let starts: std::collections::BTreeSet<usize> =
++            entries.values().map(|location| location.at).collect();
++        for location in entries.values_mut() {
++            location.end = starts
++                .range(location.at + 1..)
++                .next()
++                .copied()
++                .unwrap_or(directory)
++                .max(location.at);
++        }
++        Ok(Self { source, entries })
++    }
++
++    /// Where a member is, without reading it.
++    #[must_use]
++    pub fn locate(&self, name: &str) -> Option<Location> {
++        self.entries.get(&normalise(name)).copied()
++    }
++
++    /// Every member's name and place, in name order.
++    pub fn locations(&self) -> impl Iterator<Item = (&str, Location)> {
++        self.entries
++            .iter()
++            .map(|(name, location)| (name.as_str(), *location))
+     }
+ 
+     /// Every member's name, in order.
+@@ -237,37 +529,12 @@ impl<'a> Archive<'a> {
+     /// does not know, and [`Fault::TooLarge`] when it claims to unpack past
+     /// `MAX_UNPACKED`.
+     pub fn read(&self, name: &str) -> Result<Vec<u8>, Fault> {
+-        let entry = *self.entries.get(&normalise(name)).ok_or(Fault::Damaged)?;
+-        if entry.unpacked > MAX_UNPACKED {
++        let location = self.locate(name).ok_or(Fault::Damaged)?;
++        if location.unpacked > MAX_UNPACKED {
+             return Err(Fault::TooLarge);
+         }
+-        // The local header repeats the name and the extra field, and its
+-        // *lengths* are the authoritative ones: a writer is allowed to put
+-        // different extra fields in the two places, so the central directory's
+-        // lengths cannot be used to find the data.
+-        if u32_at(self.bytes, entry.at) != Some(LOCAL_HEADER) {
+-            return Err(Fault::Damaged);
+-        }
+-        let name_len = u16_at(self.bytes, entry.at + 26).ok_or(Fault::Damaged)? as usize;
+-        let extra_len = u16_at(self.bytes, entry.at + 28).ok_or(Fault::Damaged)? as usize;
+-        let from = entry.at + LOCAL_HEADER_LEN + name_len + extra_len;
+-        let packed = self
+-            .bytes
+-            .get(from..from.checked_add(entry.packed).ok_or(Fault::Damaged)?)
+-            .ok_or(Fault::Damaged)?;
+-
+-        match entry.method {
+-            STORED => Ok(packed.to_vec()),
+-            DEFLATED => {
+-                // The limit is the smaller of what the entry claims and what
+-                // is allowed, so a member claiming four gigabytes cannot make
+-                // the decompressor reserve four gigabytes before failing.
+-                let limit = entry.unpacked.clamp(1, MAX_UNPACKED);
+-                miniz_oxide::inflate::decompress_to_vec_with_limit(packed, limit)
+-                    .map_err(|_| Fault::Damaged)
+-            }
+-            _ => Err(Fault::Unsupported),
+-        }
++        let bytes = self.source.member(&location).ok_or(Fault::Damaged)?;
++        unpack(bytes, &location)
+     }
+ }
+ 
+@@ -494,4 +761,155 @@ pub(crate) mod tests {
+             }
+         }
+     }
++
++    /// The tail, the directory and the named members of `bytes`, and nothing
++    /// else, as a book too large to load would be read.
++    fn sparse(bytes: &[u8], wanted: &[&str]) -> Pieces {
++        let tail_at = bytes.len().saturating_sub(MAX_TAIL);
++        let (at, len) = directory_of(&bytes[tail_at..], tail_at).expect("a directory");
++        let mut pieces = Pieces::new(bytes.len());
++        pieces.insert(at, bytes[at..at + len].to_vec());
++        pieces.insert(
++            tail_at.max(at + len),
++            bytes[tail_at.max(at + len)..].to_vec(),
++        );
++        let whole = Archive::open(bytes).expect("a readable archive");
++        for name in wanted {
++            let place = whole.locate(name).expect("a member");
++            pieces.insert(place.at, bytes[place.at..place.end].to_vec());
++        }
++        pieces
++    }
++
++    #[test]
++    fn a_member_reads_from_its_own_bytes_alone() {
++        let bytes = archive(&[("a", b"first"), ("b", b"second"), ("c", b"third")]);
++        let pieces = sparse(&bytes, &["b"]);
++        assert!(pieces.held() < bytes.len());
++        let opened = Archive::open_pieces(&pieces).expect("a readable directory");
++        assert_eq!(opened.names().count(), 3);
++        assert_eq!(opened.read("b").expect("held"), b"second");
++        // A member that was never read is not there to unpack.
++        assert_eq!(opened.read("a").unwrap_err(), Fault::Damaged);
++    }
++
++    #[test]
++    fn a_location_unpacks_from_a_later_read() {
++        let bytes = archive(&[("a", b"first"), ("b", b"second")]);
++        let pieces = sparse(&bytes, &[]);
++        let opened = Archive::open_pieces(&pieces).expect("a readable directory");
++        let place = opened.locate("B").expect("found by folded name");
++        assert_eq!(place.unpacked(), 6);
++        assert_eq!(
++            unpack(&bytes[place.at..place.end], &place).expect("unpacks"),
++            b"second"
++        );
++    }
++
++    #[test]
++    fn each_member_ends_where_the_next_begins() {
++        let bytes = archive(&[("a", b"first"), ("b", b"second")]);
++        let opened = Archive::open(&bytes).expect("a readable archive");
++        let a = opened.locate("a").expect("a");
++        let b = opened.locate("b").expect("b");
++        assert_eq!(a.end, b.at);
++        let (directory, _) = directory_of(&bytes, 0).expect("a directory");
++        assert_eq!(b.end, directory);
++    }
++
++    #[test]
++    fn pieces_without_the_tail_are_not_an_archive() {
++        let bytes = archive(&[("a", b"first")]);
++        let mut pieces = Pieces::new(bytes.len());
++        pieces.insert(0, bytes[..bytes.len() - 1].to_vec());
++        assert_eq!(
++            Archive::open_pieces(&pieces).err(),
++            Some(Fault::NotAnArchive)
++        );
++    }
++
++    #[test]
++    fn pieces_find_a_range_inside_any_part() {
++        let mut pieces = Pieces::new(100);
++        pieces.insert(10, vec![1; 20]);
++        pieces.insert(20, vec![2; 30]);
++        pieces.insert(90, vec![3; 50]);
++        assert_eq!(pieces.get(12, 5), Some(&[1u8; 5][..]));
++        assert_eq!(pieces.get(25, 25), Some(&[2u8; 25][..]));
++        assert_eq!(pieces.get(5, 10), None);
++        assert_eq!(pieces.get(45, 10), None);
++        // Cut at the end of the whole.
++        assert_eq!(pieces.held(), 60);
++    }
++
++    /// A member's local header followed by `packed`, as the card holds it.
++    fn local(method: u16, packed: &[u8]) -> Vec<u8> {
++        let mut out = Vec::new();
++        out.extend_from_slice(&LOCAL_HEADER.to_le_bytes());
++        out.extend_from_slice(&[0; 4]);
++        out.extend_from_slice(&method.to_le_bytes());
++        out.extend_from_slice(&[0; 16]);
++        out.extend_from_slice(&1u16.to_le_bytes()); // 26 name
++        out.extend_from_slice(&3u16.to_le_bytes()); // 28 extra
++        out.extend_from_slice(b"pxyz");
++        out.extend_from_slice(packed);
++        out
++    }
++
++    #[test]
++    fn the_start_of_a_member_unpacks_from_the_start_of_its_bytes() {
++        let body: Vec<u8> = (0..200_000u32).map(|n| (n * 7 % 251) as u8).collect();
++        let deflated = miniz_oxide::deflate::compress_to_vec(&body, 6);
++        for (method, packed) in [(STORED, body.clone()), (DEFLATED, deflated)] {
++            let bytes = local(method, &packed);
++            let place = Location {
++                at: 0,
++                end: bytes.len(),
++                method,
++                packed: packed.len(),
++                unpacked: body.len(),
++            };
++            let cut = &bytes[..bytes.len() / 2];
++            assert_eq!(
++                unpack_prefix(cut, &place, 4096).expect("a prefix"),
++                &body[..4096],
++                "method {method}"
++            );
++            // Asking for more than the part holds gives what it holds.
++            let some = unpack_prefix(&bytes[..600], &place, 4096).expect("a little");
++            assert!(!some.is_empty(), "method {method}");
++            assert!(method != STORED || some.len() < 600);
++            assert_eq!(some, &body[..some.len()]);
++            // And never more than the member is.
++            assert_eq!(
++                unpack_prefix(&bytes, &place, usize::MAX)
++                    .expect("all")
++                    .len(),
++                body.len()
++            );
++        }
++        assert_eq!(
++            unpack_prefix(
++                b"not a header at all, no",
++                &Location {
++                    at: 0,
++                    end: 0,
++                    method: STORED,
++                    packed: 0,
++                    unpacked: 0,
++                },
++                1
++            )
++            .err(),
++            Some(Fault::Damaged)
++        );
++    }
++
++    #[test]
++    fn a_damaged_directory_offset_is_refused() {
++        let mut bytes = archive(&[("a", b"first")]);
++        let end = bytes.len() - END_OF_DIRECTORY_LEN;
++        bytes[end + 16..end + 20].copy_from_slice(&u32::MAX.to_le_bytes());
++        assert_eq!(directory_of(&bytes, 0).err(), Some(Fault::Damaged));
++    }
+ }
 diff --git a/crates/kobo-frame-plan/src/lib.rs b/crates/kobo-frame-plan/src/lib.rs
 index dbea710..73542f4 100644
 --- a/crates/kobo-frame-plan/src/lib.rs
