@@ -133,7 +133,11 @@ AAPT2=$build_tools/aapt2 bash "$root/scripts/android-apk-check.sh" "$built" || {
   echo "android-apk: the built APK failed its checks; not signing it" >&2
   exit 1
 }
-debuggable=$("$build_tools/aapt2" dump xmltree --file AndroidManifest.xml "$built" | grep -c 'android:debuggable.*=true' || true)
+manifest=$("$build_tools/aapt2" dump xmltree --file AndroidManifest.xml "$built") || {
+  echo "android-apk: could not read the manifest of $built; not signing it" >&2
+  exit 1
+}
+debuggable=$(printf '%s\n' "$manifest" | grep -c 'android:debuggable.*=true' || true)
 echo "android-apk: gradle $assemble built $(basename "$built") debuggable=$debuggable" >&2
 if [ "$profile" = release ] && [ "$debuggable" != 0 ]; then
   echo "android-apk: the release APK is debuggable; refusing to sign it" >&2
