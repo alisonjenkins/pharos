@@ -457,3 +457,51 @@ fn a_home_cover_never_stands_in_on_a_shelf() {
         "the shelf asks for a cover sized to its own tiles"
     );
 }
+
+#[test]
+fn back_from_a_long_shelf_finds_the_home_covers_still_held() {
+    let (mut runner, _) = opened();
+    let commands = runner.store_result(StoreResult::Loaded {
+        key: ACCOUNT_KEY.to_owned(),
+        value: Some(account().encode()),
+    });
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
+    let mut all = commands.clone();
+    all.extend(runner.task_outcome(views, ok(VIEWS)));
+    all.extend(runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    }));
+    let described = runner.task_outcome(resume, ok(RESUMED));
+    all.extend(described.clone());
+    for album in ["al1", "al9"] {
+        let (task, _) = asked(&described, &format!("/Users/u1/Items/{album}")).expect("asked");
+        all.extend(runner.task_outcome(
+            task,
+            ok(&format!(
+                r#"{{"Id":"{album}","Name":"{album}","ImageTags":{{"Primary":"c-{album}"}}}}"#
+            )),
+        ));
+    }
+    for (task, _) in cover_tasks(&all) {
+        let reply = runner.task_outcome(task, cover_bytes());
+        let _ = answer_cancels(&mut runner, &reply);
+    }
+    let opened = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&opened, "ParentId=lib-music").expect("albums");
+    let mut commands = runner.task_outcome(albums, ok(&album_block(0, 100, 100)));
+    for _ in 0..6 {
+        let (last, _) = settle(&mut runner, commands);
+        let _ = answer_cancels(&mut runner, &last);
+        commands = runner.action(action_id("page-next"));
+    }
+    let _ = settle(&mut runner, commands);
+    let back = runner.action(ActionId::BACK);
+    let text = screen_text(&last_screen(&back).expect("home at once"));
+    assert_eq!(
+        text.matches("picture: Some").count(),
+        2,
+        "home is drawn with its covers, not bare (B1458): {text}"
+    );
+}

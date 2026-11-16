@@ -539,12 +539,15 @@ impl Pharos {
     fn refresh_covers(&mut self, context: &mut Context) {
         let (wanted, per_page) = self.wanted_covers(context);
         self.covers.set_capacity(MIN_COVERS.max(per_page * 3));
-        // What is on show and what is playing keep their covers.
+        // What is on show and what is playing keep their covers, and so does
+        // the home screen, so Back finds them drawn instead of drawing home
+        // bare and again as they come back (B1458).
         let pinned = self
             .album
             .iter()
             .chain(self.playing.iter().map(|playing| &playing.album))
             .map(|album| album.id.clone())
+            .chain(self.home_covers(context).into_iter().map(|(id, _)| id))
             .collect();
         self.covers.set_pinned(pinned);
         // Last wanted first, so the page showing is the newest and the last
