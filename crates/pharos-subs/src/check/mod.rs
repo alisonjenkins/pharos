@@ -4,3 +4,4 @@
 //! does the aligner calls and storage.
 
 pub mod lang;
+pub mod probes;
