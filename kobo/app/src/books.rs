@@ -7,6 +7,7 @@
 //! never holds; the Quick Connect token it does hold works on `/Items`.
 
 use crate::api::{query_escape, Account, PAGE};
+use crate::filters::Narrow;
 use kobo_json::{ObjectBuilder, Value};
 
 /// The store key of the downloaded-books record.
@@ -133,17 +134,30 @@ pub struct BookPage {
     pub total: usize,
 }
 
-/// Books in every library the user can see, by name. `People` carries the
-/// author, `Path` the file's extension and `Overview` the description.
-/// `IsReadable=true` leaves out the books no client can open, a Kindle book
-/// locked with DRM among them, so they are never offered (V1449).
+/// Books in every library the user can see, narrowed and ordered by
+/// `narrow` (V1451). `People` carries the author, `Path` the file's extension
+/// and `Overview` the description. Books no client can open, a Kindle book
+/// locked with DRM among them, are always left out (V1449). Only downloaded
+/// books are `downloaded`, the ids of the books on this reader.
 #[must_use]
-pub fn list_url(server: &str, account: &Account, start: usize) -> String {
+pub fn list_url(
+    server: &str,
+    account: &Account,
+    start: usize,
+    narrow: &Narrow,
+    downloaded: &[&str],
+) -> String {
+    let ids = if narrow.downloaded {
+        let ids: Vec<String> = downloaded.iter().map(|id| query_escape(id)).collect();
+        format!("&Ids={}", ids.join(","))
+    } else {
+        String::new()
+    };
     format!(
-        "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true&IsReadable=true\
-         &SortBy=SortName&SortOrder=Ascending&Fields=Path,People,Overview\
-         &StartIndex={start}&Limit={PAGE}",
-        query_escape(&account.user_id)
+        "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true&{}\
+         &Fields=Path,People,Overview{ids}&StartIndex={start}&Limit={PAGE}",
+        query_escape(&account.user_id),
+        narrow.query(),
     )
 }
 
@@ -424,7 +438,7 @@ mod tests {
 
     #[test]
     fn the_listing_asks_for_books_by_name_with_authors_and_paths() {
-        let url = list_url("https://p.test", &account(), 50);
+        let url = list_url("https://p.test", &account(), 50, &Narrow::default(), &[]);
         assert!(url.starts_with("https://p.test/Users/u1/Items?"));
         assert!(url.contains("IncludeItemTypes=Book"));
         assert!(
@@ -434,6 +448,20 @@ mod tests {
         assert!(url.contains("SortBy=SortName&SortOrder=Ascending"));
         assert!(url.contains("Fields=Path,People,Overview"));
         assert!(url.contains("StartIndex=50&Limit=50"));
+    }
+
+    #[test]
+    fn a_narrowed_listing_carries_its_filters_and_downloaded_ids() {
+        let narrow = Narrow {
+            downloaded: true,
+            read: crate::filters::ReadState::Unread,
+            ..Narrow::default()
+        };
+        let url = list_url("https://p.test", &account(), 0, &narrow, &["b1", "b 2"]);
+        assert!(url.contains("&IsReadable=true&IsPlayed=false&"), "{url}");
+        assert!(url.contains("&Ids=b1,b%202&"), "{url}");
+        let all = list_url("https://p.test", &account(), 0, &Narrow::default(), &["b1"]);
+        assert!(!all.contains("Ids="), "only Downloaded names ids: {all}");
     }
 
     #[test]
