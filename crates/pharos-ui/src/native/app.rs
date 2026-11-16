@@ -2559,8 +2559,11 @@ fn Screen(route: Route) -> Element {
             rsx! { SettingsLayout { current: Section::OfflineMusic, super::offline_view::OfflineMusicSettings {} } }
         }
         Route::OfflineMusic => rsx! { NotFoundView { path: Route::OfflineMusic.path() } },
-        Route::Downloads if offline_store().is_some() => {
-            rsx! { super::offline_view::DownloadsScreen {} }
+        Route::Downloads if offline_store().is_some() || super::ports::video_store().is_some() => {
+            rsx! {
+                super::offline_view::DownloadsScreen {}
+                super::kept_video_view::VideoDownloads {}
+            }
         }
         Route::Downloads => rsx! { NotFoundView { path: Route::Downloads.path() } },
         Route::Find => rsx! { FindScreen {} },
