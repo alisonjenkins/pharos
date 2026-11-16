@@ -401,7 +401,7 @@ pub fn on_back_at_root(on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
 /// Send the app to the background (`Activity.moveTaskToBack`), as Back at
 /// the first page does in any Android app.
 fn leave_app() {
-    let left = (|| -> Result<(), String> {
+    let left: Result<(), String> = {
         let ctx = ndk_context::android_context();
         // SAFETY: tao put the process's JavaVM and the activity in the
         // context at start-up, and both live as long as the app.
@@ -418,7 +418,7 @@ fn leave_app() {
             Ok(())
         })
         .map_err(|e| e.to_string())
-    })();
+    };
     match left {
         Ok(()) => log::info!("pharos: back at root action=leave"),
         Err(e) => log::warn!("pharos: back at root leave failed error={e}"),
