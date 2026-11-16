@@ -135,6 +135,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "Cache",
     "CacheStorage",
     "Response",
+    "Headers",
     "StorageManager",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
