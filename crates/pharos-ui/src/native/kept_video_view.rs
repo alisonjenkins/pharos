@@ -5,6 +5,7 @@
 //! [`VideoStore`].
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
@@ -196,9 +197,12 @@ fn use_user() -> Option<String> {
 
 /// The user's videos, re-read every [`POLL_MS`] while the component lives.
 fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
+    // Each render hands the poller the user as it is now.
+    let current = use_hook(|| Rc::new(RefCell::new(user.clone())));
+    *current.borrow_mut() = user;
     let read = {
-        let user = user.clone();
-        move || match (video_store(), &user) {
+        let current = Rc::clone(&current);
+        move || match (video_store(), current.borrow().as_deref()) {
             (Some(store), Some(user)) => store.videos(user),
             _ => Vec::new(),
         }
