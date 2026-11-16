@@ -2136,6 +2136,60 @@ pub trait SubtitleStylingStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Option<SubtitleSignalsRow>>> + Send;
 }
 
+/// One subtitle track's check against its video (spec 040). Keyed by item and
+/// `source_key` (`stream:<index>` for an embedded stream, `sidecar:<hash>` for
+/// a sidecar file, so a new sidecar beside it does not move the key). The
+/// signature fields are what the check read; a mismatch, or an older
+/// `check_version`, means the track is checked again (FR-015).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtitleCheckRow {
+    pub item_id: MediaId,
+    pub source_key: String,
+    pub source_mtime: i64,
+    pub source_size: u64,
+    /// The sidecar file's signature; `None` for an embedded stream.
+    pub sidecar_mtime: Option<i64>,
+    pub sidecar_size: Option<u64>,
+    pub check_version: u32,
+    /// `fits`, `retimed`, `wrong_video`, `segmented` or `unknown`; `None`
+    /// while an aligner failure waits for its retry (FR-015a).
+    pub verdict: Option<String>,
+    /// The reason with its numbers, or the last aligner error while pending.
+    pub reason: String,
+    /// The correction for a `retimed` track.
+    pub offset_ms: Option<i64>,
+    pub ratio: Option<f64>,
+    /// Every probe and decoy score per candidate tried, opaque to the store.
+    pub scores_json: Option<String>,
+    /// Aligner failures so far (FR-015a).
+    pub attempts: u32,
+    /// Not before this unix second, while `verdict` is `None`.
+    pub retry_at: Option<i64>,
+    pub checked_at: i64,
+}
+
+/// Storage for [`SubtitleCheckRow`]s. Split from [`MediaStore`] like
+/// [`SubtitleStylingStore`].
+pub trait SubtitleCheckStore: Send + Sync {
+    /// Upsert by `(item_id, source_key)`.
+    fn put_subtitle_check(
+        &self,
+        row: SubtitleCheckRow,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// The item's rows, ordered by `source_key`.
+    fn subtitle_checks(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SubtitleCheckRow>>> + Send;
+
+    /// Every row with `scores_json` always `None`, for the backfill to skip
+    /// finished tracks.
+    fn subtitle_check_index(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SubtitleCheckRow>>> + Send;
+}
+
 /// T70 — playlists as first-class, user-owned, ordered item containers.
 /// Split from [`MediaStore`] like [`CollectionStore`] so in-memory test
 /// stores that only round-trip items don't have to implement the join.
