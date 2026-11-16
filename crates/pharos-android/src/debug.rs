@@ -13,10 +13,10 @@
 use std::sync::Mutex;
 
 use jni::objects::{JObject, JValue};
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 
 use crate::receiver::{self, Registered};
-use crate::{guarded, jerr, log, LIBRARY, R};
+use crate::{guarded_native, jerr, log, LIBRARY, R};
 
 pub const ACTION: &str = "com.alisonjenkins.pharos.auto.DEBUG_OFFLINE";
 /// `Context.RECEIVER_EXPORTED` (API 33): the shell's broadcasts reach it.
@@ -26,7 +26,7 @@ pub const SENDER_PERMISSION: &str = "android.permission.DUMP";
 
 static RECEIVER: Mutex<Option<Registered>> = Mutex::new(None);
 
-pub fn register(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+pub fn register(env: &mut Env, ctx: &JObject) -> R<()> {
     let mut guard = RECEIVER
         .lock()
         .map_err(|_| "debug receiver mutex poisoned".to_owned())?;
@@ -47,7 +47,7 @@ pub fn register(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     Ok(())
 }
 
-pub fn unregister(env: &mut JNIEnv) -> R<()> {
+pub fn unregister(env: &mut Env) -> R<()> {
     let taken = RECEIVER
         .lock()
         .map_err(|_| "debug receiver mutex poisoned".to_owned())?
@@ -59,12 +59,12 @@ pub fn unregister(env: &mut JNIEnv) -> R<()> {
     Ok(())
 }
 
-fn has_extra(env: &mut JNIEnv, intent: &JObject, name: &str) -> R<bool> {
+fn has_extra(env: &mut Env, intent: &JObject, name: &str) -> R<bool> {
     let key = JObject::from(env.new_string(name).map_err(jerr("extra name"))?);
     env.call_method(
         intent,
-        "hasExtra",
-        "(Ljava/lang/String;)Z",
+        jni::jni_str!("hasExtra"),
+        jni::jni_sig!("(Ljava/lang/String;)Z"),
         &[JValue::Object(&key)],
     )
     .and_then(|v| v.z())
@@ -73,12 +73,12 @@ fn has_extra(env: &mut JNIEnv, intent: &JObject, name: &str) -> R<bool> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosDebugReceiver_onReceive<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _ctx: JObject<'l>,
     intent: JObject<'l>,
 ) {
-    guarded(&mut env, "debug onReceive", (), |env| {
+    guarded_native(&mut env, "debug onReceive", (), |env| {
         let Some(lib) = LIBRARY.get() else {
             log("debug: no library, ignored");
             return Ok(());
@@ -89,9 +89,9 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosDebugReceiver_on
             let on = env
                 .call_method(
                     &intent,
-                    "getBooleanExtra",
-                    "(Ljava/lang/String;Z)Z",
-                    &[JValue::Object(&key), JValue::Bool(0)],
+                    jni::jni_str!("getBooleanExtra"),
+                    jni::jni_sig!("(Ljava/lang/String;Z)Z"),
+                    &[JValue::Object(&key), JValue::Bool(false)],
                 )
                 .and_then(|v| v.z())
                 .map_err(jerr("getBooleanExtra(on)"))?;
@@ -103,8 +103,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosDebugReceiver_on
             let cap = env
                 .call_method(
                     &intent,
-                    "getLongExtra",
-                    "(Ljava/lang/String;J)J",
+                    jni::jni_str!("getLongExtra"),
+                    jni::jni_sig!("(Ljava/lang/String;J)J"),
                     &[JValue::Object(&key), JValue::Long(-1)],
                 )
                 .and_then(|v| v.j())

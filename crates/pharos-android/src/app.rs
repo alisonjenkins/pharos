@@ -51,9 +51,13 @@ pub fn library() -> Option<&'static content::Library> {
 /// Starts the media service, so its `onCreate` sets up the runtime the app's
 /// commands need. Call it while the activity is in the foreground: a
 /// background start throws. Safe to repeat; a running service ignores it.
-pub fn start_service(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+pub fn start_service(env: &mut Env, ctx: &JObject) -> R<()> {
     let intent = env
-        .new_object("android/content/Intent", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/content/Intent"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("Intent"))?;
     let name = JObject::from(
         env.new_string(SERVICE_CLASS)
@@ -61,16 +65,16 @@ pub fn start_service(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     );
     env.call_method(
         &intent,
-        "setClassName",
-        "(Landroid/content/Context;Ljava/lang/String;)Landroid/content/Intent;",
+        jni::jni_str!("setClassName"),
+        jni::jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Landroid/content/Intent;"),
         &[JValue::Object(ctx), JValue::Object(&name)],
     )
     .map_err(jerr("Intent.setClassName"))?;
     let started = env
         .call_method(
             ctx,
-            "startService",
-            "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+            jni::jni_str!("startService"),
+            jni::jni_sig!("(Landroid/content/Intent;)Landroid/content/ComponentName;"),
             &[JValue::Object(&intent)],
         )
         .and_then(|v| v.l())
@@ -128,9 +132,13 @@ impl NotificationAsk {
 /// Asks for `POST_NOTIFICATIONS` when the system needs it and it is not yet
 /// granted, so the playback notification shows. `activity` must be an
 /// Activity; the system shows its own dialog.
-pub fn ask_notification_permission(env: &mut JNIEnv, activity: &JObject) -> R<NotificationAsk> {
+pub fn ask_notification_permission(env: &mut Env, activity: &JObject) -> R<NotificationAsk> {
     let sdk = env
-        .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+        .get_static_field(
+            jni::jni_str!("android/os/Build$VERSION"),
+            jni::jni_str!("SDK_INT"),
+            jni::jni_sig!("I"),
+        )
         .and_then(|v| v.i())
         .map_err(jerr("SDK_INT"))?;
     let ask = if sdk < TIRAMISU {
@@ -143,8 +151,8 @@ pub fn ask_notification_permission(env: &mut JNIEnv, activity: &JObject) -> R<No
         let granted = env
             .call_method(
                 activity,
-                "checkSelfPermission",
-                "(Ljava/lang/String;)I",
+                jni::jni_str!("checkSelfPermission"),
+                jni::jni_sig!("(Ljava/lang/String;)I"),
                 &[JValue::Object(&name)],
             )
             .and_then(|v| v.i())
@@ -153,12 +161,12 @@ pub fn ask_notification_permission(env: &mut JNIEnv, activity: &JObject) -> R<No
             NotificationAsk::AlreadyGranted
         } else {
             let names = env
-                .new_object_array(1, "java/lang/String", &name)
+                .new_object_array(1, jni::jni_str!("java/lang/String"), &name)
                 .map_err(jerr("permission array"))?;
             env.call_method(
                 activity,
-                "requestPermissions",
-                "([Ljava/lang/String;I)V",
+                jni::jni_str!("requestPermissions"),
+                jni::jni_sig!("([Ljava/lang/String;I)V"),
                 &[JValue::Object(&names), JValue::Int(NOTIFICATION_REQUEST)],
             )
             .map_err(jerr("requestPermissions"))?;

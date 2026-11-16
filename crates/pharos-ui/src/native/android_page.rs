@@ -405,12 +405,18 @@ fn leave_app() {
         let ctx = ndk_context::android_context();
         // SAFETY: tao put the process's JavaVM and the activity in the
         // context at start-up, and both live as long as the app.
-        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
-        let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
-        let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-        env.call_method(&activity, "moveTaskToBack", "(Z)Z", &[true.into()])
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+        vm.attach_current_thread_for_scope(|env| -> Result<(), jni::errors::Error> {
+            let activity = unsafe { jni::objects::JObject::from_raw(env, ctx.context().cast()) };
+            env.call_method(
+                &activity,
+                jni::jni_str!("moveTaskToBack"),
+                jni::jni_sig!("(Z)Z"),
+                &[true.into()],
+            )?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
     })();
     match left {
         Ok(()) => log::info!("pharos: back at root action=leave"),

@@ -125,7 +125,7 @@ pub(crate) fn play_from(id: &str) -> Command {
     }
 }
 
-pub(crate) fn apply(env: &mut JNIEnv, command: Command, source: Source) -> R<()> {
+pub(crate) fn apply(env: &mut Env, command: Command, source: Source) -> R<()> {
     let name = command.label();
     let from = source.label();
     match command {
@@ -270,12 +270,12 @@ pub(crate) fn set_volume(level: f32) -> f32 {
 
 /// `MediaPlayer.setVolume` with the stored level on both channels, lowered
 /// while another app has ducked us.
-pub(crate) fn apply_volume(env: &mut JNIEnv, player: &JObject) -> R<()> {
+pub(crate) fn apply_volume(env: &mut Env, player: &JObject) -> R<()> {
     let level = volume() * focus::duck_factor();
     env.call_method(
         player,
-        "setVolume",
-        "(FF)V",
+        jni::jni_str!("setVolume"),
+        jni::jni_sig!("(FF)V"),
         &[JValue::Float(level), JValue::Float(level)],
     )
     .map_err(jerr("setVolume"))?;
@@ -284,7 +284,7 @@ pub(crate) fn apply_volume(env: &mut JNIEnv, player: &JObject) -> R<()> {
 
 /// Seeks the prepared player to `ms`; a seek while paused stays paused, as
 /// the car's progress bar runs only at PLAYING.
-pub(crate) fn seek(env: &mut JNIEnv, ms: u64) -> R<()> {
+pub(crate) fn seek(env: &mut Env, ms: u64) -> R<()> {
     let guard = state_lock()?;
     let Some(st) = guard.as_ref() else {
         return Ok(());
@@ -299,10 +299,20 @@ pub(crate) fn seek(env: &mut JNIEnv, ms: u64) -> R<()> {
     }
     drop(guard);
     let to = i32::try_from(ms).unwrap_or(i32::MAX);
-    env.call_method(player.as_obj(), "seekTo", "(I)V", &[JValue::Int(to)])
-        .map_err(jerr("seekTo"))?;
+    env.call_method(
+        player.as_obj(),
+        jni::jni_str!("seekTo"),
+        jni::jni_sig!("(I)V"),
+        &[JValue::Int(to)],
+    )
+    .map_err(jerr("seekTo"))?;
     let playing = env
-        .call_method(player.as_obj(), "isPlaying", "()Z", &[])
+        .call_method(
+            player.as_obj(),
+            jni::jni_str!("isPlaying"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )
         .and_then(|v| v.z())
         .map_err(jerr("isPlaying"))?;
     let state = if playing { STATE_PLAYING } else { STATE_PAUSED };
