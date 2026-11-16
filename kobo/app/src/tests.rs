@@ -302,9 +302,30 @@ fn signing_out_stops_playback_and_forgets_the_account() {
     let _ = runner.action(ActionId::BACK);
     let _ = runner.action(ActionId::BACK);
     let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(action_id("home-menu"));
     let commands = runner.action(action_id("sign-out"));
     assert!(asked(&commands, "/Sessions/Playing/Stopped").is_some());
     assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::Store(StoreRequest::Forget { key }) if key == ACCOUNT_KEY
+    )));
+}
+
+#[test]
+fn sign_out_is_behind_the_home_menu() {
+    let (mut runner, commands) = home();
+    let screen = last_screen(&commands).expect("a home screen");
+    assert!(!screen_text(&screen).contains("Sign out"));
+
+    let commands = runner.action(action_id("home-menu"));
+    let screen = last_screen(&commands).expect("the menu");
+    assert!(screen_text(&screen).contains("Sign out"));
+
+    let commands = runner.action(ActionId::BACK);
+    let screen = last_screen(&commands).expect("home again");
+    assert!(!screen_text(&screen).contains("Sign out"));
+    assert!(screen_text(&screen).contains("Music"));
+    assert!(!commands.iter().any(|command| matches!(
         command,
         Command::Store(StoreRequest::Forget { key }) if key == ACCOUNT_KEY
     )));
