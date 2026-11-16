@@ -1675,7 +1675,8 @@ pub fn TitleView(
     /// Hears a new pick from the Version select.
     #[props(default)]
     on_version: Option<EventHandler<String>>,
-    /// Keep offline / Remove from device, for a book (browser only).
+    /// A book's Keep offline / Remove from device (browser only), or a
+    /// video's Download control (where a video store is registered).
     #[props(default)]
     keep: Option<Element>,
 ) -> Element {
@@ -1809,6 +1810,11 @@ pub fn TitleView(
                             download: "",
                             "Download"
                         }
+                        if let Some(keep) = keep.clone() {
+                            {keep}
+                        }
+                    }
+                    if book.is_none() {
                         if let Some(keep) = keep.clone() {
                             {keep}
                         }
@@ -3622,6 +3628,21 @@ mod tests {
     fn between<'a>(html: &'a str, from: &str, to: &str) -> &'a str {
         let rest = html.split_once(from).map_or("", |(_, r)| r);
         rest.split_once(to).map_or(rest, |(inner, _)| inner)
+    }
+
+    /// The Download control rides the film's actions through the `keep`
+    /// slot, and a title with no slot has none.
+    #[test]
+    fn a_films_keep_slot_draws_in_its_actions() {
+        let detail = two_copies(ItemKind::Movie);
+        let bare = detail.clone();
+        let html = with_video_queue(move || {
+            rsx! { TitleView { detail: detail.clone(), keep: rsx! { span { id: "keep-slot" } } } }
+        });
+        let actions = between(&html, r#"class="pharos-actions""#, "pharos-title-picks");
+        assert!(actions.contains("keep-slot"), "{actions}");
+        let html = with_video_queue(move || rsx! { TitleView { detail: bare.clone() } });
+        assert!(!html.contains("keep-slot"), "{html}");
     }
 
     /// B1353/V1324: a film's page has one row of actions, Play first, then

@@ -4900,6 +4900,7 @@ fn SeenTitle(
     let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
     let detail_for_keep = detail.clone();
+    let version_for_keep = version.clone();
     rsx! {
         TitleView {
             detail,
@@ -4910,15 +4911,27 @@ fn SeenTitle(
             tracks,
             version,
             on_version,
-            keep: keep_control(&detail_for_keep),
+            keep: keep_control(&detail_for_keep, &version_for_keep),
         }
     }
+}
+
+/// What a title page keeps on the device: a video's Download control where a
+/// video store is registered, else a readable book's Keep offline.
+fn keep_control(detail: &Detail, version: &str) -> Option<Element> {
+    let video = matches!(detail.item.kind, ItemKind::Movie | ItemKind::Episode);
+    if video && super::ports::video_store().is_some() {
+        return Some(rsx! {
+            super::kept_video_view::VideoKeep { detail: detail.clone(), version: version.to_owned() }
+        });
+    }
+    book_keep_control(detail)
 }
 
 /// Keep offline for a readable book. The cache is the browser's, so the
 /// other builds have none.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-fn keep_control(detail: &Detail) -> Option<Element> {
+fn book_keep_control(detail: &Detail) -> Option<Element> {
     let format = detail.book.as_ref()?.format;
     Some(rsx! {
         super::kept_web::KeepButton {
@@ -4934,7 +4947,7 @@ fn keep_control(detail: &Detail) -> Option<Element> {
 }
 
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-fn keep_control(_detail: &Detail) -> Option<Element> {
+fn book_keep_control(_detail: &Detail) -> Option<Element> {
     None
 }
 
