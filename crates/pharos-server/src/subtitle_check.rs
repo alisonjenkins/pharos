@@ -429,16 +429,24 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
     /// the aligner is down.
     async fn wait_for_turn(&self) {
         loop {
-            if self.aligner.busy() || self.queue.pending().await > 0 {
+            if self.aligner.busy() {
                 tokio::time::sleep(self.busy_poll).await;
                 continue;
             }
+            self.wait_for_transcodes().await;
             if !self.aligner.healthy().await {
                 tracing::info!("subtitle check: aligner unhealthy; paused");
                 tokio::time::sleep(self.health_poll).await;
                 continue;
             }
             return;
+        }
+    }
+
+    /// FR-016: start no track while a viewer's transcode waits.
+    async fn wait_for_transcodes(&self) {
+        while self.queue.pending().await > 0 {
+            tokio::time::sleep(self.busy_poll).await;
         }
     }
 
@@ -452,6 +460,7 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
         let started = Instant::now();
         let key = source_key(c);
         let audio_lang = audio_language(item);
+        self.wait_for_transcodes().await;
         let text = {
             let permit = BgPermit::acquire(&self.bg_io).await;
             read_source(self.cache.as_ref(), item, c, &permit).await
@@ -759,6 +768,19 @@ mod tests {
         }
     }
 
+    /// Pending for the first `busy` looks.
+    struct Queued {
+        busy: AtomicUsize,
+    }
+    impl TranscodeQueue for &Queued {
+        async fn pending(&self) -> usize {
+            let left = self
+                .busy
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            usize::from(left.is_ok())
+        }
+    }
+
     /// Twenty spoken English cues, a minute apart.
     fn srt() -> String {
         let mut s = String::new();
@@ -958,6 +980,34 @@ mod tests {
         let starts = fake.starts.lock().unwrap().clone();
         // Every cue starts one second into its minute: no start padding.
         assert!(starts.iter().all(|s| s % 60_000 == 1_000), "{starts:?}");
+    }
+
+    #[tokio::test]
+    async fn no_track_starts_while_a_transcode_waits() {
+        let text = srt();
+        // A gate outcome needs no aligner, and still waits for the queue.
+        let lib = library(&[(1, "anime.mkv", MediaKind::Episode, "jpn", Some(&text))]).await;
+        let fake = Fake::new(900, 250);
+        let queued = Queued {
+            busy: AtomicUsize::new(3),
+        };
+        let checker = Checker {
+            store: lib.store.clone(),
+            aligner: &fake,
+            queue: &queued,
+            bg_io: Arc::new(Semaphore::new(1)),
+            cache: None,
+            thresholds: Thresholds::default(),
+            busy_poll: Duration::from_millis(1),
+            health_poll: Duration::from_millis(1),
+        };
+        checker.run_pass().await;
+        assert_eq!(
+            queued.busy.load(Ordering::SeqCst),
+            0,
+            "waited out the queue"
+        );
+        assert_eq!(row(&lib, 1).await.verdict.as_deref(), Some("unknown"));
     }
 
     #[tokio::test]
