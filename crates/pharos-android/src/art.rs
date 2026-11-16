@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jni::objects::{JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jobject};
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 
 use crate::{jerr, log, string, take_exception, R};
 
@@ -110,31 +110,36 @@ pub fn art_uri(http_url: &str) -> String {
 }
 
 /// `Uri.parse(art_uri(http_url))`.
-pub fn art_uri_object<'l>(env: &mut JNIEnv<'l>, http_url: &str) -> R<JObject<'l>> {
+pub fn art_uri_object<'l>(env: &mut Env<'l>, http_url: &str) -> R<JObject<'l>> {
     let s = JObject::from(env.new_string(art_uri(http_url)).map_err(jerr("art uri"))?);
     env.call_static_method(
-        "android/net/Uri",
-        "parse",
-        "(Ljava/lang/String;)Landroid/net/Uri;",
+        jni::jni_str!("android/net/Uri"),
+        jni::jni_str!("parse"),
+        jni::jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"),
         &[JValue::Object(&s)],
     )
     .and_then(|v| v.l())
     .map_err(jerr("Uri.parse"))
 }
 
-fn java_string(env: &mut JNIEnv, obj: &JObject, method: &str) -> R<String> {
+fn java_string(env: &mut Env, obj: &JObject, method: &str) -> R<String> {
     let s = env
-        .call_method(obj, method, "()Ljava/lang/String;", &[])
+        .call_method(
+            obj,
+            jni::strings::JNIString::new(method),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr(method))?;
-    string(env, &JString::from(s))
+    string(env, &s)
 }
 
-fn file<'l>(env: &mut JNIEnv<'l>, path: &str) -> R<JObject<'l>> {
+fn file<'l>(env: &mut Env<'l>, path: &str) -> R<JObject<'l>> {
     let p = JObject::from(env.new_string(path).map_err(jerr("path"))?);
     env.new_object(
-        "java/io/File",
-        "(Ljava/lang/String;)V",
+        jni::jni_str!("java/io/File"),
+        jni::jni_sig!("(Ljava/lang/String;)V"),
         &[JValue::Object(&p)],
     )
     .map_err(jerr("File"))
@@ -142,7 +147,7 @@ fn file<'l>(env: &mut JNIEnv<'l>, path: &str) -> R<JObject<'l>> {
 
 /// Downloads `url` to `dest` through a unique temp file, so two binder
 /// threads fetching the same key never see a half-written image.
-fn download(env: &mut JNIEnv, url: &str, dest: &str) -> R<()> {
+fn download(env: &mut Env, url: &str, dest: &str) -> R<()> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -152,41 +157,67 @@ fn download(env: &mut JNIEnv, url: &str, dest: &str) -> R<()> {
     let u = JObject::from(env.new_string(url).map_err(jerr("url"))?);
     let u = env
         .new_object(
-            "java/net/URL",
-            "(Ljava/lang/String;)V",
+            jni::jni_str!("java/net/URL"),
+            jni::jni_sig!("(Ljava/lang/String;)V"),
             &[JValue::Object(&u)],
         )
         .map_err(jerr("URL"))?;
     let conn = env
-        .call_method(&u, "openConnection", "()Ljava/net/URLConnection;", &[])
+        .call_method(
+            &u,
+            jni::jni_str!("openConnection"),
+            jni::jni_sig!("()Ljava/net/URLConnection;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("openConnection"))?;
     env.call_method(
         &conn,
-        "setConnectTimeout",
-        "(I)V",
+        jni::jni_str!("setConnectTimeout"),
+        jni::jni_sig!("(I)V"),
         &[JValue::Int(TIMEOUT_MS)],
     )
     .map_err(jerr("setConnectTimeout"))?;
-    env.call_method(&conn, "setReadTimeout", "(I)V", &[JValue::Int(TIMEOUT_MS)])
-        .map_err(jerr("setReadTimeout"))?;
+    env.call_method(
+        &conn,
+        jni::jni_str!("setReadTimeout"),
+        jni::jni_sig!("(I)V"),
+        &[JValue::Int(TIMEOUT_MS)],
+    )
+    .map_err(jerr("setReadTimeout"))?;
     let input = env
-        .call_method(&conn, "getInputStream", "()Ljava/io/InputStream;", &[])
+        .call_method(
+            &conn,
+            jni::jni_str!("getInputStream"),
+            jni::jni_sig!("()Ljava/io/InputStream;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getInputStream"))?;
     let tmp_file = file(env, &tmp)?;
     let tmp_path = env
-        .call_method(&tmp_file, "toPath", "()Ljava/nio/file/Path;", &[])
+        .call_method(
+            &tmp_file,
+            jni::jni_str!("toPath"),
+            jni::jni_sig!("()Ljava/nio/file/Path;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("toPath"))?;
     let no_options = env
-        .new_object_array(0, "java/nio/file/CopyOption", JObject::null())
+        .new_object_array(
+            0,
+            jni::jni_str!("java/nio/file/CopyOption"),
+            JObject::null(),
+        )
         .map_err(jerr("CopyOption[]"))?;
     let copied = env
         .call_static_method(
-            "java/nio/file/Files",
-            "copy",
-            "(Ljava/io/InputStream;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)J",
+            jni::jni_str!("java/nio/file/Files"),
+            jni::jni_str!("copy"),
+            jni::jni_sig!(
+                "(Ljava/io/InputStream;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)J"
+            ),
             &[
                 JValue::Object(&input),
                 JValue::Object(&tmp_path),
@@ -198,7 +229,7 @@ fn download(env: &mut JNIEnv, url: &str, dest: &str) -> R<()> {
             let exception = take_exception(env);
             format!("Files.copy: {e}{exception}")
         });
-    let _ = env.call_method(&input, "close", "()V", &[]);
+    let _ = env.call_method(&input, jni::jni_str!("close"), jni::jni_sig!("()V"), &[]);
     let bytes = match copied {
         Ok(n) => n,
         Err(e) => {
@@ -212,17 +243,27 @@ fn download(env: &mut JNIEnv, url: &str, dest: &str) -> R<()> {
 }
 
 /// The cached image path for `uri`, downloading it first on a miss.
-fn open(env: &mut JNIEnv, this: &JObject, uri: &JObject) -> R<String> {
+fn open(env: &mut Env, this: &JObject, uri: &JObject) -> R<String> {
     let k = java_string(env, uri, "getLastPathSegment")?;
     if !valid_key(&k) {
         return Err(format!("not an art key: {k:?}"));
     }
     let ctx = env
-        .call_method(this, "getContext", "()Landroid/content/Context;", &[])
+        .call_method(
+            this,
+            jni::jni_str!("getContext"),
+            jni::jni_sig!("()Landroid/content/Context;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getContext"))?;
     let dir = env
-        .call_method(&ctx, "getCacheDir", "()Ljava/io/File;", &[])
+        .call_method(
+            &ctx,
+            jni::jni_str!("getCacheDir"),
+            jni::jni_sig!("()Ljava/io/File;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getCacheDir"))?;
     let dir = format!("{}/art", java_string(env, &dir, "getAbsolutePath")?);
@@ -250,65 +291,82 @@ fn open(env: &mut JNIEnv, this: &JObject, uri: &JObject) -> R<String> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_onCreate<'l>(
-    _env: JNIEnv<'l>,
+    _env: EnvUnowned<'l>,
     _this: JObject<'l>,
 ) -> jboolean {
     log("art provider onCreate");
-    1
+    true
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_openFile<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     this: JObject<'l>,
     uri: JObject<'l>,
     mode: JString<'l>,
 ) -> jobject {
-    let result = (|| -> R<JObject<'l>> {
-        let mode = string(&mut env, &mode)?;
-        if mode != "r" {
-            return Err(format!("art is read-only, asked for mode {mode:?}"));
-        }
-        let path = open(&mut env, &this, &uri)?;
-        let f = file(&mut env, &path)?;
-        env.call_static_method(
-            "android/os/ParcelFileDescriptor",
-            "open",
-            "(Ljava/io/File;I)Landroid/os/ParcelFileDescriptor;",
-            &[JValue::Object(&f), JValue::Int(MODE_READ_ONLY)],
-        )
-        .and_then(|v| v.l())
-        .map_err(jerr("ParcelFileDescriptor.open"))
-    })();
-    match result {
-        Ok(pfd) => pfd.into_raw(),
-        Err(e) => {
-            log(&format!("art openFile failed: {e}"));
-            // A pending exception would make throw_new misbehave.
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_clear();
-            }
-            let _ = env.throw_new("java/io/FileNotFoundException", e);
-            std::ptr::null_mut()
-        }
+    let outcome = env
+        .with_env(|env| -> Result<jobject, jni::errors::Error> {
+            let result = (|| -> R<JObject<'l>> {
+                let mode = string(env, &mode)?;
+                if mode != "r" {
+                    return Err(format!("art is read-only, asked for mode {mode:?}"));
+                }
+                let path = open(env, &this, &uri)?;
+                let f = file(env, &path)?;
+                env.call_static_method(
+                    jni::jni_str!("android/os/ParcelFileDescriptor"),
+                    jni::jni_str!("open"),
+                    jni::jni_sig!("(Ljava/io/File;I)Landroid/os/ParcelFileDescriptor;"),
+                    &[JValue::Object(&f), JValue::Int(MODE_READ_ONLY)],
+                )
+                .and_then(|v| v.l())
+                .map_err(jerr("ParcelFileDescriptor.open"))
+            })();
+            Ok(match result {
+                Ok(pfd) => pfd.into_raw(),
+                Err(e) => {
+                    log(&format!("art openFile failed: {e}"));
+                    // A pending exception would make throw_new misbehave.
+                    if env.exception_check() {
+                        env.exception_clear();
+                    }
+                    let _ = env.throw_new(
+                        jni::jni_str!("java/io/FileNotFoundException"),
+                        jni::strings::JNIString::new(&e),
+                    );
+                    std::ptr::null_mut()
+                }
+            })
+        })
+        .into_outcome();
+    match outcome {
+        jni::Outcome::Ok(p) => p,
+        _ => std::ptr::null_mut(),
     }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_getType<'l>(
-    env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _uri: JObject<'l>,
 ) -> jobject {
     // Callers ask for image/*; a null type fails openTypedAssetFile.
-    env.new_string("image/*")
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    let outcome = env
+        .with_env(|env| -> Result<jobject, jni::errors::Error> {
+            env.new_string("image/*").map(|s| s.into_raw())
+        })
+        .into_outcome();
+    match outcome {
+        jni::Outcome::Ok(p) => p,
+        _ => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_query<'l>(
-    _env: JNIEnv<'l>,
+    _env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _uri: JObject<'l>,
     _projection: JObject<'l>,
@@ -321,7 +379,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_quer
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_insert<'l>(
-    _env: JNIEnv<'l>,
+    _env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _uri: JObject<'l>,
     _values: JObject<'l>,
@@ -331,7 +389,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_inse
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_delete<'l>(
-    _env: JNIEnv<'l>,
+    _env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _uri: JObject<'l>,
     _selection: JObject<'l>,
@@ -342,7 +400,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_dele
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosArtProvider_update<'l>(
-    _env: JNIEnv<'l>,
+    _env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _uri: JObject<'l>,
     _values: JObject<'l>,

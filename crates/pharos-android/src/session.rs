@@ -6,15 +6,15 @@ use super::*;
 macro_rules! callback {
     ($fn:ident, $name:literal, |$env:ident| $body:expr) => {
         #[no_mangle]
-        pub extern "system" fn $fn<'l>(mut env: JNIEnv<'l>, _this: JObject<'l>) {
+        pub extern "system" fn $fn<'l>(mut env: EnvUnowned<'l>, _this: JObject<'l>) {
             log(concat!("session ", $name));
-            guarded(&mut env, $name, (), |$env| $body)
+            guarded_native(&mut env, $name, (), |$env| $body)
         }
     };
 }
 
 pub(crate) fn set_playback_state(
-    env: &mut JNIEnv,
+    env: &mut Env,
     session: &JObject,
     state: i32,
     position_ms: i64,
@@ -23,27 +23,30 @@ pub(crate) fn set_playback_state(
 }
 
 /// ERROR with `message`, which the car shows (and reads out) to the driver.
-pub(crate) fn set_error(env: &mut JNIEnv, session: &JObject, message: &str) -> R<()> {
+pub(crate) fn set_error(env: &mut Env, session: &JObject, message: &str) -> R<()> {
     publish_state(env, session, STATE_ERROR, 0, Some(message))
 }
 
 pub(crate) fn publish_state(
-    env: &mut JNIEnv,
+    env: &mut Env,
     session: &JObject,
     state: i32,
     position_ms: i64,
     error: Option<&str>,
 ) -> R<()> {
     snapshot::note_state(state, position_ms, error);
-    const B: &str = "Landroid/media/session/PlaybackState$Builder;";
     let b = env
-        .new_object("android/media/session/PlaybackState$Builder", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/media/session/PlaybackState$Builder"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("PlaybackState.Builder"))?;
     let speed = if state == STATE_PLAYING { 1.0f32 } else { 0.0 };
     env.call_method(
         &b,
-        "setState",
-        format!("(IJF){B}"),
+        jni::jni_str!("setState"),
+        jni::jni_sig!("(IJF)Landroid/media/session/PlaybackState$Builder;"),
         &[
             JValue::Int(state),
             JValue::Long(position_ms),
@@ -53,8 +56,8 @@ pub(crate) fn publish_state(
     .map_err(jerr("setState"))?;
     env.call_method(
         &b,
-        "setActions",
-        format!("(J){B}"),
+        jni::jni_str!("setActions"),
+        jni::jni_sig!("(J)Landroid/media/session/PlaybackState$Builder;"),
         &[JValue::Long(ACTIONS)],
     )
     .map_err(jerr("setActions"))?;
@@ -62,20 +65,27 @@ pub(crate) fn publish_state(
         let m = JObject::from(env.new_string(message).map_err(jerr("error message"))?);
         env.call_method(
             &b,
-            "setErrorMessage",
-            format!("(Ljava/lang/CharSequence;){B}"),
+            jni::jni_str!("setErrorMessage"),
+            jni::jni_sig!(
+                "(Ljava/lang/CharSequence;)Landroid/media/session/PlaybackState$Builder;"
+            ),
             &[JValue::Object(&m)],
         )
         .map_err(jerr("setErrorMessage"))?;
     }
     let ps = env
-        .call_method(&b, "build", "()Landroid/media/session/PlaybackState;", &[])
+        .call_method(
+            &b,
+            jni::jni_str!("build"),
+            jni::jni_sig!("()Landroid/media/session/PlaybackState;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("PlaybackState.build"))?;
     env.call_method(
         session,
-        "setPlaybackState",
-        "(Landroid/media/session/PlaybackState;)V",
+        jni::jni_str!("setPlaybackState"),
+        jni::jni_sig!("(Landroid/media/session/PlaybackState;)V"),
         &[JValue::Object(&ps)],
     )
     .map_err(jerr("setPlaybackState"))?;
@@ -101,17 +111,15 @@ fn now_playing(e: &Item) -> (&str, String, &str) {
     }
 }
 
-pub(crate) fn set_metadata(
-    env: &mut JNIEnv,
-    session: &JObject,
-    e: &Item,
-    duration_ms: i64,
-) -> R<()> {
+pub(crate) fn set_metadata(env: &mut Env, session: &JObject, e: &Item, duration_ms: i64) -> R<()> {
     let (title, artist, album) = now_playing(e);
     foreground::describe(title, &artist)?;
-    const B: &str = "Landroid/media/MediaMetadata$Builder;";
     let b = env
-        .new_object("android/media/MediaMetadata$Builder", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/media/MediaMetadata$Builder"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("MediaMetadata.Builder"))?;
     let mut fields = vec![
         ("android.media.metadata.MEDIA_ID", e.id.clone()),
@@ -131,8 +139,10 @@ pub(crate) fn set_metadata(
         let v = JObject::from(env.new_string(value).map_err(jerr("value"))?);
         env.call_method(
             &b,
-            "putString",
-            format!("(Ljava/lang/String;Ljava/lang/String;){B}"),
+            jni::jni_str!("putString"),
+            jni::jni_sig!(
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/media/MediaMetadata$Builder;"
+            ),
             &[JValue::Object(&k), JValue::Object(&v)],
         )
         .map_err(jerr("putString"))?;
@@ -143,19 +153,24 @@ pub(crate) fn set_metadata(
     );
     env.call_method(
         &b,
-        "putLong",
-        format!("(Ljava/lang/String;J){B}"),
+        jni::jni_str!("putLong"),
+        jni::jni_sig!("(Ljava/lang/String;J)Landroid/media/MediaMetadata$Builder;"),
         &[JValue::Object(&k), JValue::Long(duration_ms)],
     )
     .map_err(jerr("putLong"))?;
     let md = env
-        .call_method(&b, "build", "()Landroid/media/MediaMetadata;", &[])
+        .call_method(
+            &b,
+            jni::jni_str!("build"),
+            jni::jni_sig!("()Landroid/media/MediaMetadata;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("MediaMetadata.build"))?;
     env.call_method(
         session,
-        "setMetadata",
-        "(Landroid/media/MediaMetadata;)V",
+        jni::jni_str!("setMetadata"),
+        jni::jni_sig!("(Landroid/media/MediaMetadata;)V"),
         &[JValue::Object(&md)],
     )
     .map_err(jerr("setMetadata"))?;
@@ -168,13 +183,13 @@ pub(crate) fn ids(items: &[Item]) -> Vec<String> {
 }
 
 /// Calls `method` on the current player, then publishes `state`.
-pub(crate) fn transport(env: &mut JNIEnv, method: &str, state: i32) -> R<()> {
+pub(crate) fn transport(env: &mut Env, method: &str, state: i32) -> R<()> {
     transport_with(env, method, state, true)
 }
 
 /// [`transport`]; `explicit` is false for a pause the system caused (a
 /// transient focus loss), which must not cancel the resume-on-gain it set.
-pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explicit: bool) -> R<()> {
+pub(crate) fn transport_with(env: &mut Env, method: &str, state: i32, explicit: bool) -> R<()> {
     if method == "stop" {
         supersede();
     }
@@ -215,8 +230,13 @@ pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explici
         return Ok(());
     }
     if player_call_valid(method, started) {
-        env.call_method(player.as_obj(), method, "()V", &[])
-            .map_err(jerr(method))?;
+        env.call_method(
+            player.as_obj(),
+            jni::strings::JNIString::new(method),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map_err(jerr(method))?;
         if method == "start" {
             // Only if the player whose start just succeeded is still current:
             // a newer play may have replaced it while the lock was released.
@@ -238,7 +258,12 @@ pub(crate) fn transport_with(env: &mut JNIEnv, method: &str, state: i32, explici
         ));
     }
     let pos = env
-        .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
+        .call_method(
+            player.as_obj(),
+            jni::jni_str!("getCurrentPosition"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
         .and_then(|v| v.i())
         .map_err(jerr("getCurrentPosition"))?;
     if method != "start" {
@@ -262,15 +287,25 @@ fn player_call_valid(method: &str, started: bool) -> bool {
 /// Stops and releases `player`, already taken out of the state, so a later
 /// play creates a fresh one. Its position is saved first when it was
 /// prepared.
-fn stop_player(env: &mut JNIEnv, session: &GlobalRef, player: &GlobalRef, prepared: bool) -> R<()> {
+fn stop_player(env: &mut Env, session: &GlobalRef, player: &GlobalRef, prepared: bool) -> R<()> {
     let saved = (|| -> R<i32> {
         if !prepared {
             return Ok(0);
         }
-        env.call_method(player.as_obj(), "stop", "()V", &[])
-            .map_err(jerr("stop"))?;
+        env.call_method(
+            player.as_obj(),
+            jni::jni_str!("stop"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map_err(jerr("stop"))?;
         let pos = env
-            .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
+            .call_method(
+                player.as_obj(),
+                jni::jni_str!("getCurrentPosition"),
+                jni::jni_sig!("()I"),
+                &[],
+            )
             .and_then(|v| v.i())
             .map_err(jerr("getCurrentPosition"))?;
         resume::note_for(env, player, i64::from(pos), "stop")?;
@@ -282,7 +317,12 @@ fn stop_player(env: &mut JNIEnv, session: &GlobalRef, player: &GlobalRef, prepar
     }
     resume::drop_for(env, player)?;
     let released = env
-        .call_method(player.as_obj(), "release", "()V", &[])
+        .call_method(
+            player.as_obj(),
+            jni::jni_str!("release"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("release"));
     let pos = saved?;
     released?;
@@ -302,7 +342,7 @@ fn stop_player(env: &mut JNIEnv, session: &GlobalRef, player: &GlobalRef, prepar
 /// Moves `step` through the queue; past either end it wraps when `wrap`,
 /// and stops otherwise. An empty queue plays the first test entry when the
 /// test catalogue is built in, and does nothing otherwise.
-pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
+pub(crate) fn skip(env: &mut Env, step: isize, wrap: bool) -> R<()> {
     let (current, queue) = {
         let guard = state_lock()?;
         let st = guard.as_ref().ok_or("skip before onCreate")?;
@@ -341,23 +381,25 @@ pub(crate) fn skip(env: &mut JNIEnv, step: isize, wrap: bool) -> R<()> {
 
 /// Points the session at the app's launcher activity,
 /// so a tap on the media notification or the car's app button opens the app.
-pub(crate) fn set_session_activity(env: &mut JNIEnv, ctx: &JObject, session: &JObject) -> R<()> {
+pub(crate) fn set_session_activity(env: &mut Env, ctx: &JObject, session: &JObject) -> R<()> {
     const FLAG_IMMUTABLE: i32 = 67_108_864;
     let class = env
-        .find_class("dev/dioxus/main/MainActivity")
+        .find_class(jni::jni_str!("dev/dioxus/main/MainActivity"))
         .map_err(jerr("find MainActivity"))?;
     let intent = env
         .new_object(
-            "android/content/Intent",
-            "(Landroid/content/Context;Ljava/lang/Class;)V",
+            jni::jni_str!("android/content/Intent"),
+            jni::jni_sig!("(Landroid/content/Context;Ljava/lang/Class;)V"),
             &[JValue::Object(ctx), JValue::Object(&class)],
         )
         .map_err(jerr("Intent"))?;
     let pi = env
         .call_static_method(
-            "android/app/PendingIntent",
-            "getActivity",
-            "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;",
+            jni::jni_str!("android/app/PendingIntent"),
+            jni::jni_str!("getActivity"),
+            jni::jni_sig!(
+                "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;"
+            ),
             &[
                 JValue::Object(ctx),
                 JValue::Int(0),
@@ -369,8 +411,8 @@ pub(crate) fn set_session_activity(env: &mut JNIEnv, ctx: &JObject, session: &JO
         .map_err(jerr("PendingIntent.getActivity"))?;
     env.call_method(
         session,
-        "setSessionActivity",
-        "(Landroid/app/PendingIntent;)V",
+        jni::jni_str!("setSessionActivity"),
+        jni::jni_sig!("(Landroid/app/PendingIntent;)V"),
         &[JValue::Object(&pi)],
     )
     .map_err(jerr("setSessionActivity"))?;
@@ -379,30 +421,40 @@ pub(crate) fn set_session_activity(env: &mut JNIEnv, ctx: &JObject, session: &JO
 
 /// The keys of `extras`, for logs: which hints (focus, title, artist) the
 /// assistant sent with a request.
-pub(crate) fn bundle_keys(env: &mut JNIEnv, extras: &JObject) -> R<String> {
+pub(crate) fn bundle_keys(env: &mut Env, extras: &JObject) -> R<String> {
     if extras.is_null() {
         return Ok("null".into());
     }
     let keys = env
-        .call_method(extras, "keySet", "()Ljava/util/Set;", &[])
+        .call_method(
+            extras,
+            jni::jni_str!("keySet"),
+            jni::jni_sig!("()Ljava/util/Set;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("keySet"))?;
     let text = env
-        .call_method(&keys, "toString", "()Ljava/lang/String;", &[])
+        .call_method(
+            &keys,
+            jni::jni_str!("toString"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("keySet.toString"))?;
-    string(env, &JString::from(text))
+    string(env, &text)
 }
 
 /// Loads `item` without starting it, as the PREPARE actions ask: its
 /// metadata and PAUSED. A later onPlay plays it.
-pub(crate) fn prepare(env: &mut JNIEnv, item: Item, queue: Vec<Item>) -> R<()> {
+pub(crate) fn prepare(env: &mut Env, item: Item, queue: Vec<Item>) -> R<()> {
     prepare_at(env, item, queue, supersede())
 }
 
 /// [`prepare`] for a request that already holds its generation `gen`; a
 /// newer request made meanwhile drops it.
-pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen: u64) -> R<()> {
+pub(crate) fn prepare_at(env: &mut Env, item: Item, mut queue: Vec<Item>, gen: u64) -> R<()> {
     let session = {
         let mut guard = state_lock()?;
         if !is_current(gen) {
@@ -415,7 +467,12 @@ pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen
         let st = guard.as_mut().ok_or("prepare before onCreate")?;
         if let Some(old) = st.player.take() {
             resume::leave(env, "track_change")?;
-            let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
+            let _ = env.call_method(
+                old.as_obj(),
+                jni::jni_str!("release"),
+                jni::jni_sig!("()V"),
+                &[],
+            );
         }
         st.prepared = false;
         st.started = false;
@@ -435,7 +492,7 @@ pub(crate) fn prepare_at(env: &mut JNIEnv, item: Item, mut queue: Vec<Item>, gen
 }
 
 /// Prepares `id`: a test entry at once, a library node from a worker.
-pub(crate) fn prepare_id(env: &mut JNIEnv, id: &str) -> R<()> {
+pub(crate) fn prepare_id(env: &mut Env, id: &str) -> R<()> {
     let gen = supersede();
     if let Some(item) = fixture::playable(id) {
         return prepare_at(env, item, fixture::playables(), gen);
@@ -482,11 +539,11 @@ callback!(
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onSeekTo<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     pos: jlong,
 ) {
-    guarded(&mut env, "onSeekTo", (), |env| {
+    guarded_native(&mut env, "onSeekTo", (), |env| {
         log(&format!("session onSeekTo pos_ms={pos}"));
         apply(
             env,
@@ -500,12 +557,12 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlayFromMediaId<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     id: JString<'l>,
     _extras: JObject<'l>,
 ) {
-    guarded(&mut env, "onPlayFromMediaId", (), |env| {
+    guarded_native(&mut env, "onPlayFromMediaId", (), |env| {
         let id = string(env, &id)?;
         log(&format!("session onPlayFromMediaId id={id}"));
         if is_book_id(&id) {
@@ -540,12 +597,12 @@ callback!(
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromMediaId<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     id: JString<'l>,
     _extras: JObject<'l>,
 ) {
-    guarded(&mut env, "onPrepareFromMediaId", (), |env| {
+    guarded_native(&mut env, "onPrepareFromMediaId", (), |env| {
         let id = string(env, &id)?;
         log(&format!("session onPrepareFromMediaId id={id}"));
         prepare_id(env, &id)

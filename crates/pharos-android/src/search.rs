@@ -46,7 +46,7 @@ fn playable_queue(hits: Vec<Item>, expand: impl FnOnce(&str) -> Vec<Item>) -> Ve
 /// track alone, an album or mix from its first track with the rest queued.
 /// Blocks on the network to list an album; run it on a worker.
 pub(crate) fn autoplay_search(
-    env: &mut JNIEnv,
+    env: &mut Env,
     query_len: usize,
     hits: &[Item],
     report: Option<&content::SearchReport>,
@@ -88,7 +88,7 @@ pub(crate) fn autoplay_search(
 /// Voice "play/prepare X": a test match at once, else the first playable
 /// library hit, found on a worker. `then_play` plays it; otherwise it is
 /// only prepared.
-pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play: bool) -> R<()> {
+pub(crate) fn from_search(env: &mut Env, what: &str, query: String, then_play: bool) -> R<()> {
     if let Some(cmd) = voice::command(&query) {
         log(&format!("{what} verdict={cmd:?} reason=voice_command"));
         return voice::run(env, cmd);
@@ -139,13 +139,13 @@ pub(crate) fn from_search(env: &mut JNIEnv, what: &str, query: String, then_play
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onSearch<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     query: JString<'l>,
     _extras: JObject<'l>,
     result: JObject<'l>,
 ) {
-    guarded(&mut env, "onSearch", (), |env| {
+    guarded_native(&mut env, "onSearch", (), |env| {
         let q = string(env, &query)?;
         answer_later(env, "onSearch", &result, move || {
             let hits = find(&q);
@@ -160,12 +160,12 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onS
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPlayFromSearch<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     query: JString<'l>,
     extras: JObject<'l>,
 ) {
-    guarded(&mut env, "onPlayFromSearch", (), |env| {
+    guarded_native(&mut env, "onPlayFromSearch", (), |env| {
         let q = string(env, &query)?;
         let keys = bundle_keys(env, &extras)?;
         log(&format!(
@@ -179,12 +179,12 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_onPrepareFromSearch<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     query: JString<'l>,
     extras: JObject<'l>,
 ) {
-    guarded(&mut env, "onPrepareFromSearch", (), |env| {
+    guarded_native(&mut env, "onPrepareFromSearch", (), |env| {
         let q = string(env, &query)?;
         let keys = bundle_keys(env, &extras)?;
         log(&format!(
@@ -201,33 +201,48 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSessionCallback_
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_nativeOnCreate<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     this: JObject<'l>,
     _saved: JObject<'l>,
 ) {
-    guarded(&mut env, "search activity", (), |env| {
+    guarded_native(&mut env, "search activity", (), |env| {
         let intent = env
-            .call_method(&this, "getIntent", "()Landroid/content/Intent;", &[])
+            .call_method(
+                &this,
+                jni::jni_str!("getIntent"),
+                jni::jni_sig!("()Landroid/content/Intent;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getIntent"))?;
         let action = env
-            .call_method(&intent, "getAction", "()Ljava/lang/String;", &[])
+            .call_method(
+                &intent,
+                jni::jni_str!("getAction"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getAction"))?;
-        let action = string(env, &JString::from(action))?;
+        let action = string(env, &action)?;
         let key = JObject::from(env.new_string("query").map_err(jerr("key"))?);
         let q = env
             .call_method(
                 &intent,
-                "getStringExtra",
-                "(Ljava/lang/String;)Ljava/lang/String;",
+                jni::jni_str!("getStringExtra"),
+                jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
                 &[JValue::Object(&key)],
             )
             .and_then(|v| v.l())
             .map_err(jerr("getStringExtra"))?;
-        let q = string(env, &JString::from(q))?;
+        let q = string(env, &q)?;
         let extras = env
-            .call_method(&intent, "getExtras", "()Landroid/os/Bundle;", &[])
+            .call_method(
+                &intent,
+                jni::jni_str!("getExtras"),
+                jni::jni_sig!("()Landroid/os/Bundle;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getExtras"))?;
         let keys = bundle_keys(env, &extras)?;
@@ -242,7 +257,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosSearchActivity_n
         } else {
             Ok(())
         };
-        env.call_method(&this, "finish", "()V", &[])
+        env.call_method(&this, jni::jni_str!("finish"), jni::jni_sig!("()V"), &[])
             .map_err(jerr("finish"))?;
         played
     })

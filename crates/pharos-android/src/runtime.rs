@@ -15,7 +15,7 @@ use super::*;
 /// a jump larger than a few of these as a seek.
 const POSITION_EVERY: Duration = Duration::from_secs(1);
 /// Local references one app command may hold before the frame grows.
-const COMMAND_LOCAL_REFS: i32 = 64;
+const COMMAND_LOCAL_REFS: usize = 64;
 /// How long an app command waits for the service's `onCreate`: Android stops
 /// an idle background service, and the app's next play starts it again.
 const SERVICE_WAIT: Duration = Duration::from_secs(2);
@@ -132,7 +132,7 @@ static STARTING: Mutex<()> = Mutex::new(());
 ///
 /// Call it on the main thread (service `onCreate`, or the app's start): only
 /// there does class lookup see the app's own classes. `ctx` is any Context.
-pub fn runtime(env: &mut JNIEnv, ctx: &JObject) -> R<&'static Player> {
+pub fn runtime(env: &mut Env, ctx: &JObject) -> R<&'static Player> {
     let _starting = STARTING
         .lock()
         .map_err(|_| "runtime start mutex poisoned".to_owned())?;
@@ -169,12 +169,14 @@ pub fn runtime(env: &mut JNIEnv, ctx: &JObject) -> R<&'static Player> {
     Ok(PLAYER.get_or_init(|| Player { tx }))
 }
 
-fn cache_classes(env: &mut JNIEnv) -> R<()> {
+fn cache_classes(env: &mut Env) -> R<()> {
     if CLASSES.get().is_some() {
         return Ok(());
     }
     let listener = env
-        .find_class("com/alisonjenkins/pharos/auto/PharosPlayerListener")
+        .find_class(jni::jni_str!(
+            "com/alisonjenkins/pharos/auto/PharosPlayerListener"
+        ))
         .map_err(jerr("find PharosPlayerListener"))?;
     let compat_item = env
         .find_class(compat::ITEM_CLASS)
@@ -195,34 +197,32 @@ fn command_loop(rx: mpsc::Receiver<Command>) {
         log("command thread: no JavaVM, app commands are dropped");
         return;
     };
-    let mut env = match vm.attach_current_thread_permanently() {
-        Ok(env) => env,
-        Err(e) => {
-            log(&format!("command thread: attach failed: {e}"));
-            return;
-        }
-    };
-    loop {
-        match rx.recv_timeout(POSITION_EVERY) {
-            Ok(command) => {
-                await_service(command.label());
-                // This thread never returns to Java, so its local refs would
-                // otherwise pile up until it ends.
-                guarded(&mut env, "app command", (), |env| {
-                    env.with_local_frame(COMMAND_LOCAL_REFS, |env| {
-                        Ok::<_, jni::errors::Error>(apply(env, command, Source::App))
-                    })
-                    .map_err(jerr("with_local_frame"))?
-                });
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                guarded(&mut env, "position tick", (), tick_position);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                log("command thread: player dropped, stopping");
-                return;
+    let attached = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
+        loop {
+            match rx.recv_timeout(POSITION_EVERY) {
+                Ok(command) => {
+                    await_service(command.label());
+                    // This thread never returns to Java, so its local refs would
+                    // otherwise pile up until it ends.
+                    guarded(env, "app command", (), |env| {
+                        env.with_local_frame(COMMAND_LOCAL_REFS, |env| {
+                            Ok::<_, jni::errors::Error>(apply(env, command, Source::App))
+                        })
+                        .map_err(jerr("with_local_frame"))?
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    guarded(env, "position tick", (), tick_position);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    log("command thread: player dropped, stopping");
+                    return Ok(());
+                }
             }
         }
+    });
+    if let Err(e) = attached {
+        log(&format!("command thread: attach failed: {e}"));
     }
 }
 
@@ -248,7 +248,7 @@ fn await_service(name: &str) {
 }
 
 /// Reads the playhead into the snapshot while playing.
-fn tick_position(env: &mut JNIEnv) -> R<()> {
+fn tick_position(env: &mut Env) -> R<()> {
     if snapshot::current().state != snapshot::PlayState::Playing {
         return Ok(());
     }
@@ -263,7 +263,12 @@ fn tick_position(env: &mut JNIEnv) -> R<()> {
         return Ok(());
     };
     let pos = env
-        .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
+        .call_method(
+            player.as_obj(),
+            jni::jni_str!("getCurrentPosition"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
         .and_then(|v| v.i())
         .map_err(jerr("getCurrentPosition"))?;
     snapshot::note_position(u64::try_from(pos).unwrap_or(0));

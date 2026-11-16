@@ -192,6 +192,7 @@ serde_core = { version = "1", default-features = false, features = ["alloc", "rc
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
+simdutf8 = { version = "0.1", features = ["aarch64_neon"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
@@ -232,6 +233,7 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["public_imp"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
@@ -248,6 +250,7 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 [target.aarch64-unknown-linux-gnu.build-dependencies]
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["public_imp"] }
 
 [target.aarch64-apple-darwin.dependencies]
 block2 = { version = "0.6" }
@@ -270,6 +273,7 @@ errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", default-features = false, features = ["extra_traits"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["public_imp"] }
 
 [target.x86_64-apple-darwin.dependencies]
 block2 = { version = "0.6" }
@@ -292,5 +296,6 @@ errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", default-features = false, features = ["extra_traits"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["public_imp"] }
 
 ### END HAKARI SECTION
