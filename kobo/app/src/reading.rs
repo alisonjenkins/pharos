@@ -468,6 +468,7 @@ impl Reading {
         match &self.job {
             Job::Downloading { bytes, .. } => {
                 let received = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let received = received - received % books::PROGRESS_STEP;
                 return Some(own(self
                     .banner(ScreenBuilder::new("pharos-book-busy").top_bar("Downloading"))
                     .transfer("Downloading the book", received, None)
