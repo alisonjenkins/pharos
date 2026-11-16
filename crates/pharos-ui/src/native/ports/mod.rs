@@ -46,6 +46,7 @@ pub struct AlreadyRegistered;
 
 static NATIVE_AUDIO: Slot<dyn NativeAudio> = Slot::new();
 static OFFLINE_STORE: Slot<dyn OfflineStore> = Slot::new();
+static VIDEO_STORE: Slot<dyn super::kept_video::VideoStore> = Slot::new();
 
 /// Called once by the host app before the UI launches.
 pub fn register_native_audio(port: Arc<dyn NativeAudio>) -> Result<(), AlreadyRegistered> {
@@ -65,6 +66,20 @@ pub fn register_offline_store(port: Arc<dyn OfflineStore>) -> Result<(), Already
 /// `None` on web and desktop: the UI hides offline music.
 pub fn offline_store() -> Option<Arc<dyn OfflineStore>> {
     OFFLINE_STORE.get()
+}
+
+/// Register the store of downloaded videos (spec 048): the web app's Cache
+/// Storage store, or the phone's. The Download control and the Downloads
+/// page draw only when one is registered.
+pub fn register_video_store(
+    port: Arc<dyn super::kept_video::VideoStore>,
+) -> Result<(), AlreadyRegistered> {
+    VIDEO_STORE.set(port)
+}
+
+/// The registered store of downloaded videos, if any.
+pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
+    VIDEO_STORE.get()
 }
 
 /// What the host app runs when the user signs in or out, so a second client
