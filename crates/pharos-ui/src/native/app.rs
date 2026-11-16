@@ -2204,7 +2204,7 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
-                if kept_any() {
+                if kept_any() || !offline_video::ready_for_last_user().is_empty() {
                     spawn(async move {
                         platform::sleep_ms(SLOW_CONNECT_MS).await;
                         let m = machine.peek();
@@ -2250,6 +2250,7 @@ fn NativeApp(route: Route) -> Element {
             match retry_once("me", || api.me(&info)).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
+                    offline_video::remember_user(&me.id);
                     claim_queue(queue, held, &me.id);
                     Some(me)
                 }
@@ -2311,6 +2312,7 @@ fn NativeApp(route: Route) -> Element {
                                 // The queue is emptied by the sign-in effect.
                                 if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
                                     forget_kept_books("sign-out").await;
+                                    offline_video::forget_user();
                                 }
                             });
                         },
@@ -2636,11 +2638,45 @@ fn kept_any() -> bool {
     super::offline_start::any_downloaded()
 }
 
+/// The app with no connection: a downloaded video that was asked for plays
+/// in the full player, as it does online; else the lists of what is on the
+/// device, the videos beside the books or music. `None` when nothing is, so
+/// the usual waiting page shows.
+fn offline_start(route: &Route) -> Option<Element> {
+    let videos = offline_video::ready_for_last_user();
+    if let Route::Watch(id) = route {
+        if videos.iter().any(|v| v.item == id.to_string()) {
+            platform::info(&format!("pharos: offline start verdict=play item={id}"));
+            return Some(rsx! {
+                div { class: "pharos-app",
+                    Screen { route: route.clone() }
+                    StageView {}
+                }
+            });
+        }
+    }
+    let others = offline_start_books(route);
+    platform::info(&format!(
+        "pharos: offline start verdict={} videos={} books_or_music={}",
+        if others.is_some() || !videos.is_empty() { "list" } else { "waiting" },
+        videos.len(),
+        others.is_some()
+    ));
+    match (others, videos.is_empty()) {
+        (others, true) => others,
+        (Some(others), false) => Some(rsx! {
+            {others}
+            super::kept_video_view::OfflineVideos {}
+        }),
+        (None, false) => Some(rsx! { super::kept_video_view::OfflineVideos {} }),
+    }
+}
+
 /// The app with no connection and books kept on the device: the list, or
 /// the reader when a kept book was asked for. `None` when nothing is kept,
 /// so the usual waiting page shows. Two builds have one: the browser (kept books) and the phone (downloads).
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-fn offline_start(route: &Route) -> Option<Element> {
+fn offline_start_books(route: &Route) -> Option<Element> {
     let store = super::kept_web::read()?;
     Some(match route {
         Route::Read(id) if store.find(&id.to_string()).is_some() => {
@@ -2653,7 +2689,7 @@ fn offline_start(route: &Route) -> Option<Element> {
 /// The phone: the music and books downloaded on it, which play without the
 /// server. `None` where no store is registered or nothing is downloaded.
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-fn offline_start(_route: &Route) -> Option<Element> {
+fn offline_start_books(_route: &Route) -> Option<Element> {
     super::offline_start::start()
 }
 
