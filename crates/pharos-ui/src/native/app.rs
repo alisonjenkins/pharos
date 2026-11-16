@@ -15,6 +15,7 @@ use pharos_client::api::{
 };
 use pharos_client::{CallInfo, ClientError};
 
+use super::offline_video;
 use super::account::AccountMenu;
 use super::account_settings;
 use super::activity;
@@ -5224,6 +5225,101 @@ fn stored_version(title: ItemRef) -> Option<String> {
         .flatten()
 }
 
+/// The downloaded copy of `id` to play instead of asking the server, with
+/// the user it belongs to. Logs the verdict whenever a store is registered.
+fn downloaded_copy(
+    id: ItemRef,
+    wanted: Option<&str>,
+    signed_in: Option<String>,
+) -> Option<(
+    super::kept_video::KeptVideo,
+    String,
+    std::sync::Arc<dyn super::kept_video::VideoStore>,
+)> {
+    let store = super::ports::video_store()?;
+    let Some(user) = signed_in.or_else(offline_video::last_user) else {
+        platform::info(&format!("pharos: playback copy item={id} downloaded=false reason=no_user"));
+        return None;
+    };
+    let videos = store.videos(&user);
+    let copy = offline_video::ready_copy(&videos, &id.to_string(), wanted);
+    platform::info(&format!(
+        "pharos: playback copy item={id} downloaded={} videos={} wanted_version={wanted:?}",
+        copy.is_some(),
+        videos.len()
+    ));
+    copy.map(|c| (c, user, store))
+}
+
+/// A playback of a downloaded copy: the stored master playlist as it was
+/// negotiated, the stored position, and no call to the server.
+fn offline_playing(
+    copy: super::kept_video::KeptVideo,
+    user: String,
+    store: std::sync::Arc<dyn super::kept_video::VideoStore>,
+    resume_ms: u64,
+    from_start: bool,
+    grant_gen: u32,
+) -> Result<PlayingRef, StartFailure> {
+    let fail = |reason: String| {
+        platform::warn(&format!(
+            "pharos: playback offline failed item={} url={} reason={reason}",
+            copy.item, copy.master_url
+        ));
+        StartFailure::new(FailureKind::Unplayable, reason)
+    };
+    let Some(detail) = offline_video::offline_detail(&copy) else {
+        return Err(fail(format!("The download names no playable item ({:?}).", copy.item)));
+    };
+    let verdict = resolve_engine(
+        true,
+        platform::plays_hls(),
+        platform::has_mse(),
+        mse_engine_choice(),
+        platform::hls_engine_used,
+    );
+    let engine = verdict.engine;
+    if engine == Engine::Unsupported {
+        return Err(fail("This download needs HLS, which this browser cannot play.".to_owned()));
+    }
+    if engine.reports_fragments() {
+        platform::info(&verdict.line());
+    }
+    let start_ms = match (resume_ms, from_start) {
+        (0, true) => 0,
+        (0, false) => offline_video::resume_ms(copy.position_ms, copy.runtime_ms),
+        (here, _) => here,
+    };
+    platform::info(&format!(
+        "pharos: playback offline item={} engine={engine:?} start_ms={start_ms} quality_bps={} url={}",
+        copy.item, copy.quality_bps, copy.master_url
+    ));
+    platform::turn_open(&copy.item);
+    let tracks = (&detail.audio_tracks[..], &detail.subtitle_tracks[..]);
+    let track_map = track_follow::TrackMap::new(tracks, tracks);
+    Ok(PlayingRef(Rc::new(Playing {
+        title: copy.title.clone(),
+        kind: detail.item.kind,
+        image: None,
+        url: copy.master_url.clone(),
+        start_ms,
+        from_start: start_ms == 0 && from_start,
+        engine,
+        session: offline_video::OFFLINE_SESSION.to_owned(),
+        grant: RefCell::new(None),
+        grant_gen: Cell::new(grant_gen),
+        track_map,
+        audio: copy.audio,
+        subtitle: None,
+        asked_audio: None,
+        method: offline_video::OFFLINE_METHOD.to_owned(),
+        asked_subtitle: TrackChoice::default(),
+        version: copy.version.clone(),
+        offline: Some(OfflineSave { store, user }),
+        detail,
+    })))
+}
+
 /// A negotiated playback, ready for the player.
 struct Playing {
     title: String,
@@ -5488,6 +5584,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let negotiated_at = Rc::clone(&negotiated_gen);
     let gap_notify = Rc::clone(&notify);
     let carry_flag = Rc::clone(&picks_in_primary);
+    let account = try_use_context::<AccountMe>();
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -5519,7 +5616,18 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let from_start = previous || pressed;
         let reason = if pressed { "start_over" } else { "previous" };
         let together = together.clone();
+        // A downloaded copy plays whatever the connection is: a weak signal
+        // never breaks it. `peek`: the account loading must not restart it.
+        let wanted = picked_here.clone().or_else(|| stored_version(id));
+        let signed_in = account
+            .and_then(|a| a.0.peek().clone().flatten())
+            .map(|me| me.id);
+        let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
         async move {
+            if let Some((copy, user, store)) = downloaded {
+                let resume = resume_from.get();
+                return Some(offline_playing(copy, user, store, resume, from_start, grant_gen));
+            }
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
             let info = call("watch", play_action(ctx_stage.peek().view));

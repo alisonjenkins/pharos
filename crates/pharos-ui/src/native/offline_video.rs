@@ -32,6 +32,20 @@ pub fn ready_copy(videos: &[KeptVideo], item: &str, wanted: Option<&str>) -> Opt
         .cloned()
 }
 
+/// How near the end a saved position counts as finished, so the film
+/// starts over rather than resuming into the credits.
+const FINISHED_WITHIN_MS: u64 = 30_000;
+
+/// Where a downloaded copy starts: where the viewer stopped, or the
+/// beginning when that was the end.
+pub fn resume_ms(position_ms: u64, runtime_ms: u64) -> u64 {
+    if runtime_ms > 0 && position_ms.saturating_add(FINISHED_WITHIN_MS) >= runtime_ms {
+        0
+    } else {
+        position_ms
+    }
+}
+
 /// The capabilities a download negotiates with: no container the server may
 /// play directly, so the answer is HLS, and the video capped at `quality_bps`.
 pub fn download_caps(mut caps: Capabilities, quality_bps: u64) -> Capabilities {
@@ -270,6 +284,13 @@ mod tests {
             Some("/videos/8/subtitles/3/stream.vtt")
         );
         assert!(offline_detail(&video("not an id", "", KeptState::Ready)).is_none());
+    }
+
+    #[test]
+    fn a_finished_copy_starts_over() {
+        assert_eq!(resume_ms(61_000, 5_400_000), 61_000);
+        assert_eq!(resume_ms(5_380_000, 5_400_000), 0);
+        assert_eq!(resume_ms(61_000, 0), 61_000);
     }
 
     #[test]
