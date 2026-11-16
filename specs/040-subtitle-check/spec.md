@@ -43,6 +43,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 
 - FR-001. The job checks every text subtitle track of a video item: sidecar files, embedded text streams and downloaded subtitles. Image subtitles (PGS, VobSub) are out of scope.
 - FR-002. A track is checked with the aligner only when its language equals the language of the audio stream it would play over (the default audio stream, by ISO 639 code after normalising 639-1/-2 forms) and its text is in the Latin alphabet after accent folding (at least 80% of its letters fold into `a`-`z`). Any other track gets verdict `unknown`, reason `language_mismatch:<sub>/<audio>` or `script:<sub>`, and no correction.
+- FR-002a. The aligner decodes the audio stream ffmpeg picks, which can differ from the default stream the gate reads the language of. Until the aligner request names a stream (with slice 3, which decodes the audio itself), such a file may be scored against another stream; while the job only logs, that affects calibration rows only.
 - FR-003. A track with no language tag takes the audio's language only when the audio is tagged and the track's text passes a cheap stopword test for that language; otherwise `unknown`, reason `language_untagged`.
 
 ### Probes
@@ -53,7 +54,7 @@ Twelve dialogue cues per track, each sent with its own times padded by ±2 s, ag
 
 ### Verdict
 
-- FR-007. Stage 1 sends the probes at their own times, padded by 2 s each side, using the aligner's existing offset estimate (±8 s). A track **fits** when the median probe score is at least `T_median` (start 0.45) **or** at least half the probes score `T_line` (start 0.5) or more, **and** the median probe score exceeds the median decoy score by at least `T_margin` (start 0.2).
+- FR-007. Stage 1 sends the probes from their own start, with the end padded by 2 s (a padded start would shift the aligner's offset by the pad), using the aligner's existing offset estimate (±8 s). A track **fits** when the median probe score is at least `T_median` (start 0.45) **or** at least half the probes score `T_line` (start 0.5) or more, **and** the median probe score exceeds the median decoy score by at least `T_margin` (start 0.2).
 - FR-008. A track that does not fit in stage 1 goes to stage 2, the wide search, before it may be called wrong:
   - Offsets: a coarse search over ±120 s from a speech-activity match (FR-009), then the probes re-sent at the best candidate.
   - Speed ratios: 25/23.976, 23.976/25, 24/23.976 and 23.976/24, each with its own best offset.
