@@ -70,12 +70,60 @@ const VIEWS: &str = r#"{"Items":[
     {"Id":"lib-books","Name":"Reading","CollectionType":"books"}
 ]}"#;
 
-/// A signed-in runner whose home screen has loaded its sections.
+/// A signed-in runner whose home screen has loaded its sections, with
+/// nothing played. The downloaded-books record is left to the test.
 fn home() -> (AppRunner<Pharos>, Vec<Command>) {
-    let (mut runner, commands) = started(Some(&account()));
-    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
-    let commands = runner.task_outcome(views, ok(VIEWS));
+    let (runner, commands) = home_with(VIEWS);
     (runner, commands)
+}
+
+/// [`home`], with `views` as the libraries pharos lists.
+fn home_with(views: &str) -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, commands) = started(Some(&account()));
+    let mut all = commands.clone();
+    let (asked_views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    all.extend(runner.task_outcome(asked_views, ok(views)));
+    let commands = settle_home(&mut runner, all, r#"{"Items":[]}"#, None);
+    (runner, commands)
+}
+
+/// Answers what the home screen still waits on among `commands`, and what
+/// those answers ask for in turn, so it is drawn (B1457): what was played
+/// last as `resumed`, each album pharos is asked about as not found, the
+/// books read here as `books` when given, and each cover with a picture.
+/// Returns `commands` and every command on the way.
+fn settle_home(
+    runner: &mut AppRunner<Pharos>,
+    commands: Vec<Command>,
+    resumed: &str,
+    books: Option<&str>,
+) -> Vec<Command> {
+    let mut pending = spawns(&commands);
+    let mut all = commands;
+    while !pending.is_empty() {
+        let (task, work) = pending.remove(0);
+        let Some(url) = url_of(&work).map(str::to_owned) else {
+            continue;
+        };
+        let outcome = if url.contains("/Items/Resume") {
+            ok(resumed)
+        } else if url.contains("/Images/Primary") {
+            cover_bytes()
+        } else if url.contains("Ids=") {
+            match books {
+                Some(books) => ok(books),
+                None => continue,
+            }
+        } else if url.contains("/Users/u1/Items/") && !url.contains('?') {
+            TaskOutcome::Failed(TaskError::NotFound)
+        } else {
+            continue;
+        };
+        let reply = runner.task_outcome(task, outcome);
+        pending.extend(spawns(&reply));
+        all.extend(reply);
+    }
+    all
 }
 
 /// A runner on the music shelf, with `ALBUMS` loaded.
@@ -240,9 +288,7 @@ fn every_screen_fits_the_smallest_reader() {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let (mut runner, commands) = started(Some(&account()));
-    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
-    let commands = runner.task_outcome(views, ok(VIEWS));
+    let (mut runner, commands) = home();
     screens.extend(last_screen(&commands));
     let commands = runner.action(action_id("section-music"));
     let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
@@ -384,9 +430,7 @@ fn the_home_screen_offers_a_section_for_each_kind_of_library() {
 
 #[test]
 fn an_account_with_no_libraries_is_told_so() {
-    let (mut runner, commands) = started(Some(&account()));
-    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
-    let commands = runner.task_outcome(views, ok(r#"{"Items":[]}"#));
+    let (_, commands) = home_with(r#"{"Items":[]}"#);
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("shows no music"), "{screen}");
 }
