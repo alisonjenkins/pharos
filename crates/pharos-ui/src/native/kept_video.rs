@@ -240,6 +240,13 @@ pub fn missing_files(files: &[String], cached: &std::collections::HashSet<String
         .collect()
 }
 
+/// Files of an earlier plan that the new plan no longer names: a retry whose
+/// plan changed must not leave them in the cache.
+pub fn stale_files(old: &[String], new: &[String]) -> Vec<String> {
+    let keep: std::collections::HashSet<&String> = new.iter().collect();
+    old.iter().filter(|f| !keep.contains(f)).cloned().collect()
+}
+
 /// Whether progress is due to be saved: at most once a second.
 pub fn progress_due(last_saved_ms: f64, now_ms: f64) -> bool {
     now_ms - last_saved_ms >= 1_000.0
@@ -557,5 +564,13 @@ mod tests {
         assert!(put_is_retryable("NetworkError"));
         assert!(!put_is_retryable("QuotaExceededError"));
         assert!(!put_is_retryable("InvalidStateError"));
+    }
+
+    #[test]
+    fn a_changed_plan_drops_the_old_files() {
+        let old: Vec<String> = ["a", "b", "c"].map(String::from).into();
+        let new: Vec<String> = ["b", "d"].map(String::from).into();
+        assert_eq!(stale_files(&old, &new), ["a", "c"]);
+        assert!(stale_files(&[], &new).is_empty());
     }
 }
