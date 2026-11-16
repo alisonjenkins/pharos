@@ -171,6 +171,7 @@ jobs:
     needs: release-please
     if: ${{ github.repository == 'alisonjenkins/pharos' && needs.release-please.outputs.release_created == 'true' }}
     permissions:
+      actions: read
       contents: write
     uses: ./.github/workflows/android-apps.yml
     secrets: inherit
