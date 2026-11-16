@@ -47,7 +47,14 @@ pub struct MediaPlan {
     pub files: Vec<String>,
     /// The playlist's length.
     pub duration_ms: u64,
+    /// The last segment, when it is under [`SHORT_TAIL_MS`]: a sliver the
+    /// server's grid leaves at the very end, which an encoder can fail to
+    /// fill. A host may go without it; the stream then ends a frame early.
+    pub short_tail: Option<String>,
 }
+
+/// A last segment shorter than this is a short tail (see [`MediaPlan`]).
+pub const SHORT_TAIL_MS: u64 = 1000;
 
 /// The files the media playlist `text` (at `url`) names.
 pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
@@ -56,12 +63,21 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         .segments
         .last()
         .map_or(0, |s| s.start_ms.saturating_add(s.duration_ms));
+    let short_tail = media
+        .segments
+        .last()
+        .filter(|s| s.duration_ms < SHORT_TAIL_MS)
+        .map(|s| s.uri.clone());
     let files = media
         .init_uri
         .into_iter()
         .chain(media.segments.into_iter().map(|s| s.uri))
         .collect();
-    Ok(MediaPlan { files, duration_ms })
+    Ok(MediaPlan {
+        files,
+        duration_ms,
+        short_tail,
+    })
 }
 
 /// The bytes a stream of `bandwidth_bps` lasting `duration_ms` takes.
@@ -115,6 +131,17 @@ mod tests {
             ]
         );
         assert_eq!(plan.duration_ms, 10_500);
+        assert_eq!(plan.short_tail, None);
+    }
+
+    #[test]
+    fn a_last_segment_under_a_second_is_a_short_tail() {
+        let text = MEDIA.replace("#EXTINF:4.5,", "#EXTINF:0.042,");
+        let plan = plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &text).unwrap();
+        assert_eq!(
+            plan.short_tail.as_deref(),
+            Some("https://h/videos/9/h264cmaf/1.m4s?PlaySessionId=p")
+        );
     }
 
     #[test]
