@@ -1029,10 +1029,10 @@ index 9875021..297a63f 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
-index 0000000..e1880f8
+index 0000000..9acdbe9
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelved.rs
-@@ -0,0 +1,542 @@
+@@ -0,0 +1,616 @@
 +//! A book read off the shelf a range at a time, rather than all at once.
 +//!
 +//! A large illustrated book is mostly pictures, and the reader holds a few
@@ -1203,6 +1203,7 @@ index 0000000..e1880f8
 +    Tail,
 +    /// The directory starts before the tail did, and is being read up to it.
 +    Directory {
++        tail_at: usize,
 +        tail: Vec<u8>,
 +    },
 +    Members,
@@ -1275,10 +1276,15 @@ index 0000000..e1880f8
 +        match std::mem::replace(&mut self.stage, Stage::Members) {
 +            Stage::Head => self.headed(&bytes),
 +            Stage::Tail => self.tailed(at, bytes),
-+            Stage::Directory { tail } => {
++            Stage::Directory { tail_at, tail } => {
 +                let mut part = bytes;
-+                part.extend_from_slice(&tail);
-+                self.pieces.insert(at, part);
++                if at + part.len() == tail_at {
++                    part.extend_from_slice(&tail);
++                    self.pieces.insert(at, part);
++                } else {
++                    self.pieces.insert(at, part);
++                    self.pieces.insert(tail_at, tail);
++                }
 +                self.directed()
 +            }
 +            Stage::Members => {
@@ -1314,9 +1320,11 @@ index 0000000..e1880f8
 +            self.pieces.insert(tail_at, tail);
 +            return self.directed();
 +        }
-+        // One part from the directory to the end, so no entry straddles two
-+        // reads and the directory can be walked as one run of bytes.
-+        Ok(self.begin(Stage::Directory { tail }, at, tail_at))
++        // From the directory to the tail, so no entry straddles two reads. Its
++        // own length bounds the read: an end record that points the directory
++        // far back must not make the whole file be read to find it.
++        let until = tail_at.min(at.saturating_add(len));
++        Ok(self.begin(Stage::Directory { tail_at, tail }, at, until))
 +    }
 +
 +    fn directed(&mut self) -> Result<Next, ShelfFault> {
@@ -1573,6 +1581,72 @@ index 0000000..e1880f8
 +            opening.answer(offset, piece, 100_001).err(),
 +            Some(ShelfFault::Store(StoreError::Missing))
 +        );
++    }
++
++    #[test]
++    fn a_directory_is_read_no_further_than_its_declared_length() {
++        let mut book = b"PK\x03\x04".to_vec();
++        book.resize(20 * 1024 * 1024, 0);
++        // An end record claiming one entry of twenty-two bytes at offset 0.
++        let mut end = Vec::new();
++        end.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
++        end.extend_from_slice(&[0; 4]);
++        end.extend_from_slice(&1u16.to_le_bytes());
++        end.extend_from_slice(&1u16.to_le_bytes());
++        end.extend_from_slice(&22u32.to_le_bytes());
++        end.extend_from_slice(&0u32.to_le_bytes());
++        end.extend_from_slice(&0u16.to_le_bytes());
++        book.extend_from_slice(&end);
++        let (_, reads) = drive(&book);
++        let read: usize = reads.iter().map(|(_, length)| *length as usize).sum();
++        assert!(
++            read < zip::MAX_TAIL + 1024,
++            "{read} of {} bytes read for a 22 byte directory",
++            book.len()
++        );
++    }
++
++    #[test]
++    fn a_directory_longer_than_the_tail_read_still_opens() {
++        let mut members = vec![
++            ("mimetype".to_owned(), b"application/epub+zip".to_vec()),
++            (
++                "META-INF/container.xml".to_owned(),
++                br#"<?xml version="1.0"?>
++<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
++  <rootfiles><rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles>
++</container>"#
++                    .to_vec(),
++            ),
++            (
++                "OEBPS/book.opf".to_owned(),
++                br#"<?xml version="1.0"?>
++<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
++  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Long</dc:title></metadata>
++  <manifest><item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/></manifest>
++  <spine><itemref idref="c0"/></spine>
++</package>"#
++                    .to_vec(),
++            ),
++            (
++                "OEBPS/c0.xhtml".to_owned(),
++                b"<html><body><p>Some words.</p></body></html>".to_vec(),
++            ),
++        ];
++        for index in 0..1500 {
++            members.push((format!("OEBPS/extra/{index:0>60}.bin"), vec![1; 8]));
++        }
++        let book = zip::stored(&members).expect("a book");
++        let (directory, _) = zip::directory_of(&book, 0).expect("a directory");
++        assert!(
++            directory < book.len() - zip::MAX_TAIL,
++            "the directory begins before the tail read does"
++        );
++        let (result, _) = drive(&book);
++        let Ok(Next::Done(document, _, _)) = result else {
++            panic!("an open book, not {result:?}");
++        };
++        assert!(!document.blocks.is_empty());
 +    }
 +}
 diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
