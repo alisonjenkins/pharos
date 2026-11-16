@@ -135,10 +135,12 @@ pub struct BookPage {
 
 /// Books in every library the user can see, by name. `People` carries the
 /// author, `Path` the file's extension and `Overview` the description.
+/// `IsReadable=true` leaves out the books no client can open, a Kindle book
+/// locked with DRM among them, so they are never offered (V1449).
 #[must_use]
 pub fn list_url(server: &str, account: &Account, start: usize) -> String {
     format!(
-        "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true\
+        "{server}/Users/{}/Items?IncludeItemTypes=Book&Recursive=true&IsReadable=true\
          &SortBy=SortName&SortOrder=Ascending&Fields=Path,People,Overview\
          &StartIndex={start}&Limit={PAGE}",
         query_escape(&account.user_id)
@@ -425,6 +427,10 @@ mod tests {
         let url = list_url("https://p.test", &account(), 50);
         assert!(url.starts_with("https://p.test/Users/u1/Items?"));
         assert!(url.contains("IncludeItemTypes=Book"));
+        assert!(
+            url.contains("&IsReadable=true"),
+            "locked books are left out"
+        );
         assert!(url.contains("SortBy=SortName&SortOrder=Ascending"));
         assert!(url.contains("Fields=Path,People,Overview"));
         assert!(url.contains("StartIndex=50&Limit=50"));
