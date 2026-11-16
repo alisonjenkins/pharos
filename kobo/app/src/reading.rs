@@ -16,7 +16,7 @@ use crate::MAX_JSON;
 use kobo_bookview::{BookView, Step};
 use kobo_read::{Memory, Outcome};
 use kobo_sdk::{
-    action_id, ActionId, BannerLevel, Context, Glyph, Header, Screen, ScreenBuilder, ShelfDownload,
+    action_id, ActionId, BannerLevel, Context, Glyph, Header, LogLevel, Screen, ScreenBuilder, ShelfDownload,
     ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
     TileShape, TileState,
 };
@@ -1182,11 +1182,18 @@ impl Reading {
             self.say(BannerLevel::Error, why);
             return;
         }
-        if self
+        if let Err(fault) = self
             .view
             .open_bytes(context, &file, &bytes, Memory::default())
-            .is_err()
         {
+            context.log(
+                LogLevel::Info,
+                format!(
+                    "pharos: book {} ({} bytes) did not open: {fault}",
+                    book.id,
+                    bytes.len()
+                ),
+            );
             self.say(
                 BannerLevel::Error,
                 "This download is not a readable book. Check the file on Pharos.",
