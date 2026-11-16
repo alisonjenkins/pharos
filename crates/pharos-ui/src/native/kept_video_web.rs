@@ -449,7 +449,14 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         let free = measure_free().await.unwrap_or(u64::MAX);
         let used = with_list(|l| reserved_by(l, user, Some(item)));
         let needed = still_needed(estimate, stored_bytes);
-        if let Err(refusal) = fits(needed, used, DEFAULT_CAP_BYTES, free) {
+        // What this download already holds counts against the cap; only
+        // what is still to fetch needs free space.
+        if let Err(refusal) = fits(
+            needed,
+            used.saturating_add(stored_bytes),
+            DEFAULT_CAP_BYTES,
+            free,
+        ) {
             warn(&format!(
                 "pharos: video keep refused item={item} reason={refusal} used={used} free={free} resume={resume}"
             ));
