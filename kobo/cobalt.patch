@@ -2064,10 +2064,10 @@ index 7a43abf..93b1882 100644
          self.document.images = images;
      }
 diff --git a/crates/kobo-doc/src/zip.rs b/crates/kobo-doc/src/zip.rs
-index 4fa657b..4fc7047 100644
+index 4fa657b..6db36c4 100644
 --- a/crates/kobo-doc/src/zip.rs
 +++ b/crates/kobo-doc/src/zip.rs
-@@ -74,21 +74,304 @@ impl std::fmt::Display for Fault {
+@@ -74,21 +74,305 @@ impl std::fmt::Display for Fault {
  
  impl std::error::Error for Fault {}
  
@@ -2302,7 +2302,8 @@ index 4fa657b..4fc7047 100644
 +        .ok_or(Fault::Damaged)?;
 +
 +    match location.method {
-+        STORED => Ok(packed.to_vec()),
++        STORED if location.packed == location.unpacked => Ok(packed.to_vec()),
++        STORED => Err(Fault::Damaged),
 +        DEFLATED => {
 +            // The limit is the smaller of what the entry claims and what
 +            // is allowed, so a member claiming four gigabytes cannot make
@@ -2379,7 +2380,7 @@ index 4fa657b..4fc7047 100644
  }
  
  /// Writes an ordinary ZIP archive whose members are stored without another
-@@ -180,39 +463,54 @@ impl<'a> Archive<'a> {
+@@ -180,39 +464,54 @@ impl<'a> Archive<'a> {
      /// [`Fault::Damaged`] when one is found but does not point at a directory
      /// inside the file.
      pub fn open(bytes: &'a [u8]) -> Result<Self, Fault> {
@@ -2449,7 +2450,7 @@ index 4fa657b..4fc7047 100644
                      method,
                      packed,
                      unpacked,
-@@ -220,7 +518,33 @@ impl<'a> Archive<'a> {
+@@ -220,7 +519,33 @@ impl<'a> Archive<'a> {
              );
              at = name_at + name_len + extra_len + comment_len;
          }
@@ -2484,7 +2485,7 @@ index 4fa657b..4fc7047 100644
      }
  
      /// Every member's name, in order.
-@@ -237,37 +561,12 @@ impl<'a> Archive<'a> {
+@@ -237,37 +562,12 @@ impl<'a> Archive<'a> {
      /// does not know, and [`Fault::TooLarge`] when it claims to unpack past
      /// `MAX_UNPACKED`.
      pub fn read(&self, name: &str) -> Result<Vec<u8>, Fault> {
@@ -2526,7 +2527,7 @@ index 4fa657b..4fc7047 100644
      }
  }
  
-@@ -494,4 +793,189 @@ pub(crate) mod tests {
+@@ -494,4 +794,207 @@ pub(crate) mod tests {
              }
          }
      }
@@ -2657,6 +2658,24 @@ index 4fa657b..4fc7047 100644
 +        out.extend_from_slice(b"pxyz");
 +        out.extend_from_slice(packed);
 +        out
++    }
++
++    #[test]
++    fn a_stored_member_whose_sizes_disagree_is_damaged() {
++        let bytes = local(STORED, b"hello");
++        let place = Location {
++            at: 0,
++            end: bytes.len(),
++            method: STORED,
++            packed: 5,
++            unpacked: 3,
++        };
++        assert_eq!(unpack(&bytes, &place).unwrap_err(), Fault::Damaged);
++        let place = Location {
++            unpacked: 5,
++            ..place
++        };
++        assert_eq!(unpack(&bytes, &place).expect("sizes agree"), b"hello");
 +    }
 +
 +    #[test]
