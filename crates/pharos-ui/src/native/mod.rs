@@ -54,6 +54,7 @@ pub mod my_devices;
 pub mod offline_names;
 pub mod offline_start;
 pub mod offline_ui;
+pub mod offline_video;
 pub mod offline_view;
 pub mod paging;
 pub mod palette;
