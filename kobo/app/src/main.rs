@@ -34,6 +34,7 @@ const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
 };
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ACCOUNT_KEY: &str = "account";
+const HOME_MENU: &str = "home-menu";
 const POLL_SECONDS: u32 = 3;
 /// How often a playing track's place is sent while nobody touches anything.
 const REPORT_SECONDS: u32 = 30;
@@ -169,6 +170,8 @@ struct Pharos {
     resume_now: bool,
     /// Whether the open album came from the home screen, which Back returns to.
     album_from_home: bool,
+    /// Whether the home screen's top-right menu, which holds Sign out, is open.
+    home_menu_open: bool,
 }
 
 impl Default for Pharos {
@@ -194,6 +197,7 @@ impl Default for Pharos {
             resume_at: None,
             resume_now: false,
             album_from_home: false,
+            home_menu_open: false,
         }
     }
 }
@@ -1358,7 +1362,9 @@ impl Pharos {
     /// The top of the home screen: its bar and the recent rows that have
     /// something in them.
     fn recent_rows(&self, listening: usize, reading: usize) -> ScreenBuilder {
-        let mut screen = self.now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"));
+        let mut screen = self
+            .now_playing(ScreenBuilder::new("pharos-home").top_bar("Pharos"))
+            .top_bar_overflow(HOME_MENU, self.home_menu_open, [("sign-out", "Sign out")]);
         if listening > 0 {
             screen = screen
                 .section("Continue listening")
@@ -1416,7 +1422,21 @@ impl Pharos {
                 )
             })),
         };
-        screen.bottom_action("sign-out", "Sign out").build()
+        screen.build()
+    }
+
+    /// Opens or closes the home screen's menu. Any input while it is open
+    /// closes it, and only Sign out goes on to be answered: a tap outside it
+    /// arrives as Back, which must not leave home. Whether the input was used.
+    fn home_menu(&mut self, action: ActionId) -> bool {
+        if !matches!(self.view, View::Home) {
+            return false;
+        }
+        if action == action_id(HOME_MENU) {
+            self.home_menu_open = !self.home_menu_open;
+            return true;
+        }
+        std::mem::take(&mut self.home_menu_open) && action != action_id("sign-out")
     }
 
     /// Answers a tap on the home screen: a recent tile, or a section.
@@ -1728,7 +1748,7 @@ impl KoboApp for Pharos {
                 }
             }
         }
-        if self.pick_letter(context, action) {
+        if self.home_menu(action) || self.pick_letter(context, action) {
             self.refresh_covers(context);
             self.show(context);
             return;
