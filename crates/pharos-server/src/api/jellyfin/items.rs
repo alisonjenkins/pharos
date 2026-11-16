@@ -3234,6 +3234,12 @@ struct ListQuery {
     is_hd: Option<bool>,
     #[serde(default)]
     is_3d: Option<bool>,
+    /// Pharos extension, not in Jellyfin: `IsReadable=true` leaves out books
+    /// no client can open (a DRM-locked Kindle file, or one too damaged to
+    /// convert), `false` keeps only those, absent keeps all (B1470). The
+    /// Kobo app hides them this way; jellyfin-web never sends it.
+    #[serde(default)]
+    is_readable: Option<bool>,
     /// Explicit min/max bounds on the source video width. Lets a
     /// power user pick a 1440p cutoff that the canned chips miss.
     #[serde(default)]
@@ -3298,8 +3304,7 @@ impl From<&ListQuery> for ItemQuery {
             is_4k: q.is_4k,
             is_hd: q.is_hd,
             is_3d: q.is_3d,
-            // /Items never filters by it (B1420).
-            book_readable: None,
+            book_readable: q.is_readable,
             min_width: q.min_width,
             max_width: q.max_width,
             collapse_collections: false,
