@@ -148,6 +148,8 @@ subtle = "2.6"
 base64 = "0.23"
 # Avatar uploads: decoded and re-encoded in memory-safe Rust, not ffmpeg.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# PDF pages for e-readers, written at the panel's 4-bit grey depth (ADR-0144).
+png = "0.18"
 sonic-rs = "0.5"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "2"
