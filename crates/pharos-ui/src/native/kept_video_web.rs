@@ -563,10 +563,34 @@ async fn warm_player_script() -> Result<(), String> {
         }
         platform::sleep_ms(300).await;
     }
-    Err(format!(
-        "player script {} was not stored by the service worker",
-        url_path(platform::HLSJS_SRC)
-    ))
+    // No worker controls this page yet (a first visit): store it in the
+    // shell's cache ourselves, where the worker looks for it offline.
+    let keys: js_sys::Array = JsFuture::from(storage.keys())
+        .await
+        .map_err(|e| describe(&e))?
+        .into();
+    let shell = keys
+        .iter()
+        .filter_map(|k| k.as_string())
+        .find(|k| k.starts_with("pharos-shell-"));
+    let Some(shell) = shell else {
+        return Err(format!(
+            "player script {} not stored: no service worker cache",
+            url_path(platform::HLSJS_SRC)
+        ));
+    };
+    let cache: web_sys::Cache = JsFuture::from(storage.open(&shell))
+        .await
+        .map_err(|e| describe(&e))?
+        .dyn_into()
+        .map_err(|e| describe(&e))?;
+    JsFuture::from(cache.add_with_str(&key))
+        .await
+        .map_err(|e| format!("player script not stored in {shell}: {}", describe(&e)))?;
+    info(&format!(
+        "pharos: video keep player script stored by page cache={shell}"
+    ));
+    Ok(())
 }
 
 async fn run(user: String, item: String, resume: bool) {
