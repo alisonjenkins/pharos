@@ -58,6 +58,7 @@ impl Kind {
 
 /// Which readable kind the item's `Path` names. Pharos hands a Kindle book
 /// over as the EPUB it converted, and `Path` says so, so those read as EPUB.
+/// Pharos never converts KFX, so a KFX book would arrive as itself.
 #[must_use]
 pub fn support(path: &str) -> Support {
     let extension = path
@@ -65,7 +66,8 @@ pub fn support(path: &str) -> Support {
         .map(|(_, extension)| extension.to_ascii_lowercase())
         .unwrap_or_default();
     match extension.as_str() {
-        "epub" | "azw" | "azw3" | "mobi" | "kfx" => Support::Reads(Kind::Epub),
+        "epub" | "azw" | "azw3" | "mobi" => Support::Reads(Kind::Epub),
+        "kfx" => Support::Cannot("This reader can't open KFX Kindle books yet."),
         "txt" => Support::Reads(Kind::Text),
         "md" | "markdown" => Support::Reads(Kind::Markdown),
         "htm" | "html" | "xhtml" => Support::Reads(Kind::Html),
@@ -429,6 +431,10 @@ mod tests {
     fn epubs_and_kindle_conversions_read_and_pdfs_and_comics_say_why_not() {
         assert_eq!(support("/b/Book One.EPUB"), Support::Reads(Kind::Epub));
         assert_eq!(support("/b/Book One.azw3"), Support::Reads(Kind::Epub));
+        assert_eq!(
+            support("/b/Book One.kfx"),
+            Support::Cannot("This reader can't open KFX Kindle books yet.")
+        );
         assert_eq!(support("/b/notes.txt"), Support::Reads(Kind::Text));
         assert_eq!(support("/b/notes.md"), Support::Reads(Kind::Markdown));
         assert_eq!(support("/b/page.xhtml"), Support::Reads(Kind::Html));
