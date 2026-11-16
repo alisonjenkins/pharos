@@ -20,7 +20,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
-    absolute_url, cache_name, check_not_kept, fits, find, insert_front, interrupted, is_retryable,
+    absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
     missing_files, new_record, progress_due, retry_delay_secs, take, url_path, used_by,
     KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES,
     RECORDS_KEY,
@@ -79,9 +79,9 @@ fn with_list<R>(f: impl FnOnce(&mut Vec<KeptVideo>) -> R) -> R {
 
 fn save() {
     let text = with_list(|list| serde_json::to_string(list));
-    let result = text
-        .map_err(|e| e.to_string())
-        .and_then(|t| local_storage().and_then(|s| s.set_item(RECORDS_KEY, &t).map_err(|e| describe(&e))));
+    let result = text.map_err(|e| e.to_string()).and_then(|t| {
+        local_storage().and_then(|s| s.set_item(RECORDS_KEY, &t).map_err(|e| describe(&e)))
+    });
     match result {
         Ok(()) => LAST_SAVE_MS.with(|c| c.set(js_sys::Date::now())),
         Err(e) => warn(&format!("pharos: video record not saved error={e}")),
@@ -90,13 +90,15 @@ fn save() {
 
 /// Changes the record of `item`; false when it is gone (removed meanwhile).
 fn update(user: &str, item: &str, f: impl FnOnce(&mut KeptVideo)) -> bool {
-    with_list(|list| match list.iter_mut().find(|v| v.user == user && v.item == item) {
-        Some(v) => {
-            f(v);
-            true
-        }
-        None => false,
-    })
+    with_list(
+        |list| match list.iter_mut().find(|v| v.user == user && v.item == item) {
+            Some(v) => {
+                f(v);
+                true
+            }
+            None => false,
+        },
+    )
 }
 
 fn origin() -> String {
@@ -138,7 +140,10 @@ fn notify_worker() {
     let _ = js_sys::Reflect::set(&message, &"kind".into(), &SW_KIND.into());
     let _ = js_sys::Reflect::set(&message, &"event".into(), &"videos-changed".into());
     if let Err(e) = worker.post_message(&message) {
-        warn(&format!("pharos: video worker note failed error={}", describe(&e)));
+        warn(&format!(
+            "pharos: video worker note failed error={}",
+            describe(&e)
+        ));
     }
 }
 
@@ -159,7 +164,10 @@ fn request_persist() {
                 "pharos: video persist granted={}",
                 v.as_bool().unwrap_or(false)
             )),
-            Err(e) => warn(&format!("pharos: video persist failed error={}", describe(&e))),
+            Err(e) => warn(&format!(
+                "pharos: video persist failed error={}",
+                describe(&e)
+            )),
         }
     });
 }
@@ -233,12 +241,7 @@ async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Respo
         ));
         match (is_retryable(status), retry_delay_secs(attempt)) {
             (true, Some(secs)) => platform::sleep_ms(secs as u32 * 1000).await,
-            _ => {
-                return Err(Stop::Failed(format!(
-                    "{} answered {shown}",
-                    url_path(url)
-                )))
-            }
+            _ => return Err(Stop::Failed(format!("{} answered {shown}", url_path(url)))),
         }
     }
 }
@@ -282,9 +285,7 @@ async fn playlist(
             r
         }
     };
-    let promise = response
-        .text()
-        .map_err(|e| Stop::Failed(describe(&e)))?;
+    let promise = response.text().map_err(|e| Stop::Failed(describe(&e)))?;
     JsFuture::from(promise)
         .await
         .map_err(|e| Stop::Failed(describe(&e)))?
@@ -340,17 +341,24 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     let mut stored = vec![master.clone()];
     let mut files: Vec<String> = Vec::new();
     let mut duration_ms = 0u64;
+    let mut short_tails: HashSet<String> = HashSet::new();
     for url in &plan.media_playlists {
         let text = playlist(&cache, user, item, url).await?;
         stored.push(url.clone());
         let media = plan_media(url, &text)
             .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(url))))?;
         duration_ms = duration_ms.max(media.duration_ms);
+        short_tails.extend(media.short_tail);
         files.extend(media.files);
     }
     let mut all = stored.clone();
     all.extend(files);
-    all.extend(record.subtitles.iter().map(|s| absolute_url(&origin, &s.url)));
+    all.extend(
+        record
+            .subtitles
+            .iter()
+            .map(|s| absolute_url(&origin, &s.url)),
+    );
     let mut seen = HashSet::new();
     all.retain(|f| seen.insert(f.clone()));
 
@@ -376,7 +384,11 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     if !update(user, item, |v| {
         v.files = planned;
         v.estimated_bytes = estimate;
-        v.state = KeptState::Downloading { done: 0, total, bytes: 0 };
+        v.state = KeptState::Downloading {
+            done: 0,
+            total,
+            bytes: 0,
+        };
     }) {
         return Err(Stop::Gone);
     }
@@ -392,8 +404,21 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     publish(user, item, done, total, bytes, true);
 
     let cache = &cache;
+    let short_tails = &short_tails;
     let mut results = stream::iter(todo.iter().map(|url| async move {
-        let response = fetch_retry(user, item, url).await?;
+        let response = match fetch_retry(user, item, url).await {
+            Ok(r) => r,
+            // B1476: the sliver of a last segment can fail to encode; the
+            // copy plays without it, ending a frame early.
+            Err(Stop::Failed(reason)) if short_tails.contains(url) => {
+                warn(&format!(
+                    "pharos: video keep skipped short tail item={item} url_path={} reason={reason}",
+                    url_path(url)
+                ));
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
         let len = length_of(&response);
         put(cache, url, &response).await?;
         Ok::<u64, Stop>(len)
@@ -454,12 +479,18 @@ async fn run(user: String, item: String, resume: bool) {
                 v.estimated_bytes = bytes;
             }) {
                 save();
-                info(&format!("pharos: video keep ready item={item} bytes={bytes}"));
+                info(&format!(
+                    "pharos: video keep ready item={item} bytes={bytes}"
+                ));
             }
         }
-        Err(Stop::Gone) => info(&format!("pharos: video keep stopped item={item} reason=removed")),
+        Err(Stop::Gone) => info(&format!(
+            "pharos: video keep stopped item={item} reason=removed"
+        )),
         Err(Stop::Refused(reason)) | Err(Stop::Failed(reason)) => {
-            warn(&format!("pharos: video keep failed item={item} reason={reason}"));
+            warn(&format!(
+                "pharos: video keep failed item={item} reason={reason}"
+            ));
             if update(&user, &item, |v| v.state = KeptState::Failed { reason }) {
                 save();
             }
@@ -478,7 +509,10 @@ impl VideoStore for WebVideoStore {
 
     fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
         if let Err(e) = caches() {
-            warn(&format!("pharos: video keep refused item={} reason={e}", request.item));
+            warn(&format!(
+                "pharos: video keep refused item={} reason={e}",
+                request.item
+            ));
             return Err(KeepVideoRefusal::Host(e));
         }
         let (user, item) = (request.user.clone(), request.item.clone());
