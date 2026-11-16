@@ -665,3 +665,38 @@ fn a_book_that_will_not_open_logs_why_before_it_says_so() {
         "no title in the log: {commands:?}"
     );
 }
+
+#[test]
+fn a_twenty_piece_download_draws_its_progress_a_megabyte_at_a_time() {
+    let (mut runner, _) = books_from(EPUB_LIST);
+    let _ = runner.action(action_id("book-0"));
+    let mut commands = runner.action(action_id("book-read"));
+    let mut drawn = 0;
+    for piece in 0..20 {
+        let (task, _) = asked(&commands, "/Items/b1/Download").expect("the next piece");
+        let mut body = "x".repeat(books::CHUNK as usize);
+        if piece == 0 {
+            body.replace_range(..4, "PK\u{3}\u{4}");
+        }
+        commands = runner.task_outcome(task, ok(&body));
+        drawn += draws(&commands);
+    }
+    assert_eq!(drawn, 5, "one draw per megabyte of five");
+    let (task, _) = asked(&commands, "/Items/b1/Download").expect("the last piece");
+    let commands = runner.task_outcome(task, ok("end"));
+    assert_eq!(draws(&commands), 1, "the end is drawn once");
+}
+
+#[test]
+fn a_piece_that_changes_nothing_shown_is_logged_unchanged_and_not_drawn() {
+    let (mut runner, _) = books_from(EPUB_LIST);
+    let _ = runner.action(action_id("book-0"));
+    let commands = runner.action(action_id("book-read"));
+    let (task, _) = asked(&commands, "/Items/b1/Download").expect("download");
+    let commands = runner.task_outcome(task, ok(&"x".repeat(books::CHUNK as usize)));
+    assert_eq!(draws(&commands), 0, "{commands:?}");
+    assert!(
+        logged(&commands, "pharos: draw unchanged view=books cause=reading"),
+        "{commands:?}"
+    );
+}
