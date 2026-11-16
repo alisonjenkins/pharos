@@ -9,9 +9,9 @@
 
 use crate::about;
 use crate::api::{self, Account};
-use crate::books::{self, Book, BookPage, Kind, Piece, Saved, Shelf, Support};
+use crate::books::{self, Book, Kind, Piece, Saved, Shelf, Support};
 use crate::filters::{self, Narrow, Order, ReadState};
-use crate::letters;
+use crate::shelf;
 use crate::MAX_JSON;
 use kobo_bookview::{BookView, Step};
 use kobo_read::{Memory, Outcome};
@@ -88,12 +88,9 @@ pub struct Reading {
     account: Option<Account>,
     load: Load,
     shelf: Shelf,
-    list: BookPage,
+    list: shelf::Shelf<Book>,
     list_task: Option<(TaskId, usize)>,
     list_failed: Option<String>,
-    page: usize,
-    /// Whether the letters to jump the list to are showing (V1442).
-    picking_letter: bool,
     /// How the list is narrowed and ordered (V1451).
     narrow: Narrow,
     /// The narrowing being chosen on the filter screen, applied by its
@@ -138,11 +135,9 @@ impl Reading {
             account: None,
             load: Load::Unloaded,
             shelf: Shelf::default(),
-            list: BookPage::default(),
+            list: shelf::Shelf::new(TileShape::Portrait),
             list_task: None,
             list_failed: None,
-            page: 0,
-            picking_letter: false,
             narrow: Narrow::default(),
             draft: Narrow::default(),
             subjects: None,
@@ -177,7 +172,7 @@ impl Reading {
         self.notice = None;
         self.from_home = false;
         self.home_book = None;
-        if self.list.books.is_empty() {
+        if self.list.entries.is_empty() {
             self.load_list(context, 0);
         }
     }
@@ -195,7 +190,7 @@ impl Reading {
     /// The book `id`, from the list or from those asked for by id.
     fn book(&self, id: &str) -> Option<&Book> {
         self.list
-            .books
+            .entries
             .iter()
             .chain(&self.known)
             .find(|book| book.id == id)
@@ -283,7 +278,7 @@ impl Reading {
     fn detail_book(&self, index: usize) -> Option<&Book> {
         self.home_book
             .as_ref()
-            .or_else(|| self.list.books.get(index))
+            .or_else(|| self.list.entries.get(index))
     }
 
     fn headers(&self) -> Vec<Header> {
@@ -310,7 +305,7 @@ impl Reading {
             .collect();
         if self.narrow.downloaded && downloaded.is_empty() {
             // Nothing is on this reader, so there is nothing to ask for.
-            self.list = BookPage::default();
+            self.list.restart();
             return;
         }
         let task = context.spawn(Task::Fetch {
@@ -338,16 +333,10 @@ impl Reading {
         self.shelf.get(&book.id).is_some()
     }
 
-    /// The list split into the pages of covers this panel holds.
-    fn pages(&self, context: &Context) -> Vec<Vec<usize>> {
-        context.paginate_tiles(self.list.books.len(), TileShape::Portrait, false)
-    }
-
-    /// The books on the page showing, by their place in the list.
-    fn page_books(&self, context: &Context) -> Vec<usize> {
-        let pages = self.pages(context);
-        let page = self.page.min(pages.len().saturating_sub(1));
-        pages.get(page).cloned().unwrap_or_default()
+    /// Whether the list is the screen, so its covers are wanted and waited
+    /// for: not while a book is open or being fetched, nor under a menu.
+    fn list_showing(&self) -> bool {
+        !(self.opened || self.mode != Mode::List || self.busy())
     }
 
     /// The covers worth having now, as `(book id, cover tag)`: an open
@@ -364,38 +353,39 @@ impl Reading {
             Mode::Filter | Mode::Subjects(_) => return Vec::new(),
             Mode::Menu(index) | Mode::About { index, .. } => self.detail_book(index),
         };
-        let pages = self.pages(context);
-        let page = self.page.min(pages.len().saturating_sub(1));
-        let listed = api::wanted(&pages, page)
+        let listed = self
+            .list
+            .wanted(context)
             .into_iter()
-            .filter_map(|index| self.list.books.get(index))
             .filter(|book| detail.is_none_or(|detail| detail.id != book.id));
         detail
             .into_iter()
             .chain(listed)
-            .filter_map(|book| Some((book.id.clone(), book.image_tag.clone()?)))
+            .filter_map(shelf::Shelf::tagged)
             .collect()
     }
 
-    /// The covers on the page showing that are tagged, for the app to tell
-    /// whether all of them are in yet.
+    /// Whether a cover on the page showing is still to come, `unready` saying
+    /// of a cover's id that it is asked for and not here yet, or not asked
+    /// for yet.
     #[must_use]
-    pub fn page_covers(&self, context: &Context) -> Vec<String> {
-        if self.opened || self.mode != Mode::List || self.busy() {
-            return Vec::new();
-        }
-        self.page_books(context)
-            .into_iter()
-            .filter_map(|index| self.list.books.get(index))
-            .filter(|book| book.image_tag.is_some())
-            .map(|book| book.id.clone())
-            .collect()
+    pub fn covers_pending(&self, context: &Context, unready: &dyn Fn(&str) -> bool) -> bool {
+        self.list_showing() && self.list.covers_pending(context, unready)
+    }
+
+    /// Whether the screen showing still waits on the list: a block of it is
+    /// on its way, or a cover on the page showing is still to come.
+    #[must_use]
+    pub fn loading(&self, context: &Context, unready: &dyn Fn(&str) -> bool) -> bool {
+        self.list.loading(context, self.list_loading(), &|id| {
+            self.list_showing() && unready(id)
+        })
     }
 
     /// How many covers one page holds.
     #[must_use]
     pub fn per_page(&self, context: &Context) -> usize {
-        self.pages(context).first().map_or(0, Vec::len)
+        self.list.per_page(context)
     }
 
     /// The tiles of the page showing. A book this reader cannot open says
@@ -415,76 +405,31 @@ impl Reading {
         Option<TilePicture>,
         TileState,
     )> {
-        self.page_books(context)
-            .into_iter()
-            .filter_map(|index| {
-                let book = self.list.books.get(index)?;
-                let downloaded = self.downloaded(book);
-                let subtitle = match book.support {
-                    Support::Cannot(_) => "Can't open here".to_owned(),
-                    Support::Reads(_) => book.author.clone(),
-                };
-                let (menu, state) = if downloaded {
-                    (format!("book-menu-{index}"), TileState::Held)
-                } else {
-                    (String::new(), TileState::Normal)
-                };
-                Some((
-                    format!("book-{index}"),
-                    book.title.clone(),
-                    subtitle,
-                    Glyph::Book,
-                    menu,
-                    cover(&book.id),
-                    state,
-                ))
-            })
-            .collect()
+        self.list.page_tiles(context, |index, book| {
+            let subtitle = match book.support {
+                Support::Cannot(_) => "Can't open here".to_owned(),
+                Support::Reads(_) => book.author.clone(),
+            };
+            let (menu, state) = if self.downloaded(book) {
+                (format!("book-menu-{index}"), TileState::Held)
+            } else {
+                (String::new(), TileState::Normal)
+            };
+            (
+                format!("book-{index}"),
+                book.title.clone(),
+                subtitle,
+                Glyph::Book,
+                menu,
+                cover(&book.id),
+                state,
+            )
+        })
     }
 
-    /// Where each letter starts in the list (V1442).
-    fn letter_starts(&self) -> Vec<(char, usize)> {
-        letters::starts(self.list.books.iter().map(|book| book.title.as_str()))
-    }
-
-    /// The letters the list holds, over it while the reader picks one.
-    fn letter_picker(&self, context: &Context, screen: ScreenBuilder) -> ScreenBuilder {
-        if !self.picking_letter {
-            return screen;
-        }
-        let showing = self
-            .page_books(context)
-            .first()
-            .and_then(|&index| self.list.books.get(index))
-            .map(|book| letters::letter_of(&book.title));
-        letters::picker(screen, &self.letter_starts(), showing)
-    }
-
-    /// Answers the letter picker: a letter turns to the page its first book
-    /// is on, and Back closes it. Whether the action was its.
+    /// Answers the letter picker on the list. Whether the action was its.
     fn pick_letter(&mut self, context: &Context, action: ActionId) -> bool {
-        if self.mode != Mode::List {
-            return false;
-        }
-        if action == action_id("letters") {
-            self.picking_letter = true;
-            return true;
-        }
-        if !self.picking_letter {
-            return false;
-        }
-        self.picking_letter = false;
-        if action == ActionId::BACK {
-            return true;
-        }
-        if let Some(index) = letters::chosen(action, &self.letter_starts()) {
-            if let Some(page) = letters::page_holding(&self.pages(context), index) {
-                self.page = page;
-            }
-            return true;
-        }
-        // Anything else on the screen closes the picker and does its own job.
-        false
+        self.mode == Mode::List && self.list.pick_letter(context, action)
     }
 
     fn banner(&self, screen: ScreenBuilder) -> ScreenBuilder {
@@ -568,7 +513,7 @@ impl Reading {
                 .error_state(why.clone())
                 .primary_button("books-retry", "Try again"));
         }
-        if self.list.books.is_empty() {
+        if self.list.entries.is_empty() {
             let screen = self.banner(
                 ScreenBuilder::new("pharos-books")
                     .top_bar("Books")
@@ -606,7 +551,7 @@ impl Reading {
         own(screen
             .contextual_picture_tiles(TileShape::Portrait, self.tiles(context, cover))
             .page_turns("books-page-back", "books-page-next")
-            .compose(|screen| self.letter_picker(context, screen)))
+            .compose(|screen| self.list.letter_picker(context, screen)))
     }
 
     /// The filter screen: the order, the read state, the subject and
@@ -714,9 +659,7 @@ impl Reading {
         if let Some((task, _)) = self.list_task.take() {
             context.cancel(task);
         }
-        self.list = BookPage::default();
-        self.page = 0;
-        self.picking_letter = false;
+        self.list.clear();
         self.load_list(context, 0);
     }
 
@@ -724,7 +667,7 @@ impl Reading {
     /// theirs.
     fn filter_action(&mut self, context: &mut Context, action: ActionId) -> bool {
         if action == action_id("books-filter") && self.mode == Mode::List {
-            self.picking_letter = false;
+            self.list.stop_picking();
             self.draft = self.narrow.clone();
             self.mode = Mode::Filter;
             self.fetch_subjects(context);
@@ -1067,11 +1010,15 @@ impl Reading {
         if let Some((task, start)) = self.list_task {
             if task == id {
                 self.list_task = None;
-                let before = if start == 0 { 0 } else { self.list.books.len() };
+                let before = if start == 0 {
+                    0
+                } else {
+                    self.list.entries.len()
+                };
                 let leave = self.listed(start, outcome);
                 // The whole list, so every letter is there to jump to; a
                 // block that added nothing ends it rather than asking again.
-                let loaded = self.list.books.len();
+                let loaded = self.list.entries.len();
                 if leave == Leave::Stay && loaded > before && loaded < self.list.total {
                     self.load_list(context, loaded);
                 }
@@ -1091,12 +1038,11 @@ impl Reading {
             TaskOutcome::Completed(bytes) => match books::parse_page(bytes) {
                 Some(page) => {
                     if start == 0 {
-                        self.list = page;
-                        self.page = 0;
-                    } else if start == self.list.books.len() {
-                        self.list.books.extend(page.books);
-                        self.list.total = page.total;
+                        self.list.restart();
                     }
+                    let sent = page.books.len();
+                    self.list
+                        .take_block(start, sent, page.total, page.books, usize::MAX);
                 }
                 None => {
                     self.list_failed = Some("Pharos sent a list this app could not read.".into());
@@ -1279,7 +1225,7 @@ impl Reading {
     }
 
     fn row_action(&mut self, context: &mut Context, action: ActionId) {
-        for index in self.page_books(context) {
+        for index in self.list.page_indices(context) {
             if action == action_id(&format!("book-{index}"))
                 || action == action_id(&format!("book-menu-{index}"))
             {
@@ -1290,17 +1236,11 @@ impl Reading {
     }
 
     fn turn(&mut self, context: &mut Context, forward: bool) {
-        let pages = self.pages(context);
-        let per_page = pages.first().map_or(1, Vec::len).max(1);
-        let pages = pages.len().max(1);
-        if forward && self.page + 1 < pages {
-            self.page += 1;
-        } else if !forward && self.page > 0 {
-            self.page -= 1;
-        }
+        self.list.turn(context, forward);
+        let per_page = self.list.per_page(context).max(1);
         // Fetch the next block before the reader reaches the end of this one.
-        let loaded = self.list.books.len();
-        if loaded < self.list.total && (self.page + 2) * per_page >= loaded {
+        let loaded = self.list.entries.len();
+        if loaded < self.list.total && (self.list.page_number() + 2) * per_page >= loaded {
             self.load_list(context, loaded);
         }
     }
@@ -1323,7 +1263,7 @@ impl Reading {
 
     /// Opens the book at `index`, downloading it first if it is not here.
     fn begin(&mut self, context: &mut Context, index: usize) {
-        if let Some(book) = self.list.books.get(index).cloned() {
+        if let Some(book) = self.list.entries.get(index).cloned() {
             self.begin_book(context, book);
         }
     }

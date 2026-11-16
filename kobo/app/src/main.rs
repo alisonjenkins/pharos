@@ -604,7 +604,7 @@ impl Pharos {
         match self.view {
             View::Home => self.home_loading(context),
             View::Library(_) => self.shelf_loading(context),
-            View::Books => self.reading.list_loading() || self.page_covers_pending(context),
+            View::Books => self.reading.loading(context, &|id| self.cover_unready(id)),
             _ => false,
         }
     }
@@ -635,9 +635,7 @@ impl Pharos {
         if matches!(self.view, View::Books) {
             return self
                 .reading
-                .page_covers(context)
-                .iter()
-                .any(|id| self.cover_unready(id));
+                .covers_pending(context, &|id| self.cover_unready(id));
         }
         if matches!(self.view, View::Home) {
             return self
