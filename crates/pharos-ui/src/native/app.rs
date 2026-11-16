@@ -15,7 +15,6 @@ use pharos_client::api::{
 };
 use pharos_client::{CallInfo, ClientError};
 
-use super::offline_video;
 use super::account::AccountMenu;
 use super::account_settings;
 use super::activity;
@@ -35,6 +34,7 @@ use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::music_bridge::{self, Follow, MediaIo, Step};
+use super::offline_video;
 use super::palette::{self, Row};
 use super::person::PersonView;
 use super::platform::{self, OpenError};
@@ -2658,7 +2658,11 @@ fn offline_start(route: &Route) -> Option<Element> {
     let others = offline_start_books(route);
     platform::info(&format!(
         "pharos: offline start verdict={} videos={} books_or_music={}",
-        if others.is_some() || !videos.is_empty() { "list" } else { "waiting" },
+        if others.is_some() || !videos.is_empty() {
+            "list"
+        } else {
+            "waiting"
+        },
         videos.len(),
         others.is_some()
     ));
@@ -5290,7 +5294,9 @@ fn downloaded_copy(
 )> {
     let store = super::ports::video_store()?;
     let Some(user) = signed_in.or_else(offline_video::last_user) else {
-        platform::info(&format!("pharos: playback copy item={id} downloaded=false reason=no_user"));
+        platform::info(&format!(
+            "pharos: playback copy item={id} downloaded=false reason=no_user"
+        ));
         return None;
     };
     let videos = store.videos(&user);
@@ -5321,18 +5327,28 @@ fn offline_playing(
         StartFailure::new(FailureKind::Unplayable, reason)
     };
     let Some(detail) = offline_video::offline_detail(&copy) else {
-        return Err(fail(format!("The download names no playable item ({:?}).", copy.item)));
+        return Err(fail(format!(
+            "The download names no playable item ({:?}).",
+            copy.item
+        )));
     };
+    // B1476: a browser's own HLS player may fetch around the service
+    // worker (Chrome's reports `maybe` and could not parse the stored
+    // stream), so where MSE exists the page's engine fetches it, through the
+    // worker that holds the download.
+    let native_hls = platform::plays_hls() && !platform::has_mse();
     let verdict = resolve_engine(
         true,
-        platform::plays_hls(),
+        native_hls,
         platform::has_mse(),
         mse_engine_choice(),
         platform::hls_engine_used,
     );
     let engine = verdict.engine;
     if engine == Engine::Unsupported {
-        return Err(fail("This download needs HLS, which this browser cannot play.".to_owned()));
+        return Err(fail(
+            "This download needs HLS, which this browser cannot play.".to_owned(),
+        ));
     }
     if engine.reports_fragments() {
         platform::info(&verdict.line());
@@ -5678,7 +5694,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         async move {
             if let Some((copy, user, store)) = downloaded {
                 let resume = resume_from.get();
-                return Some(offline_playing(copy, user, store, resume, from_start, grant_gen));
+                return Some(offline_playing(
+                    copy, user, store, resume, from_start, grant_gen,
+                ));
             }
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
