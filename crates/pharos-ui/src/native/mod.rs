@@ -72,6 +72,9 @@ mod platform;
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[path = "android_page.rs"]
 mod platform;
+/// Opens and registers the phone's store of downloaded video (ADR 0145).
+#[cfg(all(feature = "mobile", target_os = "android"))]
+pub use platform::register_video_store as register_phone_video_store;
 #[cfg(all(feature = "mobile", target_os = "android"))]
 pub use platform::use_server_proxy;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]

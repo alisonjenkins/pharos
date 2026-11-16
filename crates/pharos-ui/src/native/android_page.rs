@@ -29,6 +29,12 @@ use dioxus::core::{spawn_forever, try_consume_context};
 use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
+use super::kept_video::{
+    loudness, request_class, request_key, request_line, url_path, Loudness, StoredFile, Verdict,
+};
+use super::kept_video_disk::{
+    iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher,
+};
 use super::tv_page::{self, Bridge, Paths};
 use super::tv_turn;
 
@@ -3150,6 +3156,128 @@ async fn fetch_server(
     Ok((status, back, body))
 }
 
+/// How long a download's request or one chunk of its body may go without
+/// an answer before it counts as a failure (a retryable one: no signal).
+const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The phone's video downloads over the same client, token and server
+/// address as the proxy, the body streamed rather than held.
+struct ServerFetcher;
+
+struct ServerBody(reqwest::Response);
+
+fn no_answer(what: &str) -> FetchError {
+    FetchError {
+        status: None,
+        message: format!("{what} timed out after {DOWNLOAD_STALL:?}"),
+    }
+}
+
+impl Body for ServerBody {
+    fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>> {
+        Box::pin(async move {
+            match tokio::time::timeout(DOWNLOAD_STALL, self.0.chunk()).await {
+                Err(_) => Err(no_answer("body")),
+                Ok(Ok(chunk)) => Ok(chunk.map(|c| c.to_vec())),
+                Ok(Err(e)) => Err(FetchError {
+                    status: None,
+                    message: format!("body {}", tv_page::error_chain(&e.without_url())),
+                }),
+            }
+        })
+    }
+}
+
+impl Fetcher for ServerFetcher {
+    fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
+        Box::pin(async move {
+            let mut req = http().get(tv_page::server_url(&server(), key));
+            if let Some(token) = android::token() {
+                req = req.header("X-Emby-Token", token);
+            }
+            let resp = tokio::time::timeout(DOWNLOAD_STALL, req.send())
+                .await
+                .map_err(|_| no_answer("request"))?
+                .map_err(|e| FetchError {
+                    status: None,
+                    message: format!("send {}", tv_page::error_chain(&e.without_url())),
+                })?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(Box::new(ServerBody(resp)) as Box<dyn Body>)
+            } else {
+                Err(FetchError {
+                    status: Some(status.as_u16()),
+                    message: String::new(),
+                })
+            }
+        })
+    }
+}
+
+/// Opens the phone's store of downloaded video under `root`, restarts the
+/// downloads a closed app left half done, and registers it as the app's
+/// [`VideoStore`](super::kept_video::VideoStore). The downloads run on a
+/// runtime of their own: one thread, because they wait on the network and
+/// the disk, and RAM is scarce. Call once, before launch.
+pub fn register_video_store(
+    root: std::path::PathBuf,
+    budget: Arc<dyn Budget>,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("video runtime: {e}"))?;
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .name("pharos-video".into())
+        .spawn(move || runtime.block_on(std::future::pending::<()>()))
+        .map_err(|e| format!("video thread: {e}"))?;
+    let store = DiskVideoStore::open(
+        root,
+        Env {
+            fetcher: Arc::new(ServerFetcher),
+            budget,
+            sleep: Arc::new(|secs| {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_secs(secs)))
+            }),
+            now: iso_now,
+            runtime: handle,
+        },
+    );
+    super::ports::register_video_store(store).map_err(|e| e.to_string())
+}
+
+/// Logs where a stream request was answered from: playlists at info,
+/// segments at debug, other requests not at all.
+fn log_video_request(key: &str, verdict: Verdict, bytes: u64) {
+    let line = request_line(key, verdict, bytes);
+    match loudness(request_class(key)) {
+        Some(Loudness::Info) => log::info!("{line}"),
+        Some(Loudness::Debug) => log::debug!("{line}"),
+        None => {}
+    }
+}
+
+/// The stored copy of the request for `key`, read whole: the WebView's
+/// response is a buffer, and a segment is a few MB at most. `None` when
+/// nothing is stored, or the file would not read (logged; the network
+/// answers instead).
+async fn stored_answer(key: &str) -> Option<(StoredFile, Vec<u8>)> {
+    let file = super::ports::video_store()?.stored_file(key)?;
+    match tokio::fs::read(&file.path).await {
+        Ok(body) => Some((file, body)),
+        Err(e) => {
+            log::warn!(
+                "pharos: video request class={} verdict=stored_unreadable url_path={} error={e}",
+                request_class(key).label(),
+                url_path(key)
+            );
+            None
+        }
+    }
+}
+
 /// Answer the page's requests to the server (`tv_page::proxied_segments`)
 /// by fetching them with the token in a header. Call once, in the root
 /// component.
@@ -3173,6 +3301,28 @@ pub fn use_server_proxy() {
                 .collect();
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
+                // A downloaded video's files answer from disk, online or
+                // not: no data used, and the same bytes the player was
+                // given when it was kept.
+                let key = request_key(&path);
+                if let Some((file, body)) = stored_answer(&key).await {
+                    log_video_request(&key, Verdict::ServedOffline, file.len);
+                    let response = dioxus::mobile::wry::http::Response::builder()
+                        .status(200)
+                        .header("access-control-allow-origin", "*")
+                        .header("content-type", file.content_type)
+                        .header("cache-control", "private, max-age=31536000, immutable")
+                        .body(body)
+                        .unwrap_or_else(|e| {
+                            log::warn!("pharos: proxy response build failed error={e}");
+                            let mut fallback = dioxus::mobile::wry::http::Response::new(Vec::new());
+                            *fallback.status_mut() =
+                                dioxus::mobile::wry::http::StatusCode::BAD_GATEWAY;
+                            fallback
+                        });
+                    responder.respond(response);
+                    return;
+                }
                 let fetched = tokio::time::timeout(PROXY_DEADLINE, fetch_server(&path, &headers))
                     .await
                     .unwrap_or_else(|_| {
@@ -3187,6 +3337,7 @@ pub fn use_server_proxy() {
                             builder = builder.header(name, value);
                         }
                         let ms = started.elapsed().as_millis();
+                        log_video_request(&key, Verdict::Network, body.len() as u64);
                         if status >= 400 {
                             // The server's own refusal, passed on: no "proxy failed" line.
                             log::warn!(

@@ -1411,6 +1411,23 @@ mod tests {
         assert_eq!(lines("pharos: video keep skipped short tail").len(), 1);
     }
 
+    /// The proxy asks with the path and query the WebView sent; a stored
+    /// file is found by that, and a different play session is a miss.
+    #[tokio::test]
+    async fn a_proxy_request_hits_by_path_and_query_and_misses_otherwise() {
+        let rig = Rig::new("lookup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let hit = |url: &str| store.stored_file(&request_key(url));
+        assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
+        assert!(hit("http://localhost:8096/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
+        assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=other").is_none());
+        assert!(hit("/videos/1/h264cmaf/0.m4s").is_none());
+        assert!(hit("/videos/1/h264cmaf/9.m4s?PlaySessionId=p").is_none());
+        assert!(hit("/Items/1/Images/Primary").is_none());
+    }
+
     #[test]
     fn names_are_safe_and_stable() {
         assert_eq!(safe_name("ab-12_Z"), "ab-12_Z");
