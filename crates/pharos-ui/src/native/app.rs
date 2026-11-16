@@ -5690,6 +5690,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let signed_in = account
             .and_then(|a| a.0.peek().clone().flatten())
             .map(|me| me.id);
+        // With no connection the downloaded copy is all there is, so a
+        // preferred version that is another file does not hide it.
+        let wanted = wanted.filter(|_| api.is_some());
         let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
         async move {
             if let Some((copy, user, store)) = downloaded {
