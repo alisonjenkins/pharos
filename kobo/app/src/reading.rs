@@ -13,6 +13,8 @@ use crate::books::{self, Book, Kind, Piece, Saved, Shelf, Support};
 use crate::filters::{self, Narrow, Order, ReadState};
 use crate::shelf;
 use crate::MAX_JSON;
+use kobo_bookview::comic::Outcome as ComicOutcome;
+use kobo_bookview::shelf_comic::{ComicStep, ShelfComic};
 use kobo_bookview::{BookView, ShelfFault, ShelfStep, Step};
 use kobo_read::{Memory, Outcome};
 use kobo_sdk::{
@@ -136,6 +138,9 @@ pub struct Reading {
     damaged: Option<String>,
     job: Job,
     view: BookView,
+    /// A book of page pictures, a PDF, read off the shelf a page at a time
+    /// (V1461).
+    comic: ShelfComic,
     opened: bool,
     /// The record being written, until the runtime answers.
     write: Option<Vec<u8>>,
@@ -178,6 +183,7 @@ impl Reading {
             damaged: None,
             job: Job::Idle,
             view: BookView::default(),
+            comic: ShelfComic::new(),
             opened: false,
             write: None,
             dirty: false,
@@ -202,6 +208,7 @@ impl Reading {
             _ => {}
         }
         self.view.close(context);
+        self.comic.close(context);
         *self = Self::new(self.server, self.version);
     }
 
@@ -514,6 +521,9 @@ impl Reading {
                 .current
                 .as_ref()
                 .map_or("Book", |book| book.title.as_str());
+            if let Some(screen) = self.comic.screen() {
+                return screen.with_own_back(true);
+            }
             if let Some(screen) = self.view.screen(title) {
                 // Back closes the book onto the list; left to the platform it
                 // would leave Pharos for the launcher.
@@ -843,7 +853,9 @@ impl Reading {
         if matches!(teaser, Some((_, true))) {
             screen = screen.button("book-about", "About this book");
         }
-        if matches!(book.support, Support::Reads(_)) {
+        // Pharos reads an opening out of an EPUB's text; a PDF has none it
+        // can give.
+        if matches!(book.support, Support::Reads(kind) if kind != Kind::Pages) {
             screen = screen.button("book-opening", "Read the opening");
         }
         screen
@@ -908,8 +920,49 @@ impl Reading {
         self.write = Some(bytes);
     }
 
+    /// What a shelf answer did to the open page book: `None` when it was
+    /// not for it, else whether the screen wants drawing.
+    fn comic_step(&mut self, context: &mut Context, step: ComicStep) -> Option<bool> {
+        match step {
+            ComicStep::Elsewhere => None,
+            ComicStep::Busy => Some(false),
+            ComicStep::Changed => Some(true),
+            ComicStep::Opened => {
+                if let Job::OpeningShelf(started) = std::mem::take(&mut self.job) {
+                    step_taken(context, "open", started, 0);
+                }
+                self.opened = true;
+                self.notice = None;
+                Some(true)
+            }
+            ComicStep::Failed(why) => {
+                if let Job::OpeningShelf(started) = std::mem::take(&mut self.job) {
+                    step_taken(context, "open", started, 0);
+                }
+                if let Some(book) = &self.current {
+                    context.log(
+                        LogLevel::Info,
+                        format!(
+                            "pharos: book open refused id={} from=shelf kind=pages why={why}",
+                            book.id
+                        ),
+                    );
+                }
+                self.damaged_copy(
+                    "The downloaded book is incomplete or unreadable. Open it again to download it.",
+                    true,
+                );
+                Some(true)
+            }
+        }
+    }
+
     /// The answer to a shelf request. `true` if a transfer here wanted it.
     pub fn shelf(&mut self, context: &mut Context, name: &str, result: &StoreResult) -> bool {
+        let step = self.comic.shelf(context, name, result);
+        if let Some(wanted) = self.comic_step(context, step) {
+            return wanted;
+        }
         match self.view.shelf(context, name, result) {
             ShelfStep::Elsewhere => {}
             ShelfStep::Busy => return false,
@@ -1290,6 +1343,22 @@ impl Reading {
     /// Opens a saved book: an EPUB straight off the shelf, anything else
     /// read back whole first.
     fn open_saved(&mut self, context: &mut Context, file: &str) {
+        if self.current_kind() == Some(Kind::Pages) {
+            let (title, memory) = self.current.as_ref().map_or_else(
+                || ("Book".to_owned(), None),
+                |book| {
+                    let memory = self
+                        .shelf
+                        .get(&book.id)
+                        .map(|saved| saved.memory.clone().into_bytes())
+                        .filter(|memory| !memory.is_empty());
+                    (book.title.clone(), memory)
+                },
+            );
+            self.comic.open(context, file, &title, memory);
+            self.job = Job::OpeningShelf(Instant::now());
+            return;
+        }
         if self.current_kind() == Some(Kind::Epub) {
             let memory = self
                 .current
@@ -1314,8 +1383,20 @@ impl Reading {
             self.job = Job::Idle;
             return;
         };
+        let url = if book.support == Support::Reads(Kind::Pages) {
+            let metrics = context.metrics();
+            books::pages_url(
+                self.server,
+                &book.id,
+                u32::try_from(metrics.width.min(metrics.height)).unwrap_or(1),
+                u32::try_from(metrics.width.max(metrics.height)).unwrap_or(1),
+                context.panel_shows_colour(),
+            )
+        } else {
+            books::download_url(self.server, &book.id)
+        };
         let task = context.spawn(Task::Fetch {
-            url: books::download_url(self.server, &book.id),
+            url,
             offset,
             max_bytes: books::CHUNK,
             credential: None,
@@ -1615,6 +1696,17 @@ impl Reading {
     }
 
     fn act_in_book(&mut self, context: &mut Context, action: ActionId) {
+        if self.comic.is_open() {
+            let before = self.comic.memory();
+            match self.comic.act(context, action) {
+                Some(ComicOutcome::Exit) => self.close_book(context),
+                Some(ComicOutcome::RetrySave) => self.keep_place(context),
+                // The place is kept as it moves, as a prose book's is.
+                Some(_) if self.comic.memory() != before => self.keep_place(context),
+                _ => {}
+            }
+            return;
+        }
         match self.view.act(context, action) {
             None if action == ActionId::BACK => self.close_book(context),
             Some(Outcome::Close) => self.close_book(context),
@@ -1630,6 +1722,7 @@ impl Reading {
     fn close_book(&mut self, context: &mut Context) {
         self.keep_place(context);
         self.view.close(context);
+        self.comic.close(context);
         self.opened = false;
     }
 
@@ -1637,7 +1730,11 @@ impl Reading {
         let Some(book) = &self.current else {
             return;
         };
-        if let Some(memory) = self.view.memory() {
+        if let Some(memory) = self.comic.memory() {
+            let encoded = String::from_utf8(memory).unwrap_or_default();
+            self.shelf.remember(&book.id, encoded);
+            self.save(context);
+        } else if let Some(memory) = self.view.memory() {
             let encoded = String::from_utf8(memory.encode()).unwrap_or_default();
             self.shelf.remember(&book.id, encoded);
             self.save(context);
@@ -1682,6 +1779,7 @@ fn kind_words(kind: Kind) -> &'static str {
         Kind::Text => "text",
         Kind::Markdown => "Markdown",
         Kind::Html => "a web page",
+        Kind::Pages => "a page book",
     }
 }
 
