@@ -6,6 +6,7 @@
 //! network only through the runtime's HTTPS tasks (ADR-0136).
 
 use kobo_json::{ObjectBuilder, Value};
+use kobo_sdk::TaskError;
 
 /// The device id pharos keys this reader's session by.
 pub const DEVICE_ID: &str = "pharos-kobo";
@@ -315,8 +316,12 @@ pub enum Cover {
         width: u32,
         height: u32,
     },
-    /// Could not be had; the tile keeps its glyph and nothing asks again.
+    /// Could not be had, and nothing asks again.
     Failed,
+    /// Could not be had for a reason that may pass (the server restarting, a
+    /// radio coming back): asked for again once the cache's clock reaches
+    /// `due`, in seconds.
+    Waiting { due: u64 },
 }
 
 /// The covers the runtime is holding on this app's behalf, and the covers
@@ -330,6 +335,27 @@ pub struct CoverCache {
     capacity: usize,
     next_handle: u32,
     pinned: Vec<String>,
+    /// Seconds the retry sleeps have counted: the app has no clock, so the
+    /// time a waiting cover is due is read against this.
+    clock: u64,
+    /// How many times each cover has failed for a transient reason, so the
+    /// wait doubles. Forgotten when the cover arrives, is let go, or is
+    /// pushed out.
+    attempts: Vec<(String, u32)>,
+}
+
+/// The first wait before a cover that failed for a transient reason is asked
+/// for again, in seconds. It doubles each time, up to [`RETRY_MAX_SECONDS`].
+pub const RETRY_FIRST_SECONDS: u32 = 15;
+/// The longest wait between two asks for the same cover, in seconds.
+pub const RETRY_MAX_SECONDS: u32 = 300;
+
+/// Whether a cover that failed this way may arrive if asked for again: the
+/// radio or the server was not there, or the server asked for patience. A
+/// missing picture, a refusal and an oversized one will not change.
+#[must_use]
+pub const fn transient(error: TaskError) -> bool {
+    error.worth_retrying() || matches!(error, TaskError::RateLimited(_))
 }
 
 impl CoverCache {
@@ -340,6 +366,8 @@ impl CoverCache {
             capacity: capacity.max(1),
             next_handle: 0,
             pinned: Vec::new(),
+            clock: 0,
+            attempts: Vec::new(),
         }
     }
 
@@ -395,6 +423,9 @@ impl CoverCache {
                 dropped.push(handle);
             }
         }
+        let slots = &self.slots;
+        self.attempts
+            .retain(|(held, _)| slots.iter().any(|(slot, _)| slot == held));
         dropped
     }
 
@@ -408,6 +439,7 @@ impl CoverCache {
             .position(|(held, cover)| held == id && *cover == Cover::Loading)?;
         self.next_handle = self.next_handle.wrapping_add(1).max(1);
         let handle = self.next_handle;
+        self.attempts.retain(|(held, _)| held != id);
         if let Some(slot) = self.slots.get_mut(at) {
             slot.1 = Cover::Ready {
                 handle,
@@ -422,7 +454,7 @@ impl CoverCache {
     /// caller logs it once.
     pub fn failed(&mut self, id: &str) -> bool {
         match self.slots.iter_mut().find(|(held, _)| held == id) {
-            Some((_, cover)) if *cover != Cover::Failed => {
+            Some((_, cover)) if !matches!(cover, Cover::Failed) => {
                 *cover = Cover::Failed;
                 true
             }
@@ -430,10 +462,73 @@ impl CoverCache {
         }
     }
 
+    /// Records that `id`, being waited for, failed for a transient reason:
+    /// it is asked for again after the returned seconds, which double with
+    /// each failure up to [`RETRY_MAX_SECONDS`] and are at least `at_least`
+    /// (a host's own request for patience). `None` when `id` is not being
+    /// waited for.
+    pub fn retry_later(&mut self, id: &str, at_least: u32) -> Option<u32> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|(held, cover)| held == id && *cover == Cover::Loading)?;
+        let tried = if let Some((_, tried)) = self.attempts.iter_mut().find(|(held, _)| held == id)
+        {
+            *tried = tried.saturating_add(1);
+            *tried
+        } else {
+            self.attempts.push((id.to_owned(), 0));
+            0
+        };
+        let wait = RETRY_FIRST_SECONDS
+            .saturating_mul(1u32.checked_shl(tried).unwrap_or(u32::MAX))
+            .max(at_least)
+            .min(RETRY_MAX_SECONDS);
+        slot.1 = Cover::Waiting {
+            due: self.clock.saturating_add(u64::from(wait)),
+        };
+        Some(wait)
+    }
+
+    /// Lets `seconds` pass on the retry clock.
+    pub fn advance(&mut self, seconds: u32) {
+        self.clock = self.clock.saturating_add(u64::from(seconds));
+    }
+
+    /// Whether `id` waits to be asked for again and its time has come.
+    #[must_use]
+    pub fn retry_due(&self, id: &str) -> bool {
+        matches!(self.state(id), Some(Cover::Waiting { due }) if due <= self.clock)
+    }
+
+    /// Notes that `id`, whose retry is due, has been asked for again.
+    pub fn retried(&mut self, id: &str) {
+        if self.retry_due(id) {
+            if let Some(slot) = self.slots.iter_mut().find(|(held, _)| held == id) {
+                slot.1 = Cover::Loading;
+            }
+        }
+    }
+
+    /// Seconds until the soonest of `ids` that waits to retry is due, at
+    /// least one; `None` when none of them waits.
+    #[must_use]
+    pub fn next_retry<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Option<u32> {
+        ids.filter_map(|id| match self.state(id) {
+            Some(Cover::Waiting { due }) => Some(due.saturating_sub(self.clock)),
+            _ => None,
+        })
+        .min()
+        .map(|seconds| u32::try_from(seconds).unwrap_or(u32::MAX).max(1))
+    }
+
     /// Forgets a cover still being waited for, because it is wanted no more.
     pub fn release(&mut self, id: &str) {
         self.slots
             .retain(|(held, cover)| held != id || *cover != Cover::Loading);
+        let slots = &self.slots;
+        self.attempts
+            .retain(|(held, _)| slots.iter().any(|(slot, _)| slot == held));
     }
 
     /// Forgets everything, returning the handles to drop.
@@ -447,6 +542,7 @@ impl CoverCache {
             })
             .collect();
         self.pinned.clear();
+        self.attempts.clear();
         handles
     }
 }

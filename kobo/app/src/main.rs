@@ -121,6 +121,11 @@ enum Work {
     ReportTimer,
     /// A screen's wait for what it shows, ended by the first draw.
     DrawWait,
+    /// The one sleep that counts down to the soonest cover waiting to be
+    /// asked for again (V1453); `seconds` is how long it was asked to sleep.
+    CoverRetry {
+        seconds: u32,
+    },
 }
 
 struct Playing {
@@ -158,6 +163,8 @@ struct Pharos {
     /// The [`Work::DrawWait`] running, which holds one of the runtime's few
     /// task slots until it is cancelled.
     draw_wait: Option<TaskId>,
+    /// The [`Work::CoverRetry`] running, if a cover on show waits to retry.
+    cover_retry: Option<TaskId>,
     reading: Reading,
     /// The albums and audiobooks the owner stopped part-way through, newest
     /// first (V1445).
@@ -192,6 +199,7 @@ impl Default for Pharos {
             playing: None,
             report_timer: None,
             draw_wait: None,
+            cover_retry: None,
             reading: Reading::new(SERVER, VERSION),
             listening: Vec::new(),
             resume_at: None,
@@ -455,7 +463,7 @@ impl Pharos {
                 width,
                 height,
             } => Some(TilePicture::new(PictureHandle(handle), width, height)),
-            Cover::Loading | Cover::Failed => None,
+            Cover::Loading | Cover::Failed | Cover::Waiting { .. } => None,
         }
     }
 
@@ -561,7 +569,8 @@ impl Pharos {
             .filter(|(_, work)| matches!(work, Work::Cover { .. }))
             .count();
         for (id, tag) in &wanted {
-            if self.covers.state(id).is_some() {
+            let retry = self.covers.retry_due(id);
+            if self.covers.state(id).is_some() && !retry {
                 continue;
             }
             // Leave a task free for everything that is not a cover.
@@ -581,11 +590,30 @@ impl Pharos {
                 break;
             };
             self.tasks.push((task, Work::Cover { id: id.clone() }));
+            if retry {
+                self.covers.retried(id);
+                context.log(LogLevel::Info, format!("pharos: cover {id} retrying"));
+            }
             for handle in self.covers.begin(id) {
                 context.drop_picture(PictureHandle(handle));
             }
             fetching += 1;
         }
+        self.schedule_cover_retry(context, &wanted);
+    }
+
+    /// Starts the one sleep that wakes the app when the soonest wanted cover
+    /// waiting to retry is due, unless it is running. It holds a task slot
+    /// only while some cover on show waits, and not one per cover.
+    fn schedule_cover_retry(&mut self, context: &mut Context, wanted: &[(String, String)]) {
+        if self.cover_retry.is_some() {
+            return;
+        }
+        let ids = wanted.iter().map(|(id, _)| id.as_str());
+        let Some(seconds) = self.covers.next_retry(ids) else {
+            return;
+        };
+        self.cover_retry = self.sleep(context, seconds, Work::CoverRetry { seconds });
     }
     /// Whether the home screen is still waiting on pharos: for its
     /// libraries, what was played last, a description of an album in it, or
@@ -705,6 +733,25 @@ impl Pharos {
         {
             playing.player.set_cover(cover);
         }
+    }
+
+    /// A cover that failed with `error`: one that may come right is asked
+    /// for again after a wait that doubles (V1453), and the rest are skipped.
+    fn cover_errored(&mut self, context: &mut Context, id: &str, error: TaskError) {
+        let patience = match error {
+            TaskError::RateLimited(seconds) => seconds,
+            _ => 0,
+        };
+        if api::transient(error) {
+            if let Some(seconds) = self.covers.retry_later(id, patience) {
+                context.log(
+                    LogLevel::Info,
+                    format!("pharos: cover {id} retry in {seconds}s: {error:?}"),
+                );
+                return;
+            }
+        }
+        self.cover_failed(context, id, &format!("{error:?}"));
     }
 
     /// A cover that cannot be had keeps its glyph. It is logged the first
@@ -948,6 +995,7 @@ impl Pharos {
                 );
             }
             Work::DrawWait => {}
+            Work::CoverRetry { seconds } => self.covers.advance(seconds),
             Work::ReportTimer => {
                 if self
                     .playing
@@ -1020,7 +1068,7 @@ impl Pharos {
         );
         match (work, error) {
             // A cover that fails keeps its glyph and nothing else changes.
-            (Work::Cover { id }, error) => self.cover_failed(context, &id, &format!("{error:?}")),
+            (Work::Cover { id }, error) => self.cover_errored(context, &id, error),
             (_, TaskError::Unauthorized) if self.account.is_some() => {
                 // Signed out on the server (the device removed, or the
                 // password changed): forget the token and sign in again.
@@ -1029,7 +1077,14 @@ impl Pharos {
             // A lost report only costs the server a moment of the listener's
             // place, and the home screen does without its Continue listening
             // row until it is shown again.
-            (Work::Report(_) | Work::ReportTimer | Work::DrawWait | Work::Listening, _) => {}
+            (
+                Work::Report(_)
+                | Work::ReportTimer
+                | Work::DrawWait
+                | Work::CoverRetry { .. }
+                | Work::Listening,
+                _,
+            ) => {}
             // The album keeps the name its track gave it, and the glyph.
             (Work::ListeningAlbum { id }, _) => self.album_described(context, &id, None),
             // The shelf keeps what loaded, and the rest is read when it is
@@ -1651,6 +1706,7 @@ fn work_label(work: &Work) -> &'static str {
         Work::Report(report) => report.label(),
         Work::ReportTimer => "report-timer",
         Work::DrawWait => "draw-wait",
+        Work::CoverRetry { .. } => "cover-retry",
     }
 }
 
@@ -1882,6 +1938,9 @@ impl KoboApp for Pharos {
         }
         if self.report_timer == Some(task) {
             self.report_timer = None;
+        }
+        if self.cover_retry == Some(task) {
+            self.cover_retry = None;
         }
         match outcome {
             TaskOutcome::Completed(bytes) => self.completed(context, work, &bytes),
