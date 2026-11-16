@@ -207,6 +207,13 @@ pub fn url_path(url: &str) -> &str {
     from_path.split(['?', '#']).next().unwrap_or("")
 }
 
+/// Whether a failed `cache.put` is the body transfer breaking (the browser
+/// rejects with a `TypeError`) rather than the store refusing it (quota and
+/// the like, which a retry cannot mend).
+pub fn put_is_retryable(error_name: &str) -> bool {
+    matches!(error_name, "TypeError" | "NetworkError")
+}
+
 /// Seconds to wait before retry number `attempt` (1-based) of one file, or
 /// `None` once the attempts are used up.
 pub fn retry_delay_secs(attempt: u32) -> Option<u64> {
@@ -542,5 +549,13 @@ mod tests {
         assert!(!needs_admission(true, 500));
         assert_eq!(still_needed(100, 30), 70);
         assert_eq!(still_needed(100, 130), 0);
+    }
+
+    #[test]
+    fn only_a_broken_transfer_is_retried_when_storing() {
+        assert!(put_is_retryable("TypeError"));
+        assert!(put_is_retryable("NetworkError"));
+        assert!(!put_is_retryable("QuotaExceededError"));
+        assert!(!put_is_retryable("InvalidStateError"));
     }
 }
