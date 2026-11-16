@@ -49,6 +49,12 @@ enum Load {
     Blocked,
 }
 
+/// The most bytes of an opening taken: pharos sends about 6000 characters.
+const MAX_OPENING: u32 = 64 * 1024;
+
+/// Shown on the detail page when pharos has no opening for the book.
+const NO_OPENING: &str = "This book has no opening Pharos can show.";
+
 /// What the screen is showing, when no book is open.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -58,10 +64,23 @@ enum Mode {
     Menu(usize),
     /// A page of the description of the book at this index.
     About { index: usize, page: usize },
+    /// A page of the opening of the book at this index, held in
+    /// [`Reading::opening`].
+    Opening { index: usize, page: usize },
     /// The filter screen, changing [`Reading::draft`] (V1451).
     Filter,
     /// This page of the subjects to narrow to.
     Subjects(u16),
+}
+
+/// The opening text of the book whose detail page is open. Dropped when that
+/// page is left.
+#[derive(Default)]
+enum Opening {
+    #[default]
+    None,
+    Loading(TaskId),
+    Ready(String),
 }
 
 /// The one piece of work that may be running.
@@ -124,6 +143,7 @@ pub struct Reading {
     /// in the list loaded so far. While set, the detail and About pages
     /// show it rather than a book of the list.
     home_book: Option<Book>,
+    opening: Opening,
 }
 
 impl Reading {
@@ -156,6 +176,7 @@ impl Reading {
             known_task: None,
             from_home: false,
             home_book: None,
+            opening: Opening::None,
         }
     }
 
@@ -172,6 +193,7 @@ impl Reading {
         self.notice = None;
         self.from_home = false;
         self.home_book = None;
+        self.drop_opening(context);
         if self.list.entries.is_empty() {
             self.load_list(context, 0);
         }
@@ -351,7 +373,9 @@ impl Reading {
             Mode::List => None,
             // The list may change under these, so nothing is fetched for it.
             Mode::Filter | Mode::Subjects(_) => return Vec::new(),
-            Mode::Menu(index) | Mode::About { index, .. } => self.detail_book(index),
+            Mode::Menu(index) | Mode::About { index, .. } | Mode::Opening { index, .. } => {
+                self.detail_book(index)
+            }
         };
         let listed = self
             .list
@@ -498,6 +522,22 @@ impl Reading {
                     &book.overview,
                     page,
                     ("book-about-back", "book-about-next"),
+                ));
+            }
+        }
+        if let Mode::Opening { index, page } = self.mode {
+            if self.detail_book(index).is_some() {
+                let text = match &self.opening {
+                    Opening::Ready(text) => text.as_str(),
+                    Opening::Loading(_) | Opening::None => "Loading the opening…",
+                };
+                return own(about::screen(
+                    context,
+                    "pharos-book-opening",
+                    "Opening",
+                    text,
+                    page,
+                    ("book-opening-back", "book-opening-next"),
                 ));
             }
         }
@@ -788,6 +828,9 @@ impl Reading {
         if matches!(teaser, Some((_, true))) {
             screen = screen.button("book-about", "About this book");
         }
+        if matches!(book.support, Support::Reads(_)) {
+            screen = screen.button("book-opening", "Read the opening");
+        }
         screen
     }
 
@@ -1007,6 +1050,9 @@ impl Reading {
             }
             return Some(Leave::Stay);
         }
+        if matches!(self.opening, Opening::Loading(task) if task == id) {
+            return Some(self.opening_arrived(outcome));
+        }
         if let Some((task, start)) = self.list_task {
             if task == id {
                 self.list_task = None;
@@ -1186,11 +1232,23 @@ impl Reading {
                 Mode::Menu(_) if self.home_book.is_some() => {
                     self.home_book = None;
                     self.from_home = false;
+                    self.drop_opening(context);
                     return Leave::Back;
                 }
                 Mode::Menu(_) | Mode::Filter | Mode::Subjects(_) => Mode::List,
                 Mode::About { index, .. } => Mode::Menu(index),
+                Mode::Opening { index, .. } => {
+                    // A request still out is not wanted once the page is left.
+                    if let Opening::Loading(task) = self.opening {
+                        context.cancel(task);
+                        self.opening = Opening::None;
+                    }
+                    Mode::Menu(index)
+                }
             };
+            if !matches!(self.mode, Mode::Menu(_)) {
+                self.drop_opening(context);
+            }
         } else if action == action_id("books-retry") {
             self.list_failed = None;
             self.load_list(context, 0);
@@ -1214,10 +1272,16 @@ impl Reading {
             if let Mode::Menu(index) = self.mode {
                 self.mode = Mode::About { index, page: 0 };
             }
-        } else if action == action_id("book-about-next") {
-            self.turn_about(context, true);
-        } else if action == action_id("book-about-back") {
-            self.turn_about(context, false);
+        } else if action == action_id("book-opening") {
+            if let Mode::Menu(index) = self.mode {
+                self.read_opening(context, index);
+            }
+        } else if action == action_id("book-about-next") || action == action_id("book-opening-next")
+        {
+            self.turn_pager(context, true);
+        } else if action == action_id("book-about-back") || action == action_id("book-opening-back")
+        {
+            self.turn_pager(context, false);
         } else {
             self.row_action(context, action);
         }
@@ -1245,20 +1309,95 @@ impl Reading {
         }
     }
 
-    fn turn_about(&mut self, context: &Context, forward: bool) {
-        let Mode::About { index, page } = self.mode else {
-            return;
+    /// Turns the page of the description or of the opening.
+    fn turn_pager(&mut self, context: &Context, forward: bool) {
+        let (index, page, pages) = match self.mode {
+            Mode::About { index, page } => {
+                let Some(book) = self.detail_book(index) else {
+                    return;
+                };
+                (index, page, about::page_count(context, &book.overview))
+            }
+            Mode::Opening { index, page } => {
+                let Opening::Ready(text) = &self.opening else {
+                    return;
+                };
+                (index, page, about::page_count(context, text))
+            }
+            _ => return,
         };
-        let Some(book) = self.detail_book(index) else {
-            return;
-        };
-        let pages = about::page_count(context, &book.overview);
         let page = if forward {
             (page + 1).min(pages.saturating_sub(1))
         } else {
             page.saturating_sub(1)
         };
-        self.mode = Mode::About { index, page };
+        self.mode = match self.mode {
+            Mode::Opening { .. } => Mode::Opening { index, page },
+            _ => Mode::About { index, page },
+        };
+    }
+
+    /// Asks pharos for the opening of the book at `index`, and shows its
+    /// pages when it comes. One already fetched for this page is shown again.
+    fn read_opening(&mut self, context: &mut Context, index: usize) {
+        self.notice = None;
+        if matches!(self.opening, Opening::Ready(_)) {
+            self.mode = Mode::Opening { index, page: 0 };
+            return;
+        }
+        let Some(book) = self.detail_book(index) else {
+            return;
+        };
+        let url = books::opening_url(self.server, &book.id);
+        let task = context.spawn(Task::Fetch {
+            url,
+            offset: 0,
+            max_bytes: MAX_OPENING,
+            credential: None,
+            headers: self.headers(),
+        });
+        match task {
+            Some(task) => {
+                self.opening = Opening::Loading(task);
+                self.mode = Mode::Opening { index, page: 0 };
+            }
+            None => self.say(BannerLevel::Error, "The opening could not be requested."),
+        }
+    }
+
+    /// Forgets the opening, cancelling a request still out.
+    fn drop_opening(&mut self, context: &mut Context) {
+        if let Opening::Loading(task) = std::mem::take(&mut self.opening) {
+            context.cancel(task);
+        }
+    }
+
+    /// The answer to asking for the opening. The text is kept for the
+    /// pager; a failure returns to the detail page with the reason.
+    fn opening_arrived(&mut self, outcome: &TaskOutcome) -> Leave {
+        self.opening = Opening::None;
+        let failure = match outcome {
+            TaskOutcome::Completed(bytes) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                if text.trim().is_empty() {
+                    Some((BannerLevel::Attention, NO_OPENING))
+                } else {
+                    self.opening = Opening::Ready(text);
+                    None
+                }
+            }
+            TaskOutcome::Failed(TaskError::Unauthorized) => return Leave::SignOut,
+            TaskOutcome::Failed(TaskError::NotFound) => Some((BannerLevel::Attention, NO_OPENING)),
+            TaskOutcome::Failed(error) => Some((BannerLevel::Error, task_words(*error))),
+            TaskOutcome::Cancelled => return Leave::Stay,
+        };
+        if let Some((level, words)) = failure {
+            if let Mode::Opening { index, .. } = self.mode {
+                self.mode = Mode::Menu(index);
+            }
+            self.say(level, words);
+        }
+        Leave::Stay
     }
 
     /// Opens the book at `index`, downloading it first if it is not here.
@@ -1270,6 +1409,7 @@ impl Reading {
 
     /// Opens `book`, downloading it first if it is not here.
     fn begin_book(&mut self, context: &mut Context, book: Book) {
+        self.drop_opening(context);
         self.mode = Mode::List;
         self.notice = None;
         if let Support::Cannot(why) = book.support {

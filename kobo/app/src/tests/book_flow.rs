@@ -159,7 +159,10 @@ fn a_kindle_book_pharos_could_not_convert_says_so() {
     let commands = downloaded(&mut runner, "BOOKMOBI");
     assert!(wrote(&commands).is_none());
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("couldn't convert this Kindle book"), "{screen}");
+    assert!(
+        screen.contains("couldn't convert this Kindle book"),
+        "{screen}"
+    );
 }
 
 #[test]
@@ -400,7 +403,10 @@ fn the_books_list_loads_whole_and_jumps_to_a_letter() {
 fn a_tap_opens_the_book_s_detail_page_before_anything_downloads() {
     let (mut runner, _) = books();
     let commands = runner.action(action_id("book-0"));
-    assert!(asked(&commands, "/Download").is_none(), "a tap only opens it");
+    assert!(
+        asked(&commands, "/Download").is_none(),
+        "a tap only opens it"
+    );
     let detail = last_screen(&commands).expect("a screen");
     let text = screen_text(&detail);
     for part in ["Book One", "Author A", "Download and read"] {
@@ -410,7 +416,10 @@ fn a_tap_opens_the_book_s_detail_page_before_anything_downloads() {
     assert!(detail.validate(&CLARA_BW_METRICS).is_empty());
     let commands = runner.action(ActionId::BACK);
     let text = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(text.contains("TileGrid"), "Back returns to the grid: {text}");
+    assert!(
+        text.contains("TileGrid"),
+        "Back returns to the grid: {text}"
+    );
 }
 
 #[test]
@@ -450,7 +459,12 @@ fn a_downloaded_book_s_detail_page_reads_and_removes() {
     for open in ["book-0", "book-menu-0"] {
         let detail = last_screen(&runner.action(action_id(open))).expect("a screen");
         let text = screen_text(&detail);
-        for part in ["Downloaded", "\"Read\"", "Remove download", "About this book"] {
+        for part in [
+            "Downloaded",
+            "\"Read\"",
+            "Remove download",
+            "About this book",
+        ] {
             assert!(text.contains(part), "{open}: {part} missing from {text}");
         }
         assert!(detail.validate(&CLARA_BW_METRICS).is_empty());
@@ -482,5 +496,123 @@ fn an_open_detail_page_keeps_its_cover_wanted() {
     );
     let commands = runner.task_outcome(covers[0].0, cover_bytes());
     let text = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(text.contains("Picture"), "the cover beside the title: {text}");
+    assert!(
+        text.contains("Picture"),
+        "the cover beside the title: {text}"
+    );
+}
+
+/// Prose long enough to take several pages.
+fn long_opening() -> String {
+    (0..60)
+        .map(|n| format!("Paragraph {n} of a made-up opening that goes on for a while."))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Opens the first book's detail page and taps Read the opening; returns the
+/// task asking for it.
+fn ask_opening(runner: &mut AppRunner<Pharos>) -> TaskId {
+    let _ = runner.action(action_id("book-0"));
+    let commands = runner.action(action_id("book-opening"));
+    let (task, request) = asked(&commands, "/Items/b1/Opening").expect("the opening is asked for");
+    let Task::Fetch {
+        headers,
+        offset,
+        max_bytes,
+        ..
+    } = request
+    else {
+        panic!("the opening is a GET");
+    };
+    assert_eq!(offset, 0);
+    assert!(max_bytes >= 32 * 1024);
+    assert!(headers
+        .iter()
+        .any(|header| header.value.contains("Token=\"t0k\"")));
+    assert!(screen_text(&last_screen(&commands).expect("a screen")).contains("Loading the opening"));
+    task
+}
+
+#[test]
+fn a_readable_book_offers_its_opening_and_an_unreadable_one_does_not() {
+    let (mut runner, _) = books();
+    let detail = last_screen(&runner.action(action_id("book-0"))).expect("a screen");
+    assert!(screen_text(&detail).contains("Read the opening"));
+    let _ = runner.action(ActionId::BACK);
+    let detail = last_screen(&runner.action(action_id("book-1"))).expect("a screen");
+    assert!(!screen_text(&detail).contains("Read the opening"));
+}
+
+#[test]
+fn the_opening_is_shown_on_pages_and_back_returns_to_the_detail_page() {
+    let (mut runner, _) = books();
+    let task = ask_opening(&mut runner);
+    let first = last_screen(&runner.task_outcome(task, ok(&long_opening()))).expect("a screen");
+    let text = screen_text(&first);
+    assert!(text.contains("Opening"), "{text}");
+    assert!(text.contains("Paragraph 0 of"), "{text}");
+    assert!(first.validate(&CLARA_BW_METRICS).is_empty());
+
+    let next = last_screen(&runner.action(action_id("book-opening-next"))).expect("a screen");
+    assert_ne!(screen_text(&next), text, "the page turns");
+    let back = last_screen(&runner.action(action_id("book-opening-back"))).expect("a screen");
+    assert_eq!(screen_text(&back), text);
+
+    let detail = screen_text(&last_screen(&runner.action(ActionId::BACK)).expect("a screen"));
+    assert!(detail.contains("Read the opening"), "{detail}");
+    assert!(detail.contains("Book One"), "{detail}");
+}
+
+#[test]
+fn leaving_the_detail_page_drops_the_opening() {
+    let (mut runner, _) = books();
+    let task = ask_opening(&mut runner);
+    let _ = runner.task_outcome(task, ok(PROSE));
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(ActionId::BACK);
+    let _ = runner.action(action_id("book-0"));
+    let commands = runner.action(action_id("book-opening"));
+    assert!(
+        asked(&commands, "/Items/b1/Opening").is_some(),
+        "a new visit asks again: {commands:?}"
+    );
+}
+
+#[test]
+fn a_book_without_an_opening_says_so_on_its_detail_page() {
+    let (mut runner, _) = books();
+    let task = ask_opening(&mut runner);
+    let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NotFound));
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        text.contains("This book has no opening Pharos can show."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Read the opening"),
+        "still the detail page: {text}"
+    );
+}
+
+#[test]
+fn another_failure_shows_the_usual_words() {
+    let (mut runner, _) = books();
+    let task = ask_opening(&mut runner);
+    let commands = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Offline));
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("The reader is offline"), "{text}");
+    assert!(text.contains("Read the opening"), "{text}");
+}
+
+#[test]
+fn backing_out_while_the_opening_loads_cancels_it() {
+    let (mut runner, _) = books();
+    let task = ask_opening(&mut runner);
+    let commands = runner.action(ActionId::BACK);
+    assert!(commands
+        .iter()
+        .any(|command| matches!(command, Command::Cancel(id) if *id == task)));
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(text.contains("Read the opening"), "{text}");
 }
