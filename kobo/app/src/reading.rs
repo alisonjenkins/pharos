@@ -905,13 +905,16 @@ impl Reading {
             return;
         };
         if !books::is_what_it_claims(kind, &bytes) {
-            self.say(
-                BannerLevel::Error,
+            let why = if book.kindle {
+                "Pharos couldn't convert this Kindle book to an EPUB. It may be locked with DRM."
+                    .to_owned()
+            } else {
                 format!(
                     "Pharos sent a file this reader can't open as {}.",
                     kind_words(kind)
-                ),
-            );
+                )
+            };
+            self.say(BannerLevel::Error, why);
             return;
         }
         if self
