@@ -51,6 +51,78 @@ const LANGS: &[(&str, &[&str])] = &[
     ("uk", &["ukr", "ukrainian"]),
     ("vi", &["vie", "vietnamese"]),
     ("zh", &["chi", "zho", "chinese"]),
+    // Further ISO 639-1 languages, so a 639-1 tag and its 639-2 form compare
+    // equal (B/T forms where they differ).
+    ("af", &["afr", "afrikaans"]),
+    ("am", &["amh", "amharic"]),
+    ("az", &["aze", "azerbaijani"]),
+    ("be", &["bel", "belarusian"]),
+    ("bn", &["ben", "bengali"]),
+    ("bo", &["tib", "bod", "tibetan"]),
+    ("br", &["bre", "breton"]),
+    ("bs", &["bos", "bosnian"]),
+    ("co", &["cos", "corsican"]),
+    ("eo", &["epo", "esperanto"]),
+    ("fo", &["fao", "faroese"]),
+    ("fy", &["fry", "frisian"]),
+    ("gd", &["gla", "gaelic"]),
+    ("gu", &["guj", "gujarati"]),
+    ("ha", &["hau", "hausa"]),
+    ("ht", &["hat", "haitian"]),
+    ("hy", &["arm", "hye", "armenian"]),
+    ("ig", &["ibo", "igbo"]),
+    ("jv", &["jav", "javanese"]),
+    ("ka", &["geo", "kat", "georgian"]),
+    ("kk", &["kaz", "kazakh"]),
+    ("km", &["khm", "khmer"]),
+    ("kn", &["kan", "kannada"]),
+    ("ku", &["kur", "kurdish"]),
+    ("kw", &["cor", "cornish"]),
+    ("ky", &["kir", "kyrgyz"]),
+    ("la", &["lat", "latin"]),
+    ("lb", &["ltz", "luxembourgish"]),
+    ("ln", &["lin", "lingala"]),
+    ("lo", &["lao"]),
+    ("mg", &["mlg", "malagasy"]),
+    ("mi", &["mao", "mri", "maori"]),
+    ("mk", &["mac", "mkd", "macedonian"]),
+    ("ml", &["mal", "malayalam"]),
+    ("mn", &["mon", "mongolian"]),
+    ("mr", &["mar", "marathi"]),
+    ("mt", &["mlt", "maltese"]),
+    ("my", &["bur", "mya", "burmese"]),
+    ("ne", &["nep", "nepali"]),
+    ("ny", &["nya", "chichewa"]),
+    ("oc", &["oci", "occitan"]),
+    ("pa", &["pan", "punjabi"]),
+    ("ps", &["pus", "pashto"]),
+    ("qu", &["que", "quechua"]),
+    ("rm", &["roh", "romansh"]),
+    ("rw", &["kin", "kinyarwanda"]),
+    ("se", &["sme", "sami"]),
+    ("si", &["sin", "sinhala"]),
+    ("sm", &["smo", "samoan"]),
+    ("sn", &["sna", "shona"]),
+    ("so", &["som", "somali"]),
+    ("sq", &["alb", "sqi", "albanian"]),
+    ("st", &["sot", "sesotho"]),
+    ("su", &["sun", "sundanese"]),
+    ("sw", &["swa", "swahili"]),
+    ("ta", &["tam", "tamil"]),
+    ("te", &["tel", "telugu"]),
+    ("tg", &["tgk", "tajik"]),
+    ("tk", &["tuk", "turkmen"]),
+    ("tn", &["tsn", "tswana"]),
+    ("to", &["ton", "tongan"]),
+    ("ug", &["uig", "uyghur"]),
+    ("ur", &["urd", "urdu"]),
+    ("uz", &["uzb", "uzbek"]),
+    ("wa", &["wln", "walloon"]),
+    ("wo", &["wol", "wolof"]),
+    ("xh", &["xho", "xhosa"]),
+    ("yi", &["yid", "yiddish"]),
+    ("yo", &["yor", "yoruba"]),
+    ("zu", &["zul", "zulu"]),
 ];
 
 /// Tags that say "no language": undetermined, multiple, none, uncoded.
@@ -80,7 +152,7 @@ pub fn normalise_lang(tag: &str) -> Option<String> {
 /// Extensions (lower-case `ə` beside Extended-B's `Ə`), Latin Extended
 /// Additional and Latin Extended-C/D/E. All fold into `a`-`z` with marks
 /// dropped, or are Latin letters the aligner reads as their base.
-fn folds_to_latin(c: char) -> bool {
+pub(crate) fn folds_to_latin(c: char) -> bool {
     c.is_ascii_alphabetic()
         || matches!(
             c,
@@ -266,6 +338,8 @@ mod tests {
         assert_eq!(normalise_lang("fra").as_deref(), Some("fr"));
         assert_eq!(normalise_lang("nob").as_deref(), Some("no"));
         assert_eq!(normalise_lang("xyz").as_deref(), Some("xyz"));
+        assert_eq!(normalise_lang("afr"), normalise_lang("af"));
+        assert_eq!(normalise_lang("alb"), normalise_lang("sqi"));
         for tag in ["", "und", "mul", "  ", "1x"] {
             assert_eq!(normalise_lang(tag), None, "{tag:?}");
         }
@@ -294,6 +368,18 @@ mod tests {
         assert_eq!(
             gate(Some("eng"), Some("en"), ENGLISH.iter().copied()),
             Ok("en".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_639_1_tag_and_its_639_2_form_are_the_same_language() {
+        let afrikaans = [
+            "Ek weet nie wat jy van my wil hê nie.",
+            "Dit is die laaste keer dat ons dit doen.",
+        ];
+        assert_eq!(
+            gate(Some("af"), Some("afr"), afrikaans),
+            Ok("af".to_owned())
         );
     }
 
