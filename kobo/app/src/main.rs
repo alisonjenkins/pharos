@@ -25,6 +25,7 @@ use kobo_sdk::{
     TilePicture, TileShape, TileState, MAX_TASKS_IN_FLIGHT,
 };
 use reading::{Leave, Reading};
+use shelf::Shelf;
 use std::process::ExitCode;
 
 const SERVER: &str = match option_env!("PHAROS_KOBO_SERVER") {
@@ -139,18 +140,7 @@ struct Pharos {
     /// The kind of album the shelf holds, which is the one last opened.
     kind: Kind,
     /// The albums of that kind loaded so far.
-    shelf: Page,
-    /// How many rows of the listing have been asked for, kept or not.
-    shelf_sent: usize,
-    /// Whether the whole listing has been read.
-    shelf_done: bool,
-    /// How many albums the shelf's top bar counts. It catches up when the
-    /// screen is drawn for something else, so a later block of albums
-    /// landing behind the page showing draws nothing of its own.
-    shelf_counted: usize,
-    shelf_page: usize,
-    /// Whether the letters to jump the shelf to are showing (V1442).
-    picking_letter: bool,
+    shelf: Shelf<Entry>,
     covers: CoverCache,
     /// The screen last handed to the runtime, so a task that changes nothing
     /// on it does not make the runtime draw the whole panel again.
@@ -189,12 +179,7 @@ impl Default for Pharos {
             tasks: Vec::new(),
             sections: None,
             kind: Kind::Music,
-            shelf: Page::default(),
-            shelf_sent: 0,
-            shelf_done: false,
-            shelf_counted: 0,
-            shelf_page: 0,
-            picking_letter: false,
+            shelf: Shelf::default(),
             covers: CoverCache::new(MIN_COVERS),
             shown: None,
             tracks: Page::default(),
@@ -280,7 +265,7 @@ impl Pharos {
         self.resume_at = None;
         self.resume_now = false;
         self.album_from_home = false;
-        self.clear_shelf();
+        self.shelf.clear();
         self.drop_covers(context);
         self.reading.reset(context);
         context.store().forget(ACCOUNT_KEY);
@@ -426,11 +411,6 @@ impl Pharos {
         }
     }
 
-    /// The tiles of the shelf, split into the pages this panel holds.
-    fn grid_pages(&self, context: &Context) -> Vec<Vec<usize>> {
-        context.paginate_tiles(self.shelf.entries.len(), Self::shape(self.kind), false)
-    }
-
     /// The pixel size the cover held as `key` is asked for and fitted to:
     /// the tile it fills. A home screen cover fills a square tile wherever
     /// the reader has gone by the time it comes.
@@ -478,16 +458,15 @@ impl Pharos {
     /// The covers worth having now: those on the page showing and the next
     /// one, as `(album id, cover tag)`. An album with no cover tag has none.
     fn wanted_covers(&self, context: &Context) -> (Vec<(String, String)>, usize) {
-        let tagged = |entry: &Entry| Some((entry.id.clone(), entry.image_tag.clone()?));
+        let tagged = Shelf::<Entry>::tagged;
         let shelf_covers = || {
-            let pages = self.grid_pages(context);
-            let page = self.shelf_page.min(pages.len().saturating_sub(1));
-            let wanted: Vec<(String, String)> = api::wanted(&pages, page)
+            let wanted: Vec<(String, String)> = self
+                .shelf
+                .wanted(context)
                 .into_iter()
-                .filter_map(|index| self.shelf.entries.get(index))
                 .filter_map(tagged)
                 .collect();
-            (wanted, pages.first().map_or(0, Vec::len))
+            (wanted, self.shelf.per_page(context))
         };
         let (mut wanted, per_page) = match &self.view {
             // The shelf stays behind an open album, so its covers on the way
@@ -637,7 +616,16 @@ impl Pharos {
             .tasks
             .iter()
             .any(|(_, work)| matches!(work, Work::Shelf { .. }));
-        (asking && self.shelf.entries.is_empty()) || self.page_covers_pending(context)
+        self.shelf
+            .loading(context, asking && self.shelf.entries.is_empty(), &|id| {
+                self.cover_unready(id)
+            })
+    }
+
+    /// Whether the cover held as `id` is asked for and not here yet, or not
+    /// asked for yet. A cover that failed is not waited for.
+    fn cover_unready(&self, id: &str) -> bool {
+        matches!(self.covers.state(id), None | Some(Cover::Loading))
     }
 
     /// Whether a cover on the shelf page showing is still to come: asked
@@ -649,25 +637,19 @@ impl Pharos {
                 .reading
                 .page_covers(context)
                 .iter()
-                .any(|id| matches!(self.covers.state(id), None | Some(Cover::Loading)));
+                .any(|id| self.cover_unready(id));
         }
         if matches!(self.view, View::Home) {
-            return self.home_covers(context).iter().any(|(id, tag)| {
-                tag.is_some() && matches!(self.covers.state(id), None | Some(Cover::Loading))
-            });
+            return self
+                .home_covers(context)
+                .iter()
+                .any(|(id, tag)| tag.is_some() && self.cover_unready(id));
         }
         if !matches!(self.view, View::Library(_)) {
             return false;
         }
-        let pages = self.grid_pages(context);
-        let page = self.shelf_page.min(pages.len().saturating_sub(1));
-        pages
-            .get(page)
-            .into_iter()
-            .flatten()
-            .filter_map(|&index| self.shelf.entries.get(index))
-            .filter(|entry| entry.image_tag.is_some())
-            .any(|entry| matches!(self.covers.state(&entry.id), None | Some(Cover::Loading)))
+        self.shelf
+            .covers_pending(context, &|id| self.cover_unready(id))
     }
 
     /// Takes a cover that arrived: fits it to its tile, and hands it to the
@@ -740,7 +722,7 @@ impl Pharos {
             .tasks
             .iter()
             .any(|(_, work)| matches!(work, Work::Shelf { .. }));
-        if self.shelf_done
+        if self.shelf.is_done()
             || asking
             || self.draw_wait.is_some()
             || !matches!(self.view, View::Library(_))
@@ -748,18 +730,9 @@ impl Pharos {
             return;
         }
         if let Some(library) = self.shelf_library() {
-            let next = self.shelf_sent;
+            let next = self.shelf.sent();
             self.load_shelf(context, &library, next);
         }
-    }
-
-    fn clear_shelf(&mut self) {
-        self.shelf = Page::default();
-        self.shelf_sent = 0;
-        self.shelf_done = false;
-        self.shelf_counted = 0;
-        self.shelf_page = 0;
-        self.picking_letter = false;
     }
 
     /// Opens a section: albums load into a shelf, books open the ebook list.
@@ -780,8 +753,8 @@ impl Pharos {
             }
             return;
         }
-        self.clear_shelf();
         self.kind = kind;
+        self.shelf.open(Self::shape(kind));
         self.view = View::Library(kind);
         self.load_shelf(context, &library, 0);
     }
@@ -1023,19 +996,15 @@ impl Pharos {
         // A reply for a shelf the reader has since left is stale.
         if !matches!(self.view, View::Library(open) if open == kind)
             || self.kind != kind
-            || start != self.shelf_sent
+            || start != self.shelf.sent()
         {
             return;
         }
         match api::parse_page(bytes) {
             Some(page) => {
-                self.shelf_sent += page.sent;
-                self.shelf.total = page.total;
+                let kept = page.entries.into_iter().filter(|entry| kind.keeps(entry));
                 self.shelf
-                    .entries
-                    .extend(page.entries.into_iter().filter(|entry| kind.keeps(entry)));
-                self.shelf_done =
-                    page.sent == 0 || self.shelf_sent >= page.total || self.shelf_sent >= MAX_SHELF;
+                    .take_block(start, page.sent, page.total, kept, MAX_SHELF);
                 self.more_shelf(context);
             }
             None => self.problem("Pharos sent a list this app could not read."),
@@ -1063,7 +1032,7 @@ impl Pharos {
             (Work::ListeningAlbum { id }, _) => self.album_described(context, &id, None),
             // The shelf keeps what loaded, and the rest is read when it is
             // opened again.
-            (Work::Shelf { start, .. }, _) if start > 0 => self.shelf_done = true,
+            (Work::Shelf { start, .. }, _) if start > 0 => self.shelf.finish(),
             // A later block of tracks fails in the background, maybe while the
             // listener is in the player: keep what loaded, and opening the
             // album again fetches the rest.
@@ -1207,7 +1176,7 @@ impl Pharos {
             View::Library(kind) if self.shelf.entries.is_empty() => {
                 let screen =
                     self.now_playing(ScreenBuilder::new("pharos-library").top_bar(kind.label()));
-                let screen = if self.shelf_done {
+                let screen = if self.shelf.is_done() {
                     screen.text(format!("No {} here yet.", kind.noun()))
                 } else {
                     screen.activity(format!("Loading your {}", kind.noun()), None)
@@ -1218,13 +1187,13 @@ impl Pharos {
                 .now_playing(ScreenBuilder::new("pharos-library").top_bar(format!(
                     "{} · {} {}",
                     kind.label(),
-                    self.shelf_counted,
+                    self.shelf.counted(),
                     kind.noun()
                 )))
                 .top_bar_action("letters", "A–Z")
-                .picture_tiles(Self::shape(*kind), self.tiles(context))
+                .picture_tiles(self.shelf.shape(), self.tiles(context))
                 .page_turns("page-back", "page-next")
-                .compose(|screen| self.letter_picker(context, screen))
+                .compose(|screen| self.shelf.letter_picker(context, screen))
                 .build()
                 .with_own_back(true),
             View::Books => self.reading.screen(context, &|id| self.cover_of(id)),
@@ -1277,70 +1246,19 @@ impl Pharos {
     /// The tiles of the shelf page showing, each with its cover when it has
     /// arrived and its glyph until then.
     fn tiles(&self, context: &Context) -> Vec<(String, String, Glyph, Option<TilePicture>)> {
-        let pages = self.grid_pages(context);
-        let page = self.shelf_page.min(pages.len().saturating_sub(1));
-        pages
-            .get(page)
-            .into_iter()
-            .flatten()
-            .filter_map(|&index| {
-                let entry = self.shelf.entries.get(index)?;
-                Some((
-                    format!("tile-{index}"),
-                    entry.name.clone(),
-                    Self::glyph(self.kind),
-                    self.cover_of(&entry.id),
-                ))
-            })
-            .collect()
+        self.shelf.page_tiles(context, |index, entry| {
+            (
+                format!("tile-{index}"),
+                entry.name.clone(),
+                Self::glyph(self.kind),
+                self.cover_of(&entry.id),
+            )
+        })
     }
 
-    /// Where each letter starts on the shelf (V1442).
-    fn letter_starts(&self) -> Vec<(char, usize)> {
-        letters::starts(self.shelf.entries.iter().map(|entry| entry.name.as_str()))
-    }
-
-    /// The letters the shelf holds, over the shelf while the reader picks
-    /// one. The letter of the page showing is marked.
-    fn letter_picker(&self, context: &Context, screen: ScreenBuilder) -> ScreenBuilder {
-        if !self.picking_letter {
-            return screen;
-        }
-        let pages = self.grid_pages(context);
-        let page = self.shelf_page.min(pages.len().saturating_sub(1));
-        let showing = pages
-            .get(page)
-            .and_then(|page| page.first())
-            .and_then(|&index| self.shelf.entries.get(index))
-            .map(|entry| letters::letter_of(&entry.name));
-        letters::picker(screen, &self.letter_starts(), showing)
-    }
-
-    /// Answers the letter picker: a letter turns the shelf to the page its
-    /// first album is on, and Back closes it. Whether the action was its.
+    /// Answers the letter picker on the shelf. Whether the action was its.
     fn pick_letter(&mut self, context: &Context, action: ActionId) -> bool {
-        if !matches!(self.view, View::Library(_)) {
-            return false;
-        }
-        if action == action_id("letters") {
-            self.picking_letter = true;
-            return true;
-        }
-        if !self.picking_letter {
-            return false;
-        }
-        self.picking_letter = false;
-        if action == ActionId::BACK {
-            return true;
-        }
-        if let Some(index) = letters::chosen(action, &self.letter_starts()) {
-            if let Some(page) = letters::page_holding(&self.grid_pages(context), index) {
-                self.shelf_page = page;
-            }
-            return true;
-        }
-        // Anything else on the screen closes the picker and does its own job.
-        false
+        matches!(self.view, View::Library(_)) && self.shelf.pick_letter(context, action)
     }
 
     fn glyph(kind: Kind) -> Glyph {
@@ -1531,6 +1449,7 @@ impl Pharos {
                 } else {
                     Kind::Music
                 };
+                self.shelf.set_shape(Self::shape(self.kind));
                 context.log(
                     LogLevel::Info,
                     format!(
@@ -1581,7 +1500,7 @@ impl Pharos {
     fn show(&mut self, context: &mut Context) {
         self.end_draw_wait(context);
         self.more_shelf(context);
-        self.shelf_counted = self.shelf.entries.len();
+        self.shelf.catch_up();
         let screen = self.screen(context);
         self.shown = Some(screen.clone());
         context.set_screen(screen);
@@ -1601,11 +1520,10 @@ impl Pharos {
         if self.shown.as_ref() == Some(&screen) {
             return false;
         }
-        let counted = self.shelf.entries.len();
-        let screen = if self.shelf_counted == counted {
+        let screen = if self.shelf.is_caught_up() {
             screen
         } else {
-            self.shelf_counted = counted;
+            self.shelf.catch_up();
             self.screen(context)
         };
         self.shown = Some(screen.clone());
@@ -1663,7 +1581,7 @@ impl Pharos {
         };
         let message = format!(
             "pharos: draw {verdict} view={view} cause={cause} page={} in_flight={} covers_pending={} waiting={}",
-            self.shelf_page,
+            self.shelf.page_number(),
             context.tasks_in_flight(),
             self.page_covers_pending(context),
             self.draw_wait.is_some(),
@@ -1677,8 +1595,11 @@ impl Pharos {
     }
 
     fn turn(&mut self, context: &Context, forward: bool) {
+        if matches!(self.view, View::Library(_)) {
+            self.shelf.turn(context, forward);
+            return;
+        }
         let pages = match &self.view {
-            View::Library(_) => self.grid_pages(context).len().max(1),
             View::Album(album) if self.about.is_some() => {
                 about::page_count(context, &album.overview)
             }
@@ -1686,7 +1607,6 @@ impl Pharos {
             _ => return,
         };
         let current = match (&self.view, self.about.as_mut()) {
-            (View::Library(_), _) => &mut self.shelf_page,
             (_, Some(about)) => about,
             _ => &mut self.page,
         };
