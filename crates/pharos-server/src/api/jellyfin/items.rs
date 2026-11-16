@@ -900,9 +900,15 @@ fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
 /// items into a flat list. Each entry carries a stable id derived
 /// via dto::genre_id_for, so /Items?ParentId={id} pivots cleanly
 /// once that branch is wired (currently library/series/season only).
+///
+/// `IncludeItemTypes` narrows it, as in Jellyfin, to the genres items of
+/// those kinds carry, each counted over those items only: the Kobo app asks
+/// `IncludeItemTypes=Book` for a book's subjects without every film genre
+/// beside them (V1450). A list naming no stored kind leaves it unnarrowed.
 async fn list_genres(
     state: web::Data<AppState>,
     user: AuthUser,
+    q: CiQuery<GenresQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::GenreStore;
     // LIB-C4 — genres are now entity rows. Lazily backfill the join from
@@ -934,6 +940,12 @@ async fn list_genres(
     )
     .await
     .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let kinds = ItemType::stored_kinds(q.0.include_item_types.as_deref().unwrap_or_default());
+    let rows = if kinds.is_empty() {
+        rows
+    } else {
+        genres_of_kinds(&state, &user, rows, &kinds).await?
+    };
     let items: Vec<SynthItemDto> = rows
         .iter()
         .map(|(gc, count)| SynthItemDto {
@@ -948,6 +960,50 @@ async fn list_genres(
         .collect();
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+}
+
+/// `/Genres` query: only the kind narrowing is read.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct GenresQuery {
+    include_item_types: Option<String>,
+}
+
+/// `rows` narrowed to the genres an item of `kinds` the user can see
+/// carries, each counted over those items.
+async fn genres_of_kinds(
+    state: &web::Data<AppState>,
+    user: &AuthUser,
+    rows: Vec<(pharos_core::GenreCount, u32)>,
+    kinds: &[MediaKind],
+) -> Result<Vec<(pharos_core::GenreCount, u32)>, actix_web::Error> {
+    use pharos_core::GenreStore;
+    use std::collections::HashSet;
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(state, &user.0, all, "genres")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
+    let wanted: HashSet<pharos_core::MediaId> = all
+        .iter()
+        .filter(|item| kinds.contains(&item.kind))
+        .map(|item| item.id)
+        .collect();
+    let mut kept = Vec::new();
+    for (gc, _) in rows {
+        let ids = state
+            .stores
+            .item_ids_for_genre(&gc.genre.wire_id)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let count = ids.iter().filter(|id| wanted.contains(id)).count();
+        if count > 0 {
+            kept.push((gc, u32::try_from(count).unwrap_or(u32::MAX)));
+        }
+    }
+    Ok(kept)
 }
 
 /// `GET /MusicGenres` — the genres carried by AUDIO items only, typed
