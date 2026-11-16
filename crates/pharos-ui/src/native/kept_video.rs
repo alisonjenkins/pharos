@@ -171,6 +171,140 @@ pub trait VideoStore: Send + Sync {
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
+    /// The stored file for a request's [`request_key`], if this store holds
+    /// it whole. A host that answers the player's requests itself (the
+    /// phone's server proxy) asks before going to the network; a store whose
+    /// platform answers them another way (the web's service worker) keeps
+    /// the default.
+    fn stored_file(&self, _key: &str) -> Option<StoredFile> {
+        None
+    }
+}
+
+/// A file a [`VideoStore`] holds, ready to answer a request with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub path: std::path::PathBuf,
+    pub len: u64,
+    /// The `Content-Type` the server sent for it.
+    pub content_type: &'static str,
+}
+
+/// The key a request is stored under on a host that sees no scheme or
+/// host: the path and the query, which names the play session. An absolute
+/// URL is cut down to the same, so both spellings of one file agree.
+pub fn request_key(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let path_and_query = if url.contains("://") {
+        rest.find('/').map_or("/", |i| &rest[i..])
+    } else {
+        rest
+    };
+    let key = path_and_query.split('#').next().unwrap_or_default();
+    if key.starts_with('/') {
+        key.to_owned()
+    } else {
+        format!("/{key}")
+    }
+}
+
+/// The `Content-Type` the server sends for a stored file, by its extension.
+pub fn content_type_for(key: &str) -> &'static str {
+    let path = url_path(key);
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("m4s" | "mp4" | "m4a" | "m4v") => "video/mp4",
+        Some("ts") => "video/mp2t",
+        Some("vtt") => "text/vtt",
+        _ => "application/octet-stream",
+    }
+}
+
+/// What a request for a stream is, for the log line a host writes about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestClass {
+    Master,
+    Playlist,
+    Init,
+    Segment,
+    Subtitle,
+    /// Anything else the page asks the server for: not part of a download.
+    Other,
+}
+
+impl RequestClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Master => "master",
+            Self::Playlist => "playlist",
+            Self::Init => "init",
+            Self::Segment => "segment",
+            Self::Subtitle => "subtitle",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The class of the request for `key`.
+pub fn request_class(key: &str) -> RequestClass {
+    let path = url_path(key);
+    let name = path.rsplit('/').next().unwrap_or_default();
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("m3u8") if name.starts_with("master") => RequestClass::Master,
+        Some("m3u8") => RequestClass::Playlist,
+        Some("mp4") if name.starts_with("init") => RequestClass::Init,
+        Some("m4s" | "mp4" | "m4a" | "m4v" | "ts") => RequestClass::Segment,
+        Some("vtt") => RequestClass::Subtitle,
+        _ => RequestClass::Other,
+    }
+}
+
+/// Where a host answered a request from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// From a stored file, with no network.
+    ServedOffline,
+    /// From the server.
+    Network,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ServedOffline => "served_offline",
+            Self::Network => "network",
+        }
+    }
+}
+
+/// How loudly a request's verdict is logged: playlists are few and say
+/// which copy plays, so they are info; a film has a thousand segments, so
+/// those are debug; a request that is no part of a stream is not logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loudness {
+    Info,
+    Debug,
+}
+
+pub fn loudness(class: RequestClass) -> Option<Loudness> {
+    match class {
+        RequestClass::Master | RequestClass::Playlist => Some(Loudness::Info),
+        RequestClass::Init | RequestClass::Segment | RequestClass::Subtitle => {
+            Some(Loudness::Debug)
+        }
+        RequestClass::Other => None,
+    }
+}
+
+/// The log line for a request's verdict. The path only: the query carries
+/// the play session.
+pub fn request_line(key: &str, verdict: Verdict, bytes: u64) -> String {
+    format!(
+        "pharos: video request class={} verdict={} bytes={bytes} url_path={}",
+        request_class(key).label(),
+        verdict.label(),
+        url_path(key)
+    )
 }
 
 /// Where the record of downloaded videos is kept on a device (a JSON array
@@ -491,6 +625,103 @@ mod tests {
         assert_eq!(used_by(&list, "u", Some("b")), 10);
         assert_eq!(used_by(&list, "other", None), 0);
         assert_eq!(interrupted(&list).len(), 1);
+    }
+
+    #[test]
+    fn a_request_key_is_the_path_and_query_whatever_the_spelling() {
+        let k = "/videos/1/0.m4s?PlaySessionId=z";
+        assert_eq!(request_key(k), k);
+        assert_eq!(
+            request_key("https://h:8096/videos/1/0.m4s?PlaySessionId=z#f"),
+            k
+        );
+        assert_eq!(request_key("videos/1/0.m4s?PlaySessionId=z"), k);
+        assert_eq!(request_key("http://h"), "/");
+    }
+
+    #[test]
+    fn a_stored_file_is_answered_with_the_type_the_server_sends() {
+        for (key, want) in [
+            ("/videos/1/master.m3u8?a=b", "application/vnd.apple.mpegurl"),
+            (
+                "/videos/1/h264cmaf/main.m3u8",
+                "application/vnd.apple.mpegurl",
+            ),
+            ("/videos/1/init.mp4?a=b.ts", "video/mp4"),
+            ("/videos/1/0.m4s?a=b", "video/mp4"),
+            ("/hls1/main/0.ts", "video/mp2t"),
+            ("/videos/1/subtitles/3/stream.vtt", "text/vtt"),
+            ("/videos/1/stream", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type_for(key), want, "{key}");
+        }
+    }
+
+    #[test]
+    fn requests_are_classed_and_logged_by_how_often_they_come() {
+        let cases = [
+            (
+                "/videos/1/master.m3u8?p=1",
+                RequestClass::Master,
+                Some(Loudness::Info),
+            ),
+            (
+                "/videos/1/h264cmaf/main.m3u8?p=1",
+                RequestClass::Playlist,
+                Some(Loudness::Info),
+            ),
+            (
+                "/videos/1/h264cmaf/init.mp4?p=1",
+                RequestClass::Init,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/videos/1/h264cmaf/7.m4s?p=1",
+                RequestClass::Segment,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/hls1/main/7.ts",
+                RequestClass::Segment,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/videos/1/subtitles/3/stream.vtt",
+                RequestClass::Subtitle,
+                Some(Loudness::Debug),
+            ),
+            ("/Items/1/Images/Primary", RequestClass::Other, None),
+        ];
+        for (key, class, loud) in cases {
+            assert_eq!(request_class(key), class, "{key}");
+            assert_eq!(loudness(class), loud, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_request_labels_are_distinct_and_the_line_hides_the_query() {
+        let mut labels = vec![
+            RequestClass::Master.label(),
+            RequestClass::Playlist.label(),
+            RequestClass::Init.label(),
+            RequestClass::Segment.label(),
+            RequestClass::Subtitle.label(),
+            RequestClass::Other.label(),
+            Verdict::ServedOffline.label(),
+            Verdict::Network.label(),
+        ];
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 8);
+        let line = request_line(
+            "/videos/1/7.m4s?PlaySessionId=secret",
+            Verdict::ServedOffline,
+            99,
+        );
+        assert_eq!(
+            line,
+            "pharos: video request class=segment verdict=served_offline bytes=99 url_path=/videos/1/7.m4s"
+        );
     }
 
     #[test]
