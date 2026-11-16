@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ff9a014..557ad2a 100644
+index ff9a014..48f80fa 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -1559,6 +1559,18 @@ dependencies = [
+@@ -1559,6 +1559,19 @@ dependencies = [
   "kobo-zstory",
  ]
  
@@ -12,6 +12,7 @@ index ff9a014..557ad2a 100644
 +dependencies = [
 + "kobo-audio",
 + "kobo-bookview",
++ "kobo-doc",
 + "kobo-image",
 + "kobo-json",
 + "kobo-read",

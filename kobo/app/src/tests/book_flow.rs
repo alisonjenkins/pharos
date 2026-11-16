@@ -119,15 +119,28 @@ fn a_book_downloads_saves_opens_and_is_marked_downloaded() {
         .expect("the downloaded list is saved");
     let shelf = books::Shelf::decode(&saved).expect("a record this app reads");
     assert_eq!(shelf.saved.len(), 1);
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::ShelfRead { name, .. }) if name == "book-b1.txt"
+        )),
+        "the book opens from the shelf, not from memory"
+    );
+    let _ = runner.store_result(StoreResult::Saved {
+        key: books::KEY.to_owned(),
+    });
+    let commands = runner.store_result(StoreResult::ShelfRead {
+        name: "book-b1.txt".to_owned(),
+        offset: 0,
+        size: u32::try_from(PROSE.len()).expect("small"),
+        bytes: PROSE.as_bytes().to_vec(),
+    });
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(
         screen.contains("Some prose to read"),
         "the book is open: {screen}"
     );
 
-    let _ = runner.store_result(StoreResult::Saved {
-        key: books::KEY.to_owned(),
-    });
     let commands = runner.action(ActionId::BACK);
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("Held"), "the downloaded mark: {screen}");
@@ -172,8 +185,58 @@ fn a_full_piece_asks_for_the_next_from_where_it_ended() {
     let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
     let piece = "x".repeat(books::CHUNK as usize);
     let commands = runner.task_outcome(download, ok(&piece));
+    assert!(
+        asked(&commands, "/Items/b1/Download").is_none(),
+        "the piece is written before the next is fetched"
+    );
+    let write = commands.iter().find_map(|command| match command {
+        Command::Store(StoreRequest::ShelfWrite {
+            name, offset, last, ..
+        }) => Some((name.clone(), *offset, *last)),
+        _ => None,
+    });
+    assert_eq!(write, Some(("book-b1.txt".to_owned(), 0, false)));
+    let commands = runner.store_result(StoreResult::ShelfWritten {
+        name: "book-b1.txt".to_owned(),
+        size: books::CHUNK,
+    });
     let (_, task) = asked(&commands, "/Items/b1/Download").expect("the next piece");
     assert!(matches!(task, Task::Fetch { offset, .. } if offset == books::CHUNK));
+}
+
+#[test]
+fn a_cancelled_download_removes_what_reached_the_shelf() {
+    let (mut runner, _) = books();
+    let commands = read(&mut runner, 0);
+    let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
+    let piece = "x".repeat(books::CHUNK as usize);
+    let _ = runner.task_outcome(download, ok(&piece));
+    let _ = runner.store_result(StoreResult::ShelfWritten {
+        name: "book-b1.txt".to_owned(),
+        size: books::CHUNK,
+    });
+    let commands = runner.action(action_id("books-cancel"));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::Store(StoreRequest::ShelfRemove { name }) if name == "book-b1.txt"
+    )));
+}
+
+#[test]
+fn a_full_shelf_mid_download_stops_and_removes_the_part() {
+    let (mut runner, _) = books();
+    let commands = read(&mut runner, 0);
+    let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
+    let piece = "x".repeat(books::CHUNK as usize);
+    let _ = runner.task_outcome(download, ok(&piece));
+    let commands = runner.store_result(StoreResult::Denied(kobo_sdk::StoreError::TooFull));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::Store(StoreRequest::ShelfRemove { name }) if name == "book-b1.txt"
+    )));
+    assert!(asked(&commands, "/Items/b1/Download").is_none());
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("Free some space"), "{screen}");
 }
 
 #[test]
@@ -617,6 +680,80 @@ fn backing_out_while_the_opening_loads_cancels_it() {
     assert!(text.contains("Read the opening"), "{text}");
 }
 
+/// Answers every download, shelf write and shelf read from `book` until
+/// the app asks for nothing more; returns every command it gave.
+fn settle(runner: &mut AppRunner<Pharos>, first: Vec<Command>, book: &[u8]) -> Vec<Command> {
+    let mut seen = Vec::new();
+    let mut pending = first;
+    while !pending.is_empty() {
+        let mut next = Vec::new();
+        for command in std::mem::take(&mut pending) {
+            next.extend(match &command {
+                Command::Spawn {
+                    task,
+                    work: Task::Fetch { offset, .. },
+                } => {
+                    let at = book.len().min(*offset as usize);
+                    let until = book.len().min(at + books::CHUNK as usize);
+                    runner.task_outcome(*task, TaskOutcome::Completed(book[at..until].to_vec()))
+                }
+                Command::Store(StoreRequest::ShelfWrite {
+                    name,
+                    offset,
+                    bytes,
+                    ..
+                }) => runner.store_result(StoreResult::ShelfWritten {
+                    name: name.clone(),
+                    size: offset + u32::try_from(bytes.len()).expect("a piece"),
+                }),
+                Command::Store(StoreRequest::Save { key, .. }) => {
+                    runner.store_result(StoreResult::Saved { key: key.clone() })
+                }
+                Command::Store(StoreRequest::ShelfRead {
+                    name,
+                    offset,
+                    length,
+                }) => {
+                    let at = book.len().min(*offset as usize);
+                    let until = book.len().min(at + *length as usize);
+                    runner.store_result(StoreResult::ShelfRead {
+                        name: name.clone(),
+                        offset: *offset,
+                        bytes: book[at..until].to_vec(),
+                        size: u32::try_from(book.len()).expect("a test book"),
+                    })
+                }
+                _ => Vec::new(),
+            });
+            seen.push(command);
+        }
+        pending = next;
+    }
+    seen
+}
+
+/// Answers the download asked for in `commands` with `body`, then the
+/// shelf write it causes; returns the commands of both.
+fn piece_written(runner: &mut AppRunner<Pharos>, commands: &[Command], body: &str) -> Vec<Command> {
+    let (task, _) = asked(commands, "/Items/b1/Download").expect("a piece is asked for");
+    let mut seen = runner.task_outcome(task, ok(body));
+    let write = seen.iter().find_map(|command| match command {
+        Command::Store(StoreRequest::ShelfWrite {
+            name,
+            offset,
+            bytes,
+            ..
+        }) => Some(StoreResult::ShelfWritten {
+            name: name.clone(),
+            size: offset + u32::try_from(bytes.len()).expect("a piece"),
+        }),
+        _ => None,
+    });
+    let write = write.expect("the piece is written to the shelf");
+    seen.extend(runner.store_result(write));
+    seen
+}
+
 const EPUB_LIST: &str =
     r#"{"Items":[{"Id":"b1","Name":"Book One","Path":"/b/one.epub"}],"TotalRecordCount":1}"#;
 
@@ -626,18 +763,13 @@ fn each_book_step_logs_its_time_on_the_main_thread() {
     let _ = runner.action(action_id("book-0"));
     let tap = runner.action(action_id("book-read"));
     assert!(logged(&tap, "pharos: book step=read-tap ms="), "{tap:?}");
-    let (download, _) = asked(&tap, "/Items/b1/Download").expect("download");
-    let piece = format!("PK\u{3}\u{4}{}", "x".repeat(books::CHUNK as usize - 4));
-    let more = runner.task_outcome(download, ok(&piece));
+    let book = an_epub_with_a_large_picture();
+    let all = settle(&mut runner, tap, &book);
     assert!(
-        logged(&more, "pharos: book step=piece ms=") && logged(&more, " bytes=0"),
-        "{more:?}"
+        logged(&all, "pharos: book step=piece ms=") && logged(&all, " bytes=0"),
+        "{all:?}"
     );
-    let (last, _) = asked(&more, "/Items/b1/Download").expect("next piece");
-    let done = runner.task_outcome(last, ok("tail"));
-    assert!(logged(&done, "pharos: book step=piece ms="), "{done:?}");
-    assert!(logged(&done, "pharos: book step=open ms="), "{done:?}");
-    assert!(logged(&done, "pharos: book step=finish ms="), "{done:?}");
+    assert!(logged(&all, "pharos: book step=open ms="), "{all:?}");
 }
 
 #[test]
@@ -652,51 +784,194 @@ fn a_book_that_will_not_open_logs_why_before_it_says_so() {
         "{commands:?}"
     );
     let (mut runner, _) = books_from(EPUB_LIST);
-    let commands = downloaded(&mut runner, "PK\u{3}\u{4}junk");
+    let junk = b"PK\x03\x04junk".to_vec();
+    let commands = read(&mut runner, 0);
+    let all = settle(&mut runner, commands, &junk);
     assert!(
-        logged(
-            &commands,
-            "pharos: book open refused id=b1 bytes=8 kind=an EPUB head=504b03046a756e6b why="
-        ),
-        "{commands:?}"
+        logged(&all, "pharos: book open refused id=b1 from=shelf why="),
+        "{all:?}"
     );
-    assert!(
-        !logged(&commands, "Book One"),
-        "no title in the log: {commands:?}"
-    );
+    assert!(!logged(&all, "Book One"), "no title in the log: {all:?}");
 }
 
 #[test]
 fn a_twenty_piece_download_draws_its_progress_a_megabyte_at_a_time() {
     let (mut runner, _) = books_from(EPUB_LIST);
-    let _ = runner.action(action_id("book-0"));
-    let mut commands = runner.action(action_id("book-read"));
+    let mut commands = read(&mut runner, 0);
     let mut drawn = 0;
     for piece in 0..20 {
-        let (task, _) = asked(&commands, "/Items/b1/Download").expect("the next piece");
         let mut body = "x".repeat(books::CHUNK as usize);
         if piece == 0 {
             body.replace_range(..4, "PK\u{3}\u{4}");
         }
-        commands = runner.task_outcome(task, ok(&body));
+        commands = piece_written(&mut runner, &commands, &body);
         drawn += draws(&commands);
     }
     assert_eq!(drawn, 5, "one draw per megabyte of five");
-    let (task, _) = asked(&commands, "/Items/b1/Download").expect("the last piece");
-    let commands = runner.task_outcome(task, ok("end"));
-    assert_eq!(draws(&commands), 1, "the end is drawn once");
 }
 
 #[test]
 fn a_piece_that_changes_nothing_shown_is_logged_unchanged_and_not_drawn() {
     let (mut runner, _) = books_from(EPUB_LIST);
-    let _ = runner.action(action_id("book-0"));
-    let commands = runner.action(action_id("book-read"));
-    let (task, _) = asked(&commands, "/Items/b1/Download").expect("download");
-    let commands = runner.task_outcome(task, ok(&"x".repeat(books::CHUNK as usize)));
+    let commands = read(&mut runner, 0);
+    let mut body = "x".repeat(books::CHUNK as usize);
+    body.replace_range(..4, "PK\u{3}\u{4}");
+    let commands = piece_written(&mut runner, &commands, &body);
     assert_eq!(draws(&commands), 0, "{commands:?}");
     assert!(
         logged(&commands, "pharos: draw unchanged view=books cause=reading"),
         "{commands:?}"
+    );
+}
+
+#[test]
+fn a_book_an_exact_number_of_pieces_long_is_finished_by_an_empty_piece() {
+    let (mut runner, _) = books();
+    let commands = read(&mut runner, 0);
+    let (download, _) = asked(&commands, "/Items/b1/Download").expect("download");
+    let piece = "x".repeat(books::CHUNK as usize);
+    let _ = runner.task_outcome(download, ok(&piece));
+    let commands = runner.store_result(StoreResult::ShelfWritten {
+        name: "book-b1.txt".to_owned(),
+        size: books::CHUNK,
+    });
+    let (next, _) = asked(&commands, "/Items/b1/Download").expect("the next piece");
+    let commands = runner.task_outcome(next, ok(""));
+    let write = commands.iter().find_map(|command| match command {
+        Command::Store(StoreRequest::ShelfWrite {
+            offset,
+            bytes,
+            last,
+            ..
+        }) => Some((*offset, bytes.len(), *last)),
+        _ => None,
+    });
+    assert_eq!(
+        write,
+        Some((books::CHUNK, 0, true)),
+        "the empty piece publishes"
+    );
+    let commands = runner.store_result(StoreResult::ShelfWritten {
+        name: "book-b1.txt".to_owned(),
+        size: books::CHUNK,
+    });
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        Command::Store(StoreRequest::ShelfRead { name, .. }) if name == "book-b1.txt"
+    )));
+}
+
+/// A small EPUB carrying a picture far larger than its text, which opening
+/// it must not read.
+fn an_epub_with_a_large_picture() -> Vec<u8> {
+    let members = [
+        ("mimetype", b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#
+                .to_vec(),
+        ),
+        (
+            "OEBPS/book.opf",
+            br#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book Three</dc:title></metadata>
+  <manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c"/></spine>
+</package>"#
+                .to_vec(),
+        ),
+        (
+            "OEBPS/c.xhtml",
+            format!("<html><body><p>{PROSE}</p></body></html>").into_bytes(),
+        ),
+        ("OEBPS/scan.png", vec![9; 3 * books::CHUNK as usize]),
+    ];
+    let members: Vec<(String, Vec<u8>)> = members
+        .into_iter()
+        .map(|(name, bytes)| (name.to_owned(), bytes))
+        .collect();
+    kobo_doc::zip::stored(&members).expect("an archive")
+}
+
+#[test]
+fn a_downloaded_epub_opens_off_the_shelf_a_part_at_a_time() {
+    const EPUBS: &str = r#"{"Items":[{"Id":"b3","Name":"Book Three","Path":"/b/three.epub"}],
+        "TotalRecordCount":1}"#;
+    let book = an_epub_with_a_large_picture();
+    let size = u32::try_from(book.len()).expect("a test book");
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    });
+    let _ = runner.task_outcome(list, ok(EPUBS));
+
+    let mut pending = read(&mut runner, 0);
+    let (mut reads, mut screens) = (Vec::new(), Vec::new());
+    while !pending.is_empty() {
+        let mut next = Vec::new();
+        for command in std::mem::take(&mut pending) {
+            next.extend(match command {
+                Command::Spawn {
+                    task,
+                    work: Task::Fetch { url, offset, .. },
+                } if url.contains("/Items/b3/Download") => {
+                    let at = offset as usize;
+                    let until = book.len().min(at + books::CHUNK as usize);
+                    runner.task_outcome(task, TaskOutcome::Completed(book[at..until].to_vec()))
+                }
+                Command::Store(StoreRequest::ShelfWrite {
+                    name,
+                    offset,
+                    bytes,
+                    ..
+                }) => runner.store_result(StoreResult::ShelfWritten {
+                    name,
+                    size: offset + u32::try_from(bytes.len()).expect("a piece"),
+                }),
+                Command::Store(StoreRequest::Save { key, .. }) => {
+                    runner.store_result(StoreResult::Saved { key })
+                }
+                Command::Store(StoreRequest::ShelfRead {
+                    name,
+                    offset,
+                    length,
+                }) => {
+                    assert_eq!(name, "book-b3.epub");
+                    reads.push(length);
+                    let at = offset as usize;
+                    let until = book.len().min(at + length as usize);
+                    runner.store_result(StoreResult::ShelfRead {
+                        name,
+                        offset,
+                        bytes: book[at..until].to_vec(),
+                        size,
+                    })
+                }
+                Command::SetScreen(screen) => {
+                    screens.push(screen);
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            });
+        }
+        pending = next;
+    }
+    let screen = screen_text(screens.last().expect("a screen"));
+    assert!(
+        screen.contains("Some prose to read"),
+        "the book is open: {screen}"
+    );
+    assert!(!reads.is_empty(), "the book is read off the shelf");
+    let read: u32 = reads.iter().sum();
+    assert!(
+        read < size / 2,
+        "opening read {read} of {size} bytes: the picture was read"
     );
 }
