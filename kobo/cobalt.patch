@@ -867,7 +867,7 @@ index dbea710..73542f4 100644
      fn known_damage_does_not_hide_changes_elsewhere() {
          let (mut planner, mut frame) = started(32, 32);
 diff --git a/crates/kobo-image/src/lib.rs b/crates/kobo-image/src/lib.rs
-index 94c0621..34ad1d6 100644
+index 94c0621..57437f8 100644
 --- a/crates/kobo-image/src/lib.rs
 +++ b/crates/kobo-image/src/lib.rs
 @@ -414,10 +414,17 @@ impl Picture {
@@ -936,6 +936,49 @@ index 94c0621..34ad1d6 100644
      #[test]
      fn a_colour_picture_scales_both_planes_together_and_can_drop_one() {
          let mut rgb = Vec::new();
+@@ -924,6 +959,42 @@ mod tests {
+         assert_eq!((picture.width(), picture.height()), (1, 2));
+     }
+ 
++    /// A book's pictures are measured from their first bytes alone, so that a
++    /// reader can lay out a book whose plates it has not yet read.
++    #[test]
++    fn a_picture_is_measured_from_its_first_bytes() {
++        const PREFIX: usize = 64 * 1024;
++        let (width, height) = (1200_u32, 1600_u32);
++        let mut state = 0x9e37_79b9_u32;
++        let noise: Vec<u8> = (0..width * height * 3)
++            .map(|_| {
++                state ^= state << 13;
++                state ^= state >> 17;
++                state ^= state << 5;
++                state.to_le_bytes()[0]
++            })
++            .collect();
++        let image = RgbImage::from_raw(width, height, noise).expect("rgb fixture");
++        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
++            let mut encoded = Cursor::new(Vec::new());
++            DynamicImage::ImageRgb8(image.clone())
++                .write_to(&mut encoded, format)
++                .expect("encode fixture");
++            let encoded = encoded.into_inner();
++            assert!(
++                encoded.len() > PREFIX * 4,
++                "{format:?} fixture of {} bytes is too small to prove anything",
++                encoded.len()
++            );
++            assert_eq!(
++                size(&encoded[..PREFIX]).expect("measured from a prefix"),
++                (width, height),
++                "{format:?}"
++            );
++        }
++        assert_eq!(size(&oriented_jpeg()).expect("oriented"), (1, 2));
++    }
++
+     #[test]
+     fn something_that_is_not_a_picture_is_refused_rather_than_guessed_at() {
+         let error = decode(b"<!doctype html><title>not a picture</title>").expect_err("refused");
 diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
 index b6e6ed5..811a2e3 100644
 --- a/crates/kobo-read/src/lib.rs
