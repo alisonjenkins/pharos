@@ -425,4 +425,17 @@ mod tests {
     fn the_cache_is_named_for_the_user() {
         assert_eq!(cache_name("ab"), "pharos-videos-ab");
     }
+
+    /// The worker is JavaScript the page cannot call, so pin the contract
+    /// the two share: the cache prefix, the message, the path it serves.
+    #[test]
+    fn the_service_worker_serves_the_video_caches_by_exact_url() {
+        let sw = include_str!("../../assets/sw.js");
+        assert!(sw.contains(&format!("const VIDEO_PREFIX = \"{CACHE_PREFIX}\"")));
+        assert!(sw.contains("\"/ui/assets/vendor/\""), "the player script is cached");
+        assert!(sw.contains("\"videos-changed\""));
+        assert!(sw.contains("cache.match(request.url, { ignoreVary: true })"));
+        assert!(!sw.contains("ignoreSearch"), "the query names the play session");
+        assert!(sw.contains("__PHAROS_BUNDLE_HASH__") && sw.contains("__PHAROS_PRECACHE__"));
+    }
 }
