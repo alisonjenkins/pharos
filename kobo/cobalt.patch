@@ -2727,6 +2727,102 @@ index 94c0621..57437f8 100644
      #[test]
      fn something_that_is_not_a_picture_is_refused_rather_than_guessed_at() {
          let error = decode(b"<!doctype html><title>not a picture</title>").expect_err("refused");
+diff --git a/crates/kobo-policy/src/shelf.rs b/crates/kobo-policy/src/shelf.rs
+index 0742b92..14965f5 100644
+--- a/crates/kobo-policy/src/shelf.rs
++++ b/crates/kobo-policy/src/shelf.rs
+@@ -39,8 +39,8 @@ use std::io::{Seek, SeekFrom, Write};
+ use std::path::{Path, PathBuf};
+ 
+ use kobo_protocol::{
+-    is_valid_key, StoreError, StoreRequest, StoreResult, MAX_SHELF_BLOBS, MAX_SHELF_BYTES,
+-    MAX_SHELF_CHUNK, SHELF_RESERVE,
++    is_valid_key, StoreError, StoreRequest, StoreResult, MAX_SHELF_BLOBS, MAX_SHELF_BLOB_BYTES,
++    MAX_SHELF_BYTES, MAX_SHELF_CHUNK, SHELF_RESERVE,
+ };
+ 
+ /// One application's large data.
+@@ -163,6 +163,9 @@ impl Shelf {
+         if u64::from(offset) != so_far {
+             return StoreResult::Denied(StoreError::Missing);
+         }
++        if u64::from(offset).saturating_add(chunk) > MAX_SHELF_BLOB_BYTES {
++            return StoreResult::Denied(StoreError::TooFull);
++        }
+ 
+         // Counted against what this application already holds, not counting
+         // the partial being replaced -- an application that cannot re-download
+@@ -369,7 +372,7 @@ fn read_at(path: &Path, offset: u64, into: &mut [u8]) -> std::io::Result<()> {
+ /// A size as it goes on the wire.
+ ///
+ /// Saturating rather than wrapping: a blob larger than four gigabytes cannot
+-/// exist here ([`MAX_SHELF_BYTES`] is a quarter of that) but a size that
++/// exist here ([`MAX_SHELF_BLOB_BYTES`] refuses the write) but a size that
+ /// wrapped would report a huge file as a tiny one, and a caller would stop
+ /// reading it at the wrong place and believe it had the whole thing.
+ fn clamp_size(size: u64) -> u32 {
+@@ -693,6 +696,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn a_blob_cannot_grow_past_what_a_u32_offset_can_name() {
++        let root = temporary_root();
++        let shelf = Shelf::new(&root);
++        write(&shelf, "book.epub", 0, b"a", false);
++        // Sparse, so the test does not write four gigabytes.
++        let near_the_end = u32::MAX - 1;
++        std::fs::OpenOptions::new()
++            .write(true)
++            .open(partial_path(&root, "book.epub"))
++            .and_then(|file| file.set_len(u64::from(near_the_end)))
++            .expect("grow the partial");
++        assert_eq!(
++            write(&shelf, "book.epub", near_the_end, &[0; 2], false),
++            StoreResult::Denied(StoreError::TooFull)
++        );
++    }
++
+     #[test]
+     fn the_list_is_sorted_and_carries_sizes() {
+         let shelf = Shelf::new(temporary_root());
+diff --git a/crates/kobo-protocol/src/lib.rs b/crates/kobo-protocol/src/lib.rs
+index cfd97b2..a39a823 100644
+--- a/crates/kobo-protocol/src/lib.rs
++++ b/crates/kobo-protocol/src/lib.rs
+@@ -409,7 +409,16 @@ pub const MAX_LISTED_KEYS: usize = MAX_STORE_KEYS + MAX_CACHE_KEYS;
+ pub const MAX_SHELF_CHUNK: usize = 256 * 1024;
+ 
+ /// The most bytes one application may keep on the shelf.
+-pub const MAX_SHELF_BYTES: u64 = 256 * 1024 * 1024;
++///
++/// Room for a library of large illustrated books. The card's own reserve
++/// ([`SHELF_RESERVE`]) is what protects the stock reader, not this.
++pub const MAX_SHELF_BYTES: u64 = 4 * 1024 * 1024 * 1024;
++
++/// The most bytes one blob on the shelf may hold.
++///
++/// Offsets and sizes travel as `u32`, and the card is FAT32, whose files stop
++/// one byte short of four gigabytes.
++pub const MAX_SHELF_BLOB_BYTES: u64 = u32::MAX as u64;
+ 
+ /// The most blobs one application may keep.
+ pub const MAX_SHELF_BLOBS: usize = 4_096;
+@@ -421,10 +430,10 @@ pub const MAX_DICTIONARY_DEFINITION_BYTES: usize = 4_096;
+ ///
+ /// `KoboReader.sqlite` shares this partition, and it is the stock reader's
+ /// entire library. A database with nowhere to write is a library that comes
+-/// back empty, and nothing about that failure points at us. Sixty-four
+-/// megabytes is far more than the database needs to grow into and small enough
+-/// not to matter on a card measured in gigabytes.
+-pub const SHELF_RESERVE: u64 = 64 * 1024 * 1024;
++/// back empty, and nothing about that failure points at us. Two gigabytes
++/// leaves the database room to grow and the stock reader room for the books
++/// copied onto the card beside ours.
++pub const SHELF_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+ 
+ /// A handle to work the runtime is carrying out on an application's behalf.
+ #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 diff --git a/crates/kobo-read/src/lib.rs b/crates/kobo-read/src/lib.rs
 index b6e6ed5..811a2e3 100644
 --- a/crates/kobo-read/src/lib.rs
@@ -2824,9 +2920,20 @@ index d2e8c26..ec846f0 100644
      ///
      /// The height is a physical measurement rather than a pixel count so that
 diff --git a/crates/kobo-sdk/src/lib.rs b/crates/kobo-sdk/src/lib.rs
-index 7d672a0..92608f3 100644
+index 7d672a0..3fb78c4 100644
 --- a/crates/kobo-sdk/src/lib.rs
 +++ b/crates/kobo-sdk/src/lib.rs
+@@ -31,8 +31,8 @@ pub use kobo_protocol::{
+     TaskId, TaskOutcome, UpdateChannel, UpdateMethod, WifiNetwork, CACHE_PREFIX, MAX_CACHE_KEYS,
+     MAX_FONT_BYTES, MAX_HEADERS, MAX_HEADER_NAME, MAX_HEADER_VALUE, MAX_INLINE_PICTURE_BYTES,
+     MAX_LOOKUP_WORD_BYTES, MAX_PICTURE_BYTES, MAX_PICTURE_CHUNK_BYTES, MAX_RADIO_DEVICES,
+-    MAX_RADIO_NAME, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK, MAX_STORE_KEYS, MAX_STORE_VALUE,
+-    MAX_TASK_BYTES, MAX_URL_LEN,
++    MAX_RADIO_NAME, MAX_SHELF_BLOB_BYTES, MAX_SHELF_BYTES, MAX_SHELF_CHUNK, MAX_SHELL_CHUNK,
++    MAX_STORE_KEYS, MAX_STORE_VALUE, MAX_TASK_BYTES, MAX_URL_LEN,
+ };
+ /// The runtime's notices, as the launcher shows them.
+ pub use kobo_protocol::{Notice, NoticeList, NoticeTarget, MAX_NOTICES, NOTICES_VERSION};
 @@ -2088,12 +2088,14 @@ impl AppShelf<'_> {
  
  /// The most an application may pull back into memory in one download.
@@ -2837,7 +2944,7 @@ index 7d672a0..92608f3 100644
 -/// by whatever knows how to page it, and this ceiling is where that decision
 -/// gets forced rather than discovered by an out-of-memory kill.
 -pub const MAX_SHELF_DOWNLOAD: usize = 32 * 1024 * 1024;
-+/// A shelf that allows a quarter of a gigabyte on the card must not allow the
++/// A shelf that allows gigabytes on the card must not allow the
 +/// same figure in a `Vec`. A Libra Colour has about 780 MB available with an
 +/// application running, and a book read from memory costs its own size plus
 +/// its pictures kept compressed, so sixty-four leaves room for both several
