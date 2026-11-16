@@ -1,6 +1,10 @@
 //! Downloaded video on a device's disk (spec 048, ADR 0145): the phone's
 //! [`VideoStore`], and any other host that has a directory to keep files in.
 //!
+//! Guarded by V1463 (whole files, path+query keys), V1464 (shared cap and
+//! free-space guard) and V1465 (every outcome logged) in
+//! `specs/001-pharos-baseline/invariants.md`.
+//!
 //! The same plan as the web store (`kept_video_web.rs`): the player's own
 //! HLS stream, every playlist, init and segment stored under the request
 //! key the player will ask for (`request_key`: path and query). Here a key
