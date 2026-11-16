@@ -62,6 +62,20 @@ pub struct Entry {
     pub overview: String,
 }
 
+impl crate::shelf::Item for Entry {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn image_tag(&self) -> Option<&str> {
+        self.image_tag.as_deref()
+    }
+
+    fn sort_name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// A page of a listing and how many there are in all.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Page {
