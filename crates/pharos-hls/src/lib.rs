@@ -8,6 +8,7 @@
 pub mod abr;
 pub mod annexb;
 pub mod fmp4;
+pub mod offline;
 pub mod planner;
 pub mod playlist;
 pub mod retry;
