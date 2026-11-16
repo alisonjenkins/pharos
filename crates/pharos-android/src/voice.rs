@@ -2,7 +2,7 @@
 //! Android Auto turns "next song" into an in-app search rather than a skip,
 //! so a query that is only a transport phrase runs that action instead.
 
-use jni::JNIEnv;
+use jni::Env;
 
 use crate::{log, skip, state_lock, transport, R, STATE_PAUSED, STATE_PLAYING};
 
@@ -105,7 +105,7 @@ impl Command {
 }
 
 /// Runs `cmd` on the session's player.
-pub fn run(env: &mut JNIEnv, cmd: Command) -> R<()> {
+pub fn run(env: &mut Env, cmd: Command) -> R<()> {
     log(&format!("voice command={cmd:?}"));
     match cmd {
         Command::Next => skip(env, 1, true),

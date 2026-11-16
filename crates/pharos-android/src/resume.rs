@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use jni::objects::{GlobalRef, JValue};
-use jni::JNIEnv;
+use crate::GlobalRef;
+use jni::objects::JValue;
+use jni::Env;
 
 use crate::{jerr, log, LIBRARY, R, VM};
 use pharos_content::{Progress, Resume, ResumeVerdict, RESUME_MIN_TRACK_MS, RESUME_SAVE_EVERY};
@@ -130,35 +131,39 @@ fn tick_loop(token: u64) {
         TICKER.release(token);
         return;
     };
-    let mut env = match vm.attach_current_thread() {
-        Ok(env) => env,
-        Err(e) => {
-            log(&format!("resume: ticker attach failed: {e}"));
-            TICKER.release(token);
-            return;
-        }
-    };
-    while TICKER.is_live(token) {
-        std::thread::sleep(RESUME_SAVE_EVERY);
-        if !TICKER.is_live(token) {
-            break;
-        }
-        if let Err(e) = note_if_playing(&mut env) {
-            log(&format!("resume: tick failed: {e}"));
-            if env.exception_check().unwrap_or(false) {
-                let _ = env.exception_clear();
+    let attached = vm.attach_current_thread_for_scope(|env| -> Result<(), jni::errors::Error> {
+        while TICKER.is_live(token) {
+            std::thread::sleep(RESUME_SAVE_EVERY);
+            if !TICKER.is_live(token) {
+                break;
+            }
+            if let Err(e) = note_if_playing(env) {
+                log(&format!("resume: tick failed: {e}"));
+                if env.exception_check() {
+                    env.exception_clear();
+                }
             }
         }
+        Ok(())
+    });
+    if let Err(e) = attached {
+        log(&format!("resume: ticker attach failed: {e}"));
+        TICKER.release(token);
     }
 }
 
-fn note_if_playing(env: &mut JNIEnv) -> R<()> {
+fn note_if_playing(env: &mut Env) -> R<()> {
     let mut guard = now()?;
     let Some(n) = guard.as_mut() else {
         return Ok(());
     };
     let playing = env
-        .call_method(n.player.as_obj(), "isPlaying", "()Z", &[])
+        .call_method(
+            n.player.as_obj(),
+            jni::jni_str!("isPlaying"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )
         .and_then(|v| v.z())
         .map_err(jerr("isPlaying"))?;
     if !playing {
@@ -200,9 +205,14 @@ fn progress_for(why: &str) -> Progress {
     }
 }
 
-fn position(env: &mut JNIEnv, player: &GlobalRef) -> R<u64> {
+fn position(env: &mut Env, player: &GlobalRef) -> R<u64> {
     let pos = env
-        .call_method(player.as_obj(), "getCurrentPosition", "()I", &[])
+        .call_method(
+            player.as_obj(),
+            jni::jni_str!("getCurrentPosition"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
         .and_then(|v| v.i())
         .map_err(jerr("getCurrentPosition"))?;
     Ok(u64::try_from(pos).unwrap_or(0))
@@ -260,7 +270,7 @@ fn start_position(
 /// `player` is prepared with `id`. Returns where to seek before starting,
 /// and logs the decision. `report` sends its progress to the server too.
 pub fn prepared(
-    env: &mut JNIEnv,
+    env: &mut Env,
     id: &str,
     duration_ms: u64,
     server_ms: u64,
@@ -284,8 +294,8 @@ pub fn prepared(
         Some(ms) => {
             env.call_method(
                 player.as_obj(),
-                "seekTo",
-                "(I)V",
+                jni::jni_str!("seekTo"),
+                jni::jni_sig!("(I)V"),
                 &[JValue::Int(i32::try_from(ms).unwrap_or(i32::MAX))],
             )
             .map_err(jerr("seekTo(resume)"))?;
@@ -329,7 +339,7 @@ fn note_held(guard: &Option<Now>, pos: i64, why: &str) -> R<()> {
 /// As [`note`], only while `player` is the one being tracked: a newer
 /// player's progress is not another's to record. One guard spans the check
 /// and the record, so a new player cannot take over between them.
-pub fn note_for(env: &mut JNIEnv, player: &GlobalRef, pos: i64, why: &str) -> R<()> {
+pub fn note_for(env: &mut Env, player: &GlobalRef, pos: i64, why: &str) -> R<()> {
     let guard = now()?;
     if !tracks(env, &guard, player)? {
         log(&format!("resume: {why} for a replaced player, not saved"));
@@ -340,7 +350,7 @@ pub fn note_for(env: &mut JNIEnv, player: &GlobalRef, pos: i64, why: &str) -> R<
 
 /// As [`drop_current`], only while `player` is the one being tracked, under
 /// one guard for the check and the take.
-pub fn drop_for(env: &mut JNIEnv, player: &GlobalRef) -> R<()> {
+pub fn drop_for(env: &mut Env, player: &GlobalRef) -> R<()> {
     let mut guard = now()?;
     if !tracks(env, &guard, player)? {
         return Ok(());
@@ -350,7 +360,7 @@ pub fn drop_for(env: &mut JNIEnv, player: &GlobalRef) -> R<()> {
     Ok(())
 }
 
-fn tracks(env: &mut JNIEnv, guard: &Option<Now>, player: &GlobalRef) -> R<bool> {
+fn tracks(env: &mut Env, guard: &Option<Now>, player: &GlobalRef) -> R<bool> {
     let Some(n) = guard.as_ref() else {
         return Ok(false);
     };
@@ -359,7 +369,7 @@ fn tracks(env: &mut JNIEnv, guard: &Option<Now>, player: &GlobalRef) -> R<bool> 
 }
 
 /// The current player is about to be released: save where it was.
-pub fn leave(env: &mut JNIEnv, why: &str) -> R<()> {
+pub fn leave(env: &mut Env, why: &str) -> R<()> {
     let taken = now()?.take();
     if let Some(n) = taken {
         // Never stops the caller from releasing the player.

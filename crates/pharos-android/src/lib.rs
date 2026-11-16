@@ -60,11 +60,27 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::objects::{JObject, JString, JValue};
 
 use jni::sys::{jlong, jobject};
 
-use jni::{JNIEnv, JavaVM};
+use jni::{Env, EnvUnowned, JavaVM};
+
+/// A reference to a Java object that outlives the call that made it.
+#[derive(Clone)]
+pub(crate) struct GlobalRef(std::sync::Arc<jni::refs::Global<JObject<'static>>>);
+
+impl GlobalRef {
+    /// Pins `obj` so it outlives the call; clones share one JNI reference.
+    pub(crate) fn new(env: &mut Env, obj: &JObject) -> Result<Self, jni::errors::Error> {
+        env.new_global_ref(obj)
+            .map(|g| Self(std::sync::Arc::new(g)))
+    }
+
+    pub(crate) fn as_obj(&self) -> &JObject<'static> {
+        &self.0
+    }
+}
 
 const STATE_STOPPED: i32 = 1;
 
@@ -175,8 +191,8 @@ static LIBRARY: OnceLock<content::Library> = OnceLock::new();
 /// App classes, looked up on the main thread: a thread attached from Rust
 /// finds classes through the system loader, which does not see the app's.
 struct Classes {
-    listener: GlobalRef,
-    compat_item: GlobalRef,
+    listener: jni::refs::Global<jni::objects::JClass<'static>>,
+    compat_item: jni::refs::Global<jni::objects::JClass<'static>>,
 }
 
 static CLASSES: OnceLock<Classes> = OnceLock::new();
@@ -220,11 +236,11 @@ fn jerr(what: &str) -> impl Fn(jni::errors::Error) -> String + '_ {
 
 /// Runs `f`; on error logs it with `context` and clears any Java exception,
 /// naming its class, so the call returns to Java cleanly.
-fn guarded<T>(
-    env: &mut JNIEnv,
+fn guarded<'l, T>(
+    env: &mut Env<'l>,
     context: &str,
     fallback: T,
-    f: impl FnOnce(&mut JNIEnv) -> R<T>,
+    f: impl FnOnce(&mut Env<'l>) -> R<T>,
 ) -> T {
     match f(env) {
         Ok(v) => v,
@@ -236,36 +252,69 @@ fn guarded<T>(
     }
 }
 
+/// [`guarded`] for a Java entry point: also catches a panic, which must not
+/// unwind into the JVM, and returns `fallback` for it.
+fn guarded_native<'l, T: Copy>(
+    env: &mut EnvUnowned<'l>,
+    context: &str,
+    fallback: T,
+    f: impl FnOnce(&mut Env<'l>) -> R<T>,
+) -> T {
+    let outcome = env
+        .with_env(|env| -> Result<T, jni::errors::Error> { Ok(guarded(env, context, fallback, f)) })
+        .into_outcome();
+    match outcome {
+        jni::Outcome::Ok(v) => v,
+        jni::Outcome::Err(e) => {
+            log(&format!("{context} failed: {e}"));
+            fallback
+        }
+        jni::Outcome::Panic(_) => {
+            log(&format!("{context} failed: panic"));
+            fallback
+        }
+    }
+}
+
 /// Clears a pending Java exception and names its class for the log.
 /// The message stays out: it can name the server or a TLS reason.
-pub(crate) fn take_exception(env: &mut JNIEnv) -> String {
-    let Ok(throwable) = env.exception_occurred() else {
+pub(crate) fn take_exception(env: &mut Env) -> String {
+    let Some(throwable) = env.exception_occurred() else {
         return String::new();
     };
-    if throwable.is_null() {
-        return String::new();
-    }
-    let _ = env.exception_clear();
+    env.exception_clear();
     let name = env
-        .call_method(&throwable, "getClass", "()Ljava/lang/Class;", &[])
+        .call_method(
+            &throwable,
+            jni::jni_str!("getClass"),
+            jni::jni_sig!("()Ljava/lang/Class;"),
+            &[],
+        )
         .and_then(|v| v.l())
-        .and_then(|c| env.call_method(&c, "getName", "()Ljava/lang/String;", &[]))
+        .and_then(|c| {
+            env.call_method(
+                &c,
+                jni::jni_str!("getName"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+        })
         .and_then(|v| v.l())
-        .map(jni::objects::JString::from)
-        .and_then(|s| env.get_string(&s).map(String::from));
+        .map_err(|e| e.to_string())
+        .and_then(|s| string(env, &s));
     match name {
         Ok(n) => format!(" exception={n}"),
         Err(_) => " exception=unknown".to_owned(),
     }
 }
 
-fn string(env: &mut JNIEnv, s: &JString) -> R<String> {
-    if s.is_null() {
+fn string<'a>(env: &mut Env, s: &impl AsRef<JObject<'a>>) -> R<String> {
+    let obj = s.as_ref();
+    if obj.is_null() {
         return Ok(String::new());
     }
-    env.get_string(s)
-        .map(Into::into)
-        .map_err(jerr("get_string"))
+    let js = env.as_cast::<JString>(obj).map_err(jerr("get_string"))?;
+    js.try_to_string(env).map_err(jerr("get_string"))
 }
 
 fn state_lock() -> R<MutexGuard<'static, Option<State>>> {

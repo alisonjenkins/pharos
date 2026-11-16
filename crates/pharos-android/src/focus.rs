@@ -5,12 +5,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
+use crate::GlobalRef;
+use jni::objects::{JClass, JObject, JValue};
 use jni::sys::jint;
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 
 use crate::{
-    guarded, jerr, log, state_lock, transport, transport_with, R, STATE_PAUSED, STATE_PLAYING,
+    guarded_native, jerr, log, state_lock, transport, transport_with, R, STATE_PAUSED,
+    STATE_PLAYING,
 };
 
 const USAGE_MEDIA: i32 = 1;
@@ -99,19 +101,23 @@ fn audio() -> R<std::sync::MutexGuard<'static, Option<Audio>>> {
 /// Builds the media attributes and the focus request for `ctx`, and tells
 /// `session` it plays locally with them.
 pub fn create(
-    env: &mut JNIEnv,
+    env: &mut Env,
     ctx: &JObject,
     session: &JObject,
-    listener_class: &JClass,
+    listener_class: &jni::refs::Global<JClass<'static>>,
 ) -> R<()> {
     let b = env
-        .new_object("android/media/AudioAttributes$Builder", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/media/AudioAttributes$Builder"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("AudioAttributes.Builder"))?;
     let b = env
         .call_method(
             &b,
-            "setUsage",
-            "(I)Landroid/media/AudioAttributes$Builder;",
+            jni::jni_str!("setUsage"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
             &[JValue::Int(USAGE_MEDIA)],
         )
         .and_then(|v| v.l())
@@ -119,20 +125,25 @@ pub fn create(
     let b = env
         .call_method(
             &b,
-            "setContentType",
-            "(I)Landroid/media/AudioAttributes$Builder;",
+            jni::jni_str!("setContentType"),
+            jni::jni_sig!("(I)Landroid/media/AudioAttributes$Builder;"),
             &[JValue::Int(CONTENT_TYPE_MUSIC)],
         )
         .and_then(|v| v.l())
         .map_err(jerr("setContentType"))?;
     let attrs = env
-        .call_method(&b, "build", "()Landroid/media/AudioAttributes;", &[])
+        .call_method(
+            &b,
+            jni::jni_str!("build"),
+            jni::jni_sig!("()Landroid/media/AudioAttributes;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("AudioAttributes.build"))?;
     env.call_method(
         session,
-        "setPlaybackToLocal",
-        "(Landroid/media/AudioAttributes;)V",
+        jni::jni_str!("setPlaybackToLocal"),
+        jni::jni_sig!("(Landroid/media/AudioAttributes;)V"),
         &[JValue::Object(&attrs)],
     )
     .map_err(jerr("setPlaybackToLocal"))?;
@@ -141,8 +152,8 @@ pub fn create(
     let manager = env
         .call_method(
             ctx,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
+            jni::jni_str!("getSystemService"),
+            jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&name)],
         )
         .and_then(|v| v.l())
@@ -151,20 +162,22 @@ pub fn create(
         return Err("getSystemService(audio) returned null".into());
     }
     let listener = env
-        .new_object(listener_class, "()V", &[])
+        .new_object(listener_class, jni::jni_sig!("()V"), &[])
         .map_err(jerr("focus listener"))?;
     let b = env
         .new_object(
-            "android/media/AudioFocusRequest$Builder",
-            "(I)V",
+            jni::jni_str!("android/media/AudioFocusRequest$Builder"),
+            jni::jni_sig!("(I)V"),
             &[JValue::Int(AUDIOFOCUS_GAIN)],
         )
         .map_err(jerr("AudioFocusRequest.Builder"))?;
     let b = env
         .call_method(
             &b,
-            "setAudioAttributes",
-            "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;",
+            jni::jni_str!("setAudioAttributes"),
+            jni::jni_sig!(
+                "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;"
+            ),
             &[JValue::Object(&attrs)],
         )
         .and_then(|v| v.l())
@@ -172,39 +185,40 @@ pub fn create(
     let b = env
         .call_method(
             &b,
-            "setOnAudioFocusChangeListener",
-            "(Landroid/media/AudioManager$OnAudioFocusChangeListener;)Landroid/media/AudioFocusRequest$Builder;",
+            jni::jni_str!("setOnAudioFocusChangeListener"),
+            jni::jni_sig!("(Landroid/media/AudioManager$OnAudioFocusChangeListener;)Landroid/media/AudioFocusRequest$Builder;"),
             &[JValue::Object(&listener)],
         )
         .and_then(|v| v.l())
         .map_err(jerr("setOnAudioFocusChangeListener"))?;
     let request = env
-        .call_method(&b, "build", "()Landroid/media/AudioFocusRequest;", &[])
+        .call_method(
+            &b,
+            jni::jni_str!("build"),
+            jni::jni_sig!("()Landroid/media/AudioFocusRequest;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("AudioFocusRequest.build"))?;
     *audio()? = Some(Audio {
-        attrs: env.new_global_ref(&attrs).map_err(jerr("global attrs"))?,
-        manager: env
-            .new_global_ref(&manager)
-            .map_err(jerr("global audio manager"))?,
-        request: env
-            .new_global_ref(&request)
-            .map_err(jerr("global focus request"))?,
+        attrs: GlobalRef::new(env, &attrs).map_err(jerr("global attrs"))?,
+        manager: GlobalRef::new(env, &manager).map_err(jerr("global audio manager"))?,
+        request: GlobalRef::new(env, &request).map_err(jerr("global focus request"))?,
     });
     log("audio: media attributes set, playback to local");
     Ok(())
 }
 
 /// Gives `player` the media attributes. Must run before `setDataSource`.
-pub fn apply(env: &mut JNIEnv, player: &JObject) -> R<()> {
+pub fn apply(env: &mut Env, player: &JObject) -> R<()> {
     let attrs = audio()?
         .as_ref()
         .map(|a| a.attrs.clone())
         .ok_or("audio not created")?;
     env.call_method(
         player,
-        "setAudioAttributes",
-        "(Landroid/media/AudioAttributes;)V",
+        jni::jni_str!("setAudioAttributes"),
+        jni::jni_sig!("(Landroid/media/AudioAttributes;)V"),
         &[JValue::Object(attrs.as_obj())],
     )
     .map_err(jerr("setAudioAttributes"))?;
@@ -212,7 +226,7 @@ pub fn apply(env: &mut JNIEnv, player: &JObject) -> R<()> {
 }
 
 /// Asks for media focus before playback starts. False: do not start.
-pub fn request(env: &mut JNIEnv) -> R<bool> {
+pub fn request(env: &mut Env) -> R<bool> {
     let Some((manager, req)) = audio()?
         .as_ref()
         .map(|a| (a.manager.clone(), a.request.clone()))
@@ -222,8 +236,8 @@ pub fn request(env: &mut JNIEnv) -> R<bool> {
     let result = env
         .call_method(
             manager.as_obj(),
-            "requestAudioFocus",
-            "(Landroid/media/AudioFocusRequest;)I",
+            jni::jni_str!("requestAudioFocus"),
+            jni::jni_sig!("(Landroid/media/AudioFocusRequest;)I"),
             &[JValue::Object(req.as_obj())],
         )
         .and_then(|v| v.i())
@@ -234,7 +248,7 @@ pub fn request(env: &mut JNIEnv) -> R<bool> {
 }
 
 /// Gives focus back: on stop, permanent loss and destroy.
-pub fn abandon(env: &mut JNIEnv) -> R<()> {
+pub fn abandon(env: &mut Env) -> R<()> {
     let Some((manager, req)) = audio()?
         .as_ref()
         .map(|a| (a.manager.clone(), a.request.clone()))
@@ -244,8 +258,8 @@ pub fn abandon(env: &mut JNIEnv) -> R<()> {
     let result = env
         .call_method(
             manager.as_obj(),
-            "abandonAudioFocusRequest",
-            "(Landroid/media/AudioFocusRequest;)I",
+            jni::jni_str!("abandonAudioFocusRequest"),
+            jni::jni_sig!("(Landroid/media/AudioFocusRequest;)I"),
             &[JValue::Object(req.as_obj())],
         )
         .and_then(|v| v.i())
@@ -255,7 +269,7 @@ pub fn abandon(env: &mut JNIEnv) -> R<()> {
     Ok(())
 }
 
-pub fn destroy(env: &mut JNIEnv) -> R<()> {
+pub fn destroy(env: &mut Env) -> R<()> {
     abandon(env)?;
     *audio()? = None;
     Ok(())
@@ -281,13 +295,13 @@ pub(crate) fn duck_factor() -> f32 {
     }
 }
 
-fn set_volume(env: &mut JNIEnv, v: f32) -> R<()> {
+fn set_volume(env: &mut Env, v: f32) -> R<()> {
     let player = state_lock()?.as_ref().and_then(|s| s.player.clone());
     if let Some(p) = player {
         env.call_method(
             p.as_obj(),
-            "setVolume",
-            "(FF)V",
+            jni::jni_str!("setVolume"),
+            jni::jni_sig!("(FF)V"),
             &[JValue::Float(v), JValue::Float(v)],
         )
         .map_err(jerr("setVolume"))?;
@@ -295,26 +309,31 @@ fn set_volume(env: &mut JNIEnv, v: f32) -> R<()> {
     Ok(())
 }
 
-pub(crate) fn is_playing(env: &mut JNIEnv) -> R<bool> {
+pub(crate) fn is_playing(env: &mut Env) -> R<bool> {
     let player = state_lock()?
         .as_ref()
         .filter(|s| s.prepared)
         .and_then(|s| s.player.clone());
     let Some(p) = player else { return Ok(false) };
-    env.call_method(p.as_obj(), "isPlaying", "()Z", &[])
-        .and_then(|v| v.z())
-        .map_err(jerr("isPlaying"))
+    env.call_method(
+        p.as_obj(),
+        jni::jni_str!("isPlaying"),
+        jni::jni_sig!("()Z"),
+        &[],
+    )
+    .and_then(|v| v.z())
+    .map_err(jerr("isPlaying"))
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onAudioFocusChange<
     'l,
 >(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     change: jint,
 ) {
-    guarded(&mut env, "onAudioFocusChange", (), |env| {
+    guarded_native(&mut env, "onAudioFocusChange", (), |env| {
         let action = match change {
             AUDIOFOCUS_GAIN => {
                 let mut did = Vec::new();

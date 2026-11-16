@@ -4,10 +4,10 @@
 use std::sync::Mutex;
 
 use jni::objects::JObject;
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 
 use crate::receiver::{self, Registered};
-use crate::{focus, guarded, is_starting, log, transport, R, STATE_PAUSED};
+use crate::{focus, guarded_native, is_starting, log, transport, R, STATE_PAUSED};
 
 pub const ACTION: &str = "android.media.AUDIO_BECOMING_NOISY";
 /// `Context.RECEIVER_NOT_EXPORTED` (API 33): system broadcasts still arrive.
@@ -15,7 +15,7 @@ const RECEIVER_NOT_EXPORTED: i32 = 4;
 
 static RECEIVER: Mutex<Option<Registered>> = Mutex::new(None);
 
-pub fn register(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+pub fn register(env: &mut Env, ctx: &JObject) -> R<()> {
     let mut guard = RECEIVER
         .lock()
         .map_err(|_| "noisy receiver mutex poisoned".to_owned())?;
@@ -33,7 +33,7 @@ pub fn register(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     Ok(())
 }
 
-pub fn unregister(env: &mut JNIEnv) -> R<()> {
+pub fn unregister(env: &mut Env) -> R<()> {
     let taken = RECEIVER
         .lock()
         .map_err(|_| "noisy receiver mutex poisoned".to_owned())?
@@ -47,12 +47,12 @@ pub fn unregister(env: &mut JNIEnv) -> R<()> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNoisyReceiver_onReceive<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _ctx: JObject<'l>,
     _intent: JObject<'l>,
 ) {
-    guarded(&mut env, "noisy onReceive", (), |env| {
+    guarded_native(&mut env, "noisy onReceive", (), |env| {
         focus::note_user_pause();
         let action = if focus::is_playing(env)? || is_starting()? {
             transport(env, "pause", STATE_PAUSED)?;

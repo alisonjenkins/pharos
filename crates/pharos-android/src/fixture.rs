@@ -178,7 +178,7 @@ mod imp {
 
     /// Where test entry `id` plays from: its `url`, else its tone written to the
     /// cache dir.
-    pub(crate) fn source(env: &mut JNIEnv, id: &str) -> R<String> {
+    pub(crate) fn source(env: &mut Env, id: &str) -> R<String> {
         let e = entry(id).ok_or_else(|| format!("not a test entry: {id}"))?;
         if !e.url.is_empty() {
             return Ok(e.url.to_owned());
@@ -189,14 +189,24 @@ mod imp {
             .service
             .clone();
         let dir = env
-            .call_method(service.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])
+            .call_method(
+                service.as_obj(),
+                jni::jni_str!("getCacheDir"),
+                jni::jni_sig!("()Ljava/io/File;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getCacheDir"))?;
         let dir = env
-            .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .call_method(
+                &dir,
+                jni::jni_str!("getAbsolutePath"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getAbsolutePath"))?;
-        let dir = string(env, &JString::from(dir))?;
+        let dir = string(env, &dir)?;
         let path = format!("{dir}/{}.wav", e.id.replace(':', "-"));
         std::fs::write(&path, tone_wav(e.hz)).map_err(|err| format!("write {path}: {err}"))?;
         Ok(path)
@@ -231,7 +241,7 @@ mod imp {
         Vec::new()
     }
 
-    pub(crate) fn source(_env: &mut JNIEnv, id: &str) -> R<String> {
+    pub(crate) fn source(_env: &mut Env, id: &str) -> R<String> {
         Err(format!("no test catalogue in this build: {id}"))
     }
 }

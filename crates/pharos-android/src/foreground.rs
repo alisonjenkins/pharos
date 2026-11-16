@@ -9,8 +9,9 @@
 
 use std::sync::Mutex;
 
-use jni::objects::{GlobalRef, JObject, JValue};
-use jni::JNIEnv;
+use crate::GlobalRef;
+use jni::objects::{JObject, JValue};
+use jni::Env;
 
 use crate::{jerr, log, R, STATE_BUFFERING, STATE_PAUSED, STATE_PLAYING};
 
@@ -49,7 +50,7 @@ fn fg() -> R<std::sync::MutexGuard<'static, Option<Fg>>> {
 }
 
 /// Creates the notification channel. `token` is the session's token.
-pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
+pub fn create(env: &mut Env, service: &JObject, token: &JObject) -> R<()> {
     let name = JObject::from(
         env.new_string("notification")
             .map_err(jerr("service name"))?,
@@ -57,8 +58,8 @@ pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
     let manager = env
         .call_method(
             service,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
+            jni::jni_str!("getSystemService"),
+            jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&name)],
         )
         .and_then(|v| v.l())
@@ -67,15 +68,19 @@ pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
         return Err("getSystemService(notification) returned null".into());
     }
     let sdk = env
-        .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+        .get_static_field(
+            jni::jni_str!("android/os/Build$VERSION"),
+            jni::jni_str!("SDK_INT"),
+            jni::jni_sig!("I"),
+        )
         .and_then(|v| v.i())
         .map_err(jerr("SDK_INT"))?;
     let id = JObject::from(env.new_string(CHANNEL_ID).map_err(jerr("channel id"))?);
     let label = JObject::from(env.new_string(CHANNEL_NAME).map_err(jerr("channel name"))?);
     let channel = env
         .new_object(
-            "android/app/NotificationChannel",
-            "(Ljava/lang/String;Ljava/lang/CharSequence;I)V",
+            jni::jni_str!("android/app/NotificationChannel"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/CharSequence;I)V"),
             &[
                 JValue::Object(&id),
                 JValue::Object(&label),
@@ -85,19 +90,15 @@ pub fn create(env: &mut JNIEnv, service: &JObject, token: &JObject) -> R<()> {
         .map_err(jerr("NotificationChannel"))?;
     env.call_method(
         &manager,
-        "createNotificationChannel",
-        "(Landroid/app/NotificationChannel;)V",
+        jni::jni_str!("createNotificationChannel"),
+        jni::jni_sig!("(Landroid/app/NotificationChannel;)V"),
         &[JValue::Object(&channel)],
     )
     .map_err(jerr("createNotificationChannel"))?;
     *fg()? = Some(Fg {
-        service: env
-            .new_global_ref(service)
-            .map_err(jerr("global fg service"))?,
-        token: env.new_global_ref(token).map_err(jerr("global fg token"))?,
-        manager: env
-            .new_global_ref(&manager)
-            .map_err(jerr("global notification manager"))?,
+        service: GlobalRef::new(env, service).map_err(jerr("global fg service"))?,
+        token: GlobalRef::new(env, token).map_err(jerr("global fg token"))?,
+        manager: GlobalRef::new(env, &manager).map_err(jerr("global notification manager"))?,
         sdk,
         title: String::new(),
         text: String::new(),
@@ -120,14 +121,14 @@ pub fn describe(title: &str, text: &str) -> R<()> {
 /// Follows a published playback state. Never fails the caller: a refused
 /// foreground start (Android 12+ background limits) is logged and playback
 /// carries on as before.
-pub fn sync(env: &mut JNIEnv, state: i32) {
+pub fn sync(env: &mut Env, state: i32) {
     if let Err(e) = apply(env, state) {
         let exception = crate::take_exception(env);
         log(&format!("notify: state={state} failed: {e}{exception}"));
     }
 }
 
-fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
+fn apply(env: &mut Env, state: i32) -> R<()> {
     let mut guard = fg()?;
     let Some(f) = guard.as_mut() else {
         return Ok(());
@@ -141,15 +142,15 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
                     .map_err(jerr("service class"))?;
                 let intent = env
                     .new_object(
-                        "android/content/Intent",
-                        "(Landroid/content/Context;Ljava/lang/Class;)V",
+                        jni::jni_str!("android/content/Intent"),
+                        jni::jni_sig!("(Landroid/content/Context;Ljava/lang/Class;)V"),
                         &[JValue::Object(f.service.as_obj()), JValue::Object(&class)],
                     )
                     .map_err(jerr("service intent"))?;
                 env.call_method(
                     f.service.as_obj(),
-                    "startForegroundService",
-                    "(Landroid/content/Intent;)Landroid/content/ComponentName;",
+                    jni::jni_str!("startForegroundService"),
+                    jni::jni_sig!("(Landroid/content/Intent;)Landroid/content/ComponentName;"),
                     &[JValue::Object(&intent)],
                 )
                 .map_err(jerr("startForegroundService"))?;
@@ -158,8 +159,8 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
             if has_foreground_type(f.sdk) {
                 env.call_method(
                     f.service.as_obj(),
-                    "startForeground",
-                    "(ILandroid/app/Notification;I)V",
+                    jni::jni_str!("startForeground"),
+                    jni::jni_sig!("(ILandroid/app/Notification;I)V"),
                     &[
                         JValue::Int(NOTIFICATION_ID),
                         JValue::Object(&n),
@@ -169,8 +170,8 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
             } else {
                 env.call_method(
                     f.service.as_obj(),
-                    "startForeground",
-                    "(ILandroid/app/Notification;)V",
+                    jni::jni_str!("startForeground"),
+                    jni::jni_sig!("(ILandroid/app/Notification;)V"),
                     &[JValue::Int(NOTIFICATION_ID), JValue::Object(&n)],
                 )
             }
@@ -184,8 +185,8 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
             if f.foreground {
                 env.call_method(
                     f.service.as_obj(),
-                    "stopForeground",
-                    "(I)V",
+                    jni::jni_str!("stopForeground"),
+                    jni::jni_sig!("(I)V"),
                     &[JValue::Int(STOP_FOREGROUND_DETACH)],
                 )
                 .map_err(jerr("stopForeground(detach)"))?;
@@ -195,8 +196,8 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
                 let n = build(env, f)?;
                 env.call_method(
                     f.manager.as_obj(),
-                    "notify",
-                    "(ILandroid/app/Notification;)V",
+                    jni::jni_str!("notify"),
+                    jni::jni_sig!("(ILandroid/app/Notification;)V"),
                     &[JValue::Int(NOTIFICATION_ID), JValue::Object(&n)],
                 )
                 .map_err(jerr("notify"))?;
@@ -212,8 +213,8 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
             if f.foreground {
                 env.call_method(
                     f.service.as_obj(),
-                    "stopForeground",
-                    "(I)V",
+                    jni::jni_str!("stopForeground"),
+                    jni::jni_sig!("(I)V"),
                     &[JValue::Int(STOP_FOREGROUND_REMOVE)],
                 )
                 .map_err(jerr("stopForeground(remove)"))?;
@@ -221,13 +222,18 @@ fn apply(env: &mut JNIEnv, state: i32) -> R<()> {
             }
             env.call_method(
                 f.manager.as_obj(),
-                "cancel",
-                "(I)V",
+                jni::jni_str!("cancel"),
+                jni::jni_sig!("(I)V"),
                 &[JValue::Int(NOTIFICATION_ID)],
             )
             .map_err(jerr("cancel"))?;
-            env.call_method(f.service.as_obj(), "stopSelf", "()V", &[])
-                .map_err(jerr("stopSelf"))?;
+            env.call_method(
+                f.service.as_obj(),
+                jni::jni_str!("stopSelf"),
+                jni::jni_sig!("()V"),
+                &[],
+            )
+            .map_err(jerr("stopSelf"))?;
             f.started = false;
             log(&format!(
                 "notify: foreground=off notification=removed state={state}"
@@ -244,7 +250,7 @@ fn has_foreground_type(sdk: i32) -> bool {
 /// The app's `ic_stat_pharos` drawable, or the system play icon for an APK
 /// built without it (the spike's). Looked up once: resource ids are fixed for
 /// the life of the process.
-fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
+fn small_icon(env: &mut Env, ctx: &JObject) -> R<i32> {
     static ICON: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     if let Some(icon) = ICON.get() {
         return Ok(*icon);
@@ -252,14 +258,19 @@ fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
     let res = env
         .call_method(
             ctx,
-            "getResources",
-            "()Landroid/content/res/Resources;",
+            jni::jni_str!("getResources"),
+            jni::jni_sig!("()Landroid/content/res/Resources;"),
             &[],
         )
         .and_then(|v| v.l())
         .map_err(jerr("getResources"))?;
     let pkg = env
-        .call_method(ctx, "getPackageName", "()Ljava/lang/String;", &[])
+        .call_method(
+            ctx,
+            jni::jni_str!("getPackageName"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getPackageName"))?;
     let name = JObject::from(
@@ -270,8 +281,8 @@ fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
     let app = env
         .call_method(
             &res,
-            "getIdentifier",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+            jni::jni_str!("getIdentifier"),
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I"),
             &[
                 JValue::Object(&name),
                 JValue::Object(&kind),
@@ -284,7 +295,11 @@ fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
         (app, "app")
     } else {
         let system = env
-            .get_static_field("android/R$drawable", "ic_media_play", "I")
+            .get_static_field(
+                jni::jni_str!("android/R$drawable"),
+                jni::jni_str!("ic_media_play"),
+                jni::jni_sig!("I"),
+            )
             .and_then(|v| v.i())
             .map_err(jerr("ic_media_play"))?;
         (system, "system")
@@ -293,84 +308,99 @@ fn small_icon(env: &mut JNIEnv, ctx: &JObject) -> R<i32> {
     Ok(*ICON.get_or_init(|| icon))
 }
 
-fn build<'l>(env: &mut JNIEnv<'l>, f: &Fg) -> R<JObject<'l>> {
-    const B: &str = "Landroid/app/Notification$Builder;";
+fn build<'l>(env: &mut Env<'l>, f: &Fg) -> R<JObject<'l>> {
     let id = JObject::from(env.new_string(CHANNEL_ID).map_err(jerr("channel id"))?);
     let b = env
         .new_object(
-            "android/app/Notification$Builder",
-            "(Landroid/content/Context;Ljava/lang/String;)V",
+            jni::jni_str!("android/app/Notification$Builder"),
+            jni::jni_sig!("(Landroid/content/Context;Ljava/lang/String;)V"),
             &[JValue::Object(f.service.as_obj()), JValue::Object(&id)],
         )
         .map_err(jerr("Notification.Builder"))?;
     let icon = small_icon(env, f.service.as_obj())?;
-    env.call_method(&b, "setSmallIcon", format!("(I){B}"), &[JValue::Int(icon)])
-        .map_err(jerr("setSmallIcon"))?;
+    env.call_method(
+        &b,
+        jni::jni_str!("setSmallIcon"),
+        jni::jni_sig!("(I)Landroid/app/Notification$Builder;"),
+        &[JValue::Int(icon)],
+    )
+    .map_err(jerr("setSmallIcon"))?;
     let title = JObject::from(
         env.new_string(&f.title)
             .map_err(jerr("notification title"))?,
     );
     env.call_method(
         &b,
-        "setContentTitle",
-        format!("(Ljava/lang/CharSequence;){B}"),
+        jni::jni_str!("setContentTitle"),
+        jni::jni_sig!("(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;"),
         &[JValue::Object(&title)],
     )
     .map_err(jerr("setContentTitle"))?;
     let text = JObject::from(env.new_string(&f.text).map_err(jerr("notification text"))?);
     env.call_method(
         &b,
-        "setContentText",
-        format!("(Ljava/lang/CharSequence;){B}"),
+        jni::jni_str!("setContentText"),
+        jni::jni_sig!("(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;"),
         &[JValue::Object(&text)],
     )
     .map_err(jerr("setContentText"))?;
     env.call_method(
         &b,
-        "setVisibility",
-        format!("(I){B}"),
+        jni::jni_str!("setVisibility"),
+        jni::jni_sig!("(I)Landroid/app/Notification$Builder;"),
         &[JValue::Int(VISIBILITY_PUBLIC)],
     )
     .map_err(jerr("setVisibility"))?;
     let style = env
-        .new_object("android/app/Notification$MediaStyle", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/app/Notification$MediaStyle"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("MediaStyle"))?;
     env.call_method(
         &style,
-        "setMediaSession",
-        "(Landroid/media/session/MediaSession$Token;)Landroid/app/Notification$MediaStyle;",
+        jni::jni_str!("setMediaSession"),
+        jni::jni_sig!(
+            "(Landroid/media/session/MediaSession$Token;)Landroid/app/Notification$MediaStyle;"
+        ),
         &[JValue::Object(f.token.as_obj())],
     )
     .map_err(jerr("setMediaSession"))?;
     env.call_method(
         &b,
-        "setStyle",
-        format!("(Landroid/app/Notification$Style;){B}"),
+        jni::jni_str!("setStyle"),
+        jni::jni_sig!("(Landroid/app/Notification$Style;)Landroid/app/Notification$Builder;"),
         &[JValue::Object(&style)],
     )
     .map_err(jerr("setStyle"))?;
-    env.call_method(&b, "build", "()Landroid/app/Notification;", &[])
-        .and_then(|v| v.l())
-        .map_err(jerr("Notification.build"))
+    env.call_method(
+        &b,
+        jni::jni_str!("build"),
+        jni::jni_sig!("()Landroid/app/Notification;"),
+        &[],
+    )
+    .and_then(|v| v.l())
+    .map_err(jerr("Notification.build"))
 }
 
 /// Leaves the foreground and removes the notification.
-pub fn destroy(env: &mut JNIEnv) -> R<()> {
+pub fn destroy(env: &mut Env) -> R<()> {
     let taken = fg()?.take();
     if let Some(f) = taken {
         if f.foreground {
             env.call_method(
                 f.service.as_obj(),
-                "stopForeground",
-                "(I)V",
+                jni::jni_str!("stopForeground"),
+                jni::jni_sig!("(I)V"),
                 &[JValue::Int(STOP_FOREGROUND_REMOVE)],
             )
             .map_err(jerr("stopForeground(remove)"))?;
         }
         env.call_method(
             f.manager.as_obj(),
-            "cancel",
-            "(I)V",
+            jni::jni_str!("cancel"),
+            jni::jni_sig!("(I)V"),
             &[JValue::Int(NOTIFICATION_ID)],
         )
         .map_err(jerr("cancel"))?;

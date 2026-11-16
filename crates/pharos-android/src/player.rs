@@ -59,7 +59,7 @@ pub(crate) fn is_current(gen: u64) -> bool {
 /// play request than `gen` exists. Preparation is async;
 /// `PharosPlayerListener.onPrepared` starts playback.
 pub(crate) fn play(
-    env: &mut JNIEnv,
+    env: &mut Env,
     item: Item,
     source: &str,
     mut queue: Vec<Item>,
@@ -76,7 +76,12 @@ pub(crate) fn play(
     let st = guard.as_mut().ok_or("play before onCreate")?;
     if let Some(old) = st.player.take() {
         resume::leave(env, "track_change")?;
-        let _ = env.call_method(old.as_obj(), "release", "()V", &[]);
+        let _ = env.call_method(
+            old.as_obj(),
+            jni::jni_str!("release"),
+            jni::jni_sig!("()V"),
+            &[],
+        );
     }
     st.prepared = false;
     st.started = false;
@@ -84,25 +89,36 @@ pub(crate) fn play(
     want_start();
     let classes = CLASSES.get().ok_or("play before onCreate")?;
     let player = env
-        .new_object("android/media/MediaPlayer", "()V", &[])
-        .map_err(jerr("MediaPlayer"))?;
-    let listener_class: &JClass = classes.listener.as_obj().into();
-    let listener = env
-        .new_object(listener_class, "()V", &[])
-        .map_err(jerr("PharosPlayerListener"))?;
-    for (setter, iface) in [
-        ("setOnPreparedListener", "OnPreparedListener"),
-        ("setOnErrorListener", "OnErrorListener"),
-        ("setOnCompletionListener", "OnCompletionListener"),
-    ] {
-        env.call_method(
-            &player,
-            setter,
-            format!("(Landroid/media/MediaPlayer${iface};)V"),
-            &[JValue::Object(&listener)],
+        .new_object(
+            jni::jni_str!("android/media/MediaPlayer"),
+            jni::jni_sig!("()V"),
+            &[],
         )
-        .map_err(jerr(setter))?;
-    }
+        .map_err(jerr("MediaPlayer"))?;
+    let listener = env
+        .new_object(&classes.listener, jni::jni_sig!("()V"), &[])
+        .map_err(jerr("PharosPlayerListener"))?;
+    env.call_method(
+        &player,
+        jni::jni_str!("setOnPreparedListener"),
+        jni::jni_sig!("(Landroid/media/MediaPlayer$OnPreparedListener;)V"),
+        &[JValue::Object(&listener)],
+    )
+    .map_err(jerr("setOnPreparedListener"))?;
+    env.call_method(
+        &player,
+        jni::jni_str!("setOnErrorListener"),
+        jni::jni_sig!("(Landroid/media/MediaPlayer$OnErrorListener;)V"),
+        &[JValue::Object(&listener)],
+    )
+    .map_err(jerr("setOnErrorListener"))?;
+    env.call_method(
+        &player,
+        jni::jni_str!("setOnCompletionListener"),
+        jni::jni_sig!("(Landroid/media/MediaPlayer$OnCompletionListener;)V"),
+        &[JValue::Object(&listener)],
+    )
+    .map_err(jerr("setOnCompletionListener"))?;
     if let Err(e) = apply_volume(env, &player) {
         log(&format!("play id={}: volume not set: {e}", item.id));
     }
@@ -112,14 +128,19 @@ pub(crate) fn play(
     let src = JObject::from(env.new_string(source).map_err(jerr("source"))?);
     env.call_method(
         &player,
-        "setDataSource",
-        "(Ljava/lang/String;)V",
+        jni::jni_str!("setDataSource"),
+        jni::jni_sig!("(Ljava/lang/String;)V"),
         &[JValue::Object(&src)],
     )
     .map_err(jerr("setDataSource"))?;
-    env.call_method(&player, "prepareAsync", "()V", &[])
-        .map_err(jerr("prepareAsync"))?;
-    st.player = Some(env.new_global_ref(&player).map_err(jerr("global player"))?);
+    env.call_method(
+        &player,
+        jni::jni_str!("prepareAsync"),
+        jni::jni_sig!("()V"),
+        &[],
+    )
+    .map_err(jerr("prepareAsync"))?;
+    st.player = Some(GlobalRef::new(env, &player).map_err(jerr("global player"))?);
     if !queue.iter().any(|i| i.id == item.id) {
         queue = vec![item.clone()];
     }
@@ -186,7 +207,7 @@ fn cached_item(queue: &[Item], id: &str, lookup: impl FnOnce() -> Option<Item>) 
 const FALLBACK_TITLE: &str = "Downloaded track";
 
 /// Asks the library for `id`'s fresh stream URL (blocking) and plays it.
-pub(crate) fn play_library(env: &mut JNIEnv, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
+pub(crate) fn play_library(env: &mut Env, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
     let queue_ids: Vec<String> = queue.iter().map(|i| i.id.clone()).collect();
     let outcome = (|| {
         let lib = LIBRARY.get().ok_or("library not connected")?;
@@ -304,19 +325,19 @@ pub(crate) fn is_book_id(id: &str) -> bool {
 
 /// Plays `id` with `queue` (or the remembered list holding it): a test
 /// entry at once, a library node from a worker thread.
-pub(crate) fn start(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
+pub(crate) fn start(env: &mut Env, id: &str, queue: Option<Vec<Item>>) -> R<()> {
     start_at(env, id, queue, supersede())
 }
 
 /// [`start`] that plays from 0 whatever position was saved for the item.
-pub(crate) fn start_over(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>) -> R<()> {
+pub(crate) fn start_over(env: &mut Env, id: &str, queue: Option<Vec<Item>>) -> R<()> {
     let gen = supersede();
     want_from_start(gen);
     start_at(env, id, queue, gen)
 }
 
 /// [`start`] for a request that already holds its generation `gen`.
-pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
+pub(crate) fn start_at(env: &mut Env, id: &str, queue: Option<Vec<Item>>, gen: u64) -> R<()> {
     if is_book_id(id) {
         log(&format!("start id={id}: a book, resolving its parts"));
         return play_book(id, gen, asked_from_start(gen));
@@ -342,9 +363,9 @@ pub(crate) fn start_at(env: &mut JNIEnv, id: &str, queue: Option<Vec<Item>>, gen
 /// effects share one critical section, so a stale callback cannot alter a
 /// newer player's state.
 fn while_current<T>(
-    env: &mut JNIEnv,
+    env: &mut Env,
     mp: &JObject,
-    effects: impl FnOnce(&mut JNIEnv, &mut State, GlobalRef, Item) -> R<T>,
+    effects: impl FnOnce(&mut Env, &mut State, GlobalRef, Item) -> R<T>,
 ) -> R<Option<T>> {
     let mut guard = state_lock()?;
     let Some(st) = guard.as_mut() else {
@@ -375,14 +396,19 @@ pub(crate) fn track_length(player_ms: i32, server_ms: i64) -> (i64, &'static str
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onPrepared<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     mp: JObject<'l>,
 ) {
-    guarded(&mut env, "onPrepared", (), |env| {
+    guarded_native(&mut env, "onPrepared", (), |env| {
         let ready = while_current(env, &mp, |env, st, player, entry| {
             let duration = env
-                .call_method(player.as_obj(), "getDuration", "()I", &[])
+                .call_method(
+                    player.as_obj(),
+                    jni::jni_str!("getDuration"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )
                 .and_then(|v| v.i())
                 .map_err(jerr("getDuration"))?;
             st.prepared = true;
@@ -432,8 +458,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             ));
             return Ok(());
         }
-        env.call_method(player.as_obj(), "start", "()V", &[])
-            .map_err(jerr("start"))?;
+        env.call_method(
+            player.as_obj(),
+            jni::jni_str!("start"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map_err(jerr("start"))?;
         if let Some(st) = state_lock()?.as_mut() {
             st.started = true;
         }
@@ -448,13 +479,13 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onError<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     mp: JObject<'l>,
     what: jni::sys::jint,
     extra: jni::sys::jint,
 ) -> jni::sys::jboolean {
-    guarded(&mut env, "onError", (), |env| {
+    guarded_native(&mut env, "onError", (), |env| {
         let gone = while_current(env, &mp, |_, st, _, entry| {
             st.player = None;
             st.prepared = false;
@@ -468,7 +499,7 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
             ));
             return Ok(());
         };
-        let _ = env.call_method(&mp, "release", "()V", &[]);
+        let _ = env.call_method(&mp, jni::jni_str!("release"), jni::jni_sig!("()V"), &[]);
         set_playback_state(env, session.as_obj(), STATE_ERROR, 0)?;
         snapshot::note_error(&format!("player error what={what} extra={extra}"));
         log(&format!(
@@ -478,16 +509,16 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_o
         Ok(())
     });
     // Handled: without this MediaPlayer also calls onCompletion.
-    1
+    true
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosPlayerListener_onCompletion<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     mp: JObject<'l>,
 ) {
-    guarded(&mut env, "onCompletion", (), |env| {
+    guarded_native(&mut env, "onCompletion", (), |env| {
         let done = while_current(env, &mp, |_, _, _, entry| {
             resume::drop_current(true)?;
             Ok(entry)

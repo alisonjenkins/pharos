@@ -12,10 +12,11 @@
 
 use std::sync::Mutex;
 
-use jni::objects::{GlobalRef, JObject, JString, JValue};
-use jni::JNIEnv;
+use crate::GlobalRef;
+use jni::objects::{JObject, JValue};
+use jni::{Env, EnvUnowned};
 
-use crate::{guarded, jerr, log, string, Item, R};
+use crate::{guarded_native, jerr, log, string, Item, R};
 
 const EXTRA_MESSENGER: &str = "extra_messenger";
 const EXTRA_SERVICE_VERSION: &str = "extra_service_version";
@@ -48,44 +49,42 @@ fn length_prefixed(tag: i32, sdk: i32) -> bool {
     sdk >= LENGTH_PREFIX_SDK && matches!(tag, 2 | 4 | 11 | 12 | 16 | 17 | 21)
 }
 
-pub const ITEM_CLASS: &str = "android/support/v4/media/MediaBrowserCompat$MediaItem";
+pub const ITEM_CLASS: &jni::strings::JNIStr =
+    jni::jni_str!("android/support/v4/media/MediaBrowserCompat$MediaItem");
 
 /// Keeps the Messenger (and so its Handler) alive for the process.
 static MESSENGER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
 /// Puts the Messenger binder and service version into the root `extras`.
 /// Runs on the main thread, which the Handler then serves.
-pub fn advertise(env: &mut JNIEnv, extras: &JObject) -> R<()> {
+pub fn advertise(env: &mut Env, extras: &JObject) -> R<()> {
     let mut guard = MESSENGER
         .lock()
         .map_err(|_| "messenger mutex poisoned".to_owned())?;
     if guard.is_none() {
         let handler = env
             .new_object(
-                "com/alisonjenkins/pharos/auto/PharosCompatHandler",
-                "()V",
+                jni::jni_str!("com/alisonjenkins/pharos/auto/PharosCompatHandler"),
+                jni::jni_sig!("()V"),
                 &[],
             )
             .map_err(jerr("PharosCompatHandler"))?;
         let messenger = env
             .new_object(
-                "android/os/Messenger",
-                "(Landroid/os/Handler;)V",
+                jni::jni_str!("android/os/Messenger"),
+                jni::jni_sig!("(Landroid/os/Handler;)V"),
                 &[JValue::Object(&handler)],
             )
             .map_err(jerr("Messenger"))?;
-        *guard = Some(
-            env.new_global_ref(&messenger)
-                .map_err(jerr("global messenger"))?,
-        );
+        *guard = Some(GlobalRef::new(env, &messenger).map_err(jerr("global messenger"))?);
     }
     let messenger = guard.as_ref().ok_or("no messenger")?.clone();
     drop(guard);
     let binder = env
         .call_method(
             messenger.as_obj(),
-            "getBinder",
-            "()Landroid/os/IBinder;",
+            jni::jni_str!("getBinder"),
+            jni::jni_sig!("()Landroid/os/IBinder;"),
             &[],
         )
         .and_then(|v| v.l())
@@ -93,16 +92,16 @@ pub fn advertise(env: &mut JNIEnv, extras: &JObject) -> R<()> {
     let key = JObject::from(env.new_string(EXTRA_MESSENGER).map_err(jerr("key"))?);
     env.call_method(
         extras,
-        "putBinder",
-        "(Ljava/lang/String;Landroid/os/IBinder;)V",
+        jni::jni_str!("putBinder"),
+        jni::jni_sig!("(Ljava/lang/String;Landroid/os/IBinder;)V"),
         &[JValue::Object(&key), JValue::Object(&binder)],
     )
     .map_err(jerr("putBinder"))?;
     let key = JObject::from(env.new_string(EXTRA_SERVICE_VERSION).map_err(jerr("key"))?);
     env.call_method(
         extras,
-        "putInt",
-        "(Ljava/lang/String;I)V",
+        jni::jni_str!("putInt"),
+        jni::jni_sig!("(Ljava/lang/String;I)V"),
         &[JValue::Object(&key), JValue::Int(SERVICE_VERSION)],
     )
     .map_err(jerr("putInt"))?;
@@ -121,7 +120,7 @@ trait ParcelSource {
 }
 
 struct JniParcel<'a, 'l> {
-    env: &'a mut JNIEnv<'l>,
+    env: &'a mut Env<'l>,
     p: &'a JObject<'l>,
 }
 
@@ -130,14 +129,14 @@ impl<'l> ParcelSource for JniParcel<'_, 'l> {
 
     fn int(&mut self) -> R<i32> {
         self.env
-            .call_method(self.p, "readInt", "()I", &[])
+            .call_method(self.p, jni::jni_str!("readInt"), jni::jni_sig!("()I"), &[])
             .and_then(|v| v.i())
             .map_err(jerr("readInt"))
     }
 
     fn long(&mut self) -> R<()> {
         self.env
-            .call_method(self.p, "readLong", "()J", &[])
+            .call_method(self.p, jni::jni_str!("readLong"), jni::jni_sig!("()J"), &[])
             .map_err(jerr("readLong"))?;
         Ok(())
     }
@@ -145,29 +144,49 @@ impl<'l> ParcelSource for JniParcel<'_, 'l> {
     fn string(&mut self) -> R<String> {
         let s = self
             .env
-            .call_method(self.p, "readString", "()Ljava/lang/String;", &[])
+            .call_method(
+                self.p,
+                jni::jni_str!("readString"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("readString"))?;
-        string(self.env, &JString::from(s))
+        string(self.env, &s)
     }
 
     fn position(&mut self) -> R<i32> {
         self.env
-            .call_method(self.p, "dataPosition", "()I", &[])
+            .call_method(
+                self.p,
+                jni::jni_str!("dataPosition"),
+                jni::jni_sig!("()I"),
+                &[],
+            )
             .and_then(|v| v.i())
             .map_err(jerr("dataPosition"))
     }
 
     fn seek(&mut self, pos: i32) -> R<()> {
         self.env
-            .call_method(self.p, "setDataPosition", "(I)V", &[JValue::Int(pos)])
+            .call_method(
+                self.p,
+                jni::jni_str!("setDataPosition"),
+                jni::jni_sig!("(I)V"),
+                &[JValue::Int(pos)],
+            )
             .map_err(jerr("setDataPosition"))?;
         Ok(())
     }
 
     fn binder(&mut self) -> R<JObject<'l>> {
         self.env
-            .call_method(self.p, "readStrongBinder", "()Landroid/os/IBinder;", &[])
+            .call_method(
+                self.p,
+                jni::jni_str!("readStrongBinder"),
+                jni::jni_sig!("()Landroid/os/IBinder;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("readStrongBinder"))
     }
@@ -187,25 +206,34 @@ struct Walked<B> {
     receiver_class: String,
 }
 
-fn android_sdk(env: &mut JNIEnv) -> R<i32> {
-    env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
-        .and_then(|v| v.i())
-        .map_err(jerr("SDK_INT"))
+fn android_sdk(env: &mut Env) -> R<i32> {
+    env.get_static_field(
+        jni::jni_str!("android/os/Build$VERSION"),
+        jni::jni_str!("SDK_INT"),
+        jni::jni_sig!("I"),
+    )
+    .and_then(|v| v.i())
+    .map_err(jerr("SDK_INT"))
 }
 
 /// Walks `data`'s parcel for the query and the receiver's binder, skipping
 /// every other value by its length.
-fn read_search<'l>(env: &mut JNIEnv<'l>, data: &JObject, p: &JObject<'l>) -> R<SearchRequest<'l>> {
+fn read_search<'l>(env: &mut Env<'l>, data: &JObject, p: &JObject<'l>) -> R<SearchRequest<'l>> {
     let sdk = android_sdk(env)?;
     env.call_method(
         data,
-        "writeToParcel",
-        "(Landroid/os/Parcel;I)V",
+        jni::jni_str!("writeToParcel"),
+        jni::jni_sig!("(Landroid/os/Parcel;I)V"),
         &[JValue::Object(p), JValue::Int(0)],
     )
     .map_err(jerr("Bundle.writeToParcel"))?;
-    env.call_method(p, "setDataPosition", "(I)V", &[JValue::Int(0)])
-        .map_err(jerr("setDataPosition"))?;
+    env.call_method(
+        p,
+        jni::jni_str!("setDataPosition"),
+        jni::jni_sig!("(I)V"),
+        &[JValue::Int(0)],
+    )
+    .map_err(jerr("setDataPosition"))?;
     let walked = walk_search(&mut JniParcel { env, p }, sdk)?;
     Ok(SearchRequest {
         query: walked.query,
@@ -287,32 +315,39 @@ fn walk_search<S: ParcelSource>(p: &mut S, sdk: i32) -> R<Walked<S::Binder>> {
     })
 }
 
-fn obtain<'l>(env: &mut JNIEnv<'l>) -> R<JObject<'l>> {
-    env.call_static_method("android/os/Parcel", "obtain", "()Landroid/os/Parcel;", &[])
-        .and_then(|v| v.l())
-        .map_err(jerr("Parcel.obtain"))
+fn obtain<'l>(env: &mut Env<'l>) -> R<JObject<'l>> {
+    env.call_static_method(
+        jni::jni_str!("android/os/Parcel"),
+        jni::jni_str!("obtain"),
+        jni::jni_sig!("()Landroid/os/Parcel;"),
+        &[],
+    )
+    .and_then(|v| v.l())
+    .map_err(jerr("Parcel.obtain"))
 }
 
 /// Sends `items` to the client's receiver as `search_results`.
-fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[Item]) -> R<()> {
+fn reply(env: &mut Env, receiver: &JObject, items: &[Item]) -> R<()> {
     let len = i32::try_from(items.len()).map_err(|_| "too many results")?;
     let arr = env
-        .new_object_array(len, "android/os/Parcelable", JObject::null())
+        .new_object_array(len, jni::jni_str!("android/os/Parcelable"), JObject::null())
         .map_err(jerr("Parcelable[]"))?;
     for (i, e) in items.iter().enumerate() {
         let item = crate::media_item(env, e, true)?;
-        let i = i32::try_from(i).map_err(|_| "too many results")?;
-        env.set_object_array_element(&arr, i, item)
-            .map_err(jerr("set result"))?;
+        arr.set_element(env, i, &item).map_err(jerr("set result"))?;
     }
     let bundle = env
-        .new_object("android/os/Bundle", "()V", &[])
+        .new_object(
+            jni::jni_str!("android/os/Bundle"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
         .map_err(jerr("Bundle"))?;
     let key = JObject::from(env.new_string(SEARCH_RESULTS).map_err(jerr("key"))?);
     env.call_method(
         &bundle,
-        "putParcelableArray",
-        "(Ljava/lang/String;[Landroid/os/Parcelable;)V",
+        jni::jni_str!("putParcelableArray"),
+        jni::jni_sig!("(Ljava/lang/String;[Landroid/os/Parcelable;)V"),
         &[JValue::Object(&key), JValue::Object(&arr)],
     )
     .map_err(jerr("putParcelableArray"))?;
@@ -324,27 +359,37 @@ fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[Item]) -> R<()> {
     let sent = (|| {
         env.call_method(
             &p,
-            "writeInterfaceToken",
-            "(Ljava/lang/String;)V",
+            jni::jni_str!("writeInterfaceToken"),
+            jni::jni_sig!("(Ljava/lang/String;)V"),
             &[JValue::Object(&token)],
         )
         .map_err(jerr("writeInterfaceToken"))?;
-        env.call_method(&p, "writeInt", "(I)V", &[JValue::Int(RESULT_OK)])
-            .map_err(jerr("writeInt"))?;
+        env.call_method(
+            &p,
+            jni::jni_str!("writeInt"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(RESULT_OK)],
+        )
+        .map_err(jerr("writeInt"))?;
         // A non-null `in Bundle` argument: 1, then the bundle.
-        env.call_method(&p, "writeInt", "(I)V", &[JValue::Int(1)])
-            .map_err(jerr("writeInt"))?;
+        env.call_method(
+            &p,
+            jni::jni_str!("writeInt"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(1)],
+        )
+        .map_err(jerr("writeInt"))?;
         env.call_method(
             &bundle,
-            "writeToParcel",
-            "(Landroid/os/Parcel;I)V",
+            jni::jni_str!("writeToParcel"),
+            jni::jni_sig!("(Landroid/os/Parcel;I)V"),
             &[JValue::Object(&p), JValue::Int(0)],
         )
         .map_err(jerr("Bundle.writeToParcel"))?;
         env.call_method(
             receiver,
-            "transact",
-            "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z",
+            jni::jni_str!("transact"),
+            jni::jni_sig!("(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"),
             &[
                 JValue::Int(TRANSACTION_SEND),
                 JValue::Object(&p),
@@ -355,7 +400,7 @@ fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[Item]) -> R<()> {
         .and_then(|v| v.z())
         .map_err(jerr("transact"))
     })();
-    let _ = env.call_method(&p, "recycle", "()V", &[]);
+    let _ = env.call_method(&p, jni::jni_str!("recycle"), jni::jni_sig!("()V"), &[]);
     let delivered = sent?;
     log(&format!(
         "compat search reply results={} delivered={delivered}",
@@ -366,13 +411,13 @@ fn reply(env: &mut JNIEnv, receiver: &JObject, items: &[Item]) -> R<()> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_handleMessage<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     msg: JObject<'l>,
 ) {
-    guarded(&mut env, "compat handleMessage", (), |env| {
+    guarded_native(&mut env, "compat handleMessage", (), |env| {
         let what = env
-            .get_field(&msg, "what", "I")
+            .get_field(&msg, jni::jni_str!("what"), jni::jni_sig!("I"))
             .and_then(|v| v.i())
             .map_err(jerr("Message.what"))?;
         if what != MSG_SEARCH {
@@ -380,16 +425,19 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosCompatHandler_ha
             return Ok(());
         }
         let data = env
-            .call_method(&msg, "getData", "()Landroid/os/Bundle;", &[])
+            .call_method(
+                &msg,
+                jni::jni_str!("getData"),
+                jni::jni_sig!("()Landroid/os/Bundle;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(jerr("getData"))?;
         let p = obtain(env)?;
         let req = read_search(env, &data, &p);
-        let _ = env.call_method(&p, "recycle", "()V", &[]);
+        let _ = env.call_method(&p, jni::jni_str!("recycle"), jni::jni_sig!("()V"), &[]);
         let req = req?;
-        let receiver = env
-            .new_global_ref(&req.receiver)
-            .map_err(jerr("global receiver"))?;
+        let receiver = GlobalRef::new(env, &req.receiver).map_err(jerr("global receiver"))?;
         let (query, class) = (req.query, req.receiver_class);
         log(&format!("compat onSearch query={query:?} receiver={class}"));
         if let Some(cmd) = crate::voice::command(&query) {

@@ -4,10 +4,11 @@
 
 use std::sync::Mutex;
 
-use jni::objects::{GlobalRef, JObject, JValue};
-use jni::JNIEnv;
+use crate::GlobalRef;
+use jni::objects::{JObject, JValue};
+use jni::{Env, EnvUnowned};
 
-use crate::{guarded, jerr, log, LIBRARY, R};
+use crate::{guarded_native, jerr, log, LIBRARY, R};
 
 struct Watch {
     manager: GlobalRef,
@@ -18,7 +19,7 @@ static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
 /// Registers the default-network callback. The platform calls `onAvailable`
 /// at once when a network is up; until then the library is offline.
-pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+pub fn watch(env: &mut Env, ctx: &JObject) -> R<()> {
     let mut guard = WATCH
         .lock()
         .map_err(|_| "network mutex poisoned".to_owned())?;
@@ -32,8 +33,8 @@ pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     let manager = env
         .call_method(
             ctx,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
+            jni::jni_str!("getSystemService"),
+            jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::Object(&name)],
         )
         .and_then(|v| v.l())
@@ -43,8 +44,8 @@ pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     }
     let callback = env
         .new_object(
-            "com/alisonjenkins/pharos/auto/PharosNetworkCallback",
-            "()V",
+            jni::jni_str!("com/alisonjenkins/pharos/auto/PharosNetworkCallback"),
+            jni::jni_sig!("()V"),
             &[],
         )
         .map_err(jerr("PharosNetworkCallback"))?;
@@ -53,27 +54,23 @@ pub fn watch(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
     set_online(false);
     if let Err(e) = env.call_method(
         &manager,
-        "registerDefaultNetworkCallback",
-        "(Landroid/net/ConnectivityManager$NetworkCallback;)V",
+        jni::jni_str!("registerDefaultNetworkCallback"),
+        jni::jni_sig!("(Landroid/net/ConnectivityManager$NetworkCallback;)V"),
         &[JValue::Object(&callback)],
     ) {
         set_online(true);
         return Err(jerr("registerDefaultNetworkCallback")(e));
     }
     *guard = Some(Watch {
-        manager: env
-            .new_global_ref(&manager)
-            .map_err(jerr("global connectivity"))?,
-        callback: env
-            .new_global_ref(&callback)
-            .map_err(jerr("global network callback"))?,
+        manager: GlobalRef::new(env, &manager).map_err(jerr("global connectivity"))?,
+        callback: GlobalRef::new(env, &callback).map_err(jerr("global network callback"))?,
     });
     log("network: default-network callback registered");
     Ok(())
 }
 
 /// Unregisters the callback, so a recreated service does not stack them.
-pub fn unwatch(env: &mut JNIEnv) -> R<()> {
+pub fn unwatch(env: &mut Env) -> R<()> {
     let taken = WATCH
         .lock()
         .map_err(|_| "network mutex poisoned".to_owned())?
@@ -81,8 +78,8 @@ pub fn unwatch(env: &mut JNIEnv) -> R<()> {
     if let Some(w) = taken {
         env.call_method(
             w.manager.as_obj(),
-            "unregisterNetworkCallback",
-            "(Landroid/net/ConnectivityManager$NetworkCallback;)V",
+            jni::jni_str!("unregisterNetworkCallback"),
+            jni::jni_sig!("(Landroid/net/ConnectivityManager$NetworkCallback;)V"),
             &[JValue::Object(w.callback.as_obj())],
         )
         .map_err(jerr("unregisterNetworkCallback"))?;
@@ -103,11 +100,11 @@ fn set_online(online: bool) {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNetworkCallback_onAvailable<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _network: JObject<'l>,
 ) {
-    guarded(&mut env, "onAvailable", (), |_| {
+    guarded_native(&mut env, "onAvailable", (), |_| {
         set_online(true);
         Ok(())
     })
@@ -115,11 +112,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNetworkCallback_
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosNetworkCallback_onLost<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     _network: JObject<'l>,
 ) {
-    guarded(&mut env, "onLost", (), |_| {
+    guarded_native(&mut env, "onLost", (), |_| {
         set_online(false);
         Ok(())
     })

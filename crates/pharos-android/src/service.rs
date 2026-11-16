@@ -11,29 +11,44 @@ pub(crate) struct ContentLog;
 
 pub(crate) static CONTENT_LOG: ContentLog = ContentLog;
 
-pub(crate) fn files_dir(env: &mut JNIEnv, ctx: &JObject) -> R<String> {
+pub(crate) fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
     let dir = env
-        .call_method(ctx, "getFilesDir", "()Ljava/io/File;", &[])
+        .call_method(
+            ctx,
+            jni::jni_str!("getFilesDir"),
+            jni::jni_sig!("()Ljava/io/File;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getFilesDir"))?;
     let dir = env
-        .call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[])
+        .call_method(
+            &dir,
+            jni::jni_str!("getAbsolutePath"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getAbsolutePath"))?;
-    string(env, &JString::from(dir))
+    string(env, &dir)
 }
 
 /// The application id (`Context.getPackageName`).
-pub(crate) fn package_name(env: &mut JNIEnv, ctx: &JObject) -> R<String> {
+pub(crate) fn package_name(env: &mut Env, ctx: &JObject) -> R<String> {
     let name = env
-        .call_method(ctx, "getPackageName", "()Ljava/lang/String;", &[])
+        .call_method(
+            ctx,
+            jni::jni_str!("getPackageName"),
+            jni::jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(jerr("getPackageName"))?;
-    string(env, &JString::from(name))
+    string(env, &name)
 }
 
 /// Starts the library worker once per process. No network I/O happens here.
-pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
+pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     // Held across the check and the connect, so the service and the app
     // starting together connect once.
     static CONNECTING: Mutex<()> = Mutex::new(());
@@ -76,63 +91,68 @@ pub(crate) fn connect_library(env: &mut JNIEnv, ctx: &JObject) -> R<()> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nativeOnCreate<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     this: JObject<'l>,
 ) {
-    guarded(&mut env, "onCreate", (), |env| {
+    guarded_native(&mut env, "onCreate", (), |env| {
         runtime(env, &this)?;
         let tag = JObject::from(env.new_string("pharos").map_err(jerr("tag"))?);
         let session = env
             .new_object(
-                "android/media/session/MediaSession",
-                "(Landroid/content/Context;Ljava/lang/String;)V",
+                jni::jni_str!("android/media/session/MediaSession"),
+                jni::jni_sig!("(Landroid/content/Context;Ljava/lang/String;)V"),
                 &[JValue::Object(&this), JValue::Object(&tag)],
             )
             .map_err(jerr("MediaSession"))?;
         let cb = env
             .new_object(
-                "com/alisonjenkins/pharos/auto/PharosSessionCallback",
-                "()V",
+                jni::jni_str!("com/alisonjenkins/pharos/auto/PharosSessionCallback"),
+                jni::jni_sig!("()V"),
                 &[],
             )
             .map_err(jerr("PharosSessionCallback"))?;
         env.call_method(
             &session,
-            "setCallback",
-            "(Landroid/media/session/MediaSession$Callback;)V",
+            jni::jni_str!("setCallback"),
+            jni::jni_sig!("(Landroid/media/session/MediaSession$Callback;)V"),
             &[JValue::Object(&cb)],
         )
         .map_err(jerr("setCallback"))?;
         set_playback_state(env, &session, STATE_STOPPED, 0)?;
-        let listener_class: &JClass = CLASSES
-            .get()
-            .ok_or("classes not cached")?
-            .listener
-            .as_obj()
-            .into();
+        let listener_class = &CLASSES.get().ok_or("classes not cached")?.listener;
         if let Err(e) = focus::create(env, &this, &session, listener_class) {
             log(&format!("onCreate: audio focus unavailable: {e}"));
         }
         // FLAG_HANDLES_MEDIA_BUTTONS | FLAG_HANDLES_TRANSPORT_CONTROLS:
         // deprecated no-ops since API 26, set in case the assistant reads them.
-        env.call_method(&session, "setFlags", "(I)V", &[JValue::Int(3)])
-            .map_err(jerr("setFlags"))?;
+        env.call_method(
+            &session,
+            jni::jni_str!("setFlags"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(3)],
+        )
+        .map_err(jerr("setFlags"))?;
         set_session_activity(env, &this, &session)?;
-        env.call_method(&session, "setActive", "(Z)V", &[JValue::Bool(1)])
-            .map_err(jerr("setActive"))?;
+        env.call_method(
+            &session,
+            jni::jni_str!("setActive"),
+            jni::jni_sig!("(Z)V"),
+            &[JValue::Bool(true)],
+        )
+        .map_err(jerr("setActive"))?;
         let token = env
             .call_method(
                 &session,
-                "getSessionToken",
-                "()Landroid/media/session/MediaSession$Token;",
+                jni::jni_str!("getSessionToken"),
+                jni::jni_sig!("()Landroid/media/session/MediaSession$Token;"),
                 &[],
             )
             .and_then(|v| v.l())
             .map_err(jerr("getSessionToken"))?;
         env.call_method(
             &this,
-            "setSessionToken",
-            "(Landroid/media/session/MediaSession$Token;)V",
+            jni::jni_str!("setSessionToken"),
+            jni::jni_sig!("(Landroid/media/session/MediaSession$Token;)V"),
             &[JValue::Object(&token)],
         )
         .map_err(jerr("setSessionToken"))?;
@@ -140,10 +160,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
             log(&format!("onCreate: media notification unavailable: {e}"));
         }
         *state_lock()? = Some(State {
-            service: env.new_global_ref(&this).map_err(jerr("global service"))?,
-            session: env
-                .new_global_ref(&session)
-                .map_err(jerr("global session"))?,
+            service: GlobalRef::new(env, &this).map_err(jerr("global service"))?,
+            session: GlobalRef::new(env, &session).map_err(jerr("global session"))?,
             player: None,
             prepared: false,
             started: false,
@@ -177,10 +195,10 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nativeOnDestroy<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
 ) {
-    guarded(&mut env, "onDestroy", (), |env| {
+    guarded_native(&mut env, "onDestroy", (), |env| {
         // A play still on a worker must not build a player for a dead service.
         supersede();
         let Some(st) = state_lock()?.take() else {
@@ -194,11 +212,21 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_nat
         resume::leave(env, "destroy")?;
         resume::close();
         if let Some(p) = st.player {
-            env.call_method(p.as_obj(), "release", "()V", &[])
-                .map_err(jerr("player.release"))?;
+            env.call_method(
+                p.as_obj(),
+                jni::jni_str!("release"),
+                jni::jni_sig!("()V"),
+                &[],
+            )
+            .map_err(jerr("player.release"))?;
         }
-        env.call_method(st.session.as_obj(), "release", "()V", &[])
-            .map_err(jerr("session.release"))?;
+        env.call_method(
+            st.session.as_obj(),
+            jni::jni_str!("release"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .map_err(jerr("session.release"))?;
         log("onDestroy: released");
         Ok(())
     })
@@ -243,22 +271,27 @@ pub(crate) fn access(caller: &Caller) -> Result<&'static str, &'static str> {
 
 /// Clears a pending Java exception left by a failed call, so the next JNI
 /// call is legal.
-fn clear_exception(env: &mut JNIEnv) {
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_clear();
+fn clear_exception(env: &mut Env) {
+    if env.exception_check() {
+        env.exception_clear();
     }
 }
 
-fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
+fn caller(env: &mut Env, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
     let own_uid = env
-        .call_static_method("android/os/Process", "myUid", "()I", &[])
+        .call_static_method(
+            jni::jni_str!("android/os/Process"),
+            jni::jni_str!("myUid"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
         .and_then(|v| v.i())
         .map_err(jerr("Process.myUid"))?;
     let pm = env
         .call_method(
             ctx,
-            "getPackageManager",
-            "()Landroid/content/pm/PackageManager;",
+            jni::jni_str!("getPackageManager"),
+            jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
             &[],
         )
         .and_then(|v| v.l())
@@ -266,8 +299,8 @@ fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
     let owned = match env
         .call_method(
             &pm,
-            "getPackagesForUid",
-            "(I)[Ljava/lang/String;",
+            jni::jni_str!("getPackagesForUid"),
+            jni::jni_sig!("(I)[Ljava/lang/String;"),
             &[JValue::Int(uid)],
         )
         .and_then(|v| v.l())
@@ -280,15 +313,15 @@ fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
     };
     let mut owns_package = false;
     if !owned.is_null() {
-        let owned = jni::objects::JObjectArray::from(owned);
-        let n = env
-            .get_array_length(&owned)
-            .map_err(jerr("packages length"))?;
+        let owned = env
+            .cast_local::<jni::objects::JObjectArray<JObject>>(owned)
+            .map_err(jerr("packages array"))?;
+        let n = owned.len(env).map_err(jerr("packages length"))?;
         for i in 0..n {
-            let name = env
-                .get_object_array_element(&owned, i)
+            let name = owned
+                .get_element(env, i)
                 .map_err(jerr("packages element"))?;
-            if !name.is_null() && string(env, &JString::from(name))? == pkg {
+            if !name.is_null() && string(env, &name)? == pkg {
                 owns_package = true;
                 break;
             }
@@ -300,15 +333,15 @@ fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
         match env
             .call_method(
                 &pm,
-                "getApplicationInfo",
-                "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;",
+                jni::jni_str!("getApplicationInfo"),
+                jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;"),
                 &[JValue::Object(&name), JValue::Int(0)],
             )
             .and_then(|v| v.l())
         {
             Ok(info) => {
                 let flags = env
-                    .get_field(&info, "flags", "I")
+                    .get_field(&info, jni::jni_str!("flags"), jni::jni_sig!("I"))
                     .and_then(|v| v.i())
                     .map_err(jerr("ApplicationInfo.flags"))?;
                 system_app = flags & FLAG_SYSTEM != 0;
@@ -327,13 +360,13 @@ fn caller(env: &mut JNIEnv, ctx: &JObject, pkg: &str, uid: i32) -> R<Caller> {
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onGetRoot<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     this: JObject<'l>,
     package: JString<'l>,
     uid: i32,
     _hints: JObject<'l>,
 ) -> jobject {
-    guarded(&mut env, "onGetRoot", std::ptr::null_mut(), |env| {
+    guarded_native(&mut env, "onGetRoot", std::ptr::null_mut(), |env| {
         let pkg = string(env, &package)?;
         let caller = caller(env, &this, &pkg, uid)?;
         let verdict = access(&caller);
@@ -352,7 +385,11 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
         // Without this extra the car hides its search button (DHU check,
         // 2026-11-14): voice still binds, but typed search never reaches onSearch.
         let extras = env
-            .new_object("android/os/Bundle", "()V", &[])
+            .new_object(
+                jni::jni_str!("android/os/Bundle"),
+                jni::jni_sig!("()V"),
+                &[],
+            )
             .map_err(jerr("Bundle"))?;
         let key = JObject::from(
             env.new_string("android.media.browse.SEARCH_SUPPORTED")
@@ -360,16 +397,16 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
         );
         env.call_method(
             &extras,
-            "putBoolean",
-            "(Ljava/lang/String;Z)V",
-            &[JValue::Object(&key), JValue::Bool(1)],
+            jni::jni_str!("putBoolean"),
+            jni::jni_sig!("(Ljava/lang/String;Z)V"),
+            &[JValue::Object(&key), JValue::Bool(true)],
         )
         .map_err(jerr("putBoolean"))?;
         compat::advertise(env, &extras)?;
         let r = env
             .new_object(
-                "android/service/media/MediaBrowserService$BrowserRoot",
-                "(Ljava/lang/String;Landroid/os/Bundle;)V",
+                jni::jni_str!("android/service/media/MediaBrowserService$BrowserRoot"),
+                jni::jni_sig!("(Ljava/lang/String;Landroid/os/Bundle;)V"),
                 &[JValue::Object(&root), JValue::Object(&extras)],
             )
             .map_err(jerr("BrowserRoot"))?;
@@ -379,12 +416,12 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onG
 
 #[no_mangle]
 pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onLoadChildren<'l>(
-    mut env: JNIEnv<'l>,
+    mut env: EnvUnowned<'l>,
     _this: JObject<'l>,
     parent: JString<'l>,
     result: JObject<'l>,
 ) {
-    guarded(&mut env, "onLoadChildren", (), |env| {
+    guarded_native(&mut env, "onLoadChildren", (), |env| {
         let parent = string(env, &parent)?;
         log(&format!("onLoadChildren parent={parent}"));
         answer_later(env, "onLoadChildren", &result, move || {
