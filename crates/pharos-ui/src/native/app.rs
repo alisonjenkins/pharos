@@ -5655,6 +5655,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let carry_flag = Rc::clone(&picks_in_primary);
     let account = try_use_context::<AccountMe>();
     let offline_key = use_hook(|| Rc::new(Cell::new((0u32, false))));
+    let retry_key = Rc::clone(&offline_key);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -6079,7 +6080,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             n
                         },
                         upcoming: upcoming.read().clone().flatten(),
-                        on_renegotiate: move |next| picks.set(next),
+                        on_renegotiate: {
+                            let offline_key = Rc::clone(&retry_key);
+                            move |next| {
+                                // Try again on a downloaded copy mounts a new
+                                // player: the failed one keeps its error.
+                                let offline = matches!(
+                                    playing.peek().as_ref(),
+                                    Some(Some(Ok(p))) if p.0.session.starts_with(offline_video::OFFLINE_SESSION)
+                                );
+                                picks.set(next);
+                                if offline {
+                                    let (n, _) = offline_key.get();
+                                    offline_key.set((n, true));
+                                    playing.restart();
+                                }
+                            }
+                        },
                         on_version: {
                             let (last_ms, notify) = (Rc::clone(&last_ms), Rc::clone(&notify));
                             let picks_in_primary = Rc::clone(&picks_in_primary);
