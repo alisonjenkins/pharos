@@ -1029,10 +1029,10 @@ index 9875021..297a63f 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
-index 0000000..9acdbe9
+index 0000000..ad6e2e5
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelved.rs
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,653 @@
 +//! A book read off the shelf a range at a time, rather than all at once.
 +//!
 +//! A large illustrated book is mostly pictures, and the reader holds a few
@@ -1277,14 +1277,8 @@ index 0000000..9acdbe9
 +            Stage::Head => self.headed(&bytes),
 +            Stage::Tail => self.tailed(at, bytes),
 +            Stage::Directory { tail_at, tail } => {
-+                let mut part = bytes;
-+                if at + part.len() == tail_at {
-+                    part.extend_from_slice(&tail);
-+                    self.pieces.insert(at, part);
-+                } else {
-+                    self.pieces.insert(at, part);
-+                    self.pieces.insert(tail_at, tail);
-+                }
++                self.pieces.insert(at, bytes);
++                self.pieces.insert(tail_at, tail);
 +                self.directed()
 +            }
 +            Stage::Members => {
@@ -1581,6 +1575,49 @@ index 0000000..9acdbe9
 +            opening.answer(offset, piece, 100_001).err(),
 +            Some(ShelfFault::Store(StoreError::Missing))
 +        );
++    }
++
++    /// A text-only book small enough that its end record is read along with
++    /// the whole of it.
++    fn a_small_text_book() -> Vec<u8> {
++        let package = r#"<?xml version="1.0"?>
++<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
++  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Small</dc:title></metadata>
++  <manifest><item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/></manifest>
++  <spine><itemref idref="c0"/></spine>
++</package>"#;
++        zip::stored(&[
++            ("mimetype".to_owned(), b"application/epub+zip".to_vec()),
++            (
++                "META-INF/container.xml".to_owned(),
++                br#"<?xml version="1.0"?>
++<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
++  <rootfiles><rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles>
++</container>"#
++                    .to_vec(),
++            ),
++            ("OEBPS/book.opf".to_owned(), package.as_bytes().to_vec()),
++            (
++                "OEBPS/c0.xhtml".to_owned(),
++                b"<html><body><p>Some words.</p></body></html>".to_vec(),
++            ),
++        ])
++        .expect("a book")
++    }
++
++    #[test]
++    fn a_small_book_opens_though_its_end_record_came_with_all_of_it() {
++        let book = a_small_text_book();
++        assert!(
++            book.len() < zip::MAX_TAIL,
++            "the tail read is the whole book"
++        );
++        let (result, _) = drive(&book);
++        let Ok(Next::Done(document, _, size)) = result else {
++            panic!("an open book, not {result:?}");
++        };
++        assert_eq!(size, book.len());
++        assert!(!document.blocks.is_empty(), "the text was read");
 +    }
 +
 +    #[test]
@@ -1984,10 +2021,10 @@ index 7a43abf..93b1882 100644
          self.document.images = images;
      }
 diff --git a/crates/kobo-doc/src/zip.rs b/crates/kobo-doc/src/zip.rs
-index 4fa657b..5c28dd0 100644
+index 4fa657b..4fc7047 100644
 --- a/crates/kobo-doc/src/zip.rs
 +++ b/crates/kobo-doc/src/zip.rs
-@@ -74,21 +74,272 @@ impl std::fmt::Display for Fault {
+@@ -74,21 +74,304 @@ impl std::fmt::Display for Fault {
  
  impl std::error::Error for Fault {}
  
@@ -2056,13 +2093,45 @@ index 4fa657b..5c28dd0 100644
 +
 +    /// Adds the bytes found at `at`. A part reaching past the end of the
 +    /// archive is cut to it.
++    ///
++    /// Parts that overlap or touch the new one become one part with it, so a
++    /// range spanning two reads is one run of bytes, and the part reaching the
++    /// end of the archive, where its end record is looked for, is never
++    /// replaced by a shorter one. Where they overlap the new bytes are kept.
 +    pub fn insert(&mut self, at: usize, mut bytes: Vec<u8>) {
 +        let room = self.len.saturating_sub(at);
 +        bytes.truncate(room);
 +        if bytes.is_empty() {
 +            return;
 +        }
-+        self.parts.insert(at, bytes);
++        let end = at.saturating_add(bytes.len());
++        let joined: Vec<usize> = self
++            .parts
++            .range(..=end)
++            .filter(|(start, part)| start.saturating_add(part.len()) >= at)
++            .map(|(start, _)| *start)
++            .collect();
++        if joined.is_empty() {
++            self.parts.insert(at, bytes);
++            return;
++        }
++        let mut old: Vec<(usize, Vec<u8>)> = joined
++            .into_iter()
++            .filter_map(|start| self.parts.remove(&start).map(|part| (start, part)))
++            .collect();
++        let first = old.first().map_or(at, |(start, _)| (*start).min(at));
++        let last = old
++            .iter()
++            .map(|(start, part)| start.saturating_add(part.len()))
++            .fold(end, usize::max);
++        let mut whole = vec![0; last - first];
++        old.push((at, bytes));
++        for (start, part) in old {
++            if let Some(room) = whole.get_mut(start - first..start - first + part.len()) {
++                room.copy_from_slice(&part);
++            }
++        }
++        self.parts.insert(first, whole);
 +    }
 +
 +    /// How many bytes all the parts hold together.
@@ -2267,7 +2336,7 @@ index 4fa657b..5c28dd0 100644
  }
  
  /// Writes an ordinary ZIP archive whose members are stored without another
-@@ -180,39 +431,54 @@ impl<'a> Archive<'a> {
+@@ -180,39 +463,54 @@ impl<'a> Archive<'a> {
      /// [`Fault::Damaged`] when one is found but does not point at a directory
      /// inside the file.
      pub fn open(bytes: &'a [u8]) -> Result<Self, Fault> {
@@ -2337,7 +2406,7 @@ index 4fa657b..5c28dd0 100644
                      method,
                      packed,
                      unpacked,
-@@ -220,7 +486,33 @@ impl<'a> Archive<'a> {
+@@ -220,7 +518,33 @@ impl<'a> Archive<'a> {
              );
              at = name_at + name_len + extra_len + comment_len;
          }
@@ -2372,7 +2441,7 @@ index 4fa657b..5c28dd0 100644
      }
  
      /// Every member's name, in order.
-@@ -237,37 +529,12 @@ impl<'a> Archive<'a> {
+@@ -237,37 +561,12 @@ impl<'a> Archive<'a> {
      /// does not know, and [`Fault::TooLarge`] when it claims to unpack past
      /// `MAX_UNPACKED`.
      pub fn read(&self, name: &str) -> Result<Vec<u8>, Fault> {
@@ -2414,7 +2483,7 @@ index 4fa657b..5c28dd0 100644
      }
  }
  
-@@ -494,4 +761,155 @@ pub(crate) mod tests {
+@@ -494,4 +793,189 @@ pub(crate) mod tests {
              }
          }
      }
@@ -2496,7 +2565,41 @@ index 4fa657b..5c28dd0 100644
 +        assert_eq!(pieces.get(5, 10), None);
 +        assert_eq!(pieces.get(45, 10), None);
 +        // Cut at the end of the whole.
-+        assert_eq!(pieces.held(), 60);
++        assert_eq!(pieces.held(), 50);
++    }
++
++    #[test]
++    fn a_part_inserted_over_or_beside_others_joins_them() {
++        let mut pieces = Pieces::new(100);
++        pieces.insert(0, vec![1; 100]);
++        pieces.insert(0, vec![2; 10]);
++        pieces.insert(40, vec![3; 10]);
++        assert_eq!(pieces.held(), 100, "nothing held was dropped");
++        assert_eq!(pieces.get(0, 10), Some(&[2u8; 10][..]));
++        assert_eq!(pieces.get(10, 30), Some(&[1u8; 30][..]));
++        assert_eq!(pieces.get(40, 10), Some(&[3u8; 10][..]));
++
++        let mut pieces = Pieces::new(100);
++        pieces.insert(10, vec![1; 10]);
++        pieces.insert(20, vec![2; 10]);
++        pieces.insert(90, vec![3; 10]);
++        assert_eq!(
++            pieces.get(15, 10),
++            Some(&[1, 1, 1, 1, 1, 2, 2, 2, 2, 2][..])
++        );
++        assert_eq!(pieces.get(25, 10), None);
++        assert_eq!(pieces.held(), 30);
++    }
++
++    #[test]
++    fn the_end_record_is_found_after_a_member_is_added_to_a_whole_tail() {
++        let bytes = archive(&[("a", b"first"), ("b", b"second")]);
++        let mut pieces = Pieces::new(bytes.len());
++        pieces.insert(0, bytes.clone());
++        let whole = Archive::open(&bytes).expect("an archive");
++        let place = whole.locate("b").expect("b");
++        pieces.insert(place.at, bytes[place.at..place.end].to_vec());
++        assert!(Archive::open_pieces(&pieces).is_ok());
 +    }
 +
 +    /// A member's local header followed by `packed`, as the card holds it.
