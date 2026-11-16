@@ -7,6 +7,7 @@ pub mod bg_io;
 pub mod book_categories;
 pub mod book_convert;
 pub mod book_cover;
+pub mod book_pages;
 pub mod book_slim;
 pub mod cast;
 pub mod cast_adapter;

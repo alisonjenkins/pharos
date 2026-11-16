@@ -82,6 +82,28 @@ impl ConvertedBookCache {
         ))
     }
 
+    /// Where pictures of PDF pages live (V1460); see [`crate::book_pages`].
+    pub fn pages_dir(&self) -> PathBuf {
+        self.dir.join("pages")
+    }
+
+    /// The cache path, without extension, of item `id`'s (version `edition`)
+    /// page pictures drawn as `tag` (box and colour) from a source of
+    /// `source_bytes` last modified at `mtime_ns`.
+    pub fn pages_stem(
+        &self,
+        id: MediaId,
+        edition: Option<&str>,
+        mtime_ns: u128,
+        source_bytes: u64,
+        tag: &str,
+    ) -> PathBuf {
+        let name = self.path_for_version(id, edition);
+        let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+        self.pages_dir()
+            .join(format!("{stem}-{mtime_ns}-{source_bytes}-{tag}"))
+    }
+
     /// The converted EPUB for `id`, converting `src` if it is not cached yet.
     ///
     /// # Concurrency

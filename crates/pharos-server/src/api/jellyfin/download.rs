@@ -210,6 +210,26 @@ pub(crate) async fn serve_item_file(
     // B1451 — `maxWidth` / `maxHeight` on an EPUB ask for a copy whose
     // pictures fit that box (a Kobo takes at most 32 MB and 2 MB a picture).
     // The original stays untouched; any failure serves it.
+    // V1460 — `pages=pictures` on a PDF asks for its pages drawn as a CBZ,
+    // for a reader with no PDF engine. Unlike a slim copy there is no
+    // fallback: the PDF is the one file such a client cannot open.
+    let pages = crate::book_pages::PagesRequest::from_query(req.query_string())
+        .filter(|_| content_type_for(&serve_path) == "application/pdf");
+    if let Some(request) = pages {
+        let drawn = crate::book_pages::get_or_draw(
+            state.books.as_ref(),
+            id,
+            item.edition.as_deref(),
+            &serve_path,
+            request,
+        )
+        .await;
+        return match drawn {
+            Ok(copy) => send_file(req, item, &copy).await,
+            Err(e) => Err(pages_refusal(&e)),
+        };
+    }
+
     let serve_path = match crate::book_slim::SlimBox::from_query(req.query_string()) {
         Some(bx) if content_type_for(&serve_path) == "application/epub+zip" => {
             crate::book_slim::get_or_slim(
@@ -223,8 +243,34 @@ pub(crate) async fn serve_item_file(
         }
         _ => serve_path,
     };
+    send_file(req, item, &serve_path).await
+}
 
-    let file = open_named_file(&serve_path).await.map_err(|e| {
+/// The answer to a page-picture request that could not be met. The reason
+/// is the error's own words, which name no path.
+fn pages_refusal(e: &crate::book_pages::PagesError) -> actix_web::Error {
+    use crate::book_pages::PagesError as E;
+    let reason = match e {
+        E::Read { .. } | E::Write { .. } | E::Task(_) => {
+            "the server could not draw this book's pages".to_owned()
+        }
+        other => other.to_string(),
+    };
+    match e {
+        E::Busy | E::NoCache | E::Changed => error::ErrorServiceUnavailable(reason),
+        E::Read { .. } | E::Write { .. } | E::Task(_) => error::ErrorInternalServerError(reason),
+        _ => error::ErrorUnprocessableEntity(reason),
+    }
+}
+
+/// `serve_path` streamed as `item`'s download.
+async fn send_file(
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+    serve_path: &std::path::Path,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = item.id;
+    let file = open_named_file(serve_path).await.map_err(|e| {
         // Carry the offending path AND the underlying io error — "not found"
         // alone cannot distinguish a deleted file from a dead NFS mount, which
         // is exactly the distinction the mergerfs outage turned on.
@@ -246,10 +292,10 @@ pub(crate) async fn serve_item_file(
     // stored path: a converted book must arrive as `application/epub+zip`,
     // because a browser handed `application/vnd.amazon.ebook` on a same-origin
     // fetch may offer a download dialog instead of letting the reader have it.
-    let ct = content_type_for(&serve_path);
+    let ct = content_type_for(serve_path);
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(ct));
-    if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path, &serve_path)) {
+    if let Ok(v) = header::HeaderValue::from_str(&disposition_for(&item.path, serve_path)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
