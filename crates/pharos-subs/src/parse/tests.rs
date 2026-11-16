@@ -113,3 +113,15 @@ fn events_sorted_by_start() {
     );
     assert_eq!(s.events[0].text, "a");
 }
+
+#[test]
+fn pos_and_move_mark_an_event_as_positioned() {
+    let src = "[Script Info]\nScriptType: v4.00+\n\n[Events]\n\
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\pos(10,20)}A sign\n\
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\an8\\move(0,0,9,9)}Moving\n\
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\\b1\\position}Spoken line\n";
+    let s = Script::parse(src);
+    let flags: Vec<bool> = s.events.iter().map(|e| e.positioned).collect();
+    assert_eq!(flags, [true, true, false]);
+}
