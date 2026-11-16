@@ -51,6 +51,7 @@ use player::*;
 pub use resume::saved_ms as saved_resume_ms;
 pub use runtime::{runtime, Player};
 use search::*;
+pub use service::files_dir;
 use service::*;
 use session::*;
 

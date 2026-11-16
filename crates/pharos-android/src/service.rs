@@ -11,7 +11,8 @@ pub(crate) struct ContentLog;
 
 pub(crate) static CONTENT_LOG: ContentLog = ContentLog;
 
-pub(crate) fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
+/// The app's private files directory (`Context.getFilesDir`).
+pub fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
     let dir = env
         .call_method(
             ctx,
