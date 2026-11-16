@@ -10,18 +10,44 @@ const VERSION = "__PHAROS_BUNDLE_HASH__";
 const PRECACHE = __PHAROS_PRECACHE__;
 
 // This worker owns caches named `pharos-shell-*` and deletes the old ones on
-// activate. It never opens or deletes any other name: `pharos-books-*` is
-// reserved for kept books (spec 036 slice 3).
+// activate. It never writes or deletes any other name: `pharos-books-*` is
+// reserved for kept books (spec 036 slice 3) and is never served (V1133).
+//
+// One exception, ADR 0143: it serves downloaded video. A same-origin GET
+// under /videos/ (no Range) is answered from a `pharos-videos-*` cache by
+// exact URL, query included, when one holds it, else it goes to the network.
+// The page writes those caches; the worker only reads them.
 const SHELL_PREFIX = "pharos-shell-";
 const SHELL_CACHE = SHELL_PREFIX + VERSION;
 
 const MOUNT = "/ui/";
 // Lazy modules, not precached because they are large: cached when fetched,
 // in the shell cache, so they go with the shell on a deploy.
-const LAZY_PREFIXES = ["/ui/assets/pdf/"];
+const LAZY_PREFIXES = ["/ui/assets/pdf/", "/ui/assets/vendor/"];
 // With a cached copy to fall back on, the network gets this long to start
 // answering, so a dead connection (a tunnel) does not hang the page.
 const NETWORK_WAIT_MS = 4000;
+
+// Downloaded video (ADR 0143). `videoCaches` is the names of the
+// `pharos-videos-*` caches: null until read (a worker restarts often), then
+// kept current on activate and when the page posts `videos-changed`. With
+// none, a /videos/ request is left to the browser untouched.
+const VIDEO_PREFIX = "pharos-videos-";
+const VIDEO_PATH = "/videos/";
+let videoCaches = null;
+let videoCachesRead = null;
+
+function refreshVideoCaches() {
+  videoCachesRead = caches
+    .keys()
+    .then((names) => {
+      videoCaches = names.filter((n) => n.startsWith(VIDEO_PREFIX));
+    })
+    .catch(() => {
+      videoCaches = [];
+    });
+  return videoCachesRead;
+}
 
 const precached = new Set(PRECACHE);
 
@@ -44,6 +70,7 @@ self.addEventListener("activate", (event) => {
           await caches.delete(name);
         }
       }
+      await refreshVideoCaches();
       await self.clients.claim();
       const clients = await self.clients.matchAll({ type: "window" });
       for (const client of clients) {
@@ -68,9 +95,39 @@ function keyFor(request, url) {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   const key = keyFor(event.request, url);
-  if (key === null) return;
+  if (key === null) {
+    if (isVideoRequest(event.request, url) && !(videoCaches && videoCaches.length === 0)) {
+      event.respondWith(downloadedVideo(event.request));
+    }
+    return;
+  }
   event.respondWith(networkFirst(event.request, key, !precached.has(key) && key !== MOUNT));
 });
+
+function isVideoRequest(request, url) {
+  return (
+    request.method === "GET" &&
+    !request.headers.has("range") &&
+    url.origin === self.location.origin &&
+    url.pathname.startsWith(VIDEO_PATH)
+  );
+}
+
+// The stored response for exactly this URL, else the network. `ignoreVary`
+// because the page stored it under its own request headers.
+async function downloadedVideo(request) {
+  try {
+    if (videoCaches === null) await (videoCachesRead || refreshVideoCaches());
+    for (const name of videoCaches) {
+      const cache = await caches.open(name);
+      const hit = await cache.match(request.url, { ignoreVary: true });
+      if (hit) return hit;
+    }
+  } catch (err) {
+    // A cache that cannot be read is no reason to fail playback.
+  }
+  return fetch(request);
+}
 
 async function networkFirst(request, key, remember) {
   const cache = await caches.open(SHELL_CACHE);
@@ -103,5 +160,8 @@ self.addEventListener("message", (event) => {
   const data = event.data;
   if (data && data.kind === "pharos-sw" && data.event === "hello" && event.source) {
     event.source.postMessage({ kind: "pharos-sw", event: "version", version: VERSION });
+  }
+  if (data && data.kind === "pharos-sw" && data.event === "videos-changed") {
+    event.waitUntil(refreshVideoCaches());
   }
 });
