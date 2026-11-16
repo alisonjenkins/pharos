@@ -15,6 +15,7 @@ mod books;
 mod filters;
 mod letters;
 mod reading;
+mod shelf;
 
 use api::{Account, Cover, CoverCache, Entry, Kind, Page, Report, Resumed, Section};
 use kobo_sdk::audio::{AudioMetadata, AudioPlayer};
