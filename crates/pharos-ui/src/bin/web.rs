@@ -13,5 +13,6 @@
 
 fn main() {
     pharos_ui::native::register_service_worker();
+    pharos_ui::native::register_video_store();
     dioxus_web::launch::launch_cfg(pharos_ui::App, dioxus_web::Config::new());
 }

@@ -35,6 +35,8 @@ pub mod hls_trace;
 mod hls_web;
 pub mod kept;
 pub mod kept_video;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod kept_video_web;
 pub mod kept_view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod kept_web;
@@ -94,6 +96,10 @@ mod sw_web;
 /// it once at start.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use sw_web::register as register_service_worker;
+/// Registers the browser's store of downloaded video (ADR 0143) and restarts
+/// downloads a closed page left half done; the browser build calls it once.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub use kept_video_web::register as register_video_store;
 pub mod preplay;
 pub mod privacy;
 pub mod quality;
