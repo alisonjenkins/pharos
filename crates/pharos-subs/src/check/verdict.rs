@@ -292,12 +292,18 @@ pub fn decide(stage1: &Candidate, stage2: Option<&[Candidate]>, t: &Thresholds) 
             format_args!("not_searched {fit1}"),
         );
     };
-    let best = wide
+    // Only the wide search can call a track wrong: with no stage-2
+    // candidate there is nothing to call it on.
+    let Some(best) = wide
         .iter()
         .map(|c| c.fit(t))
-        .chain(std::iter::once(fit1))
         .max_by(|a, b| a.median.total_cmp(&b.median))
-        .unwrap_or(fit1);
+    else {
+        return Verdict::unknown(
+            UnknownClass::Inconclusive,
+            format_args!("inconclusive no_candidates {fit1}"),
+        );
+    };
     if best.decoy_level(t) {
         Verdict::WrongVideo { fit: best }
     } else {
@@ -411,6 +417,16 @@ mod tests {
         let v = decide(&cand(0, 1.0, &WRONG, &DECOY), Some(&wide), &t());
         assert_eq!(v.label(), "wrong_video");
         assert_eq!(v.to_string(), "median=0.28 decoy=0.25 hits=1/12");
+    }
+
+    #[test]
+    fn a_wide_search_with_no_candidates_is_inconclusive_not_wrong() {
+        let v = decide(&cand(0, 1.0, &WRONG, &DECOY), Some(&[]), &t());
+        assert_eq!(v.reason_class(), "inconclusive");
+        assert!(
+            v.to_string().starts_with("inconclusive no_candidates"),
+            "{v}"
+        );
     }
 
     #[test]
