@@ -407,7 +407,8 @@ fn leave_app() {
         // context at start-up, and both live as long as the app.
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
         vm.attach_current_thread_for_scope(|env| -> Result<(), jni::errors::Error> {
-            let activity = unsafe { jni::objects::JObject::from_raw(env, ctx.context().cast()) };
+            let raw: jni::sys::jobject = ctx.context().cast();
+            let activity = unsafe { env.as_cast_raw::<jni::objects::JObject>(&raw)? };
             env.call_method(
                 &activity,
                 jni::jni_str!("moveTaskToBack"),

@@ -14,7 +14,10 @@ fn with_activity(f: impl FnOnce(&mut Env, &JObject) -> Result<(), String>) -> Re
     // at start-up, and both live as long as the app.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
     vm.attach_current_thread_for_scope(|env| -> Result<Result<(), String>, jni::errors::Error> {
-        let activity = unsafe { JObject::from_raw(env, ctx.context().cast()) };
+        // The context is an app-lifetime handle, not a local reference of
+        // this frame, so borrow it instead of taking it over.
+        let raw: jni::sys::jobject = ctx.context().cast();
+        let activity = unsafe { env.as_cast_raw::<JObject>(&raw)? };
         let result = f(env, &activity);
         if result.is_err() && env.exception_check() {
             env.exception_clear();
