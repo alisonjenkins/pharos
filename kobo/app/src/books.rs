@@ -20,6 +20,10 @@ pub const MAX_BYTES: usize = kobo_sdk::MAX_SHELF_DOWNLOAD;
 pub const TOO_BIG: &str = "This book is over the 64 MB limit.";
 /// How much of a book one request fetches.
 pub const CHUNK: u32 = 256 * 1024;
+/// How much more of a book must arrive before the progress shown moves. Each
+/// new screen costs a panel update on the main thread (B1472), so a download
+/// of 256 KiB pieces is drawn once per megabyte, not once per piece.
+pub const PROGRESS_STEP: u64 = 1024 * 1024;
 /// Downloaded books kept at once, so the record below stays small.
 pub const MAX_DOWNLOADED: usize = 64;
 /// The largest a reading position may be and still be kept.

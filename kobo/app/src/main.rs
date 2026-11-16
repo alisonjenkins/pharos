@@ -1941,8 +1941,14 @@ impl KoboApp for Pharos {
                 self.log_draw(context, "held", "reading");
                 return;
             }
-            self.log_draw(context, "drawn", "reading");
-            self.show(context);
+            // Only a change to what is shown is drawn: a download's pieces
+            // move the progress a megabyte at a time (B1472).
+            let verdict = if self.show_if_changed(context) {
+                "drawn"
+            } else {
+                "unchanged"
+            };
+            self.log_draw(context, verdict, "reading");
             return;
         }
         let Some(position) = self.tasks.iter().position(|(id, _)| *id == task) else {
