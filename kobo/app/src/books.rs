@@ -77,6 +77,16 @@ pub fn support(path: &str) -> Support {
     }
 }
 
+/// Whether `path` names a Kindle book Pharos converts.
+#[must_use]
+pub fn is_kindle(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        ["azw", "azw3", "mobi"]
+            .iter()
+            .any(|kindle| extension.eq_ignore_ascii_case(kindle))
+    })
+}
+
 /// Whether downloaded bytes are what `kind` promised. An EPUB is a zip; a
 /// Kindle book Pharos could not convert arrives as itself, and the parser
 /// would take those bytes for prose and show garbage.
@@ -93,6 +103,9 @@ pub struct Book {
     /// Empty when Pharos sent no author.
     pub author: String,
     pub support: Support,
+    /// Whether the file is a Kindle book, which Pharos hands over as an EPUB
+    /// only when it could convert it.
+    pub kindle: bool,
     /// Pharos's tag for the cover, present only when there is a cover to
     /// fetch.
     pub image_tag: Option<String>,
@@ -194,6 +207,7 @@ pub fn parse_page(bytes: &[u8]) -> Option<BookPage> {
                     .to_owned(),
                 author: author_of(item),
                 support: support(item.get("Path").and_then(Value::as_str).unwrap_or_default()),
+                kindle: is_kindle(item.get("Path").and_then(Value::as_str).unwrap_or_default()),
                 image_tag: item
                     .get("ImageTags")
                     .and_then(|tags| tags.get("Primary"))
@@ -391,6 +405,7 @@ mod tests {
             title: "Book One".to_owned(),
             author: "Author A".to_owned(),
             support: support(path),
+            kindle: is_kindle(path),
             image_tag: None,
             overview: String::new(),
         }

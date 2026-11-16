@@ -12,6 +12,11 @@ const PROSE: &str = "Chapter one.\n\nSome prose to read.";
 
 /// Signed in, with the Books list shown and the downloaded-books record empty.
 fn books() -> (AppRunner<Pharos>, Vec<Command>) {
+    books_from(BOOKS)
+}
+
+/// [`books`] with `list` as Pharos's answer for the list.
+fn books_from(list_body: &str) -> (AppRunner<Pharos>, Vec<Command>) {
     let (mut runner, _) = home();
     let commands = runner.action(action_id("section-books"));
     let (list, task) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
@@ -25,7 +30,7 @@ fn books() -> (AppRunner<Pharos>, Vec<Command>) {
         key: books::KEY.to_owned(),
         value: None,
     });
-    let commands = runner.task_outcome(list, ok(BOOKS));
+    let commands = runner.task_outcome(list, ok(list_body));
     (runner, commands)
 }
 
@@ -144,6 +149,17 @@ fn a_file_that_is_not_the_format_promised_is_refused_before_it_is_saved() {
     assert!(wrote(&commands).is_none());
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(screen.contains("can't open"), "{screen}");
+}
+
+#[test]
+fn a_kindle_book_pharos_could_not_convert_says_so() {
+    let (mut runner, _) = books_from(
+        r#"{"Items":[{"Id":"b1","Name":"Book One","Path":"/b/one.azw3"}],"TotalRecordCount":1}"#,
+    );
+    let commands = downloaded(&mut runner, "BOOKMOBI");
+    assert!(wrote(&commands).is_none());
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("couldn't convert this Kindle book"), "{screen}");
 }
 
 #[test]
