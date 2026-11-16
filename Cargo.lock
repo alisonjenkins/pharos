@@ -8490,6 +8490,7 @@ dependencies = [
  "pharos-transcode",
  "proptest",
  "quick-xml",
+ "quire",
  "read-fonts 0.47.0",
  "regex-lite",
  "reqwest",

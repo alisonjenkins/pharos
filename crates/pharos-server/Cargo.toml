@@ -17,6 +17,7 @@ pharos-cast = { path = "../pharos-cast" }
 pharos-core = { path = "../pharos-core" }
 pharos-discovery = { path = "../pharos-discovery" }
 pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
+quire = { path = "../quire" }
 pharos-scanner = { path = "../pharos-scanner" }
 pharos-store-sqlx = { path = "../pharos-store-sqlx" }
 pharos-sync = { path = "../pharos-sync" }

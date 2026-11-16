@@ -6,6 +6,7 @@ mod book_cover;
 mod book_end_to_end;
 mod book_formats_fold;
 mod book_offers_nothing_to_play;
+mod book_opening;
 mod book_read_progress;
 mod book_slim;
 mod course_lessons;
