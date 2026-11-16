@@ -602,19 +602,38 @@ impl Pharos {
         self.schedule_cover_retry(context, &wanted);
     }
 
-    /// Starts the one sleep that wakes the app when the soonest wanted cover
-    /// waiting to retry is due, unless it is running. It holds a task slot
-    /// only while some cover on show waits, and not one per cover.
+    /// Keeps the one sleep that wakes the app when the soonest wanted cover
+    /// waiting to retry is due. It holds a task slot only while some cover on
+    /// show waits: it is cancelled when none does, and replaced when a cover
+    /// needs an earlier wake than it gives. Not one sleep per cover.
     fn schedule_cover_retry(&mut self, context: &mut Context, wanted: &[(String, String)]) {
-        if self.cover_retry.is_some() {
-            return;
+        let ids = || wanted.iter().map(|(id, _)| id.as_str());
+        if let Some(task) = self.cover_retry {
+            let remaining = self.covers.sleep_remaining().unwrap_or(0);
+            let reason = match self.covers.next_not_due(ids()) {
+                None if ids().all(|id| !self.covers.waiting(id)) => "no cover waits",
+                Some(seconds) if seconds < remaining => "a cover is due sooner",
+                _ => return,
+            };
+            // The clock does not move: the answer to the cancel carries no
+            // time, so every cover keeps waiting its full delay.
+            context.cancel(task);
+            self.cover_retry = None;
+            self.covers.sleep_ended();
+            context.log(
+                LogLevel::Info,
+                format!("pharos: cover retry sleep cancelled: {reason}"),
+            );
         }
-        let ids = wanted.iter().map(|(id, _)| id.as_str());
-        let Some(seconds) = self.covers.next_retry(ids) else {
+        let Some(seconds) = self.covers.next_retry(ids()) else {
             return;
         };
         self.cover_retry = self.sleep(context, seconds, Work::CoverRetry { seconds });
+        if self.cover_retry.is_some() {
+            self.covers.sleep_started(seconds);
+        }
     }
+
     /// Whether the home screen is still waiting on pharos: for its
     /// libraries, what was played last, a description of an album in it, or
     /// a cover it shows.
@@ -1941,6 +1960,7 @@ impl KoboApp for Pharos {
         }
         if self.cover_retry == Some(task) {
             self.cover_retry = None;
+            self.covers.sleep_ended();
         }
         match outcome {
             TaskOutcome::Completed(bytes) => self.completed(context, work, &bytes),

@@ -873,6 +873,108 @@ fn a_cover_that_keeps_failing_waits_longer_each_time_up_to_five_minutes() {
 }
 
 #[test]
+fn a_cover_that_fails_during_a_sleep_still_waits_its_full_delay() {
+    let (mut runner, commands) = art_shelf(false, 3);
+    let covers = cover_tasks(&commands);
+    let first = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::Unreachable));
+    let (nap, seconds) = sleeps(&first)[0];
+    assert_eq!(seconds, 15);
+    // The second fails while the first's sleep runs: it is timed from that
+    // sleep's end, not from a clock the sleep has not advanced yet.
+    let second = runner.task_outcome(covers[1].0, TaskOutcome::Failed(TaskError::Unreachable));
+    assert!(
+        logged(&second, "pharos: cover a1 retry in 15s"),
+        "{second:?}"
+    );
+    // The third cover lands, which frees a slot for the retry.
+    for (task, _) in cover_tasks(&first).iter().chain(&cover_tasks(&second)) {
+        let _ = runner.task_outcome(*task, cover_bytes());
+    }
+    let woke = runner.task_outcome(nap, ok(""));
+    let again = cover_tasks(&woke);
+    assert_eq!(again.len(), 1, "only the first is due: {woke:?}");
+    assert!(again[0].1.contains("/a0/"), "{again:?}");
+    let (nap, seconds) = sleeps(&woke)[0];
+    assert_eq!(seconds, 15, "the second waits its own full delay");
+    let woke = runner.task_outcome(nap, ok(""));
+    let again = cover_tasks(&woke);
+    assert_eq!(again.len(), 1, "{woke:?}");
+    assert!(again[0].1.contains("/a1/"), "{again:?}");
+}
+
+#[test]
+fn leaving_the_page_cancels_the_retry_sleep_and_frees_its_slot() {
+    let (mut runner, commands) = art_shelf(false, 2);
+    let covers = cover_tasks(&commands);
+    let failed = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::Unreachable));
+    let (nap, _) = sleeps(&failed)[0];
+    let _ = runner.task_outcome(covers[1].0, cover_bytes());
+    let left = runner.action(ActionId::BACK);
+    assert!(
+        left.iter()
+            .any(|command| matches!(command, Command::Cancel(id) if *id == nap)),
+        "{left:?}"
+    );
+    assert!(logged(
+        &left,
+        "pharos: cover retry sleep cancelled: no cover waits"
+    ));
+    assert!(sleeps(&left).is_empty(), "nothing waits: {left:?}");
+    let after = answer_cancels(&mut runner, &left);
+    assert!(sleeps(&after).is_empty(), "{after:?}");
+    assert!(cover_tasks(&after).is_empty(), "{after:?}");
+}
+
+#[test]
+fn a_cover_due_sooner_replaces_a_longer_retry_sleep() {
+    let (mut runner, commands) = art_shelf(false, 20);
+    let covers = cover_tasks(&commands);
+    // A cover of page one fails and waits 15 s.
+    let first = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::Unreachable));
+    let (nap, _) = sleeps(&first)[0];
+    for (task, _) in &covers[1..] {
+        let _ = runner.task_outcome(*task, cover_bytes());
+    }
+    // Page two wants nothing waiting, so the sleep goes.
+    let next = runner.action(action_id("page-next"));
+    assert!(
+        next.iter()
+            .any(|command| matches!(command, Command::Cancel(id) if *id == nap)),
+        "{next:?}"
+    );
+    let mut freed = answer_cancels(&mut runner, &next);
+    // The page's own draw wait is over, which frees its slot for covers.
+    let (wait, _) = sleeps(&next)[0];
+    freed.extend(runner.task_outcome(wait, ok("")));
+    // A cover there is told to wait five minutes.
+    let page_two = cover_tasks(&freed);
+    assert!(!page_two.is_empty(), "page two asks for covers: {freed:?}");
+    let failed = runner.task_outcome(
+        page_two[0].0,
+        TaskOutcome::Failed(TaskError::RateLimited(300)),
+    );
+    let (long, seconds) = sleeps(&failed)[0];
+    assert_eq!(seconds, 300);
+    // Back on page one, its cover is due much sooner.
+    let back = runner.action(action_id("page-back"));
+    assert!(
+        back.iter()
+            .any(|command| matches!(command, Command::Cancel(id) if *id == long)),
+        "{back:?}"
+    );
+    assert!(logged(
+        &back,
+        "pharos: cover retry sleep cancelled: a cover is due sooner"
+    ));
+    let (_, seconds) = sleeps(&back)[0];
+    assert_eq!(seconds, 15);
+    // The answer to the cancel moves no clock and starts nothing.
+    let after = answer_cancels(&mut runner, &back);
+    assert!(sleeps(&after).is_empty(), "{after:?}");
+    assert!(cover_tasks(&after).is_empty(), "{after:?}");
+}
+
+#[test]
 fn a_cover_the_server_will_not_give_is_never_asked_again() {
     for error in [
         TaskError::NotFound,

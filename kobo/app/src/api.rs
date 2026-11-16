@@ -342,6 +342,11 @@ pub struct CoverCache {
     /// wait doubles. Forgotten when the cover arrives, is let go, or is
     /// pushed out.
     attempts: Vec<(String, u32)>,
+    /// The clock reading at which the retry sleep running will end, if one
+    /// runs. A cover that fails meanwhile is timed from there, not from the
+    /// clock, which the sleep has not advanced yet: no cover waits less than
+    /// its full delay.
+    sleeping_until: Option<u64>,
 }
 
 /// The first wait before a cover that failed for a transient reason is asked
@@ -368,6 +373,7 @@ impl CoverCache {
             pinned: Vec::new(),
             clock: 0,
             attempts: Vec::new(),
+            sleeping_until: None,
         }
     }
 
@@ -465,7 +471,7 @@ impl CoverCache {
     /// Records that `id`, being waited for, failed for a transient reason:
     /// it is asked for again after the returned seconds, which double with
     /// each failure up to [`RETRY_MAX_SECONDS`] and are at least `at_least`
-    /// (a host's own request for patience). `None` when `id` is not being
+    /// (a host's own request for patience, which the cap does not trim). `None` when `id` is not being
     /// waited for.
     pub fn retry_later(&mut self, id: &str, at_least: u32) -> Option<u32> {
         let slot = self
@@ -482,10 +488,11 @@ impl CoverCache {
         };
         let wait = RETRY_FIRST_SECONDS
             .saturating_mul(1u32.checked_shl(tried).unwrap_or(u32::MAX))
-            .max(at_least)
-            .min(RETRY_MAX_SECONDS);
+            .min(RETRY_MAX_SECONDS)
+            .max(at_least);
+        let from = self.sleeping_until.unwrap_or(self.clock).max(self.clock);
         slot.1 = Cover::Waiting {
-            due: self.clock.saturating_add(u64::from(wait)),
+            due: from.saturating_add(u64::from(wait)),
         };
         Some(wait)
     }
@@ -493,6 +500,43 @@ impl CoverCache {
     /// Lets `seconds` pass on the retry clock.
     pub fn advance(&mut self, seconds: u32) {
         self.clock = self.clock.saturating_add(u64::from(seconds));
+    }
+
+    /// Whether `id` waits to be asked for again, due or not.
+    #[must_use]
+    pub fn waiting(&self, id: &str) -> bool {
+        matches!(self.state(id), Some(Cover::Waiting { .. }))
+    }
+
+    /// Notes that a retry sleep of `seconds` has started.
+    pub fn sleep_started(&mut self, seconds: u32) {
+        self.sleeping_until = Some(self.clock.saturating_add(u64::from(seconds)));
+    }
+
+    /// Notes that the retry sleep is over or cancelled, without letting any
+    /// time pass: the next failure is timed from the clock.
+    pub fn sleep_ended(&mut self) {
+        self.sleeping_until = None;
+    }
+
+    /// Seconds the running retry sleep has left, if one runs.
+    #[must_use]
+    pub fn sleep_remaining(&self) -> Option<u32> {
+        self.sleeping_until
+            .map(|end| u32::try_from(end.saturating_sub(self.clock)).unwrap_or(u32::MAX))
+    }
+
+    /// Seconds until the soonest of `ids` that waits to retry and is not due
+    /// yet; `None` when none does. A due cover waits for a task slot, not
+    /// for time.
+    #[must_use]
+    pub fn next_not_due<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Option<u32> {
+        ids.filter_map(|id| match self.state(id) {
+            Some(Cover::Waiting { due }) if due > self.clock => Some(due - self.clock),
+            _ => None,
+        })
+        .min()
+        .map(|seconds| u32::try_from(seconds).unwrap_or(u32::MAX))
     }
 
     /// Whether `id` waits to be asked for again and its time has come.
@@ -1057,6 +1101,16 @@ mod tests {
         let dropped = cache.begin(id);
         assert!(cache.ready(id, 10, 10).is_some());
         dropped
+    }
+
+    #[test]
+    fn a_hosts_request_for_patience_is_not_trimmed_by_the_backoff_cap() {
+        let mut cache = CoverCache::new(2);
+        cache.begin("a");
+        assert_eq!(cache.retry_later("a", 600), Some(600));
+        assert_eq!(cache.next_not_due(["a"].into_iter()), Some(600));
+        cache.begin("b");
+        assert_eq!(cache.retry_later("b", 0), Some(RETRY_FIRST_SECONDS));
     }
 
     #[test]
