@@ -810,6 +810,95 @@ fn a_cover_that_fails_keeps_its_glyph_is_not_asked_again_and_does_not_end_the_se
     assert!(puts(&commands).is_empty());
 }
 
+/// The seconds of each sleep `commands` started.
+fn sleeps(commands: &[Command]) -> Vec<(TaskId, u32)> {
+    spawns(commands)
+        .into_iter()
+        .filter_map(|(id, task)| match task {
+            Task::Sleep { seconds } => Some((id, seconds)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A two-cover shelf whose second cover arrives and whose first fails with
+/// `error`. Returns the runner, the first cover's task id and the commands
+/// the failure produced after the second landed.
+fn shelf_with_one_failed_cover(error: TaskError) -> (AppRunner<Pharos>, Vec<Command>) {
+    let (mut runner, commands) = art_shelf(false, 2);
+    let covers = cover_tasks(&commands);
+    assert_eq!(covers.len(), 2);
+    let mut all = runner.task_outcome(covers[0].0, TaskOutcome::Failed(error));
+    all.extend(runner.task_outcome(covers[1].0, cover_bytes()));
+    (runner, all)
+}
+
+#[test]
+fn a_cover_that_fails_unreachable_is_asked_again_after_a_wait_and_draws_once() {
+    let (mut runner, commands) = shelf_with_one_failed_cover(TaskError::Unreachable);
+    assert!(
+        logged(&commands, "pharos: cover a0 retry in 15s: Unreachable"),
+        "{commands:?}"
+    );
+    assert_eq!(draws(&commands), 1, "the page drew once with a glyph");
+    assert!(cover_tasks(&commands).is_empty(), "not asked at once");
+    let (nap, seconds) = *sleeps(&commands)
+        .iter()
+        .find(|(_, seconds)| *seconds == 15)
+        .expect("one sleep counts down to the retry");
+    assert_eq!(seconds, 15);
+    let woke = runner.task_outcome(nap, ok(""));
+    let again = cover_tasks(&woke);
+    assert_eq!(again.len(), 1, "{woke:?}");
+    assert!(again[0].1.contains("/a0/"), "the failed cover is asked");
+    let landed = runner.task_outcome(again[0].0, cover_bytes());
+    assert_eq!(draws(&landed), 1, "the retried cover folds into one draw");
+    let text = screen_text(&last_screen(&landed).expect("the page"));
+    assert!(!text.contains("picture: None"), "{text}");
+}
+
+#[test]
+fn a_cover_that_keeps_failing_waits_longer_each_time_up_to_five_minutes() {
+    let (mut runner, commands) = shelf_with_one_failed_cover(TaskError::TimedOut);
+    let mut nap = sleeps(&commands)[0];
+    let mut waits = vec![nap.1];
+    for _ in 0..7 {
+        let woke = runner.task_outcome(nap.0, ok(""));
+        let (task, _) = cover_tasks(&woke)[0].clone();
+        let failed = runner.task_outcome(task, TaskOutcome::Failed(TaskError::Unreachable));
+        nap = sleeps(&failed)[0];
+        waits.push(nap.1);
+    }
+    assert_eq!(waits, [15, 30, 60, 120, 240, 300, 300, 300]);
+}
+
+#[test]
+fn a_cover_the_server_will_not_give_is_never_asked_again() {
+    for error in [
+        TaskError::NotFound,
+        TaskError::Unauthorized,
+        TaskError::TooLarge,
+        TaskError::Denied,
+    ] {
+        let (_, commands) = shelf_with_one_failed_cover(error);
+        assert!(logged(&commands, "pharos: cover a0 skipped"), "{error:?}");
+        assert!(!logged(&commands, "retry in"), "{error:?}");
+        assert!(sleeps(&commands).is_empty(), "{error:?}: {commands:?}");
+    }
+}
+
+#[test]
+fn a_cover_waiting_to_retry_does_not_hold_the_page_draw() {
+    let (mut runner, commands) = art_shelf(false, 2);
+    let covers = cover_tasks(&commands);
+    let first = runner.task_outcome(covers[0].0, TaskOutcome::Failed(TaskError::Unreachable));
+    assert_eq!(draws(&first), 0, "the other cover is still on its way");
+    assert!(logged(&first, "covers_pending=true"), "{first:?}");
+    let second = runner.task_outcome(covers[1].0, cover_bytes());
+    assert_eq!(draws(&second), 1, "only a waiting cover is left, so draw");
+    assert!(logged(&second, "covers_pending=false"), "{second:?}");
+}
+
 #[test]
 fn paging_through_hundreds_of_albums_keeps_the_held_covers_bounded() {
     let (mut runner, mut commands) = art_shelf(false, 120);
