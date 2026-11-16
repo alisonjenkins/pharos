@@ -154,15 +154,13 @@ async fn download(
     serve_item_file(&state, &req, &item).await
 }
 
-/// `item`'s bytes as a streamed `NamedFile` response, a converted Kindle
-/// book as its EPUB, with the `Content-Type` and `Content-Disposition` of
-/// what is sent. The caller has already checked the requester may reach it.
-/// Shared by this route and the OPDS acquisition link (045).
-pub(crate) async fn serve_item_file(
+/// The file `item` is served from: a converted Kindle book's cached EPUB,
+/// else the item's own file. Shared by the download and the opening preview
+/// so both read the same bytes.
+pub(crate) async fn served_path(
     state: &AppState,
-    req: &HttpRequest,
     item: &pharos_core::MediaItem,
-) -> Result<HttpResponse, actix_web::Error> {
+) -> std::path::PathBuf {
     let id = item.id;
     // 005-kindle-conversion — a Kindle book was stored as `Epub` because it
     // converts, so this route must hand over the EPUB and not the `.azw3` the
@@ -173,7 +171,7 @@ pub(crate) async fn serve_item_file(
     // 004-books behaviour (an unopenable but downloadable book) is strictly
     // better than a 500, and the cause is already on the counter and in the
     // log by the time this returns.
-    let serve_path = match (&state.books, &item.book) {
+    match (&state.books, &item.book) {
         (Some(cache), Some(book))
             if pharos_scanner::book::kindle::is_converted_kindle(&item.path, book.format) =>
         {
@@ -194,7 +192,20 @@ pub(crate) async fn serve_item_file(
             }
         }
         _ => item.path.clone(),
-    };
+    }
+}
+
+/// `item`'s bytes as a streamed `NamedFile` response, a converted Kindle
+/// book as its EPUB, with the `Content-Type` and `Content-Disposition` of
+/// what is sent. The caller has already checked the requester may reach it.
+/// Shared by this route and the OPDS acquisition link (045).
+pub(crate) async fn serve_item_file(
+    state: &AppState,
+    req: &HttpRequest,
+    item: &pharos_core::MediaItem,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id = item.id;
+    let serve_path = served_path(state, item).await;
 
     let file = open_named_file(&serve_path).await.map_err(|e| {
         // Carry the offending path AND the underlying io error — "not found"
