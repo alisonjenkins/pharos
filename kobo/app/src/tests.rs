@@ -130,8 +130,32 @@ fn settle_home(
         } else {
             continue;
         };
-        let reply = runner.task_outcome(task, outcome);
+        let mut reply = runner.task_outcome(task, outcome);
+        let cancelled = answer_cancels(runner, &reply);
+        reply.extend(cancelled);
         pending.extend(spawns(&reply));
+        all.extend(reply);
+    }
+    all
+}
+
+/// Reports each task `commands` cancelled as cancelled, as the runtime
+/// does, so its slot is free again. Returns what those reports produced.
+fn answer_cancels(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Vec<Command> {
+    let mut all = Vec::new();
+    let mut pending: Vec<TaskId> = commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Cancel(task) => Some(*task),
+            _ => None,
+        })
+        .collect();
+    while let Some(task) = pending.pop() {
+        let reply = runner.task_outcome(task, TaskOutcome::Cancelled);
+        pending.extend(reply.iter().filter_map(|command| match command {
+            Command::Cancel(task) => Some(*task),
+            _ => None,
+        }));
         all.extend(reply);
     }
     all
@@ -142,7 +166,9 @@ fn shelf() -> (AppRunner<Pharos>, Vec<Command>) {
     let (mut runner, _) = home();
     let commands = runner.action(action_id("section-music"));
     let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
-    let commands = runner.task_outcome(albums, ok(ALBUMS));
+    let mut commands = runner.task_outcome(albums, ok(ALBUMS));
+    let cancelled = answer_cancels(&mut runner, &commands);
+    commands.extend(cancelled);
     (runner, commands)
 }
 
@@ -530,6 +556,15 @@ fn cover_bytes() -> TaskOutcome {
 /// A runner on the music shelf holding `count` albums with covers, and the
 /// commands the shelf produced.
 fn art_shelf(colour: bool, count: usize) -> (AppRunner<Pharos>, Vec<Command>) {
+    let mut runner = settled_home(colour);
+    let commands = runner.action(action_id("section-music"));
+    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
+    let commands = runner.task_outcome(albums, ok(&albums_with_art(count)));
+    (runner, commands)
+}
+
+/// A runner on a home screen that has everything it shows.
+fn settled_home(colour: bool) -> AppRunner<Pharos> {
     let mut runner = AppRunner::new(Pharos::default()).showing_colour(colour);
     let _ = runner.start();
     let commands = runner.store_result(StoreResult::Loaded {
@@ -539,11 +574,10 @@ fn art_shelf(colour: bool, count: usize) -> (AppRunner<Pharos>, Vec<Command>) {
     let wait = slept(&commands).expect("the opening screen waits for home");
     let _ = runner.task_outcome(wait, ok(""));
     let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
-    let _ = runner.task_outcome(views, ok(VIEWS));
-    let commands = runner.action(action_id("section-music"));
-    let (albums, _) = asked(&commands, "ParentId=lib-music").expect("albums");
-    let commands = runner.task_outcome(albums, ok(&albums_with_art(count)));
-    (runner, commands)
+    let mut all = commands;
+    all.extend(runner.task_outcome(views, ok(VIEWS)));
+    let _ = settle_home(&mut runner, all, r#"{"Items":[]}"#, None);
+    runner
 }
 
 fn cover_tasks(commands: &[Command]) -> Vec<(TaskId, String)> {
@@ -660,11 +694,13 @@ fn page_drawn(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Screen {
 #[test]
 fn an_arrived_cover_replaces_the_glyph_on_its_tile() {
     let (mut runner, commands) = art_shelf(false, 3);
-    let before = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        last_screen(&commands).is_none(),
+        "the page is not drawn bare before its covers (B1458)"
+    );
     let after = screen_text(&page_drawn(&mut runner, &commands));
-    assert_ne!(before, after, "the tile now carries a picture");
     assert!(after.contains("picture: Some"), "{after}");
-    assert!(before.contains("picture: None"), "{before}");
+    assert!(!after.contains("picture: None"), "{after}");
 }
 
 #[test]
@@ -789,9 +825,22 @@ fn paging_through_hundreds_of_albums_keeps_the_held_covers_bounded() {
 #[test]
 fn the_shelf_screens_fit_the_smallest_reader_with_and_without_covers() {
     let (mut runner, commands) = art_shelf(true, 40);
-    let screen = last_screen(&commands).expect("a screen");
-    assert!(screen.validate(&CLARA_BW_METRICS).is_empty());
     let screen = page_drawn(&mut runner, &commands);
+    let problems = screen.validate(&CLARA_BW_METRICS);
+    assert!(problems.is_empty(), "{problems:?}");
+    // Every cover failing draws the page with its glyphs.
+    let (mut runner, mut commands) = art_shelf(true, 40);
+    let mut screen = None;
+    while let Some((task, _)) = cover_tasks(&commands).first().cloned() {
+        let reply = runner.task_outcome(task, TaskOutcome::Failed(TaskError::NotFound));
+        screen = last_screen(&reply).or(screen);
+        commands.retain(
+            |command| !matches!(command, Command::Spawn { task: held, .. } if *held == task),
+        );
+        commands.extend(reply);
+    }
+    let screen = screen.expect("the page drawn without covers");
+    assert!(!screen_text(&screen).contains("picture: Some"));
     let problems = screen.validate(&CLARA_BW_METRICS);
     assert!(problems.is_empty(), "{problems:?}");
 }
@@ -810,7 +859,9 @@ fn books_shelf(colour: bool) -> (AppRunner<Pharos>, Vec<Command>) {
         value: Some(account().encode()),
     });
     let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
-    let _ = runner.task_outcome(views, ok(VIEWS));
+    let mut all = commands;
+    all.extend(runner.task_outcome(views, ok(VIEWS)));
+    let _ = settle_home(&mut runner, all, r#"{"Items":[]}"#, None);
     let commands = runner.action(action_id("section-audiobooks"));
     let (books, _) = asked(&commands, "ParentId=lib-books").expect("books");
     let commands = runner.task_outcome(books, ok(BOOKS));
@@ -986,37 +1037,77 @@ mod about_flow;
 mod book_flow;
 mod home_flow;
 
+/// `count` albums with covers from `start`, out of `total` on the server.
+fn album_block(start: usize, count: usize, total: usize) -> String {
+    let items: Vec<String> = (start..start + count)
+        .map(|index| {
+            format!(
+                r#"{{"Id":"a{index}","Name":"Album {index}","AlbumArtist":"Artist A","ImageTags":{{"Primary":"t{index}"}}}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"Items":[{}],"TotalRecordCount":{total}}}"#,
+        items.join(",")
+    )
+}
+
+fn draws(commands: &[Command]) -> usize {
+    commands
+        .iter()
+        .filter(|command| matches!(command, Command::SetScreen(_)))
+        .count()
+}
+
 #[test]
-fn a_page_s_covers_are_drawn_together_and_hidden_ones_draw_nothing() {
-    let (mut runner, commands) = art_shelf(false, 120);
-    let mut showing = last_screen(&commands).expect("the shelf");
-    let mut pending: Vec<(TaskId, String)> = cover_tasks(&commands);
-    pending.reverse();
-    let (mut on_show, mut redraws) = (0, 0);
-    while !pending.is_empty() {
-        let (task, url) = pending.remove(0);
-        let album = url
-            .split("/Items/a")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .expect("an album id")
-            .to_owned();
-        if screen_text(&showing).contains(&format!("\"Album {album}\"")) {
-            on_show += 1;
-        }
-        let reply = runner.task_outcome(task, cover_bytes());
-        if let Some(screen) = last_screen(&reply) {
-            redraws += 1;
-            showing = screen;
-        }
-        pending.extend(cover_tasks(&reply));
-    }
-    assert!(on_show > 1, "the page shows several covers");
-    assert_eq!(
-        redraws, 1,
-        "the page is drawn once, when its last cover is in, and covers for \
-         other pages draw nothing"
+fn a_shelf_page_opens_in_one_draw_across_blocks_and_cover_waves() {
+    let mut runner = settled_home(false);
+    let mut all = runner.action(action_id("section-music"));
+    assert_eq!(draws(&all), 0, "opening the section waits for the page");
+    let (first, _) = asked(&all, "StartIndex=0&").expect("the first block");
+    let reply = runner.task_outcome(first, ok(&album_block(0, 100, 130)));
+    assert!(
+        asked(&reply, "StartIndex=100&").is_none(),
+        "the next block waits until the page showing is drawn"
     );
+    let mut pending = reply.clone();
+    all.extend(reply);
+    let mut covers = 0;
+    while let Some((task, work)) = spawns(&pending).into_iter().find(|(_, work)| {
+        url_of(work)
+            .is_some_and(|url| url.contains("/Images/Primary") || url.contains("StartIndex=100&"))
+    }) {
+        pending.retain(
+            |command| !matches!(command, Command::Spawn { task: held, .. } if *held == task),
+        );
+        let outcome = if url_of(&work).is_some_and(|url| url.contains("StartIndex=100&")) {
+            ok(&album_block(100, 30, 130))
+        } else {
+            covers += 1;
+            cover_bytes()
+        };
+        let mut reply = runner.task_outcome(task, outcome);
+        let cancelled = answer_cancels(&mut runner, &reply);
+        reply.extend(cancelled);
+        pending.extend(reply.clone());
+        all.extend(reply);
+    }
+    assert!(
+        covers > 2,
+        "the covers came in more than one wave: {covers}"
+    );
+    assert!(
+        asked(&all, "StartIndex=100&").is_some(),
+        "the next block was asked for once the page was drawn"
+    );
+    assert_eq!(
+        draws(&all),
+        1,
+        "the page is drawn once with its albums and covers; covers for \
+         other pages and the later block draw nothing"
+    );
+    let showing = screen_text(&last_screen(&all).expect("the page"));
+    assert!(!showing.contains("picture: None"), "{showing}");
 }
 
 /// A music shelf of `a` albums under A, then `m` under M, then `z` whose
