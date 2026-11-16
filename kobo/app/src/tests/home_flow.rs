@@ -34,11 +34,11 @@ fn signed_in(record: Option<Vec<u8>>) -> (AppRunner<Pharos>, Vec<Command>) {
     (runner, all)
 }
 
-/// The home screen with `RESUMED` answered.
+/// The home screen with `RESUMED` answered and drawn, its albums asked
+/// about and not found.
 fn listening() -> (AppRunner<Pharos>, Vec<Command>) {
     let (mut runner, commands) = signed_in(None);
-    let (resume, _) = asked(&commands, "/Items/Resume?MediaTypes=Audio").expect("resume");
-    let commands = runner.task_outcome(resume, ok(RESUMED));
+    let commands = settle_home(&mut runner, commands, RESUMED, None);
     (runner, commands)
 }
 
@@ -95,26 +95,77 @@ fn part_played_albums_lead_the_home_screen_one_tile_each() {
 
 #[test]
 fn a_described_audiobook_gets_its_glyph_and_cover() {
-    let (mut runner, commands) = listening();
-    let (describe, _) = asked(&commands, "/Users/u1/Items/al1").expect("describe");
+    let (mut runner, commands) = signed_in(None);
+    let (resume, _) = asked(&commands, "/Items/Resume?MediaTypes=Audio").expect("resume");
+    let commands = runner.task_outcome(resume, ok(RESUMED));
+    // Both albums are asked about at once, and nothing is drawn meanwhile.
+    let (describe, _) = asked(&commands, "/Users/u1/Items/al1").expect("describe al1");
+    let (other, _) = asked(&commands, "/Users/u1/Items/al9").expect("describe al9");
+    assert!(last_screen(&commands).is_none(), "{commands:?}");
     let commands = runner.task_outcome(
         describe,
         ok(r#"{"Id":"al1","Name":"First Album","PharosAudiobook":true,"ImageTags":{"Primary":"c1"}}"#),
     );
+    assert!(last_screen(&commands).is_none(), "still waiting on al9");
+    let mut all = commands;
+    all.extend(runner.task_outcome(other, TaskOutcome::Failed(TaskError::NotFound)));
+    let covers = cover_tasks(&all);
     assert!(
-        cover_tasks(&commands)
+        covers
             .iter()
             .any(|(_, url)| url.contains("/Items/al1/Images")),
-        "{:?}",
-        cover_tasks(&commands)
+        "{covers:?}"
     );
-    // The next album is described in turn, one at a time.
-    assert!(asked(&commands, "/Users/u1/Items/al9").is_some());
-    let (cover, _) = cover_tasks(&commands)[0].clone();
+    assert!(last_screen(&all).is_none(), "still waiting on the cover");
+    let (cover, _) = covers[0].clone();
     let commands = runner.task_outcome(cover, cover_bytes());
-    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    let text = screen_text(&last_screen(&commands).expect("drawn once, whole"));
     assert!(text.contains("Headphones"), "{text}");
     assert!(text.contains("Picture"), "{text}");
+}
+
+#[test]
+fn the_home_screen_is_drawn_once_when_everything_it_shows_is_in() {
+    let (mut runner, commands) = started(Some(&account()));
+    let mut all = Vec::new();
+    let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
+    let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
+    all.extend(runner.task_outcome(views, ok(VIEWS)));
+    all.extend(runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    }));
+    let described = runner.task_outcome(resume, ok(RESUMED));
+    all.extend(described.clone());
+    for (album, kind) in [("al1", "true"), ("al9", "false")] {
+        let (task, _) = asked(&described, &format!("/Users/u1/Items/{album}")).expect("asked");
+        let reply = runner.task_outcome(
+            task,
+            ok(&format!(
+                r#"{{"Id":"{album}","Name":"{album}","PharosAudiobook":{kind},"ImageTags":{{"Primary":"c-{album}"}}}}"#
+            )),
+        );
+        all.extend(reply);
+    }
+    let covers = cover_tasks(&all);
+    assert_eq!(covers.len(), 2, "{covers:?}");
+    for (task, _) in covers {
+        all.extend(runner.task_outcome(task, cover_bytes()));
+    }
+    let draws: Vec<&Screen> = all
+        .iter()
+        .filter_map(|command| match command {
+            Command::SetScreen(screen) => Some(screen),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        draws.len(),
+        1,
+        "one draw for the libraries, the row, its albums and their covers"
+    );
+    let text = screen_text(draws[0]);
+    assert_eq!(text.matches("picture: Some").count(), 2, "{text}");
 }
 
 /// Asserts `commands` started `tr2` ten minutes in.
@@ -207,8 +258,12 @@ fn a_failed_resume_list_leaves_the_libraries_alone() {
     let (mut runner, commands) = signed_in(None);
     let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
     let commands = runner.task_outcome(resume, TaskOutcome::Failed(TaskError::Offline));
-    // Nothing on the panel changes, so nothing is drawn again.
-    assert!(last_screen(&commands).is_none(), "{commands:?}");
+    // The libraries are drawn without the row.
+    let text = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(
+        text.contains("Music") && !text.contains("Continue listening"),
+        "{text}"
+    );
     let commands = runner.action(action_id("section-music"));
     assert!(
         asked(&commands, "ParentId=lib-music").is_some(),
@@ -219,8 +274,11 @@ fn a_failed_resume_list_leaves_the_libraries_alone() {
 /// The home screen with `b1` read on this reader and described.
 fn reading() -> AppRunner<Pharos> {
     let (mut runner, commands) = signed_in(Some(record("at 2\n")));
-    let (known, _) = asked(&commands, "Ids=b1&").expect("only the book read is asked about");
-    let commands = runner.task_outcome(known, ok(BOOKS));
+    assert!(
+        asked(&commands, "Ids=b1&").is_some(),
+        "only the book read is asked about"
+    );
+    let commands = settle_home(&mut runner, commands, r#"{"Items":[]}"#, Some(BOOKS));
     let text = screen_text(&last_screen(&commands).expect("a screen"));
     assert!(text.contains("Continue reading"), "{text}");
     assert!(text.contains("Book One"), "{text}");
@@ -310,11 +368,8 @@ fn a_full_home_screen_keeps_every_library_on_the_smallest_reader() {
         })
         .collect();
     let (mut runner, commands) = signed_in(Some(record("at 2\n")));
-    let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
-    let mut drawn =
-        runner.task_outcome(resume, ok(&format!(r#"{{"Items":[{}]}}"#, many.join(","))));
-    let (known, _) = asked(&commands, "Ids=b1&").expect("known");
-    drawn.extend(runner.task_outcome(known, ok(BOOKS)));
+    let resumed = format!(r#"{{"Items":[{}]}}"#, many.join(","));
+    let drawn = settle_home(&mut runner, commands, &resumed, Some(BOOKS));
     let screen = last_screen(&drawn).expect("a screen");
     let text = screen_text(&screen);
     let problems = screen.validate(&CLARA_BW_METRICS);
@@ -349,6 +404,7 @@ fn the_libra_colour_has_room_for_both_rows_and_every_library() {
     let (known, _) = asked(&commands, "Ids=b1&").expect("known");
     let mut drawn = runner.task_outcome(resume, ok(RESUMED));
     drawn.extend(runner.task_outcome(known, ok(BOOKS)));
+    let drawn = settle_home(&mut runner, drawn, RESUMED, Some(BOOKS));
     let screen = last_screen(&drawn).expect("a screen");
     let text = screen_text(&screen);
     let problems = screen.validate(&libra);
@@ -366,7 +422,9 @@ fn the_libra_colour_has_room_for_both_rows_and_every_library() {
 
 #[test]
 fn a_home_cover_never_stands_in_on_a_shelf() {
-    let (mut runner, commands) = listening();
+    let (mut runner, commands) = signed_in(None);
+    let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
+    let commands = runner.task_outcome(resume, ok(RESUMED));
     let (describe, _) = asked(&commands, "/Users/u1/Items/al1").expect("describe");
     let commands = runner.task_outcome(
         describe,
