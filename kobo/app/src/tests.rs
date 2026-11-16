@@ -1110,6 +1110,51 @@ fn a_shelf_page_opens_in_one_draw_across_blocks_and_cover_waves() {
     assert!(!showing.contains("picture: None"), "{showing}");
 }
 
+fn logged(commands: &[Command], part: &str) -> bool {
+    commands
+        .iter()
+        .any(|command| matches!(command, Command::Log { message, .. } if message.contains(part)))
+}
+
+#[test]
+fn each_draw_decision_is_logged_with_what_prompted_it() {
+    let mut runner = settled_home(false);
+    let opened = runner.action(action_id("section-music"));
+    assert!(
+        logged(&opened, "pharos: draw held view=shelf cause=input"),
+        "{opened:?}"
+    );
+    let (first, _) = asked(&opened, "StartIndex=0&").expect("the first block");
+    let reply = runner.task_outcome(first, ok(&album_block(0, 3, 3)));
+    assert!(
+        logged(&reply, "pharos: draw held view=shelf cause=shelf"),
+        "{reply:?}"
+    );
+    assert!(logged(&reply, "covers_pending=true"), "{reply:?}");
+    let drawn = page_drawn_commands(&mut runner, &reply);
+    assert!(
+        logged(&drawn, "pharos: draw drawn view=shelf cause=cover"),
+        "{drawn:?}"
+    );
+}
+
+/// Answers covers until the page is drawn, returning every command on the way.
+fn page_drawn_commands(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> Vec<Command> {
+    let mut all = Vec::new();
+    let mut pending = cover_tasks(commands);
+    while !pending.is_empty() {
+        let (task, _) = pending.remove(0);
+        let reply = runner.task_outcome(task, cover_bytes());
+        let drawn = last_screen(&reply).is_some();
+        pending.extend(cover_tasks(&reply));
+        all.extend(reply);
+        if drawn {
+            break;
+        }
+    }
+    all
+}
+
 /// A music shelf of `a` albums under A, then `m` under M, then `z` whose
 /// names start with an article before a Z.
 fn lettered_shelf(a: usize, m: usize, z: usize) -> (AppRunner<Pharos>, Vec<Command>) {
