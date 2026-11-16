@@ -11,6 +11,8 @@
 #   PHAROS_ANDROID_KEY_ALIAS           key alias in that keystore
 # Optional:
 #   PHAROS_ANDROID_APK_OUT             output path (default target/pharos-phone-<profile>.apk)
+#   PHAROS_ANDROID_VERSION_CODE        versionCode (default minutes since 2026-01-01 UTC)
+#   PHAROS_ANDROID_VERSION_NAME        versionName (default dx's, from the crate version)
 
 set -euo pipefail
 
@@ -106,6 +108,13 @@ grep -q "versionCode = $version_code" "$gradle_root/app/build.gradle.kts" || {
   echo "android-phone-apk: could not set versionCode $version_code" >&2
   exit 1
 }
+if [ -n "${PHAROS_ANDROID_VERSION_NAME:-}" ]; then
+  sed -i "s/versionName = \"[^\"]*\"/versionName = \"$PHAROS_ANDROID_VERSION_NAME\"/" "$gradle_root/app/build.gradle.kts"
+  grep -q "versionName = \"$PHAROS_ANDROID_VERSION_NAME\"" "$gradle_root/app/build.gradle.kts" || {
+    echo "android-phone-apk: could not set versionName $PHAROS_ANDROID_VERSION_NAME" >&2
+    exit 1
+  }
+fi
 
 echo "android-phone-apk: 4/6 assembling with gradle" >&2
 apk_dir=$gradle_root/app/build/outputs/apk
