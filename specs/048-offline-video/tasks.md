@@ -8,3 +8,6 @@
 - [ ] T6 Offline playback from the record; position saved locally (FR-005, FR-006).
 - [ ] T7 Offline start lists downloads; Downloads page (FR-007, FR-008).
 - [ ] T8 Phone app VideoStore over its files dir and asset proxy.
+- [ ] T9 Re-negotiate a fresh play session when a download resumes after its session ended (6 h idle), keeping stored files of the same stream (PR #1482 review).
+- [ ] T10 Serialise the download record list across tabs (Web Locks or BroadcastChannel) (PR #1482 review).
+- [ ] T11 Bind progress and terminal updates to a run generation, so a removed-and-restarted download is not finished by the old run (PR #1482 review).
