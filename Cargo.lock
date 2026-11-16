@@ -8217,7 +8217,7 @@ dependencies = [
 name = "pharos-android"
 version = "0.0.0"
 dependencies = [
- "jni 0.21.1",
+ "jni 0.22.4",
  "log",
  "pharos-content",
  "tokio",
@@ -8398,7 +8398,7 @@ version = "0.0.0"
 dependencies = [
  "android_logger",
  "dioxus",
- "jni 0.21.1",
+ "jni 0.22.4",
  "log",
  "ndk-context",
  "pharos-android",
@@ -8641,7 +8641,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "gloo-net",
- "jni 0.21.1",
+ "jni 0.22.4",
  "js-sys",
  "log",
  "ndk-context",
