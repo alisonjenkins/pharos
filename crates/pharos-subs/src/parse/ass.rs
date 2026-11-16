@@ -209,6 +209,7 @@ fn parse_event(script: &mut Script, val: &str, fmt: &[String]) -> Option<Event> 
         alignment: None,
         text: String::new(),
         runs: Vec::new(),
+        positioned: false,
     };
     let mut raw_text = "";
     for (name, v) in fmt.iter().zip(fields.iter()) {
@@ -240,5 +241,6 @@ fn parse_event(script: &mut Script, val: &str, fmt: &[String]) -> Option<Event> 
     ev.text = parsed.text;
     ev.runs = parsed.runs;
     ev.alignment = parsed.alignment;
+    ev.positioned = parsed.positioned;
     Some(ev)
 }
