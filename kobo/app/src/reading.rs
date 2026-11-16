@@ -10,6 +10,7 @@
 use crate::about;
 use crate::api::{self, Account};
 use crate::books::{self, Book, BookPage, Kind, Piece, Saved, Shelf, Support};
+use crate::filters::{self, Narrow, Order, ReadState};
 use crate::letters;
 use crate::MAX_JSON;
 use kobo_bookview::{BookView, Step};
@@ -57,6 +58,10 @@ enum Mode {
     Menu(usize),
     /// A page of the description of the book at this index.
     About { index: usize, page: usize },
+    /// The filter screen, changing [`Reading::draft`] (V1451).
+    Filter,
+    /// This page of the subjects to narrow to.
+    Subjects(u16),
 }
 
 /// The one piece of work that may be running.
@@ -89,6 +94,15 @@ pub struct Reading {
     page: usize,
     /// Whether the letters to jump the list to are showing (V1442).
     picking_letter: bool,
+    /// How the list is narrowed and ordered (V1451).
+    narrow: Narrow,
+    /// The narrowing being chosen on the filter screen, applied by its
+    /// Show books button.
+    draft: Narrow,
+    /// The subjects pharos's books carry, once asked for.
+    subjects: Option<Vec<String>>,
+    subjects_task: Option<TaskId>,
+    subjects_failed: bool,
     mode: Mode,
     notice: Option<(BannerLevel, String)>,
     /// The book being downloaded, opened or removed.
@@ -129,6 +143,11 @@ impl Reading {
             list_failed: None,
             page: 0,
             picking_letter: false,
+            narrow: Narrow::default(),
+            draft: Narrow::default(),
+            subjects: None,
+            subjects_task: None,
+            subjects_failed: false,
             mode: Mode::List,
             notice: None,
             current: None,
@@ -283,8 +302,19 @@ impl Reading {
             return;
         }
         self.list_failed = None;
+        let downloaded: Vec<&str> = self
+            .shelf
+            .saved
+            .iter()
+            .map(|saved| saved.id.as_str())
+            .collect();
+        if self.narrow.downloaded && downloaded.is_empty() {
+            // Nothing is on this reader, so there is nothing to ask for.
+            self.list = BookPage::default();
+            return;
+        }
         let task = context.spawn(Task::Fetch {
-            url: books::list_url(self.server, account, start),
+            url: books::list_url(self.server, account, start, &self.narrow, &downloaded),
             offset: 0,
             max_bytes: MAX_JSON,
             credential: None,
@@ -330,6 +360,8 @@ impl Reading {
         }
         let detail = match self.mode {
             Mode::List => None,
+            // The list may change under these, so nothing is fetched for it.
+            Mode::Filter | Mode::Subjects(_) => return Vec::new(),
             Mode::Menu(index) | Mode::About { index, .. } => self.detail_book(index),
         };
         let pages = self.pages(context);
@@ -524,6 +556,12 @@ impl Reading {
                 ));
             }
         }
+        if self.mode == Mode::Filter {
+            return own(self.filter_screen());
+        }
+        if let Mode::Subjects(page) = self.mode {
+            return own(self.subjects_screen(page));
+        }
         if let Some(why) = &self.list_failed {
             return own(ScreenBuilder::new("pharos-books")
                 .top_bar("Books")
@@ -531,18 +569,32 @@ impl Reading {
                 .primary_button("books-retry", "Try again"));
         }
         if self.list.books.is_empty() {
-            let screen = self.banner(ScreenBuilder::new("pharos-books").top_bar("Books"));
+            let screen = self.banner(
+                ScreenBuilder::new("pharos-books")
+                    .top_bar("Books")
+                    .top_bar_action("books-filter", "Filter"),
+            );
             return own(if self.list_task.is_some() {
                 screen.activity("Loading your books", None)
+            } else if self.narrow.narrows() {
+                screen
+                    .text("No books match these filters.")
+                    .button("books-filter-reset", "Clear filters")
             } else {
                 screen.text("Pharos has no books for this account.")
             });
         }
-        let mut screen = self.banner(
-            ScreenBuilder::new("pharos-books")
-                .top_bar(format!("Books · {}", self.list.total))
-                .top_bar_action("letters", "A–Z"),
-        );
+        let title = match self.narrow.summary() {
+            Some(summary) => format!("{summary} · {}", self.list.total),
+            None => format!("Books · {}", self.list.total),
+        };
+        let mut screen = ScreenBuilder::new("pharos-books").top_bar(title);
+        // The letters follow name order; in a date order they would jump
+        // about, so they are offered only by name.
+        if self.narrow.order == Order::Name {
+            screen = screen.top_bar_action("letters", "A–Z");
+        }
+        let mut screen = self.banner(screen.top_bar_action("books-filter", "Filter"));
         if self.load == Load::Blocked {
             screen = screen
                 .banner(
@@ -555,6 +607,215 @@ impl Reading {
             .contextual_picture_tiles(TileShape::Portrait, self.tiles(context, cover))
             .page_turns("books-page-back", "books-page-next")
             .compose(|screen| self.letter_picker(context, screen)))
+    }
+
+    /// The filter screen: the order, the read state, the subject and
+    /// Downloaded only, as chosen so far (V1451).
+    fn filter_screen(&self) -> ScreenBuilder {
+        let draft = &self.draft;
+        let order = Order::ALL
+            .iter()
+            .position(|o| *o == draft.order)
+            .unwrap_or(0);
+        let read = ReadState::ALL
+            .iter()
+            .position(|r| *r == draft.read)
+            .unwrap_or(0);
+        let subject = draft.subject.clone().unwrap_or_else(|| "All".to_owned());
+        ScreenBuilder::new("pharos-book-filter")
+            .top_bar("Filter books")
+            .section("Sort by")
+            .segmented(order, Order::ALL.map(|o| (o.action(), o.label())))
+            .section("Read")
+            .segmented(read, ReadState::ALL.map(|r| (r.action(), r.label())))
+            .section_with_value("Subject", subject)
+            .section_link("books-subjects", "Choose")
+            .toggle(
+                "books-downloaded",
+                "Downloaded only",
+                "Books saved on this reader",
+                draft.downloaded,
+            )
+            .primary_button("books-filter-apply", "Show books")
+            .button("books-filter-clear", "Clear filters")
+    }
+
+    /// The subjects to narrow to, a page at a time, All first.
+    fn subjects_screen(&self, page: u16) -> ScreenBuilder {
+        let screen = ScreenBuilder::new("pharos-book-subjects").top_bar("Subject");
+        let Some(subjects) = &self.subjects else {
+            return if self.subjects_failed {
+                screen
+                    .error_state("The subjects could not be loaded.")
+                    .primary_button("books-subjects-retry", "Try again")
+            } else {
+                screen.activity("Loading the subjects", None)
+            };
+        };
+        let chosen = self
+            .draft
+            .subject
+            .as_ref()
+            .and_then(|subject| subjects.iter().position(|s| s == subject))
+            .map_or(0, |index| index + 1);
+        let options = std::iter::once((
+            "books-subject-0".to_owned(),
+            "All subjects".to_owned(),
+            String::new(),
+        ))
+        .chain(subjects.iter().enumerate().map(|(index, name)| {
+            (
+                format!("books-subject-{}", index + 1),
+                name.clone(),
+                String::new(),
+            )
+        }));
+        screen
+            .option_list(
+                "Show books on",
+                page,
+                "books-subjects-back",
+                "books-subjects-next",
+                options,
+            )
+            .chosen(chosen)
+    }
+
+    /// Asks pharos for the subjects, once, unless they are here or on
+    /// their way.
+    fn fetch_subjects(&mut self, context: &mut Context) {
+        if self.subjects.is_some() || self.subjects_task.is_some() {
+            return;
+        }
+        let Some(account) = &self.account else {
+            return;
+        };
+        self.subjects_failed = false;
+        self.subjects_task = context.spawn(Task::Fetch {
+            url: filters::subjects_url(self.server, &account.user_id),
+            offset: 0,
+            max_bytes: MAX_JSON,
+            credential: None,
+            headers: self.headers(),
+        });
+        if self.subjects_task.is_none() {
+            self.subjects_failed = true;
+        }
+    }
+
+    /// Lists the books as [`Self::draft`] says, from the first, if that
+    /// changes anything.
+    fn apply_narrow(&mut self, context: &mut Context) {
+        self.mode = Mode::List;
+        if self.draft == self.narrow {
+            return;
+        }
+        self.narrow = self.draft.clone();
+        if let Some((task, _)) = self.list_task.take() {
+            context.cancel(task);
+        }
+        self.list = BookPage::default();
+        self.page = 0;
+        self.picking_letter = false;
+        self.load_list(context, 0);
+    }
+
+    /// Answers the filter and subject screens. Whether the action was
+    /// theirs.
+    fn filter_action(&mut self, context: &mut Context, action: ActionId) -> bool {
+        if action == action_id("books-filter") && self.mode == Mode::List {
+            self.picking_letter = false;
+            self.draft = self.narrow.clone();
+            self.mode = Mode::Filter;
+            self.fetch_subjects(context);
+            return true;
+        }
+        if action == action_id("books-filter-reset") && self.mode == Mode::List {
+            self.draft = Narrow::default();
+            self.apply_narrow(context);
+            return true;
+        }
+        match self.mode {
+            Mode::Filter => {
+                if action == ActionId::BACK {
+                    self.mode = Mode::List;
+                } else if action == action_id("books-filter-apply") {
+                    self.apply_narrow(context);
+                } else if action == action_id("books-filter-clear") {
+                    self.draft = Narrow::default();
+                } else if action == action_id("books-downloaded") {
+                    self.draft.downloaded = !self.draft.downloaded;
+                } else if action == action_id("books-subjects") {
+                    // A failed ask waits for its Try again on that screen.
+                    if !self.subjects_failed {
+                        self.fetch_subjects(context);
+                    }
+                    self.mode = Mode::Subjects(self.subject_page(context));
+                } else if let Some(order) = Order::ALL
+                    .into_iter()
+                    .find(|o| action == action_id(o.action()))
+                {
+                    self.draft.order = order;
+                } else if let Some(read) = ReadState::ALL
+                    .into_iter()
+                    .find(|r| action == action_id(r.action()))
+                {
+                    self.draft.read = read;
+                } else {
+                    return false;
+                }
+                true
+            }
+            Mode::Subjects(page) => {
+                if action == ActionId::BACK {
+                    self.mode = Mode::Filter;
+                } else if action == action_id("books-subjects-retry") {
+                    self.fetch_subjects(context);
+                } else if action == action_id("books-subjects-next") {
+                    let last = self.subject_pages(context).saturating_sub(1);
+                    self.mode = Mode::Subjects(page.saturating_add(1).min(last));
+                } else if action == action_id("books-subjects-back") {
+                    self.mode = Mode::Subjects(page.saturating_sub(1));
+                } else if let Some(row) = self.subject_row(action) {
+                    self.draft.subject = row
+                        .checked_sub(1)
+                        .and_then(|index| self.subjects.as_ref()?.get(index).cloned());
+                    self.mode = Mode::Filter;
+                } else {
+                    return false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Which row of the subjects screen a tap names: 0 is All, then each
+    /// subject in order.
+    fn subject_row(&self, action: ActionId) -> Option<usize> {
+        let count = self.subjects.as_ref()?.len();
+        (0..=count).find(|row| action == action_id(&format!("books-subject-{row}")))
+    }
+
+    /// How many pages the subjects take, All among them.
+    fn subject_pages(&self, context: &Context) -> u16 {
+        let count = self.subjects.as_ref().map_or(0, Vec::len) + 1;
+        u16::try_from(kobo_sdk::options_pages(count, &context.metrics(), false)).unwrap_or(u16::MAX)
+    }
+
+    /// The page holding the subject chosen so far.
+    fn subject_page(&self, context: &Context) -> u16 {
+        let Some(subjects) = &self.subjects else {
+            return 0;
+        };
+        let index = self
+            .draft
+            .subject
+            .as_ref()
+            .and_then(|subject| subjects.iter().position(|s| s == subject))
+            .map_or(0, |index| index + 1);
+        let per_page = kobo_sdk::options_per_page(&context.metrics(), false).max(1);
+        u16::try_from(index / per_page).unwrap_or(0)
     }
 
     /// A book's detail page: its cover beside the title and author, the
@@ -777,6 +1038,18 @@ impl Reading {
         id: TaskId,
         outcome: &TaskOutcome,
     ) -> Option<Leave> {
+        if self.subjects_task == Some(id) {
+            self.subjects_task = None;
+            match outcome {
+                TaskOutcome::Completed(bytes) => match filters::parse_subjects(bytes) {
+                    Some(subjects) => self.subjects = Some(subjects),
+                    None => self.subjects_failed = true,
+                },
+                TaskOutcome::Failed(TaskError::Unauthorized) => return Some(Leave::SignOut),
+                TaskOutcome::Failed(_) | TaskOutcome::Cancelled => self.subjects_failed = true,
+            }
+            return Some(Leave::Stay);
+        }
         if self.known_task == Some(id) {
             self.known_task = None;
             match outcome {
@@ -958,6 +1231,9 @@ impl Reading {
         if self.pick_letter(context, action) {
             return Leave::Stay;
         }
+        if self.filter_action(context, action) {
+            return Leave::Stay;
+        }
         if action == ActionId::BACK {
             self.mode = match self.mode {
                 Mode::List => return Leave::Back,
@@ -966,7 +1242,7 @@ impl Reading {
                     self.from_home = false;
                     return Leave::Back;
                 }
-                Mode::Menu(_) => Mode::List,
+                Mode::Menu(_) | Mode::Filter | Mode::Subjects(_) => Mode::List,
                 Mode::About { index, .. } => Mode::Menu(index),
             };
         } else if action == action_id("books-retry") {
