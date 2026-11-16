@@ -173,6 +173,134 @@ pub trait VideoStore: Send + Sync {
     fn free_bytes(&self) -> u64;
 }
 
+/// Where the record of downloaded videos is kept on a device (a JSON array
+/// of [`KeptVideo`]).
+pub const RECORDS_KEY: &str = "pharos.kept_videos";
+
+/// Cache Storage names for downloaded video start with this; the service
+/// worker looks through every cache with it (ADR 0143).
+pub const CACHE_PREFIX: &str = "pharos-videos-";
+
+/// The Cache Storage cache holding `user`'s downloaded video.
+pub fn cache_name(user: &str) -> String {
+    format!("{CACHE_PREFIX}{user}")
+}
+
+/// `url` as an absolute URL against `origin` (`https://host`): the key the
+/// service worker's `caches.match(request.url)` finds. An absolute URL is
+/// returned as is.
+pub fn absolute_url(origin: &str, url: &str) -> String {
+    if url.contains("://") {
+        url.to_owned()
+    } else if url.starts_with('/') {
+        format!("{}{url}", origin.trim_end_matches('/'))
+    } else {
+        format!("{}/{url}", origin.trim_end_matches('/'))
+    }
+}
+
+/// The path of `url`, with no query, for log lines (the query carries the
+/// play session).
+pub fn url_path(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let from_path = rest.find('/').map_or("", |i| &rest[i..]);
+    from_path.split(['?', '#']).next().unwrap_or("")
+}
+
+/// Seconds to wait before retry number `attempt` (1-based) of one file, or
+/// `None` once the attempts are used up.
+pub fn retry_delay_secs(attempt: u32) -> Option<u64> {
+    const DELAYS: [u64; 6] = [1, 2, 4, 8, 15, 30];
+    DELAYS.get(attempt.checked_sub(1)? as usize).copied()
+}
+
+/// Whether a failed fetch is worth another try: no answer at all (`None`),
+/// a segment not ready yet (404) or a busy server (5xx).
+pub fn is_retryable(status: Option<u16>) -> bool {
+    match status {
+        None => true,
+        Some(s) => s == 404 || (500..600).contains(&s),
+    }
+}
+
+/// `files` that `cached` does not hold yet, in order: what a restarted
+/// download still has to fetch.
+pub fn missing_files(files: &[String], cached: &std::collections::HashSet<String>) -> Vec<String> {
+    files.iter().filter(|f| !cached.contains(*f)).cloned().collect()
+}
+
+/// Whether progress is due to be saved: at most once a second.
+pub fn progress_due(last_saved_ms: f64, now_ms: f64) -> bool {
+    now_ms - last_saved_ms >= 1_000.0
+}
+
+/// The record of `item` for `user`, if any.
+pub fn find<'a>(list: &'a [KeptVideo], user: &str, item: &str) -> Option<&'a KeptVideo> {
+    list.iter().find(|v| v.user == user && v.item == item)
+}
+
+/// Refuses a second download of an item already kept or in progress; a
+/// failed one may be started again.
+pub fn check_not_kept(list: &[KeptVideo], user: &str, item: &str) -> Result<(), KeepVideoRefusal> {
+    match find(list, user, item) {
+        Some(v) if !matches!(v.state, KeptState::Failed { .. }) => {
+            Err(KeepVideoRefusal::AlreadyKept { item: item.to_owned() })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Puts `video` at the front (newest first), replacing the record of the
+/// same user and item.
+pub fn insert_front(list: &mut Vec<KeptVideo>, video: KeptVideo) {
+    list.retain(|v| !(v.user == video.user && v.item == video.item));
+    list.insert(0, video);
+}
+
+/// Deletes the record of `item` for `user`, returning it.
+pub fn take(list: &mut Vec<KeptVideo>, user: &str, item: &str) -> Option<KeptVideo> {
+    let at = list.iter().position(|v| v.user == user && v.item == item)?;
+    Some(list.remove(at))
+}
+
+/// Bytes `user`'s videos hold, leaving out `except` (the item being
+/// started, whose old record must not count against itself).
+pub fn used_by(list: &[KeptVideo], user: &str, except: Option<&str>) -> u64 {
+    list.iter()
+        .filter(|v| v.user == user && Some(v.item.as_str()) != except)
+        .map(KeptVideo::bytes)
+        .sum()
+}
+
+/// The downloads a page load must restart: the page closed mid-download.
+pub fn interrupted(list: &[KeptVideo]) -> Vec<KeptVideo> {
+    list.iter()
+        .filter(|v| matches!(v.state, KeptState::Downloading { .. }))
+        .cloned()
+        .collect()
+}
+
+/// A new record in the Downloading state, from the request.
+pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
+    KeptVideo {
+        item: request.item.clone(),
+        version: request.version.clone(),
+        user: request.user.clone(),
+        title: request.title.clone(),
+        kind: request.kind.clone(),
+        runtime_ms: request.runtime_ms,
+        master_url: request.master_url.clone(),
+        audio: request.audio,
+        subtitles: request.subtitles.clone(),
+        files: Vec::new(),
+        quality_bps: request.quality_bps,
+        estimated_bytes: 0,
+        state: KeptState::Downloading { done: 0, total: 0, bytes: 0 },
+        position_ms: 0,
+        saved_at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +331,98 @@ mod tests {
             labels,
             ["Small (1 Mbps)", "Medium (2 Mbps)", "Large (4 Mbps)"]
         );
+    }
+
+    fn video(user: &str, item: &str, state: KeptState) -> KeptVideo {
+        new_record(
+            &KeepVideoRequest {
+                item: item.into(),
+                version: String::new(),
+                user: user.into(),
+                title: "t".into(),
+                kind: "movie".into(),
+                runtime_ms: 1,
+                master_url: "/videos/x/master.m3u8".into(),
+                audio: None,
+                subtitles: vec![],
+                quality_bps: DEFAULT_QUALITY_BPS,
+            },
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .with_state(state)
+    }
+
+    impl KeptVideo {
+        fn with_state(mut self, state: KeptState) -> Self {
+            self.state = state;
+            self
+        }
+    }
+
+    #[test]
+    fn urls_become_absolute_keys() {
+        assert_eq!(absolute_url("https://h", "/videos/1/m.m3u8?a=b"), "https://h/videos/1/m.m3u8?a=b");
+        assert_eq!(absolute_url("https://h/", "/x"), "https://h/x");
+        assert_eq!(absolute_url("https://h", "https://o/y"), "https://o/y");
+        assert_eq!(url_path("https://h/videos/1/0.m4s?PlaySessionId=z"), "/videos/1/0.m4s");
+        assert_eq!(url_path("/videos/1/0.m4s?a"), "/videos/1/0.m4s");
+    }
+
+    #[test]
+    fn retries_back_off_then_stop() {
+        let delays: Vec<_> = (1..=7).map(retry_delay_secs).collect();
+        assert_eq!(delays, [Some(1), Some(2), Some(4), Some(8), Some(15), Some(30), None]);
+        assert_eq!(retry_delay_secs(0), None);
+        assert!(is_retryable(None) && is_retryable(Some(404)) && is_retryable(Some(500)));
+        assert!(!is_retryable(Some(403)) && !is_retryable(Some(401)));
+    }
+
+    #[test]
+    fn a_restart_skips_what_is_cached() {
+        let files: Vec<String> = ["a", "b", "c"].map(String::from).into();
+        let cached = ["a", "c"].map(String::from).into();
+        assert_eq!(missing_files(&files, &cached), ["b"]);
+    }
+
+    #[test]
+    fn progress_is_saved_once_a_second() {
+        assert!(!progress_due(0.0, 999.0));
+        assert!(progress_due(0.0, 1_000.0));
+    }
+
+    #[test]
+    fn records_are_per_user_and_replace_by_item() {
+        let mut list = vec![];
+        insert_front(&mut list, video("u1", "a", KeptState::Ready));
+        insert_front(&mut list, video("u2", "a", KeptState::Ready));
+        insert_front(&mut list, video("u1", "a", KeptState::Failed { reason: "x".into() }));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].user, "u1");
+        assert!(check_not_kept(&list, "u1", "a").is_ok(), "failed may restart");
+        assert!(matches!(
+            check_not_kept(&list, "u2", "a"),
+            Err(KeepVideoRefusal::AlreadyKept { .. })
+        ));
+        assert!(check_not_kept(&list, "u1", "b").is_ok());
+        assert!(take(&mut list, "u2", "a").is_some());
+        assert!(take(&mut list, "u2", "a").is_none());
+    }
+
+    #[test]
+    fn used_bytes_leave_out_the_item_being_started() {
+        let mut a = video("u", "a", KeptState::Ready);
+        a.estimated_bytes = 10;
+        let mut b = video("u", "b", KeptState::Downloading { done: 1, total: 2, bytes: 5 });
+        b.estimated_bytes = 99;
+        let list = vec![a, b];
+        assert_eq!(used_by(&list, "u", None), 15);
+        assert_eq!(used_by(&list, "u", Some("b")), 10);
+        assert_eq!(used_by(&list, "other", None), 0);
+        assert_eq!(interrupted(&list).len(), 1);
+    }
+
+    #[test]
+    fn the_cache_is_named_for_the_user() {
+        assert_eq!(cache_name("ab"), "pharos-videos-ab");
     }
 }
