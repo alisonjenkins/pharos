@@ -292,6 +292,17 @@ pub fn reserved_by(list: &[KeptVideo], user: &str, except: Option<&str>) -> u64 
         .sum()
 }
 
+/// Whether a download still has to pass admission: a new one, or a restart
+/// of one that closed before its plan was admitted (no estimate recorded).
+pub fn needs_admission(resume: bool, recorded_estimate: u64) -> bool {
+    !resume || recorded_estimate == 0
+}
+
+/// What a download still needs room for: its estimate less what is stored.
+pub fn still_needed(estimate: u64, stored: u64) -> u64 {
+    estimate.saturating_sub(stored)
+}
+
 /// The downloads a page load must restart: the page closed mid-download.
 pub fn interrupted(list: &[KeptVideo]) -> Vec<KeptVideo> {
     list.iter()
@@ -494,13 +505,42 @@ mod tests {
 
     #[test]
     fn a_download_in_progress_reserves_its_estimate() {
-        let mut a = video("u", "a", KeptState::Downloading { done: 1, total: 9, bytes: 5 });
+        let mut a = video(
+            "u",
+            "a",
+            KeptState::Downloading {
+                done: 1,
+                total: 9,
+                bytes: 5,
+            },
+        );
         a.estimated_bytes = 100;
-        let mut b = video("u", "b", KeptState::Downloading { done: 9, total: 9, bytes: 120 });
+        let mut b = video(
+            "u",
+            "b",
+            KeptState::Downloading {
+                done: 9,
+                total: 9,
+                bytes: 120,
+            },
+        );
         b.estimated_bytes = 100;
         let list = vec![a, b];
         assert_eq!(reserved_by(&list, "u", None), 220);
         assert_eq!(reserved_by(&list, "u", Some("a")), 120);
-        assert_eq!(used_by(&list, "u", None), 125, "display counts fetched bytes");
+        assert_eq!(
+            used_by(&list, "u", None),
+            125,
+            "display counts fetched bytes"
+        );
+    }
+
+    #[test]
+    fn a_restart_is_admitted_only_when_it_never_was() {
+        assert!(needs_admission(false, 500));
+        assert!(needs_admission(true, 0));
+        assert!(!needs_admission(true, 500));
+        assert_eq!(still_needed(100, 30), 70);
+        assert_eq!(still_needed(100, 130), 0);
     }
 }
