@@ -433,7 +433,12 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     }
     drop(results);
 
-    warm_player_script().await;
+    warm_player_script().await.map_err(|reason| {
+        warn(&format!(
+            "pharos: video keep player script failed item={item} reason={reason}"
+        ));
+        Stop::Failed(reason)
+    })?;
     Ok(if bytes == 0 { estimate } else { bytes })
 }
 
@@ -448,29 +453,42 @@ fn publish(user: &str, item: &str, done: usize, total: u32, bytes: u64, force: b
     }
 }
 
-/// Fetches the player script once so the service worker stores it, which
-/// an offline start needs (the worker caches `/ui/assets/vendor/`).
-async fn warm_player_script() {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    match JsFuture::from(window.fetch_with_str(platform::HLSJS_SRC)).await {
-        Ok(v) => {
-            if let Ok(r) = v.dyn_into::<web_sys::Response>() {
-                if let Ok(p) = r.blob() {
-                    let _ = JsFuture::from(p).await;
-                }
-                info(&format!(
-                    "pharos: video keep player script status={}",
-                    r.status()
-                ));
-            }
-        }
-        Err(e) => warn(&format!(
-            "pharos: video keep player script failed error={}",
-            describe(&e)
-        )),
+/// Fetches the player script so the service worker stores it, and checks it
+/// did: an offline start cannot play without it. Errs naming the cause.
+async fn warm_player_script() -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let response: web_sys::Response = JsFuture::from(window.fetch_with_str(platform::HLSJS_SRC))
+        .await
+        .map_err(|e| format!("player script fetch failed: {}", describe(&e)))?
+        .dyn_into()
+        .map_err(|e| describe(&e))?;
+    if !response.ok() {
+        return Err(format!(
+            "player script {} answered {}",
+            url_path(platform::HLSJS_SRC),
+            response.status()
+        ));
     }
+    if let Ok(p) = response.blob() {
+        let _ = JsFuture::from(p).await;
+    }
+    let key = absolute_url(&origin(), platform::HLSJS_SRC);
+    let storage = caches()?;
+    // The worker stores it after answering, so give it a moment.
+    for attempt in 0..5 {
+        let hit = JsFuture::from(storage.match_with_str(&key)).await;
+        if hit.is_ok_and(|v| !v.is_undefined()) {
+            info(&format!(
+                "pharos: video keep player script cached attempt={attempt}"
+            ));
+            return Ok(());
+        }
+        platform::sleep_ms(300).await;
+    }
+    Err(format!(
+        "player script {} was not stored by the service worker",
+        url_path(platform::HLSJS_SRC)
+    ))
 }
 
 async fn run(user: String, item: String, resume: bool) {
@@ -585,6 +603,18 @@ pub fn register() {
     wasm_bindgen_futures::spawn_local(async {
         let _ = measure_free().await;
     });
+    if with_list(|l| l.iter().any(KeptVideo::ready)) {
+        // A shell deploy drops the cached player script; fetch it again
+        // while online so a ready video still plays offline.
+        wasm_bindgen_futures::spawn_local(async {
+            match warm_player_script().await {
+                Ok(()) => info("pharos: video player script refreshed"),
+                Err(e) => warn(&format!(
+                    "pharos: video player script refresh failed reason={e}"
+                )),
+            }
+        });
+    }
     for v in restart {
         info(&format!(
             "pharos: video keep resume item={} files={}",
