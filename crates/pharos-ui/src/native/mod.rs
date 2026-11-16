@@ -37,6 +37,7 @@ pub mod kept;
 pub mod kept_video;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod kept_video_web;
+pub mod kept_video_view;
 pub mod kept_view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod kept_web;
