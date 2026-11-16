@@ -5239,7 +5239,10 @@ struct Playing {
     session: String,
     /// Reports and the stop go through this. It dies with the connection,
     /// so a reconnect swaps in a fresh one under the same player.
-    grant: RefCell<NativeGrant>,
+    /// `None` for a downloaded copy, which has no session on the server.
+    grant: RefCell<Option<NativeGrant>>,
+    /// Set for a downloaded copy: the position is kept on the device.
+    offline: Option<OfflineSave>,
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
     detail: Detail,
@@ -5260,7 +5263,24 @@ struct Playing {
     asked_subtitle: TrackChoice,
 }
 
+/// Where a downloaded copy's position is kept.
+struct OfflineSave {
+    store: std::sync::Arc<dyn super::kept_video::VideoStore>,
+    user: String,
+}
+
 impl Playing {
+    /// Keep `at_ms` on the device when this is a downloaded copy; false when
+    /// the server's grant reports it instead.
+    fn save_offline(&self, at_ms: u64) -> bool {
+        let Some(save) = &self.offline else {
+            return false;
+        };
+        save.store
+            .save_position(&save.user, &self.detail.item.id.to_string(), at_ms);
+        true
+    }
+
     /// The tracks this playback was negotiated with, for negotiating it again.
     fn asked(&self) -> TrackPicks {
         TrackPicks {
@@ -5644,7 +5664,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         from_start: start_ms == 0 && from_start,
                         engine,
                         session: decision.play_session,
-                        grant: RefCell::new(grant),
+                        grant: RefCell::new(Some(grant)),
+                        offline: None,
                         grant_gen: Cell::new(grant_gen),
                         detail,
                         version,
@@ -5738,7 +5759,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             }
             Some(None) => return,
         };
-        if p.0.grant_gen.replace(gen) == gen {
+        if p.0.grant_gen.replace(gen) == gen || p.0.offline.is_some() {
             return;
         }
         let Some(api) = ctx.api.peek().clone() else {
@@ -5756,7 +5777,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 }
                 match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
-                        *p.0.grant.borrow_mut() = grant;
+                        *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
                         platform::info(&format!(
                             "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
@@ -6439,7 +6460,9 @@ fn Player(
                         continue;
                     }
                     asked_at = now;
-                    let grant = p.grant.borrow().clone();
+                    let Some(grant) = p.grant.borrow().clone() else {
+                        continue;
+                    };
                     match grant.queue_hint(&call("watch", "queue hint")).await {
                         // Set only on a change: each set rebuilds the player.
                         Ok(hint) if media.peek().loading => {
@@ -6778,8 +6801,13 @@ fn Player(
             if !clock.borrow_mut().stop() {
                 return;
             }
-            let grant = p.grant.borrow().clone();
             let at = last_ms.get();
+            if p.save_offline(at) {
+                return;
+            }
+            let Some(grant) = p.grant.borrow().clone() else {
+                return;
+            };
             platform::spawn_detached(async move {
                 match grant.stop(&call("watch", "stop"), at).await {
                     Ok(()) => {}
@@ -6824,8 +6852,13 @@ fn Player(
                     else {
                         return;
                     };
-                    let grant = p.grant.borrow().clone();
                     let at = last_ms.get();
+                    if p.save_offline(at) {
+                        return;
+                    }
+                    let Some(grant) = p.grant.borrow().clone() else {
+                        return;
+                    };
                     let tracks = TrackPicks {
                         audio: TrackChoice::Default,
                         subtitle: switched.get().unwrap_or_default(),
@@ -7401,7 +7434,12 @@ fn Player(
             // A stop at the end is how the server marks an item watched,
             // once, whether or not an earlier stop (page hide) went first.
             let at = total_ms(&media.peek(), p.detail.item.runtime_ms);
-            let grant = p.grant.borrow().clone();
+            if p.save_offline(0) {
+                return;
+            }
+            let Some(grant) = p.grant.borrow().clone() else {
+                return;
+            };
             platform::spawn_detached(async move {
                 if let Err(e) = grant.stop(&call("watch", "finish"), at).await {
                     platform::warn(&format!("pharos: marking watched failed: {e}"));
@@ -7689,8 +7727,13 @@ fn Player(
             let Outgoing::Report { paused } = send else {
                 return;
             };
-            let grant = p.grant.borrow().clone();
             let at = last_ms.get();
+            if p.save_offline(at) {
+                return;
+            }
+            let Some(grant) = p.grant.borrow().clone() else {
+                return;
+            };
             let tracks = reported_tracks(
                 p.asked_audio,
                 p.audio,
