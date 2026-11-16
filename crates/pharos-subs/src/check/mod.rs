@@ -5,3 +5,4 @@
 
 pub mod lang;
 pub mod probes;
+pub mod verdict;
