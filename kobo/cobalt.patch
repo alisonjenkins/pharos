@@ -1029,10 +1029,10 @@ index 9875021..297a63f 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
-index 0000000..ad6e2e5
+index 0000000..3d83ef5
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelved.rs
-@@ -0,0 +1,653 @@
+@@ -0,0 +1,696 @@
 +//! A book read off the shelf a range at a time, rather than all at once.
 +//!
 +//! A large illustrated book is mostly pictures, and the reader holds a few
@@ -1323,11 +1323,21 @@ index 0000000..ad6e2e5
 +
 +    fn directed(&mut self) -> Result<Next, ShelfFault> {
 +        let archive = zip::Archive::open_pieces(&self.pieces)?;
-+        let mut ranges: Vec<(usize, usize)> = archive
++        let needed: Vec<Location> = archive
 +            .locations()
 +            .filter(|(name, _)| kobo_doc::epub::needed_to_open(name))
-+            .map(|(_, place)| (place.at, place.end))
++            .map(|(_, place)| place)
 +            .collect();
++        // What the members come to once unpacked is what is held; a member
++        // is unpacked to no more than it declares, so this bounds it.
++        let unpacked = needed
++            .iter()
++            .fold(0_usize, |sum, place| sum.saturating_add(place.unpacked()));
++        if unpacked > MAX_TEXT {
++            return Err(ShelfFault::TooLarge { bytes: unpacked });
++        }
++        let mut ranges: Vec<(usize, usize)> =
++            needed.iter().map(|place| (place.at, place.end)).collect();
 +        ranges.sort_unstable();
 +        let mut members: Vec<(usize, usize)> = Vec::new();
 +        for (at, end) in ranges {
@@ -1684,6 +1694,39 @@ index 0000000..ad6e2e5
 +            panic!("an open book, not {result:?}");
 +        };
 +        assert!(!document.blocks.is_empty());
++    }
++
++    /// `book` with the central directory claiming `claimed` bytes unpacked for
++    /// each of the named members.
++    fn claiming_to_unpack(mut book: Vec<u8>, names: &[&str], claimed: u32) -> Vec<u8> {
++        let mut at = 0;
++        while at + 46 <= book.len() {
++            if book[at..at + 4] == 0x0201_4b50_u32.to_le_bytes() {
++                let name_len = usize::from(u16::from_le_bytes([book[at + 28], book[at + 29]]));
++                let name = String::from_utf8_lossy(&book[at + 46..at + 46 + name_len]).into_owned();
++                if names.contains(&name.as_str()) {
++                    book[at + 24..at + 28].copy_from_slice(&claimed.to_le_bytes());
++                }
++            }
++            at += 1;
++        }
++        book
++    }
++
++    #[test]
++    fn text_that_would_unpack_past_the_bound_is_refused_before_it_is_read() {
++        let book = claiming_to_unpack(
++            a_small_text_book(),
++            &["OEBPS/book.opf", "OEBPS/c0.xhtml"],
++            40 * 1024 * 1024,
++        );
++        let (result, reads) = drive(&book);
++        assert!(
++            matches!(result, Err(ShelfFault::TooLarge { bytes }) if bytes > 64 * 1024 * 1024),
++            "{result:?}"
++        );
++        let read: usize = reads.iter().map(|(_, length)| *length as usize).sum();
++        assert!(read <= book.len() + zip::MAX_TAIL, "{read}");
 +    }
 +}
 diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
