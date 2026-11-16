@@ -8,6 +8,8 @@
 #   PHAROS_ANDROID_KEY_ALIAS           key alias in that keystore
 # Optional:
 #   PHAROS_ANDROID_APK_OUT             output path (default target/pharos-tv-<profile>.apk)
+#   PHAROS_ANDROID_VERSION_CODE        versionCode (default minutes since 2026-01-01 UTC)
+#   PHAROS_ANDROID_VERSION_NAME        versionName (default dx's, from the crate version)
 #   CARGO_TARGET_DIR                   cargo/dx target dir (default <repo>/target)
 
 profile=debug
@@ -94,6 +96,13 @@ grep -q "versionCode = $version_code" "$gradle_root/app/build.gradle.kts" || {
   echo "android-apk: could not set versionCode $version_code" >&2
   exit 1
 }
+if [ -n "${PHAROS_ANDROID_VERSION_NAME:-}" ]; then
+  sed -i "s/versionName = \"[^\"]*\"/versionName = \"$PHAROS_ANDROID_VERSION_NAME\"/" "$gradle_root/app/build.gradle.kts"
+  grep -q "versionName = \"$PHAROS_ANDROID_VERSION_NAME\"" "$gradle_root/app/build.gradle.kts" || {
+    echo "android-apk: could not set versionName $PHAROS_ANDROID_VERSION_NAME" >&2
+    exit 1
+  }
+fi
 apk_dir=$gradle_root/app/build/outputs/apk
 rm -rf "$apk_dir"
 # dx runs assembleRelease only when [bundle.android] signing is configured,
