@@ -21,9 +21,9 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
     absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, new_record, progress_due, reserved_by, retry_delay_secs, take, url_path, used_by,
-    KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES,
-    RECORDS_KEY,
+    missing_files, needs_admission, new_record, progress_due, reserved_by, retry_delay_secs,
+    still_needed, take, url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState,
+    KeptVideo, VideoStore, DEFAULT_CAP_BYTES, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -368,12 +368,18 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         record.quality_bps,
         all.len()
     ));
-    if !resume {
+    let cached = cached_urls(&cache).await;
+    let mut stored_bytes = 0u64;
+    for url in all.iter().filter(|f| cached.contains(*f)) {
+        stored_bytes += cached_length(&cache, url).await;
+    }
+    if needs_admission(resume, record.estimated_bytes) {
         let free = measure_free().await.unwrap_or(u64::MAX);
         let used = with_list(|l| reserved_by(l, user, Some(item)));
-        if let Err(refusal) = fits(estimate, used, DEFAULT_CAP_BYTES, free) {
+        let needed = still_needed(estimate, stored_bytes);
+        if let Err(refusal) = fits(needed, used, DEFAULT_CAP_BYTES, free) {
             warn(&format!(
-                "pharos: video keep refused item={item} reason={refusal} used={used} free={free}"
+                "pharos: video keep refused item={item} reason={refusal} used={used} free={free} resume={resume}"
             ));
             delete_files(user, &stored).await;
             return Err(Stop::Refused(refusal.to_string()));
@@ -394,13 +400,9 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     }
     save();
 
-    let cached = cached_urls(&cache).await;
     let todo = missing_files(&all, &cached);
     let mut done = all.len() - todo.len();
-    let mut bytes = 0u64;
-    for url in all.iter().filter(|f| cached.contains(*f)) {
-        bytes += cached_length(&cache, url).await;
-    }
+    let mut bytes = stored_bytes;
     publish(user, item, done, total, bytes, true);
 
     let cache = &cache;
