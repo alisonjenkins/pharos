@@ -21,9 +21,9 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
     absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, needs_admission, new_record, progress_due, reserved_by, retry_delay_secs,
-    still_needed, take, url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState,
-    KeptVideo, VideoStore, DEFAULT_CAP_BYTES, RECORDS_KEY,
+    missing_files, needs_admission, new_record, progress_due, put_is_retryable, reserved_by,
+    retry_delay_secs, still_needed, take, url_path, used_by, KeepVideoRefusal, KeepVideoRequest,
+    KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -246,15 +246,91 @@ async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Respo
     }
 }
 
-async fn put(cache: &web_sys::Cache, url: &str, response: &web_sys::Response) -> Result<(), Stop> {
+enum PutErr {
+    /// The body transfer broke: fetching again can mend it.
+    Transfer(String),
+    /// The store refused it (quota and the like).
+    Store(String),
+}
+
+async fn put(
+    cache: &web_sys::Cache,
+    url: &str,
+    response: &web_sys::Response,
+) -> Result<(), PutErr> {
     JsFuture::from(cache.put_with_str(url, response))
         .await
         .map(|_| ())
         .map_err(|e| {
-            let reason = format!("could not store {}: {}", url_path(url), describe(&e));
-            warn(&format!("pharos: video keep store failed reason={reason}"));
-            Stop::Failed(reason)
+            let name = js_sys::Reflect::get(&e, &"name".into())
+                .ok()
+                .and_then(|n| n.as_string())
+                .unwrap_or_default();
+            let reason = format!("{name}: {}", describe(&e));
+            if put_is_retryable(&name) {
+                PutErr::Transfer(reason)
+            } else {
+                PutErr::Store(reason)
+            }
         })
+}
+
+/// Fetches `url` and stores it, fetching again (on the same backoff) when
+/// the body breaks mid-transfer. With `read_back` the response comes back
+/// with its body unread, for a playlist's text.
+async fn fetch_put(
+    cache: &web_sys::Cache,
+    user: &str,
+    item: &str,
+    url: &str,
+    read_back: bool,
+) -> Result<(web_sys::Response, u64), Stop> {
+    let mut attempt = 0u32;
+    loop {
+        let response = fetch_retry(user, item, url).await?;
+        let len = length_of(&response);
+        let (stored, back) = if read_back {
+            let copy = response.clone().map_err(|e| Stop::Failed(describe(&e)))?;
+            (copy, Some(response))
+        } else {
+            (response, None)
+        };
+        let err = match put(cache, url, &stored).await {
+            Ok(()) => {
+                let r = match back {
+                    Some(r) => r,
+                    None => stored,
+                };
+                return Ok((r, len));
+            }
+            Err(e) => e,
+        };
+        attempt += 1;
+        match err {
+            PutErr::Store(reason) => {
+                let reason = format!("could not store {}: {reason}", url_path(url));
+                warn(&format!(
+                    "pharos: video keep store failed item={item} reason={reason}"
+                ));
+                return Err(Stop::Failed(reason));
+            }
+            PutErr::Transfer(reason) => {
+                warn(&format!(
+                    "pharos: video keep file failed item={item} url_path={} status=body ({reason}) attempt={attempt}",
+                    url_path(url)
+                ));
+                match retry_delay_secs(attempt) {
+                    Some(secs) => platform::sleep_ms(secs as u32 * 1000).await,
+                    None => {
+                        return Err(Stop::Failed(format!(
+                            "{} body transfer failed: {reason}",
+                            url_path(url)
+                        )))
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn length_of(response: &web_sys::Response) -> u64 {
@@ -278,12 +354,7 @@ async fn playlist(
     let cached = JsFuture::from(cache.match_with_str(url)).await.ok();
     let response = match cached.and_then(|v| v.dyn_into::<web_sys::Response>().ok()) {
         Some(r) => r,
-        None => {
-            let r = fetch_retry(user, item, url).await?;
-            let copy = r.clone().map_err(|e| Stop::Failed(describe(&e)))?;
-            put(cache, url, &copy).await?;
-            r
-        }
+        None => fetch_put(cache, user, item, url, true).await?.0,
     };
     let promise = response.text().map_err(|e| Stop::Failed(describe(&e)))?;
     JsFuture::from(promise)
@@ -408,8 +479,8 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     let cache = &cache;
     let short_tails = &short_tails;
     let mut results = stream::iter(todo.iter().map(|url| async move {
-        let response = match fetch_retry(user, item, url).await {
-            Ok(r) => r,
+        let len = match fetch_put(cache, user, item, url, false).await {
+            Ok((_, len)) => len,
             // B1476: the sliver of a last segment can fail to encode; the
             // copy plays without it, ending a frame early.
             Err(Stop::Failed(reason)) if short_tails.contains(url) => {
@@ -421,8 +492,6 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
             }
             Err(e) => return Err(e),
         };
-        let len = length_of(&response);
-        put(cache, url, &response).await?;
         Ok::<u64, Stop>(len)
     }))
     .buffer_unordered(CONCURRENCY);
