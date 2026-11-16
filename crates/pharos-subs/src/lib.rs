@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod cache;
+pub mod check;
 mod fonts;
 mod frame;
 mod layout;
