@@ -61,8 +61,7 @@ icu_normalizer = { version = "2", default-features = false, features = ["compile
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 indexmap = { version = "2" }
-itertools-3575ec1268b04181 = { package = "itertools", version = "0.15" }
-itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
+itertools = { version = "0.13" }
 libc = { version = "0.2" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
@@ -87,7 +86,7 @@ quick-xml = { version = "0.42", features = ["escape-html"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rapidhash = { version = "4" }
-read-fonts = { version = "0.46" }
+read-fonts = { version = "0.47" }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -101,7 +100,8 @@ sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 simd-adler32 = { version = "0.3" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon"] }
-skrifa = { version = "0.49" }
+skrifa-53698392db9f8492 = { package = "skrifa", version = "0.50" }
+skrifa-8ed344a00b7dfd1e = { package = "skrifa", version = "0.49" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
@@ -167,8 +167,7 @@ icu_locale_core = { version = "2", default-features = false, features = ["alloc"
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data", "utf16_iter", "utf8_iter"] }
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked"] }
 indexmap = { version = "2" }
-itertools-3575ec1268b04181 = { package = "itertools", version = "0.15" }
-itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
+itertools = { version = "0.13" }
 libc = { version = "0.2" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
