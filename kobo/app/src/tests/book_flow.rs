@@ -988,3 +988,45 @@ fn a_downloaded_epub_opens_off_the_shelf_a_part_at_a_time() {
         "opening read {read} of {size} bytes: the picture was read"
     );
 }
+
+#[test]
+fn a_download_that_cannot_be_asked_for_removes_what_it_wrote() {
+    const LIST: &str = r#"{"Items":[
+        {"Id":"b1","Name":"Book One","Path":"/b/one.txt","ImageTags":{"Primary":"c1"}}],
+        "TotalRecordCount":2}"#;
+    let record = books::Shelf {
+        saved: vec![books::Saved {
+            id: "b9".to_owned(),
+            file: "book-b9.txt".to_owned(),
+            size: PROSE.len(),
+            memory: String::new(),
+        }],
+    }
+    .encode();
+    let (mut runner, _) = home();
+    let commands = runner.action(action_id("section-books"));
+    let (list, _) = asked(&commands, "IncludeItemTypes=Book").expect("book list");
+    // The list's next block, the books read here, a cover and the filter's
+    // subjects take every slot, and the download has none to be asked in.
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: Some(record),
+    });
+    let _ = runner.task_outcome(list, ok(LIST));
+    let _ = runner.action(action_id("books-filter"));
+    let _ = runner.action(ActionId::BACK);
+    let commands = read(&mut runner, 0);
+    assert!(
+        asked(&commands, "/Items/b1/Download").is_none(),
+        "{commands:?}"
+    );
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::ShelfRemove { name }) if name == "book-b1.txt"
+        )),
+        "{commands:?}"
+    );
+    let screen = screen_text(&last_screen(&commands).expect("a screen"));
+    assert!(screen.contains("could not start"), "{screen}");
+}
