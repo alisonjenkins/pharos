@@ -191,6 +191,16 @@ impl Reading {
 
     /// Forgets everything of the signed-in account.
     pub fn reset(&mut self, context: &mut Context) {
+        match &self.job {
+            Job::Downloading { task, .. } => {
+                if let Some(task) = task {
+                    context.cancel(*task);
+                }
+                self.abandon_download(context);
+            }
+            Job::Writing { .. } => self.abandon_download(context),
+            _ => {}
+        }
         self.view.close(context);
         *self = Self::new(self.server, self.version);
     }
