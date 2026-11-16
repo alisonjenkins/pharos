@@ -12,6 +12,7 @@
 mod about;
 mod api;
 mod books;
+mod filters;
 mod letters;
 mod reading;
 

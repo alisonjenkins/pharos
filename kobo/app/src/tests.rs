@@ -984,6 +984,7 @@ fn the_playing_cover_survives_paging_through_a_long_shelf() {
 
 mod about_flow;
 mod book_flow;
+mod filter_flow;
 mod home_flow;
 
 #[test]
