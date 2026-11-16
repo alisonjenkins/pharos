@@ -47,6 +47,16 @@ Readable: EPUB (also Kindle books, which Pharos serves as EPUB), plain text,
 Markdown and HTML, up to 64 MB and 64 downloaded books. PDF and comic books
 (CBZ, CBR) show "This reader can't open PDF books yet" and download nothing.
 Reading progress is kept on the reader only; it is not reported to Pharos.
+Books no client can open, such as a Kindle book locked with DRM, are left
+out of the grid altogether.
+
+**Filter** above the grid narrows it as the web Books sheet does: sort by
+Name, Published or Added; Unread, Reading or Read; one subject; and
+**Downloaded only** for the books on this reader. **Show books** lists them
+again; Back leaves the grid as it was. The top bar then says what is
+showing, for example "Unread · History · 12". **A–Z** is offered in name
+order only. Read state is Pharos's, so a book read only on this Kobo still
+counts as unread.
 
 ## Layout
 
