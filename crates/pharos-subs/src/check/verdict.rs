@@ -194,11 +194,19 @@ impl Verdict {
         }
     }
 
-    /// Metric `reason_class`: the unknown class, else the verdict itself.
+    /// FR-019 classes for verdicts other than `unknown`.
+    pub const REASON_CLASSES: [&'static str; 5] =
+        ["fits", "offset", "ratio", "decoy_level", "segmented"];
+
+    /// Metric `reason_class` (FR-019): why the verdict, in a bounded word.
     pub fn reason_class(&self) -> &'static str {
         match self {
+            Self::Fits { .. } => "fits",
+            Self::Retimed { ratio, .. } if (ratio - 1.0).abs() >= 1e-9 => "ratio",
+            Self::Retimed { .. } => "offset",
+            Self::WrongVideo { .. } => "decoy_level",
+            Self::Segmented { .. } => "segmented",
             Self::Unknown { class, .. } => class.label(),
-            other => other.label(),
         }
     }
 
@@ -459,11 +467,28 @@ mod tests {
 
     #[test]
     fn labels_are_distinct_and_stable() {
-        let mut all: Vec<&str> = Verdict::LABELS.to_vec();
-        all.extend(UnknownClass::ALL.iter().map(|c| c.label()));
-        let n = all.len();
-        all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), n);
+        let mut labels: Vec<&str> = Verdict::LABELS.to_vec();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), Verdict::LABELS.len());
+        let mut classes: Vec<&str> = Verdict::REASON_CLASSES.to_vec();
+        classes.extend(UnknownClass::ALL.iter().map(|c| c.label()));
+        let n = classes.len();
+        classes.sort_unstable();
+        classes.dedup();
+        assert_eq!(classes.len(), n);
+    }
+
+    #[test]
+    fn reason_class_says_offset_or_ratio_for_a_retimed_track() {
+        let off = decide(&cand(3_000, 1.0, &RIGHT, &DECOY), None, &t());
+        assert_eq!(off.reason_class(), "offset");
+        let wide = [cand(0, 25.0 / 23.976, &RIGHT, &DECOY)];
+        let ratio = decide(&cand(0, 1.0, &WRONG, &DECOY), Some(&wide), &t());
+        assert_eq!(ratio.reason_class(), "ratio");
+        assert_eq!(
+            decide(&cand(0, 1.0, &RIGHT, &DECOY), None, &t()).reason_class(),
+            "fits"
+        );
     }
 }
