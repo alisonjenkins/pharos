@@ -11,7 +11,7 @@ use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
 
 use super::app::{call, AccountMe, Ctx};
 use super::kept_video::{
-    quality_label, KeptState, KeptVideo, QUALITY_CHOICES_BPS, DEFAULT_QUALITY_BPS,
+    quality_label, KeptState, KeptVideo, DEFAULT_QUALITY_BPS, QUALITY_CHOICES_BPS,
 };
 use super::offline_ui::format_bytes;
 use super::offline_video;
@@ -42,7 +42,9 @@ pub fn percent(done: u32, total: u32) -> u32 {
 /// What a download says about itself in words.
 pub fn state_line(v: &KeptVideo) -> String {
     match &v.state {
-        KeptState::Downloading { done, total, .. } => format!("Downloading {}%", percent(*done, *total)),
+        KeptState::Downloading { done, total, .. } => {
+            format!("Downloading {}%", percent(*done, *total))
+        }
         KeptState::Ready => format!("On this device \u{b7} {}", format_bytes(v.bytes())),
         KeptState::Failed { reason } => format!("Failed: {reason}"),
     }
@@ -61,7 +63,9 @@ pub fn VideoKeepControl(
     on_download: EventHandler<()>,
     on_remove: EventHandler<()>,
 ) -> Element {
-    let state = video.as_ref().map(|v| (state_line(v), matches!(v.state, KeptState::Failed { .. })));
+    let state = video
+        .as_ref()
+        .map(|v| (state_line(v), matches!(v.state, KeptState::Failed { .. })));
     let idle = !matches!(&state, Some((_, false)));
     let label = match (&state, busy) {
         (_, true) => "Starting\u{2026}",
@@ -184,7 +188,9 @@ thread_local! {
 /// remembered on this device.
 fn use_user() -> Option<String> {
     let account = try_use_context::<AccountMe>();
-    let me = account.and_then(|a| a.0.read().clone().flatten()).map(|m| m.id);
+    let me = account
+        .and_then(|a| a.0.read().clone().flatten())
+        .map(|m| m.id);
     me.or_else(offline_video::last_user)
 }
 
@@ -303,7 +309,13 @@ async fn start_download(
     };
     let caps = offline_video::download_caps(platform::capabilities(), quality_bps);
     let (decision, grant) = api
-        .play(&call("title", "download"), id, version, &caps, TrackPicks::default())
+        .play(
+            &call("title", "download"),
+            id,
+            version,
+            &caps,
+            TrackPicks::default(),
+        )
         .await
         .map_err(|e| format!("The server would not start a stream: {e}"))?;
     platform::info(&format!(
@@ -313,7 +325,9 @@ async fn start_download(
     let request = offline_video::keep_request(detail, version, &me.id, &decision, quality_bps)?;
     HELD_GRANTS.with(|g| g.borrow_mut().push(grant));
     store.start(request).map_err(|e| e.to_string())?;
-    platform::info(&format!("pharos: video keep started item={id} quality_bps={quality_bps}"));
+    platform::info(&format!(
+        "pharos: video keep started item={id} quality_bps={quality_bps}"
+    ));
     Ok(())
 }
 
@@ -426,7 +440,14 @@ mod tests {
     #[test]
     fn a_running_download_shows_its_percent_and_remove() {
         let html = render(|| {
-            control(Some(video("8", KeptState::Downloading { done: 3, total: 10, bytes: 5 })))
+            control(Some(video(
+                "8",
+                KeptState::Downloading {
+                    done: 3,
+                    total: 10,
+                    bytes: 5,
+                },
+            )))
         });
         assert!(html.contains("Downloading 30%"), "{html}");
         assert!(html.contains("Remove"));
@@ -443,7 +464,12 @@ mod tests {
     #[test]
     fn a_failed_download_names_the_reason_and_retries() {
         let html = render(|| {
-            control(Some(video("8", KeptState::Failed { reason: "segment 4 returned 502".into() })))
+            control(Some(video(
+                "8",
+                KeptState::Failed {
+                    reason: "segment 4 returned 502".into(),
+                },
+            )))
         });
         assert!(html.contains("segment 4 returned 502"), "{html}");
         assert!(html.contains("Retry"));
