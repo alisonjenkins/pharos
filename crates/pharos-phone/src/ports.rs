@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use pharos_android::snapshot::{self, PlayState as HostState, Snapshot};
 use pharos_android::{content, Player};
+use pharos_ui::native::kept_video_disk::Budget;
 use pharos_ui::native::ports::{
     self, ContainerKind, ContainerRef, Download, NativeAudio, OfflineError, OfflineStore,
     PlayState, PlayerSnapshot, TrackDownload, TrackState, VisFrame,
@@ -224,6 +225,73 @@ fn container_id(c: &ContainerRef) -> Option<String> {
             .iter()
             .position(|m| m.name == c.id)
             .map(|n| format!("mix/{n}")),
+    }
+}
+
+/// Downloaded video shares the music cache's budget: one cap for what the
+/// phone keeps, set where the music cache's is, with the music's bytes
+/// counted against it. Before the media service has started there is no
+/// cache to ask, so the default cap stands and the music counts as nothing.
+struct PhoneBudget {
+    dir: std::path::PathBuf,
+}
+
+impl Budget for PhoneBudget {
+    fn cap_bytes(&self) -> u64 {
+        pharos_android::library()
+            .and_then(content::Library::cache_cap)
+            .unwrap_or(content::DEFAULT_CAP_BYTES)
+    }
+
+    fn other_used_bytes(&self) -> u64 {
+        pharos_android::library()
+            .and_then(content::Library::offline_summary)
+            .map_or(0, |s| s.used_bytes)
+    }
+
+    fn free_bytes(&self) -> u64 {
+        match content::statvfs_free(&self.dir) {
+            Ok(free) => free,
+            Err(e) => {
+                // Unknown room is no room: a download is refused, not risked.
+                log::warn!(
+                    "pharos: video free space unreadable dir={} error={e}",
+                    self.dir.display()
+                );
+                0
+            }
+        }
+    }
+}
+
+/// Opens the video store under the app's files directory and registers it.
+/// Run on the first render of the root component: the files directory comes
+/// from the activity, which is there by then, and the first screen then
+/// sees the store.
+pub fn register_video() {
+    let root = match crate::activity::files_dir() {
+        Ok(dir) => dir.join("video"),
+        Err(e) => {
+            log::warn!(
+                "pharos: port video_store verdict=not_registered reason=no_files_dir error={e}"
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        log::warn!(
+            "pharos: port video_store verdict=not_registered reason=no_folder dir={} error={e}",
+            root.display()
+        );
+        return;
+    }
+    let budget = Arc::new(PhoneBudget { dir: root.clone() });
+    match pharos_ui::native::register_phone_video_store(root.clone(), budget) {
+        Ok(()) => log::info!(
+            "pharos: port video_store verdict=registered dir={}",
+            root.display()
+        ),
+        Err(e) => log::warn!("pharos: port video_store verdict=not_registered reason={e}"),
     }
 }
 

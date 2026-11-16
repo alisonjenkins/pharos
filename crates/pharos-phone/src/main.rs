@@ -54,6 +54,8 @@ fn main() {
     dioxus::LaunchBuilder::new().with_cfg(config).launch(root);
 
     fn root() -> Element {
+        // First, so the first screen sees the video store.
+        use_hook(ports::register_video);
         use_hook(activity::start_media_service);
         pharos_ui::native::use_server_proxy();
         rsx! {
