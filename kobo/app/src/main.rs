@@ -34,6 +34,9 @@ const ACCOUNT_KEY: &str = "account";
 const POLL_SECONDS: u32 = 3;
 /// How often a playing track's place is sent while nobody touches anything.
 const REPORT_SECONDS: u32 = 30;
+/// How long a screen waits for what it shows to arrive before it is drawn
+/// with what has, so a slow server still shows something.
+const DRAW_WAIT_SECONDS: u32 = 2;
 const MAX_JSON: u32 = 512 * 1024;
 /// How wide the cover is on an album's masthead, in millimetres: about what
 /// a tile is on the smallest reader, so the picture already held fits.
@@ -112,6 +115,8 @@ enum Work {
     },
     Report(Report),
     ReportTimer,
+    /// A screen's wait for what it shows, ended by the first draw.
+    DrawWait,
 }
 
 struct Playing {
@@ -153,6 +158,9 @@ struct Pharos {
     about: Option<usize>,
     playing: Option<Playing>,
     report_timer: Option<TaskId>,
+    /// The [`Work::DrawWait`] running, which holds one of the runtime's few
+    /// task slots until it is cancelled.
+    draw_wait: Option<TaskId>,
     reading: Reading,
     /// The albums and audiobooks the owner stopped part-way through, newest
     /// first (V1445).
@@ -188,6 +196,7 @@ impl Default for Pharos {
             about: None,
             playing: None,
             report_timer: None,
+            draw_wait: None,
             reading: Reading::new(SERVER, VERSION),
             listening: Vec::new(),
             resume_at: None,
@@ -907,6 +916,7 @@ impl Pharos {
                     format!("pharos: report {} sent", report.label()),
                 );
             }
+            Work::DrawWait => {}
             Work::ReportTimer => {
                 if self
                     .playing
@@ -997,7 +1007,7 @@ impl Pharos {
             // A lost report only costs the server a moment of the listener's
             // place, and the home screen does without its Continue listening
             // row until it is shown again.
-            (Work::Report(_) | Work::ReportTimer | Work::Listening, _) => {}
+            (Work::Report(_) | Work::ReportTimer | Work::DrawWait | Work::Listening, _) => {}
             // The album keeps the name its track gave it, and the glyph.
             (Work::ListeningAlbum { id }, _) => self.album_described(context, &id, None),
             // The shelf keeps what loaded, and the rest is read when it is
@@ -1518,6 +1528,7 @@ impl Pharos {
     }
 
     fn show(&mut self, context: &mut Context) {
+        self.end_draw_wait(context);
         let screen = self.screen(context);
         self.shown = Some(screen.clone());
         context.set_screen(screen);
@@ -1530,12 +1541,30 @@ impl Pharos {
     /// a screen after input is always sent, because the runtime waits on one
     /// after handing Back over.
     fn show_if_changed(&mut self, context: &mut Context) {
+        self.end_draw_wait(context);
         let screen = self.screen(context);
         if self.shown.as_ref() == Some(&screen) {
             return;
         }
         self.shown = Some(screen.clone());
         context.set_screen(screen);
+    }
+
+    /// Starts the wait for what the screen shows, unless one is running.
+    /// Without a task slot to spare it draws now rather than wait unbounded.
+    fn begin_draw_wait(&mut self, context: &mut Context) -> bool {
+        if self.draw_wait.is_some() {
+            return true;
+        }
+        self.draw_wait = self.sleep(context, DRAW_WAIT_SECONDS, Work::DrawWait);
+        self.draw_wait.is_some()
+    }
+
+    fn end_draw_wait(&mut self, context: &mut Context) {
+        if let Some(task) = self.draw_wait.take() {
+            context.cancel(task);
+            self.tasks.retain(|(held, _)| *held != task);
+        }
     }
 
     /// Which of `visible` things an action named `{prefix}-{index}` chose.
@@ -1579,6 +1608,7 @@ fn work_label(work: &Work) -> &'static str {
         Work::Tracks { .. } => "tracks",
         Work::Report(report) => report.label(),
         Work::ReportTimer => "report-timer",
+        Work::DrawWait => "draw-wait",
     }
 }
 
@@ -1597,6 +1627,11 @@ impl KoboApp for Pharos {
                 Some(account) => {
                     self.account = Some(account);
                     self.load_views(context);
+                    // An empty home drawn now would cost a panel update of
+                    // its own before the filled-in one.
+                    if self.home_loading(context) && self.begin_draw_wait(context) {
+                        return;
+                    }
                 }
                 None => self.sign_in(context),
             }
@@ -1637,6 +1672,9 @@ impl KoboApp for Pharos {
     }
 
     fn on_action(&mut self, context: &mut Context, action: ActionId) {
+        // Input is always answered with a draw, and the wait's task slot is
+        // wanted for what the input asks for.
+        self.end_draw_wait(context);
         if matches!(self.view, View::Books) {
             match self.reading.action(context, action) {
                 Leave::Back => self.go_home(context),
@@ -1785,11 +1823,10 @@ impl KoboApp for Pharos {
         };
         let (_, work) = self.tasks.swap_remove(position);
         let was_cover = matches!(work, Work::Cover { .. });
-        let home_work = was_cover
-            || matches!(
-                work,
-                Work::Views | Work::Listening | Work::ListeningAlbum { .. }
-            );
+        let waited = matches!(work, Work::DrawWait);
+        if waited {
+            self.draw_wait = None;
+        }
         if self.report_timer == Some(task) {
             self.report_timer = None;
         }
@@ -1807,7 +1844,7 @@ impl KoboApp for Pharos {
         }
         // The home screen is drawn once, when what it lists and the covers
         // it shows are all in, not once per answer on the way (B1457).
-        if home_work && matches!(self.view, View::Home) && self.home_loading(context) {
+        if !waited && matches!(self.view, View::Home) && self.home_loading(context) {
             return;
         }
         self.show_if_changed(context);

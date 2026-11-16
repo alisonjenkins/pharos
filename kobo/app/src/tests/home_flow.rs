@@ -126,8 +126,12 @@ fn a_described_audiobook_gets_its_glyph_and_cover() {
 
 #[test]
 fn the_home_screen_is_drawn_once_when_everything_it_shows_is_in() {
-    let (mut runner, commands) = started(Some(&account()));
-    let mut all = Vec::new();
+    let (mut runner, mut all) = opened();
+    let commands = runner.store_result(StoreResult::Loaded {
+        key: ACCOUNT_KEY.to_owned(),
+        value: Some(account().encode()),
+    });
+    all.extend(commands.clone());
     let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
     let (resume, _) = asked(&commands, "/Items/Resume").expect("resume");
     all.extend(runner.task_outcome(views, ok(VIEWS)));
@@ -161,11 +165,19 @@ fn the_home_screen_is_drawn_once_when_everything_it_shows_is_in() {
         .collect();
     assert_eq!(
         draws.len(),
-        1,
-        "one draw for the libraries, the row, its albums and their covers"
+        2,
+        "the opening screen, then one draw for the libraries, the row, its \
+         albums and their covers"
     );
-    let text = screen_text(draws[0]);
+    let text = screen_text(draws[1]);
     assert_eq!(text.matches("picture: Some").count(), 2, "{text}");
+    assert!(
+        !all.iter().any(|command| matches!(
+            command,
+            Command::Log { message, .. } if message.contains("not queued")
+        )),
+        "the wait leaves room for every fetch home makes"
+    );
 }
 
 /// Asserts `commands` started `tr2` ten minutes in.

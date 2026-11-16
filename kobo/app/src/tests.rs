@@ -55,13 +55,24 @@ fn account() -> Account {
 }
 
 /// A runner past start-up, with `saved` as what the store held.
+/// A runner whose saved account, if any, has loaded. The opening screen's
+/// wait for home is over, so the home screen as far as it got is drawn.
 fn started(saved: Option<&Account>) -> (AppRunner<Pharos>, Vec<Command>) {
-    let mut runner = AppRunner::new(Pharos::default());
-    let _ = runner.start();
-    let commands = runner.store_result(StoreResult::Loaded {
+    let (mut runner, _) = opened();
+    let mut commands = runner.store_result(StoreResult::Loaded {
         key: ACCOUNT_KEY.to_owned(),
         value: saved.map(Account::encode),
     });
+    if let Some(wait) = slept(&commands) {
+        commands.extend(runner.task_outcome(wait, ok("")));
+    }
+    (runner, commands)
+}
+
+/// A runner that has drawn its opening screen, with what it sent.
+fn opened() -> (AppRunner<Pharos>, Vec<Command>) {
+    let mut runner = AppRunner::new(Pharos::default());
+    let commands = runner.start();
     (runner, commands)
 }
 
@@ -525,6 +536,8 @@ fn art_shelf(colour: bool, count: usize) -> (AppRunner<Pharos>, Vec<Command>) {
         key: ACCOUNT_KEY.to_owned(),
         value: Some(account().encode()),
     });
+    let wait = slept(&commands).expect("the opening screen waits for home");
+    let _ = runner.task_outcome(wait, ok(""));
     let (views, _) = asked(&commands, "/Users/u1/Views").expect("views");
     let _ = runner.task_outcome(views, ok(VIEWS));
     let commands = runner.action(action_id("section-music"));
