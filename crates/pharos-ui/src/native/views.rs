@@ -3681,9 +3681,15 @@ mod tests {
         });
         let actions = between(&html, r#"class="pharos-actions""#, "pharos-title-picks");
         let link = between(actions, "pharos-download-file", "</a>");
-        assert!(link.contains(r#"href="/Items/"#) && link.contains("/Download?mediaSourceId="), "{actions}");
+        assert!(
+            link.contains(r#"href="/Items/"#) && link.contains("/Download?mediaSourceId="),
+            "{actions}"
+        );
         assert!(link.contains("-b"), "{link}");
-        assert!(link.contains("download") && link.contains(">Download file<"), "{link}");
+        assert!(
+            link.contains("download") && link.contains(">Download file<"),
+            "{link}"
+        );
     }
 
     /// B1356/V1327: an episode's file facts, its path among them, sit under
