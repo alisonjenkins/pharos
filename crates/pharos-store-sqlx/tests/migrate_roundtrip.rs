@@ -701,6 +701,11 @@ async fn seed_raw(store: &SqliteStore) {
         "INSERT INTO subtitle_signals (item_id, source_mtime, source_size, audio_stream, \
          signals_version, signals_json, measured_at) VALUES \
          (1, 1700000005, 4096, 1, 1, '{}', 1700000010)",
+        "INSERT INTO subtitle_check (item_id, source_key, source_mtime, source_size, \
+         sidecar_mtime, sidecar_size, check_version, verdict, reason, offset_ms, ratio, \
+         scores_json, attempts, retry_at, checked_at) VALUES \
+         (1, 'stream:2', 1700000005, 4096, NULL, NULL, 1, 'retimed', 'offset', -1500, 1.25, \
+         '{}', 1, 1700000014, 1700000015)",
         "INSERT INTO transcode_sessions (play_session_id, media_id, decision_json, \
          source_probe_json, updated_at, burn_subtitle_indices_json, holder_user_id, \
          holder_token_id) VALUES ('ps1', 1, '{}', '{}', 1700000008, '[3]', 'u1', 't1')",

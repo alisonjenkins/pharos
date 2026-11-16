@@ -854,6 +854,35 @@ impl pharos_core::SubtitleStylingStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// SubtitleCheckStore
+// ---------------------------------------------------------------------
+impl pharos_core::SubtitleCheckStore for AnyStore {
+    async fn put_subtitle_check(&self, row: pharos_core::SubtitleCheckRow) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_subtitle_check(row).await,
+            AnyStore::Postgres(p) => p.put_subtitle_check(row).await,
+        }
+    }
+
+    async fn subtitle_checks(
+        &self,
+        item: MediaId,
+    ) -> DomainResult<Vec<pharos_core::SubtitleCheckRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_checks(item).await,
+            AnyStore::Postgres(p) => p.subtitle_checks(item).await,
+        }
+    }
+
+    async fn subtitle_check_index(&self) -> DomainResult<Vec<pharos_core::SubtitleCheckRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_check_index().await,
+            AnyStore::Postgres(p) => p.subtitle_check_index().await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // SeriesMetadataStore
 // ---------------------------------------------------------------------
 impl SeriesMetadataStore for AnyStore {
