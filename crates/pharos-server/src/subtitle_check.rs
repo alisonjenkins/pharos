@@ -588,11 +588,19 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
         let decoy_answer = self.aligner.score(&item.path, &lines(|p| &p.decoy)).await;
         measured.aligner_s += decoy_asked.elapsed().as_secs_f64();
         metrics::histogram!("pharos_subtitle_check_aligner_seconds").record(measured.aligner_s);
+        // The probes' evidence is kept even when the decoy request fails.
+        let probes = scores(&probe_answer, picked.len());
+        measured.stage1 = Some(Candidate {
+            offset_ms: probe_answer.offset_ms,
+            ratio: 1.0,
+            probes: probes.clone(),
+            decoys: Vec::new(),
+        });
         let decoy_answer = decoy_answer?;
         let cand = Candidate {
             offset_ms: probe_answer.offset_ms,
             ratio: 1.0,
-            probes: scores(&probe_answer, picked.len()),
+            probes,
             decoys: scores(&decoy_answer, picked.len()),
         };
         let v = verdict::decide(&cand, None, &self.thresholds);
@@ -698,6 +706,8 @@ mod tests {
         fail: AtomicUsize,
         busy: AtomicUsize,
         healthy: bool,
+        /// Fail only this request (0-based), when set.
+        fail_call: Option<usize>,
         calls: Mutex<Vec<(String, usize)>>,
         starts: Mutex<Vec<u64>>,
     }
@@ -711,6 +721,7 @@ mod tests {
                 fail: AtomicUsize::new(0),
                 busy: AtomicUsize::new(0),
                 healthy: true,
+                fail_call: None,
                 calls: Mutex::default(),
                 starts: Mutex::default(),
             }
@@ -745,6 +756,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(lines.iter().map(|l| l.0));
+            if self.fail_call == Some(call) {
+                return Err("request: timed out".into());
+            }
             if self
                 .fail
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -980,6 +994,19 @@ mod tests {
         let starts = fake.starts.lock().unwrap().clone();
         // Every cue starts one second into its minute: no start padding.
         assert!(starts.iter().all(|s| s % 60_000 == 1_000), "{starts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_decoy_request_keeps_the_probe_scores() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let mut fake = Fake::new(900, 250);
+        fake.fail_call = Some(1);
+        job(&lib, &fake).run_pass().await;
+        let r = row(&lib, 1).await;
+        assert_eq!((r.verdict.as_deref(), r.attempts), (None, 1));
+        let scores = r.scores_json.unwrap();
+        assert!(scores.contains("0.9"), "{scores}");
     }
 
     #[tokio::test]
