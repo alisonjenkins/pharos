@@ -5318,6 +5318,7 @@ fn offline_playing(
     resume_ms: u64,
     from_start: bool,
     grant_gen: u32,
+    session: String,
 ) -> Result<PlayingRef, StartFailure> {
     let fail = |reason: String| {
         platform::warn(&format!(
@@ -5373,7 +5374,7 @@ fn offline_playing(
         start_ms,
         from_start: start_ms == 0 && from_start,
         engine,
-        session: offline_video::OFFLINE_SESSION.to_owned(),
+        session,
         grant: RefCell::new(None),
         grant_gen: Cell::new(grant_gen),
         track_map,
@@ -5653,6 +5654,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let gap_notify = Rc::clone(&notify);
     let carry_flag = Rc::clone(&picks_in_primary);
     let account = try_use_context::<AccountMe>();
+    let offline_key = use_hook(|| Rc::new(Cell::new((0u32, false))));
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -5694,12 +5696,20 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // preferred version that is another file does not hide it.
         let wanted = wanted.filter(|_| api.is_some());
         let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
+        let offline_key = Rc::clone(&offline_key);
         async move {
             if let Some((copy, user, store)) = downloaded {
                 let resume = resume_from.get();
-                return Some(offline_playing(
-                    copy, user, store, resume, from_start, grant_gen,
-                ));
+                // Stable across a reconnect's re-render, fresh after a
+                // failure so Try again mounts a new player.
+                let (n, failed) = offline_key.get();
+                let n = if failed { n.wrapping_add(1) } else { n };
+                let session = format!("{}-{n}", offline_video::OFFLINE_SESSION);
+                let started = offline_playing(
+                    copy, user, store, resume, from_start, grant_gen, session,
+                );
+                offline_key.set((n, started.is_err()));
+                return Some(started);
             }
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
