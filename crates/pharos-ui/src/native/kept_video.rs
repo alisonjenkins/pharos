@@ -278,6 +278,20 @@ pub fn used_by(list: &[KeptVideo], user: &str, except: Option<&str>) -> u64 {
         .sum()
 }
 
+/// Bytes `user`'s videos hold or have promised to hold, for admission: a
+/// download in progress counts at the larger of what it fetched and what it
+/// estimated, so two started together cannot both claim the same room.
+/// `except` is left out (the item being started).
+pub fn reserved_by(list: &[KeptVideo], user: &str, except: Option<&str>) -> u64 {
+    list.iter()
+        .filter(|v| v.user == user && Some(v.item.as_str()) != except)
+        .map(|v| match v.state {
+            KeptState::Downloading { bytes, .. } => bytes.max(v.estimated_bytes),
+            _ => v.bytes(),
+        })
+        .sum()
+}
+
 /// The downloads a page load must restart: the page closed mid-download.
 pub fn interrupted(list: &[KeptVideo]) -> Vec<KeptVideo> {
     list.iter()
@@ -476,5 +490,17 @@ mod tests {
             "the query names the play session"
         );
         assert!(sw.contains("__PHAROS_BUNDLE_HASH__") && sw.contains("__PHAROS_PRECACHE__"));
+    }
+
+    #[test]
+    fn a_download_in_progress_reserves_its_estimate() {
+        let mut a = video("u", "a", KeptState::Downloading { done: 1, total: 9, bytes: 5 });
+        a.estimated_bytes = 100;
+        let mut b = video("u", "b", KeptState::Downloading { done: 9, total: 9, bytes: 120 });
+        b.estimated_bytes = 100;
+        let list = vec![a, b];
+        assert_eq!(reserved_by(&list, "u", None), 220);
+        assert_eq!(reserved_by(&list, "u", Some("a")), 120);
+        assert_eq!(used_by(&list, "u", None), 125, "display counts fetched bytes");
     }
 }

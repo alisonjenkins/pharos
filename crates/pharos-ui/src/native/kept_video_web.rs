@@ -21,7 +21,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
     absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, new_record, progress_due, retry_delay_secs, take, url_path, used_by,
+    missing_files, new_record, progress_due, reserved_by, retry_delay_secs, take, url_path, used_by,
     KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES,
     RECORDS_KEY,
 };
@@ -370,7 +370,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     ));
     if !resume {
         let free = measure_free().await.unwrap_or(u64::MAX);
-        let used = with_list(|l| used_by(l, user, Some(item)));
+        let used = with_list(|l| reserved_by(l, user, Some(item)));
         if let Err(refusal) = fits(estimate, used, DEFAULT_CAP_BYTES, free) {
             warn(&format!(
                 "pharos: video keep refused item={item} reason={refusal} used={used} free={free}"
