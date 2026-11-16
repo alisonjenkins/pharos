@@ -1782,8 +1782,8 @@ impl KoboApp for Pharos {
         }
     }
 
-    fn on_shelf(&mut self, context: &mut Context, _name: &str, result: StoreResult) {
-        if self.reading.shelf(context, &result) {
+    fn on_shelf(&mut self, context: &mut Context, name: &str, result: StoreResult) {
+        if self.reading.shelf(context, name, &result) {
             self.show(context);
         }
     }
