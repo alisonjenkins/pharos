@@ -1,0 +1,159 @@
+name: android apps
+
+# Builds the phone and TV APKs, signs them with the one Pharos key, and
+# publishes them as a GitHub Release tagged apps-v<versionName>, which
+# Obtainium watches (docs/android-apps.md). Run it by hand from the Actions
+# tab, or release-please.yml calls it after each server release.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apps
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and sign APKs
+    if: github.repository == 'alisonjenkins/pharos'
+    runs-on: pharos-nix-builder-amd64
+    timeout-minutes: 180
+    outputs:
+      version_name: ${{ steps.version.outputs.name }}
+      version_code: ${{ steps.version.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
+        with:
+          max-jobs: 2
+          cores: 16
+
+      # One instant for both apps: versionCode as the scripts count it
+      # (minutes since 2026-01-01 UTC), versionName the same minute as a
+      # date, which is also the release tag Obtainium compares against.
+      - name: Pick the version
+        id: version
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          code=$(( (now - 1767225600) / 60 ))
+          name=$(date -u -d "@$now" +%Y.%m.%d.%H%M)
+          printf 'code=%s\nname=%s\n' "$code" "$name" >>"$GITHUB_OUTPUT"
+          printf 'event=android_version code=%s name=%s sha=%s\n' "$code" "$name" "$GITHUB_SHA" >&2
+
+      - name: Write the signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.PHAROS_ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.PHAROS_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PHAROS_ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS; do
+            if [ -z "${!var}" ]; then
+              echo "::error::repository secret for $var is not set (see docs/android-apps.md)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          dir=$RUNNER_TEMP/android-signing
+          rm -rf "$dir"
+          (umask 077 && mkdir -p "$dir" \
+            && printf '%s' "$KEYSTORE_B64" | base64 -d >"$dir/pharos.keystore" \
+            && printf '%s' "$KEYSTORE_PASSWORD" >"$dir/pass")
+          {
+            echo "PHAROS_ANDROID_KEYSTORE=$dir/pharos.keystore"
+            echo "PHAROS_ANDROID_KEYSTORE_PASS_FILE=$dir/pass"
+            echo "PHAROS_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+          } >>"$GITHUB_ENV"
+
+      - name: Build the TV APK
+        env:
+          PHAROS_ANDROID_VERSION_CODE: ${{ steps.version.outputs.code }}
+          PHAROS_ANDROID_VERSION_NAME: ${{ steps.version.outputs.name }}
+          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-tv-${{ steps.version.outputs.name }}.apk
+        run: nix run .#android-apk -- --release
+
+      - name: Build the phone APK
+        env:
+          PHAROS_ANDROID_VERSION_CODE: ${{ steps.version.outputs.code }}
+          PHAROS_ANDROID_VERSION_NAME: ${{ steps.version.outputs.name }}
+          PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-phone-${{ steps.version.outputs.name }}.apk
+        run: nix run .#android-phone-apk -- --release
+
+      # A different key would make every friend's update fail to install, so
+      # refuse to publish unless both APKs carry the expected certificate.
+      - name: Check both APKs carry the Pharos key
+        env:
+          EXPECTED_SHA256: ${{ vars.PHAROS_ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s' "$EXPECTED_SHA256" | tr -d ': ' | tr 'A-F' 'a-f')
+          if [ -z "$expected" ]; then
+            echo "::error::repository variable PHAROS_ANDROID_CERT_SHA256 is not set (see docs/android-apps.md)"
+            exit 1
+          fi
+          # shellcheck disable=SC2016 # expanded by the dev shell
+          apksigner=$(nix develop .#android -c sh -c 'echo "$ANDROID_HOME/build-tools/35.0.0/apksigner"')
+          status=0
+          for apk in "$RUNNER_TEMP"/apks/*.apk; do
+            actual=$(nix develop .#android -c "$apksigner" verify --print-certs "$apk" \
+              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)
+            if [ "$actual" = "$expected" ]; then
+              printf 'event=apk_cert status=ok apk=%q sha256=%s\n' "$(basename "$apk")" "$actual" >&2
+            else
+              printf 'event=apk_cert status=mismatch apk=%q sha256=%q expected=%s\n' "$(basename "$apk")" "$actual" "$expected" >&2
+              echo "::error::$(basename "$apk") is signed with ${actual:-no certificate}, expected $expected"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Remove the signing key
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/android-signing"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-apks-${{ steps.version.outputs.name }}
+          path: ${{ runner.temp }}/apks/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: android-apks-${{ needs.build.outputs.version_name }}
+          path: apks
+
+      # Re-running the job updates the same release instead of failing on an
+      # existing tag. Not marked Latest, so the server release stays Latest.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ needs.build.outputs.version_name }}
+          CODE: ${{ needs.build.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          tag="apps-v$NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" apks/*.apk --clobber
+          else
+            notes=$(printf 'Pharos phone and TV apps, version %s (versionCode %s), built from %s.\n\nInstall and update them with Obtainium: see docs/android-apps.md.\n' \
+              "$NAME" "$CODE" "$GITHUB_SHA")
+            gh release create "$tag" apks/*.apk --target "$GITHUB_SHA" \
+              --title "Pharos apps $NAME" --notes "$notes" --latest=false
+          fi
+          printf 'event=android_release status=published tag=%s\n' "$tag" >&2
