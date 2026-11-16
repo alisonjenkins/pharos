@@ -47,6 +47,9 @@ const TIMEOUT: Duration = Duration::from_secs(600);
 /// and a stalled aligner must not hold the styling queue for [`TIMEOUT`].
 const SING_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long `/healthz` may take before the aligner counts as down.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a song whose alignment failed is left alone, so a file the
 /// aligner cannot read is not sent again on every poll.
 const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -757,6 +760,50 @@ impl Aligner {
         }
         let answered = self.request(rel, lines, SING_TIMEOUT, None).await?;
         Ok(self.store(item.id, key, answered, Source::Lines))
+    }
+
+    /// Scores for subtitle probe lines of a video (spec 040), asked now and
+    /// never cached: a check runs once per file, and its decoys would only
+    /// fill the cache with text that belongs elsewhere.
+    pub async fn score(
+        &self,
+        path: &std::path::Path,
+        lines: &[(u64, u64, String)],
+    ) -> Result<Aligned, String> {
+        if lines.is_empty() || lines.len() > MAX_LINES {
+            return Err(format!(
+                "{} lines; the aligner takes 1 to {MAX_LINES}",
+                lines.len()
+            ));
+        }
+        let rel = path
+            .strip_prefix(&self.media_root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{} is outside the aligner's media root", path.display()))?;
+        Ok(self.request(rel, lines, SING_TIMEOUT, None).await?.aligned)
+    }
+
+    /// A karaoke song is queued or being aligned (spec 040 FR-016: the
+    /// subtitle check sends nothing meanwhile).
+    pub fn karaoke_busy(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    /// The aligner answers `/healthz` (spec 040 FR-015a: the check pauses,
+    /// rather than spending attempts, while it does not).
+    pub async fn healthy(&self) -> bool {
+        self.http
+            .get(format!("{}/healthz", self.base))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
     }
 
     /// Check if word timestamps are ready for `lyrics`, or queue a background job.
@@ -1712,6 +1759,37 @@ mod tests {
         let file_path = cache_dir.join("10.words.json");
         std::fs::write(&file_path, b"corrupted json").unwrap();
         assert_eq!(cache.get(10, "key_a"), None);
+    }
+
+    /// Spec 040: probe scores are asked every time, never cached, and the
+    /// queue and health reads the check waits on.
+    #[tokio::test]
+    async fn score_asks_every_time_and_reports_busy_and_health() {
+        let (base, hits) = fake_service(
+            r#"{"offset_ms": 120, "aligner_version": 5, "lines": [{"words": [], "score": 0.9}]}"#,
+        )
+        .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let aligner = Aligner::for_tests(base, dir.path().to_path_buf());
+        let video = dir.path().join("film.mkv");
+        let lines = [(1_000, 3_000, "a line of speech".to_owned())];
+        for _ in 0..2 {
+            let got = aligner.score(&video, &lines).await.unwrap();
+            assert_eq!((got.offset_ms, got.scores.clone()), (120, vec![Some(900)]));
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let outside = aligner
+            .score(std::path::Path::new("/elsewhere/x.mkv"), &lines)
+            .await;
+        assert!(outside
+            .unwrap_err()
+            .contains("outside the aligner's media root"));
+        assert!(aligner.healthy().await);
+        assert!(!aligner.karaoke_busy());
+        aligner.pending.lock().unwrap().insert(7);
+        assert!(aligner.karaoke_busy());
+        let down = Aligner::for_tests("http://127.0.0.1:9".into(), dir.path().to_path_buf());
+        assert!(!down.healthy().await);
     }
 
     /// Answers every request with `body`, counting them.
