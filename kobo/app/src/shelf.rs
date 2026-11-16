@@ -115,6 +115,14 @@ impl<T> Shelf<T> {
         true
     }
 
+    /// Forgets the entries and the place in the listing, to read it again
+    /// from the first row. The letters stay as they are.
+    pub fn restart(&mut self) {
+        let picking = self.picking;
+        self.clear();
+        self.picking = picking;
+    }
+
     /// Counts every entry loaded in the top bar.
     pub fn catch_up(&mut self) {
         self.counted = self.entries.len();
@@ -133,6 +141,10 @@ impl<T> Shelf<T> {
 
     /// The page showing, as an index into [`Self::pages`] before it is
     /// clamped to them.
+    pub fn stop_picking(&mut self) {
+        self.picking = false;
+    }
+
     #[must_use]
     pub fn page_number(&self) -> usize {
         self.page
@@ -360,8 +372,22 @@ mod tests {
         shelf.open(TileShape::Portrait);
         assert!(shelf.entries.is_empty());
         assert!(!shelf.picking);
+        shelf.picking = true;
+        shelf.stop_picking();
+        assert!(!shelf.picking);
+        assert!(!shelf.picking);
         shelf.clear();
         assert_eq!(shelf.shape(), TileShape::Portrait);
+    }
+
+    #[test]
+    fn restarting_reads_the_listing_again_but_keeps_the_letters() {
+        let mut shelf = filled(3);
+        shelf.picking = true;
+        shelf.restart();
+        assert!(shelf.entries.is_empty() && shelf.picking);
+        assert_eq!((shelf.sent(), shelf.total, shelf.is_done()), (0, 0, false));
+        assert!(shelf.take_block(0, 1, 1, [Row::new("Again", false)], 100));
     }
 
     #[test]

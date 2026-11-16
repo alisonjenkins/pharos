@@ -114,6 +114,20 @@ pub struct Book {
     pub overview: String,
 }
 
+impl crate::shelf::Item for Book {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn image_tag(&self) -> Option<&str> {
+        self.image_tag.as_deref()
+    }
+
+    fn sort_name(&self) -> &str {
+        &self.title
+    }
+}
+
 impl Book {
     /// The name of the book's file on the shelf, or `None` when its id could
     /// not be used as one or the book cannot be read.
