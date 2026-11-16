@@ -667,7 +667,7 @@ index 6220e12..752dd9f 100644
  ];
  /// Applications released through Store, including the initial built-in copies
 diff --git a/crates/kobo-doc/src/epub.rs b/crates/kobo-doc/src/epub.rs
-index 1b120a5..2da5cf2 100644
+index 1b120a5..8618a04 100644
 --- a/crates/kobo-doc/src/epub.rs
 +++ b/crates/kobo-doc/src/epub.rs
 @@ -623,12 +623,12 @@ fn read_ncx(xml: &str, base: &str) -> Vec<(String, String, Option<String>, u8)>
@@ -689,6 +689,64 @@ index 1b120a5..2da5cf2 100644
  
  /// The most bytes one picture may take.
  ///
+@@ -693,7 +693,15 @@ fn strip_toc(xml: &str) -> String {
+         let inside = &tail[1..end];
+         let name = element_name(inside);
+         if !inside.starts_with('/') && is_contents_element(inside) {
+-            rest = skip_element(&tail[end + 1..], &name);
++            // A tag that closes itself has no end tag to skip to: looking
++            // for one would carry everything after it away. A Kindle
++            // converter writes `<reference type="toc" ... />` into the head
++            // of every chapter, and the whole book read as empty.
++            rest = if inside.trim_end().ends_with('/') {
++                &tail[end + 1..]
++            } else {
++                skip_element(&tail[end + 1..], &name)
++            };
+             continue;
+         }
+         out.push_str(&tail[..=end]);
+@@ -2096,6 +2104,40 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn a_self_closing_contents_mark_drops_only_itself() {
++        // A Kindle converter puts its guide into the head of every chapter as
++        // `<reference type="toc" ... />`. Skipping to a `</reference>` that
++        // never comes emptied every chapter, and the book was "not a book".
++        let package = opf(
++            r#"<itemref idref="one"/>"#,
++            r#"<item id="one" href="one.xhtml" media-type="application/xhtml+xml"/>"#,
++        );
++        let bytes = archive(&[
++            ("META-INF/container.xml", CONTAINER_XML.as_bytes()),
++            ("OEBPS/book.opf", package.as_bytes()),
++            (
++                "OEBPS/one.xhtml",
++                br#"<html><head><title>One</title><guide><reference title="Table of Contents" type="toc" href="one.xhtml#start" /></guide></head>
++                    <body><h1>A Book</h1><p>The book itself begins.</p></body></html>"#,
++            ),
++        ]);
++        let document = parse(&bytes).expect("a readable book");
++        let words: Vec<&str> = document
++            .blocks
++            .iter()
++            .filter_map(|block| block.text())
++            .collect();
++        assert!(
++            words.iter().any(|text| text.contains("The book itself")),
++            "the chapter went with the mark: {words:?}"
++        );
++        assert!(
++            words.iter().any(|text| text.contains("A Book")),
++            "the heading went with the mark: {words:?}"
++        );
++    }
++
+     #[test]
+     fn a_class_that_merely_starts_with_toc_is_not_a_contents() {
+         // `class` is a list of words and a contents is one of them. Matching
 diff --git a/crates/kobo-frame-plan/src/lib.rs b/crates/kobo-frame-plan/src/lib.rs
 index dbea710..73542f4 100644
 --- a/crates/kobo-frame-plan/src/lib.rs
