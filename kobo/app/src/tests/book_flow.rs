@@ -861,9 +861,22 @@ fn a_book_an_exact_number_of_pieces_long_is_finished_by_an_empty_piece() {
     )));
 }
 
-/// A small EPUB carrying a picture far larger than its text, which opening
-/// it must not read.
+/// The chapter's text, with the scan referenced after enough paragraphs that
+/// it is many screens from where the book opens.
+fn chapter_with_a_late_scan() -> String {
+    let filler = "<p>Filler.</p>".repeat(300);
+    format!(
+        "<html><body><p>{PROSE}</p>{filler}<img src=\"scan.png\" alt=\"a scan\"/></body></html>"
+    )
+}
+
+/// A small EPUB carrying a valid picture far larger than its text, declared
+/// and referenced late in the chapter, which opening it must not read.
 fn an_epub_with_a_large_picture() -> Vec<u8> {
+    let mut scan = kobo_image::encode_png_grey(64, 64, &[128; 64 * 64]).expect("a png");
+    // Bytes after the end of a PNG are ignored by any decoder, and make the
+    // scan as large as a real one.
+    scan.resize(3 * books::CHUNK as usize, 0);
     let members = [
         ("mimetype", b"application/epub+zip".to_vec()),
         (
@@ -879,16 +892,16 @@ fn an_epub_with_a_large_picture() -> Vec<u8> {
             br#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book Three</dc:title></metadata>
-  <manifest><item id="c" href="c.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <manifest>
+    <item id="c" href="c.xhtml" media-type="application/xhtml+xml"/>
+    <item id="s" href="scan.png" media-type="image/png"/>
+  </manifest>
   <spine><itemref idref="c"/></spine>
 </package>"#
                 .to_vec(),
         ),
-        (
-            "OEBPS/c.xhtml",
-            format!("<html><body><p>{PROSE}</p></body></html>").into_bytes(),
-        ),
-        ("OEBPS/scan.png", vec![9; 3 * books::CHUNK as usize]),
+        ("OEBPS/c.xhtml", chapter_with_a_late_scan().into_bytes()),
+        ("OEBPS/scan.png", scan),
     ];
     let members: Vec<(String, Vec<u8>)> = members
         .into_iter()
