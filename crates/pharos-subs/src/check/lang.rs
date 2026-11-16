@@ -76,10 +76,20 @@ pub fn normalise_lang(tag: &str) -> Option<String> {
     Some(code)
 }
 
-/// A letter that folds into `a`-`z`: ASCII, Latin-1 Supplement, Latin
-/// Extended-A/B and Latin Extended Additional (all Latin letters with marks).
+/// A Latin letter: ASCII, Latin-1 Supplement, Latin Extended-A/B, IPA
+/// Extensions (lower-case `ə` beside Extended-B's `Ə`), Latin Extended
+/// Additional and Latin Extended-C/D/E. All fold into `a`-`z` with marks
+/// dropped, or are Latin letters the aligner reads as their base.
 fn folds_to_latin(c: char) -> bool {
-    c.is_ascii_alphabetic() || matches!(c, '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}')
+    c.is_ascii_alphabetic()
+        || matches!(
+            c,
+            '\u{00C0}'..='\u{02AF}'
+                | '\u{1E00}'..='\u{1EFF}'
+                | '\u{2C60}'..='\u{2C7F}'
+                | '\u{A720}'..='\u{A7FF}'
+                | '\u{AB30}'..='\u{AB6F}'
+        )
 }
 
 /// Share of the letters in `texts` that fold into `a`-`z`; 0 when there are none.
@@ -265,6 +275,7 @@ mod tests {
     fn accented_latin_counts_as_latin_and_other_scripts_do_not() {
         assert!((latin_share(["Ça va très bien, señor"]) - 1.0).abs() < f32::EPSILON);
         assert!(latin_share(["Đây là tiếng Việt"]) > 0.99);
+        assert!((latin_share(["Ə ə"]) - 1.0).abs() < f32::EPSILON);
         assert!(latin_share(["Привет, как дела"]) < 0.01);
         assert!(latin_share(["こんにちは"]) < 0.01);
         assert_eq!(latin_share(["123 ... !!"]), 0.0);
