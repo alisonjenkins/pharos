@@ -163,3 +163,14 @@ jobs:
                 "$repo" "$tag" "$tag_digest"
             done
           done
+
+  # Each server release also ships the phone and TV apps to friends
+  # (android-apps.yml, docs/android-apps.md).
+  android-apps:
+    name: android apps
+    needs: release-please
+    if: ${{ github.repository == 'alisonjenkins/pharos' && needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/android-apps.yml
+    secrets: inherit
