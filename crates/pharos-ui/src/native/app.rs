@@ -5705,9 +5705,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 let (n, failed) = offline_key.get();
                 let n = if failed { n.wrapping_add(1) } else { n };
                 let session = format!("{}-{n}", offline_video::OFFLINE_SESSION);
-                let started = offline_playing(
-                    copy, user, store, resume, from_start, grant_gen, session,
-                );
+                let started =
+                    offline_playing(copy, user, store, resume, from_start, grant_gen, session);
                 offline_key.set((n, started.is_err()));
                 return Some(started);
             }
