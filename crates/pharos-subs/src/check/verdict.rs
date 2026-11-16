@@ -85,7 +85,7 @@ impl Candidate {
         self.probes
             .iter()
             .enumerate()
-            .filter(|(_, s)| **s >= t.line)
+            .filter(|(_, s)| s.is_finite() && **s >= t.line)
             .map(|(i, _)| i)
     }
 }
@@ -427,6 +427,12 @@ mod tests {
             v.to_string().starts_with("inconclusive no_candidates"),
             "{v}"
         );
+    }
+
+    #[test]
+    fn non_finite_scores_are_not_hits() {
+        let probes = [f32::INFINITY, f32::INFINITY, 0.1, 0.1];
+        assert_eq!(cand(0, 1.0, &probes, &[0.0; 4]).fit(&t()).hits, 0);
     }
 
     #[test]
