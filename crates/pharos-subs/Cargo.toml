@@ -11,8 +11,8 @@ description = "Pure-Rust subtitle renderer (SRT, WebVTT, ASS/SSA) producing alph
 # that do not compile for wasm32. See .config/hakari.toml final-excludes.
 [dependencies]
 encoding_rs = { version = "0.8", optional = true }
-harfrust = "0.15"
-skrifa = "0.49"
+harfrust = "0.16"
+skrifa = "0.50"
 unicode-bidi = { version = "0.3", default-features = false, features = ["std", "hardcoded-data"] }
 unicode-linebreak = "0.1"
 
