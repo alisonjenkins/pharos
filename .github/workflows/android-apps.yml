@@ -160,11 +160,20 @@ jobs:
         run: |
           set -euo pipefail
           tag="apps-v$NAME"
+          # Two runs created in the same minute share a tag; only a re-run of
+          # the run that made the release may replace its APKs.
+          run_marker="workflow run $GITHUB_RUN_ID"
           if gh release view "$tag" >/dev/null 2>&1; then
+            body=$(gh release view "$tag" --json body --jq .body)
+            if [[ "$body" != *"$run_marker"* || "$body" != *"$GITHUB_SHA"* ]]; then
+              printf 'event=android_release status=collision tag=%s run=%s sha=%s\n' "$tag" "$GITHUB_RUN_ID" "$GITHUB_SHA" >&2
+              echo "::error::release $tag belongs to another run or commit; run this workflow again in a later minute"
+              exit 1
+            fi
             gh release upload "$tag" apks/*.apk --clobber
           else
-            notes=$(printf 'Pharos phone and TV apps, version %s (versionCode %s), built from %s.\n\nInstall and update them with Obtainium: see docs/android-apps.md.\n' \
-              "$NAME" "$CODE" "$GITHUB_SHA")
+            notes=$(printf 'Pharos phone and TV apps, version %s (versionCode %s), built from %s by %s.\n\nInstall and update them with Obtainium: see docs/android-apps.md.\n' \
+              "$NAME" "$CODE" "$GITHUB_SHA" "$run_marker")
             gh release create "$tag" apks/*.apk --target "$GITHUB_SHA" \
               --title "Pharos apps $NAME" --notes "$notes" --latest=false
           fi
