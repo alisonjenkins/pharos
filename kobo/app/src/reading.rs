@@ -1312,7 +1312,7 @@ impl Reading {
             headers: self.headers(),
         });
         if task.is_none() {
-            self.job = Job::Idle;
+            self.abandon_download(context);
             self.say(
                 BannerLevel::Error,
                 "The download could not start. Try again.",
