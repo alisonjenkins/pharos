@@ -121,8 +121,9 @@ it, so it updates the same release:
 - `versionName` and the tag are the same moment as `YYYY.MM.DD.HHMM`.
 
 The code is the minute the run started, not the minute it finished. A local
-build made while a CI run is still going gets a higher code, so a device that
-installs it will refuse that CI release as a downgrade. It takes the next one.
+build made while a CI run is still going can get a higher code. A device that
+installs it may then refuse that CI release as a downgrade, and takes the next
+one instead.
 
 Local sideloads use the same default `versionCode`. Do not set
 `PHAROS_ANDROID_VERSION_CODE` to a small number, or a device that has a
