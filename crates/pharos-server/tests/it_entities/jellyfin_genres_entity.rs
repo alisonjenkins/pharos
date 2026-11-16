@@ -226,3 +226,36 @@ async fn parent_id_genre_resolves_before_explicit_backfill_via_legacy_fallback()
     titles.sort_unstable();
     assert_eq!(titles, vec!["A", "B"]);
 }
+
+/// V1450: `/Genres?IncludeItemTypes=` lists only the genres items of those
+/// kinds carry, counted over those items. The Kobo app asks for a book's
+/// subjects this way. Disarm check: without the narrowing, the film-only
+/// "Sci-Fi" shows and "Action" counts 3.
+#[actix_web::test]
+async fn genres_narrowed_by_kind_list_only_that_kinds_genres() {
+    let (state, token) = seed_mixed().await;
+    let v = get_json(state.clone(), &token, "/Genres?IncludeItemTypes=Audio").await;
+    let items = v["Items"].as_array().unwrap();
+    let mut counts: Vec<(&str, u64)> = items
+        .iter()
+        .map(|i| {
+            (
+                i["Name"].as_str().unwrap(),
+                i["ChildCount"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, [("Action", 1), ("Shoegaze", 2)]);
+    assert_eq!(v["TotalRecordCount"].as_u64(), Some(2));
+
+    // Unnarrowed, every genre is listed as before.
+    let all = get_json(state, &token, "/Genres").await;
+    let names: Vec<&str> = all["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Sci-Fi"), "got {names:?}");
+}
