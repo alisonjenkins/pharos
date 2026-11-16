@@ -60,13 +60,18 @@ To update, repeat steps 3 and 4 with the newest release. It installs over
 the old version and keeps your sign-in.
 
 To use Obtainium on the TV instead, follow the phone steps with the APK
-filter `pharos-tv`.
+filter `pharos-tv`. Many TVs are 32-bit only: on those, install Obtainium's
+`app-armeabi-v7a-release.apk` instead of the arm64 one. If the arm64 file
+says "App not installed", use the 32-bit one.
 
 ### If an update will not install
 
 Android installs an update only when it is signed with the same key as the
 installed app. If you got an APK from somewhere other than these releases,
 uninstall it once, then install from a release.
+
+Uninstalling deletes the app's data. You will need to sign in again, and
+anything you downloaded for offline use has to be downloaded again.
 
 ## Publishing (server owner)
 
@@ -108,11 +113,16 @@ Colons and letter case in the fingerprint do not matter.
 
 ### Versions
 
-Each run picks one moment in UTC:
+Each run takes one moment in UTC, the time the run started. A re-run keeps
+it, so it updates the same release:
 
 - `versionCode` is the minutes since 2026-01-01 UTC, the scripts' default,
-  so every build installs as an upgrade over an older one.
+  so a newer build installs as an upgrade over an older one.
 - `versionName` and the tag are the same moment as `YYYY.MM.DD.HHMM`.
+
+The code is the minute the run started, not the minute it finished. A local
+build made while a CI run is still going gets a higher code, so a device that
+installs it will refuse that CI release as a downgrade. It takes the next one.
 
 Local sideloads use the same default `versionCode`. Do not set
 `PHAROS_ANDROID_VERSION_CODE` to a small number, or a device that has a
