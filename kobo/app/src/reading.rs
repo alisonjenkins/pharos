@@ -13,12 +13,12 @@ use crate::books::{self, Book, Kind, Piece, Saved, Shelf, Support};
 use crate::filters::{self, Narrow, Order, ReadState};
 use crate::shelf;
 use crate::MAX_JSON;
-use kobo_bookview::{BookView, Step};
+use kobo_bookview::{BookView, ShelfFault, ShelfStep, Step};
 use kobo_read::{Memory, Outcome};
 use kobo_sdk::{
     action_id, ActionId, BannerLevel, Context, Glyph, Header, LogLevel, Screen, ScreenBuilder,
-    ShelfDownload, ShelfProgress, ShelfUpload, StoreResult, Task, TaskError, TaskId, TaskOutcome,
-    TilePicture, TileShape, TileState,
+    ShelfDownload, ShelfProgress, StoreResult, Task, TaskError, TaskId, TaskOutcome, TilePicture,
+    TileShape, TileState,
 };
 use std::time::Instant;
 
@@ -89,15 +89,23 @@ enum Opening {
 enum Job {
     #[default]
     Idle,
+    /// A piece is being fetched; `received` bytes are already on the shelf.
     Downloading {
         task: Option<TaskId>,
-        bytes: Vec<u8>,
+        received: usize,
     },
-    Saving {
-        upload: ShelfUpload,
-        size: usize,
+    /// A fetched piece is being written. The book is never held whole: each
+    /// piece goes to the shelf before the next is asked for.
+    Writing {
+        /// What the shelf holds once this piece lands.
+        received: usize,
+        /// This piece finishes the file.
+        last: bool,
     },
     Opening(ShelfDownload),
+    /// An EPUB is being opened off the shelf a part at a time; the view
+    /// asks for each part.
+    OpeningShelf(Instant),
     Removing(String),
 }
 
@@ -466,20 +474,15 @@ impl Reading {
 
     fn busy_screen(&self) -> Option<Screen> {
         match &self.job {
-            Job::Downloading { bytes, .. } => {
-                let received = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            Job::Downloading { received, .. } | Job::Writing { received, .. } => {
+                let received = u64::try_from(*received).unwrap_or(u64::MAX);
                 let received = received - received % books::PROGRESS_STEP;
                 return Some(own(self
                     .banner(ScreenBuilder::new("pharos-book-busy").top_bar("Downloading"))
                     .transfer("Downloading the book", received, None)
                     .button("books-cancel", "Cancel")));
             }
-            Job::Saving { .. } => {
-                return Some(own(ScreenBuilder::new("pharos-book-busy")
-                    .top_bar("Downloading")
-                    .activity("Saving the book", None)));
-            }
-            Job::Opening(_) => {
+            Job::Opening(_) | Job::OpeningShelf(_) => {
                 return Some(own(ScreenBuilder::new("pharos-book-busy")
                     .top_bar("Opening")
                     .activity("Opening the book", None)));
@@ -896,20 +899,65 @@ impl Reading {
     }
 
     /// The answer to a shelf request. `true` if a transfer here wanted it.
-    pub fn shelf(&mut self, context: &mut Context, result: &StoreResult) -> bool {
+    pub fn shelf(&mut self, context: &mut Context, name: &str, result: &StoreResult) -> bool {
+        match self.view.shelf(context, name, result) {
+            ShelfStep::Elsewhere => {}
+            ShelfStep::Busy => return false,
+            ShelfStep::Opened => {
+                if let Job::OpeningShelf(started) = std::mem::take(&mut self.job) {
+                    step_taken(context, "open", started, 0);
+                }
+                self.opened = true;
+                self.notice = None;
+                return true;
+            }
+            ShelfStep::Failed(fault) => {
+                if let Job::OpeningShelf(started) = std::mem::take(&mut self.job) {
+                    step_taken(context, "open", started, 0);
+                }
+                if let Some(book) = &self.current {
+                    context.log(
+                        LogLevel::Info,
+                        format!(
+                            "pharos: book open refused id={} from=shelf why={fault:?}",
+                            book.id
+                        ),
+                    );
+                }
+                self.shelf_failed(&fault);
+                return true;
+            }
+        }
         match std::mem::take(&mut self.job) {
-            Job::Saving { mut upload, size } => match upload.advance(context, result) {
-                ShelfProgress::Done => self.stored(context, size),
-                ShelfProgress::Failed(_) => {
-                    self.view.close(context);
+            Job::Writing { received, last } => match result {
+                StoreResult::ShelfWritten { name, size }
+                    if Some(name) == self.current_file().as_ref() =>
+                {
+                    if usize::try_from(*size).ok() != Some(received) {
+                        self.abandon_download(context);
+                        self.say(
+                            BannerLevel::Error,
+                            "The book was not saved whole. Download it again.",
+                        );
+                    } else if last {
+                        self.stored(context, received);
+                    } else {
+                        self.job = Job::Downloading {
+                            task: None,
+                            received,
+                        };
+                        self.fetch_piece(context);
+                    }
+                }
+                StoreResult::Denied(_) => {
+                    self.abandon_download(context);
                     self.say(
                         BannerLevel::Error,
                         "The book was not saved. Free some space and download it again.",
                     );
                 }
-                ShelfProgress::Moving { .. } => self.job = Job::Saving { upload, size },
-                ShelfProgress::Elsewhere => {
-                    self.job = Job::Saving { upload, size };
+                _ => {
+                    self.job = Job::Writing { received, last };
                     return false;
                 }
             },
@@ -960,17 +1008,17 @@ impl Reading {
         };
         let saved = Saved {
             id,
-            file,
+            file: file.clone(),
             size,
             memory: String::new(),
         };
         if self.shelf.insert(saved) {
             self.damaged = None;
-            self.opened = true;
             self.notice = None;
             self.save(context);
+            self.open_saved(context, &file);
         } else {
-            self.view.close(context);
+            context.shelf().remove(file);
             self.say(
                 BannerLevel::Error,
                 "You have 64 downloaded books. Remove one first.",
@@ -1018,6 +1066,22 @@ impl Reading {
                 "The downloaded book is incomplete or unreadable. Open it again to download it.",
                 true,
             );
+        }
+    }
+
+    fn shelf_failed(&mut self, fault: &ShelfFault) {
+        match fault {
+            ShelfFault::Store(_) => self.damaged_copy(
+                "The downloaded book could not be loaded. Try opening it again.",
+                false,
+            ),
+            ShelfFault::Book(_) => self.damaged_copy(
+                "The downloaded book is incomplete or unreadable. Open it again to download it.",
+                true,
+            ),
+            ShelfFault::TooLarge { .. } => {
+                self.damaged_copy("This book has more text than the reader can hold.", false);
+            }
         }
     }
 
@@ -1119,39 +1183,124 @@ impl Reading {
 
     fn piece(&mut self, context: &mut Context, outcome: &TaskOutcome) -> Leave {
         let started = Instant::now();
-        let Job::Downloading { bytes, .. } = std::mem::take(&mut self.job) else {
+        let Job::Downloading { received, .. } = std::mem::take(&mut self.job) else {
             return Leave::Stay;
         };
-        let held = bytes.len();
+        let held = received;
         match outcome {
-            TaskOutcome::Completed(piece) => match books::after_piece(bytes.len(), piece.len()) {
+            TaskOutcome::Completed(piece) => match books::after_piece(
+                self.current_kind().unwrap_or(Kind::Text),
+                received,
+                piece.len(),
+            ) {
                 Piece::TooBig => {
-                    self.say(BannerLevel::Error, books::TOO_BIG);
+                    self.abandon_download(context);
+                    let kind = self.current_kind().unwrap_or(Kind::Text);
+                    self.say(BannerLevel::Error, kind.too_big());
                 }
-                next => {
-                    let mut bytes = bytes;
-                    bytes.extend_from_slice(piece);
-                    if next == Piece::More {
-                        self.job = Job::Downloading { task: None, bytes };
-                        self.fetch_piece(context);
-                    } else {
-                        self.finish_download(context, bytes);
-                    }
-                }
+                next => self.write_piece(context, received, piece, next == Piece::Whole),
             },
-            TaskOutcome::Failed(TaskError::Unauthorized) => return Leave::SignOut,
-            TaskOutcome::Failed(error) => self.say(BannerLevel::Error, task_words(*error)),
-            TaskOutcome::Cancelled => self.say(BannerLevel::Info, "Download cancelled."),
+            TaskOutcome::Failed(TaskError::Unauthorized) => {
+                self.abandon_download(context);
+                return Leave::SignOut;
+            }
+            TaskOutcome::Failed(error) => {
+                self.abandon_download(context);
+                self.say(BannerLevel::Error, task_words(*error));
+            }
+            TaskOutcome::Cancelled => {
+                self.abandon_download(context);
+                self.say(BannerLevel::Info, "Download cancelled.");
+            }
         }
         step_taken(context, "piece", started, held);
         Leave::Stay
     }
 
-    fn fetch_piece(&mut self, context: &mut Context) {
-        let Job::Downloading { bytes, .. } = &self.job else {
+    /// Sends one fetched piece to the shelf, after checking that the first
+    /// piece starts the way the promised format does.
+    fn write_piece(&mut self, context: &mut Context, received: usize, piece: &[u8], last: bool) {
+        let (Some(book), Some(file)) = (self.current.as_ref(), self.current_file()) else {
             return;
         };
-        let (Some(book), Ok(offset)) = (&self.current, u32::try_from(bytes.len())) else {
+        let Support::Reads(kind) = book.support else {
+            return;
+        };
+        if received == 0 && !books::is_what_it_claims(kind, piece) {
+            refused(context, &book.id, kind, piece, "not what it claims");
+            let why = if book.kindle {
+                "Pharos couldn't convert this Kindle book to an EPUB. It may be locked with DRM."
+                    .to_owned()
+            } else {
+                format!(
+                    "Pharos sent a file this reader can't open as {}.",
+                    kind_words(kind)
+                )
+            };
+            self.say(BannerLevel::Error, why);
+            return;
+        }
+        let (Ok(offset), Some(after)) = (
+            u32::try_from(received),
+            received
+                .checked_add(piece.len())
+                .filter(|after| u32::try_from(*after).is_ok()),
+        ) else {
+            self.abandon_download(context);
+            self.say(BannerLevel::Error, kind.too_big());
+            return;
+        };
+        context.shelf().write(file, offset, piece.to_vec(), last);
+        self.job = Job::Writing {
+            received: after,
+            last,
+        };
+    }
+
+    /// Drops whatever part of the book reached the shelf, so a half-written
+    /// copy does not hold space the next download needs.
+    fn abandon_download(&mut self, context: &mut Context) {
+        self.job = Job::Idle;
+        if let Some(file) = self.current_file() {
+            context.shelf().remove(file);
+        }
+    }
+
+    fn current_file(&self) -> Option<String> {
+        self.current.as_ref().and_then(Book::file)
+    }
+
+    fn current_kind(&self) -> Option<Kind> {
+        match self.current.as_ref()?.support {
+            Support::Reads(kind) => Some(kind),
+            Support::Cannot(_) => None,
+        }
+    }
+
+    /// Opens a saved book: an EPUB straight off the shelf, anything else
+    /// read back whole first.
+    fn open_saved(&mut self, context: &mut Context, file: &str) {
+        if self.current_kind() == Some(Kind::Epub) {
+            let memory = self
+                .current
+                .as_ref()
+                .and_then(|book| self.shelf.get(&book.id))
+                .map(|saved| Memory::decode(saved.memory.as_bytes()))
+                .unwrap_or_default();
+            self.view.open_shelf(context, file, memory);
+            self.job = Job::OpeningShelf(Instant::now());
+            return;
+        }
+        let mut local = ShelfDownload::new(file).at_most(books::MAX_BYTES);
+        local.start(context);
+        self.job = Job::Opening(local);
+    }
+
+    fn fetch_piece(&mut self, context: &mut Context) {
+        let Job::Downloading { received, .. } = &self.job else {
+            return;
+        };
+        let (Some(book), Ok(offset)) = (&self.current, u32::try_from(*received)) else {
             self.job = Job::Idle;
             return;
         };
@@ -1173,56 +1322,6 @@ impl Reading {
         }
     }
 
-    fn finish_download(&mut self, context: &mut Context, bytes: Vec<u8>) {
-        let started = Instant::now();
-        let size = bytes.len();
-        self.finish_download_steps(context, bytes);
-        step_taken(context, "finish", started, size);
-    }
-
-    fn finish_download_steps(&mut self, context: &mut Context, bytes: Vec<u8>) {
-        let (Some(book), Some(file)) = (
-            self.current.as_ref(),
-            self.current.as_ref().and_then(Book::file),
-        ) else {
-            return;
-        };
-        let Support::Reads(kind) = book.support else {
-            return;
-        };
-        if !books::is_what_it_claims(kind, &bytes) {
-            refused(context, &book.id, kind, &bytes, "not what it claims");
-            let why = if book.kindle {
-                "Pharos couldn't convert this Kindle book to an EPUB. It may be locked with DRM."
-                    .to_owned()
-            } else {
-                format!(
-                    "Pharos sent a file this reader can't open as {}.",
-                    kind_words(kind)
-                )
-            };
-            self.say(BannerLevel::Error, why);
-            return;
-        }
-        let opening = Instant::now();
-        let opened = self
-            .view
-            .open_bytes(context, &file, &bytes, Memory::default());
-        step_taken(context, "open", opening, bytes.len());
-        if let Err(error) = opened {
-            refused(context, &book.id, kind, &bytes, &error.to_string());
-            self.say(
-                BannerLevel::Error,
-                "This download is not a readable book. Check the file on Pharos.",
-            );
-            return;
-        }
-        let size = bytes.len();
-        let mut upload = ShelfUpload::new(&file, bytes);
-        upload.start(context);
-        self.job = Job::Saving { upload, size };
-    }
-
     /// A tap or a key. `Leave::Back` returns to the albums.
     pub fn action(&mut self, context: &mut Context, action: ActionId) -> Leave {
         if self.opened {
@@ -1233,11 +1332,19 @@ impl Reading {
             return Leave::Stay;
         }
         if action == action_id("books-cancel") {
-            if let Job::Downloading { task, .. } = std::mem::take(&mut self.job) {
-                if let Some(task) = task {
-                    context.cancel(task);
+            match std::mem::take(&mut self.job) {
+                Job::Downloading { task, .. } => {
+                    if let Some(task) = task {
+                        context.cancel(task);
+                    }
+                    self.abandon_download(context);
+                    self.say(BannerLevel::Info, "Download cancelled.");
                 }
-                self.say(BannerLevel::Info, "Download cancelled.");
+                Job::Writing { .. } => {
+                    self.abandon_download(context);
+                    self.say(BannerLevel::Info, "Download cancelled.");
+                }
+                other => self.job = other,
             }
             return Leave::Stay;
         }
@@ -1467,9 +1574,7 @@ impl Reading {
         let here = known && self.damaged.as_deref() != Some(&book.id);
         self.current = Some(book);
         if here {
-            let mut local = ShelfDownload::new(&file).at_most(books::MAX_BYTES);
-            local.start(context);
-            self.job = Job::Opening(local);
+            self.open_saved(context, &file);
         } else if !known && self.shelf.saved.len() >= books::MAX_DOWNLOADED {
             self.say(
                 BannerLevel::Error,
@@ -1478,7 +1583,7 @@ impl Reading {
         } else {
             self.job = Job::Downloading {
                 task: None,
-                bytes: Vec::new(),
+                received: 0,
             };
             self.fetch_piece(context);
         }

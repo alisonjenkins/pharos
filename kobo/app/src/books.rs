@@ -12,12 +12,16 @@ use kobo_json::{ObjectBuilder, Value};
 
 /// The store key of the downloaded-books record.
 pub const KEY: &str = "books-v1";
-/// The most a downloaded book may be: the most Cobalt's shelf takes in one
-/// file. The whole file is held in memory to parse it, on a reader shared
-/// with the stock software.
+/// The most a book read whole into memory may be: text, Markdown and web
+/// pages are parsed in one piece, on a reader shared with the stock software.
 pub const MAX_BYTES: usize = kobo_sdk::MAX_SHELF_DOWNLOAD;
+/// The most an EPUB may be. It is read off the card a part at a time, so the
+/// only bound is the largest file Cobalt's shelf holds: one byte under 4 GiB.
+pub const MAX_EPUB_BYTES: usize = 4_294_967_295;
 /// [`MAX_BYTES`] in the words the reader shows.
 pub const TOO_BIG: &str = "This book is over the 64 MB limit.";
+/// [`MAX_EPUB_BYTES`] in the words the reader shows.
+pub const EPUB_TOO_BIG: &str = "This book is over the 4 GB limit.";
 /// How much of a book one request fetches.
 pub const CHUNK: u32 = 256 * 1024;
 /// How much more of a book must arrive before the progress shown moves. Each
@@ -50,6 +54,24 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The largest file of this kind the reader opens.
+    #[must_use]
+    pub const fn max_bytes(self) -> usize {
+        match self {
+            Self::Epub => MAX_EPUB_BYTES,
+            Self::Text | Self::Markdown | Self::Html => MAX_BYTES,
+        }
+    }
+
+    /// [`Self::max_bytes`] in the words the reader shows.
+    #[must_use]
+    pub const fn too_big(self) -> &'static str {
+        match self {
+            Self::Epub => EPUB_TOO_BIG,
+            Self::Text | Self::Markdown | Self::Html => TOO_BIG,
+        }
+    }
+
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
@@ -286,9 +308,9 @@ pub enum Piece {
 /// of the piece size ends with an empty piece, which the runtime reports as
 /// the end of the file.
 #[must_use]
-pub fn after_piece(received_before: usize, piece: usize) -> Piece {
+pub fn after_piece(kind: Kind, received_before: usize, piece: usize) -> Piece {
     let total = received_before.saturating_add(piece);
-    if piece > CHUNK as usize || total > MAX_BYTES {
+    if piece > CHUNK as usize || total > kind.max_bytes() {
         Piece::TooBig
     } else if piece == CHUNK as usize {
         Piece::More
@@ -411,7 +433,10 @@ impl Shelf {
                 size: text("size")?.parse().ok()?,
                 memory: text("memory")?.to_owned(),
             };
-            if !kobo_sdk::is_valid_key(&saved.file) || saved.size == 0 || saved.size > MAX_BYTES {
+            if !kobo_sdk::is_valid_key(&saved.file)
+                || saved.size == 0
+                || saved.size > MAX_EPUB_BYTES
+            {
                 return None;
             }
             if !shelf.insert(saved) {
@@ -599,13 +624,26 @@ mod tests {
     #[test]
     fn a_download_goes_on_while_pieces_are_full_and_stops_at_the_limit() {
         let chunk = CHUNK as usize;
-        assert_eq!(after_piece(0, chunk), Piece::More);
-        assert_eq!(after_piece(chunk, 10), Piece::Whole);
-        assert_eq!(after_piece(chunk, 0), Piece::Whole);
-        assert_eq!(after_piece(MAX_BYTES - chunk, chunk), Piece::More);
-        assert_eq!(after_piece(MAX_BYTES, 1), Piece::TooBig);
+        let text = Kind::Text;
+        assert_eq!(after_piece(text, 0, chunk), Piece::More);
+        assert_eq!(after_piece(text, chunk, 10), Piece::Whole);
+        assert_eq!(after_piece(text, chunk, 0), Piece::Whole);
+        assert_eq!(after_piece(text, MAX_BYTES - chunk, chunk), Piece::More);
+        assert_eq!(after_piece(text, MAX_BYTES, 1), Piece::TooBig);
         assert_eq!(MAX_BYTES, 64 * 1024 * 1024, "TOO_BIG names this size");
-        assert_eq!(after_piece(0, chunk + 1), Piece::TooBig);
+        assert_eq!(after_piece(text, 0, chunk + 1), Piece::TooBig);
+    }
+
+    #[test]
+    fn an_epub_is_bounded_by_the_shelf_not_by_memory() {
+        let epub = Kind::Epub;
+        assert_eq!(after_piece(epub, MAX_BYTES, 1), Piece::Whole);
+        assert_eq!(after_piece(epub, MAX_EPUB_BYTES, 1), Piece::TooBig);
+        assert_eq!(
+            u64::try_from(MAX_EPUB_BYTES),
+            Ok(kobo_sdk::MAX_SHELF_BLOB_BYTES),
+            "the largest blob the shelf takes"
+        );
     }
 
     #[test]
