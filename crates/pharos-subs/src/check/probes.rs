@@ -141,9 +141,12 @@ fn eligible(script: &Script) -> Vec<Eligible> {
         .collect();
     cues.sort_by_key(|c| c.start_ms);
     let keys: Vec<String> = cues.iter().map(|c| key(&c.text)).collect();
-    for (i, cue) in cues.iter_mut().enumerate() {
-        let k = keys.get(i).map_or("", String::as_str);
-        cue.unique = keys.iter().filter(|o| o.as_str() == k).count() == 1;
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for k in &keys {
+        *counts.entry(k.as_str()).or_default() += 1;
+    }
+    for (cue, k) in cues.iter_mut().zip(&keys) {
+        cue.unique = counts.get(k.as_str()) == Some(&1);
     }
     cues
 }
