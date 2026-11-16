@@ -337,30 +337,35 @@ impl Pharos {
         self.describe_next(context);
     }
 
-    /// Asks pharos about the next album on the home screen that only its
-    /// track has named, for its cover and whether it is an audiobook.
+    /// Asks pharos about the albums on the home screen that only their
+    /// tracks have named, for each one's cover and whether it is an
+    /// audiobook: two at a time, so the row settles in one round rather
+    /// than one album after another, and covers still find a free slot.
     fn describe_next(&mut self, context: &mut Context) {
-        if self
-            .tasks
-            .iter()
-            .any(|(_, work)| matches!(work, Work::ListeningAlbum { .. }))
-        {
-            return;
-        }
-        let Some(account) = &self.account else {
+        const AT_ONCE: usize = 2;
+        let Some(account) = self.account.clone() else {
             return;
         };
-        let Some(next) = self
+        let asking: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|(_, work)| match work {
+                Work::ListeningAlbum { id } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let next: Vec<String> = self
             .listening
             .iter()
             .take(Self::home_columns(context))
-            .find(|resumed| !resumed.described)
-        else {
-            return;
-        };
-        let id = next.album.id.clone();
-        let url = api::item_url(SERVER, account, &id);
-        self.fetch(context, url, Work::ListeningAlbum { id });
+            .filter(|resumed| !resumed.described && !asking.contains(&resumed.album.id))
+            .map(|resumed| resumed.album.id.clone())
+            .take(AT_ONCE.saturating_sub(asking.len()))
+            .collect();
+        for id in next {
+            let url = api::item_url(SERVER, &account, &id);
+            self.fetch(context, url, Work::ListeningAlbum { id });
+        }
     }
 
     /// Settles one album of the row: described when pharos answered, as the
@@ -579,6 +584,18 @@ impl Pharos {
             }
             fetching += 1;
         }
+    }
+    /// Whether the home screen is still waiting on pharos: for its
+    /// libraries, what was played last, a description of an album in it, or
+    /// a cover it shows.
+    fn home_loading(&self, context: &Context) -> bool {
+        self.tasks.iter().any(|(_, work)| {
+            matches!(
+                work,
+                Work::Views | Work::Listening | Work::ListeningAlbum { .. }
+            )
+        }) || self.reading.recent_loading()
+            || self.page_covers_pending(context)
     }
 
     /// Whether a cover on the shelf page showing is still to come: asked
@@ -1592,6 +1609,12 @@ impl KoboApp for Pharos {
             self.reading.loaded(&result);
             self.reading.fetch_known(context);
             self.refresh_covers(context);
+            if matches!(self.view, View::Home) {
+                if !self.home_loading(context) {
+                    self.show_if_changed(context);
+                }
+                return;
+            }
             self.show(context);
         } else {
             self.on_store(context, result);
@@ -1748,6 +1771,12 @@ impl KoboApp for Pharos {
                 self.sign_out(context);
             }
             self.refresh_covers(context);
+            if matches!(self.view, View::Home) {
+                if !self.home_loading(context) {
+                    self.show_if_changed(context);
+                }
+                return;
+            }
             self.show(context);
             return;
         }
@@ -1756,6 +1785,11 @@ impl KoboApp for Pharos {
         };
         let (_, work) = self.tasks.swap_remove(position);
         let was_cover = matches!(work, Work::Cover { .. });
+        let home_work = was_cover
+            || matches!(
+                work,
+                Work::Views | Work::Listening | Work::ListeningAlbum { .. }
+            );
         if self.report_timer == Some(task) {
             self.report_timer = None;
         }
@@ -1769,6 +1803,11 @@ impl KoboApp for Pharos {
         // message, so a page whose covers were drawn as each arrived took one
         // panel update per cover. They are drawn together once all are in.
         if was_cover && self.page_covers_pending(context) {
+            return;
+        }
+        // The home screen is drawn once, when what it lists and the covers
+        // it shows are all in, not once per answer on the way (B1457).
+        if home_work && matches!(self.view, View::Home) && self.home_loading(context) {
             return;
         }
         self.show_if_changed(context);

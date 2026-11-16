@@ -182,6 +182,14 @@ impl Reading {
             .find(|book| book.id == id)
     }
 
+    /// Whether the home screen's Continue reading row is still waiting on
+    /// pharos describing the books read here. The record of them is local
+    /// and is not waited for.
+    #[must_use]
+    pub fn recent_loading(&self) -> bool {
+        self.known_task.is_some()
+    }
+
     /// The books read on this reader, the most recently read first, as far
     /// as pharos has described them (V1445).
     #[must_use]
