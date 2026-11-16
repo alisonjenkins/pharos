@@ -3,6 +3,7 @@
 //! host fetches and stores the URLs under their exact text.
 
 use crate::playlist::{parse_master, parse_media, ParseError};
+use crate::uri::resolve;
 
 /// What a master playlist leads to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +69,19 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         .last()
         .filter(|s| s.duration_ms < SHORT_TAIL_MS)
         .map(|s| s.uri.clone());
-    let files = media
-        .init_uri
+    // A multi-part film names one `EXT-X-MAP` per part (after each
+    // discontinuity), and the parser keeps only the last: list them all.
+    let mut inits: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#EXT-X-MAP:"))
+        .filter_map(map_uri)
+        .map(|uri| resolve(url, uri))
+        .collect();
+    if inits.is_empty() {
+        inits.extend(media.init_uri);
+    }
+    inits.dedup();
+    let files = inits
         .into_iter()
         .chain(media.segments.into_iter().map(|s| s.uri))
         .collect();
@@ -78,6 +90,13 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         duration_ms,
         short_tail,
     })
+}
+
+/// The `URI="..."` value of an `EXT-X-MAP` tag's attributes.
+fn map_uri(attributes: &str) -> Option<&str> {
+    let start = attributes.find("URI=\"")? + 5;
+    let rest = &attributes[start..];
+    rest.find('"').map(|end| &rest[..end])
 }
 
 /// The bytes a stream of `bandwidth_bps` lasting `duration_ms` takes.
@@ -132,6 +151,26 @@ mod tests {
         );
         assert_eq!(plan.duration_ms, 10_500);
         assert_eq!(plan.short_tail, None);
+    }
+
+    /// A multi-part film's playlist gives each part its own init after a
+    /// discontinuity; every one is planned.
+    #[test]
+    fn every_part_init_of_a_multi_part_playlist_is_planned() {
+        let text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
+            #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init-a.mp4?p=1\"\n\
+            #EXTINF:6.0,\na0.m4s?p=1\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init-b.mp4?p=1\"\n\
+            #EXTINF:6.0,\nb0.m4s?p=1\n#EXT-X-ENDLIST\n";
+        let plan = plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", text).unwrap();
+        assert_eq!(
+            plan.files,
+            [
+                "https://h/videos/9/h264cmaf/init-a.mp4?p=1",
+                "https://h/videos/9/h264cmaf/init-b.mp4?p=1",
+                "https://h/videos/9/h264cmaf/a0.m4s?p=1",
+                "https://h/videos/9/h264cmaf/b0.m4s?p=1",
+            ]
+        );
     }
 
     #[test]
