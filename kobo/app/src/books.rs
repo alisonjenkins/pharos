@@ -193,6 +193,12 @@ pub fn download_url(server: &str, book: &str) -> String {
     format!("{server}/Items/{}/Download", query_escape(book))
 }
 
+/// The book's first pages as plain text, with the account's header.
+#[must_use]
+pub fn opening_url(server: &str, book: &str) -> String {
+    format!("{server}/Items/{}/Opening", query_escape(book))
+}
+
 fn author_of(item: &Value) -> String {
     let named = |value: &Value| {
         value
@@ -487,6 +493,18 @@ mod tests {
         assert_eq!(
             download_url("https://p.test", "a/b"),
             "https://p.test/Items/a%2Fb/Download"
+        );
+    }
+
+    #[test]
+    fn the_opening_is_the_items_first_pages_and_carries_no_token() {
+        assert_eq!(
+            opening_url("https://p.test", "ab12"),
+            "https://p.test/Items/ab12/Opening"
+        );
+        assert_eq!(
+            opening_url("https://p.test", "a/b"),
+            "https://p.test/Items/a%2Fb/Opening"
         );
     }
 
