@@ -169,6 +169,8 @@ pub const ICON_TICK: &str = "M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2Z"
 pub const ICON_PLAY: &str =
     "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z";
 /// Two people, for Watch together.
+/// A tray with an arrow into it: save to this device.
+pub const ICON_DOWNLOAD: &str = "M5 20h14v-2H5v2Zm14-9h-4V3H9v8H5l7 7 7-7Z";
 pub const ICON_TOGETHER: &str = "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7 0a3 3 0 1 0 0-6v6Zm-7 2c-4 0-7 2-7 4.5V20h14v-2.5C16 15 13 13 9 13Zm8 0c1.8.8 3 2.4 3 4.5V20h2v-2.5c0-2.2-2.2-4-5-4.5Z";
 
 /// An `<a>` to a route. A plain click navigates in place; a modified click
@@ -1851,6 +1853,18 @@ pub fn TitleView(
                             tracks: vec![item.clone()],
                             album: None,
                             kind: QueueTarget::VideoPage,
+                        }
+                    }
+                    if video_kind(item.kind) {
+                        // B1474/V1456: the file itself, for a player like
+                        // VLC when there will be no signal.
+                        a {
+                            class: "pharos-button pharos-button-secondary pharos-download-file is-icon",
+                            href: reader::version_href(item.id, &version),
+                            download: "",
+                            title: "Download file",
+                            Icon { path: ICON_DOWNLOAD }
+                            span { class: "pharos-button-label", "Download file" }
                         }
                     }
                     if item.kind.playable() {
@@ -3654,6 +3668,22 @@ mod tests {
         assert!(picks.contains("tracks"), "{picks}");
         let facts = between(&html, r#"class="pharos-title-facts""#, "pharos-actions");
         assert!(facts.contains("pharos-ratings"), "{facts}");
+    }
+
+    /// B1474/V1456: a film's actions offer its file, of the version picked,
+    /// as a download, so it can be played with no signal. Disarm check:
+    /// dropping the link fails the lookup.
+    #[test]
+    fn a_films_actions_offer_its_file_as_a_download() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            rsx! { TitleView { detail: detail.clone(), tracks: None, version: "b".to_string() } }
+        });
+        let actions = between(&html, r#"class="pharos-actions""#, "pharos-title-picks");
+        let link = between(actions, "pharos-download-file", "</a>");
+        assert!(link.contains(r#"href="/Items/"#) && link.contains("/Download?mediaSourceId="), "{actions}");
+        assert!(link.contains("-b"), "{link}");
+        assert!(link.contains("download") && link.contains(">Download file<"), "{link}");
     }
 
     /// B1356/V1327: an episode's file facts, its path among them, sit under
