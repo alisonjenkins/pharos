@@ -7612,17 +7612,18 @@ fn Player(
             // A stop at the end is how the server marks an item watched,
             // once, whether or not an earlier stop (page hide) went first.
             let at = total_ms(&media.peek(), p.detail.item.runtime_ms);
-            if p.save_offline(0) {
-                return;
-            }
-            let Some(grant) = p.grant.borrow().clone() else {
-                return;
+            let grant = if p.save_offline(0) {
+                None
+            } else {
+                p.grant.borrow().clone()
             };
-            platform::spawn_detached(async move {
-                if let Err(e) = grant.stop(&call("watch", "finish"), at).await {
-                    platform::warn(&format!("pharos: marking watched failed: {e}"));
-                }
-            });
+            if let Some(grant) = grant {
+                platform::spawn_detached(async move {
+                    if let Err(e) = grant.stop(&call("watch", "finish"), at).await {
+                        platform::warn(&format!("pharos: marking watched failed: {e}"));
+                    }
+                });
+            }
             // In a group the group moves on, and its item brings every
             // member there; two members' up next moving it at once move it
             // once (014 US9).
