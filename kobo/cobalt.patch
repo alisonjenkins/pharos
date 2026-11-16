@@ -47,17 +47,24 @@ index 8e3f1bb..ebf319f 100644
          let encoded = reading.write.clone().unwrap();
          reading.store(
 diff --git a/crates/kobo-bookview/src/lib.rs b/crates/kobo-bookview/src/lib.rs
-index 9875021..418b6bc 100644
+index 9875021..297a63f 100644
 --- a/crates/kobo-bookview/src/lib.rs
 +++ b/crates/kobo-bookview/src/lib.rs
-@@ -49,20 +49,28 @@ pub mod offline;
+@@ -47,22 +47,34 @@ pub mod comic;
+ pub mod illustrations;
+ pub mod offline;
  pub mod positions;
++mod shelved;
++
++pub use shelved::ShelfFault;
  
  use kobo_doc::{Block, Document, FORMULA_PICTURE_EM, FORMULA_PICTURE_PREFIX};
 -use kobo_read::{Memory, Outcome, Reader};
 +use kobo_read::{Locator, Memory, Outcome, Reader};
  use kobo_sdk::{
-     Context, DisplayMetrics, PictureHandle, Screen, Task, TaskId, TaskOutcome, TilePicture,
+-    Context, DisplayMetrics, PictureHandle, Screen, Task, TaskId, TaskOutcome, TilePicture,
++    Context, DisplayMetrics, PictureHandle, Screen, StoreError, StoreResult, Task, TaskId,
++    TaskOutcome, TilePicture,
  };
  
 -/// The most pictures one document may have room reserved for.
@@ -86,7 +93,7 @@ index 9875021..418b6bc 100644
  /// The handle illustrations are numbered from.
  ///
  /// An application draws other things through the same runtime -- a shelf of
-@@ -90,6 +98,28 @@ pub const MAX_PICTURE_BYTES: u32 = 4 * 1024 * 1024;
+@@ -90,6 +102,28 @@ pub const MAX_PICTURE_BYTES: u32 = 4 * 1024 * 1024;
  /// The longest a picture's address may be.
  const MAX_PICTURE_NAME: usize = 512;
  
@@ -115,7 +122,7 @@ index 9875021..418b6bc 100644
  /// How long one pass may spend typesetting formulae.
  ///
  /// Chosen by subtraction from the runtime's 250 ms callback deadline. A pass
-@@ -160,9 +190,22 @@ pub struct BookView {
+@@ -160,9 +194,22 @@ pub struct BookView {
      /// arrives late has to be merged into what was reserved at open, and the
      /// reader takes the whole map or none of it.
      reserved: BTreeMap<String, TilePicture>,
@@ -132,7 +139,7 @@ index 9875021..418b6bc 100644
 +    /// runtime's cache holds megabytes and a book carries hundreds of
 +    /// megapixels, so decoding every plate once, down the book, left the
 +    /// cache holding the last few and the pages near the start blank.
-+    sources: BTreeMap<String, Vec<u8>>,
++    sources: BTreeMap<String, Source>,
 +    /// What the runtime is holding pixels for, by name, with the bytes it
 +    /// charges for each.
 +    held: BTreeMap<String, usize>,
@@ -141,20 +148,175 @@ index 9875021..418b6bc 100644
      /// Formulae the document named and nothing has typeset yet, as the LaTeX
      /// to set them from, in the order the text refers to them.
      ///
-@@ -260,9 +303,9 @@ impl BookView {
+@@ -198,6 +245,44 @@ pub struct BookView {
+     fetching: Option<(TaskId, String)>,
+     /// Some formulas in the open HTML were left as text past the picture budget.
+     formulae_as_text: bool,
++    /// The blob on the shelf the open book is read from, and its size.
++    blob: Option<(String, usize)>,
++    /// A book being opened off the shelf, and the place to open it at.
++    opening: Option<(String, shelved::Opening, Memory)>,
++    /// The picture being read off the shelf, where it lies, and what of it
++    /// has come so far.
++    reading: Option<(String, kobo_doc::zip::Location, shelved::Span)>,
++    /// A picture read off the shelf and waiting to be decoded.
++    loaded: Option<(String, Vec<u8>)>,
++    /// The blob a shelf read is outstanding against, if one is.
++    asked: Option<String>,
++    /// Shelf answers still to come for reads a closed book asked for, by blob.
++    ///
++    /// The shelf answers in the order it was asked, so these come before any
++    /// answer to a read asked since, and are known by counting.
++    stale: BTreeMap<String, usize>,
++}
++
++/// Where a picture's bytes are.
++#[derive(Debug)]
++enum Source {
++    /// In memory, as they came.
++    Bytes(Vec<u8>),
++    /// On the shelf, in the open book's blob, to be read when wanted.
++    Shelf(kobo_doc::zip::Location),
++}
++
++/// What a shelf answer did to the view.
++#[derive(Debug, Eq, PartialEq)]
++pub enum ShelfStep {
++    /// The answer was not for this view.
++    Elsewhere,
++    /// The answer was taken, and nothing on the page changed.
++    Busy,
++    /// The book asked for with [`BookView::open_shelf`] is open. Draw it.
++    Opened,
++    /// The book asked for will not open, and the view holds nothing.
++    Failed(ShelfFault),
+ }
+ 
+ impl BookView {
+@@ -260,10 +345,118 @@ impl BookView {
      /// Opens a document that has already been parsed.
      ///
      /// The pictures the container carried are taken off the document rather
 -    /// than left on it: the reader owns the document from here, and holding
 -    /// the scanned bytes as well as the decoded greyscale meant every plate
 -    /// was paid for twice.
+-    pub fn open(&mut self, context: &mut Context, mut document: Document, memory: Memory) {
 +    /// than left on it: the reader owns the document from here, and the view
 +    /// keeps each picture's bytes once, to decode it again whenever the reader
 +    /// comes back near it.
-     pub fn open(&mut self, context: &mut Context, mut document: Document, memory: Memory) {
++    pub fn open(&mut self, context: &mut Context, document: Document, memory: Memory) {
++        self.open_measured(context, document, memory, &BTreeMap::new());
++    }
++
++    /// Starts opening the EPUB stored on the shelf as `blob`.
++    ///
++    /// Only the parts of the book the text is made of are read, a quarter of
++    /// a megabyte at a time, and each picture is measured from its first
++    /// bytes and read whole only when the reader comes near it. So a book is
++    /// held in memory at the size of its text, whatever its pictures come to.
++    ///
++    /// Nothing is open until [`BookView::shelf`] says [`ShelfStep::Opened`];
++    /// every shelf answer goes there first.
++    pub fn open_shelf(&mut self, context: &mut Context, blob: &str, memory: Memory) {
++        self.release(context);
++        self.reader = None;
++        let (opening, read) = shelved::Opening::start();
++        self.opening = Some((blob.to_owned(), opening, memory));
++        self.ask(context, blob, read);
++    }
++
++    fn ask(&mut self, context: &mut Context, blob: &str, (offset, length): (u32, u32)) {
++        context.shelf().read(blob, offset, length);
++        self.asked = Some(blob.to_owned());
++    }
++
++    /// Takes a shelf answer, if it is one this view asked for.
++    ///
++    /// An application passes every shelf answer here, with the name of the
++    /// blob it was for, before handling it itself.
++    pub fn shelf(&mut self, context: &mut Context, name: &str, result: &StoreResult) -> ShelfStep {
++        if let Some(count) = self.stale.get_mut(name) {
++            *count -= 1;
++            if *count == 0 {
++                self.stale.remove(name);
++            }
++            return ShelfStep::Busy;
++        }
++        if self.asked.as_deref() != Some(name) {
++            return ShelfStep::Elsewhere;
++        }
++        self.asked = None;
++        let answer = match result {
++            StoreResult::ShelfRead {
++                offset,
++                bytes,
++                size,
++                ..
++            } => Ok((*offset, bytes.as_slice(), *size)),
++            StoreResult::Denied(error) => Err(*error),
++            _ => Err(StoreError::Missing),
++        };
++        if let Some((blob, mut opening, memory)) = self.opening.take() {
++            let next = answer
++                .map_err(ShelfFault::Store)
++                .and_then(|(offset, bytes, size)| opening.answer(offset, bytes, size));
++            return match next {
++                Ok(shelved::Next::Read(offset, length)) => {
++                    self.opening = Some((blob.clone(), opening, memory));
++                    self.ask(context, &blob, (offset, length));
++                    ShelfStep::Busy
++                }
++                Ok(shelved::Next::Done(document, measured, size)) => {
++                    self.open_measured(context, document, memory, &measured);
++                    self.blob = Some((blob, size));
++                    ShelfStep::Opened
++                }
++                Err(fault) => ShelfStep::Failed(fault),
++            };
++        }
++        if let Some((picture, place, mut span)) = self.reading.take() {
++            let whole = answer.and_then(|(offset, bytes, size)| {
++                let expected = self.blob.as_ref().map(|(_, size)| *size);
++                if Some(usize::try_from(size).unwrap_or(usize::MAX)) != expected {
++                    return Err(StoreError::Missing);
++                }
++                span.take(offset, bytes)
++            });
++            match whole {
++                Ok(false) => {
++                    let read = span.request();
++                    self.reading = Some((picture, place, span));
++                    self.ask(context, name, read);
++                    return ShelfStep::Busy;
++                }
++                Ok(true) => match shelved::unpack(&span.into_bytes(), &place) {
++                    Some(bytes) => self.loaded = Some((picture, bytes)),
++                    None => {
++                        self.sources.remove(&picture);
++                    }
++                },
++                // A picture that will not read reads as its description, and
++                // is not asked for again.
++                Err(_) => {
++                    self.sources.remove(&picture);
++                }
++            }
++            self.kick(context);
++        }
++        ShelfStep::Busy
++    }
++
++    fn open_measured(
++        &mut self,
++        context: &mut Context,
++        mut document: Document,
++        memory: Memory,
++        measured: &BTreeMap<String, ((u32, u32), kobo_doc::zip::Location)>,
++    ) {
          self.formulae_as_text = false;
          // Whatever the last document handed over is about to be replaced, so
-@@ -299,18 +342,23 @@ impl BookView {
+         // it goes back first. Without this, a book reopened from the shelf
+@@ -299,18 +492,25 @@ impl BookView {
                  }
                  continue;
              }
@@ -162,6 +324,8 @@ index 9875021..418b6bc 100644
 +            if self.reserved.len() < MAX_BOOK_PICTURES {
                  if let Some(bytes) = images.get(&name) {
                      self.reserve(&name, bytes, &metrics);
++                } else if let Some(&(size, place)) = measured.get(&name) {
++                    self.claim(&name, size, Source::Shelf(place), &metrics);
                  }
              }
          }
@@ -180,7 +344,7 @@ index 9875021..418b6bc 100644
          self.match_light(context);
      }
  
-@@ -526,15 +574,15 @@ impl BookView {
+@@ -526,15 +726,15 @@ impl BookView {
      /// back to page one of something they were halfway through.
      ///
      /// Answers whether there was a document to put back.
@@ -204,7 +368,7 @@ index 9875021..418b6bc 100644
      }
  
      /// Re-measure an open document after a panel or orientation change.
-@@ -583,6 +631,8 @@ impl BookView {
+@@ -583,6 +783,8 @@ impl BookView {
              Outcome::Elsewhere => return None,
              handled => handled,
          };
@@ -213,7 +377,7 @@ index 9875021..418b6bc 100644
          if self.plating.is_none()
              && (!self.plates.is_empty() || self.dithering.is_some() || !self.unset.is_empty())
          {
-@@ -725,7 +775,7 @@ impl BookView {
+@@ -725,7 +927,7 @@ impl BookView {
          if let Some(reader) = &mut self.reader {
              reader.set_pictures(reserved, &metrics);
          }
@@ -222,12 +386,36 @@ index 9875021..418b6bc 100644
          true
      }
  
-@@ -773,16 +823,16 @@ impl BookView {
+@@ -745,10 +947,21 @@ impl BookView {
+         if !self.room_for(name) {
+             return false;
+         }
+-        let Some((width, height)) = plate_box(metrics) else {
++        let Ok(source) = kobo_image::size(bytes) else {
+             return false;
+         };
+-        let Ok(source) = kobo_image::size(bytes) else {
++        self.claim(name, source, Source::Bytes(bytes.to_vec()), metrics)
++    }
++
++    /// Claims room for a picture `source` pixels in size.
++    fn claim(
++        &mut self,
++        name: &str,
++        source: (u32, u32),
++        bytes: Source,
++        metrics: &DisplayMetrics,
++    ) -> bool {
++        let Some((width, height)) = plate_box(metrics) else {
+             return false;
+         };
+         // The size claimed here is the size the page is laid out at, so it has
+@@ -773,16 +986,16 @@ impl BookView {
              TilePicture::new(handle, drawn_width, drawn_height),
          );
          self.handles.push(handle);
 -        self.plates.push_back((name.to_owned(), bytes.to_vec()));
-+        self.sources.insert(name.to_owned(), bytes.to_vec());
++        self.sources.insert(name.to_owned(), bytes);
          true
      }
  
@@ -243,15 +431,15 @@ index 9875021..418b6bc 100644
      /// for itself, and a paper wants hundreds: measured over a 163-page paper
      /// carrying 231 of them, all of the mathematics together came to 764 KB.
      ///
-@@ -798,10 +848,103 @@ impl BookView {
+@@ -798,8 +1011,101 @@ impl BookView {
          held < if formula {
              kobo_doc::MAX_FORMULA_PICTURES
          } else {
 -            MAX_PICTURES
 +            MAX_BOOK_PICTURES
-         }
-     }
- 
++        }
++    }
++
 +    /// The pictures worth holding decoded from where the reader is, nearest
 +    /// first, as many as fit in [`PLATE_BUDGET`].
 +    ///
@@ -330,7 +518,7 @@ index 9875021..418b6bc 100644
 +            if let Some(handle) = self.handed(&name) {
 +                context.drop_picture(handle);
 +            }
-+        }
+         }
 +        if self
 +            .dithering
 +            .as_ref()
@@ -343,12 +531,21 @@ index 9875021..418b6bc 100644
 +            .into_iter()
 +            .filter(|name| !self.held.contains_key(name) && Some(name) != dithering.as_ref())
 +            .collect();
-+    }
-+
+     }
+ 
      /// Asks the runtime to carry the pipeline forward, if there is anything
-     /// left to carry and nothing already carrying it.
-     fn kick(&mut self, context: &mut Context) {
-@@ -848,6 +991,9 @@ impl BookView {
+@@ -810,6 +1116,10 @@ impl BookView {
+         {
+             return;
+         }
++        // The answer to the read in flight carries the pipeline on itself.
++        if self.reading.is_some() && self.dithering.is_none() && self.unset.is_empty() {
++            return;
++        }
+         self.plating = context.spawn(Task::Sleep { seconds: 0 });
+     }
+ 
+@@ -848,6 +1158,9 @@ impl BookView {
                  .map(str::to_owned)
                  .collect()
          });
@@ -358,7 +555,7 @@ index 9875021..418b6bc 100644
          // Formulae first, and their own pass. Typesetting one is a different
          // shape of work from turning a photograph into sixteen greys -- small
          // enough to do several of in the time one plate takes -- and mixing
-@@ -865,6 +1011,7 @@ impl BookView {
+@@ -865,6 +1178,7 @@ impl BookView {
              let (drawn_width, drawn_height) = (picture.width(), picture.height());
              if let Some(reserved) = self.handed(&name) {
                  let colour = picture.colour().map(<[u8]>::to_vec);
@@ -366,7 +563,7 @@ index 9875021..418b6bc 100644
                  if context
                      .put_picture_shown(
                          reserved,
-@@ -874,30 +1021,35 @@ impl BookView {
+@@ -874,30 +1188,50 @@ impl BookView {
                          colour,
                      )
                      .is_some()
@@ -388,8 +585,23 @@ index 9875021..418b6bc 100644
                  if self.handed(&name).is_none() {
                      continue;
                  }
-+                let Some(bytes) = self.sources.get(&name) else {
-+                    continue;
++                let read = self.loaded.take_if(|(loaded, _)| *loaded == name);
++                let bytes = match (&read, self.sources.get(&name)) {
++                    (_, None) => continue,
++                    (Some((_, bytes)), _) | (None, Some(Source::Bytes(bytes))) => bytes.as_slice(),
++                    (None, Some(Source::Shelf(place))) => {
++                        // Read off the card first; its answer comes back here.
++                        if self.reading.is_none() && self.asked.is_none() {
++                            if let Some((blob, _)) = self.blob.clone() {
++                                let span = shelved::Span::new(place.at, place.end);
++                                let first = span.request();
++                                self.reading = Some((name.clone(), *place, span));
++                                self.ask(context, &blob, first);
++                            }
++                        }
++                        self.plates.push_front(name);
++                        break;
++                    }
 +                };
                  // Read in colour only for a panel that will show it: a colour
                  // read costs twice the memory of a grey one at its peak, and a
@@ -408,7 +620,7 @@ index 9875021..418b6bc 100644
                      continue;
                  };
                  let (box_width, box_height) = if name.starts_with(FORMULA_PICTURE_PREFIX) {
-@@ -906,6 +1058,7 @@ impl BookView {
+@@ -906,6 +1240,7 @@ impl BookView {
                      (width, height)
                  };
                  let Ok(picture) = picture.fit(box_width, box_height) else {
@@ -416,7 +628,7 @@ index 9875021..418b6bc 100644
                      continue;
                  };
                  self.dithering = Some((name, picture));
-@@ -976,18 +1129,6 @@ impl BookView {
+@@ -976,18 +1311,6 @@ impl BookView {
          self.unset = wanted.into_iter().chain(rest).collect();
      }
  
@@ -435,7 +647,18 @@ index 9875021..418b6bc 100644
      /// The handle a plate was reserved against, if it was.
      fn handed(&self, name: &str) -> Option<PictureHandle> {
          self.reserved.get(name).map(|picture| picture.handle)
-@@ -1003,6 +1144,9 @@ impl BookView {
+@@ -999,10 +1322,20 @@ impl BookView {
+     /// reading any more. A sleep already in flight is left to land and be
+     /// ignored: cancelling it would cost a message to save nothing.
+     fn release(&mut self, context: &mut Context) {
++        if let Some(blob) = self.asked.take() {
++            *self.stale.entry(blob).or_default() += 1;
++        }
++        self.blob = None;
++        self.opening = None;
++        self.reading = None;
++        self.loaded = None;
+         for handle in self.handles.drain(..) {
              context.drop_picture(handle);
          }
          self.plates.clear();
@@ -445,16 +668,165 @@ index 9875021..418b6bc 100644
          self.unset.clear();
          self.offered.clear();
          self.reserved.clear();
-@@ -1144,6 +1288,8 @@ mod tests {
+@@ -1143,10 +1476,15 @@ mod tests {
+         );
      }
  
-     use super::{picture_url, pictures_in, BookView, Step};
+-    use super::{picture_url, pictures_in, BookView, Step};
 +    #[cfg(feature = "raster")]
 +    use super::{picture_cost, PLATE_BUDGET};
++    use super::{picture_url, pictures_in, BookView, ShelfStep, Step};
      use kobo_doc::{Block, Document};
      use kobo_read::{Memory, Reader};
-     use kobo_sdk::{Command, Context, PictureHandle, Task, TaskError, TaskId, TaskOutcome};
-@@ -1529,6 +1675,199 @@ mod tests {
+-    use kobo_sdk::{Command, Context, PictureHandle, Task, TaskError, TaskId, TaskOutcome};
++    use kobo_sdk::{
++        Command, Context, PictureHandle, StoreRequest, StoreResult, Task, TaskError, TaskId,
++        TaskOutcome,
++    };
+     use std::collections::BTreeMap;
+ 
+     /// Opening a paper draws none of its mathematics.
+@@ -1513,6 +1851,139 @@ mod tests {
+         (passes, longest)
+     }
+ 
++    type FromTheShelf = (
++        Vec<ShelfStep>,
++        Vec<(u32, u32)>,
++        Vec<(PictureHandle, u32, u32)>,
++    );
++
++    /// Answers every shelf read and every pipeline sleep the view asks for,
++    /// from `book`, until it asks for nothing more.
++    ///
++    /// Returns what the view made of the answers that were not
++    /// [`ShelfStep::Busy`], every read asked for, and the pictures handed over.
++    fn from_the_shelf(view: &mut BookView, mut context: Context, book: &[u8]) -> FromTheShelf {
++        let size = u32::try_from(book.len()).expect("a test book");
++        let (mut steps, mut reads, mut pictures) = (Vec::new(), Vec::new(), Vec::new());
++        for _ in 0..100_000 {
++            let commands = context.take_commands();
++            pictures.extend(handed(&commands));
++            // A fresh context per pass, for the reason [`drain`] gives.
++            context = Context::default();
++            let mut asked = false;
++            for command in commands {
++                let Command::Store(StoreRequest::ShelfRead {
++                    name,
++                    offset,
++                    length,
++                }) = command
++                else {
++                    continue;
++                };
++                asked = true;
++                reads.push((offset, length));
++                let from = (offset as usize).min(book.len());
++                let to = (from + length as usize).min(book.len());
++                let answer = StoreResult::ShelfRead {
++                    name: name.clone(),
++                    offset,
++                    bytes: book[from..to].to_vec(),
++                    size,
++                };
++                match view.shelf(&mut context, &name, &answer) {
++                    ShelfStep::Busy => {}
++                    step => steps.push(step),
++                }
++            }
++            if let Some(task) = view.plating {
++                let _ = view.woke(&mut context, task, &TaskOutcome::Completed(Vec::new()));
++            } else if !asked {
++                return (steps, reads, pictures);
++            }
++        }
++        panic!("the view never stopped asking");
++    }
++
++    /// A book on the shelf opens, and its plates are read off the card and
++    /// drawn.
++    #[test]
++    fn a_book_on_the_shelf_is_opened_and_drawn_without_being_read_whole() {
++        let book = crate::shelved::tests::a_large_illustrated_book();
++        let mut context = Context::default();
++        let mut view = BookView::new();
++        view.open_shelf(&mut context, "book", Memory::default());
++        assert!(!view.is_open(), "nothing is open before the book is read");
++
++        let (steps, reads, pictures) = from_the_shelf(&mut view, context, &book);
++
++        assert_eq!(steps, vec![ShelfStep::Opened]);
++        assert!(view.is_open());
++        assert!(
++            reads
++                .iter()
++                .all(|(_, length)| *length as usize <= kobo_sdk::MAX_SHELF_CHUNK),
++            "a read was larger than the shelf answers"
++        );
++        // The plates are small enough that every one fits the decode budget,
++        // so every one is read off the card; the false one never decodes.
++        let handles: std::collections::BTreeSet<PictureHandle> =
++            pictures.iter().map(|(handle, _, _)| *handle).collect();
++        assert_eq!(handles.len(), crate::shelved::tests::PLATES);
++    }
++
++    /// An answer to a read the last book asked for is not taken as part of
++    /// the next one, even when the next one is the same book.
++    #[test]
++    fn a_shelf_answer_for_a_book_since_closed_is_not_taken_for_the_next() {
++        let book = crate::shelved::tests::a_large_illustrated_book();
++        let mut context = Context::default();
++        let mut view = BookView::new();
++        view.open_shelf(&mut context, "book", Memory::default());
++        view.open_shelf(&mut context, "book", Memory::default());
++
++        let other = StoreResult::ShelfRead {
++            name: "other".to_owned(),
++            offset: 0,
++            bytes: Vec::new(),
++            size: 0,
++        };
++        assert_eq!(
++            view.shelf(&mut context, "other", &other),
++            ShelfStep::Elsewhere
++        );
++
++        let (steps, _, _) = from_the_shelf(&mut view, context, &book);
++        assert_eq!(steps, vec![ShelfStep::Opened]);
++        assert!(view.is_open());
++    }
++
++    /// A shelf that will not read the book leaves the view holding nothing.
++    #[test]
++    fn a_book_the_shelf_will_not_read_fails_to_open() {
++        let mut context = Context::default();
++        let mut view = BookView::new();
++        view.open_shelf(&mut context, "book", Memory::default());
++        let step = view.shelf(
++            &mut context,
++            "book",
++            &StoreResult::Denied(kobo_sdk::StoreError::Missing),
++        );
++        assert_eq!(
++            step,
++            ShelfStep::Failed(crate::ShelfFault::Store(kobo_sdk::StoreError::Missing))
++        );
++        assert!(!view.is_open());
++        assert_eq!(
++            view.shelf(
++                &mut context,
++                "book",
++                &StoreResult::Denied(kobo_sdk::StoreError::Missing)
++            ),
++            ShelfStep::Elsewhere,
++            "an answer nobody asked for was taken"
++        );
++    }
++
+     fn illustrated(plate: &[u8]) -> Document {
+         let mut blocks = prose(12);
+         blocks.push(Block::Picture {
+@@ -1529,6 +2000,199 @@ mod tests {
          }
      }
  
@@ -654,6 +1026,554 @@ index 9875021..418b6bc 100644
      fn handed(commands: &[Command]) -> Vec<(PictureHandle, u32, u32)> {
          commands
              .iter()
+diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
+new file mode 100644
+index 0000000..e1880f8
+--- /dev/null
++++ b/crates/kobo-bookview/src/shelved.rs
+@@ -0,0 +1,542 @@
++//! A book read off the shelf a range at a time, rather than all at once.
++//!
++//! A large illustrated book is mostly pictures, and the reader holds a few
++//! hundred megabytes of memory at most. Loading the file whole put a ceiling
++//! on the books that open at all, and spent the time and memory of reading
++//! every plate before the first page was drawn. So the book's end record and
++//! directory are read first, then only the members that text is made of, and
++//! each picture is measured from its first bytes; its whole is read when the
++//! reader comes near it.
++//!
++//! Everything here is plain bookkeeping over answers, with no [`Context`] in
++//! it, so that the sequence can be driven and checked without a runtime. The
++//! view sends the reads it asks for and hands back what comes.
++//!
++//! [`Context`]: kobo_sdk::Context
++
++use std::collections::{BTreeMap, VecDeque};
++
++use kobo_doc::zip::{self, Location, Pieces};
++use kobo_doc::Document;
++use kobo_sdk::{StoreError, MAX_SHELF_CHUNK};
++
++/// The first bytes read of a book: enough to know it is an archive, and the
++/// size of the whole from the answer.
++const HEAD: usize = 4;
++
++/// The most a book's central directory may run to.
++///
++/// One entry is some sixty bytes, and an archive is read to eight thousand of
++/// them, so a real directory is half a megabyte at worst. More than this is a
++/// damaged or hostile end record.
++const MAX_DIRECTORY: usize = 8 * 1024 * 1024;
++
++/// The most the text, styles and fonts of one book may come to.
++///
++/// What is held in memory while the book is open; the pictures are not in it.
++/// A long novel's text is a megabyte or two, and embedded fonts a few more.
++const MAX_TEXT: usize = 64 * 1024 * 1024;
++
++/// How much of a picture is read to learn its size.
++///
++/// A PNG states it in its first thirty bytes and a JPEG within its first few
++/// kilobytes, unless a camera wrote a thumbnail or a colour profile ahead of
++/// it; then the whole picture is read instead.
++pub(crate) const MEASURE: usize = 32 * 1024;
++
++/// The most one picture's stored bytes may span on the card.
++///
++/// Above the two megabytes a picture may unpack to, because a member's span
++/// carries its header and, sometimes, a trailing descriptor.
++pub(crate) const MAX_PICTURE_SPAN: usize = 4 * 1024 * 1024;
++
++/// Why a book on the shelf would not open.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum ShelfFault {
++    /// The shelf refused a read, or answered with something other than what
++    /// was asked for.
++    Store(StoreError),
++    /// The file is not a readable book.
++    Book(kobo_doc::epub::Fault),
++    /// The book's text, styles and fonts together are more than the reader
++    /// will hold.
++    TooLarge {
++        /// What they come to.
++        bytes: usize,
++    },
++}
++
++impl std::fmt::Display for ShelfFault {
++    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Store(error) => write!(out, "the shelf would not read the book: {error:?}"),
++            Self::Book(fault) => fault.fmt(out),
++            Self::TooLarge { bytes } => write!(
++                out,
++                "the book's text is {bytes} bytes, and {MAX_TEXT} is the most that is held"
++            ),
++        }
++    }
++}
++
++impl std::error::Error for ShelfFault {}
++
++impl From<kobo_doc::epub::Fault> for ShelfFault {
++    fn from(fault: kobo_doc::epub::Fault) -> Self {
++        Self::Book(fault)
++    }
++}
++
++impl From<zip::Fault> for ShelfFault {
++    fn from(fault: zip::Fault) -> Self {
++        Self::Book(fault.into())
++    }
++}
++
++/// One range of a blob, read in as many pieces as the shelf allows.
++#[derive(Clone, Debug)]
++pub(crate) struct Span {
++    at: usize,
++    until: usize,
++    bytes: Vec<u8>,
++}
++
++impl Span {
++    pub(crate) fn new(at: usize, until: usize) -> Self {
++        Self {
++            at,
++            until: until.max(at),
++            bytes: Vec::new(),
++        }
++    }
++
++    /// The next read to ask for, as an offset and a length.
++    pub(crate) fn request(&self) -> (u32, u32) {
++        let from = self.at + self.bytes.len();
++        let length = (self.until - from).min(MAX_SHELF_CHUNK);
++        (
++            u32::try_from(from).unwrap_or(u32::MAX),
++            u32::try_from(length).unwrap_or(u32::MAX),
++        )
++    }
++
++    /// Takes one answer, and says whether the range is now whole.
++    ///
++    /// # Errors
++    ///
++    /// [`StoreError::Missing`] for a piece that does not begin where the last
++    /// one ended, runs past what was asked, or comes back empty before the
++    /// end: any of them would splice together bytes that are not the file.
++    pub(crate) fn take(&mut self, offset: u32, bytes: &[u8]) -> Result<bool, StoreError> {
++        let (expected, length) = self.request();
++        if offset != expected
++            || bytes.len() > usize::try_from(length).unwrap_or(usize::MAX)
++            || (bytes.is_empty() && length > 0)
++        {
++            return Err(StoreError::Missing);
++        }
++        self.bytes.extend_from_slice(bytes);
++        Ok(self.done())
++    }
++
++    pub(crate) fn done(&self) -> bool {
++        self.at + self.bytes.len() >= self.until
++    }
++
++    pub(crate) const fn at(&self) -> usize {
++        self.at
++    }
++
++    pub(crate) fn into_bytes(self) -> Vec<u8> {
++        self.bytes
++    }
++}
++
++/// What an [`Opening`] wants next.
++#[derive(Debug)]
++pub(crate) enum Next {
++    /// Read this, and hand the answer back.
++    Read(u32, u32),
++    /// The book is open, with each picture's size and place, and the size
++    /// of the whole blob.
++    Done(Document, BTreeMap<String, ((u32, u32), Location)>, usize),
++}
++
++#[derive(Debug)]
++enum Stage {
++    Head,
++    Tail,
++    /// The directory starts before the tail did, and is being read up to it.
++    Directory {
++        tail: Vec<u8>,
++    },
++    Members,
++    /// Measuring one picture, from its first bytes or, failing that, all of
++    /// them.
++    Measure {
++        name: String,
++        place: Location,
++        whole: bool,
++    },
++}
++
++/// A book being opened from the shelf.
++#[derive(Debug)]
++pub(crate) struct Opening {
++    stage: Stage,
++    span: Span,
++    size: usize,
++    pieces: Pieces,
++    members: VecDeque<(usize, usize)>,
++    document: Option<Document>,
++    unmeasured: VecDeque<(String, Location)>,
++    measured: BTreeMap<String, ((u32, u32), Location)>,
++}
++
++impl Opening {
++    /// Starts, returning the first read to ask for.
++    pub(crate) fn start() -> (Self, (u32, u32)) {
++        let opening = Self {
++            stage: Stage::Head,
++            span: Span::new(0, HEAD),
++            size: 0,
++            pieces: Pieces::default(),
++            members: VecDeque::new(),
++            document: None,
++            unmeasured: VecDeque::new(),
++            measured: BTreeMap::new(),
++        };
++        let first = opening.span.request();
++        (opening, first)
++    }
++
++    /// Takes one read's answer.
++    ///
++    /// # Errors
++    ///
++    /// Whatever stops the book opening. The opening is over once one is
++    /// returned.
++    pub(crate) fn answer(
++        &mut self,
++        offset: u32,
++        bytes: &[u8],
++        size: u32,
++    ) -> Result<Next, ShelfFault> {
++        let size = usize::try_from(size).unwrap_or(usize::MAX);
++        if matches!(self.stage, Stage::Head) {
++            self.size = size;
++        } else if size != self.size {
++            // The file changed under the reads, which would make the parts
++            // pieces of two different books.
++            return Err(ShelfFault::Store(StoreError::Missing));
++        }
++        if !self.span.take(offset, bytes).map_err(ShelfFault::Store)? {
++            let (offset, length) = self.span.request();
++            return Ok(Next::Read(offset, length));
++        }
++        let span = std::mem::replace(&mut self.span, Span::new(0, 0));
++        let at = span.at();
++        let bytes = span.into_bytes();
++        match std::mem::replace(&mut self.stage, Stage::Members) {
++            Stage::Head => self.headed(&bytes),
++            Stage::Tail => self.tailed(at, bytes),
++            Stage::Directory { tail } => {
++                let mut part = bytes;
++                part.extend_from_slice(&tail);
++                self.pieces.insert(at, part);
++                self.directed()
++            }
++            Stage::Members => {
++                self.pieces.insert(at, bytes);
++                self.next_member()
++            }
++            Stage::Measure { name, place, whole } => Ok(self.measuring(name, place, whole, &bytes)),
++        }
++    }
++
++    fn begin(&mut self, stage: Stage, at: usize, until: usize) -> Next {
++        self.stage = stage;
++        self.span = Span::new(at, until);
++        let (offset, length) = self.span.request();
++        Next::Read(offset, length)
++    }
++
++    fn headed(&mut self, head: &[u8]) -> Result<Next, ShelfFault> {
++        if head != b"PK\x03\x04" {
++            return Err(zip::Fault::NotAnArchive.into());
++        }
++        self.pieces = Pieces::new(self.size);
++        let tail_at = self.size.saturating_sub(zip::MAX_TAIL);
++        Ok(self.begin(Stage::Tail, tail_at, self.size))
++    }
++
++    fn tailed(&mut self, tail_at: usize, tail: Vec<u8>) -> Result<Next, ShelfFault> {
++        let (at, len) = zip::directory_of(&tail, tail_at)?;
++        if len > MAX_DIRECTORY {
++            return Err(zip::Fault::TooLarge.into());
++        }
++        if at >= tail_at {
++            self.pieces.insert(tail_at, tail);
++            return self.directed();
++        }
++        // One part from the directory to the end, so no entry straddles two
++        // reads and the directory can be walked as one run of bytes.
++        Ok(self.begin(Stage::Directory { tail }, at, tail_at))
++    }
++
++    fn directed(&mut self) -> Result<Next, ShelfFault> {
++        let archive = zip::Archive::open_pieces(&self.pieces)?;
++        let mut ranges: Vec<(usize, usize)> = archive
++            .locations()
++            .filter(|(name, _)| kobo_doc::epub::needed_to_open(name))
++            .map(|(_, place)| (place.at, place.end))
++            .collect();
++        ranges.sort_unstable();
++        let mut members: Vec<(usize, usize)> = Vec::new();
++        for (at, end) in ranges {
++            match members.last_mut() {
++                Some((_, last)) if at <= *last => *last = (*last).max(end),
++                _ => members.push((at, end)),
++            }
++        }
++        let bytes: usize = members.iter().map(|(at, end)| end - at).sum();
++        if bytes > MAX_TEXT {
++            return Err(ShelfFault::TooLarge { bytes });
++        }
++        self.members = members.into();
++        self.next_member()
++    }
++
++    fn next_member(&mut self) -> Result<Next, ShelfFault> {
++        if let Some((at, end)) = self.members.pop_front() {
++            return Ok(self.begin(Stage::Members, at, end));
++        }
++        let mut document = kobo_doc::epub::parse_pieces(&self.pieces)?;
++        // The text's parts are the book from here; the pictures are read off
++        // the card as they are wanted.
++        self.pieces = Pieces::default();
++        self.unmeasured = std::mem::take(&mut document.places).into_iter().collect();
++        self.document = Some(document);
++        Ok(self.next_measure())
++    }
++
++    fn next_measure(&mut self) -> Next {
++        while let Some((name, place)) = self.unmeasured.pop_front() {
++            if place.end.saturating_sub(place.at) > MAX_PICTURE_SPAN {
++                continue;
++            }
++            let until = place.end.min(place.at + MEASURE);
++            return self.begin(
++                Stage::Measure {
++                    name,
++                    place,
++                    whole: until == place.end,
++                },
++                place.at,
++                until,
++            );
++        }
++        let document = self.document.take().unwrap_or_default();
++        Next::Done(document, std::mem::take(&mut self.measured), self.size)
++    }
++
++    fn measuring(&mut self, name: String, place: Location, whole: bool, bytes: &[u8]) -> Next {
++        let measured = zip::unpack_prefix(bytes, &place, usize::MAX)
++            .ok()
++            .and_then(|picture| kobo_image::size(&picture).ok());
++        match measured {
++            Some(size) => {
++                self.measured.insert(name, (size, place));
++            }
++            None if !whole => {
++                let (at, end) = (place.at, place.end);
++                return self.begin(
++                    Stage::Measure {
++                        name,
++                        place,
++                        whole: true,
++                    },
++                    at,
++                    end,
++                );
++            }
++            // A picture whose header will not read reads as its description.
++            None => {}
++        }
++        self.next_measure()
++    }
++}
++
++/// Reads `place` of the book from the bytes of its span on the card.
++pub(crate) fn unpack(bytes: &[u8], place: &Location) -> Option<Vec<u8>> {
++    zip::unpack(bytes, place).ok()
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::{Next, Opening, ShelfFault, Span, MEASURE};
++    use kobo_doc::{zip, Block};
++    use kobo_sdk::{StoreError, MAX_SHELF_CHUNK};
++
++    /// How many plates the large book carries, and how large each is.
++    pub(crate) const PLATES: usize = 24;
++    const PLATE_BYTES: usize = 1024 * 1024;
++
++    /// A book of [`PLATES`] chapters, each with a megabyte plate, and one
++    /// more picture whose bytes are not a picture at all.
++    pub(crate) fn a_large_illustrated_book() -> Vec<u8> {
++        let mut manifest = String::new();
++        let mut spine = String::new();
++        let mut members = Vec::new();
++        for index in 0..=PLATES {
++            manifest.push_str(&format!(
++                r#"<item id="c{index}" href="c{index}.xhtml" media-type="application/xhtml+xml"/>
++                   <item id="p{index}" href="p/{index}.png" media-type="image/png"/>"#
++            ));
++            spine.push_str(&format!(r#"<itemref idref="c{index}"/>"#));
++            members.push((
++                format!("OEBPS/c{index}.xhtml"),
++                format!(
++                    "<html><body><h1>Plate {index}</h1><p>Words about it.</p>\
++                     <img src=\"p/{index}.png\" alt=\"plate {index}\"/></body></html>"
++                )
++                .into_bytes(),
++            ));
++            let mut plate = if index == PLATES {
++                vec![7; MEASURE * 2]
++            } else {
++                let width = u32::try_from(100 + index).expect("a width");
++                kobo_image::encode_png_grey(width, 300, &vec![128; width as usize * 300])
++                    .expect("a png")
++            };
++            // Bytes after the end of a PNG are ignored by any decoder, and
++            // make the plate as large as a scan is.
++            plate.resize(PLATE_BYTES.max(plate.len()), 0);
++            members.push((format!("OEBPS/p/{index}.png"), plate));
++        }
++        let package = format!(
++            r#"<?xml version="1.0"?>
++<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
++  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Plates</dc:title></metadata>
++  <manifest>{manifest}</manifest>
++  <spine>{spine}</spine>
++</package>"#
++        );
++        let mut book = vec![
++            ("mimetype".to_owned(), b"application/epub+zip".to_vec()),
++            (
++                "META-INF/container.xml".to_owned(),
++                br#"<?xml version="1.0"?>
++<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
++  <rootfiles><rootfile full-path="OEBPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles>
++</container>"#
++                    .to_vec(),
++            ),
++            ("OEBPS/book.opf".to_owned(), package.into_bytes()),
++        ];
++        book.append(&mut members);
++        zip::stored(&book).expect("a book")
++    }
++
++    /// Drives an opening against `book` as the shelf would answer it,
++    /// returning what came of it and every read asked for.
++    pub(crate) fn drive(book: &[u8]) -> (Result<Next, ShelfFault>, Vec<(u32, u32)>) {
++        let (mut opening, mut read) = Opening::start();
++        let mut reads = vec![read];
++        let size = u32::try_from(book.len()).expect("a test book");
++        loop {
++            let (offset, length) = read;
++            let from = offset as usize;
++            let to = (from + length as usize).min(book.len());
++            match opening.answer(offset, &book[from..to], size) {
++                Ok(Next::Read(offset, length)) => {
++                    read = (offset, length);
++                    reads.push(read);
++                }
++                done => return (done, reads),
++            }
++        }
++    }
++
++    #[test]
++    fn a_large_book_opens_from_a_small_part_of_it() {
++        let book = a_large_illustrated_book();
++        let (result, reads) = drive(&book);
++        let Ok(Next::Done(document, measured, size)) = result else {
++            panic!("an open book, not {result:?}");
++        };
++
++        assert_eq!(size, book.len());
++        assert!(reads
++            .iter()
++            .all(|(_, length)| *length as usize <= MAX_SHELF_CHUNK));
++        let read: usize = reads.iter().map(|(_, length)| *length as usize).sum();
++        assert!(
++            read < book.len() / 8,
++            "{read} of {} bytes read to open the book",
++            book.len()
++        );
++
++        assert!(document.images.is_empty(), "no picture is held whole");
++        assert!(
++            document.places.is_empty(),
++            "the places moved to the measures"
++        );
++        let pictures = document
++            .blocks
++            .iter()
++            .filter(|block| matches!(block, Block::Picture { .. }))
++            .count();
++        assert_eq!(pictures, PLATES + 1);
++        assert_eq!(
++            measured.len(),
++            PLATES,
++            "the false picture is left unmeasured"
++        );
++        for index in 0..PLATES {
++            let width = u32::try_from(100 + index).expect("a width");
++            let (dimensions, location) = measured[&format!("OEBPS/p/{index}.png")];
++            assert_eq!(dimensions, (width, 300));
++            let plate =
++                super::unpack(&book[location.at..location.end], &location).expect("the plate");
++            assert_eq!(plate.len(), PLATE_BYTES);
++        }
++    }
++
++    #[test]
++    fn a_span_refuses_a_piece_from_anywhere_else() {
++        let mut span = Span::new(10, 20);
++        assert_eq!(span.request(), (10, 10));
++        assert_eq!(span.take(11, b"x"), Err(StoreError::Missing));
++        assert_eq!(span.take(10, b"abcd"), Ok(false));
++        assert_eq!(span.request(), (14, 6));
++        assert_eq!(span.take(14, b""), Err(StoreError::Missing));
++        assert_eq!(span.take(14, b"efghijk"), Err(StoreError::Missing));
++        assert_eq!(span.take(14, b"efghij"), Ok(true));
++        assert_eq!(span.into_bytes(), b"abcdefghij");
++    }
++
++    #[test]
++    fn something_that_is_not_an_archive_is_refused_at_once() {
++        let (result, reads) = drive(b"<html>not a book</html>");
++        assert!(matches!(result, Err(ShelfFault::Book(_))), "{result:?}");
++        assert_eq!(reads.len(), 1);
++    }
++
++    #[test]
++    fn a_file_that_changes_size_part_way_is_refused() {
++        let (mut opening, (offset, _)) = Opening::start();
++        let book = vec![0_u8; 100_000];
++        let mut head = book[..4].to_vec();
++        head.copy_from_slice(b"PK\x03\x04");
++        let Ok(Next::Read(offset, length)) = opening.answer(offset, &head, 100_000) else {
++            panic!("a tail read");
++        };
++        let from = offset as usize;
++        let piece = &book[from..from + length as usize];
++        assert_eq!(
++            opening.answer(offset, piece, 100_001).err(),
++            Some(ShelfFault::Store(StoreError::Missing))
++        );
++    }
++}
 diff --git a/crates/kobo-cli/src/main.rs b/crates/kobo-cli/src/main.rs
 index 6220e12..752dd9f 100644
 --- a/crates/kobo-cli/src/main.rs
