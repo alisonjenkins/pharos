@@ -38,6 +38,9 @@ pub struct Config {
     /// Song lyrics: the online provider switch and where its answers are kept.
     #[serde(default)]
     pub lyrics: LyricsConfig,
+    /// Spec 040: checking subtitle tracks against their video with the aligner.
+    #[serde(default)]
+    pub subtitle_check: SubtitleCheckConfig,
     /// Books: the Open Library subject lookup switch (spec 043).
     #[serde(default)]
     pub books: BooksConfig,
@@ -412,6 +415,47 @@ pub struct LyricsConfig {
     /// KiB each and need no cap.
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
+}
+
+/// `[subtitle_check]` — spec 040. The job runs only with `[lyrics].aligner_url`
+/// set (FR-018); the thresholds are FR-007's, calibrated by query (FR-014).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SubtitleCheckConfig {
+    /// Kill switch for the background job. Env: `PHAROS_SUBTITLE_CHECK_ENABLED`.
+    pub enabled: bool,
+    /// Serve corrections and mark tracks (FR-012/FR-013). Off until a
+    /// calibration run (FR-014); while off, checks only log and store.
+    pub apply: bool,
+    /// `T_median`.
+    pub median: f32,
+    /// `T_line`.
+    pub line: f32,
+    /// `T_margin`.
+    pub margin: f32,
+}
+
+impl Default for SubtitleCheckConfig {
+    fn default() -> Self {
+        let t = pharos_subs::check::verdict::Thresholds::default();
+        Self {
+            enabled: true,
+            apply: false,
+            median: t.median,
+            line: t.line,
+            margin: t.margin,
+        }
+    }
+}
+
+impl SubtitleCheckConfig {
+    pub fn thresholds(&self) -> pharos_subs::check::verdict::Thresholds {
+        pharos_subs::check::verdict::Thresholds {
+            median: self.median,
+            line: self.line,
+            margin: self.margin,
+        }
+    }
 }
 
 /// `[metadata]` — online metadata/artwork enrichment tunables. All fields
@@ -1784,6 +1828,16 @@ impl Config {
                 None => {}
             }
         }
+        if let Ok(v) = std::env::var("PHAROS_SUBTITLE_CHECK_ENABLED") {
+            match env_bool(&v) {
+                Some(b) => self.subtitle_check.enabled = b,
+                None if !v.trim().is_empty() => tracing::warn!(
+                    value = %v,
+                    "PHAROS_SUBTITLE_CHECK_ENABLED is not a recognised boolean; leaving [subtitle_check].enabled unchanged"
+                ),
+                None => {}
+            }
+        }
         if let Ok(v) = std::env::var("PHAROS_LYRICS_ALIGNER_URL") {
             let v = v.trim();
             if !v.is_empty() {
@@ -2365,6 +2419,35 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn subtitle_check_defaults_section_and_env_switch() {
+        let base = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+        "#;
+        let cfg = Config::from_toml_str(base).unwrap();
+        assert!(cfg.subtitle_check.enabled);
+        assert!(
+            !cfg.subtitle_check.apply,
+            "nothing is surfaced until calibrated"
+        );
+        assert_eq!(
+            cfg.subtitle_check.thresholds(),
+            pharos_subs::check::verdict::Thresholds::default()
+        );
+        let tuned = Config::from_toml_str(&format!(
+            "{base}\n[subtitle_check]\nmedian = 0.5\nmargin = 0.25\n"
+        ))
+        .unwrap();
+        let t = tuned.subtitle_check.thresholds();
+        assert_eq!((t.median, t.line, t.margin), (0.5, 0.5, 0.25));
+
+        let _env = [EnvVar::set("PHAROS_SUBTITLE_CHECK_ENABLED", "false")];
+        assert!(!cfg.apply_env().subtitle_check.enabled);
     }
 
     #[test]
