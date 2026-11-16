@@ -91,10 +91,12 @@ pub fn clean_text(text: &str) -> String {
         .join(" ")
 }
 
-/// Words with at least one letter: what the aligner can place.
+/// Words the aligner can place: those with a letter that folds into `a`-`z`.
+/// The aligner folds accents and keeps only `a`-`z` and `'`, so a word in
+/// another script is dropped there and is not counted here.
 pub fn alignable_words(text: &str) -> usize {
     text.split_whitespace()
-        .filter(|w| w.chars().any(char::is_alphabetic))
+        .filter(|w| w.chars().any(super::lang::folds_to_latin))
         .count()
 }
 
@@ -260,6 +262,13 @@ mod tests {
         assert_eq!(clean_text("I said (quietly) no"), "I said (quietly) no");
         assert_eq!(clean_text("Time: half past"), "Time: half past");
         assert_eq!(clean_text("MAN 2: Over here"), "Over here");
+    }
+
+    #[test]
+    fn only_latin_words_count_as_alignable() {
+        assert_eq!(alignable_words("Go 李 雷"), 1);
+        assert_eq!(alignable_words("Ça va, Zoë?"), 3);
+        assert_eq!(alignable_words("42 ... !!"), 0);
     }
 
     #[test]
