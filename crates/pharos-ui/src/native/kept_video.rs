@@ -226,7 +226,11 @@ pub fn is_retryable(status: Option<u16>) -> bool {
 /// `files` that `cached` does not hold yet, in order: what a restarted
 /// download still has to fetch.
 pub fn missing_files(files: &[String], cached: &std::collections::HashSet<String>) -> Vec<String> {
-    files.iter().filter(|f| !cached.contains(*f)).cloned().collect()
+    files
+        .iter()
+        .filter(|f| !cached.contains(*f))
+        .cloned()
+        .collect()
 }
 
 /// Whether progress is due to be saved: at most once a second.
@@ -244,7 +248,9 @@ pub fn find<'a>(list: &'a [KeptVideo], user: &str, item: &str) -> Option<&'a Kep
 pub fn check_not_kept(list: &[KeptVideo], user: &str, item: &str) -> Result<(), KeepVideoRefusal> {
     match find(list, user, item) {
         Some(v) if !matches!(v.state, KeptState::Failed { .. }) => {
-            Err(KeepVideoRefusal::AlreadyKept { item: item.to_owned() })
+            Err(KeepVideoRefusal::AlreadyKept {
+                item: item.to_owned(),
+            })
         }
         _ => Ok(()),
     }
@@ -295,7 +301,11 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         files: Vec::new(),
         quality_bps: request.quality_bps,
         estimated_bytes: 0,
-        state: KeptState::Downloading { done: 0, total: 0, bytes: 0 },
+        state: KeptState::Downloading {
+            done: 0,
+            total: 0,
+            bytes: 0,
+        },
         position_ms: 0,
         saved_at,
     }
@@ -361,17 +371,26 @@ mod tests {
 
     #[test]
     fn urls_become_absolute_keys() {
-        assert_eq!(absolute_url("https://h", "/videos/1/m.m3u8?a=b"), "https://h/videos/1/m.m3u8?a=b");
+        assert_eq!(
+            absolute_url("https://h", "/videos/1/m.m3u8?a=b"),
+            "https://h/videos/1/m.m3u8?a=b"
+        );
         assert_eq!(absolute_url("https://h/", "/x"), "https://h/x");
         assert_eq!(absolute_url("https://h", "https://o/y"), "https://o/y");
-        assert_eq!(url_path("https://h/videos/1/0.m4s?PlaySessionId=z"), "/videos/1/0.m4s");
+        assert_eq!(
+            url_path("https://h/videos/1/0.m4s?PlaySessionId=z"),
+            "/videos/1/0.m4s"
+        );
         assert_eq!(url_path("/videos/1/0.m4s?a"), "/videos/1/0.m4s");
     }
 
     #[test]
     fn retries_back_off_then_stop() {
         let delays: Vec<_> = (1..=7).map(retry_delay_secs).collect();
-        assert_eq!(delays, [Some(1), Some(2), Some(4), Some(8), Some(15), Some(30), None]);
+        assert_eq!(
+            delays,
+            [Some(1), Some(2), Some(4), Some(8), Some(15), Some(30), None]
+        );
         assert_eq!(retry_delay_secs(0), None);
         assert!(is_retryable(None) && is_retryable(Some(404)) && is_retryable(Some(500)));
         assert!(!is_retryable(Some(403)) && !is_retryable(Some(401)));
@@ -395,10 +414,16 @@ mod tests {
         let mut list = vec![];
         insert_front(&mut list, video("u1", "a", KeptState::Ready));
         insert_front(&mut list, video("u2", "a", KeptState::Ready));
-        insert_front(&mut list, video("u1", "a", KeptState::Failed { reason: "x".into() }));
+        insert_front(
+            &mut list,
+            video("u1", "a", KeptState::Failed { reason: "x".into() }),
+        );
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].user, "u1");
-        assert!(check_not_kept(&list, "u1", "a").is_ok(), "failed may restart");
+        assert!(
+            check_not_kept(&list, "u1", "a").is_ok(),
+            "failed may restart"
+        );
         assert!(matches!(
             check_not_kept(&list, "u2", "a"),
             Err(KeepVideoRefusal::AlreadyKept { .. })
@@ -412,7 +437,15 @@ mod tests {
     fn used_bytes_leave_out_the_item_being_started() {
         let mut a = video("u", "a", KeptState::Ready);
         a.estimated_bytes = 10;
-        let mut b = video("u", "b", KeptState::Downloading { done: 1, total: 2, bytes: 5 });
+        let mut b = video(
+            "u",
+            "b",
+            KeptState::Downloading {
+                done: 1,
+                total: 2,
+                bytes: 5,
+            },
+        );
         b.estimated_bytes = 99;
         let list = vec![a, b];
         assert_eq!(used_by(&list, "u", None), 15);
@@ -432,10 +465,16 @@ mod tests {
     fn the_service_worker_serves_the_video_caches_by_exact_url() {
         let sw = include_str!("../../assets/sw.js");
         assert!(sw.contains(&format!("const VIDEO_PREFIX = \"{CACHE_PREFIX}\"")));
-        assert!(sw.contains("\"/ui/assets/vendor/\""), "the player script is cached");
+        assert!(
+            sw.contains("\"/ui/assets/vendor/\""),
+            "the player script is cached"
+        );
         assert!(sw.contains("\"videos-changed\""));
         assert!(sw.contains("cache.match(request.url, { ignoreVary: true })"));
-        assert!(!sw.contains("ignoreSearch"), "the query names the play session");
+        assert!(
+            !sw.contains("ignoreSearch"),
+            "the query names the play session"
+        );
         assert!(sw.contains("__PHAROS_BUNDLE_HASH__") && sw.contains("__PHAROS_PRECACHE__"));
     }
 }
