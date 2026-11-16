@@ -105,11 +105,15 @@ if [ -n "${PHAROS_ANDROID_VERSION_NAME:-}" ]; then
 fi
 apk_dir=$gradle_root/app/build/outputs/apk
 rm -rf "$apk_dir"
-# dx runs assembleRelease only when [bundle.android] signing is configured,
-# which it is not here (this script signs), so the APK is always under debug/.
-echo "android-apk: assembling with the Pharos icon and banner" >&2
-(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet assembleDebug) || {
-  echo "android-apk: gradle assembleDebug failed (see its error above)" >&2
+# dx's template marks only the debug build type debuggable, so a release
+# build must assemble the release variant or it ships debuggable.
+case $profile in
+  release) assemble=assembleRelease ;;
+  *) assemble=assembleDebug ;;
+esac
+echo "android-apk: assembling with the Pharos icon and banner ($assemble)" >&2
+(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet "$assemble") || {
+  echo "android-apk: gradle $assemble failed (see its error above)" >&2
   exit 1
 }
 
@@ -129,6 +133,12 @@ AAPT2=$build_tools/aapt2 bash "$root/scripts/android-apk-check.sh" "$built" || {
   echo "android-apk: the built APK failed its checks; not signing it" >&2
   exit 1
 }
+debuggable=$("$build_tools/aapt2" dump xmltree --file AndroidManifest.xml "$built" | grep -c 'android:debuggable.*=true' || true)
+echo "android-apk: gradle $assemble built $(basename "$built") debuggable=$debuggable" >&2
+if [ "$profile" = release ] && [ "$debuggable" != 0 ]; then
+  echo "android-apk: the release APK is debuggable; refusing to sign it" >&2
+  exit 1
+fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$(dirname "$out")"
