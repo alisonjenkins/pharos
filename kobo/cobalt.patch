@@ -1029,7 +1029,7 @@ index 9875021..297a63f 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
-index 0000000..3d83ef5
+index 0000000..3a0cb9e
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelved.rs
 @@ -0,0 +1,696 @@
@@ -1372,7 +1372,7 @@ index 0000000..3d83ef5
 +            if place.end.saturating_sub(place.at) > MAX_PICTURE_SPAN {
 +                continue;
 +            }
-+            let until = place.end.min(place.at + MEASURE);
++            let until = place.end.min(place.at.saturating_add(MEASURE));
 +            return self.begin(
 +                Stage::Measure {
 +                    name,
