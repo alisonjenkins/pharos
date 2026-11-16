@@ -1155,6 +1155,44 @@ fn page_drawn_commands(runner: &mut AppRunner<Pharos>, commands: &[Command]) -> 
     all
 }
 
+/// `count` books with covers, out of `total`, as the book list sends them.
+fn book_block(count: usize, total: usize) -> String {
+    let items: Vec<String> = (0..count)
+        .map(|index| {
+            format!(
+                r#"{{"Id":"b{index}","Name":"Book {index}","Path":"/b/{index}.epub","ImageTags":{{"Primary":"c{index}"}}}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"Items":[{}],"TotalRecordCount":{total}}}"#,
+        items.join(",")
+    )
+}
+
+#[test]
+fn the_book_list_opens_in_one_draw_with_its_covers() {
+    let mut runner = settled_home(false);
+    let _ = runner.store_result(StoreResult::Loaded {
+        key: books::KEY.to_owned(),
+        value: None,
+    });
+    let mut all = runner.action(action_id("section-books"));
+    assert_eq!(draws(&all), 0, "opening the books waits for the page");
+    let (list, _) = asked(&all, "IncludeItemTypes=Book").expect("the book list");
+    let reply = runner.task_outcome(list, ok(&book_block(40, 40)));
+    assert_eq!(draws(&reply), 0, "the list waits for its covers");
+    all.extend(page_drawn_commands(&mut runner, &reply));
+    all.extend(reply);
+    assert_eq!(
+        draws(&all),
+        1,
+        "one draw for the list and its covers (B1458)"
+    );
+    let showing = screen_text(&last_screen(&all).expect("the list"));
+    assert!(!showing.contains("picture: None"), "{showing}");
+}
+
 /// A music shelf of `a` albums under A, then `m` under M, then `z` whose
 /// names start with an article before a Z.
 fn lettered_shelf(a: usize, m: usize, z: usize) -> (AppRunner<Pharos>, Vec<Command>) {

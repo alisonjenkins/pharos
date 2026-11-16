@@ -182,6 +182,13 @@ impl Reading {
             .find(|book| book.id == id)
     }
 
+    /// Whether the book list is showing and a block of it is on its way.
+    /// A book's detail page opened from home does not wait on the list.
+    #[must_use]
+    pub fn list_loading(&self) -> bool {
+        !self.opened && self.mode == Mode::List && self.list_task.is_some()
+    }
+
     /// Whether the home screen's Continue reading row is still waiting on
     /// pharos describing the books read here. The record of them is local
     /// and is not waited for.

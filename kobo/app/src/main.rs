@@ -614,11 +614,13 @@ impl Pharos {
 
     /// Whether the screen showing still waits on what it shows: the home
     /// screen on its rows and covers, a shelf on its first albums and the
+    /// covers of the page showing, the book list on its blocks and the
     /// covers of the page showing.
     fn screen_loading(&self, context: &Context) -> bool {
         match self.view {
             View::Home => self.home_loading(context),
             View::Library(_) => self.shelf_loading(context),
+            View::Books => self.reading.list_loading() || self.page_covers_pending(context),
             _ => false,
         }
     }
@@ -1912,6 +1914,16 @@ impl KoboApp for Pharos {
                 }
                 return;
             }
+            // The book list opened from home is drawn once its blocks and the
+            // covers of the page showing are in, while the wait for it runs.
+            if matches!(self.view, View::Books)
+                && self.draw_wait.is_some()
+                && self.screen_loading(context)
+            {
+                self.log_draw(context, "held", "reading");
+                return;
+            }
+            self.log_draw(context, "drawn", "reading");
             self.show(context);
             return;
         }
@@ -1947,8 +1959,14 @@ impl KoboApp for Pharos {
             self.log_draw(context, "held", cause);
             return;
         }
-        // A shelf page is drawn once its albums and covers are in.
-        if !waited && matches!(self.view, View::Library(_)) && self.shelf_loading(context) {
+        // A shelf page is drawn once its albums and covers are in, and the
+        // book list opened from home once its blocks and covers are.
+        let holding = match self.view {
+            View::Library(_) => self.shelf_loading(context),
+            View::Books => self.draw_wait.is_some() && self.screen_loading(context),
+            _ => false,
+        };
+        if !waited && holding {
             self.log_draw(context, "held", cause);
             return;
         }
