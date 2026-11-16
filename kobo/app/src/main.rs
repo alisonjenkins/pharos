@@ -1586,12 +1586,13 @@ impl Pharos {
     /// answered, would cost a full redraw for nothing. Only for task answers:
     /// a screen after input is always sent, because the runtime waits on one
     /// after handing Back over.
-    fn show_if_changed(&mut self, context: &mut Context) {
+    /// Whether a screen was sent.
+    fn show_if_changed(&mut self, context: &mut Context) -> bool {
         self.end_draw_wait(context);
         self.more_shelf(context);
         let screen = self.screen(context);
         if self.shown.as_ref() == Some(&screen) {
-            return;
+            return false;
         }
         let counted = self.shelf.entries.len();
         let screen = if self.shelf_counted == counted {
@@ -1602,6 +1603,7 @@ impl Pharos {
         };
         self.shown = Some(screen.clone());
         context.set_screen(screen);
+        true
     }
 
     /// Starts the wait for what the screen shows, unless one is running.
@@ -1626,11 +1628,40 @@ impl Pharos {
     /// as they land (B1458). Back is always answered at once: the runtime
     /// waits on a screen for it.
     fn answer_input(&mut self, context: &mut Context, action: ActionId) {
-        if action != ActionId::BACK && self.screen_loading(context) && self.begin_draw_wait(context)
-        {
-            return;
+        if action != ActionId::BACK && self.screen_loading(context) {
+            if self.begin_draw_wait(context) {
+                self.log_draw(context, "held", "input");
+                return;
+            }
+            // No task slot for the wait: drawing now beats waiting unbounded.
+            self.log_draw(context, "drawn-no-slot", "input");
+        } else {
+            self.log_draw(context, "drawn", "input");
         }
         self.show(context);
+    }
+
+    /// Records a draw decision for the frame log: what was decided, what
+    /// prompted it, and what the screen still waited on (B1458).
+    fn log_draw(&self, context: &mut Context, verdict: &str, cause: &str) {
+        let view = match &self.view {
+            View::Opening => "opening",
+            View::SignIn { .. } => "sign-in",
+            View::Home => "home",
+            View::Library(_) => "shelf",
+            View::Books => "books",
+            View::Album(_) => "album",
+            View::Player => "player",
+            View::Problem(_) => "problem",
+        };
+        let message = format!(
+            "pharos: draw {verdict} view={view} cause={cause} page={} in_flight={} covers_pending={} waiting={}",
+            self.shelf_page,
+            context.tasks_in_flight(),
+            self.page_covers_pending(context),
+            self.draw_wait.is_some(),
+        );
+        context.log(LogLevel::Info, message);
     }
 
     /// Which of `visible` things an action named `{prefix}-{index}` chose.
@@ -1888,6 +1919,7 @@ impl KoboApp for Pharos {
             return;
         };
         let (_, work) = self.tasks.swap_remove(position);
+        let cause = work_label(&work);
         let was_cover = matches!(work, Work::Cover { .. });
         let waited = matches!(work, Work::DrawWait);
         if waited {
@@ -1906,18 +1938,26 @@ impl KoboApp for Pharos {
         // message, so a page whose covers were drawn as each arrived took one
         // panel update per cover. They are drawn together once all are in.
         if was_cover && self.page_covers_pending(context) {
+            self.log_draw(context, "held", cause);
             return;
         }
         // The home screen is drawn once, when what it lists and the covers
         // it shows are all in, not once per answer on the way (B1457).
         if !waited && matches!(self.view, View::Home) && self.home_loading(context) {
+            self.log_draw(context, "held", cause);
             return;
         }
         // A shelf page is drawn once its albums and covers are in.
         if !waited && matches!(self.view, View::Library(_)) && self.shelf_loading(context) {
+            self.log_draw(context, "held", cause);
             return;
         }
-        self.show_if_changed(context);
+        let verdict = if self.show_if_changed(context) {
+            "drawn"
+        } else {
+            "unchanged"
+        };
+        self.log_draw(context, verdict, cause);
     }
 }
 
