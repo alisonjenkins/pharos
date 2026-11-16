@@ -2,9 +2,7 @@
 //! (spec 048): which copy plays, what the download asks the server for,
 //! and the detail the offline player is given in place of the server's.
 
-use pharos_client::api::{
-    Capabilities, Decision, Detail, Item, ItemKind, ItemRef, Track,
-};
+use pharos_client::api::{Capabilities, Decision, Detail, Item, ItemKind, ItemRef, Track};
 
 use super::kept_video::{KeepVideoRequest, KeptSubtitle, KeptVideo};
 use super::tv_page::NO_DIRECT_PLAY;
@@ -109,7 +107,12 @@ pub fn keep_request(
         version: version.to_owned(),
         user: user.to_owned(),
         title: video_title(item),
-        kind: if item.kind == ItemKind::Episode { "episode" } else { "movie" }.to_owned(),
+        kind: if item.kind == ItemKind::Episode {
+            "episode"
+        } else {
+            "movie"
+        }
+        .to_owned(),
         runtime_ms: item.runtime_ms,
         master_url: decision.stream_url.clone(),
         audio: decision.audio,
@@ -123,7 +126,11 @@ pub fn keep_request(
 /// no item.
 pub fn offline_detail(v: &KeptVideo) -> Option<Detail> {
     let id: ItemRef = v.item.parse().ok()?;
-    let kind = if v.kind == "episode" { ItemKind::Episode } else { ItemKind::Movie };
+    let kind = if v.kind == "episode" {
+        ItemKind::Episode
+    } else {
+        ItemKind::Movie
+    };
     Some(Detail {
         item: Item {
             id,
@@ -214,7 +221,11 @@ pub fn ready_for_last_user() -> Vec<KeptVideo> {
     let (Some(store), Some(user)) = (super::ports::video_store(), last_user()) else {
         return Vec::new();
     };
-    store.videos(&user).into_iter().filter(KeptVideo::ready).collect()
+    store
+        .videos(&user)
+        .into_iter()
+        .filter(KeptVideo::ready)
+        .collect()
 }
 
 #[cfg(test)]
@@ -231,7 +242,9 @@ mod tests {
             title: "Invented Film".into(),
             kind: "movie".into(),
             runtime_ms: 5_400_000,
-            master_url: format!("/videos/{item}/master.m3u8?PlaySessionId=abc&VideoBitrate=2000000"),
+            master_url: format!(
+                "/videos/{item}/master.m3u8?PlaySessionId=abc&VideoBitrate=2000000"
+            ),
             audio: Some(1),
             subtitles: vec![KeptSubtitle {
                 index: 3,
@@ -252,13 +265,20 @@ mod tests {
     /// assertion.
     #[test]
     fn only_a_ready_copy_of_the_item_is_played() {
-        let downloading = KeptState::Downloading { done: 1, total: 9, bytes: 10 };
+        let downloading = KeptState::Downloading {
+            done: 1,
+            total: 9,
+            bytes: 10,
+        };
         let videos = vec![
             video("7", "", downloading),
             video("8", "", KeptState::Ready),
             video("9", "", KeptState::Failed { reason: "x".into() }),
         ];
-        assert_eq!(ready_copy(&videos, "8", None).map(|v| v.item), Some("8".into()));
+        assert_eq!(
+            ready_copy(&videos, "8", None).map(|v| v.item),
+            Some("8".into())
+        );
         assert_eq!(ready_copy(&videos, "7", None), None);
         assert_eq!(ready_copy(&videos, "9", None), None);
         assert_eq!(ready_copy(&videos, "10", None), None);
@@ -295,7 +315,13 @@ mod tests {
 
     #[test]
     fn a_download_asks_for_hls_at_its_quality() {
-        let caps = download_caps(Capabilities { max_bitrate: 0, ..Capabilities::default() }, 2_000_000);
+        let caps = download_caps(
+            Capabilities {
+                max_bitrate: 0,
+                ..Capabilities::default()
+            },
+            2_000_000,
+        );
         assert_eq!(caps.containers, [NO_DIRECT_PLAY]);
         assert_eq!(caps.max_bitrate, 2_000_000);
     }
@@ -340,7 +366,12 @@ mod tests {
             images_url: None,
             styled_url: None,
         };
-        let image = Track { index: 4, vtt_url: None, images_url: Some("/i.json".into()), ..text.clone() };
+        let image = Track {
+            index: 4,
+            vtt_url: None,
+            images_url: Some("/i.json".into()),
+            ..text.clone()
+        };
         let kept = kept_subtitles(&[text, image]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].label, "eng");
@@ -348,7 +379,9 @@ mod tests {
 
     #[test]
     fn an_episode_is_named_with_its_show_and_number() {
-        let mut item = offline_detail(&video("8", "", KeptState::Ready)).unwrap().item;
+        let mut item = offline_detail(&video("8", "", KeptState::Ready))
+            .unwrap()
+            .item;
         item.kind = ItemKind::Episode;
         item.series_name = Some("Invented Show".into());
         item.season = Some(1);
