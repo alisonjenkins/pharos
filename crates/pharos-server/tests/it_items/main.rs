@@ -1,6 +1,7 @@
 //! Consolidated integration-test binary: one link instead of 23; each `mod` is a former tests/*.rs.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod book_readable_filter;
 mod direct_bool_filters_audit;
 mod filters_audit;
 mod genres_filter_audit;
