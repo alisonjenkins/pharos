@@ -498,41 +498,50 @@ async fn find_or_draw(
             source,
         })?;
     let tmp = tmp_path_for(&copy);
-    let (src_owned, tmp_owned) = (src.to_path_buf(), tmp.clone());
-    // Not cancelled when the request goes away: a client that gave up waiting
-    // finds the finished copy when it asks again.
-    let drawn = tokio::task::spawn_blocking(move || {
+    let (src_owned, copy_owned) = (src.to_path_buf(), copy.clone());
+    let (source_bytes, source_mtime) = (d.source_bytes, meta.modified().ok());
+    // Not cancelled when the request goes away: drawing, publishing and
+    // cleaning up all run in the blocking task, with the slot held, so a
+    // client that gave up waiting finds the finished copy when it asks again.
+    d.stats = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        draw(&src_owned, &tmp_owned, request)
+        let published = draw_and_publish(&src_owned, &tmp, &copy_owned, request, |m| {
+            m.len() == source_bytes && m.modified().ok() == source_mtime
+        });
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published
     })
     .await
     .map_err(|e| PagesError::Task(e.to_string()))
-    .and_then(|r| r);
-    let stats = match drawn {
-        Ok(stats) => stats,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
-        }
-    };
-    d.stats = stats;
-    let unchanged = tokio::fs::metadata(src)
-        .await
-        .is_ok_and(|m| m.len() == d.source_bytes && m.modified().ok() == meta.modified().ok());
-    if !unchanged {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(PagesError::Changed);
-    }
-    if let Err(source) = tokio::fs::rename(&tmp, &copy).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(PagesError::Write { path: copy, source });
-    }
+    .and_then(|r| r)?;
     d.served_bytes = tokio::fs::metadata(&copy).await.map_or(0, |m| m.len());
     Ok((
         copy,
         PagesOutcome::Drawn,
         "the pages were drawn to fit the box",
     ))
+}
+
+/// Draws `src` into `tmp`, then renames it to `copy` if `src` is still the
+/// file that was asked for (`unchanged` judges its metadata now).
+fn draw_and_publish(
+    src: &Path,
+    tmp: &Path,
+    copy: &Path,
+    request: PagesRequest,
+    unchanged: impl FnOnce(&std::fs::Metadata) -> bool,
+) -> Result<DrawStats, PagesError> {
+    let stats = draw(src, tmp, request)?;
+    if !std::fs::metadata(src).is_ok_and(|m| unchanged(&m)) {
+        return Err(PagesError::Changed);
+    }
+    std::fs::rename(tmp, copy).map_err(|source| PagesError::Write {
+        path: copy.to_path_buf(),
+        source,
+    })?;
+    Ok(stats)
 }
 
 /// A scratch path beside `copy` that no other drawing uses.
