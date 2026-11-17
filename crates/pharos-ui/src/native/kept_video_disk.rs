@@ -1040,12 +1040,23 @@ impl Inner {
                 }
                 Check::Fresh { other, cap, .. } => {
                     let used = st.reserved_by_others(user, item).saturating_add(other);
+                    // The cap is held to the whole estimate; the free space
+                    // only to what is not on disk yet (a re-planned resume
+                    // has stored bytes the disk already lacks).
                     fits(
                         plan.estimate,
                         used.saturating_add(plan.stale),
                         cap,
-                        free.saturating_sub(outstanding),
+                        u64::MAX,
                     )
+                    .and_then(|()| {
+                        fits(
+                            plan.estimate.saturating_sub(plan.stored),
+                            plan.stale,
+                            u64::MAX,
+                            free.saturating_sub(outstanding),
+                        )
+                    })
                     .map_err(|r| (r, used, free))
                 }
                 // The cap was met when the download began and its stored
@@ -1078,6 +1089,8 @@ impl Inner {
             // The reservation holds what the plan will take and what an
             // earlier plan still leaves on disk.
             v.estimated_bytes = plan.estimate.saturating_add(plan.stale);
+            // A plan is admitted: the estimate is a reserved one now.
+            v.estimate_from_adoption = false;
             v.state = KeptState::Downloading {
                 done: 0,
                 total: plan.total,
@@ -1453,6 +1466,10 @@ fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
     // files free. A walk that did not read everything leaves the folder
     // unknown until a sweep measures it whole.
     let m = dir_size(item_dir);
+    if record.estimated_bytes == 0 {
+        // No estimate was ever admitted for this record.
+        record.estimate_from_adoption = true;
+    }
     if m.bytes > record.estimated_bytes {
         emit(
             false,
@@ -1883,9 +1900,33 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     // lock is never awaited while the store's is held).
     let (check, admitted) = {
         let _admission = inner.env.budget.admission_guard();
-        let check = if resume {
+        // A resume keeps the cap it was admitted under only while its
+        // reservation already holds the new plan. One whose estimate came
+        // from adoption (the missing files were never reserved), or whose
+        // plan asks for more than it holds, passes the shared cap as a fresh
+        // download, its own reservation not counted.
+        let wants = plan.estimate.saturating_add(plan.stale);
+        let replan = if !resume {
+            None
+        } else if record.estimate_from_adoption {
+            Some("estimate_from_adoption")
+        } else if wants > record.estimated_bytes {
+            Some("estimate_raised")
+        } else {
+            None
+        };
+        let check = if resume && replan.is_none() {
             Check::Resume
         } else {
+            if let Some(reason) = replan {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video resume replanned item={item} reason={reason} estimated={} wants={wants} stored={stored_bytes}",
+                        record.estimated_bytes
+                    ),
+                );
+            }
             // Readiness first, then the figures: a library published in
             // between leaves the check refusing, never passing on the
             // default cap and no music.
@@ -1924,7 +1965,9 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             outstanding,
         }) => {
             let detail = match check {
-                Check::Fresh { cap, .. } => format!("estimate={estimate} used={used} cap={cap}"),
+                Check::Fresh { cap, .. } => {
+                    format!("resume={resume} estimate={estimate} used={used} cap={cap}")
+                }
                 Check::Resume => format!(
                     "resume=true remaining={} stored={stored_bytes}",
                     estimate.saturating_sub(stored_bytes)
@@ -4006,6 +4049,45 @@ mod tests {
         }
     }
 
+    /// A resume whose plan asks for more than its record reserves (a
+    /// finished download that lost a segment holds only what was on disk)
+    /// is held to the shared cap, its own reservation not counted: with
+    /// music holding the rest of the cap it is refused and fetches nothing.
+    #[tokio::test]
+    async fn a_resume_that_raises_its_reservation_passes_the_shared_cap() {
+        let rig = Rig::new("resume-raise");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let gone = store.stored_file("u1", SEG1).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&gone).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        let held = dir_size(&rig.dir.join("u1").join("1")).bytes;
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - held, Ordering::SeqCst);
+
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume past the shared cap went on");
+        };
+        assert!(rig.server.asked().is_empty(), "something was fetched");
+        assert!(!gone.exists(), "the missing segment was fetched");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("resume=true") && l.contains("cap=")),
+            "the resume skipped the shared cap: {refused:?}"
+        );
+        assert!(!lines("pharos: video resume replanned item=1 reason=estimate_raised").is_empty());
+        assert!(
+            store.stored_file("u1", SEG0).is_some(),
+            "stored files dropped"
+        );
+    }
+
     /// Two downloads that each fit alone but not together: the second
     /// is refused against the first's reservation, not admitted beside it.
     #[tokio::test]
@@ -5554,6 +5636,59 @@ mod tests {
             );
             store.settled().await;
         }
+    }
+
+    /// An interrupted manifest with no estimate (an older build's: the flag
+    /// is missing too) and a segment still to fetch was never reserved for
+    /// that segment. Its resume plans again and passes the shared cap as a
+    /// fresh download: with only the folder's bytes left under the cap it is
+    /// refused, and nothing beyond what is on disk is written.
+    #[tokio::test]
+    async fn a_resume_whose_estimate_came_from_adoption_passes_the_shared_cap() {
+        let (rig, _) = manifest_without_an_estimate("adopted-resume", true).await;
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut j: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        j.as_object_mut().unwrap().remove("estimate_from_adoption");
+        std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
+        let seg = dir.join("files").join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        let held = dir_size(&dir).bytes;
+        let media = dir_size(&dir.join("files")).bytes;
+        // Music holds the rest of the cap: only the folder's bytes fit.
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - held, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let refused = lines("pharos: video keep refused item=1 reason=");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("resume=true") && l.contains("cap=")),
+            "the resume skipped the shared cap: {refused:?}"
+        );
+        assert!(!seg.exists(), "the missing segment was fetched");
+        // Only the record is saved again (its verdict); no media is.
+        assert_eq!(
+            dir_size(&dir.join("files")).bytes,
+            media,
+            "media written beyond what was on disk"
+        );
+        let v = only(&store);
+        assert!(
+            v.estimated_bytes >= media,
+            "{} under {media}",
+            v.estimated_bytes
+        );
+        assert!(
+            v.estimate_from_adoption,
+            "a refused plan was marked admitted"
+        );
+        assert!(
+            !lines("pharos: video resume replanned item=1 reason=estimate_from_adoption")
+                .is_empty()
+        );
     }
 
     /// If the folder cannot be walked whole when the manifest is adopted,

@@ -106,6 +106,18 @@ pub struct KeptVideo {
     /// ISO 8601 UTC.
     #[serde(default)]
     pub saved_at: String,
+    /// The estimate was not set by an admitted plan: the record was adopted
+    /// from a manifest that lacked one, so it is the folder's measured size
+    /// and the files still missing were never reserved. A resume of such a
+    /// record plans again and passes the shared-cap check as a fresh
+    /// download. True when the manifest has no such field; false once a plan
+    /// has been admitted and saved.
+    #[serde(default = "estimate_from_adoption_default")]
+    pub estimate_from_adoption: bool,
+}
+
+fn estimate_from_adoption_default() -> bool {
+    true
 }
 
 impl KeptVideo {
@@ -537,6 +549,7 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         },
         position_ms: 0,
         saved_at,
+        estimate_from_adoption: false,
     }
 }
 
