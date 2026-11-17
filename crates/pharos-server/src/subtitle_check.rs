@@ -90,10 +90,13 @@ pub trait Scorer: Send + Sync {
     /// A karaoke song is queued or being aligned.
     fn busy(&self) -> bool;
     fn healthy(&self) -> impl Future<Output = bool> + Send;
+    /// Scores only (FR-002b), from `audio_stream`, the container's stream
+    /// index of the audio the track plays over (FR-002a).
     fn score(
         &self,
         path: &Path,
         lines: &[(u64, u64, String)],
+        audio_stream: Option<u32>,
     ) -> impl Future<Output = Result<Aligned, String>> + Send;
 }
 
@@ -104,8 +107,13 @@ impl Scorer for Arc<Aligner> {
     async fn healthy(&self) -> bool {
         Aligner::healthy(self).await
     }
-    async fn score(&self, path: &Path, lines: &[(u64, u64, String)]) -> Result<Aligned, String> {
-        Aligner::score(self, path, lines).await
+    async fn score(
+        &self,
+        path: &Path,
+        lines: &[(u64, u64, String)],
+        audio_stream: Option<u32>,
+    ) -> Result<Aligned, String> {
+        Aligner::score(self, path, lines, audio_stream).await
     }
 }
 
@@ -860,9 +868,14 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
             out
         };
         let (offset_ms, ratio) = at.map_or((0, 1.0), |s| (s.offset_ms, s.ratio));
+        // The stream stage 2 heard, so both stages score the same audio.
+        let stream = audio_stream(item).map(|t| t.stream_index);
         self.wait_for_turn().await;
         let asked = Instant::now();
-        let probe_answer = self.aligner.score(&item.path, &lines(|p| &p.text)).await;
+        let probe_answer = self
+            .aligner
+            .score(&item.path, &lines(|p| &p.text), stream)
+            .await;
         *aligner_s += asked.elapsed().as_secs_f64();
         let probe_answer = match probe_answer {
             Ok(a) => a,
@@ -877,7 +890,10 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         // FR-016: one request at a time, and a song may have come in between.
         self.wait_for_turn().await;
         let asked = Instant::now();
-        let decoy_answer = self.aligner.score(&item.path, &lines(|p| &p.decoy)).await;
+        let decoy_answer = self
+            .aligner
+            .score(&item.path, &lines(|p| &p.decoy), stream)
+            .await;
         *aligner_s += asked.elapsed().as_secs_f64();
         match decoy_answer {
             Ok(a) => {
@@ -995,6 +1011,8 @@ mod tests {
         /// Fail only this request (0-based), when set.
         fail_call: Option<usize>,
         calls: Mutex<Vec<(String, usize)>>,
+        /// The audio stream each request named.
+        streams: Mutex<Vec<Option<u32>>>,
         starts: Mutex<Vec<u64>>,
         /// When set, the video's real timing of [`srt`]'s cues,
         /// `video = sub * ratio + offset`: a probe scores `probe` only when
@@ -1017,6 +1035,7 @@ mod tests {
                 healthy: true,
                 fail_call: None,
                 calls: Mutex::default(),
+                streams: Mutex::default(),
                 starts: Mutex::default(),
                 truth: None,
                 cue_start: |i| i * 60_000 + 1_000,
@@ -1047,7 +1066,9 @@ mod tests {
             &self,
             path: &Path,
             lines: &[(u64, u64, String)],
+            audio_stream: Option<u32>,
         ) -> Result<Aligned, String> {
+            self.streams.lock().unwrap().push(audio_stream);
             self.busy_at_send
                 .lock()
                 .unwrap()
@@ -1325,6 +1346,8 @@ mod tests {
             fake.calls(),
             [("film.mkv".into(), 12), ("film.mkv".into(), 12)]
         );
+        // FR-002a: both from the default audio's stream, not the file's first.
+        assert_eq!(*fake.streams.lock().unwrap(), [Some(1), Some(1)]);
         let r = row(&lib, 1).await;
         assert_eq!(r.verdict.as_deref(), Some("fits"));
         assert_eq!(r.reason, "median=0.90 decoy=0.25 hits=12/12");
