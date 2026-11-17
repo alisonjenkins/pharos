@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// A chunked body that stops after `at` bytes: `reached` is set when it
+/// A body that stops after `at` bytes: `reached` is set when it
 /// has, and it goes on once `release` is set.
 #[derive(Debug, Clone)]
 struct Hold {
@@ -67,8 +67,8 @@ impl Script {
         self
     }
 
-    /// Holds a chunked body after `bytes` of it, to see a download in the
-    /// middle of its body. Returns the flag that releases it and the flag
+    /// Holds a body (chunked or of known length) after `bytes` of it, to see
+    /// a download in the middle of its body. Returns the flag that releases it and the flag
     /// the server sets once it has stopped there.
     pub fn hold_after(
         mut self,
@@ -268,6 +268,25 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         }
         if drop_after.is_none() {
             let _ = sock.write_all(b"0\r\n\r\n").await;
+        }
+    } else if let Some(Hold {
+        at,
+        release,
+        reached,
+    }) = &hold
+    {
+        // A known-length body held after `at` bytes: the client has the
+        // length, so its reservation is refreshed as the body arrives.
+        let mut sent = 0usize;
+        for piece in part.chunks(piece) {
+            let _ = sock.write_all(piece).await;
+            sent += piece.len();
+            if sent >= *at {
+                reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
         }
     } else {
         let _ = sock.write_all(part).await;
