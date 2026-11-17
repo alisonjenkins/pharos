@@ -5,6 +5,7 @@
 //! does the sockets and files. Nothing here logs a token or a QuickConnect
 //! secret; the QuickConnect code is logged because the user must type it.
 
+use crate::native::token_file;
 use crate::native::tv_auth::{self, Action, Polled, QuickConnect};
 use futures_util::{SinkExt, StreamExt};
 use pharos_api::pharos_capnp::{bootstrap, login_result, quick_connect_result, session};
@@ -137,32 +138,31 @@ fn token_path() -> Result<PathBuf, String> {
         })
 }
 
-/// The user the token was issued to, kept beside it: a cold start trusts a
-/// remembered user only when it is this one.
-fn token_user_path() -> Result<PathBuf, String> {
-    files_dir().map(|d| d.join("device-token.user"))
-}
-
-/// The user id stored with the token. `None` with no readable token (a
-/// token that cannot be read is nobody) or no user id stored with it.
+/// The user id stored with the token (one file: `token_file`). `None` with
+/// no readable token or no user id stored with it; the older layout's
+/// sidecar is never read, as nothing says it belongs to this token.
 pub fn load_token_user() -> Result<Option<String>, String> {
-    if load_token().is_none() {
-        return Ok(None);
-    }
-    match std::fs::read_to_string(token_user_path()?) {
-        Ok(v) => Ok(Some(v.trim().to_owned()).filter(|u| !u.is_empty())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("token user: {e}")),
-    }
+    Ok(token_file::read(&token_path()?)?.and_then(|s| s.user))
 }
 
-/// Stores the user id beside the token, written whole then renamed.
+/// Keeps `user` with the token now on file, in the same file.
 pub fn store_token_user(user: &str) -> Result<(), String> {
-    let path = token_user_path()?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, user)
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| format!("token user: {e}"))
+    let _held = FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    token_file::store_user(&token_path()?, user)
+}
+
+/// Held across a read-modify-write of the token file in this process.
+static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Removes the older layout's sidecar, best effort.
+fn drop_legacy_user(path: &std::path::Path) {
+    match std::fs::remove_file(token_file::legacy_user_path(path)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("legacy token user: {e}"),
+    }
 }
 
 /// The device token as last loaded, stored or forgotten, kept in memory for
@@ -188,59 +188,34 @@ pub fn token() -> Option<String> {
 /// The stored device token, if any. Never log the value.
 pub fn load_token() -> Option<String> {
     let path = token_path().ok()?;
-    let token = std::fs::read_to_string(path)
-        .ok()
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty());
+    let token = token_file::read(&path).ok().flatten().map(|s| s.token);
     set_cached(token.clone());
     token
 }
 
-/// Write the token to a temp file in the same directory, fsync it, and
-/// rename it over the target, so a crash never leaves a half-written token.
+/// Replaces the token file whole (`token_file::store`): the new token's user
+/// is unknown until `store_token_user`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = token_path()?;
-    let dir = path.parent().ok_or("token path has no directory")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join("device-token.tmp");
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(token.as_bytes())?;
-        f.sync_all()?;
-        if f.metadata()?.permissions().mode() & 0o077 != 0 {
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &path)
-    };
-    write()
-        .inspect(|()| {
-            set_cached(Some(token.to_owned()));
-            note_credentials_changed("stored");
-        })
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
-        })
+    let _held = FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    token_file::store(&path, token).map(|()| {
+        drop_legacy_user(&path);
+        set_cached(Some(token.to_owned()));
+        note_credentials_changed("stored");
+    })
 }
 
 pub fn forget_token() {
     set_cached(None);
-    if let Ok(path) = token_user_path() {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("forget token user: {e}"),
-        }
-    }
     let Ok(path) = token_path() else { return };
-    match std::fs::remove_file(path) {
+    let _held = FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop_legacy_user(&path);
+    // One file: the token goes with its user, or both stay.
+    match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::warn!("forget token: {e}"),

@@ -437,6 +437,9 @@ mod tests {
         /// it.
         token_present: Rc<Cell<bool>>,
         token_user: Rc<RefCell<Option<String>>>,
+        /// When set, the token and its user are this real file, read and
+        /// written by the code the phone runs (`token_file`).
+        file: Rc<RefCell<Option<std::path::PathBuf>>>,
         /// Runs once as the preference is read: a sign-in or sign-out that
         /// lands during a cold start's reads.
         on_read: Rc<RefCell<Option<ReadHook>>>,
@@ -444,6 +447,9 @@ mod tests {
 
     impl Pref {
         pub(super) fn token_user(&self) -> Result<Option<String>, String> {
+            if let Some(path) = self.file.borrow().as_ref() {
+                return Ok(super::super::token_file::read(path)?.and_then(|s| s.user));
+            }
             Ok(if self.token_present.get() {
                 self.token_user.borrow().clone()
             } else {
@@ -451,6 +457,9 @@ mod tests {
             })
         }
         pub(super) fn note_token_user(&self, user: &str) -> Result<(), String> {
+            if let Some(path) = self.file.borrow().as_ref() {
+                return super::super::token_file::store_user(path, user);
+            }
             if self.token_present.get() {
                 *self.token_user.borrow_mut() = Some(user.to_owned());
             }
@@ -602,6 +611,48 @@ mod tests {
         set_identity(Identity::Unknown);
         assert_eq!(last_user(), None, "the stale preference signed A back in");
         assert!(!serves(last_user()));
+    }
+
+    /// A sign-out whose token delete fails, then another user's sign-in,
+    /// then a restart before that user's `me` has answered: the new token
+    /// has no user of its own yet, so nothing is served, and above all not
+    /// the first user's downloads. Through the real token file the phone
+    /// writes, and the lookup the proxy answers from.
+    #[test]
+    fn a_failed_sign_out_then_another_sign_in_never_serves_the_first_user() {
+        use super::super::token_file;
+        let d = std::env::temp_dir().join(format!("pharos-ov-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+
+        // A signs in: the token, then `me` says whose it is.
+        token_file::store(&path, "tokA").unwrap();
+        remember_user("A");
+        set_identity(Identity::Unknown);
+        assert!(serves(last_user()), "A's own restart serves A");
+
+        // A signs out; the token's delete fails, so the file stays as it is.
+        forget_user();
+
+        // B signs in: the new token replaces the file whole.
+        token_file::store(&path, "tokB").unwrap();
+
+        // The restart, before B's `me` has answered. The preference still
+        // names A.
+        *p.value.borrow_mut() = Some("A".to_owned());
+        set_identity(Identity::Unknown);
+        assert_eq!(last_user(), None, "B's token vouched for A");
+        assert!(!serves(last_user()));
+
+        // `me` answers: B is known, and pairs with B's token for good.
+        remember_user("B");
+        set_identity(Identity::Unknown);
+        assert_eq!(last_user().as_deref(), Some("B"));
+        assert!(!serves(last_user()), "B has nothing downloaded");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A token with no user id stored with it, or another user's, does not

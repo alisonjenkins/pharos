@@ -134,6 +134,10 @@ mod subs_web;
 pub mod subtitles;
 pub mod together;
 pub mod together_view;
+// The device token and its user in one file (android.rs keeps it; builds on
+// the host so the sign-in sequences can be tested).
+#[cfg(any(target_os = "android", test))]
+pub mod token_file;
 pub mod track_follow;
 pub mod trail;
 pub mod turn;
