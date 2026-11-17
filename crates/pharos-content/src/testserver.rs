@@ -19,6 +19,8 @@ pub struct Script {
     piece: usize,
     ignore_range: bool,
     window: Option<u64>,
+    /// A chunked body stops after this many bytes until the flag is set.
+    hold: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
     /// Each body served pops one entry and closes the socket after that many
     /// body bytes.
     drops: VecDeque<usize>,
@@ -54,6 +56,14 @@ impl Script {
     pub fn chunk_bytes(mut self, bytes: usize) -> Self {
         self.piece = bytes;
         self
+    }
+
+    /// Holds a chunked body after `bytes` of it until the returned flag is
+    /// set, to see a download in the middle of its body.
+    pub fn hold_after(mut self, bytes: usize) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.hold = Some((bytes, flag.clone()));
+        (self, flag)
     }
 
     pub fn window(mut self, bytes: u64) -> Self {
@@ -182,7 +192,10 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         .find_map(|kv| kv.strip_prefix("api_key="))
         .map(str::to_owned);
 
-    let piece = state.lock().unwrap_or_else(PoisonError::into_inner).piece;
+    let (piece, hold) = {
+        let s = state.lock().unwrap_or_else(PoisonError::into_inner);
+        (s.piece, s.hold.clone())
+    };
     let piece = if piece == 0 { 8192 } else { piece };
     let (reply, drop_after) = {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -209,12 +222,21 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     let send = drop_after.map_or(reply.body.len(), |n| n.min(reply.body.len()));
     let part = reply.body.get(..send).unwrap_or_default();
     if reply.chunked {
+        let mut sent = 0usize;
         for piece in part.chunks(piece) {
             let _ = sock
                 .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
                 .await;
             let _ = sock.write_all(piece).await;
             let _ = sock.write_all(b"\r\n").await;
+            sent += piece.len();
+            if let Some((at, flag)) = &hold {
+                if sent >= *at {
+                    while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                }
+            }
         }
         if drop_after.is_none() {
             let _ = sock.write_all(b"0\r\n\r\n").await;

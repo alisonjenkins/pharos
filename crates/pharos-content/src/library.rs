@@ -1804,6 +1804,54 @@ mod tests {
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
     }
 
+    /// A chunked download of unknown length, held in the middle of its
+    /// window, is on the library's outstanding figure (what a host that
+    /// shares the disk reads), and gone when the job ends. The downloader
+    /// is the real one over the real cache, resolving to a local server
+    /// (the library's own resolver needs the server's node protocol).
+    #[test]
+    fn a_download_held_mid_window_is_outstanding_until_the_job_ends() {
+        use crate::prefetch::{Downloader, Resolver, Tuning, FREE_CHECK_BYTES};
+        use crate::testserver::{Script, TestServer};
+        let dir = std::env::temp_dir().join(format!("pharos-lib-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let (script, release) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .chunked()
+            .hold_after(64 * 1024);
+        let srv = Arc::new(TestServer::start(script));
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        let cache = Arc::new(Cache::open(&dir.join("cache"), 100 << 30).unwrap());
+        let s2 = srv.clone();
+        let resolve: Resolver = Arc::new(move |_| Ok(s2.url_with_token("/audio/1", "t")));
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
+        downloader.set_online(true);
+        assert!(lib
+            .offline
+            .set(Offline {
+                cache: cache.clone(),
+                downloader,
+            })
+            .is_ok());
+        assert_eq!(lib.music_outstanding_bytes(), 0);
+        lib.prefetch(&["track/1".to_owned()]);
+        let mut waited = 0;
+        while lib.music_outstanding_bytes() < FREE_CHECK_BYTES {
+            waited += 1;
+            assert!(
+                waited < 10_000,
+                "never outstanding: {}",
+                lib.music_outstanding_bytes()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        assert_eq!(lib.music_outstanding_bytes(), 0, "kept after the job ended");
+    }
+
     #[test]
     fn restored_pins_wait_for_the_first_network_report() {
         let dir = std::env::temp_dir().join(format!("pharos-lib-pins-{}", std::process::id()));
