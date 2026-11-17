@@ -444,7 +444,13 @@ impl Inner {
     /// off the disk, with the files it still holds indexed.
     fn keep_after_failed_unlink(&self, mut record: KeptVideo, dir: &Path, e: &std::io::Error) {
         let names = stored_names(dir);
+        #[cfg(test)]
+        tests::at_unlink_failure();
         let mut st = lock(&self.state);
+        // The record comes back and the removal's tombstone, mark and
+        // in-removal entry go in this one hold: no admission sees neither.
+        st.tombstones.retain(|(d, _)| d != dir);
+        st.unmeasured.retain(|(d, _)| d != dir);
         for key in &record.files {
             if let Some(len) = names.get(&file_name(key)) {
                 st.index.insert(
@@ -1753,11 +1759,6 @@ impl VideoStore for DiskVideoStore {
                 // The record is still on disk and would bring the download
                 // back at the next open, so the removal has not happened:
                 // the record stays, as a failed one, and the caller sees it.
-                {
-                    let mut st = lock(&self.inner.state);
-                    st.tombstones.retain(|(d, _)| *d != dir);
-                    st.unmeasured.retain(|(d, _)| *d != dir);
-                }
                 self.inner.keep_after_failed_unlink(record, &dir, &e);
                 return;
             }
@@ -1786,7 +1787,7 @@ impl VideoStore for DiskVideoStore {
                 ));
             }
             st.tombstones.retain(|(d, _)| *d != dir);
-            st.tombstones.push((dir, left));
+            st.tombstones.push((dir.clone(), left));
         }
         emit(
             false,
@@ -1907,6 +1908,20 @@ mod tests {
     thread_local! {
         /// Runs as a folder is being deleted.
         static DURING_REMOVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs when a removal's manifest unlink has failed, before the
+        /// record is put back.
+        static AT_UNLINK_FAILURE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn at_unlink_failure() {
+        AT_UNLINK_FAILURE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     fn removing(dir: &Path) -> std::io::Result<()> {
@@ -3740,6 +3755,41 @@ mod tests {
         assert!(dir.join("files").exists(), "the folder went");
         let line = lines("pharos: video keep remove");
         assert!(line[0].contains("verdict=not_removed"), "{line:?}");
+    }
+
+    /// When the manifest unlink fails, the tombstone and the mark stay until
+    /// the record is back: no moment in between where an admission sees
+    /// neither.
+    #[tokio::test]
+    async fn a_failed_unlink_restores_the_record_and_drops_the_tombstone_together() {
+        let rig = Rig::new("unlink-fails-gap");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = store.kept_bytes();
+        assert!(kept > 0);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        AT_UNLINK_FAILURE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                seen2.set(Some((s2.kept_bytes(), s2.size_unknown())));
+            }));
+        });
+        store.remove("u1", "1");
+        AT_UNLINK_FAILURE.with(|d| *d.borrow_mut() = None);
+        let (during, unknown) = seen.take().unwrap();
+        assert_eq!(
+            during, kept,
+            "counted for nothing before the record is back"
+        );
+        assert!(unknown, "no mark before the record is back");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        assert_eq!(store.kept_bytes(), kept, "counted twice or not at all");
+        assert!(!store.size_unknown(), "the mark outlived the restore");
     }
 
     /// While a removed download's folder is being deleted its bytes still
