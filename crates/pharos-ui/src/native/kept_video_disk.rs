@@ -674,6 +674,13 @@ fn clear_parts(dir: &Path) {
     }
 }
 
+/// Bytes of whole files on disk under `dir`, whatever plan they belong to.
+fn disk_bytes(dir: &Path) -> u64 {
+    stored_names(dir)
+        .values()
+        .fold(0u64, |sum, len| sum.saturating_add(*len))
+}
+
 /// Deletes the stored files of `item` that `plan` does not name, and
 /// forgets them: a retry that planned afresh (a new play session names
 /// every file anew) must not leave the old plan's files on the disk.
@@ -884,6 +891,8 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             format!("pharos: video keep stopped item={item} reason={what} ms={ms}"),
         );
     };
+    // What the item's folder holds now, whatever plan the files are of.
+    let held = disk_bytes(&inner.item_dir(&user, &item));
     match outcome {
         Ok(Finished {
             bytes,
@@ -895,7 +904,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 // reopen would count it missing and resume the copy.
                 v.files.retain(|k| !skipped.contains(k));
                 v.state = KeptState::Ready;
-                v.estimated_bytes = bytes;
+                // What the folder holds, a file a failed prune could not
+                // delete included: the record reports all storage used.
+                v.estimated_bytes = held;
             }) {
                 emit(
                     false,
@@ -915,6 +926,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     files = done;
                 }
                 bytes = v.bytes();
+                // A failed attempt's files stay for a retry; the record
+                // holds what is really on disk, not what was planned.
+                v.estimated_bytes = held;
                 v.state = KeptState::Failed {
                     reason: reason.clone(),
                 };
@@ -1131,7 +1145,13 @@ impl VideoStore for DiskVideoStore {
             let room = free.saturating_sub(outstanding_by_others(&st.list, &user, &item));
             let started = fits(0, used, cap, room).and_then(|()| {
                 check_not_kept(&st.list, &user, &item)?;
-                insert_front(&mut st.list, new_record(&request, (self.inner.env.now)()));
+                let mut record = new_record(&request, (self.inner.env.now)());
+                // A failed attempt's files stay on disk until a plan prunes
+                // them; the replacement keeps counting them meanwhile.
+                if let Some(old) = find(&st.list, &user, &item) {
+                    record.estimated_bytes = old.estimated_bytes;
+                }
+                insert_front(&mut st.list, record);
                 Ok(())
             });
             (started, used)
@@ -1975,6 +1995,98 @@ mod tests {
         assert_eq!(on_disk, v.files.len(), "only the new plan's files remain");
         assert_eq!(v.files.len(), 5);
         assert_eq!(lines("pharos: video keep pruned").len(), 1);
+    }
+
+    /// A failed attempt leaves files on disk; they stay counted through the
+    /// next attempt even when it fails before it has a plan to prune to.
+    #[tokio::test]
+    async fn a_failed_attempts_files_stay_counted_when_the_retry_fails_in_planning() {
+        let rig = Rig::new("retry-fails");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let dir = rig.dir.join("u1").join("1");
+        let on_disk = disk_bytes(&dir);
+        assert!(on_disk > 0);
+        assert_eq!(
+            store.kept_bytes(),
+            on_disk,
+            "a failed record reports what is on disk"
+        );
+
+        // The retry negotiates a session the server cannot answer: it fails
+        // reading its master playlist, before any plan.
+        let mut again = request("1");
+        again.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+        store.start(again).unwrap();
+        assert_eq!(
+            store.kept_bytes(),
+            on_disk,
+            "the old files stay counted while the retry starts"
+        );
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert_eq!(
+            disk_bytes(&dir),
+            on_disk,
+            "nothing was pruned without a plan"
+        );
+        assert_eq!(store.kept_bytes(), on_disk, "and they are still counted");
+    }
+
+    /// A stale file the prune cannot delete still counts against the cap.
+    #[tokio::test]
+    async fn a_file_the_prune_cannot_delete_is_counted_in_the_ready_record() {
+        let rig = Rig::new("prune-fails");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // A directory where a stale file should be: remove_file refuses it.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 10]).unwrap();
+
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert!(stuck.exists(), "the stale entry could not go");
+        let planned: u64 = v
+            .files
+            .iter()
+            .map(|k| {
+                std::fs::metadata(store.stored_file(k).unwrap().path)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert!(
+            v.estimated_bytes > planned,
+            "the record counts the stuck entry: {} vs {planned}",
+            v.estimated_bytes
+        );
+        assert_eq!(v.estimated_bytes, disk_bytes(&rig.dir.join("u1").join("1")));
     }
 
     #[tokio::test]
