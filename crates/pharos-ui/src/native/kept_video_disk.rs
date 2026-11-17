@@ -4941,6 +4941,70 @@ mod tests {
         );
     }
 
+    /// The car's case end to end: a process that never lists the downloads.
+    /// A held folder whose record reads again is swept by the music cache's
+    /// own size check (a real `Library` download, under the shared admission
+    /// lock, through `ports::outside_bytes` as the phone's hook calls it),
+    /// and the track is admitted, with no `videos()` call. The process-wide
+    /// port slot belongs to another test, so the hook is built over this
+    /// store directly.
+    #[test]
+    fn a_music_download_sweeps_a_readable_held_folder_and_is_admitted() {
+        let music = capture_music_log();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = rt.enter();
+        let (rig, store, good, manifest) = rt.block_on(held_download("music-sweep"));
+        std::fs::write(&manifest, &good).unwrap();
+        // The open's own check swept just now; make the next one due.
+        *store.inner.last_sweep.lock().unwrap() = None;
+
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        let hooked = store.clone();
+        lib.set_outside_used(Arc::new(move || {
+            crate::native::ports::outside_bytes(Some(&*hooked))
+        }));
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        lib.prefetch(&["track/3".to_owned()]);
+        // Admitted: the job passes `ensure_free` and goes on to resolve the
+        // track (nothing listens, so the resolve is retried).
+        let seen = |want: &str| {
+            music
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("id=track/3") && l.contains(want))
+        };
+        let mut waited = 0;
+        while !seen("reason=resolve") && !seen("reason=outside_size_unknown") && waited < 5_000 {
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(lib);
+        assert!(
+            !seen("reason=outside_size_unknown"),
+            "music was refused: {:?}",
+            music.lock().unwrap()
+        );
+        assert!(seen("reason=resolve"), "music was not admitted");
+        assert_eq!(store.unreadable_count(), 0, "the folder is still held");
+        assert!(!lines("pharos: video unknown-size sweep from=host_size_check").is_empty());
+    }
+
     /// A record that cannot be written is refused at the start, and the
     /// accounting is as it was: nothing runs, the record is gone, and the
     /// one it replaced is back.
