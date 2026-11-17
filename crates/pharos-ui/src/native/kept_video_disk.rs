@@ -1680,7 +1680,14 @@ impl VideoStore for DiskVideoStore {
             // when the folder counts for nothing while it is deleted.
             let dir = self.inner.item_dir(user, item);
             st.tombstones.retain(|(d, _)| *d != dir);
-            st.tombstones.push((dir, reserved(&record)));
+            st.tombstones.push((dir.clone(), reserved(&record)));
+            // The reservation is an estimate, not a bound on the folder
+            // (staged `.part` files, files an earlier plan left, a file
+            // larger than planned), so until the folder is deleted or
+            // measured its size is not known: nothing is admitted.
+            st.unmeasured.retain(|(d, _)| *d != dir);
+            st.unmeasured
+                .push((dir, "being removed, not yet measured".to_owned()));
             record
         };
         let dir = self.inner.item_dir(user, item);
@@ -1693,9 +1700,11 @@ impl VideoStore for DiskVideoStore {
                 // The record is still on disk and would bring the download
                 // back at the next open, so the removal has not happened:
                 // the record stays, as a failed one, and the caller sees it.
-                lock(&self.inner.state)
-                    .tombstones
-                    .retain(|(d, _)| *d != dir);
+                {
+                    let mut st = lock(&self.inner.state);
+                    st.tombstones.retain(|(d, _)| *d != dir);
+                    st.unmeasured.retain(|(d, _)| *d != dir);
+                }
                 self.inner.keep_after_failed_unlink(record, &dir, &e);
                 return;
             }
@@ -1703,9 +1712,9 @@ impl VideoStore for DiskVideoStore {
         let removed = (self.inner.env.remove_dir)(&dir);
         let mut left = 0;
         if removed.is_ok() {
-            lock(&self.inner.state)
-                .tombstones
-                .retain(|(d, _)| *d != dir);
+            let mut st = lock(&self.inner.state);
+            st.tombstones.retain(|(d, _)| *d != dir);
+            st.unmeasured.retain(|(d, _)| *d != dir);
         } else {
             // The bytes still on disk keep counting against the cap until
             // a later sweep deletes the folder.
@@ -3450,6 +3459,40 @@ mod tests {
         };
         assert!(reason.contains("guard"), "{reason}");
         store.settled().await;
+    }
+
+    /// While a removed download's folder is being deleted and measured its
+    /// size is not known: an admission in that window is refused, not let
+    /// through on a reservation that is only an estimate.
+    #[tokio::test]
+    async fn an_admission_while_a_folder_is_being_removed_is_refused() {
+        let rig = Rig::new("remove-window");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        // Read inside the deletion, where no start can run (the removal
+        // holds the saves lock a start's save would wait on): the state
+        // every admission reads.
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                seen2.set(Some((
+                    s2.size_unknown(),
+                    lock(&s2.inner.state).unknown_folder(),
+                )));
+            }));
+        });
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let (unknown, refusal) = seen.take().unwrap();
+        assert!(unknown, "known while the folder was being deleted");
+        assert!(
+            matches!(refusal, Some(KeepVideoRefusal::Host(_))),
+            "{refusal:?}"
+        );
+        // Once it is gone the block lifts.
+        assert!(!store.size_unknown(), "still blocked after the removal");
     }
 
     /// A damaged manifest is held the same way.
