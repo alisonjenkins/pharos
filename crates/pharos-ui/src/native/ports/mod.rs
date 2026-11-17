@@ -170,6 +170,50 @@ pub fn music_outstanding(music: Option<&dyn MusicSide>) -> u64 {
     music.map_or(0, MusicSide::outstanding_bytes)
 }
 
+/// How `register_video_root` ended.
+#[cfg(any(feature = "mobile", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// Another caller had claimed the root; nothing was touched.
+    AlreadyOpened,
+    /// The folder could not be created: no store, and the music cache has
+    /// been told the video size is unknown.
+    NoFolder(String),
+    /// The store was opened and registered.
+    Registered,
+    /// The store was opened but not registered (one already is).
+    NotRegistered(String),
+}
+
+/// The phone's registration of its video store, as the Android crate runs
+/// it (the init hook and the first render both come here). `once` is
+/// claimed first, before the folder is touched: a second store on the same
+/// root would run recovery over the first's staging files, and a first
+/// attempt that failed is not retried over what it left. `install_hook`
+/// goes in before the folder is created and reports the size unknown while
+/// no store is registered, so a folder that cannot be created leaves the
+/// music refused, not counted as free of video. `register` opens and
+/// registers the store.
+#[cfg(any(feature = "mobile", test))]
+pub fn register_video_root(
+    root: &std::path::Path,
+    once: &OpenOnce,
+    install_hook: impl FnOnce(),
+    register: impl FnOnce() -> Result<(), String>,
+) -> Registration {
+    if !once.claim() {
+        return Registration::AlreadyOpened;
+    }
+    install_hook();
+    if let Err(e) = std::fs::create_dir_all(root) {
+        return Registration::NoFolder(e.to_string());
+    }
+    match register() {
+        Ok(()) => Registration::Registered,
+        Err(e) => Registration::NotRegistered(e),
+    }
+}
+
 /// What the music cache is told about the video store: what it holds, still
 /// owes, and whether it knows its own size. With no store registered (its
 /// folder could not be created, or it has yet to be) nothing is known about

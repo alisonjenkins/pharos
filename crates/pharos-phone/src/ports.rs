@@ -316,35 +316,32 @@ static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
 static OPENED: pharos_ui::native::ports::OpenOnce = pharos_ui::native::ports::OpenOnce::new();
 
 fn register_video_at(root: std::path::PathBuf) {
-    // The init hook and the first render both come here. A second store on
-    // the same root would run recovery over the first's staging files, and
-    // a first attempt that failed is not retried over what it left.
-    if !OPENED.claim() {
-        log::info!(
+    use pharos_ui::native::ports::{register_video_root, Registration};
+    let outcome = register_video_root(
+        &root,
+        &OPENED,
+        || pharos_android::set_outside_used(pharos_ui::native::ports::outside_bytes_hook()),
+        || {
+            let budget = Arc::new(PhoneBudget { dir: root.clone() });
+            pharos_ui::native::register_phone_video_store(root.clone(), budget)
+        },
+    );
+    match outcome {
+        Registration::AlreadyOpened => log::info!(
             "pharos: port video_store verdict=already_opened dir={}",
             root.display()
-        );
-        return;
-    }
-    // The music cache counts the video's bytes against the shared cap. The
-    // hook goes in first and reports the size unknown while no store is
-    // registered, so a folder that cannot be created leaves the music
-    // refused, not counted as free of video.
-    pharos_android::set_outside_used(pharos_ui::native::ports::outside_bytes_hook());
-    if let Err(e) = std::fs::create_dir_all(&root) {
-        log::warn!(
+        ),
+        Registration::NoFolder(e) => log::warn!(
             "pharos: port video_store verdict=not_registered reason=no_folder dir={} error={e}",
             root.display()
-        );
-        return;
-    }
-    let budget = Arc::new(PhoneBudget { dir: root.clone() });
-    match pharos_ui::native::register_phone_video_store(root.clone(), budget) {
-        Ok(()) => log::info!(
+        ),
+        Registration::Registered => log::info!(
             "pharos: port video_store verdict=registered dir={}",
             root.display()
         ),
-        Err(e) => log::info!("pharos: port video_store verdict=already_registered reason={e}"),
+        Registration::NotRegistered(e) => {
+            log::info!("pharos: port video_store verdict=already_registered reason={e}");
+        }
     }
 }
 
