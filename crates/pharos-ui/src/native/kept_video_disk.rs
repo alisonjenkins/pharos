@@ -163,6 +163,11 @@ struct State {
     /// and is writing now: owed still (not on disk yet), but spoken for, so
     /// two fetches of one run cannot both spend the same headroom.
     claimed: HashMap<(String, String, u64), u64>,
+    /// Per download, the bytes an earlier plan left on disk that the
+    /// admitted plan's prune could not delete: part of its reservation
+    /// (admitted as estimate plus stale), on disk already, and in none of
+    /// its stored or staged figures, so counted here once.
+    stale_floor: HashMap<(String, String), u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -491,7 +496,8 @@ impl State {
     }
 
     /// What `run` of `v`'s download has on disk of its reservation: its
-    /// whole files and its staged (flushed) bytes. Chunks it has claimed
+    /// whole files, its staged (flushed) bytes and the stale files its plan
+    /// could not prune. Chunks it has claimed
     /// and not yet written are not here: the free space still holds them.
     fn run_on_disk(&self, v: &KeptVideo, run: u64) -> u64 {
         let who = (v.user.clone(), v.item.clone(), run);
@@ -499,7 +505,14 @@ impl State {
             KeptState::Downloading { bytes, .. } => bytes,
             _ => v.bytes(),
         };
-        stored.saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+        let stale = self
+            .stale_floor
+            .get(&(v.user.clone(), v.item.clone()))
+            .copied()
+            .unwrap_or(0);
+        stored
+            .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+            .saturating_add(stale)
     }
 
     /// What `run` holds of its reservation: what it has on disk and the
@@ -1306,6 +1319,9 @@ impl Inner {
                 total: plan.total,
                 bytes: plan.stored,
             };
+            // The stale share is on disk already: media may not grow into it.
+            st.stale_floor
+                .insert((user.to_owned(), item.to_owned()), plan.stale);
         }
         #[cfg(test)]
         self.plans_admitted
@@ -5158,6 +5174,67 @@ mod tests {
         drop(pending);
         release.store(true, Ordering::SeqCst);
         store.settled().await;
+    }
+
+    /// A plan admitted beside stale files its prune could not delete holds
+    /// estimate plus stale. The stale share is on disk, so media stop at
+    /// the plan's own share: past it the reservation must grow, and over
+    /// the cap it cannot. A cap that fits estimate plus stale exactly still
+    /// lets a download within its plan finish.
+    #[tokio::test]
+    async fn media_cannot_grow_into_the_stale_share_of_a_reservation() {
+        for big in [true, false] {
+            let rig = Rig::new(if big {
+                "stale-share"
+            } else {
+                "stale-share-fits"
+            });
+            rig.server.fail(SEG1, &[403]);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            // 2 MB an earlier plan left that the prune cannot delete.
+            let files = rig.dir.join("u1").join("1").join("files");
+            let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+            std::fs::create_dir(&stuck).unwrap();
+            std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+            let stale = dir_size(&stuck).bytes;
+            let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+            {
+                let mut f = rig.server.files.lock().unwrap();
+                let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+                for (key, body) in old {
+                    let body = match String::from_utf8(body.clone()) {
+                        Ok(text) => renamed(&text).into_bytes(),
+                        Err(_) => body,
+                    };
+                    f.insert(renamed(&key), body);
+                }
+                if big {
+                    // 4 MB of media against a 3 MB plan.
+                    f.insert(renamed(SEG1), vec![3; 4_000_000]);
+                }
+            }
+            rig.server.failures.lock().unwrap().clear();
+            let estimate = estimate_bytes(2_000_000, 12_000);
+            // The cap fits the plan and the stale files exactly.
+            rig.budget.cap.store(estimate + stale, Ordering::SeqCst);
+            let mut again = request("1");
+            again.master_url = renamed(MASTER_KEY);
+            store.start(again).unwrap();
+            store.settled().await;
+            let v = only(&store);
+            let media = dir_size(&files).bytes.saturating_sub(stale);
+            if big {
+                assert!(
+                    matches!(v.state, KeptState::Failed { .. }),
+                    "media grew into the stale share: {v:?}"
+                );
+                assert!(media <= estimate, "media reached {media} past {estimate}");
+            } else {
+                assert_eq!(v.state, KeptState::Ready, "an exact fit was refused");
+            }
+        }
     }
 
     /// A playlist past its limit is refused and not kept: its reservation
