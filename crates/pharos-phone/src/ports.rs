@@ -236,29 +236,28 @@ struct PhoneBudget {
     dir: std::path::PathBuf,
 }
 
+/// The library as the music side of the budget, once the service has
+/// connected it.
+fn music() -> Option<&'static dyn pharos_ui::native::ports::MusicSide> {
+    pharos_android::library().map(|l| l as &dyn pharos_ui::native::ports::MusicSide)
+}
+
 impl Budget for PhoneBudget {
+    // The figures come from `pharos_ui::native::ports`, the code the tests run.
     fn cap_bytes(&self) -> u64 {
-        pharos_android::library()
-            .and_then(content::Library::cache_cap)
-            .unwrap_or(content::DEFAULT_CAP_BYTES)
+        pharos_ui::native::ports::music_cap(music())
     }
 
     fn other_used_bytes(&self) -> u64 {
-        pharos_android::library()
-            .and_then(content::Library::offline_summary)
-            .map_or(0, |s| s.used_bytes)
+        pharos_ui::native::ports::music_used(music())
     }
 
     fn accounting_ready(&self) -> bool {
-        // Without the music cache enabled the cap is the default and the
-        // music counts as nothing: a new download waits for it. A library
-        // whose cache failed to start (or has yet to) is as absent.
-        pharos_android::library().is_some_and(content::Library::cache_enabled)
+        pharos_ui::native::ports::music_ready(music())
     }
 
     fn other_outstanding_bytes(&self) -> u64 {
-        // Music writes the cache has approved and not yet landed.
-        pharos_android::library().map_or(0, content::Library::music_outstanding_bytes)
+        pharos_ui::native::ports::music_outstanding(music())
     }
 
     fn admission_guard(&self) -> Box<dyn std::any::Any> {

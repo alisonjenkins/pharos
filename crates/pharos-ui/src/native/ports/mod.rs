@@ -110,6 +110,66 @@ impl Default for OpenOnce {
     }
 }
 
+/// What the video budget reads of the music side. The phone's `Budget`
+/// takes every figure from the library through these functions, so the
+/// decision is the same code in a test as on the device: the library
+/// implements this by delegating to its own methods.
+#[cfg(any(feature = "mobile", test))]
+pub trait MusicSide {
+    /// The cap in force, when the music cache is enabled.
+    fn cache_cap(&self) -> Option<u64>;
+    /// Bytes the music holds, when the cache is enabled.
+    fn used_bytes(&self) -> Option<u64>;
+    /// Whether the music cache is enabled.
+    fn cache_enabled(&self) -> bool;
+    /// Music writes approved and not yet landed.
+    fn outstanding_bytes(&self) -> u64;
+}
+
+#[cfg(any(feature = "mobile", test))]
+impl MusicSide for pharos_content::Library {
+    fn cache_cap(&self) -> Option<u64> {
+        pharos_content::Library::cache_cap(self)
+    }
+    fn used_bytes(&self) -> Option<u64> {
+        self.offline_summary().map(|s| s.used_bytes)
+    }
+    fn cache_enabled(&self) -> bool {
+        pharos_content::Library::cache_enabled(self)
+    }
+    fn outstanding_bytes(&self) -> u64 {
+        self.music_outstanding_bytes()
+    }
+}
+
+/// The shared cap: the cache's, or the default while there is no cache.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_cap(music: Option<&dyn MusicSide>) -> u64 {
+    music
+        .and_then(MusicSide::cache_cap)
+        .unwrap_or(pharos_content::DEFAULT_CAP_BYTES)
+}
+
+/// What the music holds of the cap; nothing while there is no cache.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_used(music: Option<&dyn MusicSide>) -> u64 {
+    music.and_then(MusicSide::used_bytes).unwrap_or(0)
+}
+
+/// Whether the cap and the music's figures can be had: only once the cache
+/// is enabled, the cap is the default and the music counts as nothing.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_ready(music: Option<&dyn MusicSide>) -> bool {
+    music.is_some_and(MusicSide::cache_enabled)
+}
+
+/// Music writes approved and not yet landed: room the free space does not
+/// lack yet but will.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_outstanding(music: Option<&dyn MusicSide>) -> u64 {
+    music.map_or(0, MusicSide::outstanding_bytes)
+}
+
 /// What the music cache is told about the video store: what it holds, still
 /// owes, and whether it knows its own size. With no store registered (its
 /// folder could not be created, or it has yet to be) nothing is known about
