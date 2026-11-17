@@ -179,6 +179,8 @@ tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
 # 025: the Android TV app's native link to the server (native/android.rs).
 [target.'cfg(target_os = "android")'.dependencies]
 pharos-api = { path = "../pharos-api", features = ["rustls-client"] }
+# The device token file belongs to pharos-content (native/token_file.rs).
+pharos-content = { path = "../pharos-content" }
 capnp = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

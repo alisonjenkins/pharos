@@ -146,15 +146,10 @@ pub fn load_token_user() -> Result<Option<String>, String> {
 }
 
 /// Keeps `user` with the token now on file, in the same file.
+/// The read and the write are one step under the file's lock.
 pub fn store_token_user(user: &str) -> Result<(), String> {
-    let _held = FILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     token_file::store_user(&token_path()?, user)
 }
-
-/// Held across a read-modify-write of the token file in this process.
-static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Removes the older layout's sidecar, best effort.
 fn drop_legacy_user(path: &std::path::Path) {
@@ -197,9 +192,6 @@ pub fn load_token() -> Option<String> {
 /// is unknown until `store_token_user`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
-    let _held = FILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     token_file::store(&path, token).map(|()| {
         drop_legacy_user(&path);
         set_cached(Some(token.to_owned()));
@@ -210,15 +202,10 @@ pub fn store_token(token: &str) -> Result<(), String> {
 pub fn forget_token() {
     set_cached(None);
     let Ok(path) = token_path() else { return };
-    let _held = FILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop_legacy_user(&path);
     // One file: the token goes with its user, or both stay.
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("forget token: {e}"),
+    if let Err(e) = token_file::forget(&path) {
+        log::warn!("forget token: {e}");
     }
     note_credentials_changed("forgotten");
 }
