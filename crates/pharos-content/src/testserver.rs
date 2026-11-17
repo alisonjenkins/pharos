@@ -15,6 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct Script {
     files: HashMap<String, Vec<u8>>,
     chunked: bool,
+    /// Bytes per chunk of a chunked body; 8192 when 0.
+    piece: usize,
     ignore_range: bool,
     window: Option<u64>,
     /// Each body served pops one entry and closes the socket after that many
@@ -45,6 +47,12 @@ impl Script {
     pub fn chunked(mut self) -> Self {
         self.chunked = true;
         self.ignore_range = true;
+        self
+    }
+
+    /// Serves a chunked body in pieces of `bytes`, not 8192.
+    pub fn chunk_bytes(mut self, bytes: usize) -> Self {
+        self.piece = bytes;
         self
     }
 
@@ -174,6 +182,8 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         .find_map(|kv| kv.strip_prefix("api_key="))
         .map(str::to_owned);
 
+    let piece = state.lock().unwrap_or_else(PoisonError::into_inner).piece;
+    let piece = if piece == 0 { 8192 } else { piece };
     let (reply, drop_after) = {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
         let r = plan(&mut s, path, token.as_deref(), range.as_deref());
@@ -199,7 +209,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     let send = drop_after.map_or(reply.body.len(), |n| n.min(reply.body.len()));
     let part = reply.body.get(..send).unwrap_or_default();
     if reply.chunked {
-        for piece in part.chunks(8192) {
+        for piece in part.chunks(piece) {
             let _ = sock
                 .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
                 .await;

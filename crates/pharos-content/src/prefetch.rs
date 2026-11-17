@@ -695,6 +695,10 @@ impl Gate {
                 .map_err(Fail::LowDisk)?;
             let mut written = start;
             let mut since_check = 0u64;
+            // What the last check reserved, from where it was made: a chunk
+            // that would pass it is reserved for before it is written, not
+            // after, so the bytes a host admits against never lag the disk.
+            let mut reserved_ahead = left(start);
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -707,14 +711,22 @@ impl Gate {
                 .await
                 .map_err(|e| Fail::Transient(e.redacted()))?
             {
+                let len = chunk.len() as u64;
+                if since_check.saturating_add(len) > reserved_ahead {
+                    let need = len.max(left(written));
+                    self.cache.ensure_free(id, need).map_err(Fail::LowDisk)?;
+                    reserved_ahead = need;
+                    since_check = 0;
+                }
                 file.write_all(&chunk)
                     .map_err(|e| Fail::Permanent(format!("write part: {e}")))?;
-                written = written.saturating_add(chunk.len() as u64);
-                since_check = since_check.saturating_add(chunk.len() as u64);
+                written = written.saturating_add(len);
+                since_check = since_check.saturating_add(len);
                 if since_check >= FREE_CHECK_BYTES {
                     since_check = 0;
+                    reserved_ahead = left(written);
                     self.cache
-                        .ensure_free(id, left(written))
+                        .ensure_free(id, reserved_ahead)
                         .map_err(Fail::LowDisk)?;
                 }
                 if !self.is_pin_work(id) {
@@ -1452,6 +1464,51 @@ mod tests {
         assert!(seen.len() >= 3, "{seen:?}");
         assert_eq!(seen[2], FREE_CHECK_BYTES, "window not reserved: {seen:?}");
         assert_eq!(r.cache.reserved_bytes(), 0, "kept after the job ended");
+    }
+
+    /// A chunk that crosses the reserved window is reserved for before it is
+    /// written: at every check, what has been written since the check that
+    /// reserved is within what that check reserved.
+    #[test]
+    fn a_chunk_crossing_the_window_is_reserved_before_it_is_written() {
+        let chunk = 5_000_000usize;
+        let size = chunk * 4;
+        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        // (bytes on disk, reserved) at each check.
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        let (slot2, seen2) = (slot.clone(), seen.clone());
+        let r = rig_with_free(
+            "crossing",
+            Script::default()
+                .file("/audio/1", body(size, 1))
+                .chunked()
+                .chunk_bytes(chunk),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                if let Some(c) = slot2.lock().unwrap().as_ref() {
+                    let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
+                    seen2.lock().unwrap().push((on_disk, c.reserved_bytes()));
+                }
+                Ok(u64::MAX)
+            }),
+        );
+        *slot.lock().unwrap() = Some(r.cache.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.len() >= 3, "{seen:?}");
+        // A check sees the reservation the one before it made: what reached
+        // the disk since then must be within it.
+        for pair in seen.windows(2) {
+            let ((was, _), (now, reserved)) = (pair[0], pair[1]);
+            assert!(
+                now - was <= reserved,
+                "{} bytes written past a reservation of {reserved}: {seen:?}",
+                now - was
+            );
+        }
     }
 
     #[test]
