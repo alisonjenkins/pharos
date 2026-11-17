@@ -809,6 +809,70 @@ mod tests {
         assert_eq!(last_user().as_deref(), Some("A"));
     }
 
+    /// The app's `me` resource itself (`app::use_me`, what the native app
+    /// renders): rendered while Ready, its request taken; the session-end
+    /// hook runs before the request's first poll; then `me` answers. The
+    /// sign-out stands: no user, no ready copies, the preference cleared.
+    #[test]
+    fn the_me_resource_answered_after_the_session_ended_keeps_the_user_out() {
+        use super::super::app::use_me;
+        use super::super::machine::{Event, Machine};
+        use dioxus::prelude::*;
+        thread_local! {
+            static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<String>>> =
+                const { RefCell::new(None) };
+        }
+        let p = pref();
+        remember_user("A");
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        ANSWER.with(|a| *a.borrow_mut() = Some(rx));
+        fn probe() -> Element {
+            let machine = use_signal(|| {
+                let mut m = Machine::new().with_session_end(forget_user);
+                m.apply(Event::Resumed { epoch: 0 });
+                m
+            });
+            let api = use_signal(|| Some(()));
+            let _me = use_me(
+                machine,
+                api,
+                Rc::new(|()| {
+                    Box::pin(async {
+                        let rx = ANSWER.with(|a| a.borrow_mut().take())?;
+                        rx.await.ok()
+                    })
+                }),
+                String::as_str,
+                Rc::new(|_: &String| {}),
+            );
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(probe);
+        dom.rebuild_in_place();
+        // The session ends after the request was taken, before it runs.
+        forget_user();
+        tx.send("A".to_owned()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(200), dom.wait_for_work())
+                    .await;
+            dom.render_immediate_to_vec();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                .await;
+        });
+        assert_eq!(last_user(), None, "the stale answer brought the user back");
+        assert!(ready_for_last_user().is_empty());
+        assert_eq!(
+            p.value.borrow().as_deref(),
+            Some(""),
+            "the preference was not cleared"
+        );
+    }
+
     /// A `remember_user` whose write fails still serves that user here.
     #[test]
     fn a_failed_remember_still_serves_the_right_user_in_this_process() {

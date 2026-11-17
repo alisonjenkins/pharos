@@ -1913,6 +1913,45 @@ fn app_machine() -> Machine {
     Machine::new().with_session_end(offline_video::forget_user)
 }
 
+/// What a `me` fetch returns, built by the caller (the app's retried call,
+/// or a test's hand-completed one).
+pub(crate) type MeFetch<A, M> =
+    Rc<dyn Fn(A) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<M>>>>>;
+
+/// The signed-in user's `me`, as the app asks it: again whenever the
+/// screens come up or go (a session ending clears the name; a reconnect
+/// keeps the screens, and the name, until the new API resumes), through
+/// [`offline_video::me_request`], and remembered only under the identity
+/// generation it was asked at. `fetch` sends the request, `id` names the
+/// answer's user and `on_me` runs with each answer.
+pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
+    machine: Signal<Machine>,
+    api: Signal<Option<A>>,
+    fetch: MeFetch<A, M>,
+    id: fn(&M) -> &str,
+    on_me: Rc<dyn Fn(&M)>,
+) -> Resource<Option<M>> {
+    // A memo, so other machine changes do not ask again.
+    let screens = use_memo(move || machine.read().shows_screens());
+    use_resource(move || {
+        let _ = screens();
+        // The API and the identity generation are taken together, here,
+        // before the request's future is built: a session that ends after
+        // this point signs the user out, and the answer must not undo that.
+        // Sent only to a ready session's API.
+        let ready = matches!(machine.peek().phase(), Phase::Ready);
+        let ask = offline_video::me_request(ready, api.read().clone());
+        let (fetch, on_me) = (fetch.clone(), on_me.clone());
+        async move {
+            let ask = ask?;
+            let me = fetch(ask.api.clone()).await?;
+            ask.answered(id(&me));
+            on_me(&me);
+            Some(me)
+        }
+    })
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     let mut machine = use_signal(app_machine);
@@ -2252,32 +2291,27 @@ fn NativeApp(route: Route) -> Element {
     // Asked again when the screens come up or go (a session ending clears
     // the name); a reconnect keeps the screens, and the name, until the new
     // API resumes. A memo, so other machine changes do not ask again.
-    let screens = use_memo(move || machine.read().shows_screens());
-    let me = use_resource(move || {
-        let _ = screens();
-        // The API and the identity generation are taken together, here,
-        // before the request's future is built: a session that ends after
-        // this point signs the user out, and the answer must not undo that.
-        // Sent only to a ready session's API.
-        let ready = matches!(machine.peek().phase(), Phase::Ready);
-        let ask = offline_video::me_request(ready, api.read().clone());
-        async move {
-            let ask = ask?;
-            let info = call("shell", "me");
-            match retry_once("me", || ask.api.me(&info)).await {
-                Ok(me) => {
-                    reconcile_kept_books(&me.id);
-                    ask.answered(&me.id);
-                    claim_queue(queue, held, &me.id);
-                    Some(me)
+    let me = use_me(
+        machine,
+        api,
+        Rc::new(|api| {
+            Box::pin(async move {
+                let info = call("shell", "me");
+                match retry_once("me", || api.me(&info)).await {
+                    Ok(me) => Some(me),
+                    Err(e) => {
+                        platform::warn(&format!("account: me failed: {e}"));
+                        None
+                    }
                 }
-                Err(e) => {
-                    platform::warn(&format!("account: me failed: {e}"));
-                    None
-                }
-            }
-        }
-    });
+            })
+        }),
+        |me| me.id.as_str(),
+        Rc::new(move |me| {
+            reconcile_kept_books(&me.id);
+            claim_queue(queue, held, &me.id);
+        }),
+    );
 
     use_context_provider(|| AccountMe(me));
 
