@@ -43,10 +43,26 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   event, and by a refused resume.
 - Music admission is refused while the video store's size is unknown (a
   folder that cannot be read or created, a leftover staging file, a removal
-  in flight), never counted as zero (V1464).
+  in flight), never counted as zero (V1464). A folder held because its
+  manifest could not be read is read again when the downloads are listed or
+  one is started: a manifest that parses joins the list, a folder that is
+  gone is dropped. The Downloads page offers to remove the ones that still
+  cannot be read (`VideoStore::discard_unreadable`); a folder that will not
+  delete stays counted as a tombstone. Manifest fields that only describe the
+  video default, so a field added later does not strand older manifests.
+- One lock is shared between the video store and the music cache:
+  `pharos_content::admission_guard()`, taken through
+  `Budget::admission_guard`. A video admission or start holds it while it
+  reads the music figures and reserves its own bytes; the cache holds it
+  while a track lands and the cache trims, and while it approves a write.
+  The order is fixed: the shared lock first, then the cache's or the
+  store's own lock, never the reverse.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
-  verdict=served_offline|network` (playlists at info, segments at debug).
+  verdict=served_offline|network` (playlists at info, segments at debug); a
+  request with nobody signed in logs `verdict=not_served_offline
+  reason=no_signed_in_user` and goes to the network. Held folders log
+  `video held folder verdict=released|dropped|tombstoned|still_held|discarded|discard_failed`.
 
 ## Consequences
 
