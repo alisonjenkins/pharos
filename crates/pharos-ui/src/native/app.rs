@@ -2480,10 +2480,23 @@ async fn connect(
             Event::Closed { epoch, reason }
         }
         Err(OpenError::NotOpened(probe)) => Event::NotOpened { epoch, probe },
-        Err(OpenError::NotSignedIn) => Event::ResumeRefused { epoch },
+        Err(OpenError::NotSignedIn) => {
+            forget_user_on_refused_resume(&machine.peek(), epoch);
+            Event::ResumeRefused { epoch }
+        }
         Err(OpenError::Resume(error)) => Event::ResumeFailed { epoch, error },
     };
     machine.write().apply(event);
+}
+
+/// The server knows no session for this device: nobody is signed in from
+/// here on, so the proxy and the kept-video list stop serving the previous
+/// user. An answer for an attempt that has since been replaced says nothing
+/// about the current one and is left alone.
+fn forget_user_on_refused_resume(machine: &Machine, epoch: u32) {
+    if machine.epoch() == epoch {
+        offline_video::forget_user();
+    }
 }
 
 pub(super) fn call(route: &str, action: &str) -> CallInfo {
@@ -8987,6 +9000,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A refused resume ends the cached user, so a later sign-in as someone
+    /// else is never served the first user's downloads; a refusal for a
+    /// replaced attempt changes nothing.
+    #[test]
+    fn a_refused_resume_forgets_the_user_but_a_stale_one_does_not() {
+        offline_video::remember_user("alice");
+        let mut m = Machine::new();
+        m.apply(Event::Retry);
+        let stale = m.epoch().wrapping_sub(1);
+        forget_user_on_refused_resume(&m, stale);
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+        forget_user_on_refused_resume(&m, m.epoch());
+        assert_eq!(offline_video::last_user(), None, "the previous user stayed");
+        offline_video::remember_user("bob");
+        assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
+    }
 
     #[test]
     fn the_apps_outdated_notice_names_both_versions_and_the_update() {
