@@ -2231,6 +2231,11 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         .cloned()
         .ok_or(Stop::Gone)?;
     let resume = !record.files.is_empty();
+    // An earlier run's staging files go before the plan is admitted: the
+    // admission replaces the floor that counted them, and the walks after it
+    // count this run's files only. One that will not go keeps the folder
+    // unknown, so the admission is refused rather than made without it.
+    drop_old_runs_parts(inner, user, item, run);
     // Every way out of planning passes here: a refusal there (a playlist's
     // reservation or size limit, the plan's admission) keeps nothing this
     // run fetched to plan. A new download drops the playlists it read; a
@@ -2449,6 +2454,54 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
         }
         let _ = std::fs::remove_file(inner.file_path(user, item, key));
         st.index.remove(&(user.to_owned(), key.clone()));
+    }
+}
+
+/// Deletes the staging files earlier runs left in `item`'s folder, each
+/// under the state lock while `run` still owns the item (so a removal and
+/// restart in between cannot have its replacement's file deleted), and
+/// settles what the host's size check deferred there: the folder's parts are
+/// deferred no longer. A file that will not go, or a listing that is not
+/// complete, leaves the folder a leftover (unknown) until a sweep settles it,
+/// so those bytes never drop out of the accounting. A resume runs here, in
+/// an ordinary context, never on the host's path.
+fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
+    let dir = inner.item_dir(user, item);
+    let own = format!(".{run}.part");
+    let (paths, mut clean) = part_paths(&dir, ".part");
+    let mut dropped = 0usize;
+    for path in paths {
+        if path.to_string_lossy().ends_with(&own) {
+            continue;
+        }
+        let st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return;
+        }
+        match remove_part(&path) {
+            Ok(()) => dropped += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
+        }
+    }
+    let mut st = lock(&inner.state);
+    if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+        return;
+    }
+    let deferred = st.deferred_parts.contains(&dir);
+    st.deferred_parts.retain(|d| *d != dir);
+    if !clean && !st.leftover.contains(&dir) {
+        st.leftover.push(dir.clone());
+    }
+    drop(st);
+    if dropped > 0 || deferred || !clean {
+        emit(
+            !clean,
+            format!(
+                "pharos: video keep old parts item={item} run={run} dropped={dropped} deferred={deferred} verdict={}",
+                if clean { "settled" } else { "leftover_unknown" }
+            ),
+        );
     }
 }
 
@@ -6896,6 +6949,120 @@ mod tests {
         assert!(!orphan.exists(), "the ordinary sweep left the orphan");
         assert!(!part.exists(), "the ordinary sweep left the staging file");
         assert!(!store.size_unknown());
+    }
+
+    /// An interrupted download (a segment missing) with an old run's
+    /// staging file of `big` bytes, in a user folder the store could not
+    /// list at open, recovered by the host's check alone. Returns the store
+    /// (its resume running), the item folder and the staging file.
+    async fn host_recovers_an_interrupted_download_with_an_old_part(
+        rig: &Rig,
+        big: u64,
+    ) -> (Arc<DiskVideoStore>, PathBuf, PathBuf) {
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let user = rig.dir.join("u1");
+        let dir = user.join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 4,
+            total: 5,
+            bytes: 1,
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
+        let part = dir.join("files").join("x.99.part");
+        std::fs::File::create(&part).unwrap().set_len(big).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = crate::native::ports::outside_bytes(Some(&*store));
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(outside.held >= big, "the host check left it uncounted");
+        (store, dir, part)
+    }
+
+    /// The media files and every staging file in `dir`: what a download's
+    /// figure must cover (its own manifest is not part of it).
+    fn media_on_disk(dir: &Path) -> u64 {
+        dir_size(&dir.join("files")).bytes
+    }
+
+    /// The host's check recovers an interrupted download with an old run's
+    /// staging file and resumes it. The resume is not on the host's path:
+    /// it deletes the old file before its plan is admitted, so every byte in
+    /// the folder is counted after admission and after completion, with no
+    /// ordinary sweep between.
+    #[tokio::test]
+    async fn a_resume_after_the_host_check_drops_the_old_runs_staging_file() {
+        let rig = Rig::new("host-resume-part");
+        // Larger than the plan's whole estimate, so an admission that
+        // replaces the floor cannot cover it by chance.
+        let big = 20_000_000;
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+
+        // The resume is spawned, not yet run (one thread): held from here.
+        let release = rig.server.hold_mid_body(SEG1);
+        // Admitted, the segment still in flight.
+        let admitted = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(admitted.state, KeptState::Failed { .. }),
+            "{admitted:?}"
+        );
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after admission: kept {} of {on_disk} on disk (old part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+        assert!(
+            !lock(&store.inner.state).deferred_parts.contains(&dir),
+            "the resume left the folder's parts deferred"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after completion: kept {} of {on_disk} on disk (old part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+    }
+
+    /// The same resume with the old staging file refusing to go: the folder
+    /// is a leftover (unknown), the plan is refused, and the file's bytes
+    /// never drop out of the accounting.
+    #[tokio::test]
+    async fn a_resume_whose_old_staging_file_will_not_go_is_refused_and_keeps_it_counted() {
+        let rig = Rig::new("host-resume-part-stuck");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let decided = plan_decided(&store, "1").await;
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert!(
+            matches!(decided.state, KeptState::Failed { .. }),
+            "admitted with the old file's bytes unaccounted: {decided:?}"
+        );
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "kept {} of {on_disk} on disk",
+            store.kept_bytes()
+        );
     }
 
     /// A car-only process: a removed download's folder that would not
