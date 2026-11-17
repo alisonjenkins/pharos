@@ -222,6 +222,9 @@ struct Plan {
     total: u32,
     /// Bytes of the plan already on disk (a resumed download).
     stored: u64,
+    /// Bytes of an earlier plan's files that could not be deleted: on disk
+    /// and against the cap, though the plan does not name them.
+    stale: u64,
 }
 
 /// The room a download is admitted against, read by the caller.
@@ -432,8 +435,13 @@ impl Inner {
             let verdict = match check {
                 Check::Fresh { other, cap, free } => {
                     let used = reserved_by_others(&st.list, user, item).saturating_add(other);
-                    fits(plan.estimate, used, cap, free.saturating_sub(outstanding))
-                        .map_err(|r| (r, used, free))
+                    fits(
+                        plan.estimate,
+                        used.saturating_add(plan.stale),
+                        cap,
+                        free.saturating_sub(outstanding),
+                    )
+                    .map_err(|r| (r, used, free))
                 }
                 // The cap was met when the download began and its stored
                 // bytes are counted; what is left needs room, and 0 free
@@ -462,7 +470,9 @@ impl Inner {
                 return Err(Admission::Gone);
             };
             v.files.clone_from(&plan.files);
-            v.estimated_bytes = plan.estimate;
+            // The reservation holds what the plan will take and what an
+            // earlier plan still leaves on disk.
+            v.estimated_bytes = plan.estimate.saturating_add(plan.stale);
             v.state = KeptState::Downloading {
                 done: 0,
                 total: plan.total,
@@ -744,15 +754,22 @@ fn disk_bytes(dir: &Path) -> u64 {
 /// Deletes the stored files of `item` that `plan` does not name, and
 /// forgets them: a retry that planned afresh (a new play session names
 /// every file anew) must not leave the old plan's files on the disk.
-fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) {
+/// Returns the bytes of unplanned files that could not be deleted, which
+/// still count against the cap.
+fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) -> u64 {
     let dir = inner.item_dir(user, item);
     let keep: HashSet<String> = plan.iter().map(|k| file_name(k)).collect();
     let files = dir.join("files");
-    let (mut removed, mut bytes) = (0usize, 0u64);
+    let (mut removed, mut bytes, mut left) = (0usize, 0u64, 0u64);
     for (name, len) in stored_names(&dir) {
-        if !keep.contains(&name) && std::fs::remove_file(files.join(&name)).is_ok() {
+        if keep.contains(&name) {
+            continue;
+        }
+        if std::fs::remove_file(files.join(&name)).is_ok() {
             removed += 1;
             bytes = bytes.saturating_add(len);
+        } else {
+            left = left.saturating_add(len);
         }
     }
     lock(&inner.state).index.retain(|_, (path, _)| {
@@ -767,6 +784,13 @@ fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) {
             format!("pharos: video keep pruned item={item} files={removed} bytes={bytes}"),
         );
     }
+    if left > 0 {
+        emit(
+            true,
+            format!("pharos: video keep prune left item={item} bytes={left}"),
+        );
+    }
+    left
 }
 
 /// One planned file; the sliver of a last segment may go without. The
@@ -836,6 +860,12 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             all.len()
         ),
     );
+    // Files of an earlier plan go first, so the admission below counts any
+    // that will not (they stay on disk, and against the cap, meanwhile).
+    if !inner.wanted(user, item, run) {
+        return Err(Stop::Gone);
+    }
+    let stale = prune_unplanned(inner, user, item, &all);
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
     let names = stored_names(&inner.item_dir(user, item));
@@ -852,6 +882,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         estimate,
         total: u32::try_from(all.len()).unwrap_or(u32::MAX),
         stored: if resume { stored_bytes } else { 0 },
+        stale,
     };
     let total = plan.total;
     // The room is read and the plan admitted under the host's shared
@@ -904,7 +935,6 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             return Err(Stop::Refused(refusal.to_string()));
         }
     }
-    prune_unplanned(inner, user, item, &all);
     let mut bytes = 0u64;
     for key in &have {
         if let Some(len) = names.get(&file_name(key)) {
@@ -2302,6 +2332,49 @@ mod tests {
             v.estimated_bytes
         );
         assert_eq!(v.estimated_bytes, disk_bytes(&rig.dir.join("u1").join("1")));
+    }
+
+    /// While the retry runs, the stale file the prune could not delete is
+    /// part of its reservation, not only of the count after it is done.
+    #[tokio::test]
+    async fn a_file_the_prune_cannot_delete_stays_in_the_running_downloads_reservation() {
+        let rig = Rig::new("prune-fails-running");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        let stuck_len = std::fs::metadata(&stuck).unwrap().len();
+        assert!(stuck_len > 0);
+
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        // The retry stays under way, its first segment held.
+        let _held = rig.server.hold_mid_body(&renamed(SEG0));
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        rig.server.asked_times(&renamed(SEG0), 1).await;
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        assert_eq!(
+            store.kept_bytes(),
+            estimate + stuck_len,
+            "the reservation holds the plan and the file that would not go"
+        );
     }
 
     #[tokio::test]
