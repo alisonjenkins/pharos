@@ -559,6 +559,34 @@ fn clear_parts(dir: &Path) {
     }
 }
 
+/// Deletes the stored files of `item` that `plan` does not name, and
+/// forgets them: a retry that planned afresh (a new play session names
+/// every file anew) must not leave the old plan's files on the disk.
+fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) {
+    let dir = inner.item_dir(user, item);
+    let keep: HashSet<String> = plan.iter().map(|k| file_name(k)).collect();
+    let files = dir.join("files");
+    let (mut removed, mut bytes) = (0usize, 0u64);
+    for (name, len) in stored_names(&dir) {
+        if !keep.contains(&name) && std::fs::remove_file(files.join(&name)).is_ok() {
+            removed += 1;
+            bytes = bytes.saturating_add(len);
+        }
+    }
+    lock(&inner.state).index.retain(|_, (path, _)| {
+        path.parent() != Some(files.as_path()) || {
+            path.file_name()
+                .is_some_and(|n| keep.contains(n.to_string_lossy().as_ref()))
+        }
+    });
+    if removed > 0 {
+        emit(
+            false,
+            format!("pharos: video keep pruned item={item} files={removed} bytes={bytes}"),
+        );
+    }
+}
+
 /// One planned file; the sliver of a last segment may go without. The
 /// answer is the key and its stored length, `None` when it was skipped.
 async fn fetch_planned(
@@ -659,6 +687,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     }) {
         return Err(Stop::Gone);
     }
+    prune_unplanned(inner, user, item, &all);
 
     let names = stored_names(&inner.item_dir(user, item));
     let mut have = HashSet::new();
@@ -1577,6 +1606,50 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(names.iter().all(|n| !n.ends_with(".part")), "{names:?}");
+    }
+
+    /// A retry whose plan is new (a fresh play session names every file
+    /// anew) removes the files of the plan it replaces.
+    #[tokio::test]
+    async fn a_retry_with_a_new_plan_removes_the_old_plans_files() {
+        let rig = Rig::new("new-plan");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert!(store.stored_file(INIT).is_some(), "the old plan left files");
+
+        // The next attempt negotiates a new session: every key changes.
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert!(
+            store.stored_file(INIT).is_none(),
+            "the old file is not indexed"
+        );
+        let dir = rig.dir.join("u1").join("1").join("files");
+        let on_disk = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(on_disk, v.files.len(), "only the new plan's files remain");
+        assert_eq!(v.files.len(), 5);
+        assert_eq!(lines("pharos: video keep pruned").len(), 1);
     }
 
     #[tokio::test]
