@@ -1653,6 +1653,10 @@ impl VideoStore for DiskVideoStore {
         self.inner.env.budget.cap_bytes()
     }
 
+    fn size_unknown(&self) -> bool {
+        lock(&self.inner.state).unknown_folder().is_some()
+    }
+
     fn outstanding_bytes(&self) -> u64 {
         // No record has an empty user, so this is every record's.
         lock(&self.inner.state).outstanding("", "")
@@ -2953,6 +2957,7 @@ mod tests {
             panic!("admitted beside a folder of unknown size");
         };
         assert!(why.contains("unknown"), "{why}");
+        assert!(store.size_unknown(), "the host is not told");
         assert!(dir.join("files").join("keep").exists(), "swept");
     }
 
@@ -2993,6 +2998,7 @@ mod tests {
             panic!("admitted beside a folder of unknown size");
         };
         assert!(why.contains("unknown"), "{why}");
+        assert!(store.size_unknown(), "the host is not told");
 
         // Once the folder can be deleted, the sweep clears the block.
         UNREADABLE.with(|u| u.borrow_mut().clear());
@@ -3001,6 +3007,7 @@ mod tests {
         store.settled().await;
         assert!(!dir.exists(), "the sweep deleted it");
         assert_eq!(store.videos("u1")[0].state, KeptState::Ready);
+        assert!(!store.size_unknown(), "still blocked");
     }
 
     /// A manifest that cannot be unlinked would bring the download back at

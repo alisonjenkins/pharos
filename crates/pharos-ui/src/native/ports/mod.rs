@@ -96,6 +96,13 @@ pub fn kept_video_outstanding() -> u64 {
     video_store().map_or(0, |s| s.outstanding_bytes())
 }
 
+/// Whether the registered video store holds a folder of unknown size, in
+/// which case the music cache admits nothing either; false when none is
+/// registered.
+pub fn kept_video_size_unknown() -> bool {
+    video_store().is_some_and(|s| s.size_unknown())
+}
+
 /// What the host app runs when the user signs in or out, so a second client
 /// in the same process (the car's media service) re-reads the token.
 static ON_CREDENTIALS_CHANGED: OnceLock<fn()> = OnceLock::new();

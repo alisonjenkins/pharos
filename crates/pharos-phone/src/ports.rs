@@ -295,6 +295,7 @@ pub fn register_video() {
     pharos_android::set_outside_used(Arc::new(|| content::OutsideBytes {
         held: pharos_ui::native::ports::kept_video_bytes(),
         outstanding: pharos_ui::native::ports::kept_video_outstanding(),
+        unknown: pharos_ui::native::ports::kept_video_size_unknown(),
     }));
     let budget = Arc::new(PhoneBudget { dir: root.clone() });
     match pharos_ui::native::register_phone_video_store(root.clone(), budget) {

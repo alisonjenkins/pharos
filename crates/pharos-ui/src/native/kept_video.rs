@@ -180,6 +180,12 @@ pub trait VideoStore: Send + Sync {
     fn outstanding_bytes(&self) -> u64 {
         0
     }
+    /// Whether the store holds a folder whose size or reservation it could
+    /// not read, so the host cannot trust the cap it shares: nothing else
+    /// is admitted either. False for a store that shares no cap.
+    fn size_unknown(&self) -> bool {
+        false
+    }
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;

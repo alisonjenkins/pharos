@@ -239,6 +239,9 @@ pub struct OutsideBytes {
     /// Bytes they are admitted for but have yet to write: the free space
     /// does not lack these yet, but it will.
     pub outstanding: u64,
+    /// Whether the size of what they hold is not known (a folder that could
+    /// not be read): the cap cannot be checked, so nothing is admitted.
+    pub unknown: bool,
 }
 
 pub struct Cache {
@@ -879,7 +882,18 @@ impl Cache {
         // two lowers free and the stale (higher) outstanding keeps the figure
         // conservative. The other order counts those bytes twice as spent
         // room, or not at all.
-        let outstanding = self.outside_bytes().outstanding;
+        let outside = self.outside_bytes();
+        if outside.unknown {
+            // Video's verdict too: with a folder of unknown size on the
+            // device neither cap nor free space can be trusted.
+            log::warn!(
+                "cache admission refused id={downloading} reason=outside_size_unknown held={} outstanding={}",
+                outside.held,
+                outside.outstanding
+            );
+            return Err(0);
+        }
+        let outstanding = outside.outstanding;
         let free = match (self.free)(&self.dir) {
             Ok(f) => f.saturating_sub(outstanding),
             Err(e) => {
@@ -1046,6 +1060,7 @@ mod tests {
             .set_outside_used(std::sync::Arc::new(move || OutsideBytes {
                 held: v.load(Ordering::SeqCst),
                 outstanding: 0,
+                ..OutsideBytes::default()
             }))
             .is_empty());
         put(&c, "track/a", 100);
@@ -1064,6 +1079,7 @@ mod tests {
         let evicted = c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
             held: v.load(Ordering::SeqCst),
             outstanding: 0,
+            ..OutsideBytes::default()
         }));
         assert_eq!(evicted, ids(&["track/b", "track/c"]));
         assert_eq!(
@@ -1162,6 +1178,7 @@ mod tests {
             std::sync::Arc::new(move || OutsideBytes {
                 held: 0,
                 outstanding: o.load(Ordering::SeqCst),
+                ..OutsideBytes::default()
             })
         };
         let c =
@@ -1199,6 +1216,36 @@ mod tests {
         order.lock().unwrap().clear();
         assert!(c.ensure_free("track/x", 0).is_ok());
         assert_eq!(*order.lock().unwrap(), ["outstanding", "probe"]);
+    }
+
+    /// Video cannot say how big a folder is (it could not be read): the
+    /// cap and the free space cannot be trusted, so music is refused too,
+    /// as video is.
+    #[test]
+    fn music_is_refused_while_a_videos_size_is_unknown() {
+        let unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let u = unknown.clone();
+        let c = Cache::open_with_probe(
+            &tmp("lowdisk-unknown-video"),
+            1000,
+            fixed_free(MIN_FREE_BYTES + 1_000_000),
+        )
+        .unwrap();
+        c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            unknown: u.load(Ordering::SeqCst),
+            ..OutsideBytes::default()
+        }));
+        assert_eq!(c.ensure_free("track/x", 10), Err(0), "admitted");
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/x")),
+            "{lines:?}"
+        );
+        // Known again: admitted.
+        unknown.store(false, Ordering::SeqCst);
+        assert!(c.ensure_free("track/x", 10).is_ok());
     }
 
     #[test]
