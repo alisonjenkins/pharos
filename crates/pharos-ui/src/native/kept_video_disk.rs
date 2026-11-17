@@ -1453,6 +1453,13 @@ impl VideoStore for DiskVideoStore {
                 if let Some(old) = find(&st.list, &user, &item) {
                     record.estimated_bytes = old.estimated_bytes;
                 }
+                // So do the bytes of a removed download's folder that would
+                // not delete: once a live record owns the folder they stop
+                // counting as a tombstone.
+                let dir = self.inner.item_dir(&user, &item);
+                if let Some((_, left)) = st.tombstones.iter().find(|(d, _)| *d == dir) {
+                    record.estimated_bytes = record.estimated_bytes.max(*left);
+                }
                 insert_front(&mut st.list, record);
                 Ok(())
             });
@@ -2440,6 +2447,26 @@ mod tests {
             1,
             "free read before the owed read"
         );
+        store.settled().await;
+    }
+
+    /// Starting an item again whose removed folder would not delete: the
+    /// folder's bytes stop counting as a tombstone, so the new record
+    /// carries them until its plan is admitted.
+    #[tokio::test]
+    async fn a_restart_over_an_undeleted_folder_carries_its_bytes() {
+        let rig = Rig::new("restart-tombstone");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let left = store.kept_bytes();
+        assert!(left > 0);
+        store.start(request("1")).unwrap();
+        // Before the run's plan is admitted.
+        assert_eq!(store.kept_bytes(), left, "the folder counted for less");
+        FAIL_REMOVE.with(|f| f.set(false));
         store.settled().await;
     }
 
