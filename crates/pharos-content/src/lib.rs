@@ -28,7 +28,7 @@ mod resume;
 mod testlog;
 #[cfg(test)]
 mod testserver;
-mod token;
+pub mod token;
 mod tree;
 
 pub use cache::{
