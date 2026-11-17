@@ -1954,7 +1954,10 @@ fn stored_names(dir: &Path) -> HashMap<String, u64> {
 
 /// The files under `dir/files` as (name, length), and whether the walk
 /// completed: false when the folder, an entry or a file's length could not
-/// be read (anything but being gone), so the list may be short.
+/// be read (anything but being gone), so the list may be short. An entry
+/// that is a folder counts every byte under it ([`dir_size`]), not its own
+/// entry's size, and a walk of it that falls short makes this one short.
+/// Every whole-file measure of a download goes through here.
 fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
     let read = match std::fs::read_dir(dir.join("files")) {
         Ok(read) => read,
@@ -1974,6 +1977,11 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
             continue;
         }
         match e.metadata() {
+            Ok(m) if m.is_dir() => {
+                let inner = dir_size(&e.path());
+                complete &= inner.exact;
+                names.insert(name, inner.bytes);
+            }
             Ok(m) => {
                 names.insert(name, m.len());
             }
@@ -2374,19 +2382,12 @@ fn prune_unplanned(
         if keep.contains(&name) {
             continue;
         }
-        let path = files.join(&name);
-        if std::fs::remove_file(&path).is_ok() {
+        // A folder's `len` is already what it holds.
+        if std::fs::remove_file(files.join(&name)).is_ok() {
             removed += 1;
             bytes = bytes.saturating_add(len);
         } else {
-            // An entry that is a folder lists at its own size, not what it
-            // holds: what stays counts at its whole measure.
-            let held = if path.is_dir() {
-                dir_size(&path).bytes.max(len)
-            } else {
-                len
-            };
-            left = left.saturating_add(held);
+            left = left.saturating_add(len);
         }
     }
     if !complete {
@@ -5622,6 +5623,59 @@ mod tests {
         assert_eq!(only(&store).state, KeptState::Ready);
     }
 
+    /// A folder retained inside `files/` (the prune cannot delete it)
+    /// counts at every byte under it in the terminal figure, after Ready and
+    /// after Failed alike, not at its directory entry's size. One with a
+    /// subfolder that cannot be read is not measured short: the folder is
+    /// unknown, so nothing is admitted against a figure that leaves it out.
+    #[tokio::test]
+    async fn a_retained_folder_counts_in_full_after_ready_and_failed() {
+        for case in ["ready", "failed", "unreadable"] {
+            let rig = Rig::new(&format!("kept-dir-{case}"));
+            let files = rig.dir.join("u1").join("1").join("files");
+            let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+            let deep = stuck.join("deep");
+            if case == "failed" {
+                rig.server.fail(SEG1, &[403]);
+            }
+            let store = rig.open();
+            // Made as the plan prunes (an open would sweep a folder with no
+            // record): the prune cannot delete a folder, so it stays.
+            let (made, under) = (stuck.clone(), deep.clone());
+            let hide = case == "unreadable";
+            set_hook(&BEFORE_PRUNE, move || {
+                std::fs::create_dir_all(&under).unwrap();
+                std::fs::write(made.join("inner"), vec![0u8; 2_000_000]).unwrap();
+                std::fs::write(under.join("inner"), vec![0u8; 1_000]).unwrap();
+                if hide {
+                    UNREADABLE.with(|u| u.borrow_mut().push(under.clone()));
+                }
+            });
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            clear_hook(&BEFORE_PRUNE);
+            assert!(stuck.exists(), "the retained folder went");
+            // From the state: the host's check behind `size_unknown` would
+            // measure the folder and mend the figure.
+            let unknown = lock(&store.inner.state).unknown_folder().is_some();
+            let kept = store.kept_bytes();
+            UNREADABLE.with(|u| u.borrow_mut().clear());
+            let v = only(&store);
+            let on_disk = dir_size(&files).bytes;
+            match case {
+                "ready" => assert_eq!(v.state, KeptState::Ready),
+                _ => assert!(matches!(v.state, KeptState::Failed { .. }), "{case}: {v:?}"),
+            }
+            if hide {
+                assert!(unknown, "an unreadable subfolder was measured as whole");
+            }
+            assert!(
+                unknown || kept >= on_disk,
+                "{case}: kept {kept} with {on_disk} on disk"
+            );
+        }
+    }
+
     /// A playlist past its limit is refused and not kept: its reservation
     /// was for the limit.
     #[tokio::test]
@@ -6160,7 +6214,9 @@ mod tests {
         let files = rig.dir.join("u1").join("1").join("files");
         let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
         std::fs::create_dir(&stuck).unwrap();
-        let stuck_len = std::fs::metadata(&stuck).unwrap().len();
+        std::fs::write(stuck.join("inner"), vec![0u8; 1_000]).unwrap();
+        // A folder counts at what it holds.
+        let stuck_len = dir_size(&stuck).bytes;
         assert!(stuck_len > 0);
 
         let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
