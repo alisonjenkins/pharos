@@ -189,30 +189,145 @@ pub fn offline_detail(v: &KeptVideo) -> Option<Detail> {
     })
 }
 
-/// The id of the signed-in user remembered on this device.
-pub fn last_user() -> Option<String> {
-    match super::platform::stored_theme(LAST_USER_KEY) {
-        Ok(user) => user.filter(|u| !u.is_empty()),
-        Err(e) => {
-            super::platform::warn(&format!("pharos: video user unreadable error={e}"));
-            None
-        }
+/// Who this process believes is signed in. It wins over the stored
+/// preference, which is only where a cold start learns it from: a write to
+/// the preference can fail, and the proxy must not then serve the files of
+/// someone who has signed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Identity {
+    /// Not known yet: nothing has been signed in or out, and the preference
+    /// has not been read (or could not be). Nothing is served from disk.
+    Unknown,
+    /// Signed out, or no user was ever remembered.
+    SignedOut,
+    User(String),
+}
+
+#[cfg(not(test))]
+static IDENTITY: std::sync::Mutex<Identity> = std::sync::Mutex::new(Identity::Unknown);
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY: std::cell::RefCell<Identity> = const { std::cell::RefCell::new(Identity::Unknown) };
+}
+
+fn identity() -> Identity {
+    #[cfg(not(test))]
+    {
+        IDENTITY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(test)]
+    {
+        IDENTITY.with(|i| i.borrow().clone())
     }
 }
 
+fn set_identity(next: Identity) {
+    #[cfg(not(test))]
+    {
+        *IDENTITY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+    }
+    #[cfg(test)]
+    {
+        IDENTITY.with(|i| *i.borrow_mut() = next);
+    }
+}
+
+fn read_pref() -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        return seam.read();
+    }
+    super::platform::stored_theme(LAST_USER_KEY)
+}
+
+fn write_pref(value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        return seam.write(value);
+    }
+    super::platform::store_theme(LAST_USER_KEY, value)
+}
+
+/// The id of the user signed in, and so the one whose downloads may be
+/// listed or served. The process's own knowledge wins; the stored
+/// preference is read only while that is unknown (a cold start), and one
+/// that cannot be read leaves it unknown: nobody.
+pub fn last_user() -> Option<String> {
+    match identity() {
+        Identity::User(u) => Some(u),
+        Identity::SignedOut => None,
+        Identity::Unknown => match read_pref() {
+            Ok(Some(u)) if !u.is_empty() => {
+                super::platform::info(&format!(
+                    "pharos: video user verdict=known reason=cold_start_from_preference user={u}"
+                ));
+                set_identity(Identity::User(u.clone()));
+                Some(u)
+            }
+            Ok(_) => {
+                set_identity(Identity::SignedOut);
+                None
+            }
+            Err(e) => {
+                super::platform::warn(&format!(
+                    "pharos: video user verdict=none reason=preference_unreadable error={e}"
+                ));
+                None
+            }
+        },
+    }
+}
+
+/// Notes the user who has signed in. Known in this process first; the
+/// preference follows, and a failed write is logged, not served around.
 pub fn remember_user(user: &str) {
-    if last_user().as_deref() == Some(user) {
+    set_identity(Identity::User(user.to_owned()));
+    super::platform::info(&format!(
+        "pharos: video user verdict=known reason=signed_in user={user}"
+    ));
+    if matches!(read_pref(), Ok(Some(p)) if p == user) {
         return;
     }
-    if let Err(e) = super::platform::store_theme(LAST_USER_KEY, user) {
-        super::platform::warn(&format!("pharos: video user not remembered error={e}"));
+    if let Err(e) = write_pref(user) {
+        super::platform::warn(&format!(
+            "pharos: video user not remembered (served for this run only) error={e}"
+        ));
     }
 }
 
+/// Notes a sign-out. Nobody is signed in from this call on, whatever the
+/// preference write does.
 pub fn forget_user() {
-    if let Err(e) = super::platform::store_theme(LAST_USER_KEY, "") {
-        super::platform::warn(&format!("pharos: video user not forgotten error={e}"));
+    set_identity(Identity::SignedOut);
+    super::platform::info("pharos: video user verdict=none reason=signed_out");
+    if let Err(e) = write_pref("") {
+        super::platform::warn(&format!(
+            "pharos: video user not forgotten on disk (nobody served for this run) error={e}"
+        ));
     }
+}
+
+/// The stored file the proxy answers `key` with for `user` (the user as of
+/// the request): none with nobody signed in, and none of another user's.
+pub fn stored_for(
+    store: &dyn super::kept_video::VideoStore,
+    user: Option<&str>,
+    key: &str,
+) -> Option<super::kept_video::StoredFile> {
+    let Some(user) = user else {
+        super::platform::info(&format!(
+            "pharos: video request verdict=not_served_offline reason=no_signed_in_user key_len={}",
+            key.len()
+        ));
+        return None;
+    };
+    store.stored_file(user, key)
 }
 
 /// The ready downloads of the remembered user, newest first; empty with no
@@ -233,6 +348,134 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::super::kept_video::KeptState;
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, StoredFile, VideoStore};
+
+    /// The stored preference, replaceable: its reads and writes can fail.
+    #[derive(Clone, Default)]
+    pub(super) struct Pref {
+        value: Rc<RefCell<Option<String>>>,
+        fail_read: Rc<Cell<bool>>,
+        fail_write: Rc<Cell<bool>>,
+    }
+
+    impl Pref {
+        pub(super) fn read(&self) -> Result<Option<String>, String> {
+            if self.fail_read.get() {
+                return Err("unreadable".to_owned());
+            }
+            Ok(self.value.borrow().clone())
+        }
+        pub(super) fn write(&self, v: &str) -> Result<(), String> {
+            if self.fail_write.get() {
+                return Err("read-only".to_owned());
+            }
+            *self.value.borrow_mut() = Some(v.to_owned());
+            Ok(())
+        }
+    }
+
+    thread_local! {
+        pub(super) static PREF: RefCell<Option<Pref>> = const { RefCell::new(None) };
+    }
+
+    fn pref() -> Pref {
+        let p = Pref::default();
+        PREF.with(|c| *c.borrow_mut() = Some(p.clone()));
+        set_identity(Identity::Unknown);
+        p
+    }
+
+    /// A store whose `A` has a file for the key and nobody else does.
+    struct Files;
+
+    impl VideoStore for Files {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+        fn stored_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+            (key == "/k" && user == "A").then(|| StoredFile {
+                path: "/x".into(),
+                len: 1,
+                content_type: "video/mp2t",
+            })
+        }
+    }
+
+    fn serves(user: Option<String>) -> bool {
+        stored_for(&Files, user.as_deref(), "/k").is_some()
+    }
+
+    /// A sign-out whose preference write fails still serves nothing.
+    #[test]
+    fn a_sign_out_whose_preference_write_fails_serves_nothing() {
+        let p = pref();
+        remember_user("A");
+        assert!(serves(last_user()));
+        p.fail_write.set(true);
+        forget_user();
+        assert_eq!(p.value.borrow().as_deref(), Some("A"), "the write failed");
+        assert_eq!(last_user(), None, "the stored user outlived the sign-out");
+        assert!(!serves(last_user()));
+    }
+
+    /// A switch from A to B: nothing is served between the sign-out and B's
+    /// `me`, and then only B's.
+    #[test]
+    fn a_switch_serves_only_the_new_user_and_nothing_before_their_me() {
+        let p = pref();
+        remember_user("A");
+        assert!(serves(last_user()), "A's own file");
+        // The preference is not writable for the whole switch.
+        p.fail_write.set(true);
+        forget_user();
+        assert!(
+            !serves(last_user()),
+            "served after the sign-out, before B's me"
+        );
+        remember_user("B");
+        assert!(!serves(last_user()), "B was given A's file");
+        assert_eq!(last_user().as_deref(), Some("B"));
+    }
+
+    /// A `remember_user` whose write fails still serves that user here.
+    #[test]
+    fn a_failed_remember_still_serves_the_right_user_in_this_process() {
+        let p = pref();
+        p.fail_write.set(true);
+        remember_user("A");
+        assert_eq!(last_user().as_deref(), Some("A"));
+        assert!(serves(last_user()));
+    }
+
+    /// At a cold start the preference is where the user is learnt from; one
+    /// that cannot be read leaves nobody served.
+    #[test]
+    fn a_cold_start_reads_the_preference_and_an_unreadable_one_serves_nobody() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        p.fail_read.set(true);
+        assert_eq!(last_user(), None);
+        assert!(!serves(last_user()));
+        p.fail_read.set(false);
+        assert_eq!(last_user().as_deref(), Some("A"));
+    }
 
     pub(crate) fn video(item: &str, version: &str, state: KeptState) -> KeptVideo {
         KeptVideo {

@@ -3269,7 +3269,7 @@ fn log_video_request(key: &str, verdict: Verdict, bytes: u64) {
 /// after a sign-out (the same user gets them back), but with nobody signed
 /// in, or another account, nothing is served from them.
 async fn stored_answer(user: Option<&str>, key: &str) -> Option<(StoredFile, Vec<u8>)> {
-    let file = super::ports::video_store()?.stored_file(user?, key)?;
+    let file = super::offline_video::stored_for(&*super::ports::video_store()?, user, key)?;
     match tokio::fs::read(&file.path).await {
         Ok(body) => Some((file, body)),
         Err(e) => {
