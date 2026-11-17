@@ -15,6 +15,7 @@ harfrust = "0.16"
 skrifa = "0.50"
 unicode-bidi = { version = "0.3", default-features = false, features = ["std", "hardcoded-data"] }
 unicode-linebreak = "0.1"
+unicode-normalization = "0.1"
 
 [features]
 # Legacy codepage decoding for sidecar files that are not UTF-8.
