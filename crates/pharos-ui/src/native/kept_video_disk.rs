@@ -4081,24 +4081,20 @@ mod tests {
         &LINES
     }
 
-    /// The phone registers its video store after creating its folder, and a
-    /// folder that cannot be created leaves no store. The hook the music
-    /// cache holds then reads the size as unknown, and the cache refuses a
-    /// download rather than counting the video as zero. (The phone's
-    /// registration is Android-only; the hook's no-store answer, which it
-    /// installs before creating the folder, is `ports::outside_bytes(None)`.)
-    /// The refusal is read from a real `Library`'s cache on a prefetch,
-    /// which is the admission a pin's downloads go through.
+    /// The phone's registration, run for real on a root where the folder
+    /// cannot be created (a plain file stands there): no store is opened,
+    /// the hook is installed first, on a real `Library`, the way the phone
+    /// installs it, and the music cache refuses a download as
+    /// `outside_size_unknown` rather than counting the video as zero. The
+    /// registration function is `ports::register_video_root`, the code the
+    /// Android crate calls; only its closures (the global hook slot, the
+    /// store's runtime) are the phone's.
     #[test]
     fn a_store_that_could_not_be_created_leaves_music_refused() {
         let rig = Rig::new("no-store");
         std::fs::create_dir_all(&rig.dir).unwrap();
         let root = rig.dir.join("video");
         std::fs::write(&root, b"a file where the folder should be").unwrap();
-        assert!(
-            std::fs::create_dir_all(&root).is_err(),
-            "the folder was made"
-        );
         let lines = capture_music_log();
         let base = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4113,8 +4109,25 @@ mod tests {
             },
         )
         .unwrap();
-        lib.set_outside_used(Arc::new(|| crate::native::ports::outside_bytes(None)));
         lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        let once = crate::native::ports::OpenOnce::new();
+        let opened = std::cell::Cell::new(false);
+        let outcome = crate::native::ports::register_video_root(
+            &root,
+            &once,
+            // The phone: `set_outside_used(outside_bytes_hook())` on its
+            // library; here the same hook on this one.
+            || lib.set_outside_used(crate::native::ports::outside_bytes_hook()),
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(outcome, crate::native::ports::Registration::NoFolder(_)),
+            "{outcome:?}"
+        );
+        assert!(!opened.get(), "a store was opened over a file");
         lib.prefetch(&["track/2".to_owned()]);
         let mut waited = 0;
         let refused = loop {
@@ -5260,6 +5273,12 @@ mod tests {
         store.settled().await;
         FAIL_REMOVE.with(|f| f.set(false));
         assert_eq!(store.videos("u1").len(), 2);
+        let second = store
+            .videos("u1")
+            .into_iter()
+            .find(|v| v.item == "2")
+            .unwrap();
+        assert!(second.ready(), "item 2 did not finish: {:?}", second.state);
     }
 
     /// A download restarted between a sweep's choosing a folder and its
