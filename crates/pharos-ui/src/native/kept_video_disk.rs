@@ -2960,7 +2960,11 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
 
 /// Deletes the staging files earlier runs left in `item`'s folder, each
 /// under the state lock while `run` still owns the item (so a removal and
-/// restart in between cannot have its replacement's file deleted), and
+/// restart in between cannot have its replacement's file deleted). Called
+/// before `run` stages anything, so a file is kept only while a live writer
+/// of this process has registered its run: an inherited file goes whatever
+/// its suffix, even one that names `run` itself (run ids need not be
+/// distinct across processes). It also
 /// settles what the host's size check deferred there: the folder's parts are
 /// deferred no longer. A file that will not go, or a listing that is not
 /// complete, leaves the folder a leftover (unknown) until a sweep settles it,
@@ -2968,16 +2972,22 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
 /// an ordinary context, never on the host's path.
 fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
     let dir = inner.item_dir(user, item);
-    let own = format!(".{run}.part");
     let (paths, mut clean) = part_paths(&dir, ".part");
     let mut dropped = 0usize;
     for path in paths {
-        if path.to_string_lossy().ends_with(&own) {
-            continue;
-        }
         let st = lock(&inner.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return;
+        }
+        // A revoked run of this item still writing keeps its file: its
+        // writer drops it. Anything else is no live writer's.
+        let name = path.to_string_lossy();
+        let live = st
+            .writers
+            .keys()
+            .any(|(u, i, r)| u == user && i == item && name.ends_with(&format!(".{r}.part")));
+        if live {
+            continue;
         }
         match remove_part(&path) {
             Ok(()) => dropped += 1,
@@ -3084,6 +3094,10 @@ impl Inner {
 /// (an earlier process's ids are far below them), and at least 2^32 past
 /// the last base this process handed out.
 fn open_run_base() -> u64 {
+    #[cfg(test)]
+    if let Some(base) = tests::RUN_BASE.with(std::cell::Cell::get) {
+        return base;
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4080,6 +4094,12 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    thread_local! {
+        /// While set, every open's run ids start here: the clock repeating
+        /// across two opens.
+        pub(super) static RUN_BASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     pub(super) fn sync_step(step: String) {
@@ -8204,6 +8224,49 @@ mod tests {
             !part.exists(),
             "the inherited part was taken for the run's own"
         );
+    }
+
+    /// Two opens whose run ids start at the same value (the clock
+    /// repeating, or reading before the epoch, which seeds 0): an inherited
+    /// staging file named for exactly the new run's id is still no live
+    /// writer's, so it goes before the run stages anything and never sits
+    /// uncounted beside the run.
+    #[tokio::test]
+    async fn an_inherited_part_with_the_new_runs_own_id_is_dropped_before_it_writes() {
+        for base in [1_000u64, 0] {
+            let rig = Rig::new(&format!("host-resume-same-id-{base}"));
+            RUN_BASE.with(|b| b.set(Some(base)));
+            let big = 20_000_000;
+            // Each open's first run is base + 1.
+            let name = format!("x.{}.part", base + 1);
+            let (store, dir, part) =
+                host_recovers_an_interrupted_download_with_a_part(&rig, big, &name).await;
+            let release = rig.server.hold_mid_body(SEG1);
+            let admitted = plan_decided(&store, "1").await;
+            RUN_BASE.with(|b| b.set(None));
+            let run = lock(&store.inner.state)
+                .runs
+                .get(&("u1".to_owned(), "1".to_owned()))
+                .copied();
+            assert_eq!(run, Some(base + 1), "the fixture's id is not the run's");
+            assert!(
+                !matches!(admitted.state, KeptState::Failed { .. }),
+                "{admitted:?}"
+            );
+            let on_disk = media_on_disk(&dir);
+            assert!(
+                store.size_unknown() || store.kept_bytes() >= on_disk,
+                "base={base}: after admission: kept {} of {on_disk} on disk (inherited part there: {})",
+                store.kept_bytes(),
+                part.exists()
+            );
+            release.store(true, Ordering::SeqCst);
+            store.settled().await;
+            assert!(
+                !part.exists(),
+                "base={base}: the inherited part was taken for the run's own"
+            );
+        }
     }
 
     /// The same resume with the old staging file refusing to go: the folder
