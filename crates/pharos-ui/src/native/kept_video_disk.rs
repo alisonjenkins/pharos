@@ -989,6 +989,7 @@ impl Inner {
         run: u64,
         plan: &Plan,
         check: Check,
+        other_outstanding: u64,
     ) -> Result<(), Admission> {
         {
             let mut st = lock(&self.state);
@@ -998,10 +999,9 @@ impl Inner {
             // What the running downloads still owe is read before the free
             // space is measured: a write landing in between lowers free, and
             // the stale (higher) owed figure only makes the check stricter.
-            // The other order counts that write as room.
-            let outstanding = st
-                .outstanding(user, item)
-                .saturating_add(self.env.budget.other_outstanding_bytes());
+            // The other order counts that write as room. The other kinds'
+            // share was read by the caller, before their written bytes.
+            let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
             if let Some(refusal) = st.unknown_folder() {
                 return Err(Admission::Refused {
                     refusal,
@@ -1900,6 +1900,13 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     // lock is never awaited while the store's is held).
     let (check, admitted) = {
         let _admission = inner.env.budget.admission_guard();
+        // Readiness first, then the figures: a library published in between
+        // leaves the check refusing, never passing on the default cap and no
+        // music. The owed bytes before the written ones (a write that lands
+        // in between moves from the first figure to the second, never out of
+        // both); each is read once, for the cap and for the free space.
+        let ready = inner.env.budget.accounting_ready();
+        let other_outstanding = inner.env.budget.other_outstanding_bytes();
         // A resume keeps the cap it was admitted under only while its
         // reservation already holds the new plan. One whose estimate came
         // from adoption (the missing files were never reserved), or whose
@@ -1927,10 +1934,6 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     ),
                 );
             }
-            // Readiness first, then the figures: a library published in
-            // between leaves the check refusing, never passing on the
-            // default cap and no music.
-            let ready = inner.env.budget.accounting_ready();
             let progress = inner.env.budget.other_in_progress_bytes();
             Check::Fresh {
                 // What music holds, and what it has approved and not yet
@@ -1939,14 +1942,17 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     .env
                     .budget
                     .other_used_bytes()
-                    .saturating_add(inner.env.budget.other_outstanding_bytes())
+                    .saturating_add(other_outstanding)
                     .saturating_add(progress.unwrap_or(0)),
                 cap: inner.env.budget.cap_bytes(),
                 ready,
                 unknown: progress.is_none(),
             }
         };
-        (check, inner.admit(user, item, run, &plan, check))
+        (
+            check,
+            inner.admit(user, item, run, &plan, check, other_outstanding),
+        )
     };
     match admitted {
         Ok(()) => {}
@@ -2728,13 +2734,15 @@ impl VideoStore for DiskVideoStore {
         let mut absorbed: Option<u64> = None;
         let (started, used) = {
             let _admission = budget.admission_guard();
-            // Readiness first, then the figures (see `Check::Fresh`).
+            // Readiness first, then the figures (see `Check::Fresh`): the
+            // owed bytes before the written ones, each read once.
             let ready = budget.accounting_ready();
+            let other_outstanding = budget.other_outstanding_bytes();
             let progress = budget.other_in_progress_bytes();
             let (other, cap) = (
                 budget
                     .other_used_bytes()
-                    .saturating_add(budget.other_outstanding_bytes())
+                    .saturating_add(other_outstanding)
                     .saturating_add(progress.unwrap_or(0)),
                 budget.cap_bytes(),
             );
@@ -2743,7 +2751,7 @@ impl VideoStore for DiskVideoStore {
             // Owed bytes first, then the free space (as in `admit`).
             let owed = st
                 .outstanding(&user, &item)
-                .saturating_add(budget.other_outstanding_bytes());
+                .saturating_add(other_outstanding);
             let room = budget.free_bytes().saturating_sub(owed);
             let dir = self.inner.item_dir(&user, &item);
             let started = st
@@ -3382,6 +3390,8 @@ mod tests {
         unguarded: AtomicUsize,
         /// Runs whenever the free space is measured.
         on_free: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// The other kinds' owed and written figures, in the order read.
+        reads: Mutex<Vec<&'static str>>,
     }
 
     struct FakeGuard(Arc<AtomicUsize>);
@@ -3412,6 +3422,7 @@ mod tests {
                 taken: AtomicUsize::new(0),
                 unguarded: AtomicUsize::new(0),
                 on_free: Mutex::new(None),
+                reads: Mutex::new(Vec::new()),
             })
         }
     }
@@ -3427,7 +3438,13 @@ mod tests {
         }
         fn other_outstanding_bytes(&self) -> u64 {
             self.read();
+            self.reads.lock().unwrap().push("outstanding");
             self.other_outstanding.load(Ordering::SeqCst)
+        }
+        fn other_in_progress_bytes(&self) -> Option<u64> {
+            self.read();
+            self.reads.lock().unwrap().push("in_progress");
+            Some(0)
         }
         fn accounting_ready(&self) -> bool {
             self.ready.load(Ordering::SeqCst)
@@ -4085,6 +4102,25 @@ mod tests {
         assert!(
             store.stored_file("u1", SEG0).is_some(),
             "stored files dropped"
+        );
+    }
+
+    /// Each admission (the start's and the plan's) reads the other kinds'
+    /// owed bytes once, and before their written ones, as `Budget` orders
+    /// them: a write landing in between moves between the figures, never
+    /// out of both.
+    #[tokio::test]
+    async fn an_admission_reads_the_owed_bytes_once_and_before_the_written() {
+        let rig = Rig::new("read-order");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let reads = rig.budget.reads.lock().unwrap().clone();
+        assert_eq!(
+            reads,
+            ["outstanding", "in_progress", "outstanding", "in_progress"],
+            "start, then the plan"
         );
     }
 
