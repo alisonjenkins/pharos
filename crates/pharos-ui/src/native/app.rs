@@ -1906,11 +1906,16 @@ fn mark_handler(
     })
 }
 
+/// The app's session machine. Whenever a session ends, whoever caused it,
+/// the previous user's offline identity goes with it (the machine runs the
+/// hook). The one place it is built, so a test of the hook tests the app's.
+fn app_machine() -> Machine {
+    Machine::new().with_session_end(offline_video::forget_user)
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
-    // Whenever the session ends, whoever caused it, the previous user's
-    // offline identity goes with it (the machine runs the hook).
-    let mut machine = use_signal(|| Machine::new().with_session_end(offline_video::forget_user));
+    let mut machine = use_signal(app_machine);
     // The player shows a lost connection itself; the shell under it is out
     // of sight (spec 038 FR-503).
     let connection_lost = use_memo(move || machine.read().reconnecting());
@@ -9025,7 +9030,7 @@ mod tests {
     /// revoked socket; one that finds no ready session changes nothing.
     #[test]
     fn a_session_that_ends_forgets_the_user_whoever_ended_it() {
-        let machine = || Machine::new().with_session_end(offline_video::forget_user);
+        let machine = app_machine;
         let ready = |mut m: Machine| {
             m.apply(Event::Resumed { epoch: 0 });
             m
