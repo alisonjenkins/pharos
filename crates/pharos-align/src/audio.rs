@@ -69,6 +69,43 @@ pub fn decode(
     decode_with(ffmpeg, path, start_ms, end_ms, TIMEOUT)
 }
 
+/// [`decode`] of one audio stream, `stream` its absolute index (`-map 0:N`),
+/// for a file with more than one (spec 040 FR-002a).
+pub fn decode_stream(
+    ffmpeg: &str,
+    path: &Path,
+    stream: u32,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<f32>, DecodeError> {
+    let bytes = run(
+        ffmpeg,
+        stream_args(path, stream, start_ms, end_ms, RATE),
+        None,
+        TIMEOUT,
+        (start_ms, end_ms),
+    )?;
+    Ok(f32s(&bytes))
+}
+
+/// [`ffmpeg_args`] with `-map 0:<stream>` after the input.
+pub fn stream_args(
+    path: &Path,
+    stream: u32,
+    start_ms: i64,
+    end_ms: i64,
+    rate: u32,
+) -> Vec<OsString> {
+    let mut args = ffmpeg_args(path, start_ms, end_ms, rate);
+    // Right after `-i <path>`: an output option, before the output's own.
+    let at = args
+        .iter()
+        .position(|a| a == "-i")
+        .map_or(args.len(), |i| i + 2);
+    args.splice(at..at, ["-map".into(), format!("0:{stream}").into()]);
+    args
+}
+
 fn decode_with(
     ffmpeg: &str,
     path: &Path,
@@ -246,6 +283,17 @@ mod tests {
             (zero[4].to_str(), zero[6].to_str()),
             (Some("0.000"), Some("0.250"))
         );
+    }
+
+    #[test]
+    fn a_named_stream_is_mapped_after_the_input() {
+        let got: Vec<String> = stream_args(Path::new("/m/-i"), 3, 1234, 5678, RATE)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        let want =
+            "-nostdin -v error -ss 1.234 -t 4.444 -i /m/-i -map 0:3 -ac 1 -ar 16000 -f f32le -";
+        assert_eq!(got.join(" "), want);
     }
 
     fn ffmpeg() -> Option<&'static str> {
