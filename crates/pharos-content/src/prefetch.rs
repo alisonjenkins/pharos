@@ -683,7 +683,13 @@ impl Gate {
             };
             st.got_ok = true;
             let start = if append { pos } else { 0 };
-            let left = |written: u64| st.total.map_or(0, |t| t.saturating_sub(written));
+            // With no length to go by, the next free-space check's window is
+            // what the write may still add before it is looked at again: it
+            // is reserved, and rolled forward at each check.
+            let left = |written: u64| {
+                st.total
+                    .map_or(FREE_CHECK_BYTES, |t| t.saturating_sub(written))
+            };
             self.cache
                 .ensure_free(id, left(start))
                 .map_err(Fail::LowDisk)?;
@@ -1409,6 +1415,43 @@ mod tests {
             "1000 bytes would leave 1 short"
         );
         assert!(!r.cache.part_path("track/1").exists());
+    }
+
+    /// A response with no length reserves the next check's window of free
+    /// space while it writes, so an admission made meanwhile does not count
+    /// that window as free.
+    #[test]
+    fn a_response_of_unknown_length_reserves_one_check_window() {
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let (slot2, seen2) = (slot.clone(), seen.clone());
+        let r = rig_with_free(
+            "unknown-length",
+            Script::default().file("/audio/1", body(size, 1)).chunked(),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let reserved = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(0, |c| c.reserved_bytes());
+                seen2.lock().unwrap().push(reserved);
+                Ok(u64::MAX)
+            }),
+        );
+        *slot.lock().unwrap() = Some(r.cache.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        // Reads: the job's check, the check before writing, then each check
+        // while writing; the last two see the window reserved by the one
+        // before.
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.len() >= 3, "{seen:?}");
+        assert_eq!(seen[2], FREE_CHECK_BYTES, "window not reserved: {seen:?}");
+        assert_eq!(r.cache.reserved_bytes(), 0, "kept after the job ended");
     }
 
     #[test]
