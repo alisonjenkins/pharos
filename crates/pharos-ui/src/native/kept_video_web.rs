@@ -34,8 +34,6 @@ const CONCURRENCY: usize = 2;
 thread_local! {
     static LIST: RefCell<Option<Vec<KeptVideo>>> = const { RefCell::new(None) };
     static FREE: Cell<u64> = const { Cell::new(0) };
-    /// The viewer's cap, read from `localStorage` on first use.
-    static CAP: Cell<Option<u64>> = const { Cell::new(None) };
     static PERSIST_ASKED: Cell<bool> = const { Cell::new(false) };
     static LAST_SAVE_MS: Cell<f64> = const { Cell::new(0.0) };
 }
@@ -57,20 +55,16 @@ fn local_storage() -> Result<web_sys::Storage, String> {
         .ok_or_else(|| "localStorage is unavailable".to_owned())
 }
 
-/// The cap in force: the viewer's stored choice, else the default.
+/// The cap in force: the viewer's stored choice, else the default. Read
+/// afresh each time, so a cap another tab set applies here too.
 fn current_cap() -> u64 {
-    if let Some(cap) = CAP.with(Cell::get) {
-        return cap;
-    }
     let stored = local_storage()
         .and_then(|s| s.get_item(CAP_KEY).map_err(|e| describe(&e)))
         .unwrap_or_else(|e| {
             warn(&format!("pharos: video cap unreadable reason={e}"));
             None
         });
-    let cap = cap_from_stored(stored.as_deref());
-    CAP.with(|c| c.set(Some(cap)));
-    cap
+    cap_from_stored(stored.as_deref())
 }
 
 fn load() -> Vec<KeptVideo> {
@@ -733,9 +727,7 @@ impl VideoStore for WebVideoStore {
         if option.is_empty() {
             return Err(format!("{bytes} bytes is not a cap this page offers"));
         }
-        local_storage().and_then(|s| s.set_item(CAP_KEY, &option).map_err(|e| describe(&e)))?;
-        CAP.with(|c| c.set(Some(bytes)));
-        Ok(())
+        local_storage().and_then(|s| s.set_item(CAP_KEY, &option).map_err(|e| describe(&e)))
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
