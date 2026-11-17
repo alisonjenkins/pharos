@@ -157,6 +157,18 @@ fn cue_runs(cues: &[(i64, i64)], ratio: f64) -> Vec<(i64, i64)> {
 /// FR-009: the [`KEEP`] best offsets within ±[`RANGE_MS`] at `ratio`, best
 /// first, at least [`PEAK_GAP_MS`] apart, each lining up better than chance.
 pub fn shifts(speech: &Speech, cues: &[(i64, i64)], ratio: f64) -> Vec<Shift> {
+    shifts_beyond(speech, cues, ratio, None)
+}
+
+/// [`shifts`], leaving out offsets within `skip_ms` of 0 (searched already).
+/// A peak left out still holds its [`PEAK_GAP_MS`], so its shoulders do not
+/// take the slots, but it does not count towards [`KEEP`].
+pub fn shifts_beyond(
+    speech: &Speech,
+    cues: &[(i64, i64)],
+    ratio: f64,
+    skip_ms: Option<i64>,
+) -> Vec<Shift> {
     let n = speech.on.len();
     let runs = cue_runs(cues, ratio);
     let cue_total: i64 = runs.iter().map(|(a, b)| b - a).sum();
@@ -184,24 +196,29 @@ pub fn shifts(speech: &Speech, cues: &[(i64, i64)], ratio: f64) -> Vec<Shift> {
         .collect();
     scored.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.abs().cmp(&y.0.abs())));
     let gap = PEAK_GAP_MS / FRAME_MS;
-    let mut kept: Vec<Shift> = Vec::with_capacity(KEEP);
+    let mut peaks: Vec<Shift> = Vec::new();
+    let mut kept = 0;
     for (o, lift) in scored {
-        if kept.len() == KEEP || lift <= 0.0 {
+        if kept == KEEP || lift <= 0.0 {
             break;
         }
         let o_ms = o * FRAME_MS;
-        if kept
+        if peaks
             .iter()
             .all(|k| (k.offset_ms - o_ms).abs() >= gap * FRAME_MS)
         {
-            kept.push(Shift {
+            peaks.push(Shift {
                 offset_ms: o_ms,
                 ratio,
                 lift,
             });
+            if skip_ms.map_or(true, |skip| o_ms.abs() > skip) {
+                kept += 1;
+            }
         }
     }
-    kept
+    peaks.retain(|p| skip_ms.map_or(true, |skip| p.offset_ms.abs() > skip));
+    peaks
 }
 
 /// FR-008: the stage-2 candidates to try, best first, at most `max`: the
@@ -209,10 +226,7 @@ pub fn shifts(speech: &Speech, cues: &[(i64, i64)], ratio: f64) -> Vec<Shift> {
 /// An offset stage 1 already searched (ratio 1, within `stage1_ms`) is left
 /// out.
 pub fn candidates(speech: &Speech, cues: &[(i64, i64)], stage1_ms: i64, max: usize) -> Vec<Shift> {
-    let mut all: Vec<Shift> = shifts(speech, cues, 1.0)
-        .into_iter()
-        .filter(|s| s.offset_ms.abs() > stage1_ms)
-        .collect();
+    let mut all: Vec<Shift> = shifts_beyond(speech, cues, 1.0, Some(stage1_ms));
     for r in RATIOS {
         all.extend(shifts(speech, cues, r).into_iter().take(1));
     }
@@ -285,6 +299,25 @@ mod tests {
                 .all(|g| g.ratio != 1.0 || g.offset_ms.abs() > 8_000),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn peaks_stage_one_searched_do_not_take_the_slots() {
+        let c: Vec<(i64, i64)> = (0..12)
+            .map(|i| (130_000 + i * 60_000, 131_000 + i * 60_000))
+            .collect();
+        let mut on = vec![false; 15_000];
+        for shift in [-8_000i64, 0, 8_000, 20_000] {
+            for &(a, b) in &c {
+                for f in (a + shift) / FRAME_MS..(b + shift) / FRAME_MS {
+                    on[usize::try_from(f).unwrap()] = true;
+                }
+            }
+        }
+        let s = Speech::from_frames(on);
+        let got = shifts_beyond(&s, &c, 1.0, Some(8_000));
+        assert_eq!(got.first().map(|g| g.offset_ms), Some(20_000), "{got:?}");
+        assert!(got.iter().all(|g| g.offset_ms.abs() > 8_000), "{got:?}");
     }
 
     #[test]
