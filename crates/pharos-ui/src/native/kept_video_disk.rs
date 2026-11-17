@@ -990,6 +990,84 @@ impl Inner {
                 .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }))
     }
 
+    /// Reserves [`PLAYLIST_MAX_BYTES`] for a playlist `run` is about to
+    /// fetch before its plan is admitted, by raising the record's estimate,
+    /// so every other admission counts it. Held to the shared cap and the
+    /// free floor as a fresh download is, with its refusals (accounting not
+    /// ready, music's size unknown, a folder of unknown size). The admission
+    /// that follows sets the estimate, which releases it.
+    fn reserve_playlist(&self, user: &str, item: &str, run: u64, key: &str) -> Result<(), Stop> {
+        let budget = &self.env.budget;
+        let _admission = budget.admission_guard();
+        let ready = budget.accounting_ready();
+        let other_outstanding = budget.other_outstanding_bytes();
+        let progress = budget.other_in_progress_bytes();
+        let other = budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = budget.cap_bytes();
+        let mut st = lock(&self.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return Err(Stop::Gone);
+        }
+        let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
+        let used = st.reserved_by_others(user, item).saturating_add(other);
+        let own = find(&st.list, user, item).map_or(0, reserved);
+        let verdict = if let Some(refusal) = st.unknown_folder() {
+            Err(refusal)
+        } else if !ready {
+            Err(KeepVideoRefusal::Host(
+                "the music cache is not up yet, so the shared cap cannot be checked".to_owned(),
+            ))
+        } else if progress.is_none() {
+            Err(KeepVideoRefusal::Host(
+                "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
+                    .to_owned(),
+            ))
+        } else {
+            fits(
+                PLAYLIST_MAX_BYTES,
+                used.saturating_add(own),
+                cap,
+                budget.free_bytes().saturating_sub(outstanding),
+            )
+        };
+        match verdict {
+            Ok(()) => {
+                if let Some(v) = st
+                    .list
+                    .iter_mut()
+                    .find(|v| v.user == user && v.item == item)
+                {
+                    v.estimated_bytes = own.saturating_add(PLAYLIST_MAX_BYTES);
+                }
+                drop(st);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist reserved item={item} url_path={} bytes={PLAYLIST_MAX_BYTES} used={} cap={cap}",
+                        url_path(key),
+                        used.saturating_add(own)
+                    ),
+                );
+                Ok(())
+            }
+            Err(refusal) => {
+                drop(st);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason={refusal} step=playlist url_path={} reserve={PLAYLIST_MAX_BYTES} used={} cap={cap}",
+                        url_path(key),
+                        used.saturating_add(own)
+                    ),
+                );
+                Err(Stop::Refused(refusal.to_string()))
+            }
+        }
+    }
+
     /// Admits `run`'s download: the plan is recorded and its estimate
     /// reserved in one step under the state lock, after the room it needs
     /// is checked beside every other download's reservation. Checking and
@@ -1187,6 +1265,7 @@ async fn fetch_file(
     item: &str,
     run: u64,
     key: &str,
+    limit: Option<u64>,
 ) -> Result<u64, Stop> {
     let path = inner.file_path(user, item, key);
     let mut attempt = 0u32;
@@ -1194,7 +1273,7 @@ async fn fetch_file(
         if !inner.wanted(user, item, run) {
             return Err(Stop::Gone);
         }
-        let err = match fetch_once(inner, user, item, run, key, &path).await {
+        let err = match fetch_once(inner, user, item, run, key, &path, limit).await {
             Ok(len) => {
                 return if inner.record_file(user, item, run, key, path, len) {
                     Ok(len)
@@ -1220,6 +1299,20 @@ async fn fetch_file(
                 };
             }
             FetchOnce::Gone => return Err(Stop::Gone),
+            FetchOnce::TooLarge(limit) => {
+                let reason = format!(
+                    "{} is larger than the {limit} bytes a playlist may take (reason=playlist_too_large)",
+                    url_path(key)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=playlist_too_large url_path={} limit={limit}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
             FetchOnce::Fetch(e) => e,
         };
         attempt += 1;
@@ -1246,6 +1339,8 @@ async fn fetch_file(
 enum FetchOnce {
     Fetch(FetchError),
     Store(String),
+    /// The body passed the size limit set for it (a playlist's).
+    TooLarge(u64),
     /// The download was removed or restarted while this run was fetching.
     Gone,
 }
@@ -1274,6 +1369,7 @@ async fn fetch_once(
     run: u64,
     key: &str,
     path: &Path,
+    limit: Option<u64>,
 ) -> Result<u64, FetchOnce> {
     let store_err = |what: &str, e: std::io::Error| {
         FetchOnce::Store(format!(
@@ -1330,6 +1426,15 @@ async fn fetch_once(
                     drop(file);
                     return Err(FetchOnce::Gone);
                 }
+                // A body past its limit is not written on: its reservation
+                // was for the limit.
+                if let Some(limit) = limit {
+                    if len.saturating_add(chunk.len() as u64) > limit {
+                        drop(file);
+                        inner.remove_staging(&part);
+                        return Err(FetchOnce::TooLarge(limit));
+                    }
+                }
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| store_err("write", e))?;
@@ -1374,17 +1479,29 @@ async fn fetch_once(
     }
 }
 
-/// A playlist's text: the stored file, or fetched and stored first.
+/// The most a playlist may take. Playlists are fetched before the plan is
+/// admitted, so each is reserved at this size first and refused past it.
+#[cfg(not(test))]
+pub(crate) const PLAYLIST_MAX_BYTES: u64 = 4 << 20;
+/// The test playlists are a few hundred bytes, and the test budgets small.
+#[cfg(test)]
+pub(crate) const PLAYLIST_MAX_BYTES: u64 = 256;
+
+/// A playlist's text: the stored file, or reserved, fetched and stored
+/// first (`fetched` is then pushed its key).
 async fn playlist(
     inner: &Inner,
     user: &str,
     item: &str,
     run: u64,
     key: &str,
+    fetched: &mut Vec<String>,
 ) -> Result<String, Stop> {
     let path = inner.file_path(user, item, key);
     if tokio::fs::metadata(&path).await.is_err() {
-        fetch_file(inner, user, item, run, key).await?;
+        inner.reserve_playlist(user, item, run, key)?;
+        fetch_file(inner, user, item, run, key, Some(PLAYLIST_MAX_BYTES)).await?;
+        fetched.push(key.to_owned());
     }
     let bytes = tokio::fs::read(&path)
         .await
@@ -1822,7 +1939,7 @@ async fn fetch_planned(
     key: String,
     short_tails: &HashSet<String>,
 ) -> Result<(String, Option<u64>), Stop> {
-    match fetch_file(inner, user, item, run, &key).await {
+    match fetch_file(inner, user, item, run, &key, None).await {
         Ok(len) => Ok((key, Some(len))),
         // B1476: the sliver of a last segment can fail to encode; the
         // copy plays without it, ending a frame early.
@@ -1847,7 +1964,12 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     let resume = !record.files.is_empty();
     let master = request_key(&record.master_url);
 
-    let text = playlist(inner, user, item, run, &master).await?;
+    // Playlists this run fetches before its plan is admitted: reserved at
+    // their limit until the admission sets the estimate, and deleted if
+    // the admission refuses, so a refused download keeps nothing it
+    // fetched to plan.
+    let mut fetched: Vec<String> = Vec::new();
+    let text = playlist(inner, user, item, run, &master, &mut fetched).await?;
     let plan = plan_master(&format!("{PLAN_ORIGIN}{master}"), &text)
         .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
     let mut stored = vec![master.clone()];
@@ -1856,7 +1978,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     let mut short_tails: HashSet<String> = HashSet::new();
     for url in &plan.media_playlists {
         let key = request_key(url);
-        let text = playlist(inner, user, item, run, &key).await?;
+        let text = playlist(inner, user, item, run, &key, &mut fetched).await?;
         let media = plan_media(url, &text)
             .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(&key))))?;
         stored.push(key);
@@ -2000,11 +2122,16 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     "pharos: video keep refused item={item} reason={refusal} {detail} free={free} outstanding={outstanding}"
                 ),
             );
-            // A new download keeps nothing it fetched to plan; a resumed
-            // one keeps its files for a later retry.
-            if !resume {
-                drop_refused_files(inner, user, item, run, &stored);
-            }
+            // Nothing fetched to plan is kept: a new download drops its
+            // playlists, a resumed one those this run fetched (its other
+            // files stay for a later retry).
+            drop_refused_files(
+                inner,
+                user,
+                item,
+                run,
+                if resume { &fetched } else { &stored },
+            );
             return Err(Stop::Refused(refusal.to_string()));
         }
     }
@@ -4216,10 +4343,10 @@ mod tests {
         );
     }
 
-    /// Each admission (the start's and the plan's) reads the other kinds'
-    /// owed bytes once, and before their written ones, as `Budget` orders
-    /// them: a write landing in between moves between the figures, never
-    /// out of both.
+    /// Each admission (the start's, each playlist's and the plan's) reads
+    /// the other kinds' owed bytes once, and before their written ones, as
+    /// `Budget` orders them: a write landing in between moves between the
+    /// figures, never out of both.
     #[tokio::test]
     async fn an_admission_reads_the_owed_bytes_once_and_before_the_written() {
         let rig = Rig::new("read-order");
@@ -4228,11 +4355,65 @@ mod tests {
         store.settled().await;
         assert!(only(&store).ready());
         let reads = rig.budget.reads.lock().unwrap().clone();
-        assert_eq!(
-            reads,
-            ["outstanding", "in_progress", "outstanding", "in_progress"],
-            "start, then the plan"
+        // The start, the two playlists' reservations, then the plan.
+        assert_eq!(reads, ["outstanding", "in_progress"].repeat(4));
+    }
+
+    /// A resume missing its playlist with no room left under the shared cap
+    /// is refused before the playlist is fetched: a playlist fetched to
+    /// plan is reserved at its limit first, so nothing is written.
+    #[tokio::test]
+    async fn a_resume_missing_its_playlist_with_no_room_fetches_nothing() {
+        let rig = Rig::new("resume-playlist");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let master = store.stored_file("u1", MASTER_KEY).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&master).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        let files = rig.dir.join("u1").join("1").join("files");
+        let media = dir_size(&files).bytes;
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - media, Ordering::SeqCst);
+
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume with no room went on");
+        };
+        assert!(rig.server.asked().is_empty(), "something was fetched");
+        assert!(!master.exists(), "the playlist was written");
+        assert_eq!(dir_size(&files).bytes, media, "media written");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused.iter().any(|l| l.contains("step=playlist")),
+            "{refused:?}"
         );
+    }
+
+    /// A playlist past its limit is refused and not kept: its reservation
+    /// was for the limit.
+    #[tokio::test]
+    async fn a_playlist_past_its_limit_is_refused_and_not_kept() {
+        let rig = Rig::new("playlist-limit");
+        let big = format!("{MASTER}{}", "#\n".repeat(200));
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(MASTER_KEY.into(), big.into_bytes());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("an oversized playlist was taken");
+        };
+        assert!(reason.contains("playlist_too_large"), "{reason}");
+        assert!(store.stored_file("u1", MASTER_KEY).is_none());
+        let files = rig.dir.join("u1").join("1").join("files");
+        assert_eq!(dir_size(&files).bytes, 0, "something was kept");
+        assert!(!lines("pharos: video keep refused item=1 reason=playlist_too_large").is_empty());
     }
 
     /// Two downloads that each fit alone but not together: the second
@@ -6105,7 +6286,7 @@ mod tests {
         store.remove("u1", "1");
         let dir = rig.dir.join("u1").join("1");
         let path = store.inner.file_path("u1", "1", SEG0);
-        let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path).await;
+        let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path, None).await;
         assert!(matches!(out, Err(FetchOnce::Gone)), "{}", out.is_ok());
         assert!(!dir.exists(), "a revoked run brought the folder back");
     }
