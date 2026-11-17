@@ -478,6 +478,11 @@ impl Inner {
         }
         // Nothing runs it any more.
         if matches!(record.state, KeptState::Downloading { .. }) {
+            // A Failed record reports its estimate as its bytes: what the
+            // download had written, or the folder holds, must not drop out
+            // of what it reserves in the change.
+            let on_disk = names.values().fold(0u64, |a, n| a.saturating_add(*n));
+            record.estimated_bytes = reserved(&record).max(on_disk);
             record.state = KeptState::Failed {
                 reason: format!("could not be removed: {e}"),
             };
@@ -4005,6 +4010,35 @@ mod tests {
         let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path).await;
         assert!(matches!(out, Err(FetchOnce::Gone)), "{}", out.is_ok());
         assert!(!dir.exists(), "a revoked run brought the folder back");
+    }
+
+    /// A running download put back after a failed unlink becomes a Failed
+    /// record, whose bytes are its estimate: it must not reserve less than
+    /// it did when it had written more than it planned.
+    #[tokio::test]
+    async fn a_restored_download_keeps_what_it_reserved() {
+        let rig = Rig::new("unlink-fails-reserve");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let big = 50 * GIB;
+        {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.first_mut().unwrap();
+            v.state = KeptState::Downloading {
+                done: 0,
+                total: 1,
+                bytes: big,
+            };
+        }
+        assert_eq!(store.kept_bytes(), big);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert_eq!(store.kept_bytes(), big, "the reservation shrank");
     }
 
     /// While a removed download's folder is being deleted its bytes still
