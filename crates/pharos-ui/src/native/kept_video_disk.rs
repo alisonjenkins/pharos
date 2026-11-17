@@ -1265,6 +1265,19 @@ impl DiskVideoStore {
                             continue;
                         }
                     },
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        // A record that is there but cannot be read (a
+                        // permissions fault, say) is not a removed one:
+                        // its folder is left alone, not deleted.
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video record unreadable dir={} error={e}",
+                                item_dir.display()
+                            ),
+                        );
+                        continue;
+                    }
                     Err(_) => {
                         // No record: a removed download whose folder did
                         // not delete. Try again; what stays still counts.
@@ -2697,6 +2710,28 @@ mod tests {
         store.inner.sweep_tombstones();
         assert_eq!(store.kept_bytes(), reserved, "the sweep forgot the figure");
         FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// Only a missing manifest marks a removed download. One that is there
+    /// but cannot be read leaves its folder alone.
+    #[tokio::test]
+    async fn an_unreadable_manifest_does_not_get_its_folder_deleted() {
+        let rig = Rig::new("manifest-unreadable");
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("keep"), b"bytes").unwrap();
+        // A directory where the manifest should be: reading it fails with
+        // something other than "not found".
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        let store = rig.open();
+        assert!(dir.join("files").join("keep").exists(), "the folder went");
+        assert!(store.videos("u1").is_empty());
+        assert_eq!(
+            lines("pharos: video record unreadable").len(),
+            1,
+            "{:?}",
+            lines("pharos: video record")
+        );
     }
 
     /// A folder that will not delete keeps counting against the cap, does not
