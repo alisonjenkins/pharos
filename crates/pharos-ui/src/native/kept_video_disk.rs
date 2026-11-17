@@ -1368,6 +1368,59 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
     (names, complete)
 }
 
+/// A record read from a folder, ready to join the list.
+struct Adopted {
+    record: KeptVideo,
+    /// The stored whole files, by user and key.
+    index: Vec<((String, String), (PathBuf, u64))>,
+    /// A staging file would not delete: the folder stays unknown until a
+    /// settlement.
+    leftover: bool,
+}
+
+/// What a record found in `item_dir` becomes: its staging files dropped, its
+/// whole files indexed, and a ready record that lost files back to
+/// downloading.
+fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
+    // A staging file that will not go keeps the folder unknown until a
+    // sweep deletes it or measures the folder whole.
+    let leftover = !drop_parts_of(item_dir, None);
+    let names = stored_names(item_dir);
+    let mut whole = 0usize;
+    let mut index = Vec::new();
+    for key in &record.files {
+        if let Some(len) = names.get(&file_name(key)) {
+            whole += 1;
+            index.push((
+                (record.user.clone(), key.clone()),
+                (item_dir.join("files").join(file_name(key)), *len),
+            ));
+        }
+    }
+    let mut record = record;
+    if record.ready() && whole < record.files.len() {
+        emit(
+            true,
+            format!(
+                "pharos: video record incomplete item={} files={} stored={whole}",
+                record.item,
+                record.files.len()
+            ),
+        );
+        let total = u32::try_from(record.files.len()).unwrap_or(u32::MAX);
+        record.state = KeptState::Downloading {
+            done: u32::try_from(whole).unwrap_or(u32::MAX),
+            total,
+            bytes: 0,
+        };
+    }
+    Adopted {
+        record,
+        index,
+        leftover,
+    }
+}
+
 /// A folder whose record cannot be read is left alone, never deleted. Its
 /// bytes (as far as they can be read) count against the cap, and since the
 /// record's own reservation is lost, nothing is admitted while it stays.
@@ -1968,6 +2021,155 @@ impl Inner {
     }
 }
 
+/// What a held folder's record reads as now.
+enum HeldNow {
+    /// It parses: the folder is a download again.
+    Readable(Box<KeptVideo>),
+    /// The folder is gone.
+    Gone,
+    /// The folder is there with no record: a removed download.
+    NoRecord,
+    /// Still not readable, and why.
+    Still(String),
+}
+
+fn read_held(dir: &Path) -> HeldNow {
+    match std::fs::read(dir.join("manifest.json")) {
+        Ok(bytes) => match serde_json::from_slice::<KeptVideo>(&bytes) {
+            Ok(v) => HeldNow::Readable(Box::new(v)),
+            Err(e) => HeldNow::Still(format!("record damaged: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::metadata(dir) {
+            Err(m) if m.kind() == std::io::ErrorKind::NotFound => HeldNow::Gone,
+            Err(m) => HeldNow::Still(format!("folder unreadable: {m}")),
+            Ok(_) => HeldNow::NoRecord,
+        },
+        Err(e) => HeldNow::Still(format!("record unreadable: {e}")),
+    }
+}
+
+impl Inner {
+    /// Claims the held folders nothing else is working on.
+    fn claim_held(&self) -> Vec<PathBuf> {
+        let mut st = lock(&self.state);
+        let picked: Vec<PathBuf> = st
+            .held
+            .iter()
+            .map(|(d, _)| d.clone())
+            .filter(|d| {
+                !st.removing.contains(d)
+                    && !st.deleting.contains(d)
+                    && !st.settling.contains(d)
+                    && !st.writing(d)
+            })
+            .collect();
+        st.deleting.extend(picked.iter().cloned());
+        picked
+    }
+
+    /// Reads again the folders held at open. A record that parses now
+    /// (a schema it could not read, fixed) joins the list; a folder that is
+    /// gone is dropped; one left without a record is a removed download and
+    /// becomes a tombstone; one still unreadable has its size measured again.
+    /// Each verdict is logged, a repeat of an unchanged one is not.
+    fn sweep_held(self: &Arc<Self>) {
+        for dir in self.claim_held() {
+            let now = read_held(&dir);
+            self.apply_held(&dir, now);
+            lock(&self.state).deleting.retain(|d| *d != dir);
+        }
+    }
+
+    /// Applies what [`read_held`] found for a claimed `dir`.
+    fn apply_held(self: &Arc<Self>, dir: &Path, now: HeldNow) {
+        let verdict = |v: &str, why: &str| {
+            emit(
+                false,
+                format!(
+                    "pharos: video held folder verdict={v} dir={} reason={why}",
+                    dir.display()
+                ),
+            );
+        };
+        let release = |st: &mut State| {
+            st.held.retain(|(d, _)| d != dir);
+            st.unmeasured.retain(|(d, _)| d != dir);
+        };
+        match now {
+            HeldNow::Readable(record) => {
+                if self.item_dir(&record.user, &record.item) != dir {
+                    verdict("still_held", "record names another folder");
+                    return;
+                }
+                let adopted = adopt(dir, *record);
+                let mut st = lock(&self.state);
+                if !st.held.iter().any(|(d, _)| d == dir)
+                    || find(&st.list, &adopted.record.user, &adopted.record.item).is_some()
+                {
+                    return;
+                }
+                release(&mut st);
+                st.index.extend(adopted.index);
+                if adopted.leftover {
+                    st.leftover.push(dir.to_path_buf());
+                }
+                let (user, item) = (adopted.record.user.clone(), adopted.record.item.clone());
+                let resume = !interrupted(std::slice::from_ref(&adopted.record)).is_empty();
+                st.list.push(adopted.record);
+                st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+                drop(st);
+                verdict("released", "record readable");
+                if resume {
+                    self.spawn_run(user, item);
+                }
+            }
+            HeldNow::Gone => {
+                release(&mut lock(&self.state));
+                verdict("dropped", "folder gone");
+            }
+            HeldNow::NoRecord => {
+                let m = dir_size(dir);
+                let mut st = lock(&self.state);
+                if !st.held.iter().any(|(d, _)| d == dir) {
+                    return;
+                }
+                release(&mut st);
+                st.measured.insert(dir.to_path_buf(), (0, m.exact));
+                st.tombstones.push((dir.to_path_buf(), m.bytes));
+                drop(st);
+                verdict("tombstoned", "no record, a removed download");
+            }
+            HeldNow::Still(why) => {
+                let m = dir_size(dir);
+                let mut st = lock(&self.state);
+                let changed = st
+                    .held
+                    .iter()
+                    .find(|(d, _)| d == dir)
+                    .is_some_and(|(_, b)| *b != m.bytes)
+                    || st.unmeasured.iter().any(|(d, w)| d == dir && *w != why);
+                for (d, b) in &mut st.held {
+                    if d == dir {
+                        *b = m.bytes;
+                    }
+                }
+                for (d, w) in &mut st.unmeasured {
+                    if d == dir {
+                        why.clone_into(w);
+                    }
+                }
+                drop(st);
+                if changed {
+                    verdict(
+                        "still_held",
+                        &format!("{why} bytes={} exact={}", m.bytes, m.exact),
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl DiskVideoStore {
     /// Opens the store at `root`: reads every manifest, indexes the whole
     /// files, and restarts the downloads a closed app left half done.
@@ -2038,40 +2240,12 @@ impl DiskVideoStore {
                         continue;
                     }
                 };
-                // A staging file that will not go keeps the folder unknown
-                // until a sweep deletes it or measures the folder whole.
-                if !drop_parts_of(&item_dir, None) {
+                let adopted = adopt(&item_dir, record);
+                if adopted.leftover {
                     leftover.push(item_dir.clone());
                 }
-                let names = stored_names(&item_dir);
-                let mut whole = 0usize;
-                for key in &record.files {
-                    if let Some(len) = names.get(&file_name(key)) {
-                        whole += 1;
-                        index.insert(
-                            (record.user.clone(), key.clone()),
-                            (item_dir.join("files").join(file_name(key)), *len),
-                        );
-                    }
-                }
-                let mut record = record;
-                if record.ready() && whole < record.files.len() {
-                    emit(
-                        true,
-                        format!(
-                            "pharos: video record incomplete item={} files={} stored={whole}",
-                            record.item,
-                            record.files.len()
-                        ),
-                    );
-                    let total = u32::try_from(record.files.len()).unwrap_or(u32::MAX);
-                    record.state = KeptState::Downloading {
-                        done: u32::try_from(whole).unwrap_or(u32::MAX),
-                        total,
-                        bytes: 0,
-                    };
-                }
-                list.push(record);
+                index.extend(adopted.index);
+                list.push(adopted.record);
             }
         }
         list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
@@ -2189,6 +2363,9 @@ fn dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 impl VideoStore for DiskVideoStore {
     fn videos(&self, user: &str) -> Vec<KeptVideo> {
+        // The page that lists the downloads reads the held folders again, so
+        // one whose record became readable is not stranded.
+        self.inner.sweep_held();
         lock(&self.inner.state)
             .list
             .iter()
@@ -2205,6 +2382,7 @@ impl VideoStore for DiskVideoStore {
         // planning and shows as a failed download. The room is read under
         // the host's shared admission lock, before the store's own lock is
         // taken, and the check and the new record sit under one hold of it.
+        self.inner.sweep_held();
         self.inner.sweep_tombstones();
         let mut replaced: Option<KeptVideo> = None;
         // The figure of a tombstone this start absorbed, to put back if the
@@ -4760,6 +4938,69 @@ mod tests {
             store.start(request("2")),
             Err(KeepVideoRefusal::Host(_))
         ));
+    }
+
+    /// A finished download of item 1 whose manifest is then damaged and the
+    /// store reopened over it: the folder is held and blocks admission.
+    /// Returns the rig, the store, the manifest's good bytes and its path.
+    async fn held_download(name: &str) -> (Rig, Arc<DiskVideoStore>, Vec<u8>, PathBuf) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let manifest = rig.dir.join("u1").join("1").join("manifest.json");
+        let good = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"{ not json").unwrap();
+        let store = rig.open();
+        assert!(store.size_unknown(), "the damaged manifest did not block");
+        (rig, store, good, manifest)
+    }
+
+    /// A manifest that reads again (a schema a newer build wrote, back on a
+    /// build that parses it) is released by a sweep: the download is listed,
+    /// nothing is blocked, and its bytes count once, as the record's.
+    #[tokio::test]
+    async fn a_held_folder_whose_manifest_becomes_readable_is_released_by_a_sweep() {
+        let (_rig, store, good, manifest) = held_download("held-readable").await;
+        assert!(store.videos("u1").is_empty());
+        let still_held = store.kept_bytes();
+        assert!(still_held > 0);
+        std::fs::write(&manifest, good).unwrap();
+        let listed = store.videos("u1");
+        assert_eq!(listed.len(), 1, "the download is not back");
+        assert!(listed[0].ready(), "{:?}", listed[0].state);
+        assert!(!store.size_unknown(), "still blocked after the release");
+        assert!(store.stored_file("u1", SEG0).is_some(), "files not served");
+        assert_eq!(store.kept_bytes(), reserved(&listed[0]), "counted twice");
+        assert!(!lines("pharos: video held folder verdict=released").is_empty());
+        store.start(request("2")).unwrap();
+        store.settled().await;
+    }
+
+    /// A held folder deleted by hand is dropped; one left with no record is
+    /// a removed download and is deleted by the sweep that follows.
+    #[tokio::test]
+    async fn a_held_folder_that_is_gone_or_has_no_record_stops_blocking() {
+        let (_rig, store, _good, manifest) = held_download("held-gone").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(store.videos("u1").is_empty());
+        assert!(!store.size_unknown());
+        assert_eq!(store.kept_bytes(), 0);
+        assert!(!lines("pharos: video held folder verdict=dropped").is_empty());
+
+        let (_rig, store, _good, manifest) = held_download("held-no-record").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        std::fs::remove_file(&manifest).unwrap();
+        store.videos("u1");
+        assert!(!store.size_unknown(), "measured whole, so known");
+        assert!(store.kept_bytes() > 0, "counted until it is deleted");
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the removed download's folder stayed");
+        assert!(!store.size_unknown());
+        assert!(!lines("pharos: video held folder verdict=tombstoned").is_empty());
     }
 
     /// A restart while a removed download's folder will not delete and
