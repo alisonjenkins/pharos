@@ -3184,8 +3184,9 @@ struct ServerFetcher;
 /// sends the device token): a cross-host redirect or an https-to-http
 /// downgrade stops and is logged. Not `https_only`: a plain-http server on
 /// the LAN must keep working. [`http`] is the proxy's and is unchanged.
-fn download_http() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+fn download_http() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -3207,17 +3208,19 @@ fn download_http() -> &'static reqwest::Client {
                 }
             }
         });
-        let builder = reqwest::Client::builder()
-            .user_agent(tv_page::USER_AGENT)
-            .redirect(policy);
-        let builder = match pharos_api::tls::client_config() {
-            Ok(tls) => builder.tls_backend_preconfigured(tls),
-            Err(error) => {
-                log::error!("download TLS config failed to build: {error}");
-                builder
-            }
-        };
-        builder.build().unwrap_or_default()
+        let built = tv_page::built_client(|| {
+            let tls = pharos_api::tls::client_config().map_err(|e| format!("tls config: {e}"))?;
+            reqwest::Client::builder()
+                .user_agent(tv_page::USER_AGENT)
+                .redirect(policy)
+                .tls_backend_preconfigured(tls)
+                .build()
+                .map_err(|e| e.to_string())
+        });
+        if let Err(why) = &built {
+            log::error!("pharos: video download refused reason={why}");
+        }
+        built
     })
 }
 
@@ -3248,7 +3251,13 @@ impl Body for ServerBody {
 impl Fetcher for ServerFetcher {
     fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
         Box::pin(async move {
-            let mut req = download_http().get(tv_page::server_url(&server(), key));
+            // No client, no download: never a default one without the
+            // redirect policy.
+            let client = download_http().as_ref().map_err(|why| FetchError {
+                status: None,
+                message: why.clone(),
+            })?;
+            let mut req = client.get(tv_page::server_url(&server(), key));
             if let Some(token) = android::token() {
                 req = req.header("X-Emby-Token", token);
             }
