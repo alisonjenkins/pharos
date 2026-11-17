@@ -819,6 +819,11 @@ async fn fetch_once(
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| store_err("write", e))?;
+                // `write_all` can return while tokio's write is still
+                // pending, and the free-space reading does not lack those
+                // bytes yet. They count as staged (and so stop being owed)
+                // only once the write has completed.
+                file.flush().await.map_err(|e| store_err("write", e))?;
                 len = len.saturating_add(chunk.len() as u64);
                 staged.add(chunk.len() as u64);
             }
