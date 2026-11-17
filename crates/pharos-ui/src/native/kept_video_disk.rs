@@ -1216,10 +1216,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             // A new download keeps nothing it fetched to plan; a resumed
             // one keeps its files for a later retry.
             if !resume {
-                for key in &stored {
-                    let _ = tokio::fs::remove_file(inner.file_path(user, item, key)).await;
-                    lock(&inner.state).index.remove(key);
-                }
+                drop_refused_files(inner, user, item, run, &stored);
             }
             return Err(Stop::Refused(refusal.to_string()));
         }
@@ -1356,6 +1353,21 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     let mut st = lock(&inner.state);
     if st.runs.get(&(user.clone(), item.clone())) == Some(&run) {
         st.runs.remove(&(user, item));
+    }
+}
+
+/// Deletes the files a refused new download had stored, and forgets them,
+/// while `run` still owns the item. Each check and deletion is one step
+/// under the state lock, so a removal and restart in between cannot have
+/// its replacement's file at the same path deleted from under it.
+fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[String]) {
+    for key in keys {
+        let mut st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return;
+        }
+        let _ = std::fs::remove_file(inner.file_path(user, item, key));
+        st.index.remove(key);
     }
 }
 
@@ -3597,6 +3609,35 @@ mod tests {
             !rig.server.asked().iter().any(|k| k == SEG0),
             "fetched on after the plan was lost"
         );
+    }
+
+    /// A refused plan's cleanup deletes only while its run owns the item: a
+    /// replacement run's file at the same path stays.
+    #[tokio::test]
+    async fn a_stale_runs_refusal_cleanup_leaves_the_replacements_files() {
+        let rig = Rig::new("refused-cleanup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let key = SEG0.to_owned();
+        let path = store.stored_file(&key).unwrap().path;
+        let owner = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied();
+        // The run that finished no longer owns the item (its entry is gone),
+        // as after a removal and restart: nothing is deleted.
+        assert!(owner.is_none());
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        assert!(path.exists(), "a stale run deleted the replacement's file");
+        assert!(store.stored_file(&key).is_some(), "and forgot it");
+        // The owning run deletes and forgets.
+        lock(&store.inner.state)
+            .runs
+            .insert(("u1".to_owned(), "1".to_owned()), 999);
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        assert!(!path.exists());
+        assert!(store.stored_file(&key).is_none());
     }
 
     /// A damaged manifest is held the same way.
