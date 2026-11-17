@@ -389,7 +389,13 @@ impl Inner {
                     );
                 }
                 Err(e) => {
-                    let bytes = dir_size(&dir);
+                    // An unreadable folder keeps the figure it had.
+                    let before = st
+                        .tombstones
+                        .iter()
+                        .find(|(d, _)| *d == dir)
+                        .map_or(0, |t| t.1);
+                    let bytes = dir_size(&dir).counted(before);
                     if let Some(t) = st.tombstones.iter_mut().find(|(d, _)| *d == dir) {
                         t.1 = bytes;
                     }
@@ -828,18 +834,64 @@ fn clear_parts(dir: &Path) {
     }
 }
 
-/// Every byte of every file under `dir`, whatever it is.
-fn dir_size(dir: &Path) -> u64 {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return 0;
+/// What a walk of a folder found.
+struct Measured {
+    bytes: u64,
+    /// False when something under it could not be read (anything but being
+    /// gone): the bytes are then a lower bound.
+    exact: bool,
+}
+
+impl Measured {
+    /// The figure to count against the cap: the bytes found, or, when the
+    /// walk was cut short, no less than `floor` (what was known before).
+    fn counted(&self, floor: u64) -> u64 {
+        if self.exact {
+            self.bytes
+        } else {
+            self.bytes.max(floor)
+        }
+    }
+}
+
+/// Every byte of every file under `dir`, whatever it is. A folder that is
+/// gone holds nothing; one that cannot be read is not counted as empty.
+fn dir_size(dir: &Path) -> Measured {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) => {
+            return Measured {
+                bytes: 0,
+                exact: e.kind() == std::io::ErrorKind::NotFound,
+            };
+        }
     };
-    read.filter_map(Result::ok)
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => dir_size(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .fold(0u64, u64::saturating_add)
+    let mut total = Measured {
+        bytes: 0,
+        exact: true,
+    };
+    for entry in read {
+        let part = match entry {
+            Err(_) => Measured {
+                bytes: 0,
+                exact: false,
+            },
+            Ok(e) => match e.metadata() {
+                Ok(m) if m.is_dir() => dir_size(&e.path()),
+                Ok(m) => Measured {
+                    bytes: m.len(),
+                    exact: true,
+                },
+                Err(err) => Measured {
+                    bytes: 0,
+                    exact: err.kind() == std::io::ErrorKind::NotFound,
+                },
+            },
+        };
+        total.bytes = total.bytes.saturating_add(part.bytes);
+        total.exact &= part.exact;
+    }
+    total
 }
 
 /// Bytes of whole files on disk under `dir`, whatever plan they belong to.
@@ -1217,7 +1269,7 @@ impl DiskVideoStore {
                         // No record: a removed download whose folder did
                         // not delete. Try again; what stays still counts.
                         if (inner.env.remove_dir)(&item_dir).is_err() {
-                            tombstones.push((item_dir.clone(), dir_size(&item_dir)));
+                            tombstones.push((item_dir.clone(), dir_size(&item_dir).counted(0)));
                         }
                         continue;
                     }
@@ -1405,7 +1457,9 @@ impl VideoStore for DiskVideoStore {
         if removed.is_err() {
             // The bytes still on disk keep counting against the cap until
             // a later sweep deletes the folder.
-            left = dir_size(&dir);
+            // A folder that cannot be measured counts as much as the
+            // record reserved for it.
+            left = dir_size(&dir).counted(reserved(&record));
             let mut st = lock(&self.inner.state);
             st.tombstones.retain(|(d, _)| *d != dir);
             st.tombstones.push((dir, left));
@@ -1483,10 +1537,17 @@ mod tests {
     thread_local! {
         /// While set, deleting a folder fails (a file in use, say).
         static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// With `FAIL_REMOVE`, the folder is also left unreadable: a plain
+        /// file stands where it was.
+        static LEAVE_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn removing(dir: &Path) -> std::io::Result<()> {
         if FAIL_REMOVE.with(std::cell::Cell::get) {
+            if LEAVE_UNREADABLE.with(std::cell::Cell::get) {
+                let _ = std::fs::remove_dir_all(dir);
+                let _ = std::fs::write(dir, b"x");
+            }
             Err(std::io::Error::other("in use"))
         } else {
             std::fs::remove_dir_all(dir)
@@ -2614,6 +2675,30 @@ mod tests {
         assert!(rig.open().videos("u1").is_empty());
     }
 
+    /// A folder that will not delete and cannot be measured is not counted
+    /// as empty: it keeps the bytes the record reserved, and a later failed
+    /// sweep keeps the figure it had.
+    #[tokio::test]
+    async fn an_unreadable_folder_is_not_counted_as_empty() {
+        let rig = Rig::new("tombstone-unreadable");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let reserved = reserved(&only(&store));
+        assert!(reserved > 0);
+
+        FAIL_REMOVE.with(|f| f.set(true));
+        LEAVE_UNREADABLE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        LEAVE_UNREADABLE.with(|f| f.set(false));
+        assert_eq!(store.kept_bytes(), reserved, "counted as empty");
+
+        // A sweep that fails again over a folder it cannot read keeps it.
+        store.inner.sweep_tombstones();
+        assert_eq!(store.kept_bytes(), reserved, "the sweep forgot the figure");
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
     /// A folder that will not delete keeps counting against the cap, does not
     /// bring the download back, and is deleted by a later sweep.
     #[tokio::test]
@@ -2624,7 +2709,7 @@ mod tests {
         store.settled().await;
         let dir = rig.dir.join("u1").join("1");
         // What stays once the record's manifest is gone: the files.
-        let left = dir_size(&dir.join("files"));
+        let left = dir_size(&dir.join("files")).bytes;
         assert!(left > 0);
 
         FAIL_REMOVE.with(|f| f.set(true));
