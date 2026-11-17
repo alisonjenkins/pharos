@@ -1532,8 +1532,19 @@ fn dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in read {
         let path = entry?.path();
-        if path.is_dir() {
-            out.push(path);
+        // `is_dir` would read a failed lookup as "not a folder" and drop a
+        // folder that may hold downloads. Symlinks are followed, as
+        // `is_dir` did; one that dangles (or an entry that vanished) is
+        // nothing to list.
+        #[cfg(test)]
+        if tests::UNLOOKUPABLE.with(|u| u.borrow().contains(&path)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => out.push(path),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(out)
@@ -1745,6 +1756,11 @@ mod tests {
     thread_local! {
         /// Folders `dir_size` cannot read (a root user cannot be denied).
         pub(super) static UNREADABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// Entries whose metadata lookup fails after they were listed.
+        pub(super) static UNLOOKUPABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
     thread_local! {
@@ -3033,6 +3049,30 @@ mod tests {
             Err(KeepVideoRefusal::Host(_))
         ));
         std::fs::remove_file(&rig.dir).unwrap();
+    }
+
+    /// An entry that listed but whose lookup then fails is not "not a
+    /// folder": its size is unknown and admission is blocked.
+    #[tokio::test]
+    async fn a_folder_whose_metadata_fails_after_listing_blocks_admission() {
+        let rig = Rig::new("entry-metadata");
+        let item = rig.dir.join("u9").join("1");
+        std::fs::create_dir_all(&item).unwrap();
+        // The user folder lists; its entry then cannot be looked up.
+        UNLOOKUPABLE.with(|u| u.borrow_mut().push(item.clone()));
+        let store = rig.open();
+        let held = lines("pharos: video folder unlistable");
+        assert!(
+            held.len() == 1 && held[0].contains("admission=blocked"),
+            "{held:?}"
+        );
+        assert!(store.size_unknown(), "dropped from the listing");
+        UNLOOKUPABLE.with(|u| u.borrow_mut().clear());
+        // A dangling link is nothing to list, not an unknown size.
+        std::fs::remove_dir_all(&item).unwrap();
+        std::os::unix::fs::symlink(rig.dir.join("gone"), &item).unwrap();
+        let store = rig.open();
+        assert!(!store.size_unknown(), "a dangling link blocked admission");
     }
 
     /// A damaged manifest is held the same way.
