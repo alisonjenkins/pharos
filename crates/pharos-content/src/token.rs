@@ -15,10 +15,15 @@ fn err(path: &Path, e: impl std::fmt::Display) -> ContentError {
     }
 }
 
-/// The stored token; `None` when the file is absent or empty.
+/// The stored token; `None` when the file is absent or empty. The app keeps
+/// the signed-in user's id on a second line of the same file: the token is
+/// the first line only.
 pub fn load(path: &Path) -> Result<Option<String>, ContentError> {
     match std::fs::read_to_string(path) {
-        Ok(t) => Ok(Some(t.trim().to_owned()).filter(|t| !t.is_empty())),
+        Ok(t) => {
+            Ok(Some(t.lines().next().unwrap_or_default().trim().to_owned())
+                .filter(|t| !t.is_empty()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(err(path, e)),
     }
@@ -84,6 +89,16 @@ mod tests {
         forget(&p).unwrap();
         forget(&p).unwrap();
         assert_eq!(load(&p).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_token_is_the_first_line_when_the_app_keeps_its_user_there() {
+        let d = dir("two-lines");
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("device-token");
+        std::fs::write(&p, "secret-1\nuser-1\n").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("secret-1"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
