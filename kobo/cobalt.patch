@@ -48,7 +48,7 @@ index 8e3f1bb..ebf319f 100644
          let encoded = reading.write.clone().unwrap();
          reading.store(
 diff --git a/crates/kobo-bookview/src/comic.rs b/crates/kobo-bookview/src/comic.rs
-index c66322c..03b83de 100644
+index c66322c..99a3779 100644
 --- a/crates/kobo-bookview/src/comic.rs
 +++ b/crates/kobo-bookview/src/comic.rs
 @@ -1,7 +1,11 @@
@@ -82,17 +82,20 @@ index c66322c..03b83de 100644
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub enum Outcome {
      Changed,
-@@ -62,6 +77,9 @@ pub struct ComicView {
+@@ -62,6 +77,12 @@ pub struct ComicView {
      /// typed on until the next key.
      jump_refused: Option<String>,
      save_state: SaveState,
 +    /// The reading position last drawn, to stay on while a page is read in.
 +    shown: Option<Memory>,
 +    waiting: Option<Wait>,
++    /// Pages that would not read off the card, left out of reading ahead so
++    /// a bad page is not read again and again. Asking for one again reads it.
++    unreadable: std::collections::BTreeSet<usize>,
  }
  
  impl ComicView {
-@@ -70,7 +88,19 @@ impl ComicView {
+@@ -70,7 +91,19 @@ impl ComicView {
      /// # Errors
      /// Returns the bounded archive admission error.
      pub fn open(context: &mut Context, bytes: Vec<u8>, title: &str) -> Result<Self, ComicError> {
@@ -113,12 +116,13 @@ index c66322c..03b83de 100644
          let title = reader
              .comic()
              .metadata
-@@ -91,9 +121,122 @@ impl ComicView {
+@@ -91,9 +124,131 @@ impl ComicView {
              notice,
              jump_refused: None,
              save_state: SaveState::Saved,
 +            shown: None,
 +            waiting: None,
++            unreadable: std::collections::BTreeSet::new(),
          };
 +        if let Some(Err(error)) = restored {
 +            view.notice = Some(error);
@@ -154,7 +158,9 @@ index c66322c..03b83de 100644
 +        let first = shown.first().copied().unwrap_or(0);
 +        [last + 1, last + 2, first.wrapping_sub(1)]
 +            .into_iter()
-+            .filter(|&page| page < count && !self.reader.holds(page))
++            .filter(|&page| {
++                page < count && !self.reader.holds(page) && !self.unreadable.contains(&page)
++            })
 +            .collect()
 +    }
 +
@@ -166,13 +172,19 @@ index c66322c..03b83de 100644
 +
 +    /// Takes page `index` read off the card. `true` when the screen changed.
 +    pub fn hold_page(&mut self, context: &mut Context, index: usize, bytes: Vec<u8>) -> bool {
++        self.unreadable.remove(&index);
 +        self.reader.hold(index, bytes);
 +        self.resume(context)
 +    }
 +
-+    /// Page `index` would not read off the card. The reader moves on to it
-+    /// anyway, to say so there rather than stay put with no word.
++    /// Page `index` would not read off the card. When the screen waits on
++    /// it, the reader moves on to it anyway, to say so there rather than
++    /// stay put with no word; a page read ahead only stops being read ahead.
 +    pub fn page_unreadable(&mut self, context: &mut Context, index: usize) -> bool {
++        self.unreadable.insert(index);
++        if !self.wanted_pages().contains(&index) {
++            return false;
++        }
 +        let Some(wait) = self.waiting.take() else {
 +            return false;
 +        };
@@ -237,7 +249,7 @@ index c66322c..03b83de 100644
      }
      #[must_use]
      pub const fn reader(&self) -> &Reader {
-@@ -515,7 +658,20 @@ impl ComicView {
+@@ -515,7 +670,20 @@ impl ComicView {
      fn paint(&mut self, context: &mut Context) {
          let target = self.target();
          match self.reader.render(target) {
@@ -258,7 +270,7 @@ index c66322c..03b83de 100644
                  self.picture = put_page(context, PAGE, picture);
                  if self.picture.is_none() {
                      self.notice = Some(
-@@ -524,6 +680,7 @@ impl ComicView {
+@@ -524,6 +692,7 @@ impl ComicView {
                  }
              }
              Err(error) => {
@@ -266,7 +278,7 @@ index c66322c..03b83de 100644
                  self.picture = None;
                  self.notice = Some(error.to_string());
              }
-@@ -678,9 +835,9 @@ impl ComicView {
+@@ -678,9 +847,9 @@ impl ComicView {
                  self.mode = Mode::Page;
              }
              "comic-pages" => {
@@ -279,7 +291,7 @@ index c66322c..03b83de 100644
              }
              "comic-jump" => {
                  self.mode = Mode::Jump;
-@@ -721,12 +878,10 @@ impl ComicView {
+@@ -721,12 +890,10 @@ impl ComicView {
              "comic-thumbs-next"
                  if self.preview_start + self.thumbs() < self.reader.comic().pages.len() =>
              {
@@ -1277,10 +1289,10 @@ index 9875021..815ee8c 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelf_comic.rs b/crates/kobo-bookview/src/shelf_comic.rs
 new file mode 100644
-index 0000000..edb25c1
+index 0000000..3015b86
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelf_comic.rs
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,419 @@
 +//! A comic read off the shelf a page at a time.
 +//!
 +//! A book of page pictures, such as a PDF a server drew for this panel, runs
@@ -1481,10 +1493,19 @@ index 0000000..edb25c1
 +        };
 +        if matches!(step, ComicStep::Failed(_)) {
 +            self.close(context);
-+        } else {
-+            self.kick(context);
++            return step;
 +        }
-+        step
++        let refused = self.kick(context);
++        // A page refused before it was read changes the screen too, and the
++        // first such change is the book opening.
++        match (&mut self.state, step) {
++            (State::Open(open), ComicStep::Busy) if !open.shown && !open.view.is_waiting() => {
++                open.shown = true;
++                ComicStep::Opened
++            }
++            (State::Open(open), ComicStep::Busy) if refused && open.shown => ComicStep::Changed,
++            (_, step) => step,
++        }
 +    }
 +
 +    fn opening(
@@ -1626,39 +1647,49 @@ index 0000000..edb25c1
 +    }
 +
 +    /// Asks for the next page wanted, when no read is out: the ones the
-+    /// screen is waiting for first, then those either side of it.
-+    fn kick(&mut self, context: &mut Context) {
++    /// screen is waiting for first, then those either side of it. A page
++    /// that cannot be read is refused at once and the next one tried;
++    /// `true` when such a refusal changed the screen.
++    fn kick(&mut self, context: &mut Context) -> bool {
++        let mut changed = false;
 +        if self.asked.is_some() {
-+            return;
++            return changed;
 +        }
 +        let State::Open(open) = &mut self.state else {
-+            return;
++            return changed;
 +        };
 +        if open.reading.is_some() {
-+            return;
++            return changed;
 +        }
-+        let next = open
-+            .view
-+            .wanted_pages()
-+            .first()
-+            .copied()
-+            .or_else(|| open.view.pages_ahead().first().copied());
-+        let Some(page) = next else {
-+            return;
-+        };
-+        let Some(place) = open.places.get(page).copied() else {
-+            open.view.page_unreadable(context, page);
-+            return;
-+        };
-+        if place.end.saturating_sub(place.at) > MAX_PICTURE_SPAN {
-+            open.view.page_unreadable(context, page);
-+            return;
++        // Each refusal takes a page out of the running, so this ends; the
++        // bound is a guard, not the expected way out.
++        for _ in 0..=open.places.len() {
++            let next = open
++                .view
++                .wanted_pages()
++                .first()
++                .copied()
++                .or_else(|| open.view.pages_ahead().first().copied());
++            let Some(page) = next else {
++                return changed;
++            };
++            let place = open
++                .places
++                .get(page)
++                .copied()
++                .filter(|place| place.end.saturating_sub(place.at) <= MAX_PICTURE_SPAN);
++            let Some(place) = place else {
++                changed |= open.view.page_unreadable(context, page);
++                continue;
++            };
++            let span = Span::new(place.at, place.end);
++            let read = span.request();
++            let blob = open.blob.clone();
++            open.reading = Some((page, place, span));
++            self.ask(context, &blob, read);
++            return changed;
 +        }
-+        let span = Span::new(place.at, place.end);
-+        let read = span.request();
-+        let blob = open.blob.clone();
-+        open.reading = Some((page, place, span));
-+        self.ask(context, &blob, read);
++        changed
 +    }
 +}
 +
@@ -1683,10 +1714,10 @@ index 0000000..edb25c1
 +mod tests;
 diff --git a/crates/kobo-bookview/src/shelf_comic_tests.rs b/crates/kobo-bookview/src/shelf_comic_tests.rs
 new file mode 100644
-index 0000000..b718844
+index 0000000..9b9ff0b
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelf_comic_tests.rs
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,302 @@
 +use super::*;
 +use kobo_sdk::{action_id, Command, StoreRequest};
 +
@@ -1720,6 +1751,17 @@ index 0000000..b718844
 +    context: &mut Context,
 +    book: &[u8],
 +) -> (Vec<ComicStep>, Vec<(u32, u32)>) {
++    answer_refusing(comic, context, book, |_| false)
++}
++
++/// As [`answer`], but a read starting at an offset `refused` picks is
++/// denied, as a failing card would.
++fn answer_refusing(
++    comic: &mut ShelfComic,
++    context: &mut Context,
++    book: &[u8],
++    refused: impl Fn(u32) -> bool,
++) -> (Vec<ComicStep>, Vec<(u32, u32)>) {
 +    let size = u32::try_from(book.len()).expect("a test book");
 +    let (mut steps, mut reads) = (Vec::new(), Vec::new());
 +    for _ in 0..10_000 {
@@ -1738,11 +1780,15 @@ index 0000000..b718844
 +            reads.push((offset, length));
 +            let from = (offset as usize).min(book.len());
 +            let to = (from + length as usize).min(book.len());
-+            let result = StoreResult::ShelfRead {
-+                name: name.clone(),
-+                offset,
-+                bytes: book[from..to].to_vec(),
-+                size,
++            let result = if refused(offset) {
++                StoreResult::Denied(kobo_sdk::StoreError::Missing)
++            } else {
++                StoreResult::ShelfRead {
++                    name: name.clone(),
++                    offset,
++                    bytes: book[from..to].to_vec(),
++                    size,
++                }
 +            };
 +            match comic.shelf(context, &name, &result) {
 +                ComicStep::Busy => {}
@@ -1891,6 +1937,88 @@ index 0000000..b718844
 +        steps,
 +        vec![ComicStep::Failed(ComicError::Empty.to_string())]
 +    );
++}
++
++/// Where page `index` of the open comic starts in its file.
++fn page_at(comic: &ShelfComic, index: usize) -> u32 {
++    match &comic.state {
++        State::Open(open) => u32::try_from(open.places[index].at).expect("a test book"),
++        _ => panic!("not open"),
++    }
++}
++
++#[test]
++fn a_page_read_ahead_that_fails_is_not_read_again_and_again() {
++    let book = a_page_book();
++    let mut context = Context::default();
++    let mut comic = ShelfComic::new();
++    comic.open(&mut context, "book", "Pages", None);
++    answer(&mut comic, &mut context, &book);
++    // The comic is open; now fail every read of page 2 and count them.
++    let page_two = page_at(&comic, 1);
++    comic.close(&mut context);
++    comic.open(&mut context, "book", "Pages", None);
++    let (steps, reads) =
++        answer_refusing(&mut comic, &mut context, &book, |offset| offset == page_two);
++    assert_eq!(steps, vec![ComicStep::Opened]);
++    assert_eq!(
++        reads
++            .iter()
++            .filter(|(offset, _)| *offset == page_two)
++            .count(),
++        1,
++        "page 2 was read once and then left alone"
++    );
++}
++
++#[test]
++fn a_read_ahead_failing_leaves_a_jump_waiting_for_its_page() {
++    let book = a_page_book();
++    let mut context = Context::default();
++    let mut comic = ShelfComic::new();
++    comic.open(&mut context, "book", "Pages", None);
++    answer(&mut comic, &mut context, &book);
++    comic.act(&mut context, action_id("comic-controls"));
++    comic.act(&mut context, action_id("comic-jump"));
++    for digit in ["3", "0"] {
++        comic.act(&mut context, action_id(&format!("comic-digit-{digit}")));
++    }
++    comic.act(&mut context, action_id("comic-go"));
++
++    let State::Open(open) = &mut comic.state else {
++        panic!("not open");
++    };
++    assert!(
++        !open.view.page_unreadable(&mut context, 5),
++        "the screen stays"
++    );
++    assert!(open.view.is_waiting(), "and still waits for page 30");
++    assert_eq!(page(&comic), 0);
++}
++
++#[test]
++fn a_first_page_too_big_to_read_opens_the_book_to_say_so() {
++    let mut huge = kobo_image::encode_png_grey(30, 40, &[0; 30 * 40]).expect("a png");
++    huge.resize(MAX_PICTURE_SPAN + 1, 0);
++    let book = zip::stored(&[
++        ("page-0001.png".to_owned(), huge),
++        (
++            "page-0002.png".to_owned(),
++            kobo_image::encode_png_grey(30, 40, &[0; 30 * 40]).expect("a png"),
++        ),
++    ])
++    .expect("a page book");
++    let mut context = Context::default();
++    let mut comic = ShelfComic::new();
++    comic.open(&mut context, "book", "Pages", None);
++
++    let (steps, _) = answer(&mut comic, &mut context, &book);
++
++    assert_eq!(steps, vec![ComicStep::Opened], "it does not hang opening");
++    let State::Open(open) = &comic.state else {
++        panic!("not open");
++    };
++    assert!(!open.view.is_waiting());
 +}
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
