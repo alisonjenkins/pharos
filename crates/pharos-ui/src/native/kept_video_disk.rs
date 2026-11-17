@@ -166,6 +166,10 @@ struct State {
     /// whether those are known is derived (`State::unknown_reason`) from
     /// the facts below, never stored as a mark that has to be cleared.
     unmeasured: Vec<(PathBuf, String)>,
+    /// Folders (the root, a user's) that could not be listed at open: a sweep
+    /// lists them again, and their block lifts only once the listing succeeds
+    /// and everything found is counted.
+    relist: Vec<PathBuf>,
     /// Folders a `remove` is working on right now. A sweep leaves them
     /// alone, and while one is listed its folder is of unknown size.
     removing: Vec<PathBuf>,
@@ -1421,27 +1425,153 @@ fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
     }
 }
 
-/// A folder whose record cannot be read is left alone, never deleted. Its
-/// bytes (as far as they can be read) count against the cap, and since the
-/// record's own reservation is lost, nothing is admitted while it stays.
-fn hold_folder(
-    dir: &Path,
-    why: &str,
-    held: &mut Vec<(PathBuf, u64)>,
-    unmeasured: &mut Vec<(PathBuf, String)>,
-) {
-    let m = dir_size(dir);
-    emit(
-        true,
-        format!(
-            "pharos: video folder held dir={} reason={why} bytes={} exact={} admission=blocked",
-            dir.display(),
-            m.bytes,
-            m.exact
-        ),
-    );
-    held.push((dir.to_path_buf(), m.bytes));
-    unmeasured.push((dir.to_path_buf(), why.to_owned()));
+/// What one folder under a user's folder turned out to be.
+enum Scanned {
+    /// A readable record, adopted.
+    Record(Box<Adopted>),
+    /// A record that cannot be read: left alone, never deleted. Its bytes (as
+    /// far as they can be read) count against the cap, and since the
+    /// record's own reservation is lost, nothing is admitted while it stays.
+    Held { why: String, m: Measured },
+    /// No record, a removed download, and the folder would not delete.
+    Tombstone {
+        bytes: u64,
+        exact: bool,
+        error: String,
+    },
+    /// Nothing left to count.
+    Removed,
+}
+
+fn scan_item(env: &Env, item_dir: &Path) -> Scanned {
+    match read_held(item_dir) {
+        HeldNow::Readable(record) => Scanned::Record(Box::new(adopt(item_dir, *record))),
+        HeldNow::Gone => Scanned::Removed,
+        HeldNow::Still(why) => Scanned::Held {
+            why,
+            m: dir_size(item_dir),
+        },
+        // No record: a removed download whose folder did not delete. Try
+        // again; what stays still counts.
+        HeldNow::NoRecord => match (env.remove_dir)(item_dir) {
+            Ok(()) => Scanned::Removed,
+            Err(e) => {
+                // The figure from before the restart is gone: what is
+                // measured now is all that counts, and a folder not seen
+                // whole blocks admission.
+                let m = dir_size(item_dir);
+                Scanned::Tombstone {
+                    bytes: m.bytes,
+                    exact: m.exact,
+                    error: e.to_string(),
+                }
+            }
+        },
+    }
+}
+
+/// What listing the store found.
+#[derive(Default)]
+struct Listing {
+    items: Vec<(PathBuf, Scanned)>,
+    /// Folders that could not be listed, and why.
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// Lists `dir` (the root, with `users`, or a user's folder) and scans every
+/// item folder under it that `skip` does not name.
+fn scan_tree(env: &Env, dir: &Path, users: bool, skip: &dyn Fn(&Path) -> bool, out: &mut Listing) {
+    match dirs(dir) {
+        Err(e) => out.failed.push((dir.to_path_buf(), e.to_string())),
+        Ok(children) => {
+            for child in children {
+                if users {
+                    scan_tree(env, &child, false, skip, out);
+                } else if !skip(&child) {
+                    let scanned = scan_item(env, &child);
+                    out.items.push((child, scanned));
+                }
+            }
+        }
+    }
+}
+
+impl State {
+    /// Whether `dir` is a folder this state already accounts for.
+    fn knows(&self, dir: &Path) -> bool {
+        self.held.iter().any(|(d, _)| d == dir)
+            || self.tombstones.iter().any(|(d, _)| d == dir)
+            || self
+                .list
+                .iter()
+                .any(|v| self.dir_of(&v.user, &v.item) == *dir)
+    }
+
+    /// Takes what a scan found into the state.
+    fn apply_scanned(&mut self, dir: &Path, scanned: Scanned) {
+        match scanned {
+            Scanned::Record(a) => {
+                if a.leftover {
+                    self.leftover.push(dir.to_path_buf());
+                }
+                self.index.extend(a.index);
+                self.list.push(a.record);
+            }
+            Scanned::Held { why, m } => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video folder held dir={} reason={why} bytes={} exact={} admission=blocked",
+                        dir.display(),
+                        m.bytes,
+                        m.exact
+                    ),
+                );
+                self.held.push((dir.to_path_buf(), m.bytes));
+                self.unmeasured.push((dir.to_path_buf(), why));
+            }
+            Scanned::Tombstone {
+                bytes,
+                exact,
+                error,
+            } => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep tombstone dir={} bytes={bytes} exact={exact} error={error}",
+                        dir.display()
+                    ),
+                );
+                self.measured.insert(dir.to_path_buf(), (0, exact));
+                self.tombstones.push((dir.to_path_buf(), bytes));
+            }
+            Scanned::Removed => {}
+        }
+    }
+
+    /// A folder that cannot be listed hides downloads that may be there, so
+    /// its size is unknown and nothing is admitted while it stays. Logged
+    /// when first found, not at every retry.
+    fn note_unlistable(&mut self, dir: &Path, error: &str) {
+        let reason = format!("cannot be listed: {error}");
+        if self.relist.iter().any(|d| d == dir) {
+            for (d, w) in &mut self.unmeasured {
+                if d == dir {
+                    w.clone_from(&reason);
+                }
+            }
+            return;
+        }
+        emit(
+            true,
+            format!(
+                "pharos: video folder unlistable dir={} error={error} admission=blocked",
+                dir.display()
+            ),
+        );
+        self.relist.push(dir.to_path_buf());
+        self.unmeasured.push((dir.to_path_buf(), reason));
+    }
 }
 
 /// What a walk of a folder found.
@@ -2078,6 +2208,55 @@ impl Inner {
             self.apply_held(&dir, now);
             lock(&self.state).deleting.retain(|d| *d != dir);
         }
+        self.sweep_relist();
+    }
+
+    /// Lists again the folders that could not be listed at open, and scans
+    /// what turns up: a record is adopted, an unreadable one held, a removed
+    /// download's folder deleted or tombstoned. The block on a folder lifts
+    /// only once its listing succeeds, with everything found counted.
+    fn sweep_relist(self: &Arc<Self>) {
+        let dirs: Vec<PathBuf> = lock(&self.state).relist.clone();
+        for dir in dirs {
+            let mut found = Listing::default();
+            let known = |p: &Path| lock(&self.state).knows(p);
+            scan_tree(&self.env, &dir, dir == self.root, &known, &mut found);
+            let mut resume = Vec::new();
+            let mut st = lock(&self.state);
+            for (d, scanned) in found.items {
+                if st.knows(&d) {
+                    continue;
+                }
+                if let Scanned::Record(a) = &scanned {
+                    if !interrupted(std::slice::from_ref(&a.record)).is_empty() {
+                        resume.push((a.record.user.clone(), a.record.item.clone()));
+                    }
+                }
+                st.apply_scanned(&d, scanned);
+            }
+            st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+            let still = found.failed.iter().any(|(d, _)| *d == dir);
+            for (d, e) in &found.failed {
+                st.note_unlistable(d, e);
+            }
+            if !still {
+                st.relist.retain(|d| *d != dir);
+                st.unmeasured.retain(|(d, _)| *d != dir);
+            }
+            drop(st);
+            emit(
+                false,
+                format!(
+                    "pharos: video folder relisted dir={} listed={} resume={}",
+                    dir.display(),
+                    !still,
+                    resume.len()
+                ),
+            );
+            for (user, item) in resume {
+                self.spawn_run(user, item);
+            }
+        }
     }
 
     /// Applies what [`read_held`] found for a claimed `dir`.
@@ -2102,20 +2281,15 @@ impl Inner {
                     return;
                 }
                 let adopted = adopt(dir, *record);
+                let (user, item) = (adopted.record.user.clone(), adopted.record.item.clone());
+                let resume = !interrupted(std::slice::from_ref(&adopted.record)).is_empty();
                 let mut st = lock(&self.state);
-                if !st.held.iter().any(|(d, _)| d == dir)
-                    || find(&st.list, &adopted.record.user, &adopted.record.item).is_some()
+                if !st.held.iter().any(|(d, _)| d == dir) || find(&st.list, &user, &item).is_some()
                 {
                     return;
                 }
                 release(&mut st);
-                st.index.extend(adopted.index);
-                if adopted.leftover {
-                    st.leftover.push(dir.to_path_buf());
-                }
-                let (user, item) = (adopted.record.user.clone(), adopted.record.item.clone());
-                let resume = !interrupted(std::slice::from_ref(&adopted.record)).is_empty();
-                st.list.push(adopted.record);
+                st.apply_scanned(dir, Scanned::Record(Box::new(adopted)));
                 st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
                 drop(st);
                 verdict("released", "record readable");
@@ -2249,85 +2423,19 @@ impl DiskVideoStore {
             #[cfg(test)]
             tasks: Mutex::new(Vec::new()),
         });
-        let mut list = Vec::new();
-        let mut index = HashMap::new();
-        let mut tombstones: Vec<(PathBuf, u64)> = Vec::new();
-        let mut held: Vec<(PathBuf, u64)> = Vec::new();
-        let mut unmeasured: Vec<(PathBuf, String)> = Vec::new();
-        let mut measured: HashMap<PathBuf, (u64, bool)> = HashMap::new();
-        let mut leftover: Vec<PathBuf> = Vec::new();
-        for user_dir in list_dirs(&inner.root, &mut unmeasured) {
-            for item_dir in list_dirs(&user_dir, &mut unmeasured) {
-                let manifest = item_dir.join("manifest.json");
-                let record = match std::fs::read(&manifest) {
-                    Ok(bytes) => match serde_json::from_slice::<KeptVideo>(&bytes) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            hold_folder(
-                                &item_dir,
-                                &format!("record damaged: {e}"),
-                                &mut held,
-                                &mut unmeasured,
-                            );
-                            continue;
-                        }
-                    },
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        // A record that is there but cannot be read (a
-                        // permissions fault, say) is not a removed one:
-                        // its folder is left alone, not deleted.
-                        hold_folder(
-                            &item_dir,
-                            &format!("record unreadable: {e}"),
-                            &mut held,
-                            &mut unmeasured,
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        // No record: a removed download whose folder did
-                        // not delete. Try again; what stays still counts.
-                        if let Err(e) = (inner.env.remove_dir)(&item_dir) {
-                            // The figure from before the restart is gone:
-                            // what is measured now is all that counts, and
-                            // a folder not seen whole blocks admission.
-                            let m = dir_size(&item_dir);
-                            emit(
-                                true,
-                                format!(
-                                    "pharos: video keep tombstone dir={} bytes={} exact={} error={e}",
-                                    item_dir.display(),
-                                    m.bytes,
-                                    m.exact
-                                ),
-                            );
-                            measured.insert(item_dir.clone(), (0, m.exact));
-                            tombstones.push((item_dir.clone(), m.bytes));
-                        }
-                        continue;
-                    }
-                };
-                let adopted = adopt(&item_dir, record);
-                if adopted.leftover {
-                    leftover.push(item_dir.clone());
-                }
-                index.extend(adopted.index);
-                list.push(adopted.record);
-            }
+        let mut st = State::default();
+        st.root.clone_from(&inner.root);
+        let mut found = Listing::default();
+        scan_tree(&inner.env, &inner.root, true, &|_| false, &mut found);
+        for (dir, scanned) in found.items {
+            st.apply_scanned(&dir, scanned);
         }
-        list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
-        let restart = interrupted(&list);
-        {
-            let mut st = lock(&inner.state);
-            st.list = list;
-            st.index = index;
-            st.tombstones = tombstones;
-            st.held = held;
-            st.unmeasured = unmeasured;
-            st.measured = measured;
-            st.leftover = leftover;
-            st.root.clone_from(&inner.root);
+        for (dir, error) in found.failed {
+            st.note_unlistable(&dir, &error);
         }
+        st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+        let restart = interrupted(&st.list);
+        *lock(&inner.state) = st;
         emit(
             false,
             format!(
@@ -2375,23 +2483,6 @@ impl DiskVideoStore {
             }
         }
     }
-}
-
-/// [`dirs`] for `open`: a folder that cannot be listed hides downloads that
-/// may be there, so its size is unknown and nothing is admitted while it
-/// stays.
-fn list_dirs(dir: &Path, unmeasured: &mut Vec<(PathBuf, String)>) -> Vec<PathBuf> {
-    dirs(dir).unwrap_or_else(|e| {
-        emit(
-            true,
-            format!(
-                "pharos: video folder unlistable dir={} error={e} admission=blocked",
-                dir.display()
-            ),
-        );
-        unmeasured.push((dir.to_path_buf(), format!("cannot be listed: {e}")));
-        Vec::new()
-    })
 }
 
 /// The folders directly under `dir`. A folder that is not there lists
@@ -5132,6 +5223,47 @@ mod tests {
         assert!(manifest.exists(), "a readable download was deleted");
         assert_eq!(store.videos("u1").len(), 1);
         assert!(!store.size_unknown());
+    }
+
+    /// A root or user folder that cannot be listed at open blocks admission
+    /// and is listed again by a sweep: what turns up is counted, and the
+    /// block lifts only once the listing succeeds.
+    #[tokio::test]
+    async fn a_listing_that_failed_at_open_is_retried_and_what_it_hides_is_counted() {
+        for at_root in [true, false] {
+            let rig = Rig::new("relist");
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            drop(store);
+            let failing = if at_root {
+                rig.dir.clone()
+            } else {
+                rig.dir.join("u1")
+            };
+            UNREADABLE.with(|u| u.borrow_mut().push(failing.clone()));
+            let store = rig.open();
+            assert!(store.size_unknown(), "at_root={at_root}: not blocked");
+            assert!(store.videos("u1").is_empty());
+            assert!(matches!(
+                store.start(request("2")),
+                Err(KeepVideoRefusal::Host(_))
+            ));
+            // Still failing: a sweep keeps the block.
+            store.videos("u1");
+            assert!(
+                store.size_unknown(),
+                "lifted with the listing still failing"
+            );
+            UNREADABLE.with(|u| u.borrow_mut().clear());
+            let listed = store.videos("u1");
+            assert_eq!(listed.len(), 1, "at_root={at_root}: the download is hidden");
+            assert!(!store.size_unknown(), "at_root={at_root}: still blocked");
+            assert!(store.kept_bytes() > 0, "the found download is not counted");
+            assert!(store.stored_file("u1", SEG0).is_some());
+            store.start(request("2")).unwrap();
+            store.settled().await;
+        }
     }
 
     /// A restart while a removed download's folder will not delete and
