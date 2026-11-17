@@ -1948,12 +1948,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da8a6b90513bfc04aa5360e5278e0582b98c30460b1ea64b7d5d4971f449cd5f"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
 name = "capnp-futures"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3a1724aec0e9587f267bf19708934afa545113a44f20acac4b3db9a92857056"
 dependencies = [
- "capnp",
+ "capnp 0.27.3",
  "futures-channel",
  "futures-util",
 ]
@@ -1964,18 +1973,18 @@ version = "0.27.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78cc13745b71c62d9756537969000a394d559a55794e123f5fb955813d748d44"
 dependencies = [
- "capnp",
+ "capnp 0.27.3",
  "capnp-futures",
  "futures",
 ]
 
 [[package]]
 name = "capnpc"
-version = "0.27.0"
+version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82ca16312ddb64529d31c8dc46148671c22e57b80134fa5f17811ad5a6a79492"
+checksum = "46e419b5984a8843f3192d7ffa6d51745a872081bbcca7a476e1da4aede7044e"
 dependencies = [
- "capnp",
+ "capnp 0.28.0",
 ]
 
 [[package]]
@@ -8227,7 +8236,7 @@ dependencies = [
 name = "pharos-api"
 version = "0.0.0"
 dependencies = [
- "capnp",
+ "capnp 0.27.3",
  "capnp-rpc",
  "capnpc",
  "metrics",
@@ -8296,7 +8305,7 @@ version = "0.0.0"
 name = "pharos-client"
 version = "0.0.0"
 dependencies = [
- "capnp",
+ "capnp 0.27.3",
  "capnp-rpc",
  "futures",
  "js-sys",
@@ -8311,7 +8320,7 @@ dependencies = [
 name = "pharos-content"
 version = "0.0.0"
 dependencies = [
- "capnp",
+ "capnp 0.27.3",
  "futures",
  "httparse",
  "libc",
@@ -8456,7 +8465,7 @@ dependencies = [
  "argon2",
  "awc",
  "base64 0.23.1",
- "capnp",
+ "capnp 0.27.3",
  "capnp-rpc",
  "clap",
  "futures-util",
@@ -8637,7 +8646,7 @@ name = "pharos-ui"
 version = "0.0.0"
 dependencies = [
  "android_logger",
- "capnp",
+ "capnp 0.27.3",
  "dioxus",
  "dioxus-ssr",
  "dioxus-web",
