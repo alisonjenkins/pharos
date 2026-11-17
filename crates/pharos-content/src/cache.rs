@@ -1235,6 +1235,7 @@ mod tests {
             unknown: u.load(Ordering::SeqCst),
             ..OutsideBytes::default()
         }));
+        crate::testlog::start();
         assert_eq!(c.ensure_free("track/x", 10), Err(0), "admitted");
         let lines = crate::testlog::lines();
         assert!(
