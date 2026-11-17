@@ -77,6 +77,52 @@ pub enum RequestError {
     TextTooLong,
     #[error("path escapes the media root")]
     Escapes,
+    #[error("stages must be a boolean")]
+    StagesNotBool,
+}
+
+/// Optional `/align` fields beyond the Python service's (spec 040 FR-002a):
+/// a caller that only wants scores, such as the subtitle check, names the
+/// audio stream to hear and turns the refine stages off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SongOptions {
+    /// `audio_stream`: the absolute stream index to decode; ffmpeg's pick
+    /// when absent.
+    pub audio_stream: Option<u32>,
+    /// `stages`: run the refine stages (plan 042) after today's pass, when
+    /// the service has them. Default `true`.
+    pub stages: bool,
+}
+
+impl Default for SongOptions {
+    fn default() -> Self {
+        Self {
+            audio_stream: None,
+            stages: true,
+        }
+    }
+}
+
+/// The [`SongOptions`] of an `/align` body already accepted by [`parse_request`].
+pub fn parse_options(body: &Value) -> Result<SongOptions, RequestError> {
+    let mut out = SongOptions::default();
+    let Some(body) = body.as_object() else {
+        return Err(RequestError::NotObject);
+    };
+    match body.get("audio_stream") {
+        None | Some(Value::Null) => {}
+        Some(v) => {
+            let i = int_field(v, "audio_stream")?;
+            out.audio_stream =
+                Some(u32::try_from(i).map_err(|_| RequestError::Negative("audio_stream"))?);
+        }
+    }
+    match body.get("stages") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(b)) => out.stages = *b,
+        Some(_) => return Err(RequestError::StagesNotBool),
+    }
+    Ok(out)
 }
 
 /// Audio `(start_ms, end_ms)` to decode for `line`, which has `n_words` words.
@@ -279,6 +325,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn options_name_a_stream_and_turn_the_stages_off() {
+        let body = |extra: serde_json::Value| {
+            let mut b = serde_json::json!({"path": "a.mkv", "lines": []});
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            b
+        };
+        let got = parse_options(&body(
+            serde_json::json!({"audio_stream": 2, "stages": false}),
+        ));
+        assert_eq!(
+            got.unwrap(),
+            SongOptions {
+                audio_stream: Some(2),
+                stages: false
+            }
+        );
+        let err = |extra| parse_options(&body(extra)).unwrap_err().to_string();
+        assert_eq!(
+            err(serde_json::json!({"audio_stream": -1})),
+            "audio_stream cannot be negative"
+        );
+        assert_eq!(
+            err(serde_json::json!({"audio_stream": "1"})),
+            "audio_stream must be an integer"
+        );
+        assert_eq!(
+            err(serde_json::json!({"stages": "no"})),
+            "stages must be a boolean"
+        );
+    }
+
     /// Lines at the limit go through the line window and the offset probe
     /// without overflowing; test builds panic on overflow.
     #[test]
@@ -290,6 +370,7 @@ mod tests {
             {"start_ms": max - 1_000, "end_ms": max, "text": "seven eight nine"},
         ]});
         let (_, lines) = parse_request(&body).unwrap();
+        assert_eq!(parse_options(&body).unwrap(), SongOptions::default());
         let (start, end) = window(&lines[2], 3, lines[1].end_ms);
         assert!(start < end && end > max, "{start}..{end}");
         let mut decoded = Vec::new();
