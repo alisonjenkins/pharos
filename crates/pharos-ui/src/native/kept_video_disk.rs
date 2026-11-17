@@ -129,10 +129,11 @@ struct State {
     /// download is told apart from the one still running by this number.
     runs: HashMap<(String, String), u64>,
     next_run: u64,
-    /// Bytes each download has written to staging files not yet whole: on
-    /// disk already, so the free space lacks them, but not yet in the
-    /// record's stored bytes.
-    staged: HashMap<(String, String), u64>,
+    /// Bytes each run of a download has written to staging files not yet
+    /// whole: on disk already, so the free space lacks them, but not yet in
+    /// the record's stored bytes. Keyed by run: an old run still draining
+    /// after a restart stages bytes the new run's estimate never covered.
+    staged: HashMap<(String, String, u64), u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -296,10 +297,16 @@ impl State {
             .filter(|v| !(v.user == user && v.item == item))
             .filter_map(|v| match v.state {
                 KeptState::Downloading { bytes, .. } => {
+                    // Only the run that owns the record: its estimate is
+                    // what these bytes are taken from.
                     let staged = self
-                        .staged
+                        .runs
                         .get(&(v.user.clone(), v.item.clone()))
-                        .copied()
+                        .and_then(|run| {
+                            self.staged
+                                .get(&(v.user.clone(), v.item.clone(), *run))
+                                .copied()
+                        })
                         .unwrap_or(0);
                     Some(
                         v.estimated_bytes
@@ -316,7 +323,7 @@ impl State {
 /// the file is whole, promoted or dropped.
 struct Staged<'a> {
     inner: &'a Inner,
-    who: (String, String),
+    who: (String, String, u64),
     len: u64,
 }
 
@@ -732,7 +739,7 @@ async fn fetch_once(
     let mut len = 0u64;
     let mut staged = Staged {
         inner,
-        who: (user.to_owned(), item.to_owned()),
+        who: (user.to_owned(), item.to_owned(), run),
         len: 0,
     };
     loop {
@@ -2241,6 +2248,40 @@ mod tests {
             locked.load(Ordering::SeqCst) >= 1,
             "free was read outside the owed read"
         );
+    }
+
+    /// An old run still draining after a restart stages bytes the new
+    /// run's estimate does not cover: they do not reduce what is owed.
+    #[tokio::test]
+    async fn a_stale_runs_staged_bytes_do_not_reduce_what_is_owed() {
+        let rig = Rig::new("stale-staged");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let owed = store.outstanding_bytes();
+        let run = lock(&store.inner.state).runs[&("u1".to_owned(), "1".to_owned())];
+        let mut stale = Staged {
+            inner: &store.inner,
+            who: ("u1".to_owned(), "1".to_owned(), run + 1_000),
+            len: 0,
+        };
+        stale.add(7_000);
+        assert_eq!(store.staged_bytes(), 7_050);
+        assert_eq!(
+            store.outstanding_bytes(),
+            owed,
+            "counted the old run's bytes"
+        );
+        drop(stale);
+        assert_eq!(store.staged_bytes(), 50);
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
     }
 
     /// Free space is shared too: a second download must leave the guard free
