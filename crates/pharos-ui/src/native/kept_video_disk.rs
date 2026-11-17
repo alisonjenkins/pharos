@@ -1676,8 +1676,18 @@ impl VideoStore for DiskVideoStore {
             // a later sweep deletes the folder.
             // A folder that cannot be measured counts as much as the
             // record reserved for it.
-            left = dir_size(&dir).counted(reserved(&record));
+            let measured = dir_size(&dir);
+            left = measured.counted(reserved(&record));
             let mut st = lock(&self.inner.state);
+            // A folder not read whole is of unknown size from now, not
+            // from the next sweep: nothing is admitted meanwhile.
+            st.unmeasured.retain(|(d, _)| *d != dir);
+            if !measured.exact {
+                st.unmeasured.push((
+                    dir.clone(),
+                    "removed download's folder not deleted, not fully readable".to_owned(),
+                ));
+            }
             st.tombstones.retain(|(d, _)| *d != dir);
             st.tombstones.push((dir, left));
         }
@@ -3138,6 +3148,28 @@ mod tests {
         HOLD_WRITE.with(|h| h.set(false));
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// A removal whose folder will not delete and cannot be measured whole
+    /// marks the size unknown at once, not at the next sweep.
+    #[tokio::test]
+    async fn a_removal_that_cannot_measure_the_folder_blocks_admission_at_once() {
+        let rig = Rig::new("remove-unmeasured");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.remove("u1", "1");
+        // Straight after, before any sweep.
+        assert!(store.size_unknown(), "known until the next sweep");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        FAIL_REMOVE.with(|f| f.set(false));
     }
 
     /// A damaged manifest is held the same way.
