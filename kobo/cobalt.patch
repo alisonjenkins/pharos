@@ -1289,10 +1289,10 @@ index 9875021..815ee8c 100644
              .iter()
 diff --git a/crates/kobo-bookview/src/shelf_comic.rs b/crates/kobo-bookview/src/shelf_comic.rs
 new file mode 100644
-index 0000000..3015b86
+index 0000000..f164033
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelf_comic.rs
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,431 @@
 +//! A comic read off the shelf a page at a time.
 +//!
 +//! A book of page pictures, such as a PDF a server drew for this panel, runs
@@ -1338,7 +1338,12 @@ index 0000000..3015b86
 +enum Stage {
 +    Head,
 +    Tail,
-+    Directory { tail: Vec<u8> },
++    /// The page list, read by its own length; the tail read before it is
++    /// kept at its own place.
++    Directory {
++        tail: Vec<u8>,
++        tail_at: usize,
++    },
 +}
 +
 +#[derive(Debug)]
@@ -1554,18 +1559,25 @@ index 0000000..3015b86
 +                Ok((_, len)) if len > MAX_DIRECTORY => {
 +                    return ComicStep::Failed(format!("its page list is {len} bytes"))
 +                }
-+                Ok((directory, _)) if directory >= at => {
++                Ok((directory, len)) if directory >= at || len == 0 => {
 +                    opening.pieces.insert(at, bytes);
 +                    None
 +                }
-+                // One part from the directory to the end, so no entry
-+                // straddles two reads.
-+                Ok((directory, _)) => Some((Stage::Directory { tail: bytes }, directory, at)),
++                // Only the page list's own bytes: a list said to start far
++                // before the tail must not pull the whole file in. A list
++                // that runs into the tail joins it when the two are kept.
++                Ok((directory, len)) => Some((
++                    Stage::Directory {
++                        tail: bytes,
++                        tail_at: at,
++                    },
++                    directory,
++                    directory.saturating_add(len).min(at),
++                )),
 +            },
-+            Stage::Directory { tail } => {
-+                let mut part = bytes;
-+                part.extend_from_slice(&tail);
-+                opening.pieces.insert(at, part);
++            Stage::Directory { tail, tail_at } => {
++                opening.pieces.insert(at, bytes);
++                opening.pieces.insert(tail_at, tail);
 +                None
 +            }
 +        };
@@ -1714,10 +1726,10 @@ index 0000000..3015b86
 +mod tests;
 diff --git a/crates/kobo-bookview/src/shelf_comic_tests.rs b/crates/kobo-bookview/src/shelf_comic_tests.rs
 new file mode 100644
-index 0000000..9b9ff0b
+index 0000000..7f0fdc5
 --- /dev/null
 +++ b/crates/kobo-bookview/src/shelf_comic_tests.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,330 @@
 +use super::*;
 +use kobo_sdk::{action_id, Command, StoreRequest};
 +
@@ -2019,6 +2031,34 @@ index 0000000..9b9ff0b
 +        panic!("not open");
 +    };
 +    assert!(!open.view.is_waiting());
++}
++
++#[test]
++fn a_page_list_said_to_start_far_back_is_read_by_its_own_length() {
++    let mut book = a_page_book();
++    // Point the end record's page list at the start of the file, as a
++    // damaged archive might, keeping its stated length.
++    let end = book
++        .windows(4)
++        .rposition(|w| w == b"PK\x05\x06")
++        .expect("an end record");
++    book[end + 16..end + 20].copy_from_slice(&0u32.to_le_bytes());
++    let mut context = Context::default();
++    let mut comic = ShelfComic::new();
++    comic.open(&mut context, "book", "Pages", None);
++
++    let (steps, reads) = answer(&mut comic, &mut context, &book);
++
++    assert!(
++        matches!(steps.as_slice(), [ComicStep::Failed(_)]),
++        "{steps:?}"
++    );
++    let read: usize = reads.iter().map(|(_, length)| *length as usize).sum();
++    assert!(
++        read < book.len() / 4,
++        "{read} of {} bytes were read to refuse it",
++        book.len()
++    );
 +}
 diff --git a/crates/kobo-bookview/src/shelved.rs b/crates/kobo-bookview/src/shelved.rs
 new file mode 100644
