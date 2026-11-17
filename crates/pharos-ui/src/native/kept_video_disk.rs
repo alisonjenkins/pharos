@@ -231,6 +231,9 @@ struct Inner {
     /// Sweeps the host's size check has run, on any thread.
     #[cfg(test)]
     host_sweeps: std::sync::atomic::AtomicUsize,
+    /// The items whose plan `admit` has admitted, in order.
+    #[cfg(test)]
+    plans_admitted: Mutex<Vec<String>>,
 }
 
 /// A test's hook into `sweep_relist`, given the step reached.
@@ -1190,6 +1193,11 @@ impl Inner {
                 bytes: plan.stored,
             };
         }
+        #[cfg(test)]
+        self.plans_admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(item.to_owned());
         self.save_record(user, item).map_err(Admission::Unsaved)
     }
 
@@ -2902,6 +2910,8 @@ impl DiskVideoStore {
             relist_hook: Mutex::new(None),
             #[cfg(test)]
             host_sweeps: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            plans_admitted: Mutex::new(Vec::new()),
         });
         let mut st = State::default();
         st.root.clone_from(&inner.root);
@@ -3834,6 +3844,31 @@ mod tests {
         v[0].clone()
     }
 
+    /// Waits until `item`'s plan is admitted or its download has failed
+    /// (a reservation alone sets an estimate before either), and returns
+    /// its record then.
+    async fn plan_decided(store: &DiskVideoStore, item: &str) -> KeptVideo {
+        let mut waited = 0;
+        loop {
+            let admitted = store
+                .inner
+                .plans_admitted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|i| i == item);
+            let v = store.videos("u1").into_iter().find(|v| v.item == item);
+            if let Some(v) = v {
+                if admitted || matches!(v.state, KeptState::Failed { .. }) {
+                    return v;
+                }
+            }
+            waited += 1;
+            assert!(waited < 5_000, "item {item}: no plan decided");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     fn lines(prefix: &str) -> Vec<String> {
         captured()
             .into_iter()
@@ -4277,14 +4312,9 @@ mod tests {
         let rig = Rig::new("video-in-flight-held");
         let store = rig.open();
         let release = park_writer(&rig, &store).await;
-        // The playlists are staged before the plan is admitted: wait for the
-        // reservation.
-        let mut waited = 0;
-        while only(&store).estimated_bytes == 0 {
-            waited += 1;
-            assert!(waited < 2_000, "the plan was never admitted");
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        // The playlists are staged (and reserved) before the plan is
+        // admitted: wait for the admission itself.
+        plan_decided(&store, "1").await;
         assert!(
             store.kept_bytes() >= estimate_bytes(2_000_000, 12_000),
             "an in-flight video counted at {}",
@@ -4650,18 +4680,8 @@ mod tests {
             Ordering::SeqCst,
         );
         store.start(request("2")).unwrap();
-        let mut waited = 0;
-        loop {
-            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
-            if second.as_ref().is_some_and(|v| {
-                v.estimated_bytes > 0 || matches!(v.state, KeptState::Failed { .. })
-            }) {
-                break;
-            }
-            waited += 1;
-            assert!(waited < 2_000, "{second:?}");
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        // The first writer stays held until the second's plan is decided.
+        plan_decided(&store, "2").await;
         release.store(true, Ordering::SeqCst);
         store.settled().await;
         let videos = store.videos("u1");
@@ -5667,18 +5687,8 @@ mod tests {
             .free
             .store(owed + estimate + FREE_GUARD_BYTES - 1, Ordering::SeqCst);
         store.start(request("2")).unwrap();
-        let mut waited = 0;
-        let second = loop {
-            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
-            if let Some(v) = second
-                .filter(|v| v.estimated_bytes > 0 || matches!(v.state, KeptState::Failed { .. }))
-            {
-                break v;
-            }
-            waited += 1;
-            assert!(waited < 2_000, "the second never settled");
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        };
+        // The pending write stays held until the second's plan is decided.
+        let second = plan_decided(&store, "2").await;
         HOLD_ITEM.with(|h| *h.borrow_mut() = None);
         let KeptState::Failed { reason } = &second.state else {
             panic!("admitted on room the pending write still owes: {second:?}");
