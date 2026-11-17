@@ -7885,11 +7885,16 @@ mod tests {
             let store = rig.open();
             store.start(request("1")).unwrap();
             let files = rig.dir.join("u1").join("1").join("files");
+            // The held segment's staging file: one a playlist staged while
+            // planning is renamed into place before the failure.
+            let seg0 = file_name(SEG0);
             let part = || {
                 std::fs::read_dir(&files).ok().and_then(|r| {
-                    r.flatten()
-                        .map(|e| e.path())
-                        .find(|p| p.extension().is_some_and(|x| x == "part"))
+                    r.flatten().map(|e| e.path()).find(|p| {
+                        p.extension().is_some_and(|x| x == "part")
+                            && p.file_name()
+                                .is_some_and(|n| n.to_string_lossy().starts_with(&seg0))
+                    })
                 })
             };
             let mut waited = 0;
