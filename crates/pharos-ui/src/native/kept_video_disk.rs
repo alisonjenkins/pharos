@@ -1489,6 +1489,12 @@ impl VideoStore for DiskVideoStore {
             for key in &record.files {
                 st.index.remove(key);
             }
+            // What the record reserved keeps counting, as a tombstone, from
+            // the moment the record leaves the list: there is no instant
+            // when the folder counts for nothing while it is deleted.
+            let dir = self.inner.item_dir(user, item);
+            st.tombstones.retain(|(d, _)| *d != dir);
+            st.tombstones.push((dir, reserved(&record)));
             record
         };
         let dir = self.inner.item_dir(user, item);
@@ -1501,13 +1507,20 @@ impl VideoStore for DiskVideoStore {
                 // The record is still on disk and would bring the download
                 // back at the next open, so the removal has not happened:
                 // the record stays, as a failed one, and the caller sees it.
+                lock(&self.inner.state)
+                    .tombstones
+                    .retain(|(d, _)| *d != dir);
                 self.inner.keep_after_failed_unlink(record, &dir, &e);
                 return;
             }
         }
         let removed = (self.inner.env.remove_dir)(&dir);
         let mut left = 0;
-        if removed.is_err() {
+        if removed.is_ok() {
+            lock(&self.inner.state)
+                .tombstones
+                .retain(|(d, _)| *d != dir);
+        } else {
             // The bytes still on disk keep counting against the cap until
             // a later sweep deletes the folder.
             // A folder that cannot be measured counts as much as the
@@ -1595,7 +1608,17 @@ mod tests {
         static LEAVE_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    thread_local! {
+        /// Runs as a folder is being deleted.
+        static DURING_REMOVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
     fn removing(dir: &Path) -> std::io::Result<()> {
+        DURING_REMOVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
         if FAIL_REMOVE.with(std::cell::Cell::get) {
             if LEAVE_UNREADABLE.with(std::cell::Cell::get) {
                 let _ = std::fs::remove_dir_all(dir);
@@ -2796,6 +2819,26 @@ mod tests {
         assert!(dir.join("files").exists(), "the folder went");
         let line = lines("pharos: video keep remove");
         assert!(line[0].contains("verdict=not_removed"), "{line:?}");
+    }
+
+    /// While a removed download's folder is being deleted its bytes still
+    /// count: the record is gone from the list but not from the cap.
+    #[tokio::test]
+    async fn a_folder_being_deleted_still_counts_against_the_cap() {
+        let rig = Rig::new("count-while-removing");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = store.kept_bytes();
+        assert!(kept > 0);
+        let seen = std::rc::Rc::new(std::cell::Cell::new(u64::MAX));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        DURING_REMOVE
+            .with(|d| *d.borrow_mut() = Some(Box::new(move || seen2.set(s2.kept_bytes()))));
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        assert_eq!(seen.get(), kept, "counted for nothing mid-delete");
+        assert_eq!(store.kept_bytes(), 0, "and for nothing once it is gone");
     }
 
     /// A folder that will not delete keeps counting against the cap, does not
