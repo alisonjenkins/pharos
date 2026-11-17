@@ -252,6 +252,12 @@ pub struct Cache {
     /// What the host says other downloads hold of the cap. They count
     /// against it but are never evicted from here.
     outside: Mutex<Option<OutsideUsed>>,
+    /// Bytes of music writes `ensure_free` has approved that have not landed
+    /// (or failed) yet, by track id: free space does not lack them yet, but
+    /// it will. A host admitting its own downloads against the same free
+    /// space takes them off it (`reserved_bytes`). Written only under the
+    /// shared admission lock.
+    reserved: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// Space available to an unprivileged writer, as `df` reports it.
@@ -444,6 +450,7 @@ impl Cache {
             }),
             free,
             outside: Mutex::new(None),
+            reserved: Mutex::default(),
         };
         {
             let mut s = cache.lock();
@@ -618,6 +625,8 @@ impl Cache {
         // The track joins the shared cap and the cache trims to it as one
         // step against a host's admission, which reads these bytes.
         let _admission = admission_guard();
+        // The bytes are in the entry from here: no longer to come.
+        self.unreserve(id);
         let mut s = self.lock();
         let t = Self::tick(&mut s);
         let pinned = s.pins.values().any(|v| v.iter().any(|p| p == id));
@@ -882,8 +891,54 @@ impl Cache {
     /// those are taken off it first, so music cannot spend room an admitted
     /// video needs. Read under the shared admission lock, taken before the
     /// cache's lock.
+    ///
+    /// What it approves is reserved for `downloading` (the bytes the write
+    /// has yet to add) until `commit` or `release_reservation` clears it, so a host
+    /// admitting against the same free figure sees them as spoken for.
     pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
         let _admission = admission_guard();
+        let verdict = self.check_free(downloading, need);
+        match verdict {
+            Ok(_) => self.reserve(downloading, need),
+            Err(_) => self.unreserve(downloading),
+        }
+        verdict
+    }
+
+    fn reserve(&self, id: &str, bytes: u64) {
+        let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes == 0 {
+            r.remove(id);
+        } else {
+            r.insert(id.to_owned(), bytes);
+        }
+    }
+
+    /// Drops what was reserved for `id`: its write landed, failed or was
+    /// cancelled.
+    pub fn release_reservation(&self, id: &str) {
+        let _admission = admission_guard();
+        self.unreserve(id);
+    }
+
+    fn unreserve(&self, id: &str) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// What approved music writes have yet to add to the disk. Read under
+    /// the shared admission lock by a host that admits against free space.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .fold(0, |a, b| a.saturating_add(*b))
+    }
+
+    fn check_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
         // Outstanding first, then the probe: a write that lands between the
         // two lowers free and the stale (higher) outstanding keeps the figure
         // conservative. The other order counts those bytes twice as spent
@@ -1144,6 +1199,36 @@ mod tests {
                 .any(|l| l == "cache cap bytes=150 source=set tracks=1 used=100 evicted=1"),
             "{lines:?}"
         );
+    }
+
+    /// What `ensure_free` approves is reserved until the write lands or the
+    /// job ends, so a host admitting against the same free space sees it as
+    /// spoken for.
+    #[test]
+    fn an_approved_music_write_is_reserved_until_it_lands() {
+        let d = tmp("reserve");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert_eq!(c.ensure_free("track/x", 300), Ok(MIN_FREE_BYTES + 500));
+        assert_eq!(c.reserved_bytes(), 300, "approved but not reserved");
+        // A refresh replaces the figure; it does not add to it.
+        assert_eq!(c.ensure_free("track/x", 200), Ok(MIN_FREE_BYTES + 500));
+        assert_eq!(c.reserved_bytes(), 200);
+        // A refusal reserves nothing.
+        assert!(c.ensure_free("track/y", 1 << 40).is_err());
+        assert_eq!(c.reserved_bytes(), 200);
+        // Landing clears it.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 200]).unwrap();
+        c.commit("track/x", Some(200)).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            0,
+            "still reserved after the write landed"
+        );
+        // So does the job ending.
+        assert!(c.ensure_free("track/z", 100).is_ok());
+        assert_eq!(c.reserved_bytes(), 100);
+        c.release_reservation("track/z");
+        assert_eq!(c.reserved_bytes(), 0);
     }
 
     fn fixed_free(bytes: u64) -> FreeProbe {

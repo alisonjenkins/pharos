@@ -627,6 +627,13 @@ impl Library {
         }
     }
 
+    /// What music writes the cache has approved still have to add to the
+    /// disk, for a host admitting its own downloads against the same free
+    /// space; 0 with no cache. Read under [`admission_guard`].
+    pub fn music_outstanding_bytes(&self) -> u64 {
+        self.offline.get().map_or(0, |o| o.cache.reserved_bytes())
+    }
+
     /// The cap in force, when the cache is enabled.
     pub fn cache_cap(&self) -> Option<u64> {
         self.offline.get().map(|o| o.cache.cap())

@@ -503,6 +503,11 @@ impl Gate {
         let mut st = self.lock().deferred.remove(id).unwrap_or_default();
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
         self.cache.clear_failed(id);
+        // Whatever the job reserved is released however it ends.
+        let _reserved = Reserved {
+            cache: &self.cache,
+            id,
+        };
         let outcome = loop {
             if let Err(free) = self.cache.ensure_free(id, 0) {
                 break Outcome::LowDisk(free);
@@ -734,6 +739,18 @@ impl Gate {
             .commit(id, total)
             .map(|_| ())
             .map_err(|e| Fail::Permanent(e.to_string()))
+    }
+}
+
+/// Releases a track's reserved free space when its job ends.
+struct Reserved<'a> {
+    cache: &'a Cache,
+    id: &'a str,
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        self.cache.release_reservation(self.id);
     }
 }
 
