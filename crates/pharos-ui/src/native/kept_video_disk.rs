@@ -536,24 +536,30 @@ impl Inner {
     /// [`Inner::update`] for the run that owns the download: the run id is
     /// checked under the same lock as the change, so a run that was removed
     /// or restarted since cannot touch the record of the one that replaced
-    /// it. False when `run` no longer owns `item`.
-    fn update_run(&self, user: &str, item: &str, run: u64, f: impl FnOnce(&mut KeptVideo)) -> bool {
+    /// it. `Ok(false)` when `run` no longer owns `item`; an error when the
+    /// change could not be saved (it stays in memory, as in `update`).
+    fn update_run(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        f: impl FnOnce(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
         {
             let mut st = lock(&self.state);
             if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
-                return false;
+                return Ok(false);
             }
             let Some(v) = st
                 .list
                 .iter_mut()
                 .find(|v| v.user == user && v.item == item)
             else {
-                return false;
+                return Ok(false);
             };
             f(v);
         }
-        let _ = self.save_record(user, item);
-        true
+        self.save_record(user, item).map(|()| true)
     }
 
     fn wanted(&self, user: &str, item: &str, run: u64) -> bool {
@@ -691,7 +697,9 @@ impl Inner {
             due
         };
         if due {
-            self.update_run(user, item, run, |v| {
+            // Progress only: a failed save is logged by `save_record`, and
+            // the next one (or the terminal state's) writes it again.
+            let _ = self.update_run(user, item, run, |v| {
                 v.state = KeptState::Downloading { done, total, bytes };
             });
         } else {
@@ -1264,7 +1272,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             files,
             skipped,
         }) => {
-            if inner.update_run(&user, &item, run, |v| {
+            let saved = inner.update_run(&user, &item, run, |v| {
                 // A skipped file is not on disk: left in the record, a
                 // reopen would count it missing and resume the copy.
                 v.files.retain(|k| !skipped.contains(k));
@@ -1272,21 +1280,42 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 // What the folder holds, a file a failed prune could not
                 // delete included: the record reports all storage used.
                 v.estimated_bytes = held;
-            }) {
-                emit(
+            });
+            match saved {
+                Ok(true) => emit(
                     false,
                     format!(
                         "pharos: video keep ready item={item} bytes={bytes} files={files} ms={ms}"
                     ),
-                );
-            } else {
-                superseded("superseded");
+                ),
+                Ok(false) => superseded("superseded"),
+                Err(e) => {
+                    // Ready that is not on disk would resume at the next
+                    // open: it is reported as what it is, a failure, and
+                    // the memory and the disk then tell the same story
+                    // (the files stay; a retry finds them).
+                    let reason = format!("finished but its record could not be saved: {e}");
+                    let _ = inner.update_run(&user, &item, run, |v| {
+                        v.state = KeptState::Failed {
+                            reason: reason.clone(),
+                        };
+                    });
+                    emit(
+                        true,
+                        format!(
+                            "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
+                        ),
+                    );
+                }
             }
         }
         Err(Stop::Gone) => superseded("removed"),
         Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
             let (mut files, mut bytes) = (0, 0);
             let applied = inner.update_run(&user, &item, run, |v| {
+                // Not durable when the save fails (logged by `save_record`):
+                // the disk then holds the earlier Downloading record, which
+                // resumes at the next open.
                 if let KeptState::Downloading { done, .. } = v.state {
                     files = done;
                 }
@@ -1298,7 +1327,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     reason: reason.clone(),
                 };
             });
-            if applied {
+            if applied.unwrap_or(true) {
                 emit(
                     true,
                     format!(
@@ -3493,6 +3522,46 @@ mod tests {
         );
         // Once it is gone the block lifts.
         assert!(!store.size_unknown(), "still blocked after the removal");
+    }
+
+    /// A download whose terminal record cannot be saved is not reported
+    /// Ready: that would resume at the next open. It is reported failed,
+    /// with the save error as the reason, and no success is logged.
+    #[tokio::test]
+    async fn a_completion_whose_record_cannot_be_saved_is_not_reported_ready() {
+        let rig = Rig::new("complete-save-fails");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // The disk goes bad while the download is mid-file.
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("reported {:?}", only(&store).state);
+        };
+        assert!(reason.contains("could not be saved"), "{reason}");
+        assert!(
+            lines("pharos: video keep ready").is_empty(),
+            "success logged"
+        );
+        let failed = lines("pharos: video keep failed");
+        assert!(
+            failed.len() == 1 && failed[0].contains("could not be saved"),
+            "{failed:?}"
+        );
+        // The disk disagrees with nothing: it holds no Ready record.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        drop(store);
+        let reopened = rig.open();
+        assert_ne!(only(&reopened).state, KeptState::Ready);
     }
 
     /// A damaged manifest is held the same way.
