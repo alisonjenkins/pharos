@@ -482,6 +482,10 @@ impl Cache {
         let bytes = serde_json::to_vec(&Settings { cap_bytes })
             .map_err(|e| err("encode settings", &path, e))?;
         write_atomic(&path, &bytes).map_err(|e| err("save settings", &path, e))?;
+        // The cap is part of what a host's admission reads: changed and
+        // trimmed to as one step against it (shared lock, then the cache's).
+        // No caller holds the shared lock here.
+        let _admission = admission_guard();
         let mut s = self.lock();
         self.cap.store(cap_bytes, Ordering::SeqCst);
         let evicted = self.evict_locked(&mut s);
@@ -1272,6 +1276,32 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert!(c.is_complete("track/a"));
+    }
+
+    /// A cap change is one step against a host's admission: it waits for
+    /// whoever holds the shared lock, so no admission reads the old cap
+    /// beside the new one's trim.
+    #[test]
+    fn a_cap_change_waits_for_the_shared_admission_lock() {
+        let d = tmp("cap-admission");
+        let c = std::sync::Arc::new(Cache::open(&d, 1000).unwrap());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = admission_guard();
+        let worker = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                c.set_cap(500).unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the cap changed ahead of the admission lock"
+        );
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(c.cap(), 500);
     }
 
     #[test]
