@@ -202,6 +202,18 @@ pub trait VideoStore: Send + Sync {
     fn size_unknown(&self) -> bool {
         false
     }
+    /// How many folders hold downloads whose record cannot be read: they
+    /// are kept, counted and block every admission until they read again or
+    /// are discarded. Zero for a store with no such folders.
+    fn unreadable_count(&self) -> usize {
+        0
+    }
+    /// Deletes the folders whose record still cannot be read, returning the
+    /// bytes freed. Err names why it could not, or what stayed. A store with
+    /// no folders to discard (the web's) refuses.
+    fn discard_unreadable(&self) -> Result<u64, String> {
+        Err("this device keeps no unreadable downloads".to_owned())
+    }
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;

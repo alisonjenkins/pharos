@@ -2168,6 +2168,73 @@ impl Inner {
             }
         }
     }
+
+    /// Deletes the held folders whose record is still unreadable, and
+    /// returns the bytes they held. One whose record reads now is released,
+    /// never deleted. A folder that will not delete becomes a tombstone,
+    /// counted and swept like a removed download's. Err names how many
+    /// would not delete.
+    fn discard_held(self: &Arc<Self>) -> Result<u64, String> {
+        let mut freed = 0u64;
+        let mut failed = Vec::new();
+        for dir in self.claim_held() {
+            match read_held(&dir) {
+                HeldNow::Readable(record) => self.apply_held(&dir, HeldNow::Readable(record)),
+                HeldNow::Gone => self.apply_held(&dir, HeldNow::Gone),
+                HeldNow::NoRecord | HeldNow::Still(_) => {
+                    let bytes = lock(&self.state)
+                        .held
+                        .iter()
+                        .find(|(d, _)| *d == dir)
+                        .map_or(0, |(_, b)| *b);
+                    match (self.env.remove_dir)(&dir) {
+                        Ok(()) => {
+                            let mut st = lock(&self.state);
+                            st.held.retain(|(d, _)| *d != dir);
+                            st.unmeasured.retain(|(d, _)| *d != dir);
+                            freed = freed.saturating_add(bytes);
+                            drop(st);
+                            emit(
+                                false,
+                                format!(
+                                    "pharos: video held folder verdict=discarded dir={} bytes={bytes}",
+                                    dir.display()
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            let m = dir_size(&dir);
+                            let mut st = lock(&self.state);
+                            st.held.retain(|(d, _)| *d != dir);
+                            st.unmeasured.retain(|(d, _)| *d != dir);
+                            st.measured.insert(dir.clone(), (0, m.exact));
+                            st.tombstones.push((dir.clone(), m.bytes));
+                            drop(st);
+                            emit(
+                                true,
+                                format!(
+                                    "pharos: video held folder verdict=discard_failed dir={} bytes={} error={e}",
+                                    dir.display(),
+                                    m.bytes
+                                ),
+                            );
+                            failed.push(dir.display().to_string());
+                        }
+                    }
+                }
+            }
+            lock(&self.state).deleting.retain(|d| *d != dir);
+        }
+        if failed.is_empty() {
+            Ok(freed)
+        } else {
+            Err(format!(
+                "{} folders could not be deleted and stay counted: {}",
+                failed.len(),
+                failed.join(", ")
+            ))
+        }
+    }
 }
 
 impl DiskVideoStore {
@@ -2598,6 +2665,17 @@ impl VideoStore for DiskVideoStore {
 
     fn size_unknown(&self) -> bool {
         lock(&self.inner.state).unknown_folder().is_some()
+    }
+
+    fn unreadable_count(&self) -> usize {
+        lock(&self.inner.state).held.len()
+    }
+
+    fn discard_unreadable(&self) -> Result<u64, String> {
+        let freed = self.inner.discard_held();
+        // What would not delete is a tombstone now: try it again at once.
+        self.inner.sweep_tombstones();
+        freed
     }
 
     fn outstanding_bytes(&self) -> u64 {
@@ -4954,6 +5032,7 @@ mod tests {
         std::fs::write(&manifest, b"{ not json").unwrap();
         let store = rig.open();
         assert!(store.size_unknown(), "the damaged manifest did not block");
+        assert_eq!(store.unreadable_count(), 1);
         (rig, store, good, manifest)
     }
 
@@ -4971,6 +5050,7 @@ mod tests {
         assert_eq!(listed.len(), 1, "the download is not back");
         assert!(listed[0].ready(), "{:?}", listed[0].state);
         assert!(!store.size_unknown(), "still blocked after the release");
+        assert_eq!(store.unreadable_count(), 0);
         assert!(store.stored_file("u1", SEG0).is_some(), "files not served");
         assert_eq!(store.kept_bytes(), reserved(&listed[0]), "counted twice");
         assert!(!lines("pharos: video held folder verdict=released").is_empty());
@@ -4987,6 +5067,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(store.videos("u1").is_empty());
         assert!(!store.size_unknown());
+        assert_eq!(store.unreadable_count(), 0);
         assert_eq!(store.kept_bytes(), 0);
         assert!(!lines("pharos: video held folder verdict=dropped").is_empty());
 
@@ -4994,6 +5075,7 @@ mod tests {
         let dir = manifest.parent().unwrap().to_path_buf();
         std::fs::remove_file(&manifest).unwrap();
         store.videos("u1");
+        assert_eq!(store.unreadable_count(), 0);
         assert!(!store.size_unknown(), "measured whole, so known");
         assert!(store.kept_bytes() > 0, "counted until it is deleted");
         store.start(request("2")).unwrap();
@@ -5001,6 +5083,55 @@ mod tests {
         assert!(!dir.exists(), "the removed download's folder stayed");
         assert!(!store.size_unknown());
         assert!(!lines("pharos: video held folder verdict=tombstoned").is_empty());
+    }
+
+    /// Discarding deletes the folders whose record is still unreadable and
+    /// clears the block, so admission and the music cache resume.
+    #[tokio::test]
+    async fn discarding_the_unreadable_clears_the_block() {
+        let (_rig, store, _good, manifest) = held_download("held-discard").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        let freed = store.discard_unreadable();
+        assert!(matches!(freed, Ok(b) if b > 0), "{freed:?}");
+        assert!(!dir.exists(), "the folder stayed");
+        assert!(!store.size_unknown(), "still blocked");
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(store.kept_bytes(), 0);
+        assert!(!lines("pharos: video held folder verdict=discarded").is_empty());
+        store.start(request("2")).unwrap();
+        store.settled().await;
+    }
+
+    /// A folder that will not delete is counted and swept as a removed
+    /// download's, and the discard says so.
+    #[tokio::test]
+    async fn a_discard_that_cannot_delete_keeps_the_folder_counted() {
+        let (_rig, store, _good, manifest) = held_download("held-discard-fails").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        FAIL_REMOVE.with(|f| f.set(true));
+        let outcome = store.discard_unreadable();
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(dir.exists());
+        assert!(store.kept_bytes() > 0, "counted for nothing");
+        assert!(!lines("pharos: video held folder verdict=discard_failed").is_empty());
+        // The next sweep deletes it and the block lifts.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists());
+        assert!(!store.size_unknown());
+    }
+
+    /// A discard never deletes a download whose manifest reads: it is
+    /// released instead.
+    #[tokio::test]
+    async fn a_discard_leaves_a_download_whose_record_reads_again() {
+        let (_rig, store, good, manifest) = held_download("held-discard-readable").await;
+        std::fs::write(&manifest, good).unwrap();
+        assert_eq!(store.discard_unreadable(), Ok(0));
+        assert!(manifest.exists(), "a readable download was deleted");
+        assert_eq!(store.videos("u1").len(), 1);
+        assert!(!store.size_unknown());
     }
 
     /// A restart while a removed download's folder will not delete and
