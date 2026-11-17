@@ -894,19 +894,25 @@ impl Cache {
             return Err(0);
         }
         let outstanding = outside.outstanding;
-        let free = match (self.free)(&self.dir) {
-            Ok(f) => f.saturating_sub(outstanding),
+        let raw = match (self.free)(&self.dir) {
+            Ok(f) => f,
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
                 return Ok(u64::MAX);
             }
         };
-        let want = MIN_FREE_BYTES.saturating_add(need);
-        if free >= want {
-            return Ok(free);
+        // The raw probe is held against the whole requirement, what admitted
+        // video still has to write included: taking the outstanding bytes
+        // off the probe first clamps a deficit at zero and eviction would
+        // never have to make it up. The figure returned is room beyond them.
+        let want = MIN_FREE_BYTES
+            .saturating_add(need)
+            .saturating_add(outstanding);
+        if raw >= want {
+            return Ok(raw.saturating_sub(outstanding));
         }
         let mut s = self.lock();
-        let mut now = free;
+        let mut now = raw;
         let mut evicted = false;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
@@ -922,10 +928,11 @@ impl Cache {
         if evicted {
             self.persist_locked(&s);
         }
+        let room = now.saturating_sub(outstanding);
         if now >= want {
-            Ok(now)
+            Ok(room)
         } else {
-            Err(now)
+            Err(room)
         }
     }
 
@@ -1247,6 +1254,35 @@ mod tests {
         // Known again: admitted.
         unknown.store(false, Ordering::SeqCst);
         assert!(c.ensure_free("track/x", 10).is_ok());
+    }
+
+    /// Eviction must make up what admitted video still has to write, not
+    /// only the guard: with less free than video owes, the deficit counts.
+    #[test]
+    fn eviction_covers_the_deficit_when_video_owes_more_than_is_free() {
+        let outstanding = std::sync::Arc::new(AtomicU64::new(MIN_FREE_BYTES));
+        let o = outstanding.clone();
+        // Room for a sparse 2 GiB "track" and the cap to match.
+        let c = Cache::open_with_probe(
+            &tmp("lowdisk-deficit"),
+            u64::MAX / 2,
+            fixed_free(MIN_FREE_BYTES / 2),
+        )
+        .unwrap();
+        c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            outstanding: o.load(Ordering::SeqCst),
+            ..OutsideBytes::default()
+        }));
+        let part = c.part_path("track/a");
+        std::fs::File::create(&part)
+            .unwrap()
+            .set_len(MIN_FREE_BYTES)
+            .unwrap();
+        c.commit("track/a", Some(MIN_FREE_BYTES)).unwrap();
+        c.protect(&[]);
+        // 1 GiB free, 2 GiB owed, 2 GiB of music: evicting it leaves 3 GiB
+        // against the 4 GiB the guard and the owed bytes need.
+        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES / 2));
     }
 
     #[test]
