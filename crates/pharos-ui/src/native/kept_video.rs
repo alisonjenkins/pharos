@@ -190,15 +190,24 @@ pub struct StoredFile {
     pub content_type: &'static str,
 }
 
+/// What follows `scheme://` when `url` starts with one. Only a prefix
+/// counts: a `://` inside a path or query (a redirect target, say) is part
+/// of that path or query.
+fn after_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
+}
+
 /// The key a request is stored under on a host that sees no scheme or
 /// host: the path and the query, which names the play session. An absolute
 /// URL is cut down to the same, so both spellings of one file agree.
 pub fn request_key(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let path_and_query = if url.contains("://") {
-        rest.find('/').map_or("/", |i| &rest[i..])
-    } else {
-        rest
+    let path_and_query = match after_scheme(url) {
+        Some(rest) => rest.find('/').map_or("/", |i| &rest[i..]),
+        None => url,
     };
     let key = path_and_query.split('#').next().unwrap_or_default();
     if key.starts_with('/') {
@@ -324,7 +333,7 @@ pub fn cache_name(user: &str) -> String {
 /// service worker's `caches.match(request.url)` finds. An absolute URL is
 /// returned as is.
 pub fn absolute_url(origin: &str, url: &str) -> String {
-    if url.contains("://") {
+    if after_scheme(url).is_some() {
         url.to_owned()
     } else if url.starts_with('/') {
         format!("{}{url}", origin.trim_end_matches('/'))
@@ -336,7 +345,7 @@ pub fn absolute_url(origin: &str, url: &str) -> String {
 /// The path of `url`, with no query, for log lines (the query carries the
 /// play session).
 pub fn url_path(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = after_scheme(url).unwrap_or(url);
     let from_path = rest.find('/').map_or("", |i| &rest[i..]);
     from_path.split(['?', '#']).next().unwrap_or("")
 }
@@ -637,6 +646,18 @@ mod tests {
         );
         assert_eq!(request_key("videos/1/0.m4s?PlaySessionId=z"), k);
         assert_eq!(request_key("http://h"), "/");
+        // A `://` inside the query is not a scheme.
+        let redirect = "/videos/1/0.m4s?next=https://x.test/a&PlaySessionId=z";
+        assert_eq!(request_key(redirect), redirect);
+        assert_eq!(url_path(redirect), "/videos/1/0.m4s");
+        assert_eq!(
+            request_key("https://h/videos/1/0.m4s?next=https://x.test/a"),
+            "/videos/1/0.m4s?next=https://x.test/a"
+        );
+        assert_eq!(
+            absolute_url("https://h", redirect),
+            format!("https://h{redirect}")
+        );
     }
 
     #[test]
