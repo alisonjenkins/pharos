@@ -875,8 +875,13 @@ impl Cache {
     /// cache's lock.
     pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
         let _admission = admission_guard();
+        // Outstanding first, then the probe: a write that lands between the
+        // two lowers free and the stale (higher) outstanding keeps the figure
+        // conservative. The other order counts those bytes twice as spent
+        // room, or not at all.
+        let outstanding = self.outside_bytes().outstanding;
         let free = match (self.free)(&self.dir) {
-            Ok(f) => f.saturating_sub(self.outside_bytes().outstanding),
+            Ok(f) => f.saturating_sub(outstanding),
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
                 return Ok(u64::MAX);
@@ -1173,6 +1178,27 @@ mod tests {
         c.protect(&[]);
         assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
         assert!(!c.is_complete("track/a"));
+    }
+
+    /// A video write landing between the two reads must not be missed: the
+    /// outstanding figure is read before free space is probed.
+    #[test]
+    fn room_reads_what_a_video_owes_before_probing_free_space() {
+        let order = std::sync::Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let probe_order = order.clone();
+        let probe: FreeProbe = Box::new(move |_| {
+            probe_order.lock().unwrap().push("probe");
+            Ok(MIN_FREE_BYTES + 50)
+        });
+        let c = Cache::open_with_probe(&tmp("lowdisk-order"), 1000, probe).unwrap();
+        let hook_order = order.clone();
+        c.set_outside_used(std::sync::Arc::new(move || {
+            hook_order.lock().unwrap().push("outstanding");
+            OutsideBytes::default()
+        }));
+        order.lock().unwrap().clear();
+        assert!(c.ensure_free("track/x", 0).is_ok());
+        assert_eq!(*order.lock().unwrap(), ["outstanding", "probe"]);
     }
 
     #[test]
