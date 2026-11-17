@@ -5072,6 +5072,60 @@ mod tests {
         assert_eq!(store.videos("u1").len(), 2);
     }
 
+    /// The retry is a new play session: every file is named afresh, the old
+    /// session's files are still on disk when it starts, and they are
+    /// counted until the plan prunes them. Nothing is refused forever.
+    #[tokio::test]
+    async fn a_retry_in_a_new_session_over_an_undeletable_folder_counts_the_old_files() {
+        let rig = Rig::new("takeover-new-session");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        let old = disk_bytes(&dir).bytes;
+        assert!(old > 0, "no old files");
+        // The same stream under a new session id.
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            let renamed: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(k, v)| {
+                    let body = match String::from_utf8(v.clone()) {
+                        Ok(text) if text.starts_with("#EXTM3U") => text
+                            .replace("PlaySessionId=p", "PlaySessionId=q")
+                            .into_bytes(),
+                        _ => v.clone(),
+                    };
+                    (k.replace("PlaySessionId=p", "PlaySessionId=q"), body)
+                })
+                .collect();
+            files.extend(renamed);
+        }
+        let mut req = request("1");
+        req.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+        store.start(req).unwrap();
+        // Before the run plans anything, the old files are in the figure.
+        assert!(
+            store.kept_bytes() >= old,
+            "the old files dropped out at the start: {}",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+        assert!(
+            store.kept_bytes() >= disk_bytes(&dir).bytes,
+            "the folder's bytes are not counted"
+        );
+        assert!(!store.size_unknown(), "the folder stayed unknown");
+        // Another item is admitted.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(store.videos("u1").len(), 2);
+    }
+
     /// A download restarted between a sweep's choosing a folder and its
     /// deleting it is refused, so the new files are not deleted from under it.
     #[tokio::test]
