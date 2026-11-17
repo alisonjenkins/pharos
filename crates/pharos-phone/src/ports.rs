@@ -250,9 +250,10 @@ impl Budget for PhoneBudget {
     }
 
     fn accounting_ready(&self) -> bool {
-        // Without the music cache the cap is the default and the music
-        // counts as nothing: a new download waits for it.
-        pharos_android::library().is_some()
+        // Without the music cache enabled the cap is the default and the
+        // music counts as nothing: a new download waits for it. A library
+        // whose cache failed to start (or has yet to) is as absent.
+        pharos_android::library().is_some_and(content::Library::cache_enabled)
     }
 
     fn other_outstanding_bytes(&self) -> u64 {
