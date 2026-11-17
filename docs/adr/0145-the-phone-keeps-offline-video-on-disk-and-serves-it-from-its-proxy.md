@@ -24,8 +24,8 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   existing file is a whole file; a restart fetches `missing_files` only.
 - Bodies stream to disk chunk by chunk. The downloads run on one dedicated
   thread (a current-thread tokio runtime), two files at a time.
-- The proxy asks `VideoStore::stored_file(key)` before the network and
-  answers a hit from disk with the server's `Content-Type`, whether the phone
+- The proxy asks `VideoStore::stored_file(user, key)` for the signed-in user
+  before the network and answers a hit from disk with the server's `Content-Type`, whether the phone
   is online or not (a stored copy saves mobile data). `Range` is not
   forwarded by the proxy today and the playlists carry no byte ranges, so a
   stored file is answered whole.
@@ -46,8 +46,10 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   settings takes effect once the service is up.
 - A stored file is read whole into the WebView response (a segment is a few
   MB); only the download path streams.
-- A request is answered by key across users on the device; the key carries
-  the per-session query only that user's player was given.
+- A request is answered from disk only for the signed-in user's own
+  downloads (lookup by user and key). When no user is known to be signed in,
+  including after a sign-out, nothing is served from disk; the files stay on
+  disk for that user's next sign-in.
 
 ## Alternatives considered
 
