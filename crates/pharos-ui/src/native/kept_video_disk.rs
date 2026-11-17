@@ -1439,14 +1439,12 @@ impl VideoStore for DiskVideoStore {
         self.inner.sweep_tombstones();
         let (started, used) = {
             let _admission = budget.admission_guard();
-            let (other, cap, free) = (
-                budget.other_used_bytes(),
-                budget.cap_bytes(),
-                budget.free_bytes(),
-            );
+            let (other, cap) = (budget.other_used_bytes(), budget.cap_bytes());
             let mut st = lock(&self.inner.state);
             let used = st.reserved_by_others(&user, &item).saturating_add(other);
-            let room = free.saturating_sub(st.outstanding(&user, &item));
+            // Owed bytes first, then the free space (as in `admit`).
+            let owed = st.outstanding(&user, &item);
+            let room = budget.free_bytes().saturating_sub(owed);
             let started = fits(0, used, cap, room).and_then(|()| {
                 check_not_kept(&st.list, &user, &item)?;
                 let mut record = new_record(&request, (self.inner.env.now)());
@@ -2418,6 +2416,30 @@ mod tests {
         drop(stale);
         assert_eq!(store.staged_bytes(), 50);
         release.store(true, Ordering::SeqCst);
+        store.settled().await;
+    }
+
+    /// `start` reads what running downloads owe before it measures free
+    /// space, under the state lock, like admission does.
+    #[tokio::test]
+    async fn start_measures_free_space_after_reading_what_is_owed() {
+        let rig = Rig::new("start-order");
+        let store = rig.open();
+        let inner = store.inner.clone();
+        let locked = Arc::new(AtomicUsize::new(0));
+        let l = locked.clone();
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            if inner.state.try_lock().is_err() {
+                l.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        store.start(request("1")).unwrap();
+        // The one reading made by `start` itself, before the task runs.
+        assert_eq!(
+            locked.load(Ordering::SeqCst),
+            1,
+            "free read before the owed read"
+        );
         store.settled().await;
     }
 
