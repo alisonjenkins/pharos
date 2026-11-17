@@ -313,7 +313,20 @@ static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
     install
 };
 
+/// Claimed by the first `register_video_at`, before it touches the folder.
+static OPENED: pharos_ui::native::ports::OpenOnce = pharos_ui::native::ports::OpenOnce::new();
+
 fn register_video_at(root: std::path::PathBuf) {
+    // The init hook and the first render both come here. A second store on
+    // the same root would run recovery over the first's staging files, and
+    // a first attempt that failed is not retried over what it left.
+    if !OPENED.claim() {
+        log::info!(
+            "pharos: port video_store verdict=already_opened dir={}",
+            root.display()
+        );
+        return;
+    }
     // The music cache counts the video's bytes against the shared cap. The
     // hook goes in first and reports the size unknown while no store is
     // registered, so a folder that cannot be created leaves the music

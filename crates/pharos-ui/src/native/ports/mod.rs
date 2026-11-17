@@ -82,6 +82,34 @@ pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
     VIDEO_STORE.get()
 }
 
+/// A claim that succeeds once. Opening the video store twice on one root
+/// is not harmless: the second open's recovery deletes the first's staging
+/// files. The phone has two callers (the media service's init hook and the
+/// first render), so each claims before it touches the folder; a failed
+/// first attempt is not retried by the second, which would open the store
+/// over whatever the first left.
+#[cfg(any(feature = "mobile", test))]
+pub struct OpenOnce(std::sync::atomic::AtomicBool);
+
+#[cfg(any(feature = "mobile", test))]
+impl OpenOnce {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// True for the first caller only.
+    pub fn claim(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(feature = "mobile", test))]
+impl Default for OpenOnce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// What the music cache is told about the video store: what it holds, still
 /// owes, and whether it knows its own size. With no store registered (its
 /// folder could not be created, or it has yet to be) nothing is known about
@@ -376,6 +404,22 @@ mod tests {
         let o = outside_bytes(None);
         assert!(o.unknown);
         assert_eq!((o.held, o.outstanding), (0, 0));
+    }
+
+    /// The init hook and the first render both register the video store;
+    /// only the first may open it.
+    #[test]
+    fn the_second_registration_does_not_open_the_store_again() {
+        let once = OpenOnce::new();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let register = || {
+            if once.claim() {
+                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        register();
+        register();
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
