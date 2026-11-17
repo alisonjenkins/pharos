@@ -255,6 +255,30 @@ impl Inner {
         true
     }
 
+    /// [`Inner::update`] for the run that owns the download: the run id is
+    /// checked under the same lock as the change, so a run that was removed
+    /// or restarted since cannot touch the record of the one that replaced
+    /// it. False when `run` no longer owns `item`.
+    fn update_run(&self, user: &str, item: &str, run: u64, f: impl FnOnce(&mut KeptVideo)) -> bool {
+        let saved = {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return false;
+            }
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return false;
+            };
+            f(v);
+            v.clone()
+        };
+        self.save_record(&saved);
+        true
+    }
+
     fn wanted(&self, user: &str, item: &str, run: u64) -> bool {
         let st = lock(&self.state);
         st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
@@ -278,7 +302,14 @@ impl Inner {
 
     /// Records progress; the record is written at most once a second
     /// unless `force`.
-    fn publish(&self, user: &str, item: &str, done: usize, total: u32, bytes: u64, force: bool) {
+    fn publish(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        (done, total, bytes): (usize, u32, u64),
+        force: bool,
+    ) {
         let done = u32::try_from(done).unwrap_or(u32::MAX);
         let due = {
             let mut st = lock(&self.state);
@@ -293,17 +324,19 @@ impl Inner {
             due
         };
         if due {
-            self.update(user, item, |v| {
+            self.update_run(user, item, run, |v| {
                 v.state = KeptState::Downloading { done, total, bytes };
             });
         } else {
             let mut st = lock(&self.state);
-            if let Some(v) = st
-                .list
-                .iter_mut()
-                .find(|v| v.user == user && v.item == item)
-            {
-                v.state = KeptState::Downloading { done, total, bytes };
+            if st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run) {
+                if let Some(v) = st
+                    .list
+                    .iter_mut()
+                    .find(|v| v.user == user && v.item == item)
+                {
+                    v.state = KeptState::Downloading { done, total, bytes };
+                }
             }
         }
     }
@@ -554,7 +587,7 @@ async fn download(
     }
     let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
     let planned = all.clone();
-    if !inner.update(user, item, |v| {
+    if !inner.update_run(user, item, run, |v| {
         v.files = planned;
         v.estimated_bytes = estimate;
         v.state = KeptState::Downloading {
@@ -578,7 +611,7 @@ async fn download(
     }
     let todo = missing_files(&all, &have);
     let mut done = all.len() - todo.len();
-    inner.publish(user, item, done, total, bytes, true);
+    inner.publish(user, item, run, (done, total, bytes), true);
 
     let short_tails = &short_tails;
     let mut results = stream::iter(todo)
@@ -587,7 +620,7 @@ async fn download(
     while let Some(result) = results.next().await {
         bytes = bytes.saturating_add(result?);
         done += 1;
-        inner.publish(user, item, done, total, bytes, false);
+        inner.publish(user, item, run, (done, total, bytes), false);
     }
     Ok((bytes, all.len()))
 }
@@ -596,9 +629,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     let started = Instant::now();
     let outcome = download(&inner, &user, &item, run).await;
     let ms = started.elapsed().as_millis();
+    let superseded = |what: &str| {
+        emit(
+            false,
+            format!("pharos: video keep stopped item={item} reason={what} ms={ms}"),
+        );
+    };
     match outcome {
         Ok((bytes, files)) => {
-            if inner.update(&user, &item, |v| {
+            if inner.update_run(&user, &item, run, |v| {
                 v.state = KeptState::Ready;
                 v.estimated_bytes = bytes;
             }) {
@@ -608,30 +647,32 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                         "pharos: video keep ready item={item} bytes={bytes} files={files} ms={ms}"
                     ),
                 );
+            } else {
+                superseded("superseded");
             }
         }
-        Err(Stop::Gone) => emit(
-            false,
-            format!("pharos: video keep stopped item={item} reason=removed ms={ms}"),
-        ),
+        Err(Stop::Gone) => superseded("removed"),
         Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
-            let (files, bytes) = {
-                let st = lock(&inner.state);
-                find(&st.list, &user, &item).map_or((0, 0), |v| {
-                    let done = match v.state {
-                        KeptState::Downloading { done, .. } => done,
-                        _ => 0,
-                    };
-                    (done, v.bytes())
-                })
-            };
-            emit(
-                true,
-                format!(
-                    "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
-                ),
-            );
-            inner.update(&user, &item, |v| v.state = KeptState::Failed { reason });
+            let (mut files, mut bytes) = (0, 0);
+            let applied = inner.update_run(&user, &item, run, |v| {
+                if let KeptState::Downloading { done, .. } = v.state {
+                    files = done;
+                }
+                bytes = v.bytes();
+                v.state = KeptState::Failed {
+                    reason: reason.clone(),
+                };
+            });
+            if applied {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
+                    ),
+                );
+            } else {
+                superseded("superseded");
+            }
         }
     }
     let mut st = lock(&inner.state);
@@ -926,9 +967,26 @@ mod tests {
         /// key -> statuses to answer before the file (`0` = no network).
         failures: Mutex<HashMap<String, Vec<u16>>>,
         asked: Mutex<Vec<String>>,
+        /// key -> a flag; the first request for the key waits for the flag
+        /// to be set, then answers 403.
+        holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     }
 
     impl FakeServer {
+        /// Holds the first request for `key` until the returned flag is set.
+        fn hold_first(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.holds.lock().unwrap().insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Waits until `key` has been asked for `times` times.
+        async fn asked_times(&self, key: &str, times: usize) {
+            while self.asked().iter().filter(|k| *k == key).count() < times {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
         fn with_stream() -> Arc<Self> {
             let s = Arc::new(Self::default());
             let mut f = s.files.lock().unwrap();
@@ -971,6 +1029,16 @@ mod tests {
         fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
             Box::pin(async move {
                 self.asked.lock().unwrap().push(key.to_owned());
+                let hold = self.holds.lock().unwrap().remove(key);
+                if let Some(flag) = hold {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    return Err(FetchError {
+                        status: Some(403),
+                        message: String::new(),
+                    });
+                }
                 if let Some(next) = {
                     let mut f = self.failures.lock().unwrap();
                     f.get_mut(key)
@@ -1383,6 +1451,28 @@ mod tests {
         assert!(store.videos("u1").is_empty());
         assert!(lines("pharos: video keep failed").is_empty());
         assert!(!rig.dir.join("u1").join("1").join("manifest.json").exists());
+    }
+
+    /// A download that was removed and started again has a new run; the
+    /// old run's late failure must not overwrite the new one's record.
+    #[tokio::test]
+    async fn a_removed_runs_late_failure_does_not_touch_the_restarted_download() {
+        let rig = Rig::new("stale-failure");
+        let release = rig.server.hold_first(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.remove("u1", "1");
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        // Let the new run finish, then the old run fail.
+        while only(&store).state != KeptState::Ready {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(lines("pharos: video keep failed").is_empty());
     }
 
     #[tokio::test]
