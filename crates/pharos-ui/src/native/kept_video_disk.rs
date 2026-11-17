@@ -145,6 +145,10 @@ struct State {
     /// no download is admitted while one exists, since the cap cannot be
     /// checked against what is on disk. Each carries the reason.
     unmeasured: Vec<(PathBuf, String)>,
+    /// Folders a `remove` is working on right now. A sweep leaves them
+    /// alone, so the removal's tombstone and mark outlive it only to the
+    /// removal's own end, never to a sweep's earlier one.
+    removing: Vec<PathBuf>,
     /// The store's root, to tell a record's folder from a tombstone's.
     root: PathBuf,
     last_saved: Option<Instant>,
@@ -391,15 +395,21 @@ impl Inner {
                 .iter()
                 .map(|(dir, _)| dir.clone())
                 .filter(|dir| {
-                    !st.list
-                        .iter()
-                        .any(|v| self.item_dir(&v.user, &v.item) == *dir)
+                    !st.removing.contains(dir)
+                        && !st
+                            .list
+                            .iter()
+                            .any(|v| self.item_dir(&v.user, &v.item) == *dir)
                 })
                 .collect()
         };
         for dir in pending {
             let outcome = (self.env.remove_dir)(&dir);
             let mut st = lock(&self.state);
+            if st.removing.contains(&dir) {
+                // A removal began while the delete ran: it owns the folder.
+                continue;
+            }
             match outcome {
                 Ok(()) => {
                     st.tombstones.retain(|(d, _)| *d != dir);
@@ -451,6 +461,7 @@ impl Inner {
         // in-removal entry go in this one hold: no admission sees neither.
         st.tombstones.retain(|(d, _)| d != dir);
         st.unmeasured.retain(|(d, _)| d != dir);
+        st.removing.retain(|d| d != dir);
         for key in &record.files {
             if let Some(len) = names.get(&file_name(key)) {
                 st.index.insert(
@@ -834,18 +845,25 @@ async fn fetch_once(
         .open(key)
         .await
         .map_err(FetchOnce::Fetch)?;
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| store_err("create the folder for", e))?;
-    }
     let part = path.with_extension(format!("{run}.part"));
-    // Created in one step, with no await to be cancelled in: a fetch that is
-    // dropped mid-create would otherwise leave the file to appear after the
-    // run's cleanup had looked for it.
-    let mut file = std::fs::File::create(&part)
-        .map(tokio::fs::File::from_std)
-        .map_err(|e| store_err("create", e))?;
+    // The folder and the staging file are created in one step, with no
+    // await to be cancelled in, and only while this run still owns the
+    // item: a removal revokes the run under the same lock, so an old run
+    // cannot bring the folder or a file back after a sweep measured it.
+    // (A write to a handle opened before the revocation lands in an
+    // unlinked file.)
+    let mut file = {
+        let st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return Err(FetchOnce::Gone);
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| store_err("create the folder for", e))?;
+        }
+        std::fs::File::create(&part)
+            .map(tokio::fs::File::from_std)
+            .map_err(|e| store_err("create", e))?
+    };
     let mut len = 0u64;
     let mut staged = Staged {
         inner,
@@ -1740,6 +1758,7 @@ impl VideoStore for DiskVideoStore {
             let dir = self.inner.item_dir(user, item);
             st.tombstones.retain(|(d, _)| *d != dir);
             st.tombstones.push((dir.clone(), reserved(&record)));
+            st.removing.push(dir.clone());
             // The reservation is an estimate, not a bound on the folder
             // (staged `.part` files, files an earlier plan left, a file
             // larger than planned), so until the folder is deleted or
@@ -1769,6 +1788,7 @@ impl VideoStore for DiskVideoStore {
             let mut st = lock(&self.inner.state);
             st.tombstones.retain(|(d, _)| *d != dir);
             st.unmeasured.retain(|(d, _)| *d != dir);
+            st.removing.retain(|d| *d != dir);
         } else {
             // The bytes still on disk keep counting against the cap until
             // a later sweep deletes the folder.
@@ -1788,6 +1808,7 @@ impl VideoStore for DiskVideoStore {
             }
             st.tombstones.retain(|(d, _)| *d != dir);
             st.tombstones.push((dir.clone(), left));
+            st.removing.retain(|d| *d != dir);
         }
         emit(
             false,
@@ -3757,6 +3778,41 @@ mod tests {
         assert!(line[0].contains("verdict=not_removed"), "{line:?}");
     }
 
+    /// A sweep that runs while a removal is deleting its folder leaves the
+    /// folder, its tombstone and its mark alone: the mark clears only when
+    /// the removal itself is done.
+    #[tokio::test]
+    async fn a_sweep_during_a_removal_leaves_its_folder_and_mark() {
+        let rig = Rig::new("sweep-during-remove");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2, dir2) = (store.clone(), seen.clone(), dir.clone());
+        let entered = std::cell::Cell::new(false);
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if entered.replace(true) {
+                    return;
+                }
+                s2.inner.sweep_tombstones();
+                seen2.set(Some((
+                    s2.size_unknown(),
+                    s2.kept_bytes(),
+                    dir2.join("files").exists(),
+                )));
+            }));
+        });
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let (unknown, kept, exists) = seen.take().unwrap();
+        assert!(unknown, "a sweep cleared the mark mid-removal");
+        assert!(kept > 0, "a sweep dropped the tombstone mid-removal");
+        assert!(exists, "a sweep deleted the folder mid-removal");
+        assert!(!store.size_unknown(), "still blocked after the removal");
+    }
+
     /// When the manifest unlink fails, the tombstone and the mark stay until
     /// the record is back: no moment in between where an admission sees
     /// neither.
@@ -3790,6 +3846,22 @@ mod tests {
         assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
         assert_eq!(store.kept_bytes(), kept, "counted twice or not at all");
         assert!(!store.size_unknown(), "the mark outlived the restore");
+    }
+
+    /// A run that a removal has revoked cannot recreate its folder or its
+    /// staging file.
+    #[tokio::test]
+    async fn a_revoked_run_cannot_recreate_its_folder() {
+        let rig = Rig::new("revoked-create");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        let path = store.inner.file_path("u1", "1", SEG0);
+        let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path).await;
+        assert!(matches!(out, Err(FetchOnce::Gone)), "{}", out.is_ok());
+        assert!(!dir.exists(), "a revoked run brought the folder back");
     }
 
     /// While a removed download's folder is being deleted its bytes still
