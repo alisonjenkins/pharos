@@ -1548,6 +1548,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     // (the files stay; a retry finds them).
                     let reason = format!("finished but its record could not be saved: {e}");
                     let _ = inner.update_run(&user, &item, run, |v| {
+                        // A Failed record reports its estimate as its bytes:
+                        // what the folder holds must not drop out of it.
+                        v.estimated_bytes = held.max(v.bytes()).max(v.estimated_bytes);
                         v.state = KeptState::Failed {
                             reason: reason.clone(),
                         };
@@ -3967,6 +3970,35 @@ mod tests {
         drop(store);
         let reopened = rig.open();
         assert_ne!(only(&reopened).state, KeptState::Ready);
+    }
+
+    /// The Failed record a failed completion save leaves still reserves what
+    /// the folder holds, when that is more than was planned.
+    #[tokio::test]
+    async fn a_failed_completion_save_keeps_what_the_folder_holds() {
+        let rig = Rig::new("complete-save-fails-bytes");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        let stray = std::fs::File::create(dir.join("files").join("stray")).unwrap();
+        stray.set_len(big).unwrap();
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert!(
+            store.kept_bytes() >= big,
+            "reserves {} of the {big} the folder holds",
+            store.kept_bytes()
+        );
     }
 
     /// A plan whose record cannot be saved at admission stops the download
