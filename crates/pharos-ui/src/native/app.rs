@@ -1908,7 +1908,9 @@ fn mark_handler(
 
 #[component]
 fn NativeApp(route: Route) -> Element {
-    let mut machine = use_signal(Machine::new);
+    // Whenever the session ends, whoever caused it, the previous user's
+    // offline identity goes with it (the machine runs the hook).
+    let mut machine = use_signal(|| Machine::new().with_session_end(offline_video::forget_user));
     // The player shows a lost connection itself; the shell under it is out
     // of sight (spec 038 FR-503).
     let connection_lost = use_memo(move || machine.read().reconnecting());
@@ -2513,26 +2515,13 @@ pub(super) fn call(route: &str, action: &str) -> CallInfo {
 /// also sends the app to sign-in.
 /// As [`settle`], for a play: the failure keeps its kind and trace id for
 /// the panel's hint and details line (038 FR-403/404).
-/// The server no longer accepts the session: the app goes to sign-in, and
-/// the previous user's offline identity goes with it, so the sign-in screen
-/// does not list their kept videos. Only when the event takes effect (the
-/// session was ready): one that arrives for a session that has since ended
-/// says nothing about the current one.
-fn apply_needs_sign_in(machine: &mut Machine) {
-    let was_ready = *machine.phase() == Phase::Ready;
-    machine.apply(Event::NeedsSignIn);
-    if was_ready && matches!(machine.phase(), Phase::SignIn { .. }) {
-        offline_video::forget_user();
-    }
-}
-
 fn settle_start<T>(
     mut machine: Signal<Machine>,
     result: Result<T, ClientError>,
 ) -> Result<T, StartFailure> {
     result.map_err(|e| {
         if e.needs_sign_in() {
-            apply_needs_sign_in(&mut machine.write());
+            machine.write().apply(Event::NeedsSignIn);
         }
         StartFailure::from_client(&e)
     })
@@ -2541,7 +2530,7 @@ fn settle_start<T>(
 fn settle<T>(mut machine: Signal<Machine>, result: Result<T, ClientError>) -> Result<T, String> {
     result.map_err(|e| {
         if e.needs_sign_in() {
-            apply_needs_sign_in(&mut machine.write());
+            machine.write().apply(Event::NeedsSignIn);
         }
         e.to_string()
     })
@@ -9031,25 +9020,35 @@ mod tests {
         assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
     }
 
-    /// A rejected session sends the app to sign-in and forgets the user; a
-    /// rejection that finds no ready session changes nothing.
+    /// However a session ends, through the machine, the previous user is
+    /// forgotten: a rejected request (as every load and play reports it), a
+    /// revoked socket; one that finds no ready session changes nothing.
     #[test]
-    fn needs_sign_in_forgets_the_user_only_when_it_takes_effect() {
+    fn a_session_that_ends_forgets_the_user_whoever_ended_it() {
+        let machine = || Machine::new().with_session_end(offline_video::forget_user);
+        let ready = |mut m: Machine| {
+            m.apply(Event::Resumed { epoch: 0 });
+            m
+        };
+        for end in [
+            Event::NeedsSignIn,
+            Event::Closed {
+                epoch: 0,
+                reason: "revoked".into(),
+            },
+        ] {
+            offline_video::remember_user("alice");
+            let mut m = ready(machine());
+            m.apply(end.clone());
+            assert!(matches!(m.phase(), Phase::SignIn { .. }), "{end:?}");
+            assert_eq!(offline_video::last_user(), None, "{end:?} kept the user");
+            assert!(offline_video::ready_for_last_user().is_empty());
+        }
+        // No ready session: the event changes nothing, the user stays.
         offline_video::remember_user("alice");
-        let mut stale = Machine::new();
-        apply_needs_sign_in(&mut stale);
-        assert_eq!(
-            offline_video::last_user().as_deref(),
-            Some("alice"),
-            "a rejection with no ready session forgot the user"
-        );
-        let mut m = Machine::new();
-        m.apply(Event::Resumed { epoch: 0 });
-        apply_needs_sign_in(&mut m);
-        assert!(matches!(m.phase(), Phase::SignIn { .. }));
-        assert_eq!(offline_video::last_user(), None, "the previous user stayed");
-        // The sign-in screen shows nobody's kept videos.
-        assert!(offline_video::ready_for_last_user().is_empty());
+        let mut m = machine();
+        m.apply(Event::NeedsSignIn);
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
     }
 
     #[test]

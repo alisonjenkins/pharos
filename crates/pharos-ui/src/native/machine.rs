@@ -96,6 +96,30 @@ const BACKOFF_BASE_MS: u32 = 500;
 /// Cap on the reconnect delay, so a restarted server is found within 30 s.
 const BACKOFF_MAX_MS: u32 = 30_000;
 
+/// What the host runs when a signed-in session ends (the app leaves Ready
+/// for sign-in), whichever event caused it. Compares equal to any other, so
+/// it does not take part in the machine's equality.
+#[derive(Clone, Copy, Default)]
+struct SessionEnd(Option<fn()>);
+
+impl std::fmt::Debug for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "SessionEnd(set)"
+        } else {
+            "SessionEnd(none)"
+        })
+    }
+}
+
+impl PartialEq for SessionEnd {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SessionEnd {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine {
     phase: Phase,
@@ -112,6 +136,7 @@ pub struct Machine {
     /// Why the last attempt failed, while connecting again after a failure
     /// that may clear by itself (server down, network gone).
     waiting: Option<String>,
+    on_session_end: SessionEnd,
 }
 
 impl Default for Machine {
@@ -130,7 +155,17 @@ impl Machine {
             reconnecting: false,
             notice: None,
             waiting: None,
+            on_session_end: SessionEnd(None),
         }
+    }
+
+    /// Runs `hook` whenever a signed-in session ends: the app leaves Ready
+    /// for sign-in, by a rejected request, a revoked socket or a sign-out.
+    /// The one place that happens, so no caller can skip it.
+    #[must_use]
+    pub fn with_session_end(mut self, hook: fn()) -> Self {
+        self.on_session_end = SessionEnd(Some(hook));
+        self
     }
 
     pub fn phase(&self) -> &Phase {
@@ -181,6 +216,16 @@ impl Machine {
     }
 
     pub fn apply(&mut self, event: Event) {
+        let was_ready = self.phase == Phase::Ready;
+        self.step(event);
+        if was_ready && matches!(self.phase, Phase::SignIn { .. }) {
+            if let Some(hook) = self.on_session_end.0 {
+                hook();
+            }
+        }
+    }
+
+    fn step(&mut self, event: Event) {
         let current = |epoch: u32| epoch == self.epoch;
         match event {
             Event::Resumed { epoch } if current(epoch) => {
