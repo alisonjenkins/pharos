@@ -833,8 +833,11 @@ async fn fetch_once(
             .map_err(|e| store_err("create the folder for", e))?;
     }
     let part = path.with_extension(format!("{run}.part"));
-    let mut file = tokio::fs::File::create(&part)
-        .await
+    // Created in one step, with no await to be cancelled in: a fetch that is
+    // dropped mid-create would otherwise leave the file to appear after the
+    // run's cleanup had looked for it.
+    let mut file = std::fs::File::create(&part)
+        .map(tokio::fs::File::from_std)
         .map_err(|e| store_err("create", e))?;
     let mut len = 0u64;
     let mut staged = Staged {
