@@ -2288,9 +2288,13 @@ impl VideoStore for DiskVideoStore {
                 return;
             };
             st.runs.remove(&(user.to_owned(), item.to_owned()));
-            for key in &record.files {
-                st.index.remove(&(user.to_owned(), key.clone()));
-            }
+            // Every file indexed under the item's folder goes, as in
+            // `prune_unplanned`: the playlists are indexed before the plan
+            // is admitted and are not in the record's files, and a folder
+            // that will not delete must not go on answering requests.
+            let files = self.inner.item_dir(user, item).join("files");
+            st.index
+                .retain(|_, (path, _)| path.parent() != Some(files.as_path()));
             // What the record reserved keeps counting, as a tombstone, from
             // the moment the record leaves the list: there is no instant
             // when the folder counts for nothing while it is deleted.
@@ -5219,6 +5223,28 @@ mod tests {
         store.settled().await;
         FAIL_REMOVE.with(|f| f.set(false));
         assert_eq!(store.videos("u1").len(), 2);
+    }
+
+    /// A download removed while it plans answers nothing afterwards: the
+    /// master playlist, indexed before the plan was admitted and so not in
+    /// the record's files, is dropped with everything else under the folder.
+    #[tokio::test]
+    async fn a_download_removed_while_planning_serves_no_playlist() {
+        let rig = Rig::new("remove-index");
+        let hold = rig.server.hold_first(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The master playlist is stored; the media playlist is held.
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        assert!(store.stored_file("u1", MASTER_KEY).is_some(), "not stored");
+        store.remove("u1", "1");
+        assert!(
+            store.stored_file("u1", MASTER_KEY).is_none(),
+            "the master playlist still answers after the removal"
+        );
+        hold.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(store.stored_file("u1", MASTER_KEY).is_none());
     }
 
     /// The retry is a new play session: every file is named afresh, the old
