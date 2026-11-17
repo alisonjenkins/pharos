@@ -2254,10 +2254,13 @@ fn NativeApp(route: Route) -> Element {
         async move {
             let api = api?;
             let info = call("shell", "me");
+            // Taken before the ask: a session that ends while it is in
+            // flight signs the user out, and the answer must not undo that.
+            let asked_at = offline_video::identity_generation();
             match retry_once("me", || api.me(&info)).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
-                    offline_video::remember_user(&me.id);
+                    offline_video::remember_user_if(asked_at, &me.id);
                     claim_queue(queue, held, &me.id);
                     Some(me)
                 }

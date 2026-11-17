@@ -265,14 +265,64 @@ fn set_flag(i: usize, v: bool) {
     FLAGS.with(|f| f[i].set(v));
 }
 
-fn set_identity(next: Identity) {
-    // A new identity state is a new chance for a cold start (only a test's
-    // restart sets Unknown) and a new refusal to log.
-    set_flag(REFUSAL_LOGGED, false);
-    if next == Identity::Unknown {
-        set_flag(COLD_TRIED, false);
+/// Counts sign-ins and sign-outs, so an answer that was asked for before
+/// one of them can tell it is out of date (see [`remember_user_if`]).
+/// Changed only under the identity lock.
+#[cfg(not(test))]
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn generation() -> u64 {
+    #[cfg(not(test))]
+    {
+        GENERATION.load(std::sync::atomic::Ordering::SeqCst)
     }
-    with_identity(|i| *i = next);
+    #[cfg(test)]
+    {
+        GENERATION.with(std::cell::Cell::get)
+    }
+}
+
+fn bump_generation() {
+    #[cfg(not(test))]
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+/// The identity's generation now: taken before asking who is signed in, and
+/// handed to [`remember_user_if`] with the answer.
+pub fn identity_generation() -> u64 {
+    with_identity(|_| generation())
+}
+
+fn set_identity(next: Identity) {
+    let _ = set_identity_if(None, next);
+}
+
+/// Sets the identity, under the identity lock, only while the generation is
+/// still `expected` (any generation with `None`), and starts a new one.
+/// Returns the generation found when it is not the expected one.
+fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
+    with_identity(|i| {
+        let now = generation();
+        if expected.is_some_and(|e| e != now) {
+            return Err(now);
+        }
+        // A new identity state is a new chance for a cold start (only a
+        // test's restart sets Unknown) and a new refusal to log.
+        set_flag(REFUSAL_LOGGED, false);
+        if next == Identity::Unknown {
+            set_flag(COLD_TRIED, false);
+        }
+        *i = next;
+        bump_generation();
+        Ok(())
+    })
 }
 
 fn read_pref() -> Result<Option<String>, String> {
@@ -391,6 +441,29 @@ pub fn last_user() -> Option<String> {
 /// preference follows, and a failed write is logged, not served around.
 pub fn remember_user(user: &str) {
     set_identity(Identity::User(user.to_owned()));
+    note_signed_in(user);
+}
+
+/// [`remember_user`] for an answer asked for at `asked_at` (from
+/// [`identity_generation`]): written only while no sign-in or sign-out has
+/// landed since, so a `me` that completes after its session ended cannot
+/// bring the previous user back. Returns whether it was written.
+pub fn remember_user_if(asked_at: u64, user: &str) -> bool {
+    match set_identity_if(Some(asked_at), Identity::User(user.to_owned())) {
+        Ok(()) => {
+            note_signed_in(user);
+            true
+        }
+        Err(now) => {
+            super::platform::info(&format!(
+                "pharos: video user verdict=not_remembered reason=identity_changed_since_asked asked_at={asked_at} now={now} user={user}"
+            ));
+            false
+        }
+    }
+}
+
+fn note_signed_in(user: &str) {
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
@@ -653,6 +726,32 @@ mod tests {
         remember_user("B");
         assert!(!serves(last_user()), "B was given A's file");
         assert_eq!(last_user().as_deref(), Some("B"));
+    }
+
+    /// A `me` asked before its session ended and answered after: the
+    /// session end's sign-out stands, and the answer is not remembered.
+    #[test]
+    fn a_me_answered_after_its_session_ended_does_not_bring_the_user_back() {
+        let p = pref();
+        remember_user("A");
+        let asked_at = identity_generation();
+        // The session ends while `me` is in flight.
+        forget_user();
+        assert!(
+            !remember_user_if(asked_at, "A"),
+            "the stale answer was written"
+        );
+        assert_eq!(last_user(), None, "the user came back after the sign-out");
+        assert!(!serves(last_user()));
+        assert_eq!(
+            p.value.borrow().as_deref(),
+            Some(""),
+            "the preference was rewritten"
+        );
+        // A `me` asked after the sign-out (the next session's) is written.
+        let asked_at = identity_generation();
+        assert!(remember_user_if(asked_at, "A"));
+        assert_eq!(last_user().as_deref(), Some("A"));
     }
 
     /// A `remember_user` whose write fails still serves that user here.
