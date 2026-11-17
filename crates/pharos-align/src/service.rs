@@ -15,7 +15,7 @@ use crate::ctc::Emission;
 use crate::line::LineSpans;
 use crate::offset::{estimate, probe_windows, shift};
 use crate::placement::{Fallback, Method, Placement};
-use crate::plan::{stamps, window, Line, Stamp};
+use crate::plan::{stamps, window, Line, SongOptions, Stamp};
 use crate::refine::{place, Song};
 use crate::stitch::stitched;
 use crate::text::words;
@@ -150,6 +150,14 @@ pub type Loader = Box<dyn Fn() -> Result<Box<dyn Model>, String> + Send + Sync>;
 
 /// One window of a file to samples; `audio::decode` outside tests.
 pub type Decoder = Box<dyn Fn(&Path, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync>;
+
+/// One window of one audio stream (absolute index); `audio::decode_stream`
+/// outside tests.
+pub type StreamDecoder =
+    Box<dyn Fn(&Path, u32, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync>;
+
+/// A decoder as the song's passes take it, whichever stream it hears.
+type Decode<'a> = dyn Fn(&Path, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync + 'a;
 
 /// Why a stage after today's pass failed: the reason the song keeps
 /// today's answer, and the error that caused it.
@@ -328,6 +336,7 @@ pub struct Engine {
     slot: Mutex<Slot>,
     loader: Loader,
     decoder: Decoder,
+    stream_decoder: Option<StreamDecoder>,
     idle_unload: Option<Duration>,
     stages: Option<Box<dyn Stages>>,
     stage_budget: Duration,
@@ -343,11 +352,21 @@ impl Engine {
             }),
             loader,
             decoder,
+            stream_decoder: None,
             idle_unload,
             stages: None,
             stage_budget: DEFAULT_STAGE_BUDGET,
             crash_guard: None,
         }
+    }
+
+    /// Decodes a named audio stream (`audio_stream` in a request) with
+    /// `decoder`; without it such a request is refused, as it could not be
+    /// heard on the stream it names.
+    #[must_use]
+    pub fn with_stream_decoder(mut self, decoder: StreamDecoder) -> Self {
+        self.stream_decoder = Some(decoder);
+        self
     }
 
     /// Runs `stages` after today's pass; without them every song keeps
@@ -410,9 +429,7 @@ impl Engine {
             .0
     }
 
-    /// [`Engine::align_song`], plus where it ran: known on failure too, so
-    /// the failure's log line names the device as the success's does.
-    /// `on` hears the song's [`Progress`] as it happens, on this thread.
+    /// [`Engine::align_song_with`] with the default [`Options`].
     pub fn align_song_on(
         &self,
         rel_path: &str,
@@ -424,6 +441,39 @@ impl Engine {
         Option<DeviceUsed>,
         Option<GpuMemory>,
     ) {
+        self.align_song_with(rel_path, full_path, lines, SongOptions::default(), on)
+    }
+
+    /// [`Engine::align_song`], plus where it ran: known on failure too, so
+    /// the failure's log line names the device as the success's does.
+    /// `on` hears the song's [`Progress`] as it happens, on this thread.
+    /// `opts` names the audio stream to hear and whether the stages run.
+    pub fn align_song_with(
+        &self,
+        rel_path: &str,
+        full_path: &Path,
+        lines: Vec<Line>,
+        opts: SongOptions,
+        on: &mut dyn FnMut(Progress<'_>),
+    ) -> (
+        Result<Aligned, SongError>,
+        Option<DeviceUsed>,
+        Option<GpuMemory>,
+    ) {
+        let stream_decode;
+        let decode: &Decode<'_> = match (opts.audio_stream, self.stream_decoder.as_ref()) {
+            (None, _) => &*self.decoder,
+            (Some(stream), Some(d)) => {
+                stream_decode = move |p: &Path, start: i64, end: i64| d(p, stream, start, end);
+                &stream_decode
+            }
+            (Some(stream), None) => {
+                let e = SongError::Internal(format!(
+                    "audio_stream {stream} asked for, but this service cannot pick a stream"
+                ));
+                return (Err(e), None, None);
+            }
+        };
         // The server's timeout runs from its request, so the wait counts.
         let budget = Budget {
             started: Instant::now(),
@@ -448,7 +498,7 @@ impl Engine {
                     (self.loader)().map(|m| (m, started.elapsed()))
                 })
             });
-            let probes = decode_probes(&self.decoder, full_path, &windows, &parent, s);
+            let probes = decode_probes(decode, full_path, &windows, &parent, s);
             (load.map(std::thread::ScopedJoinHandle::join), probes)
         });
         if let Some(loaded) = loaded {
@@ -475,8 +525,9 @@ impl Engine {
         let result = match slot.model.as_deref_mut() {
             Some(model) => {
                 model.begin_song();
-                let r = run_song(model, &self.decoder, rel_path, full_path, lines, probes, on).map(
+                let r = run_song(model, decode, rel_path, full_path, lines, probes, on).map(
                     |today| match self.stages.as_deref() {
+                        Some(_) if !opts.stages => today.kept(Fallback::NotAsked, String::new()),
                         Some(stages) => {
                             let used = model.device();
                             let guard = self.crash_guard.as_ref();
@@ -544,7 +595,7 @@ type Probe = ((i64, i64), Result<Vec<f32>, DecodeError>, u64);
 /// the slowest rather than the sum. A window that times out costs only that
 /// probe, and since all of them run together the wait is one timeout at most.
 fn decode_probes<'scope>(
-    decoder: &'scope Decoder,
+    decoder: &'scope Decode<'scope>,
     path: &'scope Path,
     windows: &'scope [(i64, i64)],
     parent: &'scope tracing::Span,
@@ -845,7 +896,7 @@ fn improve(
 
 fn run_song(
     model: &mut dyn Model,
-    decoder: &Decoder,
+    decoder: &Decode<'_>,
     rel_path: &str,
     full_path: &Path,
     lines: Vec<Line>,
