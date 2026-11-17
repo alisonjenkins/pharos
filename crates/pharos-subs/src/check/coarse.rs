@@ -87,12 +87,13 @@ impl Listener {
         let at = (voiced.len() * FLOOR_PERCENTILE / 100).min(voiced.len() - 1);
         let (_, floor, _) = voiced.select_nth_unstable(at);
         let threshold = floor.saturating_add(ABOVE_FLOOR);
-        Speech::from_frames(
-            self.levels
-                .iter()
-                .map(|&l| l > 0 && l >= threshold)
-                .collect(),
-        )
+        let loud = |l: u8| l > 0 && l >= threshold;
+        if self.levels.iter().any(|&l| loud(l)) {
+            return Speech::from_frames(self.levels.iter().map(|&l| loud(l)).collect());
+        }
+        // Every sound is within the margin of the floor (sound only between
+        // digital silences): the sound itself is the best guess at speech.
+        Speech::from_frames(self.levels.iter().map(|&l| l > 0).collect())
     }
 }
 
@@ -300,6 +301,21 @@ mod tests {
         let quiet = Speech::from_frames(vec![false; 27_000]);
         assert!(shifts(&quiet, &c, 1.0).is_empty());
         assert!(shifts(&s, &[], 1.0).is_empty());
+    }
+
+    #[test]
+    fn sound_between_digital_silences_is_speech_even_at_one_level() {
+        let mut l = Listener::new();
+        let voice: Vec<i16> = (0..FRAME * 3)
+            .map(|i| if (i / 20) % 2 == 0 { 3_000 } else { -3_000 })
+            .collect();
+        for _ in 0..4 {
+            l.push(&vec![0; FRAME * 2]);
+            l.push(&voice);
+        }
+        let s = l.finish();
+        let want: Vec<bool> = (0..20).map(|f| f % 5 >= 2).collect();
+        assert_eq!(s, Speech::from_frames(want));
     }
 
     #[test]
