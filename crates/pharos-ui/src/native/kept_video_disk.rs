@@ -256,6 +256,8 @@ enum Check {
 enum Admission {
     /// Removed or restarted meanwhile.
     Gone,
+    /// The plan was admitted in memory but its record could not be saved.
+    Unsaved(std::io::Error),
     Refused {
         refusal: KeepVideoRefusal,
         /// What the other downloads and kinds hold or have reserved.
@@ -650,8 +652,7 @@ impl Inner {
                 bytes: plan.stored,
             };
         }
-        let _ = self.save_record(user, item);
-        Ok(())
+        self.save_record(user, item).map_err(Admission::Unsaved)
     }
 
     /// Indexes a whole file for `run`; false when `run` no longer owns the
@@ -1183,6 +1184,13 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     match admitted {
         Ok(()) => {}
         Err(Admission::Gone) => return Err(Stop::Gone),
+        // A plan the disk does not hold would be lost at a restart: the
+        // download stops with the reason rather than fetching on.
+        Err(Admission::Unsaved(e)) => {
+            return Err(Stop::Failed(format!(
+                "the plan's record could not be saved: {e}"
+            )));
+        }
         Err(Admission::Refused {
             refusal,
             used,
@@ -3562,6 +3570,30 @@ mod tests {
         drop(store);
         let reopened = rig.open();
         assert_ne!(only(&reopened).state, KeptState::Ready);
+    }
+
+    /// A plan whose record cannot be saved at admission stops the download
+    /// with the save error, before any file is fetched.
+    #[tokio::test]
+    async fn a_plan_whose_record_cannot_be_saved_stops_the_download() {
+        let rig = Rig::new("plan-save-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The run has not begun: the disk goes bad between start and plan.
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("reported {:?}", only(&store).state);
+        };
+        assert!(
+            reason.contains("plan's record could not be saved"),
+            "{reason}"
+        );
+        assert!(
+            !rig.server.asked().iter().any(|k| k == SEG0),
+            "fetched on after the plan was lost"
+        );
     }
 
     /// A damaged manifest is held the same way.
