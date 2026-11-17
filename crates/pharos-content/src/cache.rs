@@ -507,6 +507,12 @@ impl Cache {
         hook.map_or_else(OutsideBytes::default, |f| f())
     }
 
+    /// What the hook in force reports, for a test to tell which hook that is.
+    #[cfg(test)]
+    pub(crate) fn outside_for_test(&self) -> OutsideBytes {
+        self.outside_bytes()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

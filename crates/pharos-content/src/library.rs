@@ -535,7 +535,7 @@ impl Library {
     /// (see [`super::cache::DEFAULT_CAP_BYTES`]). Call once after
     /// [`Library::connect`]; calling again is a no-op.
     pub fn enable_cache(&self, dir: &Path, default_cap: u64) -> Result<(), ContentError> {
-        self.enable_cache_with(dir, default_cap, || {})
+        self.enable_cache_with(dir, default_cap, || {}, || {})
     }
 
     /// [`Library::enable_cache`] with a hook that runs just before the
@@ -545,6 +545,7 @@ impl Library {
         dir: &Path,
         default_cap: u64,
         before_publish: impl FnOnce(),
+        between_read_and_apply: impl FnOnce(),
     ) -> Result<(), ContentError> {
         if self.offline.get().is_some() {
             return Ok(());
@@ -574,13 +575,19 @@ impl Library {
         });
         // After publishing, so a hook set while this ran is not missed: it
         // either saw the cache and applied itself, or is read here.
-        let outside = self
-            .outside_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(outside) = outside {
-            cache.set_outside_used(outside);
+        // The lock is held while the hook is applied, as `set_outside_used`
+        // holds it: a newer hook cannot be stored and applied in the gap
+        // between this read and this apply, only to be overwritten by the
+        // older one read here.
+        {
+            let outside = self
+                .outside_used
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            between_read_and_apply();
+            if let Some(outside) = outside.clone() {
+                cache.set_outside_used(outside);
+            }
         }
         // A `set_online` that landed before the downloader was published
         // could not reach it. Re-apply the state now it can, before pins run.
@@ -608,10 +615,13 @@ impl Library {
     /// now if it is. `used` runs under the cache's lock and must not call
     /// back into the library.
     pub fn set_outside_used(&self, used: cache::OutsideUsed) {
-        *self
+        // Stored and applied under one hold, so two callers (or this and
+        // `enable_cache`) cannot leave the cache with the older of two hooks.
+        let mut slot = self
             .outside_used
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(used.clone());
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = Some(used.clone());
         if let Some(o) = self.offline.get() {
             o.cache.set_outside_used(used);
         }
@@ -1293,7 +1303,7 @@ mod tests {
         let base = dead_server();
         let tok = std::env::temp_dir().join(format!("pharos-auto-lib-race-{}", std::process::id()));
         let lib = Library::connect_with(&base, &tok, quick()).unwrap();
-        lib.enable_cache_with(&cache_dir("race"), 1 << 20, || lib.set_online(false))
+        lib.enable_cache_with(&cache_dir("race"), 1 << 20, || lib.set_online(false), || {})
             .unwrap();
         assert!(!lib.is_online());
         assert!(!lib.offline.get().unwrap().downloader.is_online());
@@ -1343,6 +1353,49 @@ mod tests {
         // Set after: applied at once.
         lib.set_outside_used(hook(&calls));
         assert!(calls.load(Ordering::SeqCst) > after_enable);
+    }
+
+    /// A hook set while the cache is being enabled must be the one the cache
+    /// keeps: the older hook, read before it, must not be applied over it.
+    #[test]
+    fn a_newer_outside_hook_is_not_overwritten_by_an_older_one_while_enabling() {
+        let hook = |held: u64| -> cache::OutsideUsed {
+            Arc::new(move || cache::OutsideBytes {
+                held,
+                ..cache::OutsideBytes::default()
+            })
+        };
+        let tok = std::env::temp_dir().join(format!(
+            "pharos-auto-lib-outside-race-{}",
+            std::process::id()
+        ));
+        let lib = Arc::new(Library::connect_with(&dead_server(), &tok, quick()).unwrap());
+        lib.set_outside_used(hook(1));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = None;
+        lib.enable_cache_with(
+            &cache_dir("outside-race"),
+            1 << 20,
+            || {},
+            || {
+                // The older hook is read; a newer one is set now. It either
+                // waits for the enable to finish or is applied at once, and
+                // the enable would then put the older one over it.
+                let (l, d) = (lib.clone(), done.clone());
+                handle = Some(std::thread::spawn(move || {
+                    l.set_outside_used(hook(2));
+                    d.store(true, Ordering::SeqCst);
+                }));
+                let start = std::time::Instant::now();
+                while !done.load(Ordering::SeqCst) && start.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            },
+        )
+        .unwrap();
+        handle.unwrap().join().unwrap();
+        let held = lib.offline.get().unwrap().cache.outside_for_test().held;
+        assert_eq!(held, 2, "the cache kept the older hook");
     }
 
     #[test]
