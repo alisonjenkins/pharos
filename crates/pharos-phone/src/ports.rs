@@ -314,6 +314,11 @@ static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
 };
 
 fn register_video_at(root: std::path::PathBuf) {
+    // The music cache counts the video's bytes against the shared cap. The
+    // hook goes in first and reports the size unknown while no store is
+    // registered, so a folder that cannot be created leaves the music
+    // refused, not counted as free of video.
+    pharos_android::set_outside_used(pharos_ui::native::ports::outside_bytes_hook());
     if let Err(e) = std::fs::create_dir_all(&root) {
         log::warn!(
             "pharos: port video_store verdict=not_registered reason=no_folder dir={} error={e}",
@@ -321,8 +326,6 @@ fn register_video_at(root: std::path::PathBuf) {
         );
         return;
     }
-    // The music cache counts the video's bytes against the shared cap.
-    pharos_android::set_outside_used(pharos_ui::native::ports::outside_bytes_hook());
     let budget = Arc::new(PhoneBudget { dir: root.clone() });
     match pharos_ui::native::register_phone_video_store(root.clone(), budget) {
         Ok(()) => log::info!(

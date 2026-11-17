@@ -82,38 +82,35 @@ pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
     VIDEO_STORE.get()
 }
 
-/// Bytes the registered video store holds or has reserved, for every user;
-/// 0 when none is registered. The phone counts them against the cap it
-/// shares with the music cache.
-pub fn kept_video_bytes() -> u64 {
-    video_store().map_or(0, |s| s.kept_bytes())
+/// What the music cache is told about the video store: what it holds, still
+/// owes, and whether it knows its own size. With no store registered (its
+/// folder could not be created, or it has yet to be) nothing is known about
+/// what the video holds on disk, so the size is unknown and the music cache
+/// admits nothing, rather than reading the absence as zero usage.
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes(
+    store: Option<&dyn super::kept_video::VideoStore>,
+) -> pharos_content::OutsideBytes {
+    match store {
+        Some(s) => pharos_content::OutsideBytes {
+            held: s.kept_bytes(),
+            outstanding: s.outstanding_bytes(),
+            unknown: s.size_unknown(),
+        },
+        None => pharos_content::OutsideBytes {
+            held: 0,
+            outstanding: 0,
+            unknown: true,
+        },
+    }
 }
 
-/// Bytes the registered video store is admitted for but has yet to write,
-/// for every user; 0 when none is registered. The phone takes them off the
-/// free space before the music cache's low-disk guard.
-pub fn kept_video_outstanding() -> u64 {
-    video_store().map_or(0, |s| s.outstanding_bytes())
-}
-
-/// Whether the registered video store holds a folder of unknown size, in
-/// which case the music cache admits nothing either; false when none is
-/// registered.
-pub fn kept_video_size_unknown() -> bool {
-    video_store().is_some_and(|s| s.size_unknown())
-}
-
-/// The hook the phone registers with the music cache: what the registered
-/// video store holds, still owes, and whether it knows its own size. The
-/// phone registers exactly this (`pharos-phone` cannot host a test, being
+/// The hook the phone registers with the music cache (see `outside_bytes`).
+/// The phone registers exactly this (`pharos-phone` cannot host a test, being
 /// Android-only), and the integration tests call it too.
 #[cfg(any(feature = "mobile", test))]
 pub fn outside_bytes_hook() -> pharos_content::OutsideUsed {
-    Arc::new(|| pharos_content::OutsideBytes {
-        held: kept_video_bytes(),
-        outstanding: kept_video_outstanding(),
-        unknown: kept_video_size_unknown(),
-    })
+    Arc::new(|| outside_bytes(video_store().as_deref()))
 }
 
 /// What the host app runs when the user signs in or out, so a second client
@@ -370,6 +367,15 @@ mod tests {
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn count() {
         RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A store that failed to register (its folder could not be created)
+    /// leaves the video's bytes unknown, not zero: the music cache refuses.
+    #[test]
+    fn no_registered_video_store_reads_as_unknown_not_empty() {
+        let o = outside_bytes(None);
+        assert!(o.unknown);
+        assert_eq!((o.held, o.outstanding), (0, 0));
     }
 
     #[test]
