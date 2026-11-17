@@ -286,15 +286,33 @@ impl Budget for PhoneBudget {
 /// from the activity, which is there by then, and the first screen then
 /// sees the store.
 pub fn register_video() {
-    let root = match crate::activity::files_dir() {
-        Ok(dir) => dir.join("video"),
-        Err(e) => {
-            log::warn!(
-                "pharos: port video_store verdict=not_registered reason=no_files_dir error={e}"
-            );
-            return;
-        }
-    };
+    match crate::activity::files_dir() {
+        Ok(dir) => register_video_at(dir.join("video")),
+        Err(e) => log::warn!(
+            "pharos: port video_store verdict=not_registered reason=no_files_dir error={e}"
+        ),
+    }
+}
+
+/// What the media service runs when it connects the library, so a process
+/// the car started with no activity (where `register_video` never runs)
+/// still counts the video's bytes before music prefetches.
+fn accounting_init(files: &str) {
+    register_video_at(std::path::Path::new(files).join("video"));
+}
+
+/// Installs `accounting_init` in `pharos_android` as this library loads: a
+/// service-only process runs none of the app's own start-up.
+#[used]
+#[link_section = ".init_array"]
+static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
+    extern "C" fn install() {
+        pharos_android::set_init_hook(accounting_init);
+    }
+    install
+};
+
+fn register_video_at(root: std::path::PathBuf) {
     if let Err(e) = std::fs::create_dir_all(&root) {
         log::warn!(
             "pharos: port video_store verdict=not_registered reason=no_folder dir={} error={e}",
@@ -310,7 +328,7 @@ pub fn register_video() {
             "pharos: port video_store verdict=registered dir={}",
             root.display()
         ),
-        Err(e) => log::warn!("pharos: port video_store verdict=not_registered reason={e}"),
+        Err(e) => log::info!("pharos: port video_store verdict=already_registered reason={e}"),
     }
 }
 

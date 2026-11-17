@@ -52,7 +52,7 @@ pub use resume::saved_ms as saved_resume_ms;
 pub use runtime::{runtime, Player};
 use search::*;
 use service::*;
-pub use service::{files_dir, set_outside_used};
+pub use service::{files_dir, set_init_hook, set_outside_used};
 use session::*;
 
 use std::path::Path;
@@ -441,6 +441,17 @@ mod tests {
         let waited = wait_until_set(&slot, &set, std::time::Duration::from_secs(5))?;
         assert!(waited.is_some_and(|w| w < std::time::Duration::from_secs(1)));
         Ok(())
+    }
+
+    #[test]
+    fn prefetch_is_refused_until_the_video_accounting_is_installed() {
+        assert_eq!(
+            service::prefetch_refusal(false),
+            Some("video accounting is not installed")
+        );
+        assert_eq!(service::prefetch_refusal(true), None);
+        // Nothing in this process installed it.
+        assert!(!service::accounting_installed());
     }
 
     #[test]

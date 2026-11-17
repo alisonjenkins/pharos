@@ -25,6 +25,29 @@ pub fn set_outside_used(used: content::OutsideUsed) {
     let _ = OUTSIDE_USED.set(used);
 }
 
+/// What the app runs, with the files directory, when the library is
+/// connected: it registers the video accounting (`set_outside_used` and the
+/// video store). The app's own start-up does not run in a process the car
+/// started with no activity, so the app fills this slot as its library
+/// loads. Set once.
+static INIT_HOOK: OnceLock<fn(&str)> = OnceLock::new();
+
+pub fn set_init_hook(hook: fn(&str)) {
+    let _ = INIT_HOOK.set(hook);
+}
+
+/// Whether the video's bytes are counted against the music cache. Music
+/// is not prefetched before they are: it would spend room an admitted
+/// video needs.
+pub(crate) fn accounting_installed() -> bool {
+    OUTSIDE_USED.get().is_some()
+}
+
+/// Why prefetch must not run, when it must not.
+pub(crate) fn prefetch_refusal(installed: bool) -> Option<&'static str> {
+    (!installed).then_some("video accounting is not installed")
+}
+
 /// The app's private files directory (`Context.getFilesDir`).
 pub fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
     let dir = env
@@ -85,6 +108,11 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         &content::credentials::token_path(Path::new(&files)),
     )
     .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
+    // Before the cache is enabled or anything prefetches: the app's video
+    // accounting, in a process that never ran the app's own start-up.
+    if let Some(hook) = INIT_HOOK.get() {
+        hook(&files);
+    }
     lib.on_auth_change(|_| notify_changed());
     let auth = match lib.auth_state() {
         content::AuthState::SignedOut => "signed_out",
