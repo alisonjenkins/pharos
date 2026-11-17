@@ -2200,11 +2200,19 @@ fn prune_unplanned(
         if keep.contains(&name) {
             continue;
         }
-        if std::fs::remove_file(files.join(&name)).is_ok() {
+        let path = files.join(&name);
+        if std::fs::remove_file(&path).is_ok() {
             removed += 1;
             bytes = bytes.saturating_add(len);
         } else {
-            left = left.saturating_add(len);
+            // An entry that is a folder lists at its own size, not what it
+            // holds: what stays counts at its whole measure.
+            let held = if path.is_dir() {
+                dir_size(&path).bytes.max(len)
+            } else {
+                len
+            };
+            left = left.saturating_add(held);
         }
     }
     if !complete {
