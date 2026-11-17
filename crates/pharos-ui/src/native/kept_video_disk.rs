@@ -177,6 +177,11 @@ struct State {
     /// whole, so they are unknown meanwhile. A fact, so accounting does not
     /// depend on a cleanup having worked.
     leftover: Vec<PathBuf>,
+    /// Folders whose leftover a sweep is settling right now. One settlement
+    /// per folder at a time, and `start` refuses a folder in it: a second
+    /// sweep (or a retry) would otherwise act on what the first one saw
+    /// before the folder changed.
+    settling: Vec<PathBuf>,
     /// The last measurement of each tombstoned folder: the epoch it was
     /// taken at, and whether the walk read everything.
     measured: HashMap<PathBuf, (u64, bool)>,
@@ -579,53 +584,113 @@ impl Inner {
     /// writer in one, the files are deleted if no run owns the item, and
     /// the folder is then measured whole (staging files included); read in
     /// full, its bytes are taken into the figure that counts for it (the
-    /// record's reservation, or the tombstone's) and the fact clears. A
-    /// folder that cannot be read whole stays unknown.
+    /// record's reservation, saved, or the tombstone's) and the fact clears.
+    /// A folder that cannot be read whole, or whose save failed, stays
+    /// unknown. One settlement per folder at a time.
     fn settle_leftovers(&self) {
         let dirs: Vec<PathBuf> = {
             let st = lock(&self.state);
             st.leftover
                 .iter()
-                .filter(|d| !st.writing(d) && !st.removing.contains(d))
+                .filter(|d| !st.writing(d) && !st.removing.contains(d) && !st.settling.contains(d))
                 .cloned()
                 .collect()
         };
         for dir in dirs {
-            let owned = {
-                let st = lock(&self.state);
-                st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir)
+            let claimed = {
+                let mut st = lock(&self.state);
+                if st.settling.contains(&dir) || st.writing(&dir) || st.removing.contains(&dir) {
+                    None
+                } else {
+                    st.settling.push(dir.clone());
+                    let owned = st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir);
+                    Some((st.epoch(&dir), owned))
+                }
             };
-            if !owned {
-                let _ = drop_parts_of(&dir, None);
-            }
-            let measured = dir_size(&dir);
-            let mut st = lock(&self.state);
-            if !measured.exact || st.writing(&dir) || st.removing.contains(&dir) {
+            let Some((epoch, owned)) = claimed else {
                 continue;
+            };
+            self.settle_claimed(&dir, epoch, owned);
+            lock(&self.state).settling.retain(|d| *d != dir);
+        }
+    }
+
+    /// Whether `dir` is still as a settlement that began at `epoch` found
+    /// it: no writer, no removal, no move of its epoch.
+    fn unchanged_since(st: &State, dir: &Path, epoch: u64) -> bool {
+        st.epoch(dir) == epoch && !st.writing(dir) && !st.removing.iter().any(|d| d == dir)
+    }
+
+    fn settle_claimed(&self, dir: &Path, epoch: u64, owned: bool) {
+        #[cfg(test)]
+        tests::before_settle_drop();
+        if !owned {
+            self.drop_parts_settling(dir, epoch);
+        }
+        let measured = dir_size(dir);
+        #[cfg(test)]
+        tests::during_measure();
+        let (record, saved_floor) = {
+            let mut st = lock(&self.state);
+            if !measured.exact || !Self::unchanged_since(&st, dir, epoch) {
+                return;
             }
             let record = st
                 .list
                 .iter()
                 .position(|v| st.dir_of(&v.user, &v.item) == dir);
-            let tomb = st.tombstones.iter().position(|(d, _)| *d == dir);
+            let tomb = st.tombstones.iter().position(|(d, _)| d == dir);
+            let mut ident = None;
             if let Some(i) = record {
                 let v = &mut st.list[i];
                 v.estimated_bytes = v.estimated_bytes.max(measured.bytes);
+                ident = Some((v.user.clone(), v.item.clone()));
             }
             if let Some(i) = tomb {
                 st.tombstones[i].1 = st.tombstones[i].1.max(measured.bytes);
             }
-            st.leftover.retain(|d| *d != dir);
-            drop(st);
-            emit(
-                false,
-                format!(
-                    "pharos: video keep leftover settled dir={} bytes={}",
-                    dir.display(),
-                    measured.bytes
-                ),
-            );
+            (ident, measured.bytes)
+        };
+        // The larger reservation must be on disk before the fact clears: a
+        // restart would otherwise read the old, smaller one.
+        if let Some((user, item)) = &record {
+            if self.save_record(user, item).is_err() {
+                return;
+            }
         }
+        let mut st = lock(&self.state);
+        if !Self::unchanged_since(&st, dir, epoch) {
+            return;
+        }
+        st.leftover.retain(|d| d != dir);
+        drop(st);
+        emit(
+            false,
+            format!(
+                "pharos: video keep leftover settled dir={} bytes={saved_floor}",
+                dir.display()
+            ),
+        );
+    }
+
+    /// Deletes the staging files in `dir`, each under the state lock after
+    /// checking again that no run owns the folder and nothing moved its
+    /// epoch since the settlement began: a retry's new file is never taken.
+    fn drop_parts_settling(&self, dir: &Path, epoch: u64) -> bool {
+        let (paths, mut clean) = part_paths(dir, ".part");
+        for path in paths {
+            let st = lock(&self.state);
+            let owned = st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir);
+            if owned || !Self::unchanged_since(&st, dir, epoch) {
+                return false;
+            }
+            match remove_part(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => clean = false,
+            }
+        }
+        clean
     }
 
     /// Measures a tombstoned folder and records the figure, unless something
@@ -2104,7 +2169,7 @@ impl VideoStore for DiskVideoStore {
                 .and_then(|()| {
                     // The folder is being swept: a download begun in it now
                     // would have its files deleted.
-                    if st.deleting.contains(&dir) {
+                    if st.deleting.contains(&dir) || st.settling.contains(&dir) {
                         Err(KeepVideoRefusal::Host(format!(
                             "{} is being cleaned up, try again in a moment",
                             dir.display()
@@ -2138,6 +2203,9 @@ impl VideoStore for DiskVideoStore {
                         st.drop_tombstone(&dir);
                     }
                     insert_front(&mut st.list, record);
+                    // A settlement that began before this start must not act
+                    // on the folder as it saw it.
+                    st.bump(&dir);
                     Ok(())
                 });
             (started, used)
@@ -2385,9 +2453,20 @@ mod tests {
     }
 
     thread_local! {
+        /// Runs once a settlement has claimed its folder, before it drops a
+        /// staging file.
+        static BEFORE_SETTLE_DROP: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
         /// While set, reading a directory entry fails after the directory
         /// opened.
         pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn before_settle_drop() {
+        BEFORE_SETTLE_DROP.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     /// An entry as read from a listing; a test can make the read fail.
@@ -4625,8 +4704,10 @@ mod tests {
             "the leftover file went uncounted: kept {}",
             store.kept_bytes()
         );
-        // Later the file goes, and a sweep resolves the folder.
+        // Later the file goes and the record can be written again, and a
+        // sweep resolves the folder.
         FAIL_PART_DELETE.with(|f| f.set(false));
+        std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
         store.inner.sweep_tombstones();
         assert!(!store.size_unknown(), "the sweep did not resolve it");
         assert!(
@@ -4637,18 +4718,147 @@ mod tests {
         // files; the figure keeps what it held.)
     }
 
-    /// A directory entry that cannot be read may be a staging file: the
-    /// clean-up is not clean.
-    #[test]
-    fn an_unreadable_entry_makes_the_clean_up_not_clean() {
-        let dir = std::env::temp_dir().join(format!("kvd-entry-{}", std::process::id()));
+    /// A tombstoned folder with a leftover and a big file in it, for the
+    /// settlement tests; returns the store and the folder.
+    async fn tomb_with_leftover(name: &str) -> (Rig, Arc<DiskVideoStore>, PathBuf) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        lock(&store.inner.state).leftover.push(dir.clone());
+        (rig, store, dir)
+    }
+
+    type Hook = std::thread::LocalKey<RefCell<Option<Box<dyn Fn()>>>>;
+
+    fn set_hook(hook: &'static Hook, f: impl Fn() + 'static) {
+        hook.with(|d| *d.borrow_mut() = Some(Box::new(f)));
+    }
+
+    fn clear_hook(hook: &'static Hook) {
+        hook.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A walk that a writer's start and stop overtook is not taken: the
+    /// leftover stays until a walk made after the last change.
+    #[tokio::test]
+    async fn a_settlement_overtaken_by_a_change_applies_nothing() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-stale").await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&DURING_MEASURE, move || {
+            if !once.replace(true) {
+                lock(&s2.inner.state).bump(&d2);
+            }
+        });
+        let before = store.kept_bytes();
+        store.inner.settle_leftovers();
+        clear_hook(&DURING_MEASURE);
+        assert!(
+            lock(&store.inner.state).leftover.contains(&dir),
+            "a stale walk cleared the leftover"
+        );
+        assert_eq!(
+            store.kept_bytes(),
+            before,
+            "a stale walk changed the figure"
+        );
+        store.inner.settle_leftovers();
+        assert!(
+            !lock(&store.inner.state).leftover.contains(&dir),
+            "a walk made after the change did not settle it"
+        );
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// While one sweep settles a folder, a second sweep does not, and a
+    /// start in it is refused: the first sweep's view cannot go stale under
+    /// a settlement and a retry.
+    #[tokio::test]
+    async fn one_settlement_per_folder_and_a_start_waits_for_it() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-once").await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen2 = seen.clone();
+        set_hook(&BEFORE_SETTLE_DROP, move || {
+            s2.inner.settle_leftovers();
+            seen2
+                .borrow_mut()
+                .push(lock(&s2.inner.state).leftover.contains(&d2));
+            seen2.borrow_mut().push(s2.start(request("1")).is_err());
+        });
+        store.inner.settle_leftovers();
+        clear_hook(&BEFORE_SETTLE_DROP);
+        assert_eq!(
+            *seen.borrow(),
+            vec![true, true],
+            "the nested sweep settled the folder, or the start got in"
+        );
+        assert!(lock(&store.inner.state).settling.is_empty());
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// A staging file that appears after a settlement began (a retry's) is
+    /// not deleted by it: ownership and the epoch are checked again before
+    /// each file goes.
+    #[tokio::test]
+    async fn a_settlement_never_deletes_a_file_made_after_it_began() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-drop").await;
+        let (s2, d2) = (store.clone(), dir.clone());
+        let fresh = dir.join("files").join("new.9.part");
+        let f2 = fresh.clone();
+        set_hook(&BEFORE_SETTLE_DROP, move || {
+            std::fs::create_dir_all(d2.join("files")).unwrap();
+            std::fs::write(&f2, b"retry").unwrap();
+            lock(&s2.inner.state).bump(&d2);
+        });
+        store.inner.settle_leftovers();
+        clear_hook(&BEFORE_SETTLE_DROP);
+        assert!(fresh.exists(), "the retry's staging file was deleted");
+        assert!(lock(&store.inner.state).leftover.contains(&dir));
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// The larger reservation is saved before the fact clears; a failed
+    /// save keeps the leftover.
+    #[tokio::test]
+    async fn a_leftover_clears_only_once_the_reservation_is_saved() {
+        let rig = Rig::new("settle-save");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
         std::fs::create_dir_all(dir.join("files")).unwrap();
-        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
-        FAIL_ENTRY_READ.with(|f| f.set(true));
-        let clean = drop_parts_of(&dir, None);
-        FAIL_ENTRY_READ.with(|f| f.set(false));
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(!clean, "an entry read error counted as clean");
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        std::fs::write(
+            dir.join("big.bin"),
+            vec![0u8; usize::try_from(big).unwrap()],
+        )
+        .unwrap();
+        lock(&store.inner.state).leftover.push(dir.clone());
+        // The manifest cannot be replaced.
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.inner.settle_leftovers();
+        assert!(
+            lock(&store.inner.state).leftover.contains(&dir),
+            "the leftover cleared with the save failing"
+        );
+        std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
+        store.inner.settle_leftovers();
+        assert!(!lock(&store.inner.state).leftover.contains(&dir));
+        let on_disk: KeptVideo =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert!(
+            on_disk.estimated_bytes >= big,
+            "the new reservation is not on disk"
+        );
     }
 
     /// At open, a staging file that will not go keeps the folder unknown.
@@ -4669,6 +4879,20 @@ mod tests {
         FAIL_PART_DELETE.with(|f| f.set(false));
         store.inner.sweep_tombstones();
         assert!(!store.size_unknown(), "the sweep did not resolve it");
+    }
+
+    /// A directory entry that cannot be read may be a staging file: the
+    /// clean-up is not clean.
+    #[test]
+    fn an_unreadable_entry_makes_the_clean_up_not_clean() {
+        let dir = std::env::temp_dir().join(format!("kvd-entry-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        let clean = drop_parts_of(&dir, None);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!clean, "an entry read error counted as clean");
     }
 
     /// A same-item retry takes over a folder that would not delete: the
