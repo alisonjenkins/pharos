@@ -699,6 +699,22 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             inner.record_file(user, item, run, key, inner.file_path(user, item, key), *len);
         }
     }
+    if resume {
+        // The cap was met when the download began and its own bytes are
+        // already counted; what is still to come needs room, and an
+        // unreadable measure (0) is no room.
+        let free = inner.env.budget.free_bytes();
+        let remaining = estimate.saturating_sub(bytes);
+        if let Err(refusal) = fits(remaining, 0, u64::MAX, free) {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason={refusal} resume=true remaining={remaining} stored={bytes} free={free}"
+                ),
+            );
+            return Err(Stop::Refused(refusal.to_string()));
+        }
+    }
     let todo = missing_files(&all, &have);
     let mut done = all.len() - todo.len();
     inner.publish(user, item, run, (done, total, bytes), true);
@@ -1591,6 +1607,41 @@ mod tests {
 
     /// A file in flight when the download fails is dropped half staged;
     /// the run takes its staging file with it.
+    /// A download resumed after a restart is held to the free-space guard
+    /// for what is left to fetch, and 0 free (an unreadable measure) is no
+    /// room.
+    #[tokio::test]
+    async fn a_resumed_download_needs_room_for_what_is_left() {
+        for free in [0, FREE_GUARD_BYTES + 100] {
+            let rig = Rig::new("resume-room");
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            let gone = store.stored_file(SEG1).unwrap().path;
+            drop(store);
+            std::fs::remove_file(gone).unwrap();
+            rig.server.asked.lock().unwrap().clear();
+            rig.budget.free.store(free, Ordering::SeqCst);
+
+            let store = rig.open();
+            store.settled().await;
+            let KeptState::Failed { reason } = only(&store).state else {
+                panic!("free={free}: a resume without room went on");
+            };
+            assert!(reason.contains("guard"), "{reason}");
+            assert!(rig.server.asked().is_empty(), "nothing was fetched");
+            let refused = lines("pharos: video keep refused");
+            assert!(
+                refused.len() == 1
+                    && refused[0].contains("resume=true")
+                    && refused[0].contains(&format!("free={free}")),
+                "{refused:?}"
+            );
+            // The stored files stay: with room again the copy finishes.
+            assert!(store.stored_file(SEG0).is_some());
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_download_leaves_no_staging_file_behind() {
         let rig = Rig::new("parts");
