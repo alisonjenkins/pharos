@@ -219,6 +219,13 @@ struct State {
     /// sweep (or a retry) would otherwise act on what the first one saw
     /// before the folder changed.
     settling: Vec<PathBuf>,
+    /// Folders whose run is publishing its terminal record, one entry per
+    /// run. From before the run measures the folder until its terminal
+    /// figure and any leftover are published, in one hold, a settlement
+    /// leaves the folder alone: one in between would measure the staging
+    /// files, clear the leftover, and then have the terminal figure (which
+    /// counts no staging file) replace its measure.
+    terminating: Vec<PathBuf>,
     /// The last measurement of each tombstoned folder: the epoch it was
     /// taken at, and whether the walk read everything.
     measured: HashMap<PathBuf, (u64, bool)>,
@@ -757,14 +764,30 @@ impl Inner {
             let st = lock(&self.state);
             st.leftover
                 .iter()
-                .filter(|d| !st.writing(d) && !st.removing.contains(d) && !st.settling.contains(d))
+                .filter(|d| {
+                    !st.writing(d)
+                        && !st.removing.contains(d)
+                        && !st.settling.contains(d)
+                        && !st.terminating.contains(d)
+                })
                 .cloned()
                 .collect()
         };
         for dir in dirs {
             let claimed = {
                 let mut st = lock(&self.state);
-                if st.settling.contains(&dir) || st.writing(&dir) || st.removing.contains(&dir) {
+                if st.settling.contains(&dir)
+                    || st.writing(&dir)
+                    || st.removing.contains(&dir)
+                    || st.terminating.contains(&dir)
+                {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep leftover settle verdict=skipped dir={} reason=busy",
+                            dir.display()
+                        ),
+                    );
                     None
                 } else {
                     st.settling.push(dir.clone());
@@ -789,9 +812,13 @@ impl Inner {
     }
 
     /// Whether `dir` is still as a settlement that began at `epoch` found
-    /// it: no writer, no removal, no move of its epoch.
+    /// it: no writer, no removal, no run publishing its terminal record, no
+    /// move of its epoch.
     fn unchanged_since(st: &State, dir: &Path, epoch: u64) -> bool {
-        st.epoch(dir) == epoch && !st.writing(dir) && !st.removing.iter().any(|d| d == dir)
+        st.epoch(dir) == epoch
+            && !st.writing(dir)
+            && !st.removing.iter().any(|d| d == dir)
+            && !st.terminating.iter().any(|d| d == dir)
     }
 
     fn settle_claimed(&self, dir: &Path, epoch: u64, owned: bool) {
@@ -2578,6 +2605,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             format!("pharos: video keep stopped item={item} reason={what} ms={ms}"),
         );
     };
+    // From here until the terminal figure is published, a settlement
+    // leaves the folder alone, and one already measuring it does not count:
+    // the figure below counts no staging file and would replace its measure.
+    {
+        let dir = inner.item_dir(&user, &item);
+        let mut st = lock(&inner.state);
+        st.bump(&dir);
+        st.terminating.push(dir);
+    }
     // What the item's folder holds now, whatever plan the files are of.
     let disk = disk_bytes(&inner.item_dir(&user, &item));
     let held = disk.bytes;
@@ -2669,6 +2705,8 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 ),
             );
             cleaned = Some(clean);
+            #[cfg(test)]
+            tests::before_failed_update();
             let (mut files, mut bytes) = (0, 0);
             let applied = inner.update_run(&user, &item, run, |v| {
                 // Not durable when the save fails (logged by `save_record`):
@@ -2710,6 +2748,12 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             if !st.leftover.contains(&dir) {
                 st.leftover.push(dir);
             }
+        }
+        // The terminal figure is out and the leftover with it: settlement
+        // may measure the folder again.
+        let dir = inner.item_dir(&user, &item);
+        if let Some(i) = st.terminating.iter().position(|d| *d == dir) {
+            st.terminating.remove(i);
         }
         let owned = st.runs.get(&(user.clone(), item.clone())) == Some(&run);
         if owned {
@@ -3872,6 +3916,20 @@ mod tests {
 
     pub(super) fn before_start_rollback() {
         BEFORE_START_ROLLBACK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a failed download has dropped (or failed to drop) its
+        /// staging files, before its Failed record is published.
+        pub(super) static BEFORE_FAILED_UPDATE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_failed_update() {
+        BEFORE_FAILED_UPDATE.with(|d| {
             if let Some(f) = d.borrow().as_ref() {
                 f();
             }
@@ -7661,6 +7719,76 @@ mod tests {
                 assert!(!part.exists(), "the cancelled fetch's file stayed");
             }
         }
+    }
+
+    /// A failed download whose cancelled staging file will not go marks its
+    /// folder unknown, then publishes its Failed figure, which counts no
+    /// staging file. A sweep landing between the two must not measure the
+    /// file, clear the mark and have the smaller figure replace its
+    /// measure: the folder stays unknown until the figure is out.
+    #[tokio::test]
+    async fn a_sweep_between_a_failure_and_its_figure_leaves_the_folder_unknown() {
+        let rig = Rig::new("failed-parts-sweep");
+        let _gate = rig.server.hold_mid_body(SEG0);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let files = rig.dir.join("u1").join("1").join("files");
+        // The held segment's staging file: one a playlist staged while
+        // planning is renamed into place before the failure.
+        let seg0 = file_name(SEG0);
+        let part = || {
+            std::fs::read_dir(&files).ok().and_then(|r| {
+                r.flatten().map(|e| e.path()).find(|p| {
+                    p.extension().is_some_and(|x| x == "part")
+                        && p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with(&seg0))
+                })
+            })
+        };
+        let mut waited = 0;
+        let part = loop {
+            if let Some(p) = part() {
+                break p;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "the held segment staged no file");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        // Larger than the plan's whole estimate.
+        let big = 20_000_000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .unwrap()
+            .set_len(big)
+            .unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let s1 = store.clone();
+        set_hook(&BEFORE_FAILED_UPDATE, move || {
+            s1.inner.settle_leftovers(Sweep::Ordinary);
+        });
+        let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+        let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+        set_hook(&AFTER_FAILED_SAVE, move || {
+            let on_disk = dir_size(&files2).bytes;
+            let refused = lock(&s2.inner.state).unknown_folder().is_some();
+            *seen2.borrow_mut() = Some((refused, s2.kept_bytes(), on_disk));
+        });
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        clear_hook(&BEFORE_FAILED_UPDATE);
+        clear_hook(&AFTER_FAILED_SAVE);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        let (refused, kept, on_disk) = (*seen.borrow()).expect("the download did not fail");
+        assert!(
+            refused || kept >= on_disk,
+            "the sweep cleared the mark and the figure fell to {kept} with {on_disk} on disk"
+        );
+        assert!(
+            lock(&store.inner.state).terminating.is_empty(),
+            "the terminal mark outlived the run"
+        );
     }
 
     /// An interrupted download (a segment missing) with an old run's
