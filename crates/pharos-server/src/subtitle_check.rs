@@ -492,19 +492,20 @@ impl Measured {
         Some(serde_json::json!({ "stages": stages }).to_string())
     }
 
-    /// The stage-2 timings tried, `offset@ratio:median/decoy` each, for the log.
+    /// The stage-2 timings tried, for the log: `offset@ratio:median/decoy`
+    /// and every probe and decoy score (FR-020), `; `-separated.
     fn stage2_summary(&self, t: &Thresholds) -> String {
         self.stage2
             .iter()
             .map(|(_, c)| {
                 let f = c.fit(t);
                 format!(
-                    "{}@{:.5}:{:.2}/{:.2}",
-                    c.offset_ms, c.ratio, f.median, f.decoy
+                    "{}@{:.5}:{:.2}/{:.2} probes={:?} decoys={:?}",
+                    c.offset_ms, c.ratio, f.median, f.decoy, c.probes, c.decoys
                 )
             })
             .collect::<Vec<_>>()
-            .join(" ")
+            .join("; ")
     }
 }
 
