@@ -104,6 +104,9 @@ pub struct Env {
     pub now: fn() -> String,
     /// The runtime the downloads run on.
     pub runtime: tokio::runtime::Handle,
+    /// Deletes a folder and what is in it (`std::fs::remove_dir_all`; a
+    /// test makes it fail).
+    pub remove_dir: fn(&Path) -> std::io::Result<()>,
 }
 
 /// Why a download stopped before it was ready.
@@ -130,6 +133,12 @@ struct State {
     /// disk already, so the free space lacks them, but not yet in the
     /// record's stored bytes.
     staged: HashMap<(String, String), u64>,
+    /// Folders of removed downloads that could not be deleted, with the
+    /// bytes left in them: counted against the cap until a later sweep
+    /// deletes them.
+    tombstones: Vec<(PathBuf, u64)>,
+    /// The store's root, to tell a record's folder from a tombstone's.
+    root: PathBuf,
     last_saved: Option<Instant>,
 }
 
@@ -258,6 +267,25 @@ fn reserved(v: &KeptVideo) -> u64 {
 }
 
 impl State {
+    /// Bytes in the folders of removed downloads that would not delete,
+    /// leaving out one a live record has since taken over.
+    fn tombstoned(&self) -> u64 {
+        self.tombstones
+            .iter()
+            .filter(|(dir, _)| {
+                !self
+                    .list
+                    .iter()
+                    .any(|v| self.root.join(safe_name(&v.user)).join(safe_name(&v.item)) == *dir)
+            })
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+    }
+
+    /// Every video's reservation but `item`'s own, and the tombstones'.
+    fn reserved_by_others(&self, user: &str, item: &str) -> u64 {
+        reserved_by_others(&self.list, user, item).saturating_add(self.tombstoned())
+    }
+
     /// What the other running downloads have yet to write: their estimate
     /// less what they have stored whole and what they have staged. The free
     /// space already lacks what is on disk, so only the rest is still to
@@ -326,6 +354,50 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 }
 
 impl Inner {
+    /// Tries again to delete the folders of removed downloads that would
+    /// not go; the ones that do stop counting. A folder a live record has
+    /// taken over is left to that record.
+    fn sweep_tombstones(&self) {
+        let pending: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.tombstones
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .filter(|dir| {
+                    !st.list
+                        .iter()
+                        .any(|v| self.item_dir(&v.user, &v.item) == *dir)
+                })
+                .collect()
+        };
+        for dir in pending {
+            let outcome = (self.env.remove_dir)(&dir);
+            let mut st = lock(&self.state);
+            match outcome {
+                Ok(()) => {
+                    st.tombstones.retain(|(d, _)| *d != dir);
+                    emit(
+                        false,
+                        format!("pharos: video keep tombstone cleared dir={}", dir.display()),
+                    );
+                }
+                Err(e) => {
+                    let bytes = dir_size(&dir);
+                    if let Some(t) = st.tombstones.iter_mut().find(|(d, _)| *d == dir) {
+                        t.1 = bytes;
+                    }
+                    emit(
+                        true,
+                        format!(
+                            "pharos: video keep tombstone kept dir={} bytes={bytes} error={e}",
+                            dir.display()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     fn item_dir(&self, user: &str, item: &str) -> PathBuf {
         self.root.join(safe_name(user)).join(safe_name(item))
     }
@@ -434,7 +506,7 @@ impl Inner {
             let outstanding = st.outstanding(user, item);
             let verdict = match check {
                 Check::Fresh { other, cap, free } => {
-                    let used = reserved_by_others(&st.list, user, item).saturating_add(other);
+                    let used = st.reserved_by_others(user, item).saturating_add(other);
                     fits(
                         plan.estimate,
                         used.saturating_add(plan.stale),
@@ -742,6 +814,20 @@ fn clear_parts(dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Every byte of every file under `dir`, whatever it is.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read.filter_map(Result::ok)
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_size(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Bytes of whole files on disk under `dir`, whatever plan they belong to.
@@ -1099,6 +1185,7 @@ impl DiskVideoStore {
         });
         let mut list = Vec::new();
         let mut index = HashMap::new();
+        let mut tombstones: Vec<(PathBuf, u64)> = Vec::new();
         for user_dir in dirs(&inner.root) {
             for item_dir in dirs(&user_dir) {
                 let manifest = item_dir.join("manifest.json");
@@ -1116,7 +1203,14 @@ impl DiskVideoStore {
                             continue;
                         }
                     },
-                    Err(_) => continue,
+                    Err(_) => {
+                        // No record: a removed download whose folder did
+                        // not delete. Try again; what stays still counts.
+                        if (inner.env.remove_dir)(&item_dir).is_err() {
+                            tombstones.push((item_dir.clone(), dir_size(&item_dir)));
+                        }
+                        continue;
+                    }
                 };
                 clear_parts(&item_dir);
                 let names = stored_names(&item_dir);
@@ -1156,6 +1250,8 @@ impl DiskVideoStore {
             let mut st = lock(&inner.state);
             st.list = list;
             st.index = index;
+            st.tombstones = tombstones;
+            st.root.clone_from(&inner.root);
         }
         emit(
             false,
@@ -1235,6 +1331,7 @@ impl VideoStore for DiskVideoStore {
         // planning and shows as a failed download. The room is read under
         // the host's shared admission lock, before the store's own lock is
         // taken, and the check and the new record sit under one hold of it.
+        self.inner.sweep_tombstones();
         let (started, used) = {
             let _admission = budget.admission_guard();
             let (other, cap, free) = (
@@ -1243,7 +1340,7 @@ impl VideoStore for DiskVideoStore {
                 budget.free_bytes(),
             );
             let mut st = lock(&self.inner.state);
-            let used = reserved_by_others(&st.list, &user, &item).saturating_add(other);
+            let used = st.reserved_by_others(&user, &item).saturating_add(other);
             let room = free.saturating_sub(st.outstanding(&user, &item));
             let started = fits(0, used, cap, room).and_then(|()| {
                 check_not_kept(&st.list, &user, &item)?;
@@ -1290,7 +1387,19 @@ impl VideoStore for DiskVideoStore {
             record
         };
         let dir = self.inner.item_dir(user, item);
-        let removed = std::fs::remove_dir_all(&dir);
+        // The record goes first, so a folder that will not delete cannot
+        // bring the download back at the next open.
+        let _ = std::fs::remove_file(dir.join("manifest.json"));
+        let removed = (self.inner.env.remove_dir)(&dir);
+        let mut left = 0;
+        if removed.is_err() {
+            // The bytes still on disk keep counting against the cap until
+            // a later sweep deletes the folder.
+            left = dir_size(&dir);
+            let mut st = lock(&self.inner.state);
+            st.tombstones.retain(|(d, _)| *d != dir);
+            st.tombstones.push((dir, left));
+        }
         emit(
             false,
             format!(
@@ -1298,7 +1407,7 @@ impl VideoStore for DiskVideoStore {
                 record.files.len(),
                 match &removed {
                     Ok(()) => "removed".to_owned(),
-                    Err(e) => format!("kept_on_disk error={e}"),
+                    Err(e) => format!("kept_on_disk bytes={left} error={e}"),
                 }
             ),
         );
@@ -1319,11 +1428,12 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn kept_bytes(&self) -> u64 {
-        lock(&self.inner.state)
-            .list
+        let st = lock(&self.inner.state);
+        st.list
             .iter()
             .map(reserved)
             .fold(0u64, u64::saturating_add)
+            .saturating_add(st.tombstoned())
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
@@ -1359,6 +1469,19 @@ mod tests {
     use super::*;
     use crate::native::kept_video::DEFAULT_QUALITY_BPS;
     use crate::native::offline_ui::{FREE_GUARD_BYTES, GIB};
+
+    thread_local! {
+        /// While set, deleting a folder fails (a file in use, say).
+        static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn removing(dir: &Path) -> std::io::Result<()> {
+        if FAIL_REMOVE.with(std::cell::Cell::get) {
+            Err(std::io::Error::other("in use"))
+        } else {
+            std::fs::remove_dir_all(dir)
+        }
+    }
 
     thread_local! {
         pub(super) static CAPTURED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -1631,6 +1754,7 @@ mod tests {
                     }),
                     now: || "2026-11-16T09:00:00Z".to_owned(),
                     runtime: tokio::runtime::Handle::current(),
+                    remove_dir: removing,
                 },
             )
         }
@@ -2407,6 +2531,68 @@ mod tests {
         // And it does not come back after a restart.
         drop(store);
         assert!(rig.open().videos("u1").is_empty());
+    }
+
+    /// A folder that will not delete keeps counting against the cap, does not
+    /// bring the download back, and is deleted by a later sweep.
+    #[tokio::test]
+    async fn a_folder_that_will_not_delete_stays_counted_until_a_sweep_deletes_it() {
+        let rig = Rig::new("tombstone");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        // What stays once the record's manifest is gone: the files.
+        let left = dir_size(&dir.join("files"));
+        assert!(left > 0);
+
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        assert!(store.videos("u1").is_empty());
+        assert!(dir.exists(), "the folder would not go");
+        assert_eq!(store.kept_bytes(), left, "its bytes still count");
+        assert!(
+            lines("pharos: video keep remove")[0].contains("kept_on_disk bytes="),
+            "{:?}",
+            lines("pharos: video keep remove")
+        );
+
+        // Not back after a restart, and still counted while it will not go.
+        drop(store);
+        let store = rig.open();
+        assert!(
+            store.videos("u1").is_empty(),
+            "the removed download is back"
+        );
+        assert_eq!(store.kept_bytes(), left);
+
+        // Once the folder can go, the next start sweeps it.
+        FAIL_REMOVE.with(|f| f.set(false));
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the sweep deleted it");
+        let kept = store.videos("u1")[0].bytes();
+        assert_eq!(store.kept_bytes(), kept, "only the new download counts");
+        assert_eq!(lines("pharos: video keep tombstone cleared").len(), 1);
+    }
+
+    /// A restart finds a removed download's folder without its record and
+    /// deletes it when it can.
+    #[tokio::test]
+    async fn a_restart_deletes_a_removed_downloads_leftover_folder() {
+        let rig = Rig::new("tombstone-open");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        drop(store);
+        assert!(dir.exists());
+        let store = rig.open();
+        assert!(!dir.exists(), "the open deleted it");
+        assert_eq!(store.kept_bytes(), 0);
     }
 
     #[tokio::test]

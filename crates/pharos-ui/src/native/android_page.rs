@@ -3243,6 +3243,7 @@ pub fn register_video_store(
             }),
             now: iso_now,
             runtime: handle,
+            remove_dir: |dir| std::fs::remove_dir_all(dir),
         },
     );
     super::ports::register_video_store(store).map_err(|e| e.to_string())
