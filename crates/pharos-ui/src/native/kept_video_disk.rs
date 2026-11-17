@@ -559,7 +559,8 @@ fn clear_parts(dir: &Path) {
     }
 }
 
-/// One planned file; the sliver of a last segment may go without.
+/// One planned file; the sliver of a last segment may go without. The
+/// answer is the key and its stored length, `None` when it was skipped.
 async fn fetch_planned(
     inner: &Inner,
     user: &str,
@@ -567,9 +568,9 @@ async fn fetch_planned(
     run: u64,
     key: String,
     short_tails: &HashSet<String>,
-) -> Result<u64, Stop> {
+) -> Result<(String, Option<u64>), Stop> {
     match fetch_file(inner, user, item, run, &key).await {
-        Ok(len) => Ok(len),
+        Ok(len) => Ok((key, Some(len))),
         // B1476: the sliver of a last segment can fail to encode; the
         // copy plays without it, ending a frame early.
         Err(Stop::Failed(reason)) if short_tails.contains(&key) => {
@@ -580,18 +581,13 @@ async fn fetch_planned(
                     url_path(&key)
                 ),
             );
-            Ok(0)
+            Ok((key, None))
         }
         Err(e) => Err(e),
     }
 }
 
-async fn download(
-    inner: &Arc<Inner>,
-    user: &str,
-    item: &str,
-    run: u64,
-) -> Result<(u64, usize), Stop> {
+async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
     let record = find(&lock(&inner.state).list, user, item)
         .cloned()
         .ok_or(Stop::Gone)?;
@@ -682,12 +678,30 @@ async fn download(
     let mut results = stream::iter(todo)
         .map(|key| fetch_planned(inner, user, item, run, key, short_tails))
         .buffer_unordered(CONCURRENCY);
+    let mut skipped = Vec::new();
     while let Some(result) = results.next().await {
-        bytes = bytes.saturating_add(result?);
+        let (key, len) = result?;
+        match len {
+            Some(len) => bytes = bytes.saturating_add(len),
+            None => skipped.push(key),
+        }
         done += 1;
         inner.publish(user, item, run, (done, total, bytes), false);
     }
-    Ok((bytes, all.len()))
+    Ok(Finished {
+        bytes,
+        files: all.len() - skipped.len(),
+        skipped,
+    })
+}
+
+/// What a download that reached its end leaves.
+struct Finished {
+    bytes: u64,
+    /// Files stored, the skipped short tail not counted.
+    files: usize,
+    /// Planned files that were skipped: not stored, so not in the record.
+    skipped: Vec<String>,
 }
 
 async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
@@ -701,8 +715,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         );
     };
     match outcome {
-        Ok((bytes, files)) => {
+        Ok(Finished {
+            bytes,
+            files,
+            skipped,
+        }) => {
             if inner.update_run(&user, &item, run, |v| {
+                // A skipped file is not on disk: left in the record, a
+                // reopen would count it missing and resume the copy.
+                v.files.retain(|k| !skipped.contains(k));
                 v.state = KeptState::Ready;
                 v.estimated_bytes = bytes;
             }) {
@@ -1742,6 +1763,20 @@ mod tests {
         assert_eq!(only(&store).state, KeptState::Ready);
         assert!(store.stored_file(SEG1).is_none());
         assert_eq!(lines("pharos: video keep skipped short tail").len(), 1);
+        assert!(!only(&store).files.contains(&SEG1.to_owned()));
+
+        // A reopen leaves it Ready: the skipped file is not "missing".
+        drop(store);
+        rig.server.asked.lock().unwrap().clear();
+        let store = rig.open();
+        assert!(
+            lines("pharos: video keep resume").is_empty(),
+            "{:?}",
+            lines("pharos: video keep resume")
+        );
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(rig.server.asked().is_empty(), "{:?}", rig.server.asked());
     }
 
     /// The proxy asks with the path and query the WebView sent; a stored
