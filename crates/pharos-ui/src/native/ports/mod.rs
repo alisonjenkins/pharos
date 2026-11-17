@@ -89,6 +89,13 @@ pub fn kept_video_bytes() -> u64 {
     video_store().map_or(0, |s| s.kept_bytes())
 }
 
+/// Bytes the registered video store is admitted for but has yet to write,
+/// for every user; 0 when none is registered. The phone takes them off the
+/// free space before the music cache's low-disk guard.
+pub fn kept_video_outstanding() -> u64 {
+    video_store().map_or(0, |s| s.outstanding_bytes())
+}
+
 /// What the host app runs when the user signs in or out, so a second client
 /// in the same process (the car's media service) re-reads the token.
 static ON_CREDENTIALS_CHANGED: OnceLock<fn()> = OnceLock::new();

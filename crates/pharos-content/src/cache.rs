@@ -229,7 +229,17 @@ pub fn admission_guard() -> MutexGuard<'static, ()> {
 /// Bytes that other kinds of download hold against the same cap (the
 /// phone's offline video). Called while the cache's lock is held, so it
 /// must not call back into the cache.
-pub type OutsideUsed = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+pub type OutsideUsed = std::sync::Arc<dyn Fn() -> OutsideBytes + Send + Sync>;
+
+/// What other downloads hold of the shared budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutsideBytes {
+    /// Bytes they hold or have reserved, counted against the cap.
+    pub held: u64,
+    /// Bytes they are admitted for but have yet to write: the free space
+    /// does not lack these yet, but it will.
+    pub outstanding: u64,
+}
 
 pub struct Cache {
     dir: PathBuf,
@@ -484,14 +494,14 @@ impl Cache {
         evicted
     }
 
-    /// Bytes the host says other downloads hold against the cap.
-    fn outside_used(&self) -> u64 {
+    /// What the host says other downloads hold and have yet to write.
+    fn outside_bytes(&self) -> OutsideBytes {
         let hook = self
             .outside
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        hook.map_or(0, |f| f())
+        hook.map_or_else(OutsideBytes::default, |f| f())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -802,7 +812,7 @@ impl Cache {
         let mut evicted = Vec::new();
         loop {
             let (_, music) = Self::totals(s);
-            let outside = self.outside_used();
+            let outside = self.outside_bytes().held;
             let used = music.saturating_add(outside);
             if used <= self.cap() {
                 break;
@@ -857,9 +867,16 @@ impl Cache {
     /// [`MIN_FREE_BYTES`] free, evicting least recently played tracks first.
     /// `Ok(free)` when there is room, `Err(free)` when even eviction cannot
     /// make it. An unreadable free-space figure does not block a download.
+    ///
+    /// Other downloads admitted against the same disk (the phone's video)
+    /// still have bytes to write that the free figure does not yet lack;
+    /// those are taken off it first, so music cannot spend room an admitted
+    /// video needs. Read under the shared admission lock, taken before the
+    /// cache's lock.
     pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
+        let _admission = admission_guard();
         let free = match (self.free)(&self.dir) {
-            Ok(f) => f,
+            Ok(f) => f.saturating_sub(self.outside_bytes().outstanding),
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
                 return Ok(u64::MAX);
@@ -1021,7 +1038,10 @@ mod tests {
         let video = std::sync::Arc::new(AtomicU64::new(700));
         let v = video.clone();
         assert!(c
-            .set_outside_used(std::sync::Arc::new(move || v.load(Ordering::SeqCst)))
+            .set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+                held: v.load(Ordering::SeqCst),
+                outstanding: 0,
+            }))
             .is_empty());
         put(&c, "track/a", 100);
         put(&c, "track/b", 100);
@@ -1036,7 +1056,10 @@ mod tests {
         // When video grows, a new hook reading evicts music at once.
         video.store(850, Ordering::SeqCst);
         let v = video.clone();
-        let evicted = c.set_outside_used(std::sync::Arc::new(move || v.load(Ordering::SeqCst)));
+        let evicted = c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            held: v.load(Ordering::SeqCst),
+            outstanding: 0,
+        }));
         assert_eq!(evicted, ids(&["track/b", "track/c"]));
         assert_eq!(
             c.used_bytes(),
@@ -1122,6 +1145,34 @@ mod tests {
         c.protect(&[]);
         assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 1));
         assert!(c.is_complete("track/a") && c.is_complete("track/x"));
+    }
+
+    /// An admitted video still has bytes to write; the music write may not
+    /// spend the room they need.
+    #[test]
+    fn room_leaves_what_an_admitted_video_still_has_to_write() {
+        let outstanding = std::sync::Arc::new(AtomicU64::new(0));
+        let hook = |o: &std::sync::Arc<AtomicU64>| -> OutsideUsed {
+            let o = o.clone();
+            std::sync::Arc::new(move || OutsideBytes {
+                held: 0,
+                outstanding: o.load(Ordering::SeqCst),
+            })
+        };
+        let c =
+            Cache::open_with_probe(&tmp("lowdisk-video"), 1000, fixed_free(MIN_FREE_BYTES + 50))
+                .unwrap();
+        c.set_outside_used(hook(&outstanding));
+        assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
+        // The video still has 100 to write: 50 free beyond the guard is
+        // really 50 short of it, and nothing is there to evict.
+        outstanding.store(100, Ordering::SeqCst);
+        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 50));
+        // Evicting music makes up the difference.
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
+        assert!(!c.is_complete("track/a"));
     }
 
     #[test]

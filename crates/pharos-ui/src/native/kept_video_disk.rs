@@ -1224,6 +1224,11 @@ impl VideoStore for DiskVideoStore {
         self.inner.env.budget.cap_bytes()
     }
 
+    fn outstanding_bytes(&self) -> u64 {
+        // No record has an empty user, so this is every record's.
+        outstanding_by_others(&lock(&self.inner.state).list, "", "")
+    }
+
     fn kept_bytes(&self) -> u64 {
         lock(&self.inner.state)
             .list
@@ -2004,6 +2009,25 @@ mod tests {
         while store.kept_bytes() != ready + estimate {
             waited += 1;
             assert!(waited < 2_000, "kept_bytes={}", store.kept_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // What the running one has yet to write: its estimate less what it
+        // has stored; the finished one has nothing left.
+        let mut waited = 0;
+        loop {
+            let stored = match store.videos("u1")[0].state {
+                KeptState::Downloading { bytes, .. } => bytes,
+                ref other => panic!("not running: {other:?}"),
+            };
+            if store.outstanding_bytes() == estimate - stored {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "outstanding={} estimate={estimate} stored={stored}",
+                store.outstanding_bytes()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }

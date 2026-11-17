@@ -174,6 +174,12 @@ pub trait VideoStore: Send + Sync {
     fn kept_bytes(&self) -> u64 {
         0
     }
+    /// What every user's running downloads are admitted for but have yet
+    /// to write, for the host to take off the free space it guards for
+    /// other kinds. Zero for a store that shares no disk.
+    fn outstanding_bytes(&self) -> u64 {
+        0
+    }
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;

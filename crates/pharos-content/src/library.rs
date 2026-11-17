@@ -1326,7 +1326,7 @@ mod tests {
             let calls = calls.clone();
             Arc::new(move || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                0
+                cache::OutsideBytes::default()
             })
         };
         // Set before the cache is enabled: applied when it is.

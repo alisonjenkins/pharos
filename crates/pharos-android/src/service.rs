@@ -93,7 +93,9 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     };
     log(&format!("library server_from={server_from} auth={auth}"));
     lib.set_outside_used(std::sync::Arc::new(|| {
-        OUTSIDE_USED.get().map_or(0, |used| used())
+        OUTSIDE_USED
+            .get()
+            .map_or_else(content::OutsideBytes::default, |used| used())
     }));
     let cache_dir = Path::new(&files).join("audio-cache");
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
