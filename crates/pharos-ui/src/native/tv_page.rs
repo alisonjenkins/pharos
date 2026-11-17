@@ -141,6 +141,62 @@ pub fn proxied(segment: &str) -> bool {
     PROXIED.contains(&segment)
 }
 
+/// Scheme, host and port of an absolute `http(s)` URL, lower-cased, the
+/// port defaulted by scheme. None for anything else.
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
+        let (host, after) = v6.split_once(']')?;
+        (format!("[{host}]"), after.strip_prefix(':'))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_owned(), Some(p)),
+            None => (hostport.to_owned(), None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(p) => p.parse().ok()?,
+        None => default,
+    };
+    Some((scheme, host.to_ascii_lowercase(), port))
+}
+
+/// Whether a download's request to `original` may follow a redirect to
+/// `next`: only when scheme, host and port all match. The download sends the
+/// device token in a header, so a redirect to another host would hand it
+/// over, and one from https to http would send it in the clear. Plain http to
+/// the same http origin stays allowed: the server may be on the LAN. Err is
+/// the reason it stops, for the log.
+pub fn redirect_verdict(original: &str, next: &str) -> Result<(), String> {
+    let (Some(from), Some(to)) = (origin_of(original), origin_of(next)) else {
+        return Err("redirect target is not an http(s) URL".to_owned());
+    };
+    if from == to {
+        return Ok(());
+    }
+    if from.0 == "https" && to.0 == "http" {
+        return Err(format!("https to http downgrade to {}:{}", to.1, to.2));
+    }
+    if from.1 != to.1 {
+        return Err(format!("another host, {}", to.1));
+    }
+    if from.2 != to.2 {
+        return Err(format!("another port, {}", to.2));
+    }
+    Err(format!("another scheme, {}", to.0))
+}
+
 /// An error and every cause under it, `outer: inner: ...`, for a log line.
 /// reqwest's own `Display` names only the top layer ("error sending
 /// request"), which hides whether the connection was refused, reset or
@@ -1270,6 +1326,45 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download sends the device token, so it follows a redirect only to
+    /// the same scheme, host and port. A plain-http server on the LAN keeps
+    /// working: http to the same http origin is followed.
+    #[test]
+    fn a_download_follows_only_same_origin_redirects() {
+        let from = "https://pharos.example/Videos/1/master.m3u8?x=1";
+        assert_eq!(
+            redirect_verdict(from, "https://pharos.example/other"),
+            Ok(())
+        );
+        assert_eq!(
+            redirect_verdict(from, "https://PHAROS.example:443/other"),
+            Ok(()),
+            "case and the default port are the same origin"
+        );
+        let lan = "http://192.168.1.5:8096/Videos/1/a.ts";
+        assert_eq!(
+            redirect_verdict(lan, "http://192.168.1.5:8096/b.ts"),
+            Ok(())
+        );
+        for (next, why) in [
+            ("https://cdn.example/a", "another host"),
+            ("http://pharos.example/a", "https to http"),
+            ("https://pharos.example:8443/a", "another port"),
+            ("https://user@evil.example/a", "another host"),
+            ("ftp://pharos.example/a", "not an http"),
+            ("/relative", "not an http"),
+        ] {
+            let verdict = redirect_verdict(from, next);
+            assert!(
+                verdict.as_ref().is_err_and(|e| e.contains(why)),
+                "{next}: {verdict:?}"
+            );
+        }
+        assert!(redirect_verdict(lan, "http://192.168.1.6:8096/a").is_err());
+        assert!(redirect_verdict(lan, "http://192.168.1.5:9000/a").is_err());
+        assert!(redirect_verdict(lan, "https://192.168.1.5:8096/a").is_err());
+    }
 
     /// B1323 / V1294: the TV's activity handles every configuration change
     /// a TV makes while the app runs; one it does not list recreates the
