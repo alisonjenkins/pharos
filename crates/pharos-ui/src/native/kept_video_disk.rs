@@ -239,10 +239,10 @@ struct Plan {
 /// The room a download is admitted against, read by the caller.
 #[derive(Clone, Copy)]
 enum Check {
-    /// A new download: the other kinds' bytes, the cap, the free space.
-    Fresh { other: u64, cap: u64, free: u64 },
-    /// A resumed one: the free space.
-    Resume { free: u64 },
+    /// A new download: the other kinds' bytes and the cap.
+    Fresh { other: u64, cap: u64 },
+    /// A resumed one.
+    Resume,
 }
 
 enum Admission {
@@ -503,9 +503,14 @@ impl Inner {
             if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
                 return Err(Admission::Gone);
             }
+            // What the running downloads still owe is read before the free
+            // space is measured: a write landing in between lowers free, and
+            // the stale (higher) owed figure only makes the check stricter.
+            // The other order counts that write as room.
             let outstanding = st.outstanding(user, item);
+            let free = self.env.budget.free_bytes();
             let verdict = match check {
-                Check::Fresh { other, cap, free } => {
+                Check::Fresh { other, cap } => {
                     let used = st.reserved_by_others(user, item).saturating_add(other);
                     fits(
                         plan.estimate,
@@ -518,7 +523,7 @@ impl Inner {
                 // The cap was met when the download began and its stored
                 // bytes are counted; what is left needs room, and 0 free
                 // (an unreadable measure) is no room.
-                Check::Resume { free } => fits(
+                Check::Resume => fits(
                     plan.estimate.saturating_sub(plan.stored),
                     0,
                     u64::MAX,
@@ -976,14 +981,12 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     // lock is never awaited while the store's is held).
     let (check, admitted) = {
         let _admission = inner.env.budget.admission_guard();
-        let free = inner.env.budget.free_bytes();
         let check = if resume {
-            Check::Resume { free }
+            Check::Resume
         } else {
             Check::Fresh {
                 other: inner.env.budget.other_used_bytes(),
                 cap: inner.env.budget.cap_bytes(),
-                free,
             }
         };
         (check, inner.admit(user, item, run, &plan, check))
@@ -999,7 +1002,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         }) => {
             let detail = match check {
                 Check::Fresh { cap, .. } => format!("estimate={estimate} used={used} cap={cap}"),
-                Check::Resume { .. } => format!(
+                Check::Resume => format!(
                     "resume=true remaining={} stored={stored_bytes}",
                     estimate.saturating_sub(stored_bytes)
                 ),
@@ -1663,6 +1666,8 @@ mod tests {
         held: Arc<AtomicUsize>,
         taken: AtomicUsize,
         unguarded: AtomicUsize,
+        /// Runs whenever the free space is measured.
+        on_free: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     struct FakeGuard(Arc<AtomicUsize>);
@@ -1690,6 +1695,7 @@ mod tests {
                 held: Arc::default(),
                 taken: AtomicUsize::new(0),
                 unguarded: AtomicUsize::new(0),
+                on_free: Mutex::new(None),
             })
         }
     }
@@ -1705,6 +1711,9 @@ mod tests {
         }
         fn free_bytes(&self) -> u64 {
             self.read();
+            if let Some(hook) = self.on_free.lock().unwrap().as_ref() {
+                hook();
+            }
             self.free.load(Ordering::SeqCst)
         }
         fn admission_guard(&self) -> Box<dyn std::any::Any> {
@@ -2200,6 +2209,37 @@ mod tests {
             second.state,
             KeptState::Ready,
             "refused for room it had: {second:?}"
+        );
+    }
+
+    /// What the running downloads still owe is read before the free space
+    /// is measured, in one critical section: a write landing in between
+    /// would otherwise lower the owed figure after free was read and be
+    /// counted as room. The measure is made under the store's state lock,
+    /// after the owed figure is taken from it.
+    #[tokio::test]
+    async fn the_free_space_is_measured_after_what_is_owed_is_read() {
+        let rig = Rig::new("owed-before-free");
+        let store = rig.open();
+        let inner = store.inner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let locked = Arc::new(AtomicUsize::new(0));
+        let (c, l) = (calls.clone(), locked.clone());
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            if inner.state.try_lock().is_err() {
+                l.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        // Other readers measure free space too; the admission is the one
+        // made under the lock.
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert!(
+            locked.load(Ordering::SeqCst) >= 1,
+            "free was read outside the owed read"
         );
     }
 
