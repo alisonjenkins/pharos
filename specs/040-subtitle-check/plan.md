@@ -11,7 +11,7 @@ No new service and no change to the aligner's HTTP contract. The work is in the 
 | Probe picker | `pharos-subs` (`check::probes`) | FR-004/005 cleaning and spreading, pure, property-tested |
 | Language gate | `pharos-subs` (`check::lang`) | FR-002/003: ISO 639 normalising, Latin share, stopword test |
 | Verdict | `pharos-subs` (`check::verdict`) | FR-007/010 rules over score vectors, pure; thresholds passed in |
-| Coarse search | `pharos-server` (`subtitle_check::coarse`) | FR-009: one 8 kHz decode through the libav worker pool, speech bitmap, correlation per ratio |
+| Coarse search | `pharos-subs` (`check::coarse`, pure) + `pharos-server` (`subtitle_check::FfmpegEars`) | FR-009: one 8 kHz decode by the `ffmpeg` binary under a background-IO permit (works in both backend builds; the libav pool has no streaming PCM op), speech map, correlation per ratio |
 | Job | `pharos-server` (`subtitle_check`) | FR-015 to FR-018: passes, rows, on-demand FIFO, karaoke gate, aligner client reuse from `services::lyrics::align` |
 | Store | `pharos-store-sqlx` | one table `subtitle_check` (item id, source kind + index or sidecar path hash, mtimes/sizes, `CHECK_VERSION`, verdict, reason, offset_ms, ratio, scores JSON) and one migration; number from the merge queue |
 | Serving | `api/jellyfin/subtitles.rs` | FR-012: the cue transform in `deliver_srt`, `deliver_vtt`, `deliver_ass_inner`, after extraction and before conversion; `?raw=1` |
@@ -38,7 +38,7 @@ The align queue in `services::lyrics::align` exposes whether a job is queued or 
 0. `pharos_lyrics_align_wait_seconds` in the align queue, on its own bucket ladder (1 ms to 1 h, so a wait past 30 s is not capped and a rise within the first 100 ms still shows), with a test that fails without it (FR-022).
 1. Probe picker, language gate and verdict as pure code in `pharos-subs`, with the spike's numbers as test vectors (generic names).
 2. Table, migration and the job with `apply = false`: checks run and log, nothing is served differently. Calibration (FR-014) reads these logs.
-3. Coarse search and stage 2.
+3. Coarse search and stage 2. 3b: the aligner request names the audio stream (FR-002a).
 4. Sibling check (FR-011) and the admin list.
 5. Serving correction and track-list marks, behind `apply`.
 6. Calibration run, then `apply = true` by config.
