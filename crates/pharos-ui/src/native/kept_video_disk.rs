@@ -126,6 +126,8 @@ struct Inner {
     root: PathBuf,
     env: Env,
     state: Mutex<State>,
+    /// Held while a record is written or an item's folder is removed.
+    saves: Mutex<()>,
     #[cfg(test)]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -215,12 +217,20 @@ impl Inner {
         self.item_dir(user, item).join("files").join(file_name(key))
     }
 
-    /// Writes the record beside its files, whole or not at all.
-    fn save_record(&self, video: &KeptVideo) {
+    /// Writes the current record of `item` beside its files, whole or not
+    /// at all. Saves are serialised and write what the record holds when
+    /// their turn comes, never an older copy, and a record that has since
+    /// been removed is not written back: [`DiskVideoStore::remove`] holds
+    /// the same lock while it deletes the folder.
+    fn save_record(&self, user: &str, item: &str) {
+        let _saving = self.saves.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(video) = find(&lock(&self.state).list, user, item).cloned() else {
+            return;
+        };
         let dir = self.item_dir(&video.user, &video.item);
         let result = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
-            let text = serde_json::to_vec(video).map_err(std::io::Error::other)?;
+            let text = serde_json::to_vec(&video).map_err(std::io::Error::other)?;
             let tmp = dir.join("manifest.json.part");
             std::fs::write(&tmp, text)?;
             std::fs::rename(&tmp, dir.join("manifest.json"))
@@ -239,7 +249,7 @@ impl Inner {
 
     /// Changes the record of `item` and saves it; false when it is gone.
     fn update(&self, user: &str, item: &str, f: impl FnOnce(&mut KeptVideo)) -> bool {
-        let saved = {
+        {
             let mut st = lock(&self.state);
             let Some(v) = st
                 .list
@@ -249,9 +259,8 @@ impl Inner {
                 return false;
             };
             f(v);
-            v.clone()
-        };
-        self.save_record(&saved);
+        }
+        self.save_record(user, item);
         true
     }
 
@@ -260,7 +269,7 @@ impl Inner {
     /// or restarted since cannot touch the record of the one that replaced
     /// it. False when `run` no longer owns `item`.
     fn update_run(&self, user: &str, item: &str, run: u64, f: impl FnOnce(&mut KeptVideo)) -> bool {
-        let saved = {
+        {
             let mut st = lock(&self.state);
             if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
                 return false;
@@ -273,9 +282,8 @@ impl Inner {
                 return false;
             };
             f(v);
-            v.clone()
-        };
-        self.save_record(&saved);
+        }
+        self.save_record(user, item);
         true
     }
 
@@ -785,6 +793,7 @@ impl DiskVideoStore {
             root,
             env,
             state: Mutex::new(State::default()),
+            saves: Mutex::new(()),
             #[cfg(test)]
             tasks: Mutex::new(Vec::new()),
         });
@@ -936,15 +945,19 @@ impl VideoStore for DiskVideoStore {
             );
             return Err(refusal);
         }
-        let record = find(&lock(&self.inner.state).list, &user, &item).cloned();
-        if let Some(record) = record {
-            self.inner.save_record(&record);
-        }
+        self.inner.save_record(&user, &item);
         self.inner.spawn_run(user, item);
         Ok(())
     }
 
     fn remove(&self, user: &str, item: &str) {
+        // Held to the end: no record is written into the folder while it
+        // goes, and none after.
+        let _saving = self
+            .inner
+            .saves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let record = {
             let mut st = lock(&self.inner.state);
             let Some(record) = take(&mut st.list, user, item) else {
@@ -1658,6 +1671,47 @@ mod tests {
                 .ends_with(".part")),
             "no staging file is left"
         );
+    }
+
+    /// Position saves racing a removal must not bring the folder back, and
+    /// racing each other must leave one whole manifest and no temp file.
+    #[tokio::test]
+    async fn saves_racing_a_removal_do_not_recreate_the_item() {
+        let rig = Rig::new("save-race");
+        let store = rig.open();
+        for round in 0..25u64 {
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let spammers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (store, stop) = (store.clone(), stop.clone());
+                    std::thread::spawn(move || {
+                        let mut at = 0;
+                        while !stop.load(Ordering::SeqCst) {
+                            at += 1;
+                            store.save_position("u1", "1", at);
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let item_dir = rig.dir.join("u1").join("1");
+            let bytes = std::fs::read(item_dir.join("manifest.json")).unwrap();
+            assert!(
+                serde_json::from_slice::<KeptVideo>(&bytes).is_ok(),
+                "round {round}: the manifest is whole while saves race"
+            );
+            store.remove("u1", "1");
+            stop.store(true, Ordering::SeqCst);
+            for t in spammers {
+                t.join().unwrap();
+            }
+            assert!(
+                !item_dir.exists(),
+                "round {round}: a late save brought the removed item back"
+            );
+        }
     }
 
     #[tokio::test]
