@@ -767,7 +767,13 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
                 .speech(&item.path, audio_stream(item).map(|t| t.stream_index))
                 .await
         };
-        let shifts = speech.map(|sp| coarse::candidates(&sp, &cues, ALIGNER_REACH_MS, MAX_STAGE2));
+        // Stage 1's own search covered ±8 s only if it sent anything.
+        let searched = stage1
+            .probes
+            .iter()
+            .any(|s| s.is_finite())
+            .then_some(ALIGNER_REACH_MS);
+        let shifts = speech.map(|sp| coarse::candidates(&sp, &cues, searched, MAX_STAGE2));
         let coarse_s = heard_at.elapsed().as_secs_f64();
         measured.coarse_s = Some(coarse_s);
         metrics::histogram!("pharos_subtitle_check_coarse_seconds").record(coarse_s);
@@ -989,6 +995,8 @@ mod tests {
         /// `video = sub * ratio + offset`: a probe scores `probe` only when
         /// sent within the aligner's reach of it, and `offset_ms` is the rest.
         truth: Option<(i64, f64)>,
+        /// Where cue `i` starts in the subtitles: [`srt`]'s spacing by default.
+        cue_start: fn(i64) -> i64,
     }
 
     impl Fake {
@@ -1006,6 +1014,7 @@ mod tests {
                 calls: Mutex::default(),
                 starts: Mutex::default(),
                 truth: None,
+                cue_start: |i| i * 60_000 + 1_000,
             }
         }
         fn calls(&self) -> Vec<(String, usize)> {
@@ -1077,7 +1086,7 @@ mod tests {
                         .and_then(|t| t.split(' ').next())
                         .and_then(|n| n.parse().ok())
                         .unwrap();
-                    let real = ((i * 60_000 + 1_000) as f64 * ratio).round() as i64 + offset;
+                    let real = ((self.cue_start)(i) as f64 * ratio).round() as i64 + offset;
                     real - i64::try_from(*start).unwrap()
                 })
                 .collect();
@@ -1161,6 +1170,45 @@ mod tests {
     }
 
     /// Twenty spoken English cues, a minute apart.
+    /// Twenty cues of `len` ms, cue `i` from `start(i)`.
+    fn srt_with(start: fn(i64) -> i64, len: i64) -> String {
+        let t = |ms: i64| {
+            format!(
+                "{:02}:{:02}:{:02},{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1_000 % 60,
+                ms % 1_000
+            )
+        };
+        let mut s = String::new();
+        for i in 0..20i64 {
+            let a = start(i);
+            s.push_str(&format!(
+                "{}\n{} --> {}\nI think that line {i} is the one we want\n\n",
+                i + 1,
+                t(a),
+                t(a + len)
+            ));
+        }
+        s
+    }
+
+    /// Speech where cue `i` of [`srt_with`] is spoken at `start(i) + offset`.
+    fn spoken_with(start: fn(i64) -> i64, len: i64, offset_ms: i64) -> Speech {
+        let mut on = vec![false; 15_000];
+        for i in 0..20i64 {
+            let (a, b) = (
+                (start(i) + offset_ms) / 100,
+                (start(i) + len + offset_ms) / 100,
+            );
+            for f in a.max(0)..b.min(15_000) {
+                on[usize::try_from(f).unwrap()] = true;
+            }
+        }
+        Speech::from_frames(on)
+    }
+
     fn srt() -> String {
         let mut s = String::new();
         for i in 0..20u32 {
@@ -1392,6 +1440,31 @@ mod tests {
             1,
             "stage 2 listened"
         );
+    }
+
+    #[tokio::test]
+    async fn cues_past_the_end_can_fit_within_the_aligners_reach() {
+        // Dense cues from 100 s in a 100 s file: none starts inside it, but
+        // they are spoken 8 s earlier, which stage 1 never got to try.
+        let start: fn(i64) -> i64 = |i| 100_000 + i * 700;
+        let text = srt_with(start, 650);
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let mut item = lib.store.get(1).await.unwrap();
+        item.probe.duration_ms = Some(100_000);
+        lib.store.put(item).await.unwrap();
+        let mut fake = Fake::new(900, 250);
+        fake.truth = Some((-8_000, 1.0));
+        fake.cue_start = start;
+        job_hearing(
+            &lib,
+            &fake,
+            Ears::hearing(Ok(spoken_with(start, 650, -8_000))),
+        )
+        .run_pass()
+        .await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("retimed"), "{}", r.reason);
+        assert_eq!((r.offset_ms, r.ratio), (Some(-8_000), Some(1.0)));
     }
 
     #[tokio::test]
