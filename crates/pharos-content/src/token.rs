@@ -120,6 +120,13 @@ pub fn legacy_user_path(path: &Path) -> PathBuf {
 /// Writes the file whole to a temp file of its own (not one any other writer
 /// of the directory uses), fsyncs it, renames it over `path` and syncs the
 /// directory. Called with the lock held.
+///
+/// Once the rename has installed the new file it is the file: every reader
+/// sees it, so it is the active token. A directory sync that fails after
+/// that only leaves the rename less durable (a crash may bring the old file
+/// back); it is logged with its reason and the write succeeds, so the
+/// caller's memory and hooks follow the file. A failure before the install
+/// changes nothing and is an error.
 fn write(path: &Path, token: &str, user: Option<&str>) -> std::io::Result<()> {
     if token.contains('\n') || user.is_some_and(|u| u.contains('\n')) {
         return Err(std::io::Error::new(
@@ -146,14 +153,18 @@ fn write(path: &Path, token: &str, user: Option<&str>) -> std::io::Result<()> {
         if f.metadata()?.permissions().mode() & 0o077 != 0 {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        std::fs::rename(&tmp, path)?;
-        // The rename is durable only once the directory is: a crash must
-        // leave the old pair or the new, and the caller is told if not.
-        sync_dir(dir)
+        std::fs::rename(&tmp, path)
     };
     go().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    })
+    })?;
+    if let Err(e) = sync_dir(dir) {
+        log::warn!(
+            "token file installed but not synced dir={} reason={e}",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Flushes the directory entry of a rename to disk.
@@ -231,17 +242,26 @@ mod tests {
         );
     }
 
-    /// A rename whose directory entry cannot be flushed is an error the
-    /// caller sees, not a token that may vanish at the next crash.
+    /// A rename whose directory entry cannot be flushed has still installed
+    /// the new file: the write succeeds (the caller's memory and hooks then
+    /// follow the file) and the lost durability is logged with its reason.
     #[test]
-    fn a_failed_directory_sync_is_reported() {
+    fn a_failed_directory_sync_after_the_install_keeps_the_new_token() {
         let d = dir("dirsync");
         let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        crate::testlog::start();
         FAIL_DIR_SYNC.with(|f| f.set(true));
-        let err = store(&path, "tok").unwrap_err();
+        let stored = store(&path, "new");
         FAIL_DIR_SYNC.with(|f| f.set(false));
-        assert!(err.to_string().contains("directory sync failed"), "{err}");
-        assert!(store(&path, "tok").is_ok());
+        assert!(stored.is_ok(), "{stored:?}");
+        assert_eq!(load(&path).unwrap().as_deref(), Some("new"));
+        let lines = crate::testlog::lines();
+        assert!(
+            lines.iter().any(|l| l.contains("installed but not synced")
+                && l.contains("reason=directory sync failed")),
+            "{lines:?}"
+        );
     }
 
     #[test]
