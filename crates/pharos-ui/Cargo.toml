@@ -188,6 +188,9 @@ log = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# The video store's refusal reaching the real music cache (V1464), in a test.
+pharos-content = { path = "../pharos-content" }
+log = "0.4"
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside
 # `#[test]`s so we can assert structural landmarks (input #ids,
 # button text, expected error branches) without a browser. Lives at

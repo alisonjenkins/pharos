@@ -3172,6 +3172,99 @@ mod tests {
         FAIL_REMOVE.with(|f| f.set(false));
     }
 
+    /// The whole path of the unknown-size block into music: a real store
+    /// with a subtree it cannot read, the hook the phone installs (the
+    /// same three fields, read from the store), and a real music download
+    /// through `Library`, which the cache refuses before any network use.
+    ///
+    /// Stubbed: the phone crate itself (Android only) is not here, so its
+    /// closure is restated, and the server is one nothing listens on.
+    #[test]
+    fn music_is_refused_through_the_real_hook_while_a_video_subtree_is_unreadable() {
+        use std::sync::atomic::AtomicBool;
+        struct Capture;
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record) {
+                LINES.lock().unwrap().push(r.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture;
+        if log::set_logger(&CAPTURE).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+            INSTALLED.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            INSTALLED.load(Ordering::SeqCst),
+            "another logger was installed first"
+        );
+
+        // A real store, with its root unreadable the way a restart can find it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rig = Rig::new("music-refused");
+        let user = rig.dir.join("u9");
+        std::fs::create_dir_all(&user).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = {
+            let _enter = rt.enter();
+            rig.open()
+        };
+        assert!(store.size_unknown());
+
+        // The music side: a real Library and cache, the phone's hook.
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        let hook_store = store.clone();
+        lib.set_outside_used(Arc::new(move || pharos_content::OutsideBytes {
+            held: hook_store.kept_bytes(),
+            outstanding: hook_store.outstanding_bytes(),
+            unknown: hook_store.size_unknown(),
+        }));
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        lib.prefetch(&["track/1".to_owned()]);
+        let mut waited = 0;
+        let refused = loop {
+            let found = LINES
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/1"));
+            if found {
+                break true;
+            }
+            waited += 1;
+            if waited > 5_000 {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        assert!(
+            refused,
+            "music was not refused: {:?}",
+            LINES.lock().unwrap()
+        );
+    }
+
     /// A damaged manifest is held the same way.
     #[tokio::test]
     async fn a_damaged_manifest_folder_counts_and_blocks_admission() {

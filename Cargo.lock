@@ -8648,6 +8648,7 @@ dependencies = [
  "ndk-context",
  "pharos-api",
  "pharos-client",
+ "pharos-content",
  "pharos-hls",
  "pharos-subs",
  "quire",
