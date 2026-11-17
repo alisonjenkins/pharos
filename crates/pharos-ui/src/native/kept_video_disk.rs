@@ -480,11 +480,12 @@ impl Inner {
     /// at all. Saves are serialised and write what the record holds when
     /// their turn comes, never an older copy, and a record that has since
     /// been removed is not written back: [`DiskVideoStore::remove`] holds
-    /// the same lock while it deletes the folder.
-    fn save_record(&self, user: &str, item: &str) {
+    /// the same lock while it deletes the folder. A record that is gone has
+    /// nothing to write; a write that fails is logged and returned.
+    fn save_record(&self, user: &str, item: &str) -> std::io::Result<()> {
         let _saving = self.saves.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(video) = find(&lock(&self.state).list, user, item).cloned() else {
-            return;
+            return Ok(());
         };
         let dir = self.item_dir(&video.user, &video.item);
         let result = (|| -> std::io::Result<()> {
@@ -494,7 +495,7 @@ impl Inner {
             std::fs::write(&tmp, text)?;
             std::fs::rename(&tmp, dir.join("manifest.json"))
         })();
-        if let Err(e) = result {
+        if let Err(e) = &result {
             emit(
                 true,
                 format!(
@@ -504,6 +505,7 @@ impl Inner {
                 ),
             );
         }
+        result
     }
 
     /// Changes the record of `item` and saves it; false when it is gone.
@@ -519,7 +521,8 @@ impl Inner {
             };
             f(v);
         }
-        self.save_record(user, item);
+        // Logged by `save_record`; the change stays in memory.
+        let _ = self.save_record(user, item);
         true
     }
 
@@ -542,7 +545,7 @@ impl Inner {
             };
             f(v);
         }
-        self.save_record(user, item);
+        let _ = self.save_record(user, item);
         true
     }
 
@@ -634,7 +637,7 @@ impl Inner {
                 bytes: plan.stored,
             };
         }
-        self.save_record(user, item);
+        let _ = self.save_record(user, item);
         Ok(())
     }
 
@@ -1579,6 +1582,7 @@ impl VideoStore for DiskVideoStore {
         // the host's shared admission lock, before the store's own lock is
         // taken, and the check and the new record sit under one hold of it.
         self.inner.sweep_tombstones();
+        let mut replaced: Option<KeptVideo> = None;
         let (started, used) = {
             let _admission = budget.admission_guard();
             let (other, cap) = (budget.other_used_bytes(), budget.cap_bytes());
@@ -1593,6 +1597,7 @@ impl VideoStore for DiskVideoStore {
                 .and_then(|()| fits(0, used, cap, room))
                 .and_then(|()| {
                     check_not_kept(&st.list, &user, &item)?;
+                    replaced = find(&st.list, &user, &item).cloned();
                     let mut record = new_record(&request, (self.inner.env.now)());
                     // A failed attempt's files stay on disk until a plan prunes
                     // them; the replacement keeps counting them meanwhile.
@@ -1618,7 +1623,28 @@ impl VideoStore for DiskVideoStore {
             );
             return Err(refusal);
         }
-        self.inner.save_record(&user, &item);
+        // A record that cannot be written would not survive a restart: the
+        // download is refused, and the accounting goes back to what it was
+        // (the record it replaced is put back, its reservation with it).
+        if let Err(e) = self.inner.save_record(&user, &item) {
+            let refusal =
+                KeepVideoRefusal::Host(format!("the download's record could not be saved: {e}"));
+            {
+                let _admission = budget.admission_guard();
+                let mut st = lock(&self.inner.state);
+                take(&mut st.list, &user, &item);
+                if let Some(old) = replaced {
+                    insert_front(&mut st.list, old);
+                }
+            }
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason={refusal} verdict=rolled_back"
+                ),
+            );
+            return Err(refusal);
+        }
         self.inner.spawn_run(user, item);
         Ok(())
     }
@@ -3263,6 +3289,40 @@ mod tests {
             "music was not refused: {:?}",
             LINES.lock().unwrap()
         );
+    }
+
+    /// A record that cannot be written is refused at the start, and the
+    /// accounting is as it was: nothing runs, the record is gone, and the
+    /// one it replaced is back.
+    #[tokio::test]
+    async fn a_start_whose_record_cannot_be_saved_is_refused_and_rolled_back() {
+        let rig = Rig::new("save-fails");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("started without a durable record");
+        };
+        assert!(why.contains("could not be saved"), "{why}");
+        assert!(store.videos("u1").is_empty(), "the record stayed");
+        assert_eq!(store.kept_bytes(), 0, "its reservation stayed");
+        assert!(rig.server.asked().is_empty(), "a run was started");
+        let line = lines("pharos: video keep refused");
+        assert!(line[0].contains("verdict=rolled_back"), "{line:?}");
+
+        // A failed record the start replaced comes back as it was.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        rig.server.fail(SEG1, &[403]);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let failed = only(&store);
+        assert!(
+            matches!(failed.state, KeptState::Failed { .. }),
+            "{failed:?}"
+        );
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        assert!(store.start(request("1")).is_err());
+        assert_eq!(only(&store), failed, "the replaced record was lost");
     }
 
     /// A damaged manifest is held the same way.
