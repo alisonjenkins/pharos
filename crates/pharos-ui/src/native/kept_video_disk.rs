@@ -291,8 +291,11 @@ struct Plan {
 /// The room a download is admitted against, read by the caller.
 #[derive(Clone, Copy)]
 enum Check {
-    /// A new download: the other kinds' bytes and the cap.
-    Fresh { other: u64, cap: u64 },
+    /// A new download: the other kinds' bytes and the cap, read after
+    /// `ready` (whether the accounting was up before they were read: it
+    /// never goes down once up, so a figure read after a true `ready` is a
+    /// real one).
+    Fresh { other: u64, cap: u64, ready: bool },
     /// A resumed one.
     Resume,
 }
@@ -988,7 +991,7 @@ impl Inner {
                 // the other kinds' figures: a download restarted with no
                 // plan (and none of its files) is fresh too, and must pass
                 // the gate `start` applies.
-                Check::Fresh { .. } if !self.env.budget.accounting_ready() => Err((
+                Check::Fresh { ready: false, .. } => Err((
                     KeepVideoRefusal::Host(
                         "the music cache is not up yet, so the shared cap cannot be checked"
                             .to_owned(),
@@ -996,7 +999,7 @@ impl Inner {
                     0,
                     free,
                 )),
-                Check::Fresh { other, cap } => {
+                Check::Fresh { other, cap, .. } => {
                     let used = st.reserved_by_others(user, item).saturating_add(other);
                     fits(
                         plan.estimate,
@@ -1608,9 +1611,14 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         let check = if resume {
             Check::Resume
         } else {
+            // Readiness first, then the figures: a library published in
+            // between leaves the check refusing, never passing on the
+            // default cap and no music.
+            let ready = inner.env.budget.accounting_ready();
             Check::Fresh {
                 other: inner.env.budget.other_used_bytes(),
                 cap: inner.env.budget.cap_bytes(),
+                ready,
             }
         };
         (check, inner.admit(user, item, run, &plan, check))
@@ -2144,6 +2152,8 @@ impl VideoStore for DiskVideoStore {
         let mut absorbed: Option<u64> = None;
         let (started, used) = {
             let _admission = budget.admission_guard();
+            // Readiness first, then the figures (see `Check::Fresh`).
+            let ready = budget.accounting_ready();
             let (other, cap) = (budget.other_used_bytes(), budget.cap_bytes());
             let mut st = lock(&self.inner.state);
             let used = st.reserved_by_others(&user, &item).saturating_add(other);
@@ -2157,7 +2167,7 @@ impl VideoStore for DiskVideoStore {
                 .unknown_folder()
                 .map_or(Ok(()), Err)
                 .and_then(|()| {
-                    if budget.accounting_ready() {
+                    if ready {
                         Ok(())
                     } else {
                         Err(KeepVideoRefusal::Host(
@@ -4627,6 +4637,67 @@ mod tests {
         };
         assert!(reason.contains("music cache is not up"), "{reason}");
         assert_eq!(store.kept_bytes(), 0);
+    }
+
+    /// The music library is published while a fresh plan is being admitted,
+    /// after the figures were read: the plan is refused, not checked against
+    /// the default cap and no music.
+    #[tokio::test]
+    async fn a_library_published_during_admission_does_not_pass_a_stale_check() {
+        let rig = Rig::new("publish-during-run");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let b = rig.budget.clone();
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            // The library goes up, with the real (tiny) cap.
+            b.cap.store(1, Ordering::SeqCst);
+            b.ready.store(true, Ordering::SeqCst);
+        }));
+        store.settled().await;
+        *rig.budget.on_free.lock().unwrap() = None;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("the plan was admitted against the default cap");
+        };
+        assert!(reason.contains("music cache is not up"), "{reason}");
+    }
+
+    /// The same for a start.
+    #[tokio::test]
+    async fn a_library_published_during_a_start_does_not_pass_a_stale_check() {
+        let rig = Rig::new("publish-during-start");
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        let b = rig.budget.clone();
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            b.cap.store(1, Ordering::SeqCst);
+            b.ready.store(true, Ordering::SeqCst);
+        }));
+        let refusal = store.start(request("1")).unwrap_err();
+        *rig.budget.on_free.lock().unwrap() = None;
+        assert!(matches!(refusal, KeepVideoRefusal::Host(_)), "{refusal:?}");
+        assert!(store.videos("u1").is_empty());
+    }
+
+    /// An interrupted download reopened with no plan and none of its files
+    /// is fresh: reopened with the accounting not up, it waits for it.
+    #[tokio::test]
+    async fn a_reopened_interrupted_download_with_no_plan_waits_for_the_accounting() {
+        let rig = Rig::new("reopen-no-plan");
+        let first = rig.open();
+        first.start(request("1")).unwrap();
+        // Closed before the run planned anything.
+        for t in first.inner.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        drop(first);
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("the restarted download was admitted without the accounting");
+        };
+        assert!(reason.contains("music cache is not up"), "{reason}");
     }
 
     /// A walk of the folder that comes back short (a transient EMFILE) must
