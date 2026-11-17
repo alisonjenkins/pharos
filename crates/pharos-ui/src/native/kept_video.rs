@@ -40,7 +40,9 @@ pub fn quality_label(bps: u64) -> &'static str {
 pub struct KeptSubtitle {
     /// The stream index the player names the track by.
     pub index: u32,
+    #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub language: Option<String>,
     /// The exact URL the player fetches it from; stored under that key.
     pub url: String,
@@ -62,33 +64,47 @@ pub enum KeptState {
 /// player need, with no call to the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptVideo {
+    // Identity and the stored files have no default: a record without them
+    // names nothing it could serve. Every other field falls back, so a field
+    // added later does not strand the manifests written before it (a
+    // stranded manifest holds its folder, and the admission block with it).
     /// The item, as `ItemRef` prints it.
     pub item: String,
     /// The version played; empty is the primary.
+    #[serde(default)]
     pub version: String,
     /// The signed-in user's id (hex, as `Session.me` reports), so one
     /// user's downloads are never listed for another.
     pub user: String,
     /// The display name ("Show · S1E2 · Title" for an episode).
+    #[serde(default)]
     pub title: String,
     /// "movie" or "episode".
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub runtime_ms: u64,
     /// The exact master playlist URL the player opens.
     pub master_url: String,
     /// The audio and subtitle stream indexes the stream was made with.
+    #[serde(default)]
     pub audio: Option<u32>,
+    #[serde(default)]
     pub subtitles: Vec<KeptSubtitle>,
     /// Every stored key, master first.
     pub files: Vec<String>,
     /// The video bitrate cap it was made at.
+    #[serde(default)]
     pub quality_bps: u64,
     /// The size estimated before starting.
+    #[serde(default)]
     pub estimated_bytes: u64,
     pub state: KeptState,
     /// Where the viewer stopped, saved on the device while offline.
+    #[serde(default)]
     pub position_ms: u64,
     /// ISO 8601 UTC.
+    #[serde(default)]
     pub saved_at: String,
 }
 
@@ -514,7 +530,32 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// A manifest written before a field existed still parses, and one
+    /// written by a newer build (an extra field) does too: a manifest that
+    /// does not parse holds its folder and blocks every admission. The
+    /// fields that name the item and its files have no default.
+    #[test]
+    fn an_older_manifest_missing_later_fields_still_parses() {
+        let old = r#"{"item":"7","user":"u1","master_url":"http://h/m.m3u8",
+            "files":["http://h/m.m3u8"],"state":{"state":"ready"},
+            "a_field_from_a_newer_build":1}"#;
+        let v: KeptVideo = serde_json::from_str(old).unwrap();
+        assert_eq!((v.item.as_str(), v.quality_bps, v.position_ms), ("7", 0, 0));
+        assert!(v.subtitles.is_empty() && v.audio.is_none() && v.title.is_empty());
+        assert!(v.ready());
+        // What names the item or what it stored is not invented.
+        for gone in ["item", "user", "master_url", "files", "state"] {
+            let mut j: serde_json::Value = serde_json::from_str(old).unwrap();
+            j.as_object_mut().unwrap().remove(gone);
+            assert!(
+                serde_json::from_value::<KeptVideo>(j).is_err(),
+                "{gone} defaulted"
+            );
+        }
+    }
 
     #[test]
     fn a_download_must_fit_under_the_cap_and_above_the_guard() {
