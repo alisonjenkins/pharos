@@ -235,6 +235,31 @@ fn a_pdf_reopens_where_it_was_left() {
 }
 
 #[test]
+fn a_pdf_keeps_its_place_once_a_page_jumped_to_is_in() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let book = a_page_book(12);
+    let commands = read(&mut runner, 0);
+    let _ = settle(&mut runner, commands, &book);
+    for action in ["comic-controls", "comic-jump", "comic-digit-9"] {
+        let _ = runner.action(action_id(action));
+    }
+    let go = runner.action(action_id("comic-go"));
+    let all = settle(&mut runner, go, &book);
+    let kept = all
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            Command::Store(StoreRequest::Save { key, value }) if key == books::KEY => {
+                books::Shelf::decode(value)
+            }
+            _ => None,
+        })
+        .expect("the place is kept when page 9 is in");
+    let memory = &kept.get("b1").expect("the book is on the shelf").memory;
+    assert!(memory.contains("\"page\":8"), "{memory}");
+}
+
+#[test]
 fn a_pdf_offers_no_opening_since_pharos_reads_one_only_from_an_epub() {
     let (mut runner, _) = books_from(PDF_LIST);
     let detail = last_screen(&runner.action(action_id("book-0"))).expect("a screen");

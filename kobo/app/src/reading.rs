@@ -926,7 +926,21 @@ impl Reading {
         match step {
             ComicStep::Elsewhere => None,
             ComicStep::Busy => Some(false),
-            ComicStep::Changed => Some(true),
+            ComicStep::Changed => {
+                // A turn or jump that waited for its page moves the place
+                // only when the page is in: keep it then.
+                let moved = match (&self.current, self.comic.memory()) {
+                    (Some(book), Some(memory)) => self
+                        .shelf
+                        .get(&book.id)
+                        .is_some_and(|saved| saved.memory.as_bytes() != memory.as_slice()),
+                    _ => false,
+                };
+                if moved {
+                    self.keep_place(context);
+                }
+                Some(true)
+            }
             ComicStep::Opened => {
                 if let Job::OpeningShelf(started) = std::mem::take(&mut self.job) {
                     step_taken(context, "open", started, 0);
