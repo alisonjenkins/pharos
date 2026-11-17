@@ -1291,18 +1291,6 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
     (names, complete)
 }
 
-/// Deletes the staging files a closed app left in `dir/files`.
-fn clear_parts(dir: &Path) {
-    let Ok(read) = std::fs::read_dir(dir.join("files")) else {
-        return;
-    };
-    for entry in read.filter_map(Result::ok) {
-        if entry.file_name().to_string_lossy().ends_with(".part") {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
 /// A folder whose record cannot be read is left alone, never deleted. Its
 /// bytes (as far as they can be read) count against the cap, and since the
 /// record's own reservation is lost, nothing is admitted while it stays.
@@ -1865,6 +1853,7 @@ impl DiskVideoStore {
         let mut held: Vec<(PathBuf, u64)> = Vec::new();
         let mut unmeasured: Vec<(PathBuf, String)> = Vec::new();
         let mut measured: HashMap<PathBuf, (u64, bool)> = HashMap::new();
+        let mut leftover: Vec<PathBuf> = Vec::new();
         for user_dir in list_dirs(&inner.root, &mut unmeasured) {
             for item_dir in list_dirs(&user_dir, &mut unmeasured) {
                 let manifest = item_dir.join("manifest.json");
@@ -1916,7 +1905,11 @@ impl DiskVideoStore {
                         continue;
                     }
                 };
-                clear_parts(&item_dir);
+                // A staging file that will not go keeps the folder unknown
+                // until a sweep deletes it or measures the folder whole.
+                if !drop_parts_of(&item_dir, None) {
+                    leftover.push(item_dir.clone());
+                }
                 let names = stored_names(&item_dir);
                 let mut whole = 0usize;
                 for key in &record.files {
@@ -1958,6 +1951,7 @@ impl DiskVideoStore {
             st.held = held;
             st.unmeasured = unmeasured;
             st.measured = measured;
+            st.leftover = leftover;
             st.root.clone_from(&inner.root);
         }
         emit(
@@ -4655,6 +4649,26 @@ mod tests {
         FAIL_ENTRY_READ.with(|f| f.set(false));
         std::fs::remove_dir_all(&dir).ok();
         assert!(!clean, "an entry read error counted as clean");
+    }
+
+    /// At open, a staging file that will not go keeps the folder unknown.
+    #[tokio::test]
+    async fn a_reopen_with_an_undeletable_staging_file_keeps_the_folder_unknown() {
+        let rig = Rig::new("reopen-part");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let store = rig.open();
+        assert!(store.size_unknown(), "the folder was read as known");
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        store.inner.sweep_tombstones();
+        assert!(!store.size_unknown(), "the sweep did not resolve it");
     }
 
     /// A same-item retry takes over a folder that would not delete: the
