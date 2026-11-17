@@ -211,31 +211,26 @@ thread_local! {
     static IDENTITY: std::cell::RefCell<Identity> = const { std::cell::RefCell::new(Identity::Unknown) };
 }
 
-fn identity() -> Identity {
+/// Reads or changes the identity under its one lock.
+fn with_identity<R>(f: impl FnOnce(&mut Identity) -> R) -> R {
     #[cfg(not(test))]
     {
-        IDENTITY
+        f(&mut IDENTITY
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
     #[cfg(test)]
     {
-        IDENTITY.with(|i| i.borrow().clone())
+        IDENTITY.with(|i| f(&mut i.borrow_mut()))
     }
 }
 
+fn identity() -> Identity {
+    with_identity(|i| i.clone())
+}
+
 fn set_identity(next: Identity) {
-    #[cfg(not(test))]
-    {
-        *IDENTITY
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-    }
-    #[cfg(test)]
-    {
-        IDENTITY.with(|i| *i.borrow_mut() = next);
-    }
+    with_identity(|i| *i = next);
 }
 
 fn read_pref() -> Result<Option<String>, String> {
@@ -254,33 +249,90 @@ fn write_pref(value: &str) -> Result<(), String> {
     super::platform::store_theme(LAST_USER_KEY, value)
 }
 
+/// What the device token says about who is signed in, where a token decides
+/// it (the phone and TV apps): `Some(Ok(user))` for the user stored with a
+/// readable token, `Some(Ok(None))` for no token or none with a user id, and
+/// `None` where the preference decides alone.
+fn token_user() -> Option<Result<Option<String>, String>> {
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        return Some(seam.token_user());
+    }
+    super::platform::TOKEN_DECIDES_SIGN_IN.then(super::platform::token_user)
+}
+
+/// Who a cold start may take to be signed in: the remembered user, and
+/// where a token decides sign-in, only with a readable token that was issued
+/// to that same user. No token, an unreadable one, or one with no user id
+/// stored is nobody.
+fn cold_start_identity() -> Identity {
+    let pref = match read_pref() {
+        Ok(p) => p.filter(|u| !u.is_empty()),
+        Err(e) => {
+            super::platform::warn(&format!(
+                "pharos: video user verdict=none reason=preference_unreadable error={e}"
+            ));
+            return Identity::Unknown;
+        }
+    };
+    let Some(token) = token_user() else {
+        return pref.map_or(Identity::SignedOut, Identity::User);
+    };
+    match (token, pref) {
+        (Err(e), _) => {
+            super::platform::warn(&format!(
+                "pharos: video user verdict=none reason=token_unreadable error={e}"
+            ));
+            Identity::Unknown
+        }
+        (Ok(None), _) => {
+            super::platform::info(
+                "pharos: video user verdict=none reason=no_token_or_no_user_with_it",
+            );
+            Identity::Unknown
+        }
+        (Ok(Some(t)), Some(p)) if t == p => Identity::User(p),
+        (Ok(Some(_)), _) => {
+            super::platform::info(
+                "pharos: video user verdict=none reason=preference_not_the_tokens_user",
+            );
+            Identity::Unknown
+        }
+    }
+}
+
 /// The id of the user signed in, and so the one whose downloads may be
-/// listed or served. The process's own knowledge wins; the stored
-/// preference is read only while that is unknown (a cold start), and one
-/// that cannot be read leaves it unknown: nobody.
+/// listed or served. The process's own knowledge wins. While it is unknown
+/// (a cold start) it is worked out from the device token and the stored
+/// preference (`cold_start_identity`) and installed only if nothing set it
+/// meanwhile, so a sign-in or sign-out that lands during the read is never
+/// overwritten by what was read before it.
 pub fn last_user() -> Option<String> {
-    match identity() {
+    let known = identity();
+    if known != Identity::Unknown {
+        return match known {
+            Identity::User(u) => Some(u),
+            _ => None,
+        };
+    }
+    let found = cold_start_identity();
+    let now = with_identity(|i| {
+        if *i == Identity::Unknown && found != Identity::Unknown {
+            *i = found.clone();
+            super::platform::info(&format!(
+                "pharos: video user verdict={} reason=cold_start",
+                if matches!(found, Identity::User(_)) {
+                    "known"
+                } else {
+                    "none"
+                }
+            ));
+        }
+        i.clone()
+    });
+    match now {
         Identity::User(u) => Some(u),
-        Identity::SignedOut => None,
-        Identity::Unknown => match read_pref() {
-            Ok(Some(u)) if !u.is_empty() => {
-                super::platform::info(&format!(
-                    "pharos: video user verdict=known reason=cold_start_from_preference user={u}"
-                ));
-                set_identity(Identity::User(u.clone()));
-                Some(u)
-            }
-            Ok(_) => {
-                set_identity(Identity::SignedOut);
-                None
-            }
-            Err(e) => {
-                super::platform::warn(&format!(
-                    "pharos: video user verdict=none reason=preference_unreadable error={e}"
-                ));
-                None
-            }
-        },
+        _ => None,
     }
 }
 
@@ -291,12 +343,32 @@ pub fn remember_user(user: &str) {
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
+    note_token_user(user);
     if matches!(read_pref(), Ok(Some(p)) if p == user) {
         return;
     }
     if let Err(e) = write_pref(user) {
         super::platform::warn(&format!(
             "pharos: video user not remembered (served for this run only) error={e}"
+        ));
+    }
+}
+
+/// Keeps the user id with the device token, so a cold start can tell whose
+/// token it is.
+fn note_token_user(user: &str) {
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        if let Err(e) = seam.note_token_user(user) {
+            super::platform::warn(&format!(
+                "pharos: video user not kept with the token error={e}"
+            ));
+        }
+        return;
+    }
+    if let Err(e) = super::platform::note_token_user(user) {
+        super::platform::warn(&format!(
+            "pharos: video user not kept with the token error={e}"
         ));
     }
 }
@@ -353,20 +425,54 @@ mod tests {
 
     use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, StoredFile, VideoStore};
 
+    type ReadHook = Box<dyn Fn()>;
+
     /// The stored preference, replaceable: its reads and writes can fail.
     #[derive(Clone, Default)]
     pub(super) struct Pref {
         value: Rc<RefCell<Option<String>>>,
         fail_read: Rc<Cell<bool>>,
         fail_write: Rc<Cell<bool>>,
+        /// Whether a readable device token exists, and the user stored with
+        /// it.
+        token_present: Rc<Cell<bool>>,
+        token_user: Rc<RefCell<Option<String>>>,
+        /// Runs once as the preference is read: a sign-in or sign-out that
+        /// lands during a cold start's reads.
+        on_read: Rc<RefCell<Option<ReadHook>>>,
     }
 
     impl Pref {
-        pub(super) fn read(&self) -> Result<Option<String>, String> {
-            if self.fail_read.get() {
-                return Err("unreadable".to_owned());
+        pub(super) fn token_user(&self) -> Result<Option<String>, String> {
+            Ok(if self.token_present.get() {
+                self.token_user.borrow().clone()
+            } else {
+                None
+            })
+        }
+        pub(super) fn note_token_user(&self, user: &str) -> Result<(), String> {
+            if self.token_present.get() {
+                *self.token_user.borrow_mut() = Some(user.to_owned());
             }
-            Ok(self.value.borrow().clone())
+            Ok(())
+        }
+        /// What the sign-out does to the token: it and its user are gone.
+        pub(super) fn clear_token(&self) {
+            self.token_present.set(false);
+            *self.token_user.borrow_mut() = None;
+        }
+        pub(super) fn read(&self) -> Result<Option<String>, String> {
+            let read = if self.fail_read.get() {
+                Err("unreadable".to_owned())
+            } else {
+                Ok(self.value.borrow().clone())
+            };
+            // What was read is already in hand when the change lands.
+            let hook = self.on_read.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            read
         }
         pub(super) fn write(&self, v: &str) -> Result<(), String> {
             if self.fail_write.get() {
@@ -383,6 +489,7 @@ mod tests {
 
     fn pref() -> Pref {
         let p = Pref::default();
+        p.token_present.set(true);
         PREF.with(|c| *c.borrow_mut() = Some(p.clone()));
         set_identity(Identity::Unknown);
         p
@@ -464,17 +571,68 @@ mod tests {
         assert!(serves(last_user()));
     }
 
-    /// At a cold start the preference is where the user is learnt from; one
-    /// that cannot be read leaves nobody served.
+    /// A real offline cold start: the token is there and was issued to the
+    /// remembered user, so that user's files are served; a preference that
+    /// cannot be read serves nobody.
     #[test]
-    fn a_cold_start_reads_the_preference_and_an_unreadable_one_serves_nobody() {
+    fn a_cold_start_with_a_token_for_the_remembered_user_serves_them() {
         let p = pref();
         *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
         p.fail_read.set(true);
         assert_eq!(last_user(), None);
         assert!(!serves(last_user()));
         p.fail_read.set(false);
         assert_eq!(last_user().as_deref(), Some("A"));
+        assert!(serves(last_user()));
+    }
+
+    /// The preference alone is not a sign-in: a failed sign-out write leaves
+    /// the old user in it, and the next start (the token gone) serves nobody.
+    #[test]
+    fn a_failed_sign_out_write_followed_by_a_restart_serves_nothing() {
+        let p = pref();
+        remember_user("A");
+        assert!(serves(last_user()));
+        p.fail_write.set(true);
+        p.clear_token();
+        forget_user();
+        assert_eq!(p.value.borrow().as_deref(), Some("A"), "the write failed");
+        // The restart: the process knows nothing, the preference says A.
+        set_identity(Identity::Unknown);
+        assert_eq!(last_user(), None, "the stale preference signed A back in");
+        assert!(!serves(last_user()));
+    }
+
+    /// A token with no user id stored with it, or another user's, does not
+    /// vouch for the remembered user.
+    #[test]
+    fn a_token_that_is_not_the_remembered_users_serves_nobody() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        assert_eq!(last_user(), None, "a token with no user id vouched for A");
+        *p.token_user.borrow_mut() = Some("B".to_owned());
+        assert_eq!(last_user(), None, "B's token vouched for A");
+        assert!(!serves(last_user()));
+    }
+
+    /// A sign-in or sign-out that lands while a cold start is reading is
+    /// not overwritten by what the read found.
+    #[test]
+    fn a_change_during_the_cold_start_reads_is_not_overwritten() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        *p.on_read.borrow_mut() = Some(Box::new(forget_user));
+        assert_eq!(last_user(), None, "the cold start brought A back");
+        assert!(!serves(last_user()));
+
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        *p.on_read.borrow_mut() = Some(Box::new(|| remember_user("B")));
+        assert_eq!(last_user().as_deref(), Some("B"), "B was overwritten");
+        assert!(!serves(last_user()), "A's file served to B");
     }
 
     pub(crate) fn video(item: &str, version: &str, state: KeptState) -> KeptVideo {

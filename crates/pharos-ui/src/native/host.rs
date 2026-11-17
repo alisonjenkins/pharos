@@ -610,6 +610,20 @@ pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a device token, not the stored preference, decides who is signed
+/// in at a cold start. Only the phone and TV apps keep one.
+pub const TOKEN_DECIDES_SIGN_IN: bool = false;
+
+/// The user id kept with the device token; none where there is no token.
+pub fn token_user() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Keeps `user` with the device token; nothing to do where there is none.
+pub fn note_token_user(_user: &str) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn apply_subtitle_size(_size: SubtitleSize) {}
 
 pub fn apply_device(_device: super::playback::DeviceClass) {}

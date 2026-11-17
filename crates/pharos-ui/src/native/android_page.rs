@@ -1974,6 +1974,21 @@ pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
     android::store_pref(key, value)
 }
 
+/// The device token decides who is signed in at a cold start: no token (or
+/// one that cannot be read) is nobody, whatever a preference says.
+pub const TOKEN_DECIDES_SIGN_IN: bool = true;
+
+/// The user id kept with the device token; `None` when there is no readable
+/// token or none was stored with it.
+pub fn token_user() -> Result<Option<String>, String> {
+    android::load_token_user()
+}
+
+/// Keeps `user` with the device token, at sign-in.
+pub fn note_token_user(user: &str) -> Result<(), String> {
+    android::store_token_user(user)
+}
+
 pub fn apply_subtitle_size(size: SubtitleSize) {
     set_root_attribute("data-subtitle-size", size.as_str());
 }

@@ -137,6 +137,34 @@ fn token_path() -> Result<PathBuf, String> {
         })
 }
 
+/// The user the token was issued to, kept beside it: a cold start trusts a
+/// remembered user only when it is this one.
+fn token_user_path() -> Result<PathBuf, String> {
+    files_dir().map(|d| d.join("device-token.user"))
+}
+
+/// The user id stored with the token. `None` with no readable token (a
+/// token that cannot be read is nobody) or no user id stored with it.
+pub fn load_token_user() -> Result<Option<String>, String> {
+    if load_token().is_none() {
+        return Ok(None);
+    }
+    match std::fs::read_to_string(token_user_path()?) {
+        Ok(v) => Ok(Some(v.trim().to_owned()).filter(|u| !u.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("token user: {e}")),
+    }
+}
+
+/// Stores the user id beside the token, written whole then renamed.
+pub fn store_token_user(user: &str) -> Result<(), String> {
+    let path = token_user_path()?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, user)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("token user: {e}"))
+}
+
 /// The device token as last loaded, stored or forgotten, kept in memory for
 /// the server proxy, which sends it on every image request.
 static TOKEN: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
@@ -204,6 +232,13 @@ pub fn store_token(token: &str) -> Result<(), String> {
 
 pub fn forget_token() {
     set_cached(None);
+    if let Ok(path) = token_user_path() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("forget token user: {e}"),
+        }
+    }
     let Ok(path) = token_path() else { return };
     match std::fs::remove_file(path) {
         Ok(()) => {}
