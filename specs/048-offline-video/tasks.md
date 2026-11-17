@@ -11,3 +11,4 @@
 - [ ] T9 Re-negotiate a fresh play session when a download resumes after its session ended (6 h idle), keeping stored files of the same stream (PR #1482 review).
 - [ ] T10 Serialise the download record list across tabs (Web Locks or BroadcastChannel) (PR #1482 review).
 - [ ] T11 Bind progress and terminal updates to a run generation, so a removed-and-restarted download is not finished by the old run (PR #1482 review).
+- [x] T12 Viewer-set space allowance: a "Space for downloads" picker (2–128 GiB, default 4) on the Downloads page. The web store keeps it in `localStorage` (`pharos.kept_videos.cap_gib`) and admission (FR-003) uses it. `VideoStore::set_cap_bytes` refuses by default, so the phone store opts in by delegating to its shared offline cap.
