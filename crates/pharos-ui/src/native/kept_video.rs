@@ -189,12 +189,13 @@ pub trait VideoStore: Send + Sync {
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
-    /// The stored file for a request's [`request_key`], if this store holds
-    /// it whole. A host that answers the player's requests itself (the
+    /// The stored file for a request's [`request_key`] among `user`'s own
+    /// downloads, if this store holds it whole: one user never reads
+    /// another's. A host that answers the player's requests itself (the
     /// phone's server proxy) asks before going to the network; a store whose
     /// platform answers them another way (the web's service worker) keeps
     /// the default.
-    fn stored_file(&self, _key: &str) -> Option<StoredFile> {
+    fn stored_file(&self, _user: &str, _key: &str) -> Option<StoredFile> {
         None
     }
 }

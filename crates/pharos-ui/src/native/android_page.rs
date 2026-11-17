@@ -3264,8 +3264,12 @@ fn log_video_request(key: &str, verdict: Verdict, bytes: u64) {
 /// response is a buffer, and a segment is a few MB at most. `None` when
 /// nothing is stored, or the file would not read (logged; the network
 /// answers instead).
-async fn stored_answer(key: &str) -> Option<(StoredFile, Vec<u8>)> {
-    let file = super::ports::video_store()?.stored_file(key)?;
+///
+/// Only the signed-in user's own downloads answer: the files stay on disk
+/// after a sign-out (the same user gets them back), but with nobody signed
+/// in, or another account, nothing is served from them.
+async fn stored_answer(user: Option<&str>, key: &str) -> Option<(StoredFile, Vec<u8>)> {
+    let file = super::ports::video_store()?.stored_file(user?, key)?;
     match tokio::fs::read(&file.path).await {
         Ok(body) => Some((file, body)),
         Err(e) => {
@@ -3300,13 +3304,16 @@ pub fn use_server_proxy() {
                 .iter()
                 .filter_map(|name| header(name).map(|v| ((*name).to_owned(), v)))
                 .collect();
+            // Read now, on the caller's thread: the signed-in user this
+            // request belongs to (`None` after a sign-out).
+            let user = super::offline_video::last_user();
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 // A downloaded video's files answer from disk, online or
                 // not: no data used, and the same bytes the player was
                 // given when it was kept.
                 let key = request_key(&path);
-                if let Some((file, body)) = stored_answer(&key).await {
+                if let Some((file, body)) = stored_answer(user.as_deref(), &key).await {
                     log_video_request(&key, Verdict::ServedOffline, file.len);
                     let response = dioxus::mobile::wry::http::Response::builder()
                         .status(200)

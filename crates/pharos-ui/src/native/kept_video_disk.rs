@@ -124,7 +124,7 @@ enum Stop {
 struct State {
     list: Vec<KeptVideo>,
     /// Request key to its whole file on disk.
-    index: HashMap<String, (PathBuf, u64)>,
+    index: HashMap<(String, String), (PathBuf, u64)>,
     /// The run that owns each (user, item) download; a removed or restarted
     /// download is told apart from the one still running by this number.
     runs: HashMap<(String, String), u64>,
@@ -448,7 +448,7 @@ impl Inner {
         for key in &record.files {
             if let Some(len) = names.get(&file_name(key)) {
                 st.index.insert(
-                    key.clone(),
+                    (record.user.clone(), key.clone()),
                     (self.file_path(&record.user, &record.item, key), *len),
                 );
             }
@@ -670,7 +670,8 @@ impl Inner {
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return false;
         }
-        st.index.insert(key.to_owned(), (path, len));
+        st.index
+            .insert((user.to_owned(), key.to_owned()), (path, len));
         true
     }
 
@@ -1367,7 +1368,7 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
             return;
         }
         let _ = std::fs::remove_file(inner.file_path(user, item, key));
-        st.index.remove(key);
+        st.index.remove(&(user.to_owned(), key.clone()));
     }
 }
 
@@ -1488,7 +1489,7 @@ impl DiskVideoStore {
                     if let Some(len) = names.get(&file_name(key)) {
                         whole += 1;
                         index.insert(
-                            key.clone(),
+                            (record.user.clone(), key.clone()),
                             (item_dir.join("files").join(file_name(key)), *len),
                         );
                     }
@@ -1725,7 +1726,7 @@ impl VideoStore for DiskVideoStore {
             };
             st.runs.remove(&(user.to_owned(), item.to_owned()));
             for key in &record.files {
-                st.index.remove(key);
+                st.index.remove(&(user.to_owned(), key.clone()));
             }
             // What the record reserved keeps counting, as a tombstone, from
             // the moment the record leaves the list: there is no instant
@@ -1844,8 +1845,11 @@ impl VideoStore for DiskVideoStore {
         self.inner.env.budget.free_bytes()
     }
 
-    fn stored_file(&self, key: &str) -> Option<StoredFile> {
-        let (path, len) = lock(&self.inner.state).index.get(key).cloned()?;
+    fn stored_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+        let (path, len) = lock(&self.inner.state)
+            .index
+            .get(&(user.to_owned(), key.to_owned()))
+            .cloned()?;
         Some(StoredFile {
             path,
             len,
@@ -2253,16 +2257,19 @@ mod tests {
             MASTER.len() as u64 + MEDIA.len() as u64 + 210
         );
         for (key, byte) in [(SEG0, 2u8), (INIT, 1), (SEG1, 3)] {
-            let f = store.stored_file(key).unwrap();
+            let f = store.stored_file("u1", key).unwrap();
             assert_eq!(std::fs::read(&f.path).unwrap().first(), Some(&byte));
             assert_eq!(f.len, std::fs::metadata(&f.path).unwrap().len());
         }
-        assert_eq!(store.stored_file(SEG0).unwrap().content_type, "video/mp4");
         assert_eq!(
-            store.stored_file(MEDIA_KEY).unwrap().content_type,
+            store.stored_file("u1", SEG0).unwrap().content_type,
+            "video/mp4"
+        );
+        assert_eq!(
+            store.stored_file("u1", MEDIA_KEY).unwrap().content_type,
             "application/vnd.apple.mpegurl"
         );
-        assert!(store.stored_file("/videos/1/other.m4s").is_none());
+        assert!(store.stored_file("u1", "/videos/1/other.m4s").is_none());
         let dir = rig.dir.join("u1").join("1").join("files");
         assert!(
             std::fs::read_dir(dir).unwrap().all(|e| !e
@@ -2303,7 +2310,7 @@ mod tests {
         let store = rig.open();
         store.start(request("1")).unwrap();
         store.settled().await;
-        let gone = store.stored_file(SEG1).unwrap().path;
+        let gone = store.stored_file("u1", SEG1).unwrap().path;
         drop(store);
         std::fs::remove_file(gone).unwrap();
         rig.server.asked.lock().unwrap().clear();
@@ -2321,7 +2328,7 @@ mod tests {
             "only the missing file is asked for"
         );
         assert_eq!(only(&store).state, KeptState::Ready);
-        assert!(store.stored_file(SEG1).is_some());
+        assert!(store.stored_file("u1", SEG1).is_some());
     }
 
     #[tokio::test]
@@ -2425,7 +2432,7 @@ mod tests {
             refused[0].contains("estimate=") && refused[0].contains("cap=1000"),
             "{refused:?}"
         );
-        assert!(store.stored_file(MASTER_KEY).is_none());
+        assert!(store.stored_file("u1", MASTER_KEY).is_none());
         assert!(
             !rig.server.asked().contains(&SEG0.to_owned()),
             "no segment was fetched"
@@ -2485,7 +2492,7 @@ mod tests {
             let store = rig.open();
             store.start(request("1")).unwrap();
             store.settled().await;
-            let gone = store.stored_file(SEG1).unwrap().path;
+            let gone = store.stored_file("u1", SEG1).unwrap().path;
             drop(store);
             std::fs::remove_file(gone).unwrap();
             rig.server.asked.lock().unwrap().clear();
@@ -2506,7 +2513,7 @@ mod tests {
                 "{refused:?}"
             );
             // The stored files stay: with room again the copy finishes.
-            assert!(store.stored_file(SEG0).is_some());
+            assert!(store.stored_file("u1", SEG0).is_some());
         }
     }
 
@@ -2570,7 +2577,7 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         // A restart resumes a copy with a file gone: another admission.
-        let gone = store.stored_file(SEG1).unwrap().path;
+        let gone = store.stored_file("u1", SEG1).unwrap().path;
         drop(store);
         std::fs::remove_file(gone).unwrap();
         let store = rig.open();
@@ -2887,7 +2894,10 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
-        assert!(store.stored_file(INIT).is_some(), "the old plan left files");
+        assert!(
+            store.stored_file("u1", INIT).is_some(),
+            "the old plan left files"
+        );
 
         // The next attempt negotiates a new session: every key changes.
         let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
@@ -2910,7 +2920,7 @@ mod tests {
         let v = only(&store);
         assert_eq!(v.state, KeptState::Ready, "{v:?}");
         assert!(
-            store.stored_file(INIT).is_none(),
+            store.stored_file("u1", INIT).is_none(),
             "the old file is not indexed"
         );
         let dir = rig.dir.join("u1").join("1").join("files");
@@ -2999,7 +3009,7 @@ mod tests {
             .files
             .iter()
             .map(|k| {
-                std::fs::metadata(store.stored_file(k).unwrap().path)
+                std::fs::metadata(store.stored_file("u1", k).unwrap().path)
                     .unwrap()
                     .len()
             })
@@ -3075,7 +3085,7 @@ mod tests {
         store.settled().await;
         store.remove("u1", "1");
         assert!(store.videos("u1").is_empty());
-        assert!(store.stored_file(SEG0).is_none());
+        assert!(store.stored_file("u1", SEG0).is_none());
         assert!(!rig.dir.join("u1").join("1").exists());
         let line = lines("pharos: video keep remove");
         assert!(
@@ -3620,7 +3630,7 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         let key = SEG0.to_owned();
-        let path = store.stored_file(&key).unwrap().path;
+        let path = store.stored_file("u1", &key).unwrap().path;
         let owner = lock(&store.inner.state)
             .runs
             .get(&("u1".to_owned(), "1".to_owned()))
@@ -3630,14 +3640,33 @@ mod tests {
         assert!(owner.is_none());
         drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
         assert!(path.exists(), "a stale run deleted the replacement's file");
-        assert!(store.stored_file(&key).is_some(), "and forgot it");
+        assert!(store.stored_file("u1", &key).is_some(), "and forgot it");
         // The owning run deletes and forgets.
         lock(&store.inner.state)
             .runs
             .insert(("u1".to_owned(), "1".to_owned()), 999);
         drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
         assert!(!path.exists());
-        assert!(store.stored_file(&key).is_none());
+        assert!(store.stored_file("u1", &key).is_none());
+    }
+
+    /// Downloads are served to the user who kept them: another account
+    /// making the same request gets no stored answer, and neither does
+    /// nobody; the files stay for their owner.
+    #[tokio::test]
+    async fn a_stored_file_is_served_only_to_its_own_user() {
+        let rig = Rig::new("scoped-lookup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(store.stored_file("u1", SEG0).is_some(), "the owner");
+        assert!(store.stored_file("u2", SEG0).is_none(), "another account");
+        assert!(store.stored_file("", SEG0).is_none(), "nobody");
+        // It survives a reopen for its owner, and still not for others.
+        drop(store);
+        let store = rig.open();
+        assert!(store.stored_file("u1", SEG0).is_some());
+        assert!(store.stored_file("u2", SEG0).is_none());
     }
 
     /// A damaged manifest is held the same way.
@@ -3707,7 +3736,7 @@ mod tests {
 
         store.remove("u1", "1");
         assert_eq!(store.videos("u1").len(), 1, "the record went");
-        assert!(store.stored_file(SEG0).is_some(), "its files went");
+        assert!(store.stored_file("u1", SEG0).is_some(), "its files went");
         assert!(dir.join("files").exists(), "the folder went");
         let line = lines("pharos: video keep remove");
         assert!(line[0].contains("verdict=not_removed"), "{line:?}");
@@ -3861,7 +3890,7 @@ mod tests {
         new_body.store(true, Ordering::SeqCst);
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
-        let file = store.stored_file(SEG0).unwrap();
+        let file = store.stored_file("u1", SEG0).unwrap();
         let bytes = std::fs::read(file.path).unwrap();
         assert!(
             bytes.len() == 100 && bytes.iter().all(|b| *b != 7),
@@ -3945,7 +3974,7 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
-        assert!(store.stored_file(SEG1).is_none());
+        assert!(store.stored_file("u1", SEG1).is_none());
         assert_eq!(lines("pharos: video keep skipped short tail").len(), 1);
         assert!(!only(&store).files.contains(&SEG1.to_owned()));
 
@@ -3971,7 +4000,7 @@ mod tests {
         let store = rig.open();
         store.start(request("1")).unwrap();
         store.settled().await;
-        let hit = |url: &str| store.stored_file(&request_key(url));
+        let hit = |url: &str| store.stored_file("u1", &request_key(url));
         assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
         assert!(hit("http://localhost:8096/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
         assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=other").is_none());
