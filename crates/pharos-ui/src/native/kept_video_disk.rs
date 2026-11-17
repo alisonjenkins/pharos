@@ -512,6 +512,14 @@ impl Inner {
         let Some(video) = find(&lock(&self.state).list, user, item).cloned() else {
             return Ok(());
         };
+        self.write_manifest(&video)
+    }
+
+    /// Writes `video`'s manifest, whole or not at all, logging a failure.
+    /// The caller holds the `saves` lock.
+    fn write_manifest(&self, video: &KeptVideo) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::during_save(video);
         let dir = self.item_dir(&video.user, &video.item);
         let result = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
@@ -585,6 +593,47 @@ impl Inner {
             f(v);
         }
         self.save_record(user, item).map(|()| true)
+    }
+
+    /// [`Inner::update_run`] for a change that must not be seen before it
+    /// is on disk (a download becoming Ready): the changed record is saved
+    /// first, and only then published in memory, under the ownership check
+    /// and with the `saves` lock held throughout so no other save or
+    /// removal comes between. A failed save leaves memory untouched.
+    fn update_run_saved(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        f: impl Fn(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
+        let _saving = self.saves.lock().unwrap_or_else(PoisonError::into_inner);
+        let owns = |st: &State| st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run);
+        let candidate = {
+            let st = lock(&self.state);
+            if !owns(&st) {
+                return Ok(false);
+            }
+            let Some(mut v) = find(&st.list, user, item).cloned() else {
+                return Ok(false);
+            };
+            f(&mut v);
+            v
+        };
+        self.write_manifest(&candidate)?;
+        let mut st = lock(&self.state);
+        if !owns(&st) {
+            return Ok(false);
+        }
+        let Some(v) = st
+            .list
+            .iter_mut()
+            .find(|v| v.user == user && v.item == item)
+        else {
+            return Ok(false);
+        };
+        f(v);
+        Ok(true)
     }
 
     fn wanted(&self, user: &str, item: &str, run: u64) -> bool {
@@ -1313,7 +1362,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             files,
             skipped,
         }) => {
-            let saved = inner.update_run(&user, &item, run, |v| {
+            let saved = inner.update_run_saved(&user, &item, run, |v| {
                 // A skipped file is not on disk: left in the record, a
                 // reopen would count it missing and resume the copy.
                 v.files.retain(|k| !skipped.contains(k));
@@ -1939,6 +1988,21 @@ mod tests {
     thread_local! {
         /// Runs as a folder is being deleted.
         static DURING_REMOVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    type SaveHook = Box<dyn Fn(&KeptVideo)>;
+
+    thread_local! {
+        /// Runs as a record is about to be written, with that record.
+        static DURING_SAVE: RefCell<Option<SaveHook>> = RefCell::new(None);
+    }
+
+    pub(super) fn during_save(video: &KeptVideo) {
+        DURING_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f(video);
+            }
+        });
     }
 
     thread_local! {
@@ -3639,6 +3703,37 @@ mod tests {
         );
         // Once it is gone the block lifts.
         assert!(!store.size_unknown(), "still blocked after the removal");
+    }
+
+    /// Ready is seen only once it is on disk: a `videos()` read while the
+    /// Ready record is being saved still shows the download as running.
+    #[tokio::test]
+    async fn ready_is_not_visible_until_its_record_is_saved() {
+        let rig = Rig::new("ready-after-save");
+        let store = rig.open();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |saving: &KeptVideo| {
+                if saving.ready() {
+                    seen2
+                        .borrow_mut()
+                        .push(s2.videos("u1").iter().any(KeptVideo::ready));
+                }
+            }));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        assert_eq!(
+            *seen.borrow(),
+            vec![false],
+            "Ready seen before it was saved"
+        );
+        assert!(only(&store).ready(), "never became Ready");
+        // And the disk agrees: a reopen finds it Ready.
+        drop(store);
+        assert!(only(&rig.open()).ready());
     }
 
     /// A download whose terminal record cannot be saved is not reported
