@@ -198,6 +198,9 @@ struct State {
     /// whole, so they are unknown meanwhile. A fact, so accounting does not
     /// depend on a cleanup having worked.
     leftover: Vec<PathBuf>,
+    /// Folders whose staging files the host's size check found and left
+    /// (counted, measured whole): the next ordinary sweep deletes them.
+    deferred_parts: Vec<PathBuf>,
     /// Folders whose leftover a sweep is settling right now. One settlement
     /// per folder at a time, and `start` refuses a folder in it: a second
     /// sweep (or a retry) would otherwise act on what the first one saw
@@ -568,7 +571,18 @@ impl Inner {
     /// not go; the ones that do stop counting. A folder a live record has
     /// taken over is left to that record.
     fn sweep_tombstones(&self) {
-        self.settle_leftovers();
+        // Staging files the host's check left are settled (deleted, the
+        // folder measured) here, with the leftovers.
+        {
+            let mut st = lock(&self.state);
+            let deferred = std::mem::take(&mut st.deferred_parts);
+            for dir in deferred {
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir);
+                }
+            }
+        }
+        self.settle_leftovers(Sweep::Ordinary);
         let pending: Vec<PathBuf> = {
             let mut st = lock(&self.state);
             let picked: Vec<PathBuf> = st
@@ -633,7 +647,7 @@ impl Inner {
     /// record's reservation, saved, or the tombstone's) and the fact clears.
     /// A folder that cannot be read whole, or whose save failed, stays
     /// unknown. One settlement per folder at a time.
-    fn settle_leftovers(&self) {
+    fn settle_leftovers(&self, sweep: Sweep) {
         let dirs: Vec<PathBuf> = {
             let st = lock(&self.state);
             st.leftover
@@ -656,8 +670,16 @@ impl Inner {
             let Some((epoch, owned)) = claimed else {
                 continue;
             };
-            self.settle_claimed(&dir, epoch, owned);
-            lock(&self.state).settling.retain(|d| *d != dir);
+            // The host's check deletes no staging file: it settles on the
+            // whole folder's measure (the files included) and leaves the
+            // files to the next ordinary sweep.
+            let host = sweep == Sweep::HostCheck;
+            self.settle_claimed(&dir, epoch, owned || host);
+            let mut st = lock(&self.state);
+            st.settling.retain(|d| *d != dir);
+            if host && !owned && !st.deferred_parts.contains(&dir) {
+                st.deferred_parts.push(dir.clone());
+            }
         }
     }
 
@@ -1554,6 +1576,18 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
 }
 
 /// A record read from a folder, ready to join the list.
+/// Who runs a sweep, which decides whether it may delete.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sweep {
+    /// A listing, a start, a discard or the open: deletes what it finds
+    /// removed (an orphan folder, stale staging files).
+    Ordinary,
+    /// The host's size check, run under the music cache's locks: measures
+    /// and counts what it finds, deletes nothing. What it would delete is
+    /// left to the next ordinary sweep (`sweep_tombstones`).
+    HostCheck,
+}
+
 struct Adopted {
     record: KeptVideo,
     /// The stored whole files, by user and key.
@@ -1561,6 +1595,9 @@ struct Adopted {
     /// A staging file would not delete: the folder stays unknown until a
     /// settlement.
     leftover: bool,
+    /// Staging files were left for an ordinary sweep to delete (counted in
+    /// the floor meanwhile).
+    parts_deferred: bool,
     /// Whether the walk that took the record's floor read the whole folder.
     exact: bool,
 }
@@ -1568,10 +1605,17 @@ struct Adopted {
 /// What a record found in `item_dir` becomes: its staging files dropped, its
 /// whole files indexed, and a ready record that lost files back to
 /// downloading.
-fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
+fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
     // A staging file that will not go keeps the folder unknown until a
-    // sweep deletes it or measures the folder whole.
-    let leftover = !drop_parts_of(item_dir, None);
+    // sweep deletes it or measures the folder whole. The host's check
+    // deletes none: they count in the floor below until an ordinary sweep.
+    let (leftover, parts_deferred) = match sweep {
+        Sweep::Ordinary => (!drop_parts_of(item_dir, None), false),
+        Sweep::HostCheck => {
+            let (parts, listed) = part_paths(item_dir, ".part");
+            (!listed, !parts.is_empty())
+        }
+    };
     let names = stored_names(item_dir);
     let mut whole = 0usize;
     let mut index = Vec::new();
@@ -1624,6 +1668,7 @@ fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
         record,
         index,
         leftover,
+        parts_deferred,
         exact: m.exact,
     }
 }
@@ -1646,9 +1691,19 @@ enum Scanned {
     Removed,
 }
 
-fn scan_item(env: &Env, item_dir: &Path) -> Scanned {
+fn scan_item(env: &Env, item_dir: &Path, sweep: Sweep) -> Scanned {
     match read_held(item_dir) {
-        HeldNow::Readable(record) => Scanned::Record(Box::new(adopt(item_dir, *record))),
+        HeldNow::Readable(record) => Scanned::Record(Box::new(adopt(item_dir, *record, sweep))),
+        // The host's check deletes nothing: the folder is measured and
+        // counted as a tombstone, which the next ordinary sweep deletes.
+        HeldNow::NoRecord if sweep == Sweep::HostCheck => {
+            let m = dir_size(item_dir);
+            Scanned::Tombstone {
+                bytes: m.bytes,
+                exact: m.exact,
+                error: "deletion deferred to an ordinary sweep (host size check)".to_owned(),
+            }
+        }
         HeldNow::Gone => Scanned::Removed,
         HeldNow::Still(why) => Scanned::Held {
             why,
@@ -1683,15 +1738,22 @@ struct Listing {
 
 /// Lists `dir` (the root, with `users`, or a user's folder) and scans every
 /// item folder under it that `skip` does not name.
-fn scan_tree(env: &Env, dir: &Path, users: bool, skip: &dyn Fn(&Path) -> bool, out: &mut Listing) {
+fn scan_tree(
+    env: &Env,
+    dir: &Path,
+    users: bool,
+    skip: &dyn Fn(&Path) -> bool,
+    out: &mut Listing,
+    sweep: Sweep,
+) {
     match dirs(dir) {
         Err(e) => out.failed.push((dir.to_path_buf(), e.to_string())),
         Ok(children) => {
             for child in children {
                 if users {
-                    scan_tree(env, &child, false, skip, out);
+                    scan_tree(env, &child, false, skip, out, sweep);
                 } else if !skip(&child) {
-                    let scanned = scan_item(env, &child);
+                    let scanned = scan_item(env, &child, sweep);
                     out.items.push((child, scanned));
                 }
             }
@@ -1716,6 +1778,9 @@ impl State {
             Scanned::Record(a) => {
                 if a.leftover {
                     self.leftover.push(dir.to_path_buf());
+                }
+                if a.parts_deferred && !self.deferred_parts.iter().any(|d| d == dir) {
+                    self.deferred_parts.push(dir.to_path_buf());
                 }
                 if !a.exact {
                     self.unmeasured.push((
@@ -2510,7 +2575,7 @@ impl Inner {
         self.host_sweeps
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let before = lock(&self.state).unknown_reason();
-        self.sweep_held();
+        self.sweep_held(Sweep::HostCheck);
         // The tombstones and leftovers recover too, as `sweep_tombstones`
         // would recover them, with its claims and writer checks. Measured,
         // not deleted: this runs under the music cache's locks, and deleting
@@ -2518,7 +2583,7 @@ impl Inner {
         // is known and counted at its bytes; its deletion waits for the next
         // `sweep_tombstones` (a listing, a start or a discard). Settling a
         // leftover deletes only staging files.
-        self.settle_leftovers();
+        self.settle_leftovers(Sweep::HostCheck);
         self.measure_unknown_tombstones();
         let after = lock(&self.state).unknown_reason();
         emit(
@@ -2593,13 +2658,13 @@ impl Inner {
     /// gone is dropped; one left without a record is a removed download and
     /// becomes a tombstone; one still unreadable has its size measured again.
     /// Each verdict is logged, a repeat of an unchanged one is not.
-    fn sweep_held(self: &Arc<Self>) {
+    fn sweep_held(self: &Arc<Self>, sweep: Sweep) {
         for dir in self.claim_held() {
             let now = read_held(&dir);
-            self.apply_held(&dir, now);
+            self.apply_held(&dir, now, sweep);
             lock(&self.state).deleting.retain(|d| *d != dir);
         }
-        self.sweep_relist();
+        self.sweep_relist(sweep);
         self.sweep_remeasure();
     }
 
@@ -2607,7 +2672,7 @@ impl Inner {
     /// what turns up: a record is adopted, an unreadable one held, a removed
     /// download's folder deleted or tombstoned. The block on a folder lifts
     /// only once its listing succeeds, with everything found counted.
-    fn sweep_relist(self: &Arc<Self>) {
+    fn sweep_relist(self: &Arc<Self>, sweep: Sweep) {
         // Claimed under the hold that picks them: a sweep already listing a
         // folder keeps it to itself until its adoptions are in.
         let (dirs, skipped) = {
@@ -2644,7 +2709,7 @@ impl Inner {
                 }
                 skip
             };
-            scan_tree(&self.env, &dir, dir == self.root, &known, &mut found);
+            scan_tree(&self.env, &dir, dir == self.root, &known, &mut found, sweep);
             let mut resume = Vec::new();
             let mut st = lock(&self.state);
             for (d, scanned) in found.items {
@@ -2743,7 +2808,7 @@ impl Inner {
     }
 
     /// Applies what [`read_held`] found for a claimed `dir`.
-    fn apply_held(self: &Arc<Self>, dir: &Path, now: HeldNow) {
+    fn apply_held(self: &Arc<Self>, dir: &Path, now: HeldNow, sweep: Sweep) {
         let verdict = |v: &str, why: &str| {
             emit(
                 false,
@@ -2763,7 +2828,7 @@ impl Inner {
                     verdict("still_held", "record names another folder");
                     return;
                 }
-                let adopted = adopt(dir, *record);
+                let adopted = adopt(dir, *record, sweep);
                 let (user, item) = (adopted.record.user.clone(), adopted.record.item.clone());
                 let resume = !interrupted(std::slice::from_ref(&adopted.record)).is_empty();
                 let mut st = lock(&self.state);
@@ -2836,8 +2901,10 @@ impl Inner {
         let mut failed = Vec::new();
         for dir in self.claim_held() {
             match read_held(&dir) {
-                HeldNow::Readable(record) => self.apply_held(&dir, HeldNow::Readable(record)),
-                HeldNow::Gone => self.apply_held(&dir, HeldNow::Gone),
+                HeldNow::Readable(record) => {
+                    self.apply_held(&dir, HeldNow::Readable(record), Sweep::Ordinary);
+                }
+                HeldNow::Gone => self.apply_held(&dir, HeldNow::Gone, Sweep::Ordinary),
                 HeldNow::NoRecord | HeldNow::Still(_) => {
                     let bytes = lock(&self.state)
                         .held
@@ -2916,7 +2983,14 @@ impl DiskVideoStore {
         let mut st = State::default();
         st.root.clone_from(&inner.root);
         let mut found = Listing::default();
-        scan_tree(&inner.env, &inner.root, true, &|_| false, &mut found);
+        scan_tree(
+            &inner.env,
+            &inner.root,
+            true,
+            &|_| false,
+            &mut found,
+            Sweep::Ordinary,
+        );
         for (dir, scanned) in found.items {
             st.apply_scanned(&dir, scanned);
         }
@@ -3013,7 +3087,7 @@ impl VideoStore for DiskVideoStore {
     fn videos(&self, user: &str) -> Vec<KeptVideo> {
         // The page that lists the downloads reads the held folders again, so
         // one whose record became readable is not stranded.
-        self.inner.sweep_held();
+        self.inner.sweep_held(Sweep::Ordinary);
         lock(&self.inner.state)
             .list
             .iter()
@@ -3030,7 +3104,7 @@ impl VideoStore for DiskVideoStore {
         // planning and shows as a failed download. The room is read under
         // the host's shared admission lock, before the store's own lock is
         // taken, and the check and the new record sit under one hold of it.
-        self.inner.sweep_held();
+        self.inner.sweep_held(Sweep::Ordinary);
         self.inner.sweep_tombstones();
         let mut replaced: Option<KeptVideo> = None;
         // The figure of a tombstone this start absorbed, to put back if the
@@ -6320,11 +6394,11 @@ mod tests {
 
         let slow = {
             let inner = store.inner.clone();
-            std::thread::spawn(move || inner.sweep_relist())
+            std::thread::spawn(move || inner.sweep_relist(Sweep::Ordinary))
         };
         wait_check.recv().unwrap();
         // A second sweep while the first is between its check and its scan.
-        store.inner.sweep_relist();
+        store.inner.sweep_relist(Sweep::Ordinary);
         go.send(()).unwrap();
         slow.join().unwrap();
         *store.inner.relist_hook.lock().unwrap() = None;
@@ -6773,6 +6847,53 @@ mod tests {
         (rig, store, dir)
     }
 
+    /// The host's check runs under the music cache's locks, so it deletes
+    /// nothing. A user folder unlisted at open that hides an orphan (a
+    /// removed download's folder, no record) and a download with a stale
+    /// staging file is recovered through the hook alone: both are counted
+    /// and stay on disk. The next ordinary sweep deletes them.
+    #[tokio::test]
+    async fn the_host_check_counts_an_orphan_and_stale_parts_and_deletes_neither() {
+        let rig = Rig::new("host-no-delete");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let user = rig.dir.join("u1");
+        let orphan = user.join("9");
+        std::fs::create_dir_all(orphan.join("files")).unwrap();
+        std::fs::write(orphan.join("files").join("a"), [1u8; 300]).unwrap();
+        let part = user.join("1").join("files").join("x.7.part");
+        std::fs::write(&part, [2u8; 40]).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the folder is unlisted");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(orphan.exists(), "the host check deleted the orphan");
+        assert!(part.exists(), "the host check deleted a staging file");
+        let tomb = lock(&store.inner.state)
+            .tombstones
+            .iter()
+            .find(|(d, _)| *d == orphan)
+            .map(|(_, b)| *b);
+        assert!(
+            tomb.is_some_and(|b| b >= 300),
+            "the orphan is not counted: {tomb:?}"
+        );
+        assert!(outside.held >= 300 + 40, "held {}", outside.held);
+
+        // An ordinary sweep deletes them.
+        store.inner.sweep_tombstones();
+        assert!(!orphan.exists(), "the ordinary sweep left the orphan");
+        assert!(!part.exists(), "the ordinary sweep left the staging file");
+        assert!(!store.size_unknown());
+    }
+
     /// A car-only process: a removed download's folder that would not
     /// delete and could not be read, with a staging file that would not go,
     /// recovers through the music hook alone once the folder reads again.
@@ -6823,7 +6944,7 @@ mod tests {
             }
         });
         let before = store.kept_bytes();
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         clear_hook(&DURING_MEASURE);
         assert!(
             lock(&store.inner.state).leftover.contains(&dir),
@@ -6834,7 +6955,7 @@ mod tests {
             before,
             "a stale walk changed the figure"
         );
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         assert!(
             !lock(&store.inner.state).leftover.contains(&dir),
             "a walk made after the change did not settle it"
@@ -6853,13 +6974,13 @@ mod tests {
         let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen2 = seen.clone();
         set_hook(&BEFORE_SETTLE_DROP, move || {
-            s2.inner.settle_leftovers();
+            s2.inner.settle_leftovers(Sweep::Ordinary);
             seen2
                 .borrow_mut()
                 .push(lock(&s2.inner.state).leftover.contains(&d2));
             seen2.borrow_mut().push(s2.start(request("1")).is_err());
         });
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         clear_hook(&BEFORE_SETTLE_DROP);
         assert_eq!(
             *seen.borrow(),
@@ -6884,7 +7005,7 @@ mod tests {
             std::fs::write(&f2, b"retry").unwrap();
             lock(&s2.inner.state).bump(&d2);
         });
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         clear_hook(&BEFORE_SETTLE_DROP);
         assert!(fresh.exists(), "the retry's staging file was deleted");
         assert!(lock(&store.inner.state).leftover.contains(&dir));
@@ -6912,13 +7033,13 @@ mod tests {
         std::fs::remove_file(dir.join("manifest.json")).unwrap();
         std::fs::create_dir(dir.join("manifest.json")).unwrap();
         std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         assert!(
             lock(&store.inner.state).leftover.contains(&dir),
             "the leftover cleared with the save failing"
         );
         std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
-        store.inner.settle_leftovers();
+        store.inner.settle_leftovers(Sweep::Ordinary);
         assert!(!lock(&store.inner.state).leftover.contains(&dir));
         let on_disk: KeptVideo =
             serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
