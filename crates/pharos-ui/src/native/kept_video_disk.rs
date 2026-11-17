@@ -1718,7 +1718,20 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     // fell short (a transient EMFILE reads as nothing), no less than what
     // the record held before. A short walk also leaves the folder unknown
     // until a sweep measures it whole (below).
-    let figure = |v: &KeptVideo| disk.counted(v.estimated_bytes.max(v.bytes()));
+    // `completed` is what the record held as a download before it became
+    // terminal: a Ready or Failed record reports its estimate as its bytes,
+    // so it must be read before the state changes.
+    let figure = |v: &KeptVideo, completed: u64| disk.counted(v.estimated_bytes.max(completed));
+    // A walk that fell short leaves the folder unknown from before the
+    // terminal record is published: an admission must not see the low
+    // figure first.
+    if !disk.exact {
+        let dir = inner.item_dir(&user, &item);
+        let mut st = lock(&inner.state);
+        if !st.leftover.contains(&dir) {
+            st.leftover.push(dir);
+        }
+    }
     match outcome {
         Ok(Finished {
             bytes,
@@ -1729,10 +1742,11 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 // A skipped file is not on disk: left in the record, a
                 // reopen would count it missing and resume the copy.
                 v.files.retain(|k| !skipped.contains(k));
+                let completed = v.bytes();
                 v.state = KeptState::Ready;
                 // What the folder holds, a file a failed prune could not
                 // delete included: the record reports all storage used.
-                v.estimated_bytes = figure(v);
+                v.estimated_bytes = figure(v, completed);
             });
             match saved {
                 Ok(true) => emit(
@@ -1778,7 +1792,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 bytes = v.bytes();
                 // A failed attempt's files stay for a retry; the record
                 // holds what is really on disk, not what was planned.
-                v.estimated_bytes = figure(v);
+                v.estimated_bytes = figure(v, bytes);
                 v.state = KeptState::Failed {
                     reason: reason.clone(),
                 };
@@ -4722,6 +4736,59 @@ mod tests {
         );
         assert!(store.size_unknown(), "a short walk left the folder known");
         UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
+    /// A download bigger than its estimate, finished while the walk of its
+    /// folder falls short: the record keeps what it downloaded (not its
+    /// estimate), the folder is unknown before the record is published, and
+    /// the figure survives a reopen.
+    #[tokio::test]
+    async fn a_download_above_its_estimate_keeps_its_bytes_after_a_short_walk() {
+        let rig = Rig::new("short-walk-big");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![2; 20_000_000]);
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        let (s2, d2) = (store.clone(), dir.clone());
+        let unknown_first = std::rc::Rc::new(std::cell::Cell::new(None));
+        let u2 = unknown_first.clone();
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                if v.ready() {
+                    u2.set(Some(lock(&s2.inner.state).leftover.contains(&d2)));
+                }
+            }));
+        });
+        let mut req = request("1");
+        req.runtime_ms = 1_000;
+        store.start(req).unwrap();
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        assert!(only(&store).ready());
+        assert_eq!(
+            unknown_first.get(),
+            Some(true),
+            "the record was published before the folder was marked unknown"
+        );
+        assert!(
+            store.kept_bytes() >= 20_000_000,
+            "the record fell to {}",
+            store.kept_bytes()
+        );
+        drop(store);
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let reopened = rig.open();
+        assert!(
+            reopened.kept_bytes() >= 20_000_000,
+            "the figure did not survive a reopen: {}",
+            reopened.kept_bytes()
+        );
     }
 
     /// A staging file that cannot be deleted does not drop out of the
