@@ -37,7 +37,9 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   video directory.
 - The device token file keeps the token on line 1 and the signed-in user's
   id on line 2, replaced whole by a temp file and a rename, so an id never
-  sits beside another sign-in's token. On a cold start the remembered user
+  sits beside another sign-in's token. `pharos_content::token` owns the file
+  and its lock: every replacement and read-modify-write, the car's sign-in
+  included, goes through it. On a cold start the remembered user
   counts only when it matches the token's user. The offline user is
   forgotten whenever the session leaves Ready for sign-in, by whatever
   event, and by a refused resume.
