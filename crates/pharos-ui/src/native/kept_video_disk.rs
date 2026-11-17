@@ -3708,6 +3708,9 @@ mod tests {
         /// key -> a flag; the first body for the key stops after its first
         /// chunk until the flag is set.
         mid_holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> set once that held body has stopped at its checkpoint
+        /// (its first chunk written and staged).
+        mid_reached: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
         /// key -> a flag; the first request for the key waits for the flag,
         /// then is answered as any other.
         slow_opens: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
@@ -3735,11 +3738,37 @@ mod tests {
         /// Holds the first body for `key` after its first chunk.
         fn hold_mid_body(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.mid_reached
+                .lock()
+                .unwrap()
+                .insert(key.into(), Arc::default());
             self.mid_holds
                 .lock()
                 .unwrap()
                 .insert(key.into(), flag.clone());
             flag
+        }
+
+        /// Waits until the held body for `key` has stopped at its
+        /// checkpoint: its first chunk is written and staged. Bounded by
+        /// wall time, not by a count of polls, so a slow machine waits
+        /// longer rather than failing.
+        async fn reached_mid_body(&self, key: &str) {
+            let reached = self
+                .mid_reached
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .expect("no body is held for this key");
+            let start = std::time::Instant::now();
+            while !reached.load(Ordering::SeqCst) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "the held body never reached its checkpoint"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
         }
 
         /// Waits until `key` has been asked for `times` times.
@@ -3773,13 +3802,21 @@ mod tests {
         }
     }
 
-    struct FakeBody(Vec<Vec<u8>>, Option<Arc<std::sync::atomic::AtomicBool>>);
+    struct FakeBody(
+        Vec<Vec<u8>>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    );
 
     impl Body for FakeBody {
         fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>> {
             Box::pin(async move {
-                // A held body waits before its second chunk.
+                // A held body waits before its second chunk, and says it
+                // has got there (the first chunk is written and staged).
                 if let (Some(flag), 1) = (self.1.clone(), self.0.len()) {
+                    if let Some(reached) = &self.2 {
+                        reached.store(true, Ordering::SeqCst);
+                    }
                     while !flag.load(Ordering::SeqCst) {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
@@ -3829,12 +3866,16 @@ mod tests {
                     Some(b) => {
                         let mid = b.len() / 2;
                         let gate = self.mid_holds.lock().unwrap().remove(key);
+                        let reached = gate
+                            .as_ref()
+                            .and_then(|_| self.mid_reached.lock().unwrap().get(key).cloned());
                         Ok(Box::new(FakeBody(
                             vec![
                                 b.get(..mid).unwrap_or_default().to_vec(),
                                 b.get(mid..).unwrap_or_default().to_vec(),
                             ],
                             gate,
+                            reached,
                         )) as Box<dyn Body>)
                     }
                     None => Err(FetchError {
@@ -4897,6 +4938,7 @@ mod tests {
         let release = rig.server.hold_mid_body(SEG0);
         let store = rig.open();
         store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
         let mut waited = 0;
         while store.staged_bytes() != 50 {
             waited += 1;
@@ -5940,6 +5982,7 @@ mod tests {
         let release = rig.server.hold_mid_body(SEG0);
         let store = rig.open();
         store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
         let mut waited = 0;
         while store.staged_bytes() != 50 {
             waited += 1;
@@ -5979,6 +6022,7 @@ mod tests {
         let release = rig.server.hold_mid_body(SEG0);
         let store = rig.open();
         store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
         let mut waited = 0;
         while store.staged_bytes() != 50 {
             waited += 1;
@@ -6657,6 +6701,7 @@ mod tests {
         let release = rig.server.hold_mid_body(SEG0);
         let store = rig.open();
         store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
         let mut waited = 0;
         while store.staged_bytes() == 0 {
             waited += 1;
@@ -7604,6 +7649,7 @@ mod tests {
     async fn park_writer(rig: &Rig, store: &Arc<DiskVideoStore>) -> Arc<AtomicBool> {
         let release = rig.server.hold_mid_body(SEG0);
         store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
         let mut waited = 0;
         while store.staged_bytes() == 0 {
             waited += 1;
