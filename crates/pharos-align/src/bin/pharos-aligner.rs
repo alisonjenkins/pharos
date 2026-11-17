@@ -13,7 +13,7 @@ use pharos_align::forward::CpuAligner;
 use pharos_align::http::{configure, AppState};
 use pharos_align::obs::{self, Metrics};
 use pharos_align::pin;
-use pharos_align::service::{Decoder, Engine, Loader, Model};
+use pharos_align::service::{Decoder, Engine, Loader, Model, StreamDecoder};
 use pharos_align::weights::Weights;
 
 /// Workers only parse and answer; songs run on the blocking pool, one at a
@@ -362,11 +362,16 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     let decoder: Decoder = Box::new(move |path, start, end| {
         pharos_align::audio::decode(&decode_with, path, start, end)
     });
+    let stream_with = ffmpeg.clone();
+    let stream_decoder: StreamDecoder = Box::new(move |path, stream, start, end| {
+        pharos_align::audio::decode_stream(&stream_with, path, stream, start, end)
+    });
     let (choice, warmed) = choose_device(&config)?;
     let stages = stages(&config, &ffmpeg, &choice);
     let loader = loader(&config, choice, warmed);
-    let mut engine =
-        Engine::new(loader, decoder, config.idle_unload).with_stage_budget(config.stage_budget);
+    let mut engine = Engine::new(loader, decoder, config.idle_unload)
+        .with_stage_budget(config.stage_budget)
+        .with_stream_decoder(stream_decoder);
     if let Some(stages) = stages {
         engine = engine.with_stages(stages);
         match CrashGuard::open(&config.cache_dir) {

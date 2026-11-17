@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, SONGS_TOTAL, SONG_SECONDS};
 use crate::placement::Method;
-use crate::plan::{parse_request, resolve, Line};
+use crate::plan::{parse_options, parse_request, resolve, Line, SongOptions};
 use crate::service::{Aligned, Answer, Engine, Progress, SongError};
 
 /// The streamed `/align` answer's type (ADR-0121): one JSON event per line,
@@ -216,6 +216,8 @@ async fn align(
         aligner.rss_mib = tracing::field::Empty,
         aligner.gpu_peak_mib = tracing::field::Empty,
         aligner.gpu_kept_mib = tracing::field::Empty,
+        aligner.stages = tracing::field::Empty,
+        aligner.audio_stream = tracing::field::Empty,
     );
     set_remote_parent(&span, req.headers());
     let fail = |status: StatusCode, message: String| {
@@ -227,6 +229,16 @@ async fn align(
         Ok(parsed) => parsed,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
     };
+    let opts = match parse_options(&body) {
+        Ok(opts) => opts,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    span.record("aligner.stages", opts.stages);
+    // -1 = the file's default audio, so the field is always there to query.
+    span.record(
+        "aligner.audio_stream",
+        opts.audio_stream.map_or(-1, i64::from),
+    );
     let full_path = match resolve(&state.media_root, &rel_path) {
         Ok(p) => p,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
@@ -254,7 +266,7 @@ async fn align(
                             let _ = progress.send(line);
                         }
                     };
-                    run_song(&engine, &rel_path, &full_path, lines, &mut on)
+                    run_song(&engine, &rel_path, &full_path, lines, opts, &mut on)
                 })
             })
             .await;
@@ -278,7 +290,7 @@ async fn align(
     // The song runs on a blocking thread so /healthz answers meanwhile; it
     // finishes and logs even if the caller stops waiting.
     let done = web::block(move || {
-        span.in_scope(|| run_song(&engine, &rel_path, &full_path, lines, &mut |_| {}))
+        span.in_scope(|| run_song(&engine, &rel_path, &full_path, lines, opts, &mut |_| {}))
     })
     .await;
     match failure(done) {
@@ -294,11 +306,12 @@ fn run_song(
     rel_path: &str,
     full_path: &Path,
     lines: Vec<Line>,
+    opts: SongOptions,
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Result<Aligned, SongError> {
     let started = Instant::now();
     let n_lines = lines.len();
-    let (result, used, gpu) = engine.align_song_on(rel_path, full_path, lines, on);
+    let (result, used, gpu) = engine.align_song_with(rel_path, full_path, lines, opts, on);
     let (device, device_reason) = used.map_or(("none", String::new()), |u| (u.device, u.reason));
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
