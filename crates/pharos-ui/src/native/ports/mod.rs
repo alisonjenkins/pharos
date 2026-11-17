@@ -124,6 +124,9 @@ pub trait MusicSide {
     fn cache_enabled(&self) -> bool;
     /// Music writes approved and not yet landed.
     fn outstanding_bytes(&self) -> u64;
+    /// Bytes music's in-flight downloads have already written: in the cap,
+    /// not in the free-space figure.
+    fn in_progress_bytes(&self) -> u64;
 }
 
 #[cfg(any(feature = "mobile", test))]
@@ -139,6 +142,9 @@ impl MusicSide for pharos_content::Library {
     }
     fn outstanding_bytes(&self) -> u64 {
         self.music_outstanding_bytes()
+    }
+    fn in_progress_bytes(&self) -> u64 {
+        self.music_in_progress_bytes()
     }
 }
 
@@ -168,6 +174,13 @@ pub fn music_ready(music: Option<&dyn MusicSide>) -> bool {
 #[cfg(any(feature = "mobile", test))]
 pub fn music_outstanding(music: Option<&dyn MusicSide>) -> u64 {
     music.map_or(0, MusicSide::outstanding_bytes)
+}
+
+/// Bytes music's in-flight downloads have written already: part of the cap
+/// (with `music_used` and `music_outstanding`), never of free space.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_in_progress(music: Option<&dyn MusicSide>) -> u64 {
+    music.map_or(0, MusicSide::in_progress_bytes)
 }
 
 /// How `register_video_root` ended.

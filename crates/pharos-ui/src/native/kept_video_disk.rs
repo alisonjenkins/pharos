@@ -104,6 +104,13 @@ pub trait Budget: Send + Sync {
     fn admission_guard(&self) -> Box<dyn std::any::Any> {
         Box::new(())
     }
+    /// What the other kinds' running downloads have already written: in the
+    /// cap with `other_used_bytes` and `other_outstanding_bytes`, never in
+    /// the free-space figure (the disk already lacks them). Read after
+    /// `other_outstanding_bytes`. None by default.
+    fn other_in_progress_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// What a host supplies besides the directory.
@@ -1654,7 +1661,8 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     .env
                     .budget
                     .other_used_bytes()
-                    .saturating_add(inner.env.budget.other_outstanding_bytes()),
+                    .saturating_add(inner.env.budget.other_outstanding_bytes())
+                    .saturating_add(inner.env.budget.other_in_progress_bytes()),
                 cap: inner.env.budget.cap_bytes(),
                 ready,
             }
@@ -2209,7 +2217,8 @@ impl VideoStore for DiskVideoStore {
             let (other, cap) = (
                 budget
                     .other_used_bytes()
-                    .saturating_add(budget.other_outstanding_bytes()),
+                    .saturating_add(budget.other_outstanding_bytes())
+                    .saturating_add(budget.other_in_progress_bytes()),
                 budget.cap_bytes(),
             );
             let mut st = lock(&self.inner.state);
@@ -3210,6 +3219,9 @@ mod tests {
     /// `a_download_held_mid_window_is_outstanding_until_the_job_ends`).
     struct FakeMusic {
         outstanding: AtomicU64,
+        /// Written to in-flight `.part` files: in the cap, not in free space.
+        in_progress: AtomicU64,
+        used: AtomicU64,
     }
 
     impl crate::native::ports::MusicSide for FakeMusic {
@@ -3217,13 +3229,16 @@ mod tests {
             Some(100 * GIB)
         }
         fn used_bytes(&self) -> Option<u64> {
-            Some(0)
+            Some(self.used.load(Ordering::SeqCst))
         }
         fn cache_enabled(&self) -> bool {
             true
         }
         fn outstanding_bytes(&self) -> u64 {
             self.outstanding.load(Ordering::SeqCst)
+        }
+        fn in_progress_bytes(&self) -> u64 {
+            self.in_progress.load(Ordering::SeqCst)
         }
     }
 
@@ -3247,6 +3262,9 @@ mod tests {
         fn other_outstanding_bytes(&self) -> u64 {
             crate::native::ports::music_outstanding(Some(&*self.music))
         }
+        fn other_in_progress_bytes(&self) -> u64 {
+            crate::native::ports::music_in_progress(Some(&*self.music))
+        }
         fn free_bytes(&self) -> u64 {
             self.base.free_bytes()
         }
@@ -3268,6 +3286,8 @@ mod tests {
             .store(FREE_GUARD_BYTES + 4_000_000, Ordering::SeqCst);
         let music = Arc::new(FakeMusic {
             outstanding: AtomicU64::new(8 * 1024 * 1024),
+            in_progress: AtomicU64::new(0),
+            used: AtomicU64::new(0),
         });
         let store = rig.open_with(Arc::new(MusicBudget {
             music: music.clone(),
@@ -3311,6 +3331,41 @@ mod tests {
             "{reason}"
         );
         rig.budget.other_outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// A music download paused after a reservation refresh has written
+    /// bytes (which `used` skips) and reserves only what is left. The cap
+    /// counts both; the free-space check only the second. The video fits
+    /// beside the finished music and the remainder but not beside the
+    /// written bytes too, and the free space is ample, so the cap decides.
+    #[tokio::test]
+    async fn a_video_admission_counts_the_bytes_a_music_download_has_written() {
+        let rig = Rig::new("music-cap-written");
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(500_000),
+            in_progress: AtomicU64::new(600_000),
+            used: AtomicU64::new(100 * GIB - 4_000_000),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted past the cap with written music bytes uncounted");
+        };
+        assert!(
+            reason.contains("cap") || reason.contains("room"),
+            "{reason}"
+        );
+        // The download landed: its bytes are in `used`, once, and fit.
+        music.in_progress.store(0, Ordering::SeqCst);
+        music.outstanding.store(0, Ordering::SeqCst);
+        music.used.store(100 * GIB - 3_300_000, Ordering::SeqCst);
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready(), "{:?}", only(&store).state);

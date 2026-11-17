@@ -260,6 +260,10 @@ impl Budget for PhoneBudget {
         pharos_ui::native::ports::music_outstanding(music())
     }
 
+    fn other_in_progress_bytes(&self) -> u64 {
+        pharos_ui::native::ports::music_in_progress(music())
+    }
+
     fn admission_guard(&self) -> Box<dyn std::any::Any> {
         // The lock the music cache holds while it adds a track and trims,
         // so neither kind admits against a figure the other is changing.
