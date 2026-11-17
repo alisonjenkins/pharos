@@ -170,6 +170,9 @@ struct State {
     /// lists them again, and their block lifts only once the listing succeeds
     /// and everything found is counted.
     relist: Vec<PathBuf>,
+    /// Folders of adopted records whose walk was not whole: a sweep measures
+    /// them again, and the record's floor is taken from the whole walk.
+    remeasure: Vec<PathBuf>,
     /// Folders a `remove` is working on right now. A sweep leaves them
     /// alone, and while one is listed its folder is of unknown size.
     removing: Vec<PathBuf>,
@@ -1380,6 +1383,8 @@ struct Adopted {
     /// A staging file would not delete: the folder stays unknown until a
     /// settlement.
     leftover: bool,
+    /// Whether the walk that took the record's floor read the whole folder.
+    exact: bool,
 }
 
 /// What a record found in `item_dir` becomes: its staging files dropped, its
@@ -1418,10 +1423,26 @@ fn adopt(item_dir: &Path, record: KeptVideo) -> Adopted {
             bytes: 0,
         };
     }
+    // A record never counts for less than the folder holds: a field a
+    // manifest lacks (an estimate that defaulted to 0) cannot make its
+    // files free. A walk that did not read everything leaves the folder
+    // unknown until a sweep measures it whole.
+    let m = dir_size(item_dir);
+    if m.bytes > record.estimated_bytes {
+        emit(
+            false,
+            format!(
+                "pharos: video record floor item={} estimate={} measured={} reason=folder_holds_more",
+                record.item, record.estimated_bytes, m.bytes
+            ),
+        );
+        record.estimated_bytes = m.bytes;
+    }
     Adopted {
         record,
         index,
         leftover,
+        exact: m.exact,
     }
 }
 
@@ -1513,6 +1534,13 @@ impl State {
             Scanned::Record(a) => {
                 if a.leftover {
                     self.leftover.push(dir.to_path_buf());
+                }
+                if !a.exact {
+                    self.unmeasured.push((
+                        dir.to_path_buf(),
+                        "folder not measured whole when its record was read".to_owned(),
+                    ));
+                    self.remeasure.push(dir.to_path_buf());
                 }
                 self.index.extend(a.index);
                 self.list.push(a.record);
@@ -2209,6 +2237,7 @@ impl Inner {
             lock(&self.state).deleting.retain(|d| *d != dir);
         }
         self.sweep_relist();
+        self.sweep_remeasure();
     }
 
     /// Lists again the folders that could not be listed at open, and scans
@@ -2256,6 +2285,50 @@ impl Inner {
             for (user, item) in resume {
                 self.spawn_run(user, item);
             }
+        }
+    }
+
+    /// Measures again the adopted folders whose first walk was not whole. A
+    /// whole walk sets the record's floor and lifts the block. A folder a
+    /// download is writing waits until it is idle.
+    fn sweep_remeasure(&self) {
+        let dirs: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.remeasure
+                .iter()
+                .filter(|d| {
+                    !st.writing(d)
+                        && !st.runs.keys().any(|(u, i)| st.dir_of(u, i) == **d)
+                        && !st.removing.contains(d)
+                })
+                .cloned()
+                .collect()
+        };
+        for dir in dirs {
+            let m = dir_size(&dir);
+            if !m.exact {
+                continue;
+            }
+            let mut st = lock(&self.state);
+            let root = st.root.clone();
+            for v in &mut st.list {
+                if root.join(safe_name(&v.user)).join(safe_name(&v.item)) == dir
+                    && m.bytes > v.estimated_bytes
+                {
+                    v.estimated_bytes = m.bytes;
+                }
+            }
+            st.remeasure.retain(|d| *d != dir);
+            st.unmeasured.retain(|(d, _)| *d != dir);
+            drop(st);
+            emit(
+                false,
+                format!(
+                    "pharos: video folder remeasured dir={} bytes={}",
+                    dir.display(),
+                    m.bytes
+                ),
+            );
         }
     }
 
@@ -5223,6 +5296,79 @@ mod tests {
         assert!(manifest.exists(), "a readable download was deleted");
         assert_eq!(store.videos("u1").len(), 1);
         assert!(!store.size_unknown());
+    }
+
+    /// The manifest of a finished item-1 download with `estimated_bytes`
+    /// removed (as one written before the field existed), and the bytes its
+    /// folder holds. The rig's store is dropped.
+    async fn manifest_without_an_estimate(name: &str, interrupted: bool) -> (Rig, u64) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut j: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let o = j.as_object_mut().unwrap();
+        assert!(o.remove("estimated_bytes").is_some());
+        if interrupted {
+            o.insert(
+                "state".to_owned(),
+                serde_json::json!({"state": "downloading", "done": 0, "total": 3, "bytes": 0}),
+            );
+        }
+        std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
+        let held = dir_size(&dir).bytes;
+        assert!(held > 0);
+        (rig, held)
+    }
+
+    /// A manifest lacking the estimate never counts as 0: its folder's bytes
+    /// are its floor, for a finished download and for an interrupted one.
+    #[tokio::test]
+    async fn an_adopted_manifest_without_an_estimate_counts_its_folder() {
+        for interrupted in [false, true] {
+            let (rig, held) = manifest_without_an_estimate("no-estimate", interrupted).await;
+            let store = rig.open();
+            let listed = store.videos("u1");
+            assert_eq!(listed.len(), 1);
+            assert!(
+                listed[0].estimated_bytes >= held,
+                "interrupted={interrupted}: estimate {} under the {held} on disk",
+                listed[0].estimated_bytes
+            );
+            assert!(
+                store.kept_bytes() >= held,
+                "interrupted={interrupted}: counted {} of {held}",
+                store.kept_bytes()
+            );
+            store.settled().await;
+        }
+    }
+
+    /// If the folder cannot be walked whole when the manifest is adopted,
+    /// it stays unknown, and a sweep that can walk it takes the floor.
+    #[tokio::test]
+    async fn an_adopted_folder_not_walked_whole_stays_unknown_until_it_is() {
+        let (rig, held) = manifest_without_an_estimate("no-estimate-inexact", false).await;
+        let dir = rig.dir.join("u1").join("1");
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let store = rig.open();
+        assert!(
+            store.size_unknown(),
+            "admitted beside a folder not measured"
+        );
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let listed = store.videos("u1");
+        assert!(!store.size_unknown(), "still blocked once it can be walked");
+        assert!(
+            listed[0].estimated_bytes >= held,
+            "{}",
+            listed[0].estimated_bytes
+        );
+        assert!(store.kept_bytes() >= held);
     }
 
     /// A root or user folder that cannot be listed at open blocks admission
