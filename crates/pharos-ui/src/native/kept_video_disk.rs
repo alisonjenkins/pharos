@@ -490,16 +490,23 @@ impl State {
         id
     }
 
-    /// What `run` of `v`'s download holds of its reservation now: its
-    /// whole files, its staged bytes and the chunks it is writing.
-    fn run_holds(&self, v: &KeptVideo, run: u64) -> u64 {
+    /// What `run` of `v`'s download has on disk of its reservation: its
+    /// whole files and its staged (flushed) bytes. Chunks it has claimed
+    /// and not yet written are not here: the free space still holds them.
+    fn run_on_disk(&self, v: &KeptVideo, run: u64) -> u64 {
         let who = (v.user.clone(), v.item.clone(), run);
         let stored = match v.state {
             KeptState::Downloading { bytes, .. } => bytes,
             _ => v.bytes(),
         };
-        stored
-            .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+        stored.saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+    }
+
+    /// What `run` holds of its reservation: what it has on disk and the
+    /// chunks it has claimed to write.
+    fn run_holds(&self, v: &KeptVideo, run: u64) -> u64 {
+        let who = (v.user.clone(), v.item.clone(), run);
+        self.run_on_disk(v, run)
             .saturating_add(self.claimed.get(&who).copied().unwrap_or(0))
     }
 
@@ -1364,11 +1371,14 @@ impl Inner {
                 return Ok(());
             }
             // Owed by the others before free is read (as in `admit`), and
-            // by this run: what its reservation still lacks on disk.
+            // by this run: what its reservation still lacks on disk. A
+            // claimed chunk not yet written is owed still (the free space
+            // has not lost it), so it is not taken off.
+            let on_disk = st.run_on_disk(v, run);
             let owed = st
                 .outstanding(user, item)
                 .saturating_add(other_outstanding)
-                .saturating_add(current.saturating_sub(st.run_holds(v, run)));
+                .saturating_add(current.saturating_sub(on_disk));
             let free = budget.free_bytes();
             let room = free.saturating_sub(owed);
             let fits_at = |to: u64| {
@@ -1385,7 +1395,7 @@ impl Inner {
                     _ => "reason=refused",
                 };
                 return refuse(format!(
-                    "{why} current={current} used={used} cap={cap} free={free} owed={owed} ({r})"
+                    "{why} current={current} on_disk={on_disk} used={used} cap={cap} free={free} owed={owed} ({r})"
                 ));
             } else {
                 need
@@ -1398,13 +1408,13 @@ impl Inner {
                 return Err(ClaimRefused::Gone);
             };
             v.estimated_bytes = to;
-            (current, to)
+            (current, to, on_disk, owed, free)
         };
         emit(
             false,
             format!(
-                "pharos: video keep reservation verdict=extended item={item} run={run} from={} to={} need={need}",
-                grown.0, grown.1
+                "pharos: video keep reservation verdict=extended item={item} run={run} from={} to={} need={need} on_disk={} owed={} free={}",
+                grown.0, grown.1, grown.2, grown.3, grown.4
             ),
         );
         // On disk before more is written: a restart must not read the
@@ -5090,6 +5100,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two fetches of one download: one has claimed a chunk it has not yet
+    /// written, the other needs the reservation to grow. The claimed chunk
+    /// is still owed (the free space has not lost it), so the growth is
+    /// held to the free space less it, and refused when that is short.
+    #[tokio::test]
+    async fn growth_counts_a_claimed_unwritten_chunk_as_owed() {
+        let rig = Rig::new("grow-claimed");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let _ = plan_decided(&store, "1").await;
+        let (run, estimate) = {
+            let st = lock(&store.inner.state);
+            (
+                st.runs[&("u1".to_owned(), "1".to_owned())],
+                find(&st.list, "u1", "1").unwrap().estimated_bytes,
+            )
+        };
+        // The other fetch claims most of the reservation, its write pending.
+        let mut pending = Staged {
+            inner: &store.inner,
+            who: ("u1".to_owned(), "1".to_owned(), run),
+            len: 0,
+            part: PathBuf::new(),
+            claim: 0,
+        };
+        let claimed = estimate - 500_000;
+        assert!(pending.claim(claimed).is_ok());
+        // The disk has room for what is owed and 200 kB more: not for the
+        // 500 kB growth this fetch asks for.
+        let owed = {
+            let st = lock(&store.inner.state);
+            estimate - st.run_on_disk(find(&st.list, "u1", "1").unwrap(), run)
+        };
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + owed + 200_000, Ordering::SeqCst);
+        let grown = store
+            .inner
+            .extend_reservation("u1", "1", run, estimate + 500_000);
+        assert!(
+            matches!(grown, Err(ClaimRefused::Reason(ref why)) if why.contains("reason=low_space")),
+            "grown past the free space: the claimed chunk was counted as written"
+        );
+        drop(pending);
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
     }
 
     /// A playlist past its limit is refused and not kept: its reservation
