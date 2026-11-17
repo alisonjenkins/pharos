@@ -296,8 +296,23 @@ impl Inner {
             .sum()
     }
 
-    fn record_file(&self, key: &str, path: PathBuf, len: u64) {
-        lock(&self.state).index.insert(key.to_owned(), (path, len));
+    /// Indexes a whole file for `run`; false when `run` no longer owns the
+    /// download, which indexes nothing.
+    fn record_file(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        key: &str,
+        path: PathBuf,
+        len: u64,
+    ) -> bool {
+        let mut st = lock(&self.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return false;
+        }
+        st.index.insert(key.to_owned(), (path, len));
+        true
     }
 
     /// Records progress; the record is written at most once a second
@@ -357,14 +372,13 @@ async fn fetch_file(
         if !inner.wanted(user, item, run) {
             return Err(Stop::Gone);
         }
-        let err = match fetch_once(inner, key, &path).await {
+        let err = match fetch_once(inner, user, item, run, key, &path).await {
             Ok(len) => {
-                if !inner.wanted(user, item, run) {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return Err(Stop::Gone);
-                }
-                inner.record_file(key, path, len);
-                return Ok(len);
+                return if inner.record_file(user, item, run, key, path, len) {
+                    Ok(len)
+                } else {
+                    Err(Stop::Gone)
+                };
             }
             Err(e) => e,
         };
@@ -383,6 +397,7 @@ async fn fetch_file(
                     Err(Stop::Gone)
                 };
             }
+            FetchOnce::Gone => return Err(Stop::Gone),
             FetchOnce::Fetch(e) => e,
         };
         attempt += 1;
@@ -409,10 +424,25 @@ async fn fetch_file(
 enum FetchOnce {
     Fetch(FetchError),
     Store(String),
+    /// The download was removed or restarted while this run was fetching.
+    Gone,
 }
 
 /// One attempt: the body into `<path>.part`, then renamed into place.
-async fn fetch_once(inner: &Inner, key: &str, path: &Path) -> Result<u64, FetchOnce> {
+///
+/// The body is staged in a file named for `run` (`<name>.<run>.part`), so
+/// two runs of one item never share a staging file, and it is promoted only
+/// while `run` still owns the download: the check and the rename happen
+/// under the state lock, so a removed or restarted run cannot put its bytes
+/// in place.
+async fn fetch_once(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    key: &str,
+    path: &Path,
+) -> Result<u64, FetchOnce> {
     let store_err = |what: &str, e: std::io::Error| {
         FetchOnce::Store(format!(
             "could not {what} {}: {e}",
@@ -431,7 +461,7 @@ async fn fetch_once(inner: &Inner, key: &str, path: &Path) -> Result<u64, FetchO
             .await
             .map_err(|e| store_err("create the folder for", e))?;
     }
-    let part = path.with_extension("part");
+    let part = path.with_extension(format!("{run}.part"));
     let mut file = tokio::fs::File::create(&part)
         .await
         .map_err(|e| store_err("create", e))?;
@@ -454,10 +484,25 @@ async fn fetch_once(inner: &Inner, key: &str, path: &Path) -> Result<u64, FetchO
     }
     file.flush().await.map_err(|e| store_err("write", e))?;
     drop(file);
-    tokio::fs::rename(&part, path)
-        .await
-        .map_err(|e| store_err("finish", e))?;
-    Ok(len)
+    let promoted = {
+        let st = lock(&inner.state);
+        let owns = st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
+            && find(&st.list, user, item)
+                .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }));
+        if owns {
+            Some(std::fs::rename(&part, path))
+        } else {
+            None
+        }
+    };
+    match promoted {
+        Some(Ok(())) => Ok(len),
+        Some(Err(e)) => Err(store_err("finish", e)),
+        None => {
+            let _ = tokio::fs::remove_file(&part).await;
+            Err(FetchOnce::Gone)
+        }
+    }
 }
 
 /// A playlist's text: the stored file, or fetched and stored first.
@@ -492,6 +537,18 @@ fn stored_names(dir: &Path) -> HashMap<String, u64> {
             Some((name, e.metadata().ok()?.len()))
         })
         .collect()
+}
+
+/// Deletes the staging files a closed app left in `dir/files`.
+fn clear_parts(dir: &Path) {
+    let Ok(read) = std::fs::read_dir(dir.join("files")) else {
+        return;
+    };
+    for entry in read.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().ends_with(".part") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// One planned file; the sliver of a last segment may go without.
@@ -606,7 +663,7 @@ async fn download(
         if let Some(len) = names.get(&file_name(key)) {
             have.insert(key.clone());
             bytes = bytes.saturating_add(*len);
-            inner.record_file(key, inner.file_path(user, item, key), *len);
+            inner.record_file(user, item, run, key, inner.file_path(user, item, key), *len);
         }
     }
     let todo = missing_files(&all, &have);
@@ -675,9 +732,25 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             }
         }
     }
+    // Whatever this run left half staged (a file in flight when the
+    // download failed or was dropped) goes with it.
+    drop_parts_of(&inner.item_dir(&user, &item), run);
     let mut st = lock(&inner.state);
     if st.runs.get(&(user.clone(), item.clone())) == Some(&run) {
         st.runs.remove(&(user, item));
+    }
+}
+
+/// Deletes the staging files `run` left in `dir/files`.
+fn drop_parts_of(dir: &Path, run: u64) {
+    let Ok(read) = std::fs::read_dir(dir.join("files")) else {
+        return;
+    };
+    let suffix = format!(".{run}.part");
+    for entry in read.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().ends_with(&suffix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -736,6 +809,7 @@ impl DiskVideoStore {
                     },
                     Err(_) => continue,
                 };
+                clear_parts(&item_dir);
                 let names = stored_names(&item_dir);
                 let mut whole = 0usize;
                 for key in &record.files {
@@ -970,6 +1044,12 @@ mod tests {
         /// key -> a flag; the first request for the key waits for the flag
         /// to be set, then answers 403.
         holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> a flag; the first body for the key stops after its first
+        /// chunk until the flag is set.
+        mid_holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> a flag; the first request for the key waits for the flag,
+        /// then is answered as any other.
+        slow_opens: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     }
 
     impl FakeServer {
@@ -977,6 +1057,27 @@ mod tests {
         fn hold_first(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.holds.lock().unwrap().insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Holds the first request for `key` until the flag is set, then
+        /// answers it normally.
+        fn slow_first_open(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.slow_opens
+                .lock()
+                .unwrap()
+                .insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Holds the first body for `key` after its first chunk.
+        fn hold_mid_body(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.mid_holds
+                .lock()
+                .unwrap()
+                .insert(key.into(), flag.clone());
             flag
         }
 
@@ -1011,11 +1112,17 @@ mod tests {
         }
     }
 
-    struct FakeBody(Vec<Vec<u8>>);
+    struct FakeBody(Vec<Vec<u8>>, Option<Arc<std::sync::atomic::AtomicBool>>);
 
     impl Body for FakeBody {
         fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>> {
             Box::pin(async move {
+                // A held body waits before its second chunk.
+                if let (Some(flag), 1) = (self.1.clone(), self.0.len()) {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
                 Ok(if self.0.is_empty() {
                     None
                 } else {
@@ -1029,6 +1136,12 @@ mod tests {
         fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
             Box::pin(async move {
                 self.asked.lock().unwrap().push(key.to_owned());
+                let slow = self.slow_opens.lock().unwrap().remove(key);
+                if let Some(flag) = slow {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
                 let hold = self.holds.lock().unwrap().remove(key);
                 if let Some(flag) = hold {
                     while !flag.load(Ordering::SeqCst) {
@@ -1054,10 +1167,14 @@ mod tests {
                     // Two chunks, so a body really streams.
                     Some(b) => {
                         let mid = b.len() / 2;
-                        Ok(Box::new(FakeBody(vec![
-                            b.get(..mid).unwrap_or_default().to_vec(),
-                            b.get(mid..).unwrap_or_default().to_vec(),
-                        ])) as Box<dyn Body>)
+                        let gate = self.mid_holds.lock().unwrap().remove(key);
+                        Ok(Box::new(FakeBody(
+                            vec![
+                                b.get(..mid).unwrap_or_default().to_vec(),
+                                b.get(mid..).unwrap_or_default().to_vec(),
+                            ],
+                            gate,
+                        )) as Box<dyn Body>)
                     }
                     None => Err(FetchError {
                         status: Some(403),
@@ -1409,6 +1526,25 @@ mod tests {
         assert!(reason.contains("guard"), "{reason}");
     }
 
+    /// A file in flight when the download fails is dropped half staged;
+    /// the run takes its staging file with it.
+    #[tokio::test]
+    async fn a_failed_download_leaves_no_staging_file_behind() {
+        let rig = Rig::new("parts");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let dir = rig.dir.join("u1").join("1").join("files");
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".part")), "{names:?}");
+    }
+
     #[tokio::test]
     async fn a_second_start_of_a_kept_item_is_refused() {
         let rig = Rig::new("twice");
@@ -1473,6 +1609,55 @@ mod tests {
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
         assert!(lines("pharos: video keep failed").is_empty());
+    }
+
+    /// Two runs of one item never share a staging file, and a run that
+    /// lost the item cannot put its bytes in the finished file: the old
+    /// run reaches its fetch only after the new one has begun staging.
+    #[tokio::test]
+    async fn a_removed_run_cannot_write_into_the_restarted_downloads_file() {
+        let rig = Rig::new("stale-part");
+        let old_open = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.remove("u1", "1");
+        // The new run's body for SEG0 stops half way, staging in the file.
+        let new_body = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The old run now gets a different answer and stages it too.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![7; 100]);
+        old_open.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![2; 100]);
+        new_body.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let file = store.stored_file(SEG0).unwrap();
+        let bytes = std::fs::read(file.path).unwrap();
+        assert!(
+            bytes.len() == 100 && bytes.iter().all(|b| *b != 7),
+            "the old run's bytes are not in the file: {bytes:?}"
+        );
+        let dir = rig.dir.join("u1").join("1").join("files");
+        assert!(
+            std::fs::read_dir(dir).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part")),
+            "no staging file is left"
+        );
     }
 
     #[tokio::test]
