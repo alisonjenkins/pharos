@@ -204,6 +204,38 @@ fn iso_from_secs(secs: u64) -> String {
     )
 }
 
+/// The planned download, as [`Inner::admit`] records it.
+struct Plan {
+    files: Vec<String>,
+    estimate: u64,
+    total: u32,
+}
+
+enum Admission {
+    /// Removed or restarted meanwhile.
+    Gone,
+    Refused {
+        refusal: KeepVideoRefusal,
+        /// What the other downloads and kinds hold or have reserved.
+        used: u64,
+    },
+}
+
+/// What a record holds against the shared cap: the larger of what it has
+/// stored and what it expects to take, so a download still under way
+/// reserves its whole estimate.
+fn reserved(v: &KeptVideo) -> u64 {
+    v.bytes().max(v.estimated_bytes)
+}
+
+/// Every video's reservation but `item`'s own.
+fn reserved_by_others(list: &[KeptVideo], user: &str, item: &str) -> u64 {
+    list.iter()
+        .filter(|v| !(v.user == user && v.item == item))
+        .map(reserved)
+        .fold(0u64, u64::saturating_add)
+}
+
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -294,14 +326,47 @@ impl Inner {
                 .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }))
     }
 
-    /// Every video byte on the device, leaving out `except`'s record.
-    fn video_used(&self, except: Option<(&str, &str)>) -> u64 {
-        lock(&self.state)
-            .list
-            .iter()
-            .filter(|v| except != Some((v.user.as_str(), v.item.as_str())))
-            .map(KeptVideo::bytes)
-            .sum()
+    /// Admits `run`'s download: the plan is recorded and its estimate
+    /// reserved in one step under the state lock. With `limits` (the other
+    /// kinds' bytes, the cap, the free space) the estimate must first fit
+    /// beside every other download's reservation; checking and reserving
+    /// together is what stops two downloads from each fitting alone.
+    fn admit(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        plan: &Plan,
+        limits: Option<(u64, u64, u64)>,
+    ) -> Result<(), Admission> {
+        {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(Admission::Gone);
+            }
+            if let Some((other, cap, free)) = limits {
+                let used = reserved_by_others(&st.list, user, item).saturating_add(other);
+                if let Err(refusal) = fits(plan.estimate, used, cap, free) {
+                    return Err(Admission::Refused { refusal, used });
+                }
+            }
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Err(Admission::Gone);
+            };
+            v.files.clone_from(&plan.files);
+            v.estimated_bytes = plan.estimate;
+            v.state = KeptState::Downloading {
+                done: 0,
+                total: plan.total,
+                bytes: 0,
+            };
+        }
+        self.save_record(user, item);
+        Ok(())
     }
 
     /// Indexes a whole file for `run`; false when `run` no longer owns the
@@ -654,13 +719,26 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             all.len()
         ),
     );
-    if !resume {
-        let free = inner.env.budget.free_bytes();
-        let used = inner
-            .video_used(Some((user, item)))
-            .saturating_add(inner.env.budget.other_used_bytes());
-        let cap = inner.env.budget.cap_bytes();
-        if let Err(refusal) = fits(estimate, used, cap, free) {
+    let plan = Plan {
+        files: all.clone(),
+        estimate,
+        total: u32::try_from(all.len()).unwrap_or(u32::MAX),
+    };
+    let total = plan.total;
+    // The room is measured before the lock is taken: the music cache's own
+    // lock is never awaited while the store's is held.
+    let limits = (!resume).then(|| {
+        (
+            inner.env.budget.other_used_bytes(),
+            inner.env.budget.cap_bytes(),
+            inner.env.budget.free_bytes(),
+        )
+    });
+    match inner.admit(user, item, run, &plan, limits) {
+        Ok(()) => {}
+        Err(Admission::Gone) => return Err(Stop::Gone),
+        Err(Admission::Refused { refusal, used }) => {
+            let (_, cap, free) = limits.unwrap_or_default();
             emit(
                 true,
                 format!(
@@ -673,19 +751,6 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             }
             return Err(Stop::Refused(refusal.to_string()));
         }
-    }
-    let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
-    let planned = all.clone();
-    if !inner.update_run(user, item, run, |v| {
-        v.files = planned;
-        v.estimated_bytes = estimate;
-        v.state = KeptState::Downloading {
-            done: 0,
-            total,
-            bytes: 0,
-        };
-    }) {
-        return Err(Stop::Gone);
     }
     prune_unplanned(inner, user, item, &all);
 
@@ -992,18 +1057,24 @@ impl VideoStore for DiskVideoStore {
         let budget = &self.inner.env.budget;
         // The size is not known until the playlists are read, so this
         // catches only a full cap or a full disk; the rest is checked after
-        // planning and shows as a failed download.
-        let used = self
-            .inner
-            .video_used(Some((&user, &item)))
-            .saturating_add(budget.other_used_bytes());
-        let early = fits(0, used, budget.cap_bytes(), budget.free_bytes());
-        let started = early.and_then(|()| {
+        // planning and shows as a failed download. The room is read before
+        // the store's lock is taken, and the check and the new record sit
+        // under one hold of it.
+        let (other, cap, free) = (
+            budget.other_used_bytes(),
+            budget.cap_bytes(),
+            budget.free_bytes(),
+        );
+        let (started, used) = {
             let mut st = lock(&self.inner.state);
-            check_not_kept(&st.list, &user, &item)?;
-            insert_front(&mut st.list, new_record(&request, (self.inner.env.now)()));
-            Ok(())
-        });
+            let used = reserved_by_others(&st.list, &user, &item).saturating_add(other);
+            let started = fits(0, used, cap, free).and_then(|()| {
+                check_not_kept(&st.list, &user, &item)?;
+                insert_front(&mut st.list, new_record(&request, (self.inner.env.now)()));
+                Ok(())
+            });
+            (started, used)
+        };
         if let Err(refusal) = started {
             emit(
                 true,
@@ -1640,6 +1711,57 @@ mod tests {
             // The stored files stay: with room again the copy finishes.
             assert!(store.stored_file(SEG0).is_some());
         }
+    }
+
+    /// Two downloads that each fit alone but not together: the second
+    /// is refused against the first's reservation, not admitted beside it.
+    #[tokio::test]
+    async fn a_second_download_is_held_to_the_firsts_reserved_estimate() {
+        let rig = Rig::new("reserve");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        rig.budget.cap.store(estimate + 1_000, Ordering::SeqCst);
+        // The first download stays under way, holding its reservation.
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.start(request("2")).unwrap();
+        let mut waited = 0;
+        loop {
+            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
+            if second
+                .as_ref()
+                .is_some_and(|v| matches!(v.state, KeptState::Failed { .. }))
+            {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "the second download was admitted: {second:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let state = |item: &str| {
+            store
+                .videos("u1")
+                .into_iter()
+                .find(|v| v.item == item)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state("1"), KeptState::Ready);
+        let KeptState::Failed { reason } = state("2") else {
+            panic!("the second was admitted");
+        };
+        assert!(reason.contains("cap"), "{reason}");
+        let refused = lines("pharos: video keep refused");
+        assert!(
+            refused.len() == 1 && refused[0].contains("item=2"),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]
