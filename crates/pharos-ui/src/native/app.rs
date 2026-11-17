@@ -2249,18 +2249,25 @@ fn NativeApp(route: Route) -> Element {
 
     // Who is signed in, for the account menu; asked again on each resume.
     // A failed ask leaves the menu without a name rather than blocking it.
+    // Asked again when the screens come up or go (a session ending clears
+    // the name); a reconnect keeps the screens, and the name, until the new
+    // API resumes. A memo, so other machine changes do not ask again.
+    let screens = use_memo(move || machine.read().shows_screens());
     let me = use_resource(move || {
-        let api = api.read().clone();
+        let _ = screens();
+        // The API and the identity generation are taken together, here,
+        // before the request's future is built: a session that ends after
+        // this point signs the user out, and the answer must not undo that.
+        // Sent only to a ready session's API.
+        let ready = matches!(machine.peek().phase(), Phase::Ready);
+        let ask = offline_video::me_request(ready, api.read().clone());
         async move {
-            let api = api?;
+            let ask = ask?;
             let info = call("shell", "me");
-            // Taken before the ask: a session that ends while it is in
-            // flight signs the user out, and the answer must not undo that.
-            let asked_at = offline_video::identity_generation();
-            match retry_once("me", || api.me(&info)).await {
+            match retry_once("me", || ask.api.me(&info)).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
-                    offline_video::remember_user_if(asked_at, &me.id);
+                    ask.answered(&me.id);
                     claim_queue(queue, held, &me.id);
                     Some(me)
                 }

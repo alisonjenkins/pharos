@@ -444,6 +444,40 @@ pub fn remember_user(user: &str) {
     note_signed_in(user);
 }
 
+/// A `me` request that may be sent: the API it goes to and the identity
+/// generation it was asked at, both taken at one point, before the request
+/// is built, so a session that ends after this point is seen when the
+/// answer comes back ([`MeAsk::answered`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeAsk<A> {
+    pub api: A,
+    pub asked_at: u64,
+}
+
+/// Whether to ask who is signed in: only with an API and a ready session
+/// (the machine `Ready` at this point). The generation is taken here, at
+/// the same point as the API, never later in the request's future. Logs a
+/// refusal with its reason.
+pub fn me_request<A>(ready: bool, api: Option<A>) -> Option<MeAsk<A>> {
+    let api = api?;
+    if !ready {
+        super::platform::info("pharos: video user me verdict=not_sent reason=session_not_ready");
+        return None;
+    }
+    Some(MeAsk {
+        api,
+        asked_at: identity_generation(),
+    })
+}
+
+impl<A> MeAsk<A> {
+    /// The answer to this request names `user`: remembered only while no
+    /// sign-in or sign-out has landed since the request was taken.
+    pub fn answered(&self, user: &str) -> bool {
+        remember_user_if(self.asked_at, user)
+    }
+}
+
 /// [`remember_user`] for an answer asked for at `asked_at` (from
 /// [`identity_generation`]): written only while no sign-in or sign-out has
 /// landed since, so a `me` that completes after its session ended cannot
@@ -751,6 +785,27 @@ mod tests {
         // A `me` asked after the sign-out (the next session's) is written.
         let asked_at = identity_generation();
         assert!(remember_user_if(asked_at, "A"));
+        assert_eq!(last_user().as_deref(), Some("A"));
+    }
+
+    /// A `me` request taken while the session is up, the session ending
+    /// before its future runs, and then its answer: the sign-out stands.
+    #[test]
+    fn a_me_taken_before_its_session_ended_does_not_bring_the_user_back() {
+        let p = pref();
+        remember_user("A");
+        let ask = me_request(true, Some(())).expect("a ready session asks");
+        // The session ends after the request was taken, before it is sent.
+        forget_user();
+        assert!(!ask.answered("A"), "the stale answer was written");
+        assert_eq!(last_user(), None, "the user came back after the sign-out");
+        assert_eq!(p.value.borrow().as_deref(), Some(""));
+        // A session that is not ready sends nothing.
+        assert_eq!(me_request(false, Some(())), None);
+        assert_eq!(me_request::<()>(true, None), None);
+        // The next session's request is remembered.
+        let ask = me_request(true, Some(())).unwrap();
+        assert!(ask.answered("A"));
         assert_eq!(last_user().as_deref(), Some("A"));
     }
 
