@@ -249,6 +249,12 @@ impl Budget for PhoneBudget {
             .map_or(0, |s| s.used_bytes)
     }
 
+    fn admission_guard(&self) -> Box<dyn std::any::Any> {
+        // The lock the music cache holds while it adds a track and trims,
+        // so neither kind admits against a figure the other is changing.
+        Box::new(content::admission_guard())
+    }
+
     fn free_bytes(&self) -> u64 {
         match content::statvfs_free(&self.dir) {
             Ok(free) => free,

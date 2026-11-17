@@ -85,6 +85,13 @@ pub trait Budget: Send + Sync {
     fn other_used_bytes(&self) -> u64;
     /// Free space on the device, measured now.
     fn free_bytes(&self) -> u64;
+    /// Holds the lock a host shares between its kinds of download while an
+    /// admission reads the other kinds' bytes and reserves its own, so
+    /// neither kind admits against a figure the other is changing. Taken
+    /// before the store's own lock, always. No lock by default.
+    fn admission_guard(&self) -> Box<dyn std::any::Any> {
+        Box::new(())
+    }
 }
 
 /// What a host supplies besides the directory.
@@ -794,19 +801,24 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         stored: if resume { stored_bytes } else { 0 },
     };
     let total = plan.total;
-    // The room is read before the lock is taken: the music cache's own
-    // lock is never awaited while the store's is held.
-    let free = inner.env.budget.free_bytes();
-    let check = if resume {
-        Check::Resume { free }
-    } else {
-        Check::Fresh {
-            other: inner.env.budget.other_used_bytes(),
-            cap: inner.env.budget.cap_bytes(),
-            free,
-        }
+    // The room is read and the plan admitted under the host's shared
+    // admission lock, taken before the store's own lock (the music cache's
+    // lock is never awaited while the store's is held).
+    let (check, admitted) = {
+        let _admission = inner.env.budget.admission_guard();
+        let free = inner.env.budget.free_bytes();
+        let check = if resume {
+            Check::Resume { free }
+        } else {
+            Check::Fresh {
+                other: inner.env.budget.other_used_bytes(),
+                cap: inner.env.budget.cap_bytes(),
+                free,
+            }
+        };
+        (check, inner.admit(user, item, run, &plan, check))
     };
-    match inner.admit(user, item, run, &plan, check) {
+    match admitted {
         Ok(()) => {}
         Err(Admission::Gone) => return Err(Stop::Gone),
         Err(Admission::Refused {
@@ -1131,15 +1143,16 @@ impl VideoStore for DiskVideoStore {
         let budget = &self.inner.env.budget;
         // The size is not known until the playlists are read, so this
         // catches only a full cap or a full disk; the rest is checked after
-        // planning and shows as a failed download. The room is read before
-        // the store's lock is taken, and the check and the new record sit
-        // under one hold of it.
-        let (other, cap, free) = (
-            budget.other_used_bytes(),
-            budget.cap_bytes(),
-            budget.free_bytes(),
-        );
+        // planning and shows as a failed download. The room is read under
+        // the host's shared admission lock, before the store's own lock is
+        // taken, and the check and the new record sit under one hold of it.
         let (started, used) = {
+            let _admission = budget.admission_guard();
+            let (other, cap, free) = (
+                budget.other_used_bytes(),
+                budget.cap_bytes(),
+                budget.free_bytes(),
+            );
             let mut st = lock(&self.inner.state);
             let used = reserved_by_others(&st.list, &user, &item).saturating_add(other);
             let room = free.saturating_sub(outstanding_by_others(&st.list, &user, &item));
@@ -1428,6 +1441,27 @@ mod tests {
         cap: AtomicU64,
         other: AtomicU64,
         free: AtomicU64,
+        /// Admission guards held now, taken in all, and readings made with
+        /// none held.
+        held: Arc<AtomicUsize>,
+        taken: AtomicUsize,
+        unguarded: AtomicUsize,
+    }
+
+    struct FakeGuard(Arc<AtomicUsize>);
+
+    impl Drop for FakeGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl FakeBudget {
+        fn read(&self) {
+            if self.held.load(Ordering::SeqCst) == 0 {
+                self.unguarded.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     impl FakeBudget {
@@ -1436,19 +1470,30 @@ mod tests {
                 cap: AtomicU64::new(4 * GIB),
                 other: AtomicU64::new(0),
                 free: AtomicU64::new(100 * GIB),
+                held: Arc::default(),
+                taken: AtomicUsize::new(0),
+                unguarded: AtomicUsize::new(0),
             })
         }
     }
 
     impl Budget for FakeBudget {
         fn cap_bytes(&self) -> u64 {
+            self.read();
             self.cap.load(Ordering::SeqCst)
         }
         fn other_used_bytes(&self) -> u64 {
+            self.read();
             self.other.load(Ordering::SeqCst)
         }
         fn free_bytes(&self) -> u64 {
+            self.read();
             self.free.load(Ordering::SeqCst)
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            self.held.fetch_add(1, Ordering::SeqCst);
+            self.taken.fetch_add(1, Ordering::SeqCst);
+            Box::new(FakeGuard(self.held.clone()))
         }
     }
 
@@ -1851,6 +1896,33 @@ mod tests {
             refused.len() == 1 && refused[0].contains("item=2"),
             "{refused:?}"
         );
+    }
+
+    /// Admission reads the other kind's bytes and reserves its own under the
+    /// host's shared lock, so music cannot commit in between.
+    #[tokio::test]
+    async fn admission_reads_the_budget_only_under_the_shared_lock() {
+        let rig = Rig::new("gate");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // A restart resumes a copy with a file gone: another admission.
+        let gone = store.stored_file(SEG1).unwrap().path;
+        drop(store);
+        std::fs::remove_file(gone).unwrap();
+        let store = rig.open();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(
+            rig.budget.taken.load(Ordering::SeqCst) >= 3,
+            "start, its plan, and the resumed plan each take the lock"
+        );
+        assert_eq!(
+            rig.budget.unguarded.load(Ordering::SeqCst),
+            0,
+            "a reading was made without the shared lock"
+        );
+        assert_eq!(rig.budget.held.load(Ordering::SeqCst), 0, "all released");
     }
 
     /// Free space is shared too: a second download must leave the guard free

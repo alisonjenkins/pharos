@@ -213,6 +213,19 @@ struct State {
     clock: u64,
 }
 
+/// The one lock for admission against the shared cap. The music cache holds
+/// it while it adds a track and trims; a host that admits other downloads
+/// against the same cap (the phone's video) holds it while it reads the
+/// music's bytes and reserves its own. Taken first, always: before the
+/// cache's own lock here, and before the host's own state lock there.
+static ADMISSION: Mutex<()> = Mutex::new(());
+
+/// Holds the shared admission lock until dropped. Never call this while
+/// holding the cache's lock or a host's state lock.
+pub fn admission_guard() -> MutexGuard<'static, ()> {
+    ADMISSION.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Bytes that other kinds of download hold against the same cap (the
 /// phone's offline video). Called while the cache's lock is held, so it
 /// must not call back into the cache.
@@ -462,6 +475,7 @@ impl Cache {
     /// Returns the evicted ids.
     pub fn set_outside_used(&self, used: OutsideUsed) -> Vec<String> {
         *self.outside.lock().unwrap_or_else(PoisonError::into_inner) = Some(used);
+        let _admission = admission_guard();
         let mut s = self.lock();
         let evicted = self.evict_locked(&mut s);
         if !evicted.is_empty() {
@@ -582,6 +596,9 @@ impl Cache {
             .map_err(|e| err("sync part", &part, e))?;
         let fin = self.final_path(id);
         std::fs::rename(&part, &fin).map_err(|e| err("rename part", &fin, e))?;
+        // The track joins the shared cap and the cache trims to it as one
+        // step against a host's admission, which reads these bytes.
+        let _admission = admission_guard();
         let mut s = self.lock();
         let t = Self::tick(&mut s);
         let pinned = s.pins.values().any(|v| v.iter().any(|p| p == id));
@@ -1026,6 +1043,32 @@ mod tests {
             100,
             "850 of video leaves room for one track"
         );
+    }
+
+    /// Adding a track and trimming is one step against a host's admission:
+    /// it waits for whoever holds the shared lock.
+    #[test]
+    fn a_commit_waits_for_the_shared_admission_lock() {
+        let d = tmp("admission");
+        let c = std::sync::Arc::new(Cache::open(&d, 1000).unwrap());
+        std::fs::write(c.part_path("track/a"), vec![7u8; 10]).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = admission_guard();
+        let worker = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                c.commit("track/a", Some(10)).unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the commit went ahead of the admission lock"
+        );
+        drop(guard);
+        worker.join().unwrap();
+        assert!(c.is_complete("track/a"));
     }
 
     #[test]
