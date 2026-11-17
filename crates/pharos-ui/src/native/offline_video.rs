@@ -848,6 +848,10 @@ mod tests {
         *p.value.borrow_mut() = Some("A".to_owned());
         assert_eq!(last_user(), None, "a token with no user id vouched for A");
         *p.token_user.borrow_mut() = Some("B".to_owned());
+        // The first read found no token user and the cold start is not run
+        // again until the identity is unknown: reset it, so the mismatch
+        // branch is the one that runs.
+        set_identity(Identity::Unknown);
         assert_eq!(last_user(), None, "B's token vouched for A");
         assert!(!serves(last_user()));
     }
