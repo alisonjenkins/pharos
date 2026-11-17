@@ -229,7 +229,49 @@ fn identity() -> Identity {
     with_identity(|i| i.clone())
 }
 
+/// Per-identity-state facts: whether a cold start has read and failed
+/// (so a proxied request does not read the preference and the token again),
+/// and whether the refusal for nobody signed in has been logged since the
+/// identity last changed.
+#[cfg(not(test))]
+static FLAGS: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+#[cfg(test)]
+thread_local! {
+    static FLAGS: [std::cell::Cell<bool>; 2] = const { [std::cell::Cell::new(false), std::cell::Cell::new(false)] };
+}
+
+const COLD_TRIED: usize = 0;
+const REFUSAL_LOGGED: usize = 1;
+
+fn flag(i: usize) -> bool {
+    #[cfg(not(test))]
+    {
+        FLAGS[i].load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(test)]
+    {
+        FLAGS.with(|f| f[i].get())
+    }
+}
+
+fn set_flag(i: usize, v: bool) {
+    #[cfg(not(test))]
+    FLAGS[i].store(v, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    FLAGS.with(|f| f[i].set(v));
+}
+
 fn set_identity(next: Identity) {
+    // A new identity state is a new chance for a cold start (only a test's
+    // restart sets Unknown) and a new refusal to log.
+    set_flag(REFUSAL_LOGGED, false);
+    if next == Identity::Unknown {
+        set_flag(COLD_TRIED, false);
+    }
     with_identity(|i| *i = next);
 }
 
@@ -315,7 +357,16 @@ pub fn last_user() -> Option<String> {
             _ => None,
         };
     }
+    // A cold start that has run and found nobody is not run again for every
+    // proxied request: a sign-in or `me` sets the identity, which is what
+    // changes the answer.
+    if flag(COLD_TRIED) {
+        return None;
+    }
     let found = cold_start_identity();
+    if found == Identity::Unknown {
+        set_flag(COLD_TRIED, true);
+    }
     let now = with_identity(|i| {
         if *i == Identity::Unknown && found != Identity::Unknown {
             *i = found.clone();
@@ -393,10 +444,14 @@ pub fn stored_for(
     key: &str,
 ) -> Option<super::kept_video::StoredFile> {
     let Some(user) = user else {
-        super::platform::info(&format!(
-            "pharos: video request verdict=not_served_offline reason=no_signed_in_user key_len={}",
-            key.len()
-        ));
+        // Once per identity state, not once per segment.
+        if !flag(REFUSAL_LOGGED) {
+            set_flag(REFUSAL_LOGGED, true);
+            super::platform::info(&format!(
+                "pharos: video request verdict=not_served_offline reason=no_signed_in_user key_len={}",
+                key.len()
+            ));
+        }
         return None;
     };
     store.stored_file(user, key)
@@ -470,6 +525,8 @@ mod tests {
         /// Runs once as the preference is read: a sign-in or sign-out that
         /// lands during a cold start's reads.
         on_read: Rc<RefCell<Option<ReadHook>>>,
+        /// How many times the preference has been read.
+        reads: Rc<Cell<usize>>,
     }
 
     impl Pref {
@@ -498,6 +555,7 @@ mod tests {
             *self.token_user.borrow_mut() = None;
         }
         pub(super) fn read(&self) -> Result<Option<String>, String> {
+            self.reads.set(self.reads.get() + 1);
             let read = if self.fail_read.get() {
                 Err("unreadable".to_owned())
             } else {
@@ -618,7 +676,11 @@ mod tests {
         p.fail_read.set(true);
         assert_eq!(last_user(), None);
         assert!(!serves(last_user()));
+        // A cold start that found nobody is not read again by every request
+        // (`a_failed_cold_start_is_not_read_again_for_every_request`); the
+        // next start reads afresh.
         p.fail_read.set(false);
+        set_identity(Identity::Unknown);
         assert_eq!(last_user().as_deref(), Some("A"));
         assert!(serves(last_user()));
     }
@@ -759,6 +821,23 @@ mod tests {
         assert_eq!(bytes(answer), b"A-own");
         assert!(offline_file_for(None, "/videos/1/seg.m4s").is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A cold start that found nobody is not run again for each proxied
+    /// request, and a later sign-in still sets the user.
+    #[test]
+    fn a_failed_cold_start_is_not_read_again_for_every_request() {
+        let p = pref();
+        p.fail_read.set(true);
+        assert_eq!(last_user(), None);
+        let after_first = p.reads.get();
+        assert_eq!(after_first, 1, "the first request reads once");
+        for _ in 0..5 {
+            assert_eq!(last_user(), None);
+        }
+        assert_eq!(p.reads.get(), after_first, "later requests read again");
+        remember_user("A");
+        assert_eq!(last_user().as_deref(), Some("A"), "a sign-in is ignored");
     }
 
     /// A token with no user id stored with it, or another user's, does not
