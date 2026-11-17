@@ -1643,12 +1643,15 @@ enum FetchOnce {
 
 /// Waits for a chunk's write to complete. In a test the write can be held
 /// pending first, to show nothing is counted as staged meanwhile.
-async fn flush_chunk(file: &mut tokio::fs::File, item: &str) -> std::io::Result<()> {
+async fn flush_chunk(file: &mut tokio::fs::File, item: &str, part: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     tests::hold_write(item).await;
     #[cfg(not(test))]
-    let _ = item;
-    file.flush().await
+    let _ = (item, part);
+    file.flush().await?;
+    #[cfg(test)]
+    tests::flush_fault(part)?;
+    Ok(())
 }
 
 /// One attempt: the body into `<path>.part`, then renamed into place.
@@ -1750,7 +1753,7 @@ async fn fetch_once(
                 // pending, and the free-space reading does not lack those
                 // bytes yet. They count as staged (and so stop being owed)
                 // only once the write has completed.
-                flush_chunk(&mut file, item)
+                flush_chunk(&mut file, item, &part)
                     .await
                     .map_err(|e| store_err("write", e))?;
                 len = len.saturating_add(chunk.len() as u64);
@@ -2650,6 +2653,29 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             files,
             skipped,
         }) => {
+            // A skipped short tail can leave its staging file (a write that
+            // failed is an omission, not a failure), which the figure below
+            // does not count: it goes first, and one that will not leaves
+            // the folder unknown before the figure is published.
+            let dir = inner.item_dir(&user, &item);
+            let clean = drop_parts_of(&dir, Some(run));
+            if !clean {
+                let mut st = lock(&inner.state);
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir.clone());
+                }
+            }
+            if !clean || !skipped.is_empty() {
+                emit(
+                    !clean,
+                    format!(
+                        "pharos: video keep staging before ready item={item} run={run} skipped={} verdict={}",
+                        skipped.len(),
+                        if clean { "dropped" } else { "leftover_unknown" }
+                    ),
+                );
+            }
+            cleaned = Some(clean);
             let saved = inner.update_run_saved(&user, &item, run, |v| {
                 // A skipped file is not on disk: left in the record, a
                 // reopen would count it missing and resume the copy.
@@ -3869,6 +3895,25 @@ mod tests {
     thread_local! {
         /// While set, the chunk writes of this item alone are held.
         static HOLD_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    thread_local! {
+        /// While set, a chunk's flush fails, once written, for the staging
+        /// files whose name starts with this.
+        pub(super) static FAIL_FLUSH_OF: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn flush_fault(part: &Path) -> std::io::Result<()> {
+        let failing = FAIL_FLUSH_OF.with(|f| {
+            f.borrow().as_ref().is_some_and(|prefix| {
+                part.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix.as_str()))
+            })
+        });
+        if failing {
+            return Err(std::io::Error::other("disk full"));
+        }
+        Ok(())
     }
 
     pub(super) async fn hold_write(item: &str) {
@@ -8794,6 +8839,56 @@ mod tests {
         store.save_position("u1", "1", 61_000);
         drop(store);
         assert_eq!(only(&rig.open()).position_ms, 61_000);
+    }
+
+    /// A short tail whose write fails is skipped, but its staging file
+    /// can stay. It goes before the Ready figure (which counts no staging
+    /// file) is published, and one that will not go leaves the folder
+    /// unknown first; the tail is still skipped and the download Ready.
+    #[tokio::test]
+    async fn a_skipped_tail_that_failed_mid_write_is_cleaned_before_ready() {
+        for stuck in [false, true] {
+            let rig = Rig::new(if stuck {
+                "tail-part-stuck"
+            } else {
+                "tail-part"
+            });
+            let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+            {
+                let mut f = rig.server.files.lock().unwrap();
+                f.insert(MEDIA_KEY.into(), media.into_bytes());
+                f.insert(SEG1.into(), vec![1; 200_000]);
+            }
+            FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = Some(file_name(SEG1)));
+            FAIL_PART_DELETE.with(|f| f.set(stuck));
+            let store = rig.open();
+            let files = rig.dir.join("u1").join("1").join("files");
+            let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+            let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+            DURING_SAVE.with(|d| {
+                *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                    if v.ready() {
+                        let unknown = lock(&s2.inner.state).unknown_folder().is_some();
+                        *seen2.borrow_mut() =
+                            Some((unknown, v.estimated_bytes, dir_size(&files2).bytes));
+                    }
+                }));
+            });
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            DURING_SAVE.with(|d| *d.borrow_mut() = None);
+            FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = None);
+            FAIL_PART_DELETE.with(|f| f.set(false));
+            assert_eq!(only(&store).state, KeptState::Ready, "stuck={stuck}");
+            let (unknown, figure, on_disk) = (*seen.borrow()).expect("no Ready record was saved");
+            assert!(
+                unknown || figure >= on_disk,
+                "stuck={stuck}: Ready published at {figure} with {on_disk} on disk"
+            );
+            if stuck {
+                assert!(unknown, "the stuck staging file was uncounted at Ready");
+            }
+        }
     }
 
     #[tokio::test]
