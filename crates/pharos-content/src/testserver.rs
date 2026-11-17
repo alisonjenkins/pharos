@@ -11,6 +11,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// A chunked body that stops after `at` bytes: `reached` is set when it
+/// has, and it goes on once `release` is set.
+#[derive(Debug, Clone)]
+struct Hold {
+    at: usize,
+    release: Arc<std::sync::atomic::AtomicBool>,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Script {
     files: HashMap<String, Vec<u8>>,
@@ -20,7 +29,7 @@ pub struct Script {
     ignore_range: bool,
     window: Option<u64>,
     /// A chunked body stops after this many bytes until the flag is set.
-    hold: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
+    hold: Option<Hold>,
     /// Each body served pops one entry and closes the socket after that many
     /// body bytes.
     drops: VecDeque<usize>,
@@ -58,12 +67,25 @@ impl Script {
         self
     }
 
-    /// Holds a chunked body after `bytes` of it until the returned flag is
-    /// set, to see a download in the middle of its body.
-    pub fn hold_after(mut self, bytes: usize) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.hold = Some((bytes, flag.clone()));
-        (self, flag)
+    /// Holds a chunked body after `bytes` of it, to see a download in the
+    /// middle of its body. Returns the flag that releases it and the flag
+    /// the server sets once it has stopped there.
+    pub fn hold_after(
+        mut self,
+        bytes: usize,
+    ) -> (
+        Self,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.hold = Some(Hold {
+            at: bytes,
+            release: release.clone(),
+            reached: reached.clone(),
+        });
+        (self, release, reached)
     }
 
     pub fn window(mut self, bytes: u64) -> Self {
@@ -230,9 +252,15 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
             let _ = sock.write_all(piece).await;
             let _ = sock.write_all(b"\r\n").await;
             sent += piece.len();
-            if let Some((at, flag)) = &hold {
+            if let Some(Hold {
+                at,
+                release,
+                reached,
+            }) = &hold
+            {
                 if sent >= *at {
-                    while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                    while !release.load(std::sync::atomic::Ordering::SeqCst) {
                         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
                 }

@@ -1825,7 +1825,7 @@ mod tests {
         }
         let _cleanup = RemoveOnDrop(dir.clone());
         let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
-        let (script, release) = Script::default()
+        let (script, release, reached) = Script::default()
             .file("/audio/1", vec![7u8; size])
             .chunked()
             .hold_after(64 * 1024);
@@ -1845,6 +1845,13 @@ mod tests {
             .is_ok());
         assert_eq!(lib.music_outstanding_bytes(), 0);
         lib.prefetch(&["track/1".to_owned()]);
+        // The server has stopped mid-body: the download is in its window.
+        let mut waited = 0;
+        while !reached.load(Ordering::SeqCst) {
+            waited += 1;
+            assert!(waited < 10_000, "the server never reached the hold");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let mut waited = 0;
         while lib.music_outstanding_bytes() < FREE_CHECK_BYTES {
             waited += 1;
