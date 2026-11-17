@@ -80,11 +80,23 @@ fn write(path: &Path, token: &str, user: Option<&str>) -> std::io::Result<()> {
         if f.metadata()?.permissions().mode() & 0o077 != 0 {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // The rename is durable only once the directory is: a crash must
+        // leave the old pair or the new, and the caller is told if not.
+        sync_dir(dir)
     };
     go().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Flushes the directory entry of a rename to disk.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_DIR_SYNC.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("directory sync failed"));
+    }
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// A new sign-in's token. Whoever the file held it for is gone with it: the
@@ -117,6 +129,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    thread_local! {
+        /// While set, syncing the directory after a rename fails.
+        pub(super) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A rename whose directory entry cannot be flushed is an error the
+    /// caller sees, not a token that may vanish at the next crash.
+    #[test]
+    fn a_failed_directory_sync_is_reported() {
+        let d = dir("dirsync");
+        let path = d.join("device-token");
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let err = store(&path, "tok").unwrap_err();
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        assert!(err.contains("directory sync failed"), "{err}");
+        assert!(store(&path, "tok").is_ok());
+    }
 
     fn dir(tag: &str) -> PathBuf {
         let d =
