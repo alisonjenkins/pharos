@@ -12,7 +12,8 @@ use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
 
 use super::app::{call, AccountMe, Ctx};
 use super::kept_video::{
-    quality_label, KeptState, KeptVideo, DEFAULT_QUALITY_BPS, QUALITY_CHOICES_BPS,
+    cap_from_option, cap_options, cap_selected, quality_label, KeptState, KeptVideo, VideoStore,
+    DEFAULT_QUALITY_BPS, QUALITY_CHOICES_BPS,
 };
 use super::offline_ui::format_bytes;
 use super::offline_video;
@@ -20,6 +21,7 @@ use super::offline_view::poll_every;
 use super::platform;
 use super::ports::video_store;
 use super::route::Route;
+use super::settings::Choices;
 use super::views::Nav;
 
 /// How often a screen re-reads the store while it is on screen, so a
@@ -337,7 +339,12 @@ async fn start_download(
 
 /// The Downloads page's videos. Nothing without a registered store.
 #[component]
-pub fn VideoDownloads() -> Element {
+pub fn VideoDownloads(
+    /// Show the space allowance picker (the Downloads page does; the
+    /// offline start, which only plays, does not).
+    #[props(default = true)]
+    settings: bool,
+) -> Element {
     let Some(store) = video_store() else {
         return rsx! {};
     };
@@ -347,13 +354,33 @@ pub fn VideoDownloads() -> Element {
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
+    let mut cap = use_signal(|| store.cap_bytes());
+    let mut cap_notice = use_signal(|| None::<String>);
+    let cap_store = store.clone();
     rsx! {
         section { class: "pharos-downloads", aria_labelledby: "video-downloads-title",
             h2 { id: "video-downloads-title", "Downloaded videos" }
+            if settings {
+                VideoCapSetting {
+                cap: cap(),
+                notice: cap_notice(),
+                on_pick: move |option: String| match apply_cap(&*cap_store, &option) {
+                    Ok(bytes) => {
+                        platform::info(&format!("pharos: video cap set bytes={bytes}"));
+                        cap.set(bytes);
+                        cap_notice.set(None);
+                    }
+                    Err(e) => {
+                        platform::warn(&format!("pharos: video cap refused option={option:?} error={e}"));
+                        cap_notice.set(Some(format!("The space allowance was not changed: {e}")));
+                    }
+                },
+                }
+            }
             VideoList {
                 videos: videos(),
                 used,
-                cap: store.cap_bytes(),
+                cap: cap(),
                 on_play: move |item: String| match item.parse::<ItemRef>() {
                     Ok(id) => nav.0.call(Route::Watch(id)),
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
@@ -364,6 +391,39 @@ pub fn VideoDownloads() -> Element {
                         remove_store.remove(user, &item);
                     }
                 },
+            }
+        }
+    }
+}
+
+/// Applies a cap option to the store: the bytes set, or why not.
+pub fn apply_cap(store: &dyn VideoStore, option: &str) -> Result<u64, String> {
+    let bytes = cap_from_option(option).ok_or_else(|| format!("{option:?} is not a choice"))?;
+    store.set_cap_bytes(bytes)?;
+    Ok(bytes)
+}
+
+/// The space allowance picker for downloaded video.
+#[component]
+pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<String>) -> Element {
+    rsx! {
+        div { class: "pharos-setting pharos-video-cap",
+            div { class: "pharos-setting-text",
+                span { id: "video-cap-label", class: "pharos-setting-name", "Space for downloads" }
+                span { id: "video-cap-help", class: "pharos-setting-help",
+                    "Downloads stop at this size. Lowering it keeps what is already saved."
+                }
+            }
+            Choices {
+                id: "video-cap",
+                labelled_by: "video-cap-label",
+                described_by: "video-cap-help",
+                options: cap_options(),
+                selected: cap_selected(cap),
+                on_pick: move |o| on_pick.call(o),
+            }
+            if let Some(n) = notice {
+                p { class: "pharos-setting-help", role: "alert", "{n}" }
             }
         }
     }
@@ -380,7 +440,7 @@ pub fn OfflineVideos() -> Element {
     rsx! {
         section { class: "pharos-offline", id: "pharos-offline-videos",
             h2 { "Offline: videos on this device" }
-            VideoDownloads {}
+            VideoDownloads { settings: false }
         }
     }
 }
@@ -518,5 +578,70 @@ mod tests {
         assert_eq!(percent(0, 0), 0);
         assert_eq!(percent(5, 4), 100);
         assert_eq!(percent(1, 3), 33);
+    }
+
+    fn cap_setting() -> Element {
+        rsx! {
+            VideoCapSetting { cap: 16 * crate::native::offline_ui::GIB, notice: None, on_pick: |_| {} }
+        }
+    }
+
+    #[test]
+    fn the_cap_picker_offers_every_choice_and_presses_the_current_one() {
+        let html = render(cap_setting);
+        for (value, _) in cap_options() {
+            assert!(
+                html.contains(&format!("id=\"video-cap-{value}\"")),
+                "{html}"
+            );
+        }
+        let pressed: Vec<&str> = html
+            .split("<button")
+            .filter(|b| b.contains("aria-pressed=\"true\""))
+            .collect();
+        assert_eq!(pressed.len(), 1, "{html}");
+        assert!(pressed[0].contains("id=\"video-cap-16\""), "{html}");
+        assert!(html.contains("Space for downloads"), "{html}");
+    }
+
+    #[test]
+    fn an_option_that_is_not_offered_never_reaches_the_store() {
+        struct Spy(std::sync::Mutex<Vec<u64>>);
+        impl VideoStore for Spy {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                vec![]
+            }
+            fn start(
+                &self,
+                _: super::super::kept_video::KeepVideoRequest,
+            ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+                self.0.lock().unwrap().push(bytes);
+                Ok(())
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let spy = Spy(std::sync::Mutex::new(vec![]));
+        assert_eq!(
+            apply_cap(&spy, "32"),
+            Ok(32 * crate::native::offline_ui::GIB)
+        );
+        assert!(apply_cap(&spy, "3").is_err());
+        assert_eq!(
+            *spy.0.lock().unwrap(),
+            [32 * crate::native::offline_ui::GIB]
+        );
     }
 }
