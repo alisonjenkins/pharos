@@ -126,6 +126,10 @@ struct State {
     /// download is told apart from the one still running by this number.
     runs: HashMap<(String, String), u64>,
     next_run: u64,
+    /// Bytes each download has written to staging files not yet whole: on
+    /// disk already, so the free space lacks them, but not yet in the
+    /// record's stored bytes.
+    staged: HashMap<(String, String), u64>,
     last_saved: Option<Instant>,
 }
 
@@ -250,17 +254,60 @@ fn reserved(v: &KeptVideo) -> u64 {
     v.bytes().max(v.estimated_bytes)
 }
 
-/// What the other running downloads have yet to write: their estimate less
-/// what they have stored. The free space already lacks what they have
-/// written, so only this part is still to come out of it.
-fn outstanding_by_others(list: &[KeptVideo], user: &str, item: &str) -> u64 {
-    list.iter()
-        .filter(|v| !(v.user == user && v.item == item))
-        .filter_map(|v| match v.state {
-            KeptState::Downloading { bytes, .. } => Some(v.estimated_bytes.saturating_sub(bytes)),
-            _ => None,
-        })
-        .fold(0u64, u64::saturating_add)
+impl State {
+    /// What the other running downloads have yet to write: their estimate
+    /// less what they have stored whole and what they have staged. The free
+    /// space already lacks what is on disk, so only the rest is still to
+    /// come out of it.
+    fn outstanding(&self, user: &str, item: &str) -> u64 {
+        self.list
+            .iter()
+            .filter(|v| !(v.user == user && v.item == item))
+            .filter_map(|v| match v.state {
+                KeptState::Downloading { bytes, .. } => {
+                    let staged = self
+                        .staged
+                        .get(&(v.user.clone(), v.item.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    Some(
+                        v.estimated_bytes
+                            .saturating_sub(bytes.saturating_add(staged)),
+                    )
+                }
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// A download's bytes in a staging file, counted in [`State::staged`] until
+/// the file is whole, promoted or dropped.
+struct Staged<'a> {
+    inner: &'a Inner,
+    who: (String, String),
+    len: u64,
+}
+
+impl Staged<'_> {
+    fn add(&mut self, n: u64) {
+        self.len = self.len.saturating_add(n);
+        let mut st = lock(&self.inner.state);
+        let held = st.staged.entry(self.who.clone()).or_default();
+        *held = held.saturating_add(n);
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        let mut st = lock(&self.inner.state);
+        if let Some(held) = st.staged.get_mut(&self.who) {
+            *held = held.saturating_sub(self.len);
+            if *held == 0 {
+                st.staged.remove(&self.who);
+            }
+        }
+    }
 }
 
 /// Every video's reservation but `item`'s own.
@@ -381,7 +428,7 @@ impl Inner {
             if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
                 return Err(Admission::Gone);
             }
-            let outstanding = outstanding_by_others(&st.list, user, item);
+            let outstanding = st.outstanding(user, item);
             let verdict = match check {
                 Check::Fresh { other, cap, free } => {
                     let used = reserved_by_others(&st.list, user, item).saturating_add(other);
@@ -596,6 +643,11 @@ async fn fetch_once(
         .await
         .map_err(|e| store_err("create", e))?;
     let mut len = 0u64;
+    let mut staged = Staged {
+        inner,
+        who: (user.to_owned(), item.to_owned()),
+        len: 0,
+    };
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
@@ -603,6 +655,7 @@ async fn fetch_once(
                     .await
                     .map_err(|e| store_err("write", e))?;
                 len = len.saturating_add(chunk.len() as u64);
+                staged.add(chunk.len() as u64);
             }
             Ok(None) => break,
             Err(e) => {
@@ -1097,6 +1150,12 @@ impl DiskVideoStore {
         Arc::new(Self { inner })
     }
 
+    /// Bytes in staging files not yet whole, all downloads (tests).
+    #[cfg(test)]
+    fn staged_bytes(&self) -> u64 {
+        lock(&self.inner.state).staged.values().sum()
+    }
+
     /// Waits for every download started so far to stop (tests).
     #[cfg(test)]
     async fn settled(&self) {
@@ -1155,7 +1214,7 @@ impl VideoStore for DiskVideoStore {
             );
             let mut st = lock(&self.inner.state);
             let used = reserved_by_others(&st.list, &user, &item).saturating_add(other);
-            let room = free.saturating_sub(outstanding_by_others(&st.list, &user, &item));
+            let room = free.saturating_sub(st.outstanding(&user, &item));
             let started = fits(0, used, cap, room).and_then(|()| {
                 check_not_kept(&st.list, &user, &item)?;
                 let mut record = new_record(&request, (self.inner.env.now)());
@@ -1226,7 +1285,7 @@ impl VideoStore for DiskVideoStore {
 
     fn outstanding_bytes(&self) -> u64 {
         // No record has an empty user, so this is every record's.
-        outstanding_by_others(&lock(&self.inner.state).list, "", "")
+        lock(&self.inner.state).outstanding("", "")
     }
 
     fn kept_bytes(&self) -> u64 {
@@ -1930,6 +1989,66 @@ mod tests {
         assert_eq!(rig.budget.held.load(Ordering::SeqCst), 0, "all released");
     }
 
+    /// The free space already lacks what a download has staged in a file not
+    /// yet whole; only the rest of its estimate is still to come out of it.
+    #[tokio::test]
+    async fn staged_bytes_are_not_counted_as_still_to_write() {
+        let rig = Rig::new("staged");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first download holds its SEG0 half written (50 bytes staged)
+        // with everything else stored.
+        let stored = (MASTER.len() + MEDIA.len() + 10 + 100) as u64;
+        let mut waited = 0;
+        loop {
+            let bytes = match store.videos("u1").first().map(|v| v.state.clone()) {
+                Some(KeptState::Downloading { bytes, .. }) => bytes,
+                _ => 0,
+            };
+            if bytes == stored && store.staged_bytes() == 50 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "bytes={bytes} staged={}",
+                store.staged_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // The disk now lacks what was written: room for the second film
+        // beyond the guard, exactly, once the first's staged bytes are not
+        // counted twice.
+        rig.budget.free.store(
+            2 * estimate + FREE_GUARD_BYTES - stored - 50,
+            Ordering::SeqCst,
+        );
+        store.start(request("2")).unwrap();
+        let mut waited = 0;
+        loop {
+            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
+            if second.as_ref().is_some_and(|v| {
+                v.estimated_bytes > 0 || matches!(v.state, KeptState::Failed { .. })
+            }) {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "{second:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let videos = store.videos("u1");
+        let second = videos.iter().find(|v| v.item == "2").unwrap();
+        assert_eq!(
+            second.state,
+            KeptState::Ready,
+            "refused for room it had: {second:?}"
+        );
+    }
+
     /// Free space is shared too: a second download must leave the guard free
     /// after the first has written what it still has to write.
     #[tokio::test]
@@ -2012,14 +2131,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         // What the running one has yet to write: its estimate less what it
-        // has stored; the finished one has nothing left.
+        // has stored whole or staged; the finished one has nothing left.
         let mut waited = 0;
         loop {
             let stored = match store.videos("u1")[0].state {
                 KeptState::Downloading { bytes, .. } => bytes,
                 ref other => panic!("not running: {other:?}"),
             };
-            if store.outstanding_bytes() == estimate - stored {
+            if store.outstanding_bytes() == estimate - stored - store.staged_bytes() {
                 break;
             }
             waited += 1;
