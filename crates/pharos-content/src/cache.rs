@@ -213,11 +213,19 @@ struct State {
     clock: u64,
 }
 
+/// Bytes that other kinds of download hold against the same cap (the
+/// phone's offline video). Called while the cache's lock is held, so it
+/// must not call back into the cache.
+pub type OutsideUsed = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
 pub struct Cache {
     dir: PathBuf,
     cap: AtomicU64,
     state: Mutex<State>,
     free: FreeProbe,
+    /// What the host says other downloads hold of the cap. They count
+    /// against it but are never evicted from here.
+    outside: Mutex<Option<OutsideUsed>>,
 }
 
 /// Space available to an unprivileged writer, as `df` reports it.
@@ -409,6 +417,7 @@ impl Cache {
                 ..State::default()
             }),
             free,
+            outside: Mutex::new(None),
         };
         {
             let mut s = cache.lock();
@@ -444,6 +453,31 @@ impl Cache {
             evicted.len()
         );
         Ok(evicted)
+    }
+
+    /// Count what `used` reports (bytes other kinds of download hold) against
+    /// the cap from now on, and evict music at once if that puts the cache
+    /// over. Those bytes are never candidates for eviction here; only music
+    /// goes, so a full shared budget turns away new music, not video.
+    /// Returns the evicted ids.
+    pub fn set_outside_used(&self, used: OutsideUsed) -> Vec<String> {
+        *self.outside.lock().unwrap_or_else(PoisonError::into_inner) = Some(used);
+        let mut s = self.lock();
+        let evicted = self.evict_locked(&mut s);
+        if !evicted.is_empty() {
+            self.persist_locked(&s);
+        }
+        evicted
+    }
+
+    /// Bytes the host says other downloads hold against the cap.
+    fn outside_used(&self) -> u64 {
+        let hook = self
+            .outside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        hook.map_or(0, |f| f())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -750,13 +784,15 @@ impl Cache {
     fn evict_locked(&self, s: &mut State) -> Vec<String> {
         let mut evicted = Vec::new();
         loop {
-            let (_, used) = Self::totals(s);
+            let (_, music) = Self::totals(s);
+            let outside = self.outside_used();
+            let used = music.saturating_add(outside);
             if used <= self.cap() {
                 break;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
                 log::warn!(
-                    "cache over cap used={used} cap={} and nothing is evictable (pinned, queued or playing)",
+                    "cache over cap used={used} music={music} outside={outside} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap()
                 );
                 break;
@@ -764,7 +800,7 @@ impl Cache {
             if !self.remove_locked(s, &id) {
                 break;
             }
-            log::info!("cache evict id={id} bytes={bytes} reason=over_cap");
+            log::info!("cache evict id={id} bytes={bytes} reason=over_cap outside={outside}");
             evicted.push(id);
         }
         evicted
@@ -958,6 +994,37 @@ mod tests {
         assert!(
             c.set_cap(1000).unwrap().is_empty(),
             "growing evicts nothing"
+        );
+    }
+
+    #[test]
+    fn bytes_other_downloads_hold_count_against_the_cap_and_only_music_goes() {
+        let d = tmp("outside");
+        let c = Cache::open(&d, 1000).unwrap();
+        let video = std::sync::Arc::new(AtomicU64::new(700));
+        let v = video.clone();
+        assert!(c
+            .set_outside_used(std::sync::Arc::new(move || v.load(Ordering::SeqCst)))
+            .is_empty());
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 100);
+        put(&c, "track/c", 100);
+        c.protect(&[]);
+        assert_eq!(c.used_bytes(), 300, "music and video exactly fill the cap");
+        // One more track would make 1100: the oldest music goes, not video.
+        put(&c, "track/d", 100);
+        assert!(!c.is_complete("track/a"));
+        assert_eq!(c.used_bytes(), 300);
+        assert_eq!(video.load(Ordering::SeqCst), 700, "video is never touched");
+        // When video grows, a new hook reading evicts music at once.
+        video.store(850, Ordering::SeqCst);
+        let v = video.clone();
+        let evicted = c.set_outside_used(std::sync::Arc::new(move || v.load(Ordering::SeqCst)));
+        assert_eq!(evicted, ids(&["track/b", "track/c"]));
+        assert_eq!(
+            c.used_bytes(),
+            100,
+            "850 of video leaves room for one track"
         );
     }
 

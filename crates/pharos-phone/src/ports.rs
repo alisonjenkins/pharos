@@ -285,6 +285,8 @@ pub fn register_video() {
         );
         return;
     }
+    // The music cache counts the video's bytes against the shared cap.
+    pharos_android::set_outside_used(Arc::new(pharos_ui::native::ports::kept_video_bytes));
     let budget = Arc::new(PhoneBudget { dir: root.clone() });
     match pharos_ui::native::register_phone_video_store(root.clone(), budget) {
         Ok(()) => log::info!(

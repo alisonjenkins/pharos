@@ -51,8 +51,8 @@ use player::*;
 pub use resume::saved_ms as saved_resume_ms;
 pub use runtime::{runtime, Player};
 use search::*;
-pub use service::files_dir;
 use service::*;
+pub use service::{files_dir, set_outside_used};
 use session::*;
 
 use std::path::Path;

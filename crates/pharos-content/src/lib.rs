@@ -32,7 +32,8 @@ mod token;
 mod tree;
 
 pub use cache::{
-    statvfs_free, Download, DownloadTrack, OfflineSummary, DEFAULT_CAP_BYTES, MIN_FREE_BYTES,
+    statvfs_free, Download, DownloadTrack, OfflineSummary, OutsideUsed, DEFAULT_CAP_BYTES,
+    MIN_FREE_BYTES,
 };
 pub use error::ContentError;
 pub use fault::unreachable as server_unreachable;

@@ -168,6 +168,12 @@ pub trait VideoStore: Send + Sync {
     /// Note where the viewer stopped, for the next offline start.
     fn save_position(&self, user: &str, item: &str, position_ms: u64);
     fn cap_bytes(&self) -> u64;
+    /// What every user's downloads hold or have reserved on this device,
+    /// for the host to count against the cap it shares with other kinds.
+    /// Zero for a store that shares no cap.
+    fn kept_bytes(&self) -> u64 {
+        0
+    }
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;

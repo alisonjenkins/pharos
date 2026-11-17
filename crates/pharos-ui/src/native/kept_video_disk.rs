@@ -1130,6 +1130,14 @@ impl VideoStore for DiskVideoStore {
         self.inner.env.budget.cap_bytes()
     }
 
+    fn kept_bytes(&self) -> u64 {
+        lock(&self.inner.state)
+            .list
+            .iter()
+            .map(reserved)
+            .fold(0u64, u64::saturating_add)
+    }
+
     fn used_bytes(&self, user: &str) -> u64 {
         let video = lock(&self.inner.state)
             .list
@@ -1762,6 +1770,33 @@ mod tests {
             refused.len() == 1 && refused[0].contains("item=2"),
             "{refused:?}"
         );
+    }
+
+    /// The host counts these bytes against the cap it shares with music:
+    /// every user's, a download under way at its whole estimate.
+    #[tokio::test]
+    async fn the_kept_bytes_cover_every_user_and_a_running_downloads_estimate() {
+        let rig = Rig::new("kept-bytes");
+        let store = rig.open();
+        let mut other = request("2");
+        other.user = "u2".into();
+        store.start(other).unwrap();
+        store.settled().await;
+        let ready = store.videos("u2")[0].bytes();
+        assert!(ready > 0);
+        assert_eq!(store.kept_bytes(), ready);
+
+        // A second user's download stays under way.
+        let _held = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let mut waited = 0;
+        while store.kept_bytes() != ready + estimate {
+            waited += 1;
+            assert!(waited < 2_000, "kept_bytes={}", store.kept_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     #[tokio::test]

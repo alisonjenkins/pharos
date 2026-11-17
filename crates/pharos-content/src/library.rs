@@ -171,6 +171,9 @@ pub struct Library {
     network_known: AtomicBool,
     /// Restored pins were queued (once, after the state is known).
     pins_resumed: AtomicBool,
+    /// What other downloads hold of the cache's cap; applied to the cache
+    /// when it is enabled, or at once if it already is.
+    outside_used: Mutex<Option<cache::OutsideUsed>>,
 }
 
 /// The audio cache and the thread that fills it.
@@ -340,6 +343,7 @@ impl Library {
             network_up: AtomicBool::new(true),
             network_known: AtomicBool::new(false),
             pins_resumed: AtomicBool::new(false),
+            outside_used: Mutex::new(None),
         })
     }
 
@@ -564,7 +568,20 @@ impl Library {
         }
         downloader.set_online(self.online.load(Ordering::SeqCst));
         before_publish();
-        let _ = self.offline.set(Offline { cache, downloader });
+        let _ = self.offline.set(Offline {
+            cache: cache.clone(),
+            downloader,
+        });
+        // After publishing, so a hook set while this ran is not missed: it
+        // either saw the cache and applied itself, or is read here.
+        let outside = self
+            .outside_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(outside) = outside {
+            cache.set_outside_used(outside);
+        }
         // A `set_online` that landed before the downloader was published
         // could not reach it. Re-apply the state now it can, before pins run.
         self.apply_online();
@@ -582,6 +599,22 @@ impl Library {
             });
         };
         o.cache.set_cap(cap_bytes).map(|_| ())
+    }
+
+    /// Count what `used` reports against the cache's cap: bytes that other
+    /// downloads (the phone's offline video) hold of the one shared budget.
+    /// They are never evicted from here; only music goes, so music cannot
+    /// push the total past the cap. Applied when the cache is enabled, or
+    /// now if it is. `used` runs under the cache's lock and must not call
+    /// back into the library.
+    pub fn set_outside_used(&self, used: cache::OutsideUsed) {
+        *self
+            .outside_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(used.clone());
+        if let Some(o) = self.offline.get() {
+            o.cache.set_outside_used(used);
+        }
     }
 
     /// The cap in force, when the cache is enabled.
@@ -1284,6 +1317,32 @@ mod tests {
             Some(4096),
             "the saved cap beats the default"
         );
+    }
+
+    #[test]
+    fn a_hook_for_other_downloads_reaches_the_cache_whenever_it_is_set() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = |calls: &Arc<std::sync::atomic::AtomicUsize>| -> cache::OutsideUsed {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                0
+            })
+        };
+        // Set before the cache is enabled: applied when it is.
+        let base = dead_server();
+        let tok =
+            std::env::temp_dir().join(format!("pharos-auto-lib-outside-{}", std::process::id()));
+        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
+        lib.set_outside_used(hook(&calls));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no cache to tell yet");
+        lib.enable_cache(&cache_dir("outside-before"), 1 << 20)
+            .unwrap();
+        let after_enable = calls.load(Ordering::SeqCst);
+        assert!(after_enable > 0, "the cache was told when it came up");
+        // Set after: applied at once.
+        lib.set_outside_used(hook(&calls));
+        assert!(calls.load(Ordering::SeqCst) > after_enable);
     }
 
     #[test]

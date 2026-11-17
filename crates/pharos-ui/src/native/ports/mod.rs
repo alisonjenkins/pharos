@@ -82,6 +82,13 @@ pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
     VIDEO_STORE.get()
 }
 
+/// Bytes the registered video store holds or has reserved, for every user;
+/// 0 when none is registered. The phone counts them against the cap it
+/// shares with the music cache.
+pub fn kept_video_bytes() -> u64 {
+    video_store().map_or(0, |s| s.kept_bytes())
+}
+
 /// What the host app runs when the user signs in or out, so a second client
 /// in the same process (the car's media service) re-reads the token.
 static ON_CREDENTIALS_CHANGED: OnceLock<fn()> = OnceLock::new();

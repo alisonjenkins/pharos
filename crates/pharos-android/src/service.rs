@@ -11,6 +11,20 @@ pub(crate) struct ContentLog;
 
 pub(crate) static CONTENT_LOG: ContentLog = ContentLog;
 
+/// What other downloads (the phone's offline video) hold of the cache's
+/// cap, as the app reports it. The library's hook reads this when it runs,
+/// so it can be set after the library is up.
+static OUTSIDE_USED: OnceLock<content::OutsideUsed> = OnceLock::new();
+
+/// Registers the app's count of other downloads' bytes against the music
+/// cache's cap. The cache counts them as used and evicts only music, so
+/// music and video together cannot pass the one cap. The hook runs under
+/// the cache's lock and must not call back into the library. Set once;
+/// later calls are ignored.
+pub fn set_outside_used(used: content::OutsideUsed) {
+    let _ = OUTSIDE_USED.set(used);
+}
+
 /// The app's private files directory (`Context.getFilesDir`).
 pub fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
     let dir = env
@@ -78,6 +92,9 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         content::AuthState::SignedIn => "signed_in",
     };
     log(&format!("library server_from={server_from} auth={auth}"));
+    lib.set_outside_used(std::sync::Arc::new(|| {
+        OUTSIDE_USED.get().map_or(0, |used| used())
+    }));
     let cache_dir = Path::new(&files).join("audio-cache");
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
         Ok(()) => log(&format!(
