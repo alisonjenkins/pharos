@@ -85,6 +85,12 @@ pub trait Budget: Send + Sync {
     fn other_used_bytes(&self) -> u64;
     /// Free space on the device, measured now.
     fn free_bytes(&self) -> u64;
+    /// What the other kinds have been approved to write and not yet landed:
+    /// the free space does not lack these yet, but will. Read under the
+    /// admission lock, before the free space is measured. None by default.
+    fn other_outstanding_bytes(&self) -> u64 {
+        0
+    }
     /// Holds the lock a host shares between its kinds of download while an
     /// admission reads the other kinds' bytes and reserves its own, so
     /// neither kind admits against a figure the other is changing. Taken
@@ -612,7 +618,9 @@ impl Inner {
             // space is measured: a write landing in between lowers free, and
             // the stale (higher) owed figure only makes the check stricter.
             // The other order counts that write as room.
-            let outstanding = st.outstanding(user, item);
+            let outstanding = st
+                .outstanding(user, item)
+                .saturating_add(self.env.budget.other_outstanding_bytes());
             if let Some(refusal) = st.unknown_folder() {
                 return Err(Admission::Refused {
                     refusal,
@@ -1675,7 +1683,9 @@ impl VideoStore for DiskVideoStore {
             let mut st = lock(&self.inner.state);
             let used = st.reserved_by_others(&user, &item).saturating_add(other);
             // Owed bytes first, then the free space (as in `admit`).
-            let owed = st.outstanding(&user, &item);
+            let owed = st
+                .outstanding(&user, &item)
+                .saturating_add(budget.other_outstanding_bytes());
             let room = budget.free_bytes().saturating_sub(owed);
             let started = st
                 .unknown_folder()
@@ -2136,6 +2146,7 @@ mod tests {
     struct FakeBudget {
         cap: AtomicU64,
         other: AtomicU64,
+        other_outstanding: AtomicU64,
         free: AtomicU64,
         /// Admission guards held now, taken in all, and readings made with
         /// none held.
@@ -2167,6 +2178,7 @@ mod tests {
             Arc::new(Self {
                 cap: AtomicU64::new(4 * GIB),
                 other: AtomicU64::new(0),
+                other_outstanding: AtomicU64::new(0),
                 free: AtomicU64::new(100 * GIB),
                 held: Arc::default(),
                 taken: AtomicUsize::new(0),
@@ -2184,6 +2196,10 @@ mod tests {
         fn other_used_bytes(&self) -> u64 {
             self.read();
             self.other.load(Ordering::SeqCst)
+        }
+        fn other_outstanding_bytes(&self) -> u64 {
+            self.read();
+            self.other_outstanding.load(Ordering::SeqCst)
         }
         fn free_bytes(&self) -> u64 {
             self.read();
@@ -2226,13 +2242,17 @@ mod tests {
         }
 
         fn open(&self) -> Arc<DiskVideoStore> {
+            self.open_with(self.budget.clone())
+        }
+
+        fn open_with(&self, budget: Arc<dyn Budget>) -> Arc<DiskVideoStore> {
             self.opened.fetch_add(1, Ordering::SeqCst);
             let slept = self.slept.clone();
             DiskVideoStore::open(
                 self.dir.clone(),
                 Env {
                     fetcher: self.server.clone(),
-                    budget: self.budget.clone(),
+                    budget,
                     sleep: Arc::new(move |secs| {
                         slept.lock().unwrap().push(secs);
                         Box::pin(async {})
@@ -2485,6 +2505,34 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         assert_eq!(store.used_bytes("u1"), 4 * GIB - 10);
+    }
+
+    /// A music write the cache has approved, and not yet landed, is room a
+    /// video admission cannot count: the free figure does not lack those
+    /// bytes yet. (The phone's budget reports them from the cache's
+    /// reservation, `Library::music_outstanding_bytes`.)
+    #[tokio::test]
+    async fn a_video_admission_does_not_count_room_an_approved_music_write_will_take() {
+        let rig = Rig::new("music-approved");
+        let free = 100 * GIB;
+        rig.budget.free.store(free, Ordering::SeqCst);
+        // Music is approved for all the room above the guard, and has yet to
+        // write it.
+        rig.budget
+            .other_outstanding
+            .store(free - FREE_GUARD_BYTES, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted against room the music write will take");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+        // Once the music write lands (or its job ends) the room is the video's.
+        rig.budget.other_outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "still refused after the release");
     }
 
     #[tokio::test]

@@ -249,6 +249,11 @@ impl Budget for PhoneBudget {
             .map_or(0, |s| s.used_bytes)
     }
 
+    fn other_outstanding_bytes(&self) -> u64 {
+        // Music writes the cache has approved and not yet landed.
+        pharos_android::library().map_or(0, content::Library::music_outstanding_bytes)
+    }
+
     fn admission_guard(&self) -> Box<dyn std::any::Any> {
         // The lock the music cache holds while it adds a track and trims,
         // so neither kind admits against a figure the other is changing.
