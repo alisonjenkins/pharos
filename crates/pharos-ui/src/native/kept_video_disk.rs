@@ -411,6 +411,36 @@ impl Inner {
         }
     }
 
+    /// Puts back the record of a removal that could not take its manifest
+    /// off the disk, with the files it still holds indexed.
+    fn keep_after_failed_unlink(&self, mut record: KeptVideo, dir: &Path, e: &std::io::Error) {
+        let names = stored_names(dir);
+        let mut st = lock(&self.state);
+        for key in &record.files {
+            if let Some(len) = names.get(&file_name(key)) {
+                st.index.insert(
+                    key.clone(),
+                    (self.file_path(&record.user, &record.item, key), *len),
+                );
+            }
+        }
+        // Nothing runs it any more.
+        if matches!(record.state, KeptState::Downloading { .. }) {
+            record.state = KeptState::Failed {
+                reason: format!("could not be removed: {e}"),
+            };
+        }
+        emit(
+            true,
+            format!(
+                "pharos: video keep remove item={} verdict=not_removed manifest={} error={e}",
+                record.item,
+                dir.join("manifest.json").display()
+            ),
+        );
+        insert_front(&mut st.list, record);
+    }
+
     fn item_dir(&self, user: &str, item: &str) -> PathBuf {
         self.root.join(safe_name(user)).join(safe_name(item))
     }
@@ -1464,7 +1494,17 @@ impl VideoStore for DiskVideoStore {
         let dir = self.inner.item_dir(user, item);
         // The record goes first, so a folder that will not delete cannot
         // bring the download back at the next open.
-        let _ = std::fs::remove_file(dir.join("manifest.json"));
+        match std::fs::remove_file(dir.join("manifest.json")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // The record is still on disk and would bring the download
+                // back at the next open, so the removal has not happened:
+                // the record stays, as a failed one, and the caller sees it.
+                self.inner.keep_after_failed_unlink(record, &dir, &e);
+                return;
+            }
+        }
         let removed = (self.inner.env.remove_dir)(&dir);
         let mut left = 0;
         if removed.is_err() {
@@ -2732,6 +2772,30 @@ mod tests {
             "{:?}",
             lines("pharos: video record")
         );
+    }
+
+    /// A manifest that cannot be unlinked would bring the download back at
+    /// the next open: the removal is reported as not done and the record
+    /// stays.
+    #[tokio::test]
+    async fn a_failed_manifest_unlink_leaves_the_record_in_place() {
+        let rig = Rig::new("unlink-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        // Unlinking a non-empty directory fails with something other than
+        // "not found".
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record went");
+        assert!(store.stored_file(SEG0).is_some(), "its files went");
+        assert!(dir.join("files").exists(), "the folder went");
+        let line = lines("pharos: video keep remove");
+        assert!(line[0].contains("verdict=not_removed"), "{line:?}");
     }
 
     /// A folder that will not delete keeps counting against the cap, does not
