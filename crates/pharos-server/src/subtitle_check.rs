@@ -407,6 +407,16 @@ fn window_at(p: &Probe, at: Option<Shift>) -> Option<(u64, u64)> {
     Some((moved(p.start_ms)?, moved(p.end_ms)?.saturating_add(PAD_MS)))
 }
 
+/// A timing with nothing sent: every score NaN.
+fn unsent(n: usize, offset_ms: i64, ratio: f64) -> Candidate {
+    Candidate {
+        offset_ms,
+        ratio,
+        probes: vec![f32::NAN; n],
+        decoys: vec![f32::NAN; n],
+    }
+}
+
 /// What one timing's requests came back with.
 enum Asked {
     Scored(Candidate),
@@ -733,12 +743,9 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
                 return Err(e);
             }
             Asked::Failed(e) => return Err(e),
-            Asked::Outside => {
-                return Ok((
-                    Verdict::unknown(UnknownClass::TooFewLines, "too_few_lines:0"),
-                    Stage::Gate,
-                ))
-            }
+            // Every cue is past the end of the video at its own time: nothing
+            // to score, so stage 1 does not fit and the wide search looks.
+            Asked::Outside => unsent(picked.len(), 0, 1.0),
         };
         measured.stage1 = Some(stage1.clone());
         if stage1.fit(&self.thresholds).fits(&self.thresholds) {
@@ -813,11 +820,13 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         aligner_s: &mut f64,
     ) -> Asked {
         let duration = item.probe.duration_ms;
-        let windows: Vec<(u64, u64, &Probe)> = picked
+        // `(probe index, start, end)`: a probe outside the file is not sent.
+        let windows: Vec<(usize, u64, u64)> = picked
             .iter()
-            .filter_map(|p| {
+            .enumerate()
+            .filter_map(|(i, p)| {
                 let (a, b) = window_at(p, at)?;
-                duration.map_or(true, |d| a < d).then_some((a, b, p))
+                duration.map_or(true, |d| a < d).then_some((i, a, b))
             })
             .collect();
         if windows.is_empty() {
@@ -826,8 +835,17 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         let lines = |text: fn(&Probe) -> &str| -> Vec<(u64, u64, String)> {
             windows
                 .iter()
-                .map(|&(a, b, p)| (a, b, text(p).to_owned()))
+                .map(|&(i, a, b)| (a, b, text(&picked[i]).to_owned()))
                 .collect()
+        };
+        // Scores stay in probe order, an unsent probe NaN (scored as 0 and
+        // never a hit), so the verdict compares the same probe across timings.
+        let place = |a: &Aligned| -> Vec<f32> {
+            let mut out = vec![f32::NAN; picked.len()];
+            for (&(i, ..), s) in windows.iter().zip(scores(a, windows.len())) {
+                out[i] = s;
+            }
+            out
         };
         let (offset_ms, ratio) = at.map_or((0, 1.0), |s| (s.offset_ms, s.ratio));
         self.wait_for_turn().await;
@@ -841,7 +859,7 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         let mut cand = Candidate {
             offset_ms: offset_ms.saturating_add(probe_answer.offset_ms),
             ratio,
-            probes: scores(&probe_answer, windows.len()),
+            probes: place(&probe_answer),
             decoys: Vec::new(),
         };
         // FR-016: one request at a time, and a song may have come in between.
@@ -851,7 +869,7 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         *aligner_s += asked.elapsed().as_secs_f64();
         match decoy_answer {
             Ok(a) => {
-                cand.decoys = scores(&a, windows.len());
+                cand.decoys = place(&a);
                 Asked::Scored(cand)
             }
             Err(e) => Asked::ProbesOnly(cand, e),
@@ -1325,6 +1343,54 @@ mod tests {
         );
         assert!(r.scores_json.unwrap().contains("\"stage\":2"));
         assert_eq!(counts(&snap), [("retimed,offset,2".to_owned(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_timing_that_drops_a_probe_keeps_the_others_in_their_places() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let mut fake = Fake::new(900, 250);
+        // The first cue would start before the file at this timing.
+        fake.truth = Some((-20_000, 1.0));
+        job_hearing(&lib, &fake, Ears::hearing(Ok(spoken(-20_000, 1.0))))
+            .run_pass()
+            .await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("retimed"), "{}", r.reason);
+        assert_eq!(r.offset_ms, Some(-20_000));
+        let json: serde_json::Value = serde_json::from_str(&r.scores_json.unwrap()).unwrap();
+        let probes = json["stages"][1]["probes"].as_array().unwrap();
+        assert_eq!(probes.len(), 12, "one score per probe, in probe order");
+        assert!(probes[0].is_null(), "{probes:?}");
+        assert!(
+            probes[1..].iter().all(|p| p.as_f64() == Some(0.9)),
+            "{probes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cues_all_past_the_end_still_get_the_wide_search() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let mut item = lib.store.get(1).await.unwrap();
+        item.probe.duration_ms = Some(500);
+        lib.store.put(item).await.unwrap();
+        let fake = Fake::new(900, 250);
+        let checker = job(&lib, &fake);
+        checker.run_pass().await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("unknown"));
+        assert!(
+            r.reason.starts_with("inconclusive no_candidates"),
+            "{}",
+            r.reason
+        );
+        assert!(fake.calls().is_empty(), "nothing inside the file to send");
+        assert_eq!(
+            checker.ears.streams.lock().unwrap().len(),
+            1,
+            "stage 2 listened"
+        );
     }
 
     #[tokio::test]
