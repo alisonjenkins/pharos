@@ -1883,6 +1883,157 @@ mod tests {
         assert_eq!(lib.music_outstanding_bytes(), 0, "kept after the job ended");
     }
 
+    /// A library over the real cache and downloader, resolving `track/N` to
+    /// `/audio/N` on a local server (the library's own resolver needs the
+    /// server's node protocol), with a fixed, ample free space.
+    struct HeldRig {
+        // Dropped last, after the library and downloader.
+        _cleanup: RemoveOnDrop,
+        lib: Library,
+        _srv: Arc<crate::testserver::TestServer>,
+    }
+
+    /// Removes a test's directory last, even when an assertion fails.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn held_rig(tag: &str, script: crate::testserver::Script) -> HeldRig {
+        use crate::prefetch::{Downloader, Resolver, Tuning};
+        let dir = std::env::temp_dir().join(format!("pharos-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cleanup = RemoveOnDrop(dir.clone());
+        let srv = Arc::new(crate::testserver::TestServer::start(script));
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        let cache = Arc::new(
+            Cache::open_with_probe(&dir.join("cache"), 100 << 30, Box::new(|_| Ok(u64::MAX)))
+                .unwrap(),
+        );
+        let s2 = srv.clone();
+        let resolve: Resolver = Arc::new(move |id| {
+            let n = id.rsplit('/').next().unwrap_or("1");
+            Ok(s2.url_with_token(&format!("/audio/{n}"), "t"))
+        });
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
+        downloader.set_online(true);
+        assert!(lib.offline.set(Offline { cache, downloader }).is_ok());
+        HeldRig {
+            _cleanup: cleanup,
+            lib,
+            _srv: srv,
+        }
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let mut waited = 0;
+        while !ok() {
+            waited += 1;
+            assert!(waited < 10_000, "never: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// What a video admission against the shared cap reads from the music
+    /// cache, as the phone's budget sums it: finished bytes, bytes still to
+    /// come and bytes already written to a `.part`. A video of `video` bytes
+    /// fits under `cap` only when that sum leaves it room.
+    fn video_fits(lib: &Library, cap: u64, video: u64) -> bool {
+        let used = lib.offline_summary().map_or(0, |s| s.used_bytes);
+        let claimed = used
+            .saturating_add(lib.music_outstanding_bytes())
+            .saturating_add(lib.music_in_progress_bytes());
+        claimed.saturating_add(video) <= cap
+    }
+
+    /// A known-length download paused after its reservation was refreshed to
+    /// what is left: the bytes already written are in the cap figure, so a
+    /// video that fits only without them is refused.
+    #[test]
+    fn a_video_is_refused_after_a_music_reservation_refresh() {
+        use crate::prefetch::FREE_CHECK_BYTES;
+        use crate::testserver::Script;
+        let size = usize::try_from(FREE_CHECK_BYTES * 3).unwrap();
+        let hold_at = usize::try_from(FREE_CHECK_BYTES + (1 << 20)).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .hold_after(hold_at);
+        let rig = held_rig("refresh", script);
+        let lib = &rig.lib;
+        lib.prefetch(&["track/1".to_owned()]);
+        wait_until("the server holding", || reached.load(Ordering::SeqCst));
+        // The refresh has lowered the reservation to what is left.
+        let total = u64::try_from(size).unwrap();
+        wait_until("the reservation refreshed", || {
+            let r = lib.music_outstanding_bytes();
+            r > 0 && r <= total - FREE_CHECK_BYTES
+        });
+        let written = lib.music_in_progress_bytes();
+        assert!(
+            written >= FREE_CHECK_BYTES,
+            "written bytes not counted: {written}"
+        );
+        // A video that fits beside the remainder alone, not beside the
+        // written bytes too.
+        let video = 1 << 20;
+        let cap = lib.music_outstanding_bytes() + video + 1;
+        assert!(
+            lib.music_outstanding_bytes() + video <= cap,
+            "the scenario does not fit without the written bytes"
+        );
+        assert!(
+            !video_fits(lib, cap, video),
+            "admitted over the written bytes"
+        );
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        // Landed: the bytes are the finished track's, once.
+        assert_eq!(lib.music_in_progress_bytes(), 0);
+        assert_eq!(lib.offline_summary().unwrap().used_bytes, total);
+    }
+
+    /// A download cancelled mid-body keeps its `.part` and drops its
+    /// reservation: the kept bytes still count against the cap.
+    #[test]
+    fn a_video_is_refused_after_a_music_download_is_cancelled_with_its_part_kept() {
+        use crate::prefetch::FREE_CHECK_BYTES;
+        use crate::testserver::Script;
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let hold_at = usize::try_from(FREE_CHECK_BYTES / 2).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .file("/audio/2", vec![1u8; 1000])
+            .hold_after(hold_at);
+        let rig = held_rig("cancelled", script);
+        let lib = &rig.lib;
+        lib.prefetch(&["track/1".to_owned()]);
+        wait_until("the server holding", || reached.load(Ordering::SeqCst));
+        wait_until("bytes written", || lib.music_in_progress_bytes() > 0);
+        // Another wish replaces it: track/1 is cancelled at its next chunk.
+        lib.prefetch(&["track/2".to_owned()]);
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        assert_eq!(
+            lib.music_outstanding_bytes(),
+            0,
+            "a reservation outlived its job"
+        );
+        let kept = lib.music_in_progress_bytes();
+        assert!(kept > 0, "the cancelled download's part is not counted");
+        let used = lib.offline_summary().unwrap().used_bytes;
+        // Room for a video beside the finished tracks only, not the part.
+        let video = 1 << 20;
+        let cap = used + video + 1;
+        assert!(
+            !video_fits(lib, cap, video),
+            "admitted over a kept part of {kept}"
+        );
+    }
+
     #[test]
     fn restored_pins_wait_for_the_first_network_report() {
         let dir = std::env::temp_dir().join(format!("pharos-lib-pins-{}", std::process::id()));

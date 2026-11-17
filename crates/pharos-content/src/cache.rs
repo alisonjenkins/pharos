@@ -908,12 +908,12 @@ impl Cache {
     }
 
     fn reserve(&self, id: &str, bytes: u64) {
-        // A zero stays listed: the id is still in flight, and the bytes
-        // its `.part` holds are counted against the cap until it lands.
-        self.reserved
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.to_owned(), bytes);
+        let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes == 0 {
+            r.remove(id);
+        } else {
+            r.insert(id.to_owned(), bytes);
+        }
     }
 
     /// Drops what was reserved for `id`: its write landed, failed or was
@@ -940,22 +940,24 @@ impl Cache {
             .fold(0, |a, b| a.saturating_add(*b))
     }
 
-    /// Bytes the in-flight downloads have written to their `.part` files.
-    /// `used_bytes` skips these and `reserved_bytes` only counts what is yet
-    /// to come, so a host's cap check adds this to both: together they are
-    /// the whole claim of each download. Free space already lacks these
-    /// bytes, so the free-space check never adds them. Read the reservation
-    /// first (under the admission lock), then this.
+    /// Bytes in every `.part` file in the cache folder, reserved or not. A
+    /// host's cap check adds this to `used_bytes` (finished tracks) and
+    /// `reserved_bytes` (what running downloads have yet to write): together
+    /// they are every byte the music cache holds or has claimed. A download
+    /// that was cancelled or yielded keeps its `.part` to resume from but
+    /// drops its reservation, so this reads the folder, not the reserved ids.
+    /// Free space already lacks these bytes, so the free-space check never
+    /// adds them. Eviction never touches a `.part` (it trims finished tracks
+    /// only), so an active download's file is safe; a `.part` no job holds is
+    /// counted until its download resumes or the next `open` removes it.
+    /// Read the reservation first (under the admission lock), then this.
     pub fn in_progress_bytes(&self) -> u64 {
-        let ids: Vec<String> = self
-            .reserved
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect();
-        ids.iter()
-            .filter_map(|id| std::fs::metadata(self.part_path(id)).ok())
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        rd.filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+            .filter_map(|e| e.metadata().ok())
             .fold(0, |a, m| a.saturating_add(m.len()))
     }
 
@@ -1224,7 +1226,8 @@ mod tests {
 
     /// A host's cap needs the whole claim of an in-flight download: what its
     /// `.part` holds (which `used_bytes` skips) plus the reservation, which
-    /// a refresh lowers to what is left. Free space needs only the second.
+    /// a refresh lowers to what is left. Free space needs only the second. A
+    /// `.part` nothing reserves any more (a cancelled job's) still counts.
     #[test]
     fn an_in_flight_download_claims_its_written_and_its_remaining_bytes() {
         let d = tmp("in-progress");
@@ -1248,15 +1251,26 @@ mod tests {
         assert!(c.ensure_free("track/x", 0).is_ok());
         assert_eq!(c.reserved_bytes(), 0);
         assert_eq!(c.in_progress_bytes(), 100, "dropped at the last refresh");
+        // A cancelled job drops its reservation and keeps its part.
+        c.release_reservation("track/x");
+        assert_eq!(c.reserved_bytes(), 0);
+        assert_eq!(
+            c.in_progress_bytes(),
+            100,
+            "a part nothing reserves must still count"
+        );
+        assert!(c.ensure_free("track/x", 0).is_ok());
         // Landing moves it to the finished bytes, once.
         c.commit("track/x", Some(100)).unwrap();
         assert_eq!(c.in_progress_bytes(), 0);
         assert_eq!(c.used_bytes(), 100);
-        // A job that ends without landing claims nothing.
+        // A job that ends keeps its part, which counts until it is discarded.
         std::fs::write(c.part_path("track/y"), vec![0u8; 30]).unwrap();
         assert!(c.ensure_free("track/y", 5).is_ok());
         assert_eq!(c.in_progress_bytes(), 30);
         c.release_reservation("track/y");
+        assert_eq!(c.in_progress_bytes(), 30);
+        c.discard_part("track/y");
         assert_eq!(c.in_progress_bytes(), 0);
     }
 
