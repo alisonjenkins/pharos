@@ -38,6 +38,12 @@ const INDEX_VERSION: u32 = 1;
 const AUDIO_EXT: &str = ".audio";
 const PART_EXT: &str = ".audio.part";
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the part scan fail: 1 the folder, 2 an entry, 3 a length.
+    static PART_SCAN_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
@@ -836,7 +842,14 @@ impl Cache {
             // Parts count against the cap (a cancelled download keeps its
             // one) but are never victims: only finished tracks are evicted,
             // so an active download's file is safe.
-            let parts = self.in_progress_bytes();
+            // An incomplete scan counts what it did read, a lower bound: the
+            // cache trims for at least that much and never deletes on a guess.
+            let (parts, parts_whole) = self.scan_parts();
+            if !parts_whole {
+                log::warn!(
+                    "cache trim with parts unknown parts_known={parts} reason=part_scan_incomplete"
+                );
+            }
             let used = music.saturating_add(outside).saturating_add(parts);
             if used <= self.cap() {
                 break;
@@ -955,14 +968,65 @@ impl Cache {
     /// only), so an active download's file is safe; a `.part` no job holds is
     /// counted until its download resumes or the next `open` removes it.
     /// Read the reservation first (under the admission lock), then this.
-    pub fn in_progress_bytes(&self) -> u64 {
-        let Ok(rd) = std::fs::read_dir(&self.dir) else {
-            return 0;
+    /// None when the folder could not be read whole: the host refuses new
+    /// downloads until a scan succeeds, never counts it as 0.
+    pub fn in_progress_bytes(&self) -> Option<u64> {
+        let (bytes, whole) = self.scan_parts();
+        whole.then_some(bytes)
+    }
+
+    /// The `.part` bytes read and whether every entry was read: a scan that
+    /// fails, or an entry or a length that cannot be read, is not a 0. A
+    /// file that vanished mid-scan (renamed by a commit) is nothing to read.
+    fn scan_parts(&self) -> (u64, bool) {
+        #[cfg(test)]
+        if PART_SCAN_FAULT.with(std::cell::Cell::get) == 1 {
+            return (0, false);
+        }
+        let read = match std::fs::read_dir(&self.dir) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, true),
+            Err(e) => {
+                log::warn!("cache part scan failed dir={}: {e}", self.dir.display());
+                return (0, false);
+            }
         };
-        rd.filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
-            .filter_map(|e| e.metadata().ok())
-            .fold(0, |a, m| a.saturating_add(m.len()))
+        let (mut total, mut whole) = (0u64, true);
+        for entry in read {
+            #[cfg(test)]
+            let entry = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                entry
+            };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("cache part scan entry unreadable: {e}");
+                    whole = false;
+                    continue;
+                }
+            };
+            if !entry.file_name().to_string_lossy().ends_with(PART_EXT) {
+                continue;
+            }
+            let meta = entry.metadata();
+            #[cfg(test)]
+            let meta = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                meta
+            };
+            match meta {
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::warn!("cache part length unreadable {:?}: {e}", entry.file_name());
+                    whole = false;
+                }
+            }
+        }
+        (total, whole)
     }
 
     fn check_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
@@ -1236,17 +1300,17 @@ mod tests {
     fn an_in_flight_download_claims_its_written_and_its_remaining_bytes() {
         let d = tmp("in-progress");
         let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
-        assert_eq!(c.in_progress_bytes(), 0);
+        assert_eq!(c.in_progress_bytes(), Some(0));
         assert!(c.ensure_free("track/x", 100).is_ok());
-        assert_eq!(c.in_progress_bytes(), 0, "nothing written yet");
+        assert_eq!(c.in_progress_bytes(), Some(0), "nothing written yet");
         // 60 bytes land, then the refresh reserves what is left.
         std::fs::write(c.part_path("track/x"), vec![0u8; 60]).unwrap();
         assert!(c.ensure_free("track/x", 40).is_ok());
         assert_eq!(c.reserved_bytes(), 40, "free space needs the rest only");
-        assert_eq!(c.in_progress_bytes(), 60);
+        assert_eq!(c.in_progress_bytes(), Some(60));
         assert_eq!(c.used_bytes(), 0, "a part is not a finished track");
         assert_eq!(
-            c.reserved_bytes() + c.in_progress_bytes() + c.used_bytes(),
+            c.reserved_bytes() + c.in_progress_bytes().unwrap() + c.used_bytes(),
             100,
             "the claim is the whole track, counted once"
         );
@@ -1254,28 +1318,67 @@ mod tests {
         std::fs::write(c.part_path("track/x"), vec![0u8; 100]).unwrap();
         assert!(c.ensure_free("track/x", 0).is_ok());
         assert_eq!(c.reserved_bytes(), 0);
-        assert_eq!(c.in_progress_bytes(), 100, "dropped at the last refresh");
+        assert_eq!(
+            c.in_progress_bytes(),
+            Some(100),
+            "dropped at the last refresh"
+        );
         // A cancelled job drops its reservation and keeps its part.
         c.release_reservation("track/x");
         assert_eq!(c.reserved_bytes(), 0);
         assert_eq!(
             c.in_progress_bytes(),
-            100,
+            Some(100),
             "a part nothing reserves must still count"
         );
         assert!(c.ensure_free("track/x", 0).is_ok());
         // Landing moves it to the finished bytes, once.
         c.commit("track/x", Some(100)).unwrap();
-        assert_eq!(c.in_progress_bytes(), 0);
+        assert_eq!(c.in_progress_bytes(), Some(0));
         assert_eq!(c.used_bytes(), 100);
         // A job that ends keeps its part, which counts until it is discarded.
         std::fs::write(c.part_path("track/y"), vec![0u8; 30]).unwrap();
         assert!(c.ensure_free("track/y", 5).is_ok());
-        assert_eq!(c.in_progress_bytes(), 30);
+        assert_eq!(c.in_progress_bytes(), Some(30));
         c.release_reservation("track/y");
-        assert_eq!(c.in_progress_bytes(), 30);
+        assert_eq!(c.in_progress_bytes(), Some(30));
         c.discard_part("track/y");
-        assert_eq!(c.in_progress_bytes(), 0);
+        assert_eq!(c.in_progress_bytes(), Some(0));
+    }
+
+    /// A part scan that fails, or whose entry or length cannot be read, is
+    /// unknown, never 0; once it can be read, the figure is back.
+    #[test]
+    fn a_part_scan_that_cannot_read_everything_is_unknown_not_zero() {
+        let d = tmp("part-scan");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 40]).unwrap();
+        assert_eq!(c.in_progress_bytes(), Some(40));
+        for (fault, what) in [(1, "folder"), (2, "entry"), (3, "length")] {
+            PART_SCAN_FAULT.with(|f| f.set(fault));
+            let figure = c.in_progress_bytes();
+            PART_SCAN_FAULT.with(|f| f.set(0));
+            assert_eq!(figure, None, "a failed {what} read as a figure");
+        }
+        assert_eq!(c.in_progress_bytes(), Some(40));
+    }
+
+    /// Trimming with the part scan unknown does not guess a figure and never
+    /// deletes a part.
+    #[test]
+    fn eviction_with_an_unknown_part_scan_deletes_no_part() {
+        let d = tmp("evict-part-unknown");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 400]).unwrap();
+        c.commit("track/a", Some(400)).unwrap();
+        std::fs::write(c.part_path("track/y"), vec![0u8; 500]).unwrap();
+        std::fs::write(c.part_path("track/b"), vec![0u8; 300]).unwrap();
+        PART_SCAN_FAULT.with(|f| f.set(3));
+        let evicted = c.commit("track/b", Some(300)).unwrap();
+        PART_SCAN_FAULT.with(|f| f.set(0));
+        assert!(evicted.is_empty(), "evicted on a figure it did not have");
+        assert!(c.part_path("track/y").exists());
+        assert_eq!(c.in_progress_bytes(), Some(500));
     }
 
     /// A cancelled download's kept `.part` counts against the cap when the
@@ -1297,7 +1400,7 @@ mod tests {
             "an active part was deleted"
         );
         assert!(c.is_complete("track/b"));
-        assert_eq!(c.in_progress_bytes(), 500);
+        assert_eq!(c.in_progress_bytes(), Some(500));
     }
 
     /// What `ensure_free` approves is reserved until the write lands or the

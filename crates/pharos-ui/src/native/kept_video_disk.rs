@@ -107,9 +107,11 @@ pub trait Budget: Send + Sync {
     /// What the other kinds' running downloads have already written: in the
     /// cap with `other_used_bytes` and `other_outstanding_bytes`, never in
     /// the free-space figure (the disk already lacks them). Read after
-    /// `other_outstanding_bytes`. None by default.
-    fn other_in_progress_bytes(&self) -> u64 {
-        0
+    /// `other_outstanding_bytes`. None when they could not all be read: a
+    /// new download is refused (`reason=music_size_unknown`) until they can.
+    /// Some(0) by default.
+    fn other_in_progress_bytes(&self) -> Option<u64> {
+        Some(0)
     }
 }
 
@@ -309,7 +311,14 @@ enum Check {
     /// `ready` (whether the accounting was up before they were read: it
     /// never goes down once up, so a figure read after a true `ready` is a
     /// real one).
-    Fresh { other: u64, cap: u64, ready: bool },
+    /// `unknown`: the other kinds' unfinished downloads could not be
+    /// measured, so the figure in `other` is a lower bound.
+    Fresh {
+        other: u64,
+        cap: u64,
+        ready: bool,
+        unknown: bool,
+    },
     /// A resumed one.
     Resume,
 }
@@ -1013,6 +1022,20 @@ impl Inner {
                     0,
                     free,
                 )),
+                Check::Fresh { unknown: true, .. } => {
+                    emit(
+                        true,
+                        format!("pharos: video keep refused item={item} reason=music_size_unknown"),
+                    );
+                    Err((
+                        KeepVideoRefusal::Host(
+                            "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
+                                .to_owned(),
+                        ),
+                        0,
+                        free,
+                    ))
+                }
                 Check::Fresh { other, cap, .. } => {
                     let used = st.reserved_by_others(user, item).saturating_add(other);
                     fits(
@@ -1865,6 +1888,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             // between leaves the check refusing, never passing on the
             // default cap and no music.
             let ready = inner.env.budget.accounting_ready();
+            let progress = inner.env.budget.other_in_progress_bytes();
             Check::Fresh {
                 // What music holds, and what it has approved and not yet
                 // written: both are part of the shared cap.
@@ -1873,9 +1897,10 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     .budget
                     .other_used_bytes()
                     .saturating_add(inner.env.budget.other_outstanding_bytes())
-                    .saturating_add(inner.env.budget.other_in_progress_bytes()),
+                    .saturating_add(progress.unwrap_or(0)),
                 cap: inner.env.budget.cap_bytes(),
                 ready,
+                unknown: progress.is_none(),
             }
         };
         (check, inner.admit(user, item, run, &plan, check))
@@ -2623,11 +2648,12 @@ impl VideoStore for DiskVideoStore {
             let _admission = budget.admission_guard();
             // Readiness first, then the figures (see `Check::Fresh`).
             let ready = budget.accounting_ready();
+            let progress = budget.other_in_progress_bytes();
             let (other, cap) = (
                 budget
                     .other_used_bytes()
                     .saturating_add(budget.other_outstanding_bytes())
-                    .saturating_add(budget.other_in_progress_bytes()),
+                    .saturating_add(progress.unwrap_or(0)),
                 budget.cap_bytes(),
             );
             let mut st = lock(&self.inner.state);
@@ -2647,6 +2673,22 @@ impl VideoStore for DiskVideoStore {
                     } else {
                         Err(KeepVideoRefusal::Host(
                             "the music cache is not up yet, so the shared cap cannot be checked"
+                                .to_owned(),
+                        ))
+                    }
+                })
+                .and_then(|()| {
+                    if progress.is_some() {
+                        Ok(())
+                    } else {
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video keep refused item={item} reason=music_size_unknown"
+                            ),
+                        );
+                        Err(KeepVideoRefusal::Host(
+                            "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
                                 .to_owned(),
                         ))
                     }
@@ -3641,6 +3683,8 @@ mod tests {
         outstanding: AtomicU64,
         /// Written to in-flight `.part` files: in the cap, not in free space.
         in_progress: AtomicU64,
+        /// Set when the music cache could not read its parts.
+        in_progress_unknown: AtomicBool,
         used: AtomicU64,
     }
 
@@ -3657,8 +3701,9 @@ mod tests {
         fn outstanding_bytes(&self) -> u64 {
             self.outstanding.load(Ordering::SeqCst)
         }
-        fn in_progress_bytes(&self) -> u64 {
-            self.in_progress.load(Ordering::SeqCst)
+        fn in_progress_bytes(&self) -> Option<u64> {
+            (!self.in_progress_unknown.load(Ordering::SeqCst))
+                .then(|| self.in_progress.load(Ordering::SeqCst))
         }
     }
 
@@ -3682,7 +3727,7 @@ mod tests {
         fn other_outstanding_bytes(&self) -> u64 {
             crate::native::ports::music_outstanding(Some(&*self.music))
         }
-        fn other_in_progress_bytes(&self) -> u64 {
+        fn other_in_progress_bytes(&self) -> Option<u64> {
             crate::native::ports::music_in_progress(Some(&*self.music))
         }
         fn free_bytes(&self) -> u64 {
@@ -3707,6 +3752,7 @@ mod tests {
         let music = Arc::new(FakeMusic {
             outstanding: AtomicU64::new(8 * 1024 * 1024),
             in_progress: AtomicU64::new(0),
+            in_progress_unknown: AtomicBool::new(false),
             used: AtomicU64::new(0),
         });
         let store = rig.open_with(Arc::new(MusicBudget {
@@ -3767,6 +3813,7 @@ mod tests {
         let music = Arc::new(FakeMusic {
             outstanding: AtomicU64::new(500_000),
             in_progress: AtomicU64::new(600_000),
+            in_progress_unknown: AtomicBool::new(false),
             used: AtomicU64::new(100 * GIB - 4_000_000),
         });
         let store = rig.open_with(Arc::new(MusicBudget {
@@ -3786,6 +3833,34 @@ mod tests {
         music.in_progress.store(0, Ordering::SeqCst);
         music.outstanding.store(0, Ordering::SeqCst);
         music.used.store(100 * GIB - 3_300_000, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// Music's unfinished downloads that could not be measured are unknown,
+    /// not 0: a new video is refused with the reason in the message and the
+    /// log, admitted once they can be read.
+    #[tokio::test]
+    async fn a_video_is_refused_while_the_music_parts_cannot_be_measured() {
+        let rig = Rig::new("music-parts-unknown");
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(0),
+            in_progress: AtomicU64::new(0),
+            in_progress_unknown: AtomicBool::new(true),
+            used: AtomicU64::new(0),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("admitted with the music parts unmeasured");
+        };
+        assert!(why.contains("reason=music_size_unknown"), "{why}");
+        assert!(!lines("pharos: video keep refused item=1 reason=music_size_unknown").is_empty());
+        assert!(store.videos("u1").is_empty());
+        music.in_progress_unknown.store(false, Ordering::SeqCst);
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready(), "{:?}", only(&store).state);

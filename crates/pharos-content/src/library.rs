@@ -643,11 +643,12 @@ impl Library {
     /// Bytes music's in-flight downloads have written to `.part` files:
     /// part of the cap, not of the free-space check (free space already
     /// lacks them). Read after [`music_outstanding_bytes`], under
-    /// [`admission_guard`]; 0 with no cache.
-    pub fn music_in_progress_bytes(&self) -> u64 {
+    /// [`admission_guard`]; 0 with no cache, None when the parts could not
+    /// all be read (a host refuses new downloads until they can).
+    pub fn music_in_progress_bytes(&self) -> Option<u64> {
         self.offline
             .get()
-            .map_or(0, |o| o.cache.in_progress_bytes())
+            .map_or(Some(0), |o| o.cache.in_progress_bytes())
     }
 
     /// Whether the music cache is enabled: it is what the cap, the free
@@ -1944,7 +1945,7 @@ mod tests {
         let used = lib.offline_summary().map_or(0, |s| s.used_bytes);
         let claimed = used
             .saturating_add(lib.music_outstanding_bytes())
-            .saturating_add(lib.music_in_progress_bytes());
+            .saturating_add(lib.music_in_progress_bytes().unwrap_or(u64::MAX));
         claimed.saturating_add(video) <= cap
     }
 
@@ -1970,7 +1971,7 @@ mod tests {
             let r = lib.music_outstanding_bytes();
             r > 0 && r <= total - FREE_CHECK_BYTES
         });
-        let written = lib.music_in_progress_bytes();
+        let written = lib.music_in_progress_bytes().unwrap();
         assert!(
             written >= FREE_CHECK_BYTES,
             "written bytes not counted: {written}"
@@ -1991,7 +1992,7 @@ mod tests {
         let o = lib.offline.get().unwrap();
         assert!(o.downloader.wait_idle(Duration::from_secs(20)));
         // Landed: the bytes are the finished track's, once.
-        assert_eq!(lib.music_in_progress_bytes(), 0);
+        assert_eq!(lib.music_in_progress_bytes(), Some(0));
         assert_eq!(lib.offline_summary().unwrap().used_bytes, total);
     }
 
@@ -2011,7 +2012,7 @@ mod tests {
         let lib = &rig.lib;
         lib.prefetch(&["track/1".to_owned()]);
         wait_until("the server holding", || reached.load(Ordering::SeqCst));
-        wait_until("bytes written", || lib.music_in_progress_bytes() > 0);
+        wait_until("bytes written", || lib.music_in_progress_bytes() > Some(0));
         // Another wish replaces it: track/1 is cancelled at its next chunk.
         lib.prefetch(&["track/2".to_owned()]);
         release.store(true, Ordering::SeqCst);
@@ -2022,7 +2023,7 @@ mod tests {
             0,
             "a reservation outlived its job"
         );
-        let kept = lib.music_in_progress_bytes();
+        let kept = lib.music_in_progress_bytes().unwrap();
         assert!(kept > 0, "the cancelled download's part is not counted");
         let used = lib.offline_summary().unwrap().used_bytes;
         // Room for a video beside the finished tracks only, not the part.

@@ -260,7 +260,7 @@ impl Budget for PhoneBudget {
         pharos_ui::native::ports::music_outstanding(music())
     }
 
-    fn other_in_progress_bytes(&self) -> u64 {
+    fn other_in_progress_bytes(&self) -> Option<u64> {
         pharos_ui::native::ports::music_in_progress(music())
     }
 

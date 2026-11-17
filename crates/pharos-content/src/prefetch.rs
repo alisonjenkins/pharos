@@ -1565,7 +1565,10 @@ mod tests {
             Box::new(move |_| {
                 if let Some(c) = slot2.lock().unwrap().as_ref() {
                     let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
-                    seen2.lock().unwrap().push((on_disk, c.in_progress_bytes()));
+                    seen2
+                        .lock()
+                        .unwrap()
+                        .push((on_disk, c.in_progress_bytes().unwrap_or(u64::MAX)));
                 }
                 Ok(u64::MAX)
             }),
@@ -1581,7 +1584,7 @@ mod tests {
         for (on_disk, figure) in &seen {
             assert_eq!(figure, on_disk, "{seen:?}");
         }
-        assert_eq!(r.cache.in_progress_bytes(), 0, "kept after it landed");
+        assert_eq!(r.cache.in_progress_bytes(), Some(0), "kept after it landed");
     }
 
     #[test]
