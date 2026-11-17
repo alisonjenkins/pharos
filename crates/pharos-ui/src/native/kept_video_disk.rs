@@ -1008,8 +1008,44 @@ impl Inner {
             std::fs::create_dir_all(&dir)?;
             let text = serde_json::to_vec(&video).map_err(std::io::Error::other)?;
             let tmp = dir.join("manifest.json.part");
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, dir.join("manifest.json"))
+            // A Ready record is made durable in order: its contents, the
+            // rename, then the folder, all before Ready is published. Other
+            // records are progress a reopen can redo, and pay no sync.
+            let durable = video.ready();
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&text)?;
+                if durable {
+                    #[cfg(test)]
+                    tests::sync_step("manifest file".to_owned());
+                    file.sync_all().map_err(|e| {
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video keep sync failed item={} what=manifest error={e}",
+                                video.item
+                            ),
+                        );
+                        e
+                    })?;
+                }
+            }
+            std::fs::rename(&tmp, dir.join("manifest.json"))?;
+            if durable {
+                #[cfg(test)]
+                tests::sync_step("rename manifest".to_owned());
+                if let Err(e) = sync_dir(&dir) {
+                    emit(
+                        true,
+                        format!(
+                            "pharos: video keep sync failed item={} what=item_dir error={e}",
+                            video.item
+                        ),
+                    );
+                }
+            }
+            Ok(())
         })();
         if let Err(e) = &result {
             emit(
@@ -1654,6 +1690,32 @@ async fn flush_chunk(file: &mut tokio::fs::File, item: &str, part: &Path) -> std
     Ok(())
 }
 
+/// Makes `dir`'s entries (a rename into it) durable. A rename is atomic,
+/// not durable: until its folder is synced a power loss can undo it.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::sync_step(format!(
+        "dir {}",
+        dir.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    ));
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// The final name of a stored file, for the logs and the test's record.
+fn shown_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
 /// One attempt: the body into `<path>.part`, then renamed into place.
 ///
 /// The body is staged in a file named for `run` (`<name>.<run>.part`), so
@@ -1768,6 +1830,23 @@ async fn fetch_once(
         }
     }
     file.flush().await.map_err(|e| store_err("write", e))?;
+    // Its contents are durable before it is promoted: a file under its
+    // final name is taken as whole at a reopen, and `flush` alone leaves the
+    // bytes in the page cache.
+    #[cfg(test)]
+    tests::sync_step(format!("file {}", shown_name(path)));
+    if let Err(e) = file.sync_all().await {
+        drop(file);
+        inner.remove_staging(&part);
+        emit(
+            true,
+            format!(
+                "pharos: video keep sync failed item={item} what=file name={} error={e}",
+                shown_name(path)
+            ),
+        );
+        return Err(store_err("sync", e));
+    }
     drop(file);
     let promoted = {
         let st = lock(&inner.state);
@@ -1775,6 +1854,8 @@ async fn fetch_once(
             && find(&st.list, user, item)
                 .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }));
         if owns {
+            #[cfg(test)]
+            tests::sync_step(format!("rename {}", shown_name(path)));
             Some(std::fs::rename(&part, path))
         } else {
             None
@@ -2676,6 +2757,16 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 );
             }
             cleaned = Some(clean);
+            // The stored files' names are durable before the record that
+            // names them Ready: one folder sync for the whole download, not
+            // one per file. A failure is logged; a reopen that finds a file
+            // gone fetches it again.
+            if let Err(e) = sync_dir(&dir.join("files")) {
+                emit(
+                    true,
+                    format!("pharos: video keep sync failed item={item} what=files_dir error={e}"),
+                );
+            }
             let saved = inner.update_run_saved(&user, &item, run, |v| {
                 // A skipped file is not on disk: left in the record, a
                 // reopen would count it missing and resume the copy.
@@ -2687,12 +2778,16 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 v.estimated_bytes = figure(v, completed);
             });
             match saved {
-                Ok(true) => emit(
-                    false,
-                    format!(
-                        "pharos: video keep ready item={item} bytes={bytes} files={files} ms={ms}"
-                    ),
-                ),
+                Ok(true) => {
+                    #[cfg(test)]
+                    tests::sync_step("ready".to_owned());
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep ready item={item} bytes={bytes} files={files} ms={ms}"
+                        ),
+                    );
+                }
                 Ok(false) => superseded("superseded"),
                 Err(e) => {
                     // Ready that is not on disk would resume at the next
@@ -3914,6 +4009,20 @@ mod tests {
             return Err(std::io::Error::other("disk full"));
         }
         Ok(())
+    }
+
+    thread_local! {
+        /// While `Some`, every sync, rename and the Ready publication, in
+        /// the order they happen.
+        static SYNC_STEPS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn sync_step(step: String) {
+        SYNC_STEPS.with(|s| {
+            if let Some(steps) = s.borrow_mut().as_mut() {
+                steps.push(step);
+            }
+        });
     }
 
     pub(super) async fn hold_write(item: &str) {
@@ -8889,6 +8998,49 @@ mod tests {
                 assert!(unknown, "the stuck staging file was uncounted at Ready");
             }
         }
+    }
+
+    /// A download is durable before it is Ready: each file's contents are
+    /// synced before its rename, the files' folder once after the last
+    /// rename, and the Ready record's contents, its rename and its folder,
+    /// in that order, before Ready is published.
+    #[tokio::test]
+    async fn a_ready_download_is_synced_in_order_before_it_is_published() {
+        let rig = Rig::new("sync-order");
+        let store = rig.open();
+        SYNC_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let steps = SYNC_STEPS
+            .with(|s| s.borrow_mut().take())
+            .unwrap_or_default();
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let at = |step: &str| {
+            steps
+                .iter()
+                .position(|s| s == step)
+                .unwrap_or_else(|| panic!("no step {step:?} in {steps:?}"))
+        };
+        let mut last_rename = 0;
+        for key in [MASTER_KEY, MEDIA_KEY, INIT, SEG0, SEG1] {
+            let name = file_name(key);
+            let rename = at(&format!("rename {name}"));
+            assert!(
+                at(&format!("file {name}")) < rename,
+                "{key} renamed before its contents were synced: {steps:?}"
+            );
+            last_rename = last_rename.max(rename);
+        }
+        let files_dir = at("dir files");
+        let order = [
+            files_dir,
+            at("manifest file"),
+            at("rename manifest"),
+            at("dir 1"),
+            at("ready"),
+        ];
+        assert!(last_rename < files_dir, "{steps:?}");
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
     }
 
     #[tokio::test]
