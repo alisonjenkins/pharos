@@ -1782,22 +1782,43 @@ fn remove_part(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-/// Deletes the staging files `run` left in `dir/files` (every run's, with
-/// `None`); false when one would not go, or the folder could not be read.
-fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
+/// The staging files ending in `suffix` in `dir/files`, and whether the
+/// listing was complete: false when the folder or an entry could not be
+/// read (anything but the folder being gone).
+fn part_paths(dir: &Path, suffix: &str) -> (Vec<PathBuf>, bool) {
     let read = match std::fs::read_dir(dir.join("files")) {
         Ok(read) => read,
-        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+        Err(e) => return (Vec::new(), e.kind() == std::io::ErrorKind::NotFound),
     };
-    let suffix = run.map_or_else(|| ".part".to_owned(), |r| format!(".{r}.part"));
     let mut clean = true;
-    for entry in read.filter_map(Result::ok) {
-        if entry.file_name().to_string_lossy().ends_with(&suffix) {
-            match remove_part(&entry.path()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => clean = false,
+    let mut paths = Vec::new();
+    for entry in read {
+        #[cfg(test)]
+        let entry = tests::entry_read(entry);
+        match entry {
+            Ok(entry) => {
+                if entry.file_name().to_string_lossy().ends_with(suffix) {
+                    paths.push(entry.path());
+                }
             }
+            // An entry that cannot be read may be a staging file.
+            Err(_) => clean = false,
+        }
+    }
+    (paths, clean)
+}
+
+/// Deletes the staging files `run` left in `dir/files` (every run's, with
+/// `None`); false when one would not go, or the folder or an entry in it
+/// could not be read.
+fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
+    let suffix = run.map_or_else(|| ".part".to_owned(), |r| format!(".{r}.part"));
+    let (paths, mut clean) = part_paths(dir, &suffix);
+    for path in paths {
+        match remove_part(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
         }
     }
     clean
@@ -2367,6 +2388,22 @@ mod tests {
                 f();
             }
         });
+    }
+
+    thread_local! {
+        /// While set, reading a directory entry fails after the directory
+        /// opened.
+        pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// An entry as read from a listing; a test can make the read fail.
+    pub(super) fn entry_read(
+        entry: std::io::Result<std::fs::DirEntry>,
+    ) -> std::io::Result<std::fs::DirEntry> {
+        if FAIL_ENTRY_READ.with(std::cell::Cell::get) {
+            return Err(std::io::Error::other("entry unreadable"));
+        }
+        entry
     }
 
     pub(super) fn after_removal_unmarked() {
@@ -4604,6 +4641,20 @@ mod tests {
         );
         // (The file itself is deleted at the next open, which clears staging
         // files; the figure keeps what it held.)
+    }
+
+    /// A directory entry that cannot be read may be a staging file: the
+    /// clean-up is not clean.
+    #[test]
+    fn an_unreadable_entry_makes_the_clean_up_not_clean() {
+        let dir = std::env::temp_dir().join(format!("kvd-entry-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        let clean = drop_parts_of(&dir, None);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!clean, "an entry read error counted as clean");
     }
 
     /// A same-item retry takes over a folder that would not delete: the
