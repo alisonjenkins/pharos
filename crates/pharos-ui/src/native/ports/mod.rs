@@ -526,6 +526,44 @@ mod tests {
         assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// The registration run twice on one claim, as the init hook and the
+    /// first render do: the first (here, with no folder) installs the hook
+    /// once and opens nothing; the second does nothing at all.
+    #[test]
+    fn a_second_registration_on_one_claim_changes_nothing() {
+        use std::cell::Cell;
+        let root =
+            std::env::temp_dir().join(format!("pharos-register-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(std::fs::write(&root, b"a file where the folder should be").is_ok());
+        let once = OpenOnce::new();
+        let (hooks, registers) = (Cell::new(0), Cell::new(0));
+        let run = || {
+            register_video_root(
+                &root,
+                &once,
+                || hooks.set(hooks.get() + 1),
+                || {
+                    registers.set(registers.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        assert!(matches!(run(), Registration::NoFolder(_)));
+        assert_eq!(
+            (hooks.get(), registers.get()),
+            (1, 0),
+            "hook once, no store"
+        );
+        assert_eq!(run(), Registration::AlreadyOpened);
+        assert_eq!(
+            (hooks.get(), registers.get()),
+            (1, 0),
+            "the second call touched the hook or the store"
+        );
+        let _ = std::fs::remove_file(&root);
+    }
+
     #[test]
     fn a_hook_with_no_notifier_is_dropped_not_run_on_the_caller() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
