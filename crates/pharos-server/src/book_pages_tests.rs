@@ -286,3 +286,17 @@ fn a_decision_is_counted_under_its_label() {
     assert_eq!(count("failed"), 2);
     assert_eq!(count("cache_hit"), 0);
 }
+
+#[test]
+fn the_drawing_is_published_in_the_blocking_task_only_if_the_source_held_still() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("book.pdf");
+    let (tmp, copy) = (dir.path().join("book.tmp"), dir.path().join("book.cbz"));
+    std::fs::write(&src, pdf(&[(612, 792, false)])).unwrap();
+    let e = draw_and_publish(&src, &tmp, &copy, DEFAULT_REQUEST, |_| false).unwrap_err();
+    assert!(matches!(e, PagesError::Changed), "{e}");
+    assert!(!copy.exists());
+    let stats = draw_and_publish(&src, &tmp, &copy, DEFAULT_REQUEST, |_| true).unwrap();
+    assert_eq!(stats.pages, 1);
+    assert!(copy.exists() && !tmp.exists());
+}
