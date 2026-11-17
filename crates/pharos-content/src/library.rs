@@ -640,6 +640,16 @@ impl Library {
         self.offline.get().map_or(0, |o| o.cache.reserved_bytes())
     }
 
+    /// Bytes music's in-flight downloads have written to `.part` files:
+    /// part of the cap, not of the free-space check (free space already
+    /// lacks them). Read after [`music_outstanding_bytes`], under
+    /// [`admission_guard`]; 0 with no cache.
+    pub fn music_in_progress_bytes(&self) -> u64 {
+        self.offline
+            .get()
+            .map_or(0, |o| o.cache.in_progress_bytes())
+    }
+
     /// Whether the music cache is enabled: it is what the cap, the free
     /// space guard and the music's bytes are read from.
     pub fn cache_enabled(&self) -> bool {

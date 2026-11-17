@@ -621,10 +621,12 @@ impl Cache {
             .and_then(|f| f.sync_all())
             .map_err(|e| err("sync part", &part, e))?;
         let fin = self.final_path(id);
-        std::fs::rename(&part, &fin).map_err(|e| err("rename part", &fin, e))?;
-        // The track joins the shared cap and the cache trims to it as one
-        // step against a host's admission, which reads these bytes.
+        // The `.part` leaves the in-progress figure and the track joins the
+        // shared cap as one step against a host's admission, which reads
+        // both: taken before the rename, so no admission sees the track in
+        // neither.
         let _admission = admission_guard();
+        std::fs::rename(&part, &fin).map_err(|e| err("rename part", &fin, e))?;
         // The bytes are in the entry from here: no longer to come.
         self.unreserve(id);
         let mut s = self.lock();
@@ -906,12 +908,12 @@ impl Cache {
     }
 
     fn reserve(&self, id: &str, bytes: u64) {
-        let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
-        if bytes == 0 {
-            r.remove(id);
-        } else {
-            r.insert(id.to_owned(), bytes);
-        }
+        // A zero stays listed: the id is still in flight, and the bytes
+        // its `.part` holds are counted against the cap until it lands.
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned(), bytes);
     }
 
     /// Drops what was reserved for `id`: its write landed, failed or was
@@ -936,6 +938,25 @@ impl Cache {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .fold(0, |a, b| a.saturating_add(*b))
+    }
+
+    /// Bytes the in-flight downloads have written to their `.part` files.
+    /// `used_bytes` skips these and `reserved_bytes` only counts what is yet
+    /// to come, so a host's cap check adds this to both: together they are
+    /// the whole claim of each download. Free space already lacks these
+    /// bytes, so the free-space check never adds them. Read the reservation
+    /// first (under the admission lock), then this.
+    pub fn in_progress_bytes(&self) -> u64 {
+        let ids: Vec<String> = self
+            .reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        ids.iter()
+            .filter_map(|id| std::fs::metadata(self.part_path(id)).ok())
+            .fold(0, |a, m| a.saturating_add(m.len()))
     }
 
     fn check_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
@@ -1199,6 +1220,44 @@ mod tests {
                 .any(|l| l == "cache cap bytes=150 source=set tracks=1 used=100 evicted=1"),
             "{lines:?}"
         );
+    }
+
+    /// A host's cap needs the whole claim of an in-flight download: what its
+    /// `.part` holds (which `used_bytes` skips) plus the reservation, which
+    /// a refresh lowers to what is left. Free space needs only the second.
+    #[test]
+    fn an_in_flight_download_claims_its_written_and_its_remaining_bytes() {
+        let d = tmp("in-progress");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert_eq!(c.in_progress_bytes(), 0);
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        assert_eq!(c.in_progress_bytes(), 0, "nothing written yet");
+        // 60 bytes land, then the refresh reserves what is left.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 60]).unwrap();
+        assert!(c.ensure_free("track/x", 40).is_ok());
+        assert_eq!(c.reserved_bytes(), 40, "free space needs the rest only");
+        assert_eq!(c.in_progress_bytes(), 60);
+        assert_eq!(c.used_bytes(), 0, "a part is not a finished track");
+        assert_eq!(
+            c.reserved_bytes() + c.in_progress_bytes() + c.used_bytes(),
+            100,
+            "the claim is the whole track, counted once"
+        );
+        // All of it written, nothing left to reserve: still claimed.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 100]).unwrap();
+        assert!(c.ensure_free("track/x", 0).is_ok());
+        assert_eq!(c.reserved_bytes(), 0);
+        assert_eq!(c.in_progress_bytes(), 100, "dropped at the last refresh");
+        // Landing moves it to the finished bytes, once.
+        c.commit("track/x", Some(100)).unwrap();
+        assert_eq!(c.in_progress_bytes(), 0);
+        assert_eq!(c.used_bytes(), 100);
+        // A job that ends without landing claims nothing.
+        std::fs::write(c.part_path("track/y"), vec![0u8; 30]).unwrap();
+        assert!(c.ensure_free("track/y", 5).is_ok());
+        assert_eq!(c.in_progress_bytes(), 30);
+        c.release_reservation("track/y");
+        assert_eq!(c.in_progress_bytes(), 0);
     }
 
     /// What `ensure_free` approves is reserved until the write lands or the

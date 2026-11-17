@@ -1546,6 +1546,44 @@ mod tests {
         }
     }
 
+    /// While a download runs, the figure a host adds to its cap is what its
+    /// `.part` holds, read at each free-space check: the file's length, and
+    /// growing.
+    #[test]
+    fn a_running_download_reports_what_it_has_written() {
+        let size = usize::try_from(FREE_CHECK_BYTES * 3).unwrap();
+        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        // (bytes on disk, in-progress figure) at each check.
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        let (slot2, seen2) = (slot.clone(), seen.clone());
+        let r = rig_with_free(
+            "in-progress",
+            Script::default().file("/audio/1", body(size, 1)),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                if let Some(c) = slot2.lock().unwrap().as_ref() {
+                    let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
+                    seen2.lock().unwrap().push((on_disk, c.in_progress_bytes()));
+                }
+                Ok(u64::MAX)
+            }),
+        );
+        *slot.lock().unwrap() = Some(r.cache.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|(on_disk, _)| *on_disk >= FREE_CHECK_BYTES),
+            "no check after bytes were written: {seen:?}"
+        );
+        for (on_disk, figure) in &seen {
+            assert_eq!(figure, on_disk, "{seen:?}");
+        }
+        assert_eq!(r.cache.in_progress_bytes(), 0, "kept after it landed");
+    }
+
     #[test]
     fn free_space_is_checked_again_while_writing() {
         let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
