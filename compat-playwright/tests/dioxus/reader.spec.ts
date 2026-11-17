@@ -465,7 +465,7 @@ test.describe("book reader (spec 023)", () => {
     await openFromSearch(page, "Reader Locked", "Reader Locked");
     await expect(page.locator(".pharos-main")).toContainText("Locked to a Kindle (DRM)");
     await expect(page.getByRole("link", { name: /^(Read|Continue reading · \d+%)$/ })).toHaveCount(0);
-    await expect(page.getByRole("link", { name: "Download" })).toHaveAttribute(
+    await expect(page.getByRole("link", { name: "Download", exact: true })).toHaveAttribute(
       "href",
       /\/Items\/\d+\/Download$/,
     );
