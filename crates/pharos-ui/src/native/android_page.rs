@@ -3179,6 +3179,48 @@ const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// address as the proxy, the body streamed rather than held.
 struct ServerFetcher;
 
+/// The client the downloads use. Its redirect policy follows a redirect
+/// only to the same scheme, host and port as the request (the download
+/// sends the device token): a cross-host redirect or an https-to-http
+/// downgrade stops and is logged. Not `https_only`: a plain-http server on
+/// the LAN must keep working. [`http`] is the proxy's and is unchanged.
+fn download_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            let first = attempt
+                .previous()
+                .first()
+                .map_or_else(String::new, |u| u.to_string());
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            match tv_page::redirect_verdict(&first, attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => {
+                    log::warn!(
+                        "pharos: video download redirect stopped reason={reason} status={}",
+                        attempt.status()
+                    );
+                    attempt.stop()
+                }
+            }
+        });
+        let builder = reqwest::Client::builder()
+            .user_agent(tv_page::USER_AGENT)
+            .redirect(policy);
+        let builder = match pharos_api::tls::client_config() {
+            Ok(tls) => builder.tls_backend_preconfigured(tls),
+            Err(error) => {
+                log::error!("download TLS config failed to build: {error}");
+                builder
+            }
+        };
+        builder.build().unwrap_or_default()
+    })
+}
+
 struct ServerBody(reqwest::Response);
 
 fn no_answer(what: &str) -> FetchError {
@@ -3206,7 +3248,7 @@ impl Body for ServerBody {
 impl Fetcher for ServerFetcher {
     fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
         Box::pin(async move {
-            let mut req = http().get(tv_page::server_url(&server(), key));
+            let mut req = download_http().get(tv_page::server_url(&server(), key));
             if let Some(token) = android::token() {
                 req = req.header("X-Emby-Token", token);
             }
