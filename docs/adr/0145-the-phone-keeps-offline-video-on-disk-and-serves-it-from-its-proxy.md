@@ -41,9 +41,9 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 
 - Video cannot evict music or the reverse: a full shared budget refuses the
   new download and the viewer frees space by removing something.
-- Before the media service starts there is no music cache to ask, so the
-  default cap applies and the music counts as nothing; a cap raised in
-  settings takes effect once the service is up.
+- Before the music cache is enabled there is nothing to ask for the cap or
+  the music's bytes, so new video downloads are refused until it is (V1464);
+  a cap raised in settings takes effect once the cache is up.
 - A stored file is read whole into the WebView response (a segment is a few
   MB); only the download path streams.
 - A request is answered from disk only for the signed-in user's own
