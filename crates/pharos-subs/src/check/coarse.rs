@@ -223,10 +223,15 @@ pub fn shifts_beyond(
 
 /// FR-008: the stage-2 candidates to try, best first, at most `max`: the
 /// [`KEEP`] best offsets at ratio 1 and the best one at each of [`RATIOS`].
-/// An offset stage 1 already searched (ratio 1, within `stage1_ms`) is left
-/// out.
-pub fn candidates(speech: &Speech, cues: &[(i64, i64)], stage1_ms: i64, max: usize) -> Vec<Shift> {
-    let mut all: Vec<Shift> = shifts_beyond(speech, cues, 1.0, Some(stage1_ms));
+/// When stage 1 searched (`stage1_ms` is its reach), a ratio-1 offset within
+/// it is left out; `None` when stage 1 sent nothing, so every offset is open.
+pub fn candidates(
+    speech: &Speech,
+    cues: &[(i64, i64)],
+    stage1_ms: Option<i64>,
+    max: usize,
+) -> Vec<Shift> {
+    let mut all: Vec<Shift> = shifts_beyond(speech, cues, 1.0, stage1_ms);
     for r in RATIOS {
         all.extend(shifts(speech, cues, r).into_iter().take(1));
     }
@@ -284,7 +289,7 @@ mod tests {
         let c = cues();
         let r = 25.0 / 23.976;
         let s = speech_of(&c, r, 1_500, 45 * 60_000);
-        let got = candidates(&s, &c, 8_000, 3);
+        let got = candidates(&s, &c, Some(8_000), 3);
         assert!((got[0].ratio - r).abs() < 1e-9, "{got:?}");
         assert!((got[0].offset_ms - 1_500).abs() <= FRAME_MS, "{got:?}");
     }
@@ -293,12 +298,21 @@ mod tests {
     fn stage_ones_own_range_is_not_tried_again() {
         let c = cues();
         let s = speech_of(&c, 1.0, 3_000, 45 * 60_000);
-        let got = candidates(&s, &c, 8_000, 8);
+        let got = candidates(&s, &c, Some(8_000), 8);
         assert!(
             got.iter()
                 .all(|g| g.ratio != 1.0 || g.offset_ms.abs() > 8_000),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn with_nothing_searched_in_stage_one_a_near_offset_is_open() {
+        let c = cues();
+        let s = speech_of(&c, 1.0, -5_000, 45 * 60_000);
+        let got = candidates(&s, &c, None, 3);
+        assert_eq!(got[0].offset_ms, -5_000, "{got:?}");
+        assert!(got[0].ratio == 1.0);
     }
 
     #[test]
