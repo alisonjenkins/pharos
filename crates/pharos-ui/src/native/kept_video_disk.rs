@@ -1350,8 +1350,8 @@ impl DiskVideoStore {
         let mut tombstones: Vec<(PathBuf, u64)> = Vec::new();
         let mut held: Vec<(PathBuf, u64)> = Vec::new();
         let mut unmeasured: Vec<(PathBuf, String)> = Vec::new();
-        for user_dir in dirs(&inner.root) {
-            for item_dir in dirs(&user_dir) {
+        for user_dir in list_dirs(&inner.root, &mut unmeasured) {
+            for item_dir in list_dirs(&user_dir, &mut unmeasured) {
                 let manifest = item_dir.join("manifest.json");
                 let record = match std::fs::read(&manifest) {
                     Ok(bytes) => match serde_json::from_slice::<KeptVideo>(&bytes) {
@@ -1499,15 +1499,44 @@ impl DiskVideoStore {
     }
 }
 
-fn dirs(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .map(|r| {
-            r.filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect()
-        })
-        .unwrap_or_default()
+/// [`dirs`] for `open`: a folder that cannot be listed hides downloads that
+/// may be there, so its size is unknown and nothing is admitted while it
+/// stays.
+fn list_dirs(dir: &Path, unmeasured: &mut Vec<(PathBuf, String)>) -> Vec<PathBuf> {
+    dirs(dir).unwrap_or_else(|e| {
+        emit(
+            true,
+            format!(
+                "pharos: video folder unlistable dir={} error={e} admission=blocked",
+                dir.display()
+            ),
+        );
+        unmeasured.push((dir.to_path_buf(), format!("cannot be listed: {e}")));
+        Vec::new()
+    })
+}
+
+/// The folders directly under `dir`. A folder that is not there lists
+/// nothing; one that cannot be listed (or whose entries cannot all be
+/// read) is an error, not an empty list: what is under it is unknown.
+fn dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if tests::UNREADABLE.with(|u| u.borrow().iter().any(|p| p == dir)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let path = entry?.path();
+        if path.is_dir() {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 impl VideoStore for DiskVideoStore {
@@ -2959,6 +2988,51 @@ mod tests {
         assert!(why.contains("unknown"), "{why}");
         assert!(store.size_unknown(), "the host is not told");
         assert!(dir.join("files").join("keep").exists(), "swept");
+    }
+
+    /// A user folder that cannot be listed hides downloads that may be
+    /// there: nothing is admitted while it stays.
+    #[tokio::test]
+    async fn an_unlistable_user_folder_blocks_admission() {
+        let rig = Rig::new("user-unlistable");
+        let user = rig.dir.join("u9");
+        std::fs::create_dir_all(&user).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let held = lines("pharos: video folder unlistable");
+        assert!(
+            held.len() == 1 && held[0].contains("admission=blocked"),
+            "{held:?}"
+        );
+        assert!(store.size_unknown(), "the host is not told");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("admitted beside a folder that cannot be listed");
+        };
+        assert!(why.contains("cannot be listed"), "{why}");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
+    /// A store root that is not a folder cannot be listed either; one that
+    /// is not there is an empty store.
+    #[tokio::test]
+    async fn an_unlistable_root_blocks_admission_and_a_missing_one_is_empty() {
+        let rig = Rig::new("root-unlistable");
+        // Missing: an empty store that takes downloads.
+        let store = rig.open();
+        assert!(!store.size_unknown());
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        // A plain file where the root should be.
+        std::fs::remove_dir_all(&rig.dir).unwrap();
+        std::fs::write(&rig.dir, b"x").unwrap();
+        let store = rig.open();
+        assert!(store.size_unknown(), "a root that is a file is not empty");
+        assert!(matches!(
+            store.start(request("2")),
+            Err(KeepVideoRefusal::Host(_))
+        ));
+        std::fs::remove_file(&rig.dir).unwrap();
     }
 
     /// A damaged manifest is held the same way.
