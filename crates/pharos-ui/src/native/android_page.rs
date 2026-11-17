@@ -3130,6 +3130,27 @@ fn http() -> &'static reqwest::Client {
     })
 }
 
+/// The device token for a request to `url`, when it may go there
+/// ([`tv_page::token_allowed`]). One withheld is logged with the reason,
+/// at warn the first time and at debug after, since every request to a
+/// plain-http server would repeat it.
+fn token_for(url: &str, what: &str) -> Option<String> {
+    let token = android::token()?;
+    match tv_page::token_allowed(url, tv_page::DEFAULT_SERVER) {
+        Ok(()) => Some(token),
+        Err(reason) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::debug!("pharos: device token withheld for={what} reason={reason}");
+            } else {
+                log::warn!("pharos: device token withheld for={what} reason={reason}");
+            }
+            None
+        }
+    }
+}
+
 /// GET `path_and_query` from the server with the device token in a header.
 /// Returns the status, the passed-back headers and the body.
 async fn fetch_server(
@@ -3137,8 +3158,9 @@ async fn fetch_server(
     headers: &[(String, String)],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
     let base = server();
-    let mut req = http().get(tv_page::server_url(&base, path_and_query));
-    if let Some(token) = android::token() {
+    let url = tv_page::server_url(&base, path_and_query);
+    let mut req = http().get(&url);
+    if let Some(token) = token_for(&url, "proxy") {
         req = req.header("X-Emby-Token", token);
     }
     for (name, value) in headers {
@@ -3257,8 +3279,9 @@ impl Fetcher for ServerFetcher {
                 status: None,
                 message: why.clone(),
             })?;
-            let mut req = client.get(tv_page::server_url(&server(), key));
-            if let Some(token) = android::token() {
+            let url = tv_page::server_url(&server(), key);
+            let mut req = client.get(&url);
+            if let Some(token) = token_for(&url, "video_download") {
                 req = req.header("X-Emby-Token", token);
             }
             let resp = tokio::time::timeout(DOWNLOAD_STALL, req.send())

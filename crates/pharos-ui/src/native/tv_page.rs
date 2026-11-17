@@ -197,6 +197,27 @@ pub fn redirect_verdict(original: &str, next: &str) -> Result<(), String> {
     Err(format!("another scheme, {}", to.0))
 }
 
+/// Whether the device token may go to `url` in a header: only over https,
+/// or to the server the build was pointed at (`PHAROS_TV_SERVER`, passed as
+/// `build_server`), which a development build may serve on plain http. Any
+/// other plain-http request goes without the token. Err is the reason, for
+/// the log.
+pub fn token_allowed(url: &str, build_server: &str) -> Result<(), String> {
+    let Some(to) = origin_of(url) else {
+        return Err("not an http(s) URL".to_owned());
+    };
+    if to.0 == "https" {
+        return Ok(());
+    }
+    if origin_of(build_server).as_ref() == Some(&to) {
+        return Ok(());
+    }
+    Err(format!(
+        "plain http to {}:{}, not the build's server",
+        to.1, to.2
+    ))
+}
+
 /// The download client, or why there is none. A client that cannot be built
 /// is never replaced by a default one: its redirect policy is what keeps the
 /// device token on the server's origin, so the download is refused with the
@@ -1336,6 +1357,25 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device token goes only over https, or to the build's own server
+    /// at its own origin; any other plain-http URL is refused with the
+    /// origin named.
+    #[test]
+    fn the_device_token_goes_only_over_https_or_to_the_builds_server() {
+        let dev = "http://192.168.1.5:8096";
+        let https = "https://media.example.org";
+        assert!(token_allowed("https://media.example.org/Items", https).is_ok());
+        assert!(token_allowed("https://other.example.org/Items", dev).is_ok());
+        assert!(token_allowed("http://192.168.1.5:8096/Items", dev).is_ok());
+        let Err(why) = token_allowed("http://192.168.1.6:8096/Items", dev) else {
+            panic!("plain http to another LAN host was allowed");
+        };
+        assert!(why.contains("192.168.1.6:8096"), "{why}");
+        assert!(token_allowed("http://192.168.1.5:9000/Items", dev).is_err());
+        assert!(token_allowed("http://media.example.org/Items", https).is_err());
+        assert!(token_allowed("ftp://media.example.org/Items", https).is_err());
+    }
 
     /// A client that cannot be built is an error naming why, and what would
     /// have been sent with it is not sent. (reqwest has no way to force a
