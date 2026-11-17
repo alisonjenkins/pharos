@@ -91,6 +91,9 @@ struct Queue {
     generation: u64,
     budget: u64,
     busy: bool,
+    /// The track `busy` is about: off the queues, so a request that lists it
+    /// again must still see it as queued work.
+    current: Option<String>,
 }
 
 struct Gate {
@@ -163,6 +166,7 @@ impl Downloader {
                 generation: 0,
                 budget: 0,
                 busy: false,
+                current: None,
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
@@ -238,9 +242,17 @@ impl Downloader {
             if g.cache.is_complete(id) || q.pinned.iter().any(|w| w == id) {
                 continue;
             }
+            // The track being downloaded is off both queues but is still
+            // queued work. A pin of it is not cancelled by a newer request
+            // (see `still_wanted`), so there is nothing to add; read-ahead
+            // can be dropped, so a pin of it is still queued behind it.
+            let in_flight = q.current.as_deref() == Some(id.as_str());
+            if in_flight && g.is_pin_work(id) {
+                continue;
+            }
             // Kept even when read-ahead already lists it: the budget may drop
             // that entry, and the pin must still download.
-            if !q.wanted.iter().any(|w| w == id) {
+            if !in_flight && !q.wanted.iter().any(|w| w == id) {
                 added = added.saturating_add(1);
             }
             q.pinned.push_back(id.clone());
@@ -286,6 +298,12 @@ impl Downloader {
     #[cfg(test)]
     pub fn yields(&self) -> u64 {
         self.gate.yields.load(Ordering::SeqCst)
+    }
+
+    /// The track the downloader is working on (or holding for the network).
+    #[cfg(test)]
+    pub fn in_flight(&self) -> Option<String> {
+        self.gate.lock().current.clone()
     }
 
     /// Jobs queued or running.
@@ -342,6 +360,7 @@ impl Gate {
                 q.wanted.clear();
             }
             q.busy = false;
+            q.current = None;
             self.idle.notify_all();
         }
     }
@@ -362,6 +381,7 @@ impl Gate {
                         continue;
                     }
                     q.busy = true;
+                    q.current = Some(id.clone());
                     return Some((id, q.generation));
                 }
                 while let Some(id) = q.pinned.pop_front() {
@@ -369,9 +389,11 @@ impl Gate {
                         continue;
                     }
                     q.busy = true;
+                    q.current = Some(id.clone());
                     return Some((id, q.generation));
                 }
                 q.busy = false;
+                q.current = None;
                 self.idle.notify_all();
             }
             wait.await;
@@ -978,6 +1000,51 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
+    }
+
+    /// Waits until the downloader has taken a job off the queue.
+    fn wait_in_flight(r: &Rig, id: &str) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while r.dl.in_flight().as_deref() != Some(id) {
+            assert!(Instant::now() < end, "{id} never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A pin the downloader has taken off the queue (and is holding for the
+    /// network) is still queued work: asking again adds nothing. This raced
+    /// with the downloader thread before, so the test waits for it to take
+    /// the job instead of hoping it has not.
+    #[test]
+    fn a_pin_already_downloading_is_not_queued_again() {
+        let r = pin_rig("pin-in-flight", fast(), 3, 1000);
+        r.dl.set_online(false);
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        assert_eq!(r.dl.resume_pins(), 1);
+        wait_in_flight(&r, "track/1");
+        assert_eq!(r.dl.resume_pins(), 0, "in flight counts as queued");
+        assert_eq!(r.dl.enqueue(&ids(&["track/1"])), 0);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/1"));
+        assert_eq!(r.srv.seen().len(), 1, "fetched once");
+    }
+
+    /// Read-ahead the downloader is already fetching is listed by it, so a
+    /// pin of the same track adds nothing new to fetch.
+    #[test]
+    fn a_pin_of_read_ahead_in_flight_adds_nothing_to_fetch() {
+        let r = pin_rig("pin-readahead-in-flight", fast(), 3, 1000);
+        r.dl.set_online(false);
+        r.cache.pin("album/1", &ids(&["track/2", "track/3"]));
+        r.dl.prefetch(&ids(&["track/1"]));
+        wait_in_flight(&r, "track/1");
+        assert_eq!(r.dl.enqueue(&ids(&["track/2", "track/3", "track/1"])), 2);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        for id in ["track/1", "track/2", "track/3"] {
+            assert!(r.cache.is_complete(id), "{id}");
+        }
     }
 
     fn pin_rig(name: &str, tuning: Tuning, n: usize, size: usize) -> Rig {
