@@ -5856,6 +5856,64 @@ mod tests {
         assert!(!lines("pharos: video held folder verdict=tombstoned").is_empty());
     }
 
+    /// The hook asks the size check first: it may sweep and adopt, and the
+    /// held figure it reports is the one that sweep left. A cap lowered
+    /// while an unlisted folder is recovered trims music for that folder's
+    /// bytes, not for a figure read before it was found.
+    #[test]
+    fn a_cap_lowered_as_a_folder_is_recovered_trims_for_its_bytes() {
+        let _music = capture_music_log();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = rt.enter();
+        let rig = Rig::new("hook-order");
+        let user = rig.dir.join("u1");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            rt.block_on(store.settled());
+        }
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let audio = rig.dir.join("audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        for i in 1..=4 {
+            std::fs::write(audio.join(format!("t{i}.audio")), [7u8; 100]).unwrap();
+        }
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        lib.enable_cache(&audio, 1 << 20).unwrap();
+        let hooked = store.clone();
+        lib.set_outside_used(Arc::new(move || {
+            crate::native::ports::outside_bytes(Some(&*hooked))
+        }));
+        assert_eq!(store.kept_bytes(), 0, "the unlisted folder was found early");
+        // The folder reads again; the next check sweeps.
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        // Music alone fits this cap; with the video's bytes nothing does.
+        lib.set_cache_cap(400).unwrap();
+        let held = store.kept_bytes();
+        assert!(held > 400, "the recovered folder holds {held}");
+        let left = (1..=4)
+            .filter(|i| audio.join(format!("t{i}.audio")).exists())
+            .count();
+        assert_eq!(left, 0, "trimmed for a held figure read before the sweep");
+    }
+
     /// A process that never lists the downloads (the car's) still recovers:
     /// the music cache's size check through the hook sweeps the held
     /// folders, at most once per interval, with no `videos()` call.

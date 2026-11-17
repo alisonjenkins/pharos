@@ -237,11 +237,16 @@ pub fn outside_bytes(
     store: Option<&dyn super::kept_video::VideoStore>,
 ) -> pharos_content::OutsideBytes {
     match store {
-        Some(s) => pharos_content::OutsideBytes {
-            held: s.kept_bytes(),
-            outstanding: s.outstanding_bytes(),
-            unknown: s.size_unknown(),
-        },
+        Some(s) => {
+            // The size check first: it may sweep and adopt folders, and the
+            // figures read after it are the ones that sweep left.
+            let unknown = s.size_unknown();
+            pharos_content::OutsideBytes {
+                held: s.kept_bytes(),
+                outstanding: s.outstanding_bytes(),
+                unknown,
+            }
+        }
         None => pharos_content::OutsideBytes {
             held: 0,
             outstanding: 0,
