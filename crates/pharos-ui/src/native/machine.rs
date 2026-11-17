@@ -216,7 +216,9 @@ impl Machine {
     }
 
     pub fn apply(&mut self, event: Event) {
-        let was_ready = self.phase == Phase::Ready;
+        // A session also ends when the socket dropped and the reconnect finds
+        // it revoked: the screens were still up.
+        let was_ready = self.phase == Phase::Ready || self.reconnecting;
         self.step(event);
         if was_ready && matches!(self.phase, Phase::SignIn { .. }) {
             if let Some(hook) = self.on_session_end.0 {
@@ -524,6 +526,48 @@ mod tests {
             sign_in_error_of(&m),
             Some("Your session ended. Sign in again.")
         );
+    }
+
+    static SESSIONS_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_end() {
+        SESSIONS_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The session-end hook runs when a session revoked after a dropped
+    /// socket ends (the screens were still up), and never for an ordinary
+    /// outage that reconnects. Run as one test: the count is a static.
+    #[test]
+    fn a_revoked_close_after_a_drop_ends_the_session_but_an_outage_does_not() {
+        use std::sync::atomic::Ordering;
+        let count = || SESSIONS_ENDED.load(Ordering::SeqCst);
+        let start = count();
+        let mut m = Machine::new().with_session_end(count_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        // An outage: drop, the server down for a while, then back.
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        m.apply(Event::NotOpened {
+            epoch: 1,
+            probe: Probe::Failed("offline".into()),
+        });
+        assert!(m.shows_screens());
+        m.apply(Event::Resumed { epoch: 2 });
+        assert_eq!(count(), start, "an outage ended the session");
+        // A drop, then the reconnect finds the session revoked.
+        m.apply(Event::Closed {
+            epoch: 2,
+            reason: "idle_timeout".into(),
+        });
+        assert!(m.reconnecting());
+        m.apply(Event::Closed {
+            epoch: 3,
+            reason: REVOKED.into(),
+        });
+        assert!(matches!(m.phase, Phase::SignIn { .. }), "{:?}", m.phase);
+        assert_eq!(count(), start + 1, "the revoked session's hook did not run");
     }
 
     #[test]
