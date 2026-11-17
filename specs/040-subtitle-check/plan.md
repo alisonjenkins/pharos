@@ -38,7 +38,7 @@ The align queue in `services::lyrics::align` exposes whether a job is queued or 
 0. `pharos_lyrics_align_wait_seconds` in the align queue, on its own bucket ladder (1 ms to 1 h, so a wait past 30 s is not capped and a rise within the first 100 ms still shows), with a test that fails without it (FR-022).
 1. Probe picker, language gate and verdict as pure code in `pharos-subs`, with the spike's numbers as test vectors (generic names).
 2. Table, migration and the job with `apply = false`: checks run and log, nothing is served differently. Calibration (FR-014) reads these logs.
-3. Coarse search and stage 2. 3b: the aligner request names the audio stream (FR-002a).
+3. Coarse search and stage 2. 3b: the aligner request names the audio stream (FR-002a) and asks for scores only (FR-002b).
 4. Sibling check (FR-011) and the admin list.
 5. Serving correction and track-list marks, behind `apply`.
 6. Calibration run, then `apply = true` by config.
