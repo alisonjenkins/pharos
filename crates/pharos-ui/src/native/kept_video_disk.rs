@@ -172,6 +172,11 @@ struct State {
     /// the delete is over: a download restarted in that gap would have its
     /// new files deleted.
     deleting: Vec<PathBuf>,
+    /// Folders where a staging file could not be deleted: nothing bounds
+    /// them until a later sweep deletes the file or measures the folder
+    /// whole, so they are unknown meanwhile. A fact, so accounting does not
+    /// depend on a cleanup having worked.
+    leftover: Vec<PathBuf>,
     /// The last measurement of each tombstoned folder: the epoch it was
     /// taken at, and whether the walk read everything.
     measured: HashMap<PathBuf, (u64, bool)>,
@@ -349,6 +354,12 @@ impl State {
         if let Some((dir, why)) = self.unmeasured.first() {
             return Some((dir.clone(), why.clone()));
         }
+        if let Some(dir) = self.leftover.first() {
+            return Some((
+                dir.clone(),
+                "a staging file could not be deleted".to_owned(),
+            ));
+        }
         for (user, item, _) in self.writers.keys() {
             // With another run owning the item, the stale run's bytes are
             // counted under it (`staged`, the owner's estimate); with none
@@ -465,10 +476,14 @@ impl Drop for Staged<'_> {
         // A revoked run's staging file goes before its writer is
         // unregistered, so a folder is not bounded while it could be there.
         let revoked = st.runs.get(&(self.who.0.clone(), self.who.1.clone())) != Some(&self.who.2);
-        if revoked {
-            let _ = std::fs::remove_file(&self.part);
-        }
         let dir = st.dir_of(&self.who.0, &self.who.1);
+        if revoked {
+            if let Err(e) = remove_part(&self.part) {
+                if e.kind() != std::io::ErrorKind::NotFound && !st.leftover.contains(&dir) {
+                    st.leftover.push(dir.clone());
+                }
+            }
+        }
         st.bump(&dir);
         if let Some(n) = st.writers.get_mut(&self.who) {
             *n = n.saturating_sub(1);
@@ -502,6 +517,7 @@ impl Inner {
     /// not go; the ones that do stop counting. A folder a live record has
     /// taken over is left to that record.
     fn sweep_tombstones(&self) {
+        self.settle_leftovers();
         let pending: Vec<PathBuf> = {
             let mut st = lock(&self.state);
             let picked: Vec<PathBuf> = st
@@ -556,6 +572,59 @@ impl Inner {
                     ),
                 );
             }
+        }
+    }
+
+    /// Resolves folders where a staging file could not be deleted: with no
+    /// writer in one, the files are deleted if no run owns the item, and
+    /// the folder is then measured whole (staging files included); read in
+    /// full, its bytes are taken into the figure that counts for it (the
+    /// record's reservation, or the tombstone's) and the fact clears. A
+    /// folder that cannot be read whole stays unknown.
+    fn settle_leftovers(&self) {
+        let dirs: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.leftover
+                .iter()
+                .filter(|d| !st.writing(d) && !st.removing.contains(d))
+                .cloned()
+                .collect()
+        };
+        for dir in dirs {
+            let owned = {
+                let st = lock(&self.state);
+                st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir)
+            };
+            if !owned {
+                let _ = drop_parts_of(&dir, None);
+            }
+            let measured = dir_size(&dir);
+            let mut st = lock(&self.state);
+            if !measured.exact || st.writing(&dir) || st.removing.contains(&dir) {
+                continue;
+            }
+            let record = st
+                .list
+                .iter()
+                .position(|v| st.dir_of(&v.user, &v.item) == dir);
+            let tomb = st.tombstones.iter().position(|(d, _)| *d == dir);
+            if let Some(i) = record {
+                let v = &mut st.list[i];
+                v.estimated_bytes = v.estimated_bytes.max(measured.bytes);
+            }
+            if let Some(i) = tomb {
+                st.tombstones[i].1 = st.tombstones[i].1.max(measured.bytes);
+            }
+            st.leftover.retain(|d| *d != dir);
+            drop(st);
+            emit(
+                false,
+                format!(
+                    "pharos: video keep leftover settled dir={} bytes={}",
+                    dir.display(),
+                    measured.bytes
+                ),
+            );
         }
     }
 
@@ -623,7 +692,8 @@ impl Inner {
             // A Failed record reports its estimate as its bytes: what the
             // download had written, or the folder holds, must not drop out
             // of what it reserves in the change.
-            let on_disk = names.values().fold(0u64, |a, n| a.saturating_add(*n));
+            // The whole folder, staging files included.
+            let on_disk = dir_size(dir).bytes;
             record.estimated_bytes = reserved(&record).max(on_disk);
             record.state = KeptState::Failed {
                 reason: format!("could not be removed: {e}"),
@@ -781,6 +851,21 @@ impl Inner {
         };
         f(v);
         Ok(true)
+    }
+
+    /// Deletes a staging file; one that will not go is recorded as a
+    /// leftover of its folder, which is unknown until a sweep resolves it.
+    fn remove_staging(&self, part: &Path) {
+        let Err(e) = remove_part(part) else { return };
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        if let Some(dir) = part.parent().and_then(Path::parent) {
+            let mut st = lock(&self.state);
+            if !st.leftover.iter().any(|d| d == dir) {
+                st.leftover.push(dir.to_path_buf());
+            }
+        }
     }
 
     fn owns(&self, user: &str, item: &str, run: u64) -> bool {
@@ -1114,7 +1199,7 @@ async fn fetch_once(
             Ok(None) => break,
             Err(e) => {
                 drop(file);
-                let _ = tokio::fs::remove_file(&part).await;
+                inner.remove_staging(&part);
                 return Err(FetchOnce::Fetch(e));
             }
         }
@@ -1136,7 +1221,7 @@ async fn fetch_once(
         Some(Ok(())) => Ok(len),
         Some(Err(e)) => Err(store_err("finish", e)),
         None => {
-            let _ = tokio::fs::remove_file(&part).await;
+            inner.remove_staging(&part);
             Err(FetchOnce::Gone)
         }
     }
@@ -1602,9 +1687,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     }
     // Whatever this run left half staged (a file in flight when the
     // download failed or was dropped) goes with it.
-    drop_parts_of(&inner.item_dir(&user, &item), run);
+    let cleaned = drop_parts_of(&inner.item_dir(&user, &item), Some(run));
     let owned = {
         let mut st = lock(&inner.state);
+        if !cleaned {
+            let dir = inner.item_dir(&user, &item);
+            if !st.leftover.contains(&dir) {
+                st.leftover.push(dir);
+            }
+        }
         let owned = st.runs.get(&(user.clone(), item.clone())) == Some(&run);
         if owned {
             st.runs.remove(&(user, item));
@@ -1613,7 +1704,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     };
     // A revoked run's writer is done: a folder its removal could not
     // delete or bound while it ran is deleted or measured now.
-    if !owned {
+    if !owned || !cleaned {
         inner.sweep_tombstones();
     }
 }
@@ -1633,17 +1724,34 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
     }
 }
 
-/// Deletes the staging files `run` left in `dir/files`.
-fn drop_parts_of(dir: &Path, run: u64) {
-    let Ok(read) = std::fs::read_dir(dir.join("files")) else {
-        return;
+/// Deletes one staging file; a test can make it fail.
+fn remove_part(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_PART_DELETE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("part in use"));
+    }
+    std::fs::remove_file(path)
+}
+
+/// Deletes the staging files `run` left in `dir/files` (every run's, with
+/// `None`); false when one would not go, or the folder could not be read.
+fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
+    let read = match std::fs::read_dir(dir.join("files")) {
+        Ok(read) => read,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
     };
-    let suffix = format!(".{run}.part");
+    let suffix = run.map_or_else(|| ".part".to_owned(), |r| format!(".{r}.part"));
+    let mut clean = true;
     for entry in read.filter_map(Result::ok) {
         if entry.file_name().to_string_lossy().ends_with(&suffix) {
-            let _ = std::fs::remove_file(entry.path());
+            match remove_part(&entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => clean = false,
+            }
         }
     }
+    clean
 }
 
 impl Inner {
@@ -2218,6 +2326,11 @@ mod tests {
                 f();
             }
         });
+    }
+
+    thread_local! {
+        /// While set, deleting a staging file fails.
+        pub(super) static FAIL_PART_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     thread_local! {
@@ -4328,6 +4441,69 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready());
+    }
+
+    /// A staging file that cannot be deleted does not drop out of the
+    /// accounting: with the manifest unlink failing too, the folder stays
+    /// unknown after the writer has stopped, until a later sweep deletes the
+    /// file and the folder is measured whole.
+    #[tokio::test]
+    async fn a_staging_file_that_will_not_delete_keeps_the_folder_unknown_until_a_sweep() {
+        let rig = Rig::new("part-stays");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).ok();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        // The revoked run's file grows after the record was put back.
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        for e in std::fs::read_dir(dir.join("files")).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "part") {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(e.path())
+                    .unwrap();
+                f.set_len(big).unwrap();
+            }
+        }
+        release.store(true, Ordering::SeqCst);
+        // The writer stops; its file will not go.
+        let mut waited = 0;
+        while lock(&store.inner.state).writing(&dir) {
+            waited += 1;
+            assert!(waited < 2_000, "the writer never stopped");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        store.settled().await;
+        let parts = || {
+            std::fs::read_dir(dir.join("files"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+                .count()
+        };
+        assert!(parts() > 0, "the file was deleted anyway");
+        // Counted or unknown, never uncounted: what the file holds is in the
+        // figure once the folder has been read whole.
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= big,
+            "the leftover file went uncounted: kept {}",
+            store.kept_bytes()
+        );
+        // Later the file goes, and a sweep resolves the folder.
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        store.inner.sweep_tombstones();
+        assert!(!store.size_unknown(), "the sweep did not resolve it");
+        assert!(
+            store.kept_bytes() >= big,
+            "the bytes dropped out of the figure"
+        );
+        // (The file itself is deleted at the next open, which clears staging
+        // files; the figure keeps what it held.)
     }
 
     /// A same-item retry takes over a folder that would not delete: the
