@@ -1831,7 +1831,12 @@ mod tests {
             .hold_after(64 * 1024);
         let srv = Arc::new(TestServer::start(script));
         let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
-        let cache = Arc::new(Cache::open(&dir.join("cache"), 100 << 30).unwrap());
+        // A fixed, ample free space: the temp filesystem's own is not the
+        // subject, and under the guard it would refuse every reservation.
+        let cache = Arc::new(
+            Cache::open_with_probe(&dir.join("cache"), 100 << 30, Box::new(|_| Ok(u64::MAX)))
+                .unwrap(),
+        );
         let s2 = srv.clone();
         let resolve: Resolver = Arc::new(move |_| Ok(s2.url_with_token("/audio/1", "t")));
         let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
