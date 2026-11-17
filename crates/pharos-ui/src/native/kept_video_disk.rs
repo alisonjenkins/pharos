@@ -161,6 +161,11 @@ struct State {
     /// the next chunk's check: while a revoked run has a writer its folder
     /// is of unknown size.
     writers: HashMap<(String, String, u64), usize>,
+    /// Folders a sweep has picked and is deleting. Picked under the same
+    /// hold that checked nothing owns them, and refused to `start` until
+    /// the delete is over: a download restarted in that gap would have its
+    /// new files deleted.
+    deleting: Vec<PathBuf>,
     /// The last measurement of each tombstoned folder: the epoch it was
     /// taken at, and whether the walk read everything.
     measured: HashMap<PathBuf, (u64, bool)>,
@@ -492,25 +497,36 @@ impl Inner {
     /// taken over is left to that record.
     fn sweep_tombstones(&self) {
         let pending: Vec<PathBuf> = {
-            let st = lock(&self.state);
-            st.tombstones
+            let mut st = lock(&self.state);
+            let picked: Vec<PathBuf> = st
+                .tombstones
                 .iter()
                 .map(|(dir, _)| dir.clone())
                 .filter(|dir| {
                     !st.removing.contains(dir)
+                        && !st.deleting.contains(dir)
                         && !st.writing(dir)
                         && !st
                             .list
                             .iter()
                             .any(|v| self.item_dir(&v.user, &v.item) == *dir)
                 })
-                .collect()
+                .collect();
+            st.deleting.extend(picked.iter().cloned());
+            picked
         };
         for dir in pending {
             let outcome = (self.env.remove_dir)(&dir);
             {
                 let mut st = lock(&self.state);
-                if st.removing.contains(&dir) || st.writing(&dir) {
+                st.deleting.retain(|d| *d != dir);
+                if st.removing.contains(&dir)
+                    || st.writing(&dir)
+                    || st
+                        .list
+                        .iter()
+                        .any(|v| self.item_dir(&v.user, &v.item) == dir)
+                {
                     // A removal began while the delete ran: it owns the folder.
                     continue;
                 }
@@ -1887,9 +1903,22 @@ impl VideoStore for DiskVideoStore {
                 .outstanding(&user, &item)
                 .saturating_add(budget.other_outstanding_bytes());
             let room = budget.free_bytes().saturating_sub(owed);
+            let dir = self.inner.item_dir(&user, &item);
             let started = st
                 .unknown_folder()
                 .map_or(Ok(()), Err)
+                .and_then(|()| {
+                    // The folder is being swept: a download begun in it now
+                    // would have its files deleted.
+                    if st.deleting.contains(&dir) {
+                        Err(KeepVideoRefusal::Host(format!(
+                            "{} is being cleaned up, try again in a moment",
+                            dir.display()
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
                 .and_then(|()| fits(0, used, cap, room))
                 .and_then(|()| {
                     check_not_kept(&st.list, &user, &item)?;
@@ -4212,6 +4241,41 @@ mod tests {
             !rig.dir.join("u1").join("1").exists(),
             "the folder was not deleted once the writer stopped"
         );
+    }
+
+    /// A download restarted between a sweep's choosing a folder and its
+    /// deleting it is refused, so the new files are not deleted from under it.
+    #[tokio::test]
+    async fn a_restart_between_a_sweeps_pick_and_its_delete_is_refused() {
+        let rig = Rig::new("sweep-restart");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(store.kept_bytes() > 0, "no tombstone to sweep");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (s2, seen2, entered) = (store.clone(), seen.clone(), std::cell::Cell::new(false));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    *seen2.borrow_mut() = Some(s2.start(request("1")));
+                }
+            }));
+        });
+        store.inner.sweep_tombstones();
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let during = seen.take().expect("the sweep did not delete");
+        assert!(
+            matches!(during, Err(KeepVideoRefusal::Host(_))),
+            "a restart in the gap was admitted: {during:?}"
+        );
+        assert!(!rig.dir.join("u1").join("1").exists(), "the folder stayed");
+        // Once the sweep is over the item starts again.
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
     }
 
     /// Parks a download's SEG0 body mid-way, with its staging file open.
