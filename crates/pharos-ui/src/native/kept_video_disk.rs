@@ -41,6 +41,10 @@ use super::platform;
 /// each segment slower to arrive whole.
 const CONCURRENCY: usize = 2;
 
+/// How far past what a media chunk needs a reservation grows, when that
+/// fits: one admission-lock hold covers many chunks.
+const RESERVATION_STEP: u64 = 1 << 20;
+
 /// Playlists are planned against this origin, then cut back to keys: the
 /// shared planner resolves relative URIs against an absolute URL.
 const PLAN_ORIGIN: &str = "http://pharos.invalid";
@@ -155,6 +159,10 @@ struct State {
     /// the record's stored bytes. Keyed by run: an old run still draining
     /// after a restart stages bytes the new run's estimate never covered.
     staged: HashMap<(String, String, u64), u64>,
+    /// Bytes of media chunks each run has checked against its reservation
+    /// and is writing now: owed still (not on disk yet), but spoken for, so
+    /// two fetches of one run cannot both spend the same headroom.
+    claimed: HashMap<(String, String, u64), u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -482,6 +490,31 @@ impl State {
         id
     }
 
+    /// What `run` of `v`'s download holds of its reservation now: its
+    /// whole files, its staged bytes and the chunks it is writing.
+    fn run_holds(&self, v: &KeptVideo, run: u64) -> u64 {
+        let who = (v.user.clone(), v.item.clone(), run);
+        let stored = match v.state {
+            KeptState::Downloading { bytes, .. } => bytes,
+            _ => v.bytes(),
+        };
+        stored
+            .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+            .saturating_add(self.claimed.get(&who).copied().unwrap_or(0))
+    }
+
+    fn unclaim(&mut self, who: &(String, String, u64), n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(c) = self.claimed.get_mut(who) {
+            *c = c.saturating_sub(n);
+            if *c == 0 {
+                self.claimed.remove(who);
+            }
+        }
+    }
+
     /// What the other running downloads have yet to write: their estimate
     /// less what they have stored whole and what they have staged. The free
     /// space already lacks what is on disk, so only the rest is still to
@@ -521,6 +554,8 @@ struct Staged<'a> {
     who: (String, String, u64),
     len: u64,
     part: PathBuf,
+    /// Bytes claimed against the reservation for the chunk being written.
+    claim: u64,
 }
 
 impl Staged<'_> {
@@ -529,7 +564,47 @@ impl Staged<'_> {
         let mut st = lock(&self.inner.state);
         let held = st.staged.entry(self.who.clone()).or_default();
         *held = held.saturating_add(n);
+        // A claimed chunk moves from claimed to staged in one hold.
+        let moved = std::mem::take(&mut self.claim);
+        st.unclaim(&self.who, moved);
     }
+
+    /// Claims `n` bytes of the run's reservation for the next media chunk,
+    /// extending the reservation first when it would be passed. Err with
+    /// the reason when the extension does not fit.
+    fn claim(&mut self, n: u64) -> Result<(), ClaimRefused> {
+        let (user, item, run) = (&self.who.0, &self.who.1, self.who.2);
+        for _ in 0..2 {
+            let need = {
+                let mut st = lock(&self.inner.state);
+                if st.runs.get(&(user.clone(), item.clone())) != Some(&run) {
+                    return Err(ClaimRefused::Gone);
+                }
+                let Some(v) = find(&st.list, user, item) else {
+                    return Err(ClaimRefused::Gone);
+                };
+                let need = st.run_holds(v, run).saturating_add(n);
+                if need <= v.estimated_bytes {
+                    *st.claimed.entry(self.who.clone()).or_default() += n;
+                    self.claim = self.claim.saturating_add(n);
+                    return Ok(());
+                }
+                need
+            };
+            self.inner.extend_reservation(user, item, run, need)?;
+        }
+        Err(ClaimRefused::Reason(
+            "the reservation could not be extended for the chunk".to_owned(),
+        ))
+    }
+}
+
+/// Why a media chunk was not written.
+enum ClaimRefused {
+    /// The run no longer owns the download.
+    Gone,
+    /// The reservation could not grow to hold it, and why.
+    Reason(String),
 }
 
 impl Drop for Staged<'_> {
@@ -559,6 +634,8 @@ impl Drop for Staged<'_> {
                 st.staged.remove(&self.who);
             }
         }
+        let claim = std::mem::take(&mut self.claim);
+        st.unclaim(&self.who, claim);
     }
 }
 
@@ -1231,6 +1308,116 @@ impl Inner {
         self.save_record(user, item).map_err(Admission::Unsaved)
     }
 
+    /// Grows `run`'s reservation to hold `need` bytes (a step more when it
+    /// fits, so the admission lock is not taken for every chunk), under the
+    /// shared admission lock and the checks admission makes: the music
+    /// cache up and its size known, no folder of unknown size, the shared
+    /// cap, and the free space less what every download still owes and the
+    /// guard. Logged either way, with the figures.
+    fn extend_reservation(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        need: u64,
+    ) -> Result<(), ClaimRefused> {
+        let budget = &self.env.budget;
+        let _admission = budget.admission_guard();
+        // In admission's order: readiness, the owed bytes, the written ones.
+        let ready = budget.accounting_ready();
+        let other_outstanding = budget.other_outstanding_bytes();
+        let progress = budget.other_in_progress_bytes();
+        let other = budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = budget.cap_bytes();
+        let refuse = |why: String| {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep reservation verdict=refused item={item} run={run} need={need} why={why}"
+                ),
+            );
+            Err(ClaimRefused::Reason(why))
+        };
+        let grown = {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(ClaimRefused::Gone);
+            }
+            if !ready {
+                return refuse("reason=music_not_ready".to_owned());
+            }
+            if progress.is_none() {
+                return refuse("reason=music_size_unknown".to_owned());
+            }
+            if let Some(r) = st.unknown_folder() {
+                return refuse(format!("reason=size_unknown {r}"));
+            }
+            let used = st.reserved_by_others(user, item).saturating_add(other);
+            let Some(v) = find(&st.list, user, item) else {
+                return Err(ClaimRefused::Gone);
+            };
+            let current = v.estimated_bytes;
+            if need <= current {
+                return Ok(());
+            }
+            // Owed by the others before free is read (as in `admit`), and
+            // by this run: what its reservation still lacks on disk.
+            let owed = st
+                .outstanding(user, item)
+                .saturating_add(other_outstanding)
+                .saturating_add(current.saturating_sub(st.run_holds(v, run)));
+            let free = budget.free_bytes();
+            let room = free.saturating_sub(owed);
+            let fits_at = |to: u64| {
+                fits(to, used, cap, u64::MAX)
+                    .and_then(|()| fits(to.saturating_sub(current), 0, u64::MAX, room))
+            };
+            let stepped = need.saturating_add(RESERVATION_STEP);
+            let to = if fits_at(stepped).is_ok() {
+                stepped
+            } else if let Err(r) = fits_at(need) {
+                let why = match r {
+                    KeepVideoRefusal::OverCap { .. } => "reason=over_cap",
+                    KeepVideoRefusal::LowSpace { .. } => "reason=low_space",
+                    _ => "reason=refused",
+                };
+                return refuse(format!(
+                    "{why} current={current} used={used} cap={cap} free={free} owed={owed} ({r})"
+                ));
+            } else {
+                need
+            };
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Err(ClaimRefused::Gone);
+            };
+            v.estimated_bytes = to;
+            (current, to)
+        };
+        emit(
+            false,
+            format!(
+                "pharos: video keep reservation verdict=extended item={item} run={run} from={} to={} need={need}",
+                grown.0, grown.1
+            ),
+        );
+        // On disk before more is written: a restart must not read the
+        // smaller figure. A failed save keeps the larger one in memory.
+        if let Err(e) = self.save_record(user, item) {
+            emit(
+                true,
+                format!("pharos: video keep reservation not saved item={item} error={e}"),
+            );
+        }
+        Ok(())
+    }
+
     /// Indexes a whole file for `run`; false when `run` no longer owns the
     /// download, which indexes nothing.
     fn record_file(
@@ -1351,6 +1538,20 @@ async fn fetch_file(
                 );
                 return Err(Stop::Refused(reason));
             }
+            FetchOnce::OverReservation(why) => {
+                let reason = format!(
+                    "{} is larger than its download's reservation, which could not grow: {why}",
+                    url_path(key)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=reservation_exceeded url_path={} why={why}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
             FetchOnce::Fetch(e) => e,
         };
         attempt += 1;
@@ -1379,6 +1580,9 @@ enum FetchOnce {
     Store(String),
     /// The body passed the size limit set for it (a playlist's).
     TooLarge(u64),
+    /// A media body passed the run's reservation, which could not grow to
+    /// hold it, and why.
+    OverReservation(String),
     /// The download was removed or restarted while this run was fetching.
     Gone,
 }
@@ -1452,6 +1656,7 @@ async fn fetch_once(
                 who,
                 len: 0,
                 part: part.clone(),
+                claim: 0,
             },
         )
     };
@@ -1472,6 +1677,17 @@ async fn fetch_once(
                         inner.remove_staging(&part);
                         return Err(FetchOnce::TooLarge(limit));
                     }
+                } else if let Err(refused) = staged.claim(chunk.len() as u64) {
+                    // A media body has no limit of its own: past the run's
+                    // reservation it is written on only once the
+                    // reservation has grown to hold it, under the checks
+                    // admission makes.
+                    drop(file);
+                    inner.remove_staging(&part);
+                    return Err(match refused {
+                        ClaimRefused::Gone => FetchOnce::Gone,
+                        ClaimRefused::Reason(why) => FetchOnce::OverReservation(why),
+                    });
                 }
                 file.write_all(&chunk)
                     .await
@@ -4788,6 +5004,94 @@ mod tests {
         .is_empty());
     }
 
+    /// A media body larger than the plan's estimate. With room, the
+    /// reservation grows ahead of the chunk that would pass it and the
+    /// download finishes counted. Over the shared cap, or with the free
+    /// space below the guard, that chunk is refused: nothing past the
+    /// reservation is written, its staging file goes, and the download
+    /// fails naming the reason.
+    #[tokio::test]
+    async fn a_chunk_past_the_reservation_is_refused_unless_the_reservation_can_grow() {
+        // The plan estimates 3 MB; the segment alone is 4 MB, in two chunks.
+        let big = 4_000_000u64;
+        for case in ["cap", "floor", "roomy"] {
+            let rig = Rig::new(&format!("grow-{case}"));
+            rig.server
+                .files
+                .lock()
+                .unwrap()
+                .insert(SEG1.into(), vec![3; usize::try_from(big).unwrap()]);
+            let cap = 3_200_000;
+            if case == "cap" {
+                rig.budget.cap.store(cap, Ordering::SeqCst);
+            }
+            let release = rig.server.hold_mid_body(SEG1);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            let files = rig.dir.join("u1").join("1").join("files");
+            // The first chunk is written: the disk fills up now.
+            let mut waited = 0;
+            while dir_size(&files).bytes < big / 2 {
+                waited += 1;
+                assert!(waited < 5_000, "{case}: the first chunk never landed");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            if case == "floor" {
+                rig.budget
+                    .free
+                    .store(FREE_GUARD_BYTES + 100_000, Ordering::SeqCst);
+            }
+            release.store(true, Ordering::SeqCst);
+            store.settled().await;
+            let v = only(&store);
+            let on_disk = dir_size(&files).bytes;
+            if case == "roomy" {
+                assert_eq!(v.state, KeptState::Ready, "{case}");
+                assert!(
+                    store.kept_bytes() >= on_disk && on_disk >= big,
+                    "{case}: kept {} of {on_disk}",
+                    store.kept_bytes()
+                );
+                assert!(!lines("pharos: video keep reservation verdict=extended").is_empty());
+                continue;
+            }
+            let KeptState::Failed { reason } = &v.state else {
+                panic!("{case}: a chunk past the reservation was written: {v:?}");
+            };
+            let why = if case == "cap" {
+                "reason=over_cap"
+            } else {
+                "reason=low_space"
+            };
+            assert!(reason.contains(why), "{case}: {reason}");
+            assert!(
+                lines("pharos: video keep refused")
+                    .iter()
+                    .any(|l| l.contains("reason=reservation_exceeded") && l.contains(why)),
+                "{case}: {:?}",
+                captured()
+            );
+            assert!(
+                on_disk < big,
+                "{case}: the second chunk was written ({on_disk})"
+            );
+            assert!(
+                std::fs::read_dir(&files)
+                    .unwrap()
+                    .flatten()
+                    .all(|e| e.path().extension().is_none_or(|x| x != "part")),
+                "{case}: the refused chunk's staging file stayed"
+            );
+            if case == "cap" {
+                assert!(
+                    store.kept_bytes() <= cap,
+                    "{case}: kept {}",
+                    store.kept_bytes()
+                );
+            }
+        }
+    }
+
     /// A playlist past its limit is refused and not kept: its reservation
     /// was for the limit.
     #[tokio::test]
@@ -4993,6 +5297,7 @@ mod tests {
             who: ("u1".to_owned(), "1".to_owned(), run + 1_000),
             len: 0,
             part: PathBuf::new(),
+            claim: 0,
         };
         stale.add(7_000);
         assert_eq!(store.staged_bytes(), 7_050);
