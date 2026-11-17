@@ -8564,6 +8564,7 @@ dependencies = [
  "skrifa 0.50.0",
  "unicode-bidi",
  "unicode-linebreak",
+ "unicode-normalization",
 ]
 
 [[package]]
