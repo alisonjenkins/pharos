@@ -5310,10 +5310,30 @@ mod tests {
     #[tokio::test]
     async fn a_removal_and_restart_before_the_prune_leave_the_replacements_files() {
         let rig = Rig::new("prune-gap");
+        // The same stream under a second session id, for the replacement.
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            let renamed: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(k, v)| {
+                    let body = match String::from_utf8(v.clone()) {
+                        Ok(text) if text.starts_with("#EXTM3U") => text
+                            .replace("PlaySessionId=p", "PlaySessionId=q")
+                            .into_bytes(),
+                        _ => v.clone(),
+                    };
+                    (k.replace("PlaySessionId=p", "PlaySessionId=q"), body)
+                })
+                .collect();
+            files.extend(renamed);
+        }
         let store = rig.open();
         let dir = rig.dir.join("u1").join("1");
         let (s2, d2) = (store.clone(), dir.clone());
-        let fresh = dir.join("files").join(file_name("/new/session/0.m4s"));
+        // A file of the replacement's plan, which the old plan does not name.
+        let fresh = dir.join("files").join(file_name(
+            &SEG0.replace("PlaySessionId=p", "PlaySessionId=q"),
+        ));
         let f2 = fresh.clone();
         let once = std::cell::Cell::new(false);
         set_hook(&BEFORE_PRUNE, move || {
@@ -5321,7 +5341,9 @@ mod tests {
                 return;
             }
             s2.remove("u1", "1");
-            s2.start(request("1")).unwrap();
+            let mut req = request("1");
+            req.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+            s2.start(req).unwrap();
             // The replacement has stored a file of its own plan.
             std::fs::create_dir_all(d2.join("files")).unwrap();
             std::fs::write(&f2, b"replacement").unwrap();
