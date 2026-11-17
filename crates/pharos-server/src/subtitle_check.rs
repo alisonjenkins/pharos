@@ -439,6 +439,11 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
                 tokio::time::sleep(self.health_poll).await;
                 continue;
             }
+            // A song may have been queued while the transcodes or the health
+            // check were waited on: look again before sending.
+            if self.aligner.busy() {
+                continue;
+            }
             return;
         }
     }
@@ -705,6 +710,10 @@ mod tests {
         offset_ms: i64,
         fail: AtomicUsize,
         busy: AtomicUsize,
+        /// Looks answered idle before `busy` starts counting.
+        busy_skip: AtomicUsize,
+        /// `busy` left at each request.
+        busy_at_send: Mutex<Vec<usize>>,
         healthy: bool,
         /// Fail only this request (0-based), when set.
         fail_call: Option<usize>,
@@ -720,6 +729,8 @@ mod tests {
                 offset_ms: 0,
                 fail: AtomicUsize::new(0),
                 busy: AtomicUsize::new(0),
+                busy_skip: AtomicUsize::new(0),
+                busy_at_send: Mutex::default(),
                 healthy: true,
                 fail_call: None,
                 calls: Mutex::default(),
@@ -733,6 +744,13 @@ mod tests {
 
     impl Scorer for &Fake {
         fn busy(&self) -> bool {
+            if self
+                .busy_skip
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return false;
+            }
             self.busy
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
@@ -745,6 +763,10 @@ mod tests {
             path: &Path,
             lines: &[(u64, u64, String)],
         ) -> Result<Aligned, String> {
+            self.busy_at_send
+                .lock()
+                .unwrap()
+                .push(self.busy.load(Ordering::SeqCst));
             let mut calls = self.calls.lock().unwrap();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             // Probes and decoys alternate: the probe request comes first.
@@ -1035,6 +1057,23 @@ mod tests {
             "waited out the queue"
         );
         assert_eq!(row(&lib, 1).await.verdict.as_deref(), Some("unknown"));
+    }
+
+    #[tokio::test]
+    async fn a_song_queued_during_the_other_waits_still_goes_first() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let fake = Fake::new(900, 250);
+        // Idle at the first look, then a song arrives before the request.
+        fake.busy_skip.store(1, Ordering::SeqCst);
+        fake.busy.store(2, Ordering::SeqCst);
+        job(&lib, &fake).run_pass().await;
+        assert_eq!(
+            *fake.busy_at_send.lock().unwrap(),
+            [0, 0],
+            "no request went out while a song was queued"
+        );
+        assert_eq!(fake.calls().len(), 2);
     }
 
     #[tokio::test]
