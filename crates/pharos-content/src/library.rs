@@ -540,17 +540,21 @@ impl Library {
     /// (see [`super::cache::DEFAULT_CAP_BYTES`]). Call once after
     /// [`Library::connect`]; calling again is a no-op.
     pub fn enable_cache(&self, dir: &Path, default_cap: u64) -> Result<(), ContentError> {
-        self.enable_cache_with(dir, default_cap, || {}, || {})
+        self.enable_cache_with(dir, default_cap, || {}, || {}, || {})
     }
 
-    /// [`Library::enable_cache`] with a hook that runs just before the
-    /// downloader is published, so a test can land a network change there.
+    /// [`Library::enable_cache`] with seams for tests: `before_publish` runs
+    /// just before the downloader is published (a network change lands
+    /// there), `between_read_and_apply` between reading the outside hook and
+    /// applying it, and `after_publish` once the downloader is reachable but
+    /// before the enable is finished.
     fn enable_cache_with(
         &self,
         dir: &Path,
         default_cap: u64,
         before_publish: impl FnOnce(),
         between_read_and_apply: impl FnOnce(),
+        after_publish: impl FnOnce(),
     ) -> Result<(), ContentError> {
         if self.offline.get().is_some() {
             return Ok(());
@@ -573,26 +577,32 @@ impl Library {
             }
         }
         downloader.set_online(self.online.load(Ordering::SeqCst));
-        before_publish();
-        let _ = self.offline.set(Offline {
-            cache: cache.clone(),
-            downloader,
-        });
-        // After publishing, so a hook set while this ran is not missed: it
-        // either saw the cache and applied itself, or is read here.
-        // The lock is held while the hook is applied, as `set_outside_used`
-        // holds it: a newer hook cannot be stored and applied in the gap
-        // between this read and this apply, only to be overwritten by the
-        // older one read here.
+        // The pending hook is applied before the downloader is published: a
+        // `prefetch` that reaches it at once must already see what video
+        // holds, never the empty default. The lock is held from the read
+        // through the publish, as `set_outside_used` holds it from its store
+        // through its apply: a hook set meanwhile waits, then finds the cache
+        // published and applies itself, so the older one read here can never
+        // land over it.
         {
             let outside = self
                 .outside_used
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             between_read_and_apply();
-            if let Some(outside) = outside.clone() {
+            let hook = if let Some(outside) = outside.clone() {
                 cache.set_outside_used(outside);
-            }
+                "pending"
+            } else {
+                "none"
+            };
+            before_publish();
+            let _ = self.offline.set(Offline {
+                cache: cache.clone(),
+                downloader,
+            });
+            log::info!("cache enabled outside_hook={hook} applied=before_publish");
+            after_publish();
             self.outside_ready.store(true, Ordering::SeqCst);
         }
         // A `set_online` that landed before the downloader was published
@@ -1334,8 +1344,14 @@ mod tests {
         let base = dead_server();
         let tok = std::env::temp_dir().join(format!("pharos-auto-lib-race-{}", std::process::id()));
         let lib = Library::connect_with(&base, &tok, quick()).unwrap();
-        lib.enable_cache_with(&cache_dir("race"), 1 << 20, || lib.set_online(false), || {})
-            .unwrap();
+        lib.enable_cache_with(
+            &cache_dir("race"),
+            1 << 20,
+            || lib.set_online(false),
+            || {},
+            || {},
+        )
+        .unwrap();
         assert!(!lib.is_online());
         assert!(!lib.offline.get().unwrap().downloader.is_online());
     }
@@ -1422,6 +1438,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             },
+            || {},
         )
         .unwrap();
         handle.unwrap().join().unwrap();
@@ -1442,8 +1459,9 @@ mod tests {
             &cache_dir("pins-wait"),
             1 << 20,
             || {},
+            || {},
             || {
-                // The cache is published, the hook not yet applied.
+                // The cache is published, the enable not yet finished.
                 lib.set_online(true);
                 mid.set(Some(lib.pins_resumed.load(Ordering::SeqCst)));
             },
@@ -1457,6 +1475,51 @@ mod tests {
         assert!(
             lib.pins_resumed.load(Ordering::SeqCst),
             "pins never resumed after"
+        );
+    }
+
+    /// A `prefetch` that reaches the downloader the moment it is published
+    /// is admitted against the pending outside hook, not the empty default:
+    /// with a video folder of unknown size, its first admission asks the
+    /// hook and is refused.
+    #[test]
+    fn a_prefetch_as_the_cache_comes_up_sees_the_pending_outside_hook() {
+        let tok = std::env::temp_dir().join(format!(
+            "pharos-auto-lib-prefetch-gap-{}",
+            std::process::id()
+        ));
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        lib.set_outside_used(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            cache::OutsideBytes {
+                unknown: true,
+                ..cache::OutsideBytes::default()
+            }
+        }));
+        let asked = std::cell::Cell::new(false);
+        lib.enable_cache_with(
+            &cache_dir("prefetch-gap"),
+            1 << 20,
+            || {},
+            || {},
+            || {
+                let before = calls.load(Ordering::SeqCst);
+                assert_eq!(lib.prefetch(&["track/x".into()]), 1);
+                let start = std::time::Instant::now();
+                while calls.load(Ordering::SeqCst) == before
+                    && start.elapsed() < Duration::from_secs(2)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                asked.set(calls.load(Ordering::SeqCst) > before);
+            },
+        )
+        .unwrap();
+        assert!(
+            asked.get(),
+            "the prefetch was admitted without the pending hook"
         );
     }
 
