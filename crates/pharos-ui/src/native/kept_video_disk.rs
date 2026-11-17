@@ -138,6 +138,13 @@ struct State {
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
     tombstones: Vec<(PathBuf, u64)>,
+    /// Folders found at open whose record could not be read: kept, never
+    /// swept, and counted against the cap at the bytes measured.
+    held: Vec<(PathBuf, u64)>,
+    /// Folders whose size, or whose record's reservation, is not known:
+    /// no download is admitted while one exists, since the cap cannot be
+    /// checked against what is on disk. Each carries the reason.
+    unmeasured: Vec<(PathBuf, String)>,
     /// The store's root, to tell a record's folder from a tombstone's.
     root: PathBuf,
     last_saved: Option<Instant>,
@@ -273,6 +280,7 @@ impl State {
     fn tombstoned(&self) -> u64 {
         self.tombstones
             .iter()
+            .chain(self.held.iter())
             .filter(|(dir, _)| {
                 !self
                     .list
@@ -280,6 +288,16 @@ impl State {
                     .any(|v| self.root.join(safe_name(&v.user)).join(safe_name(&v.item)) == *dir)
             })
             .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+    }
+
+    /// Why nothing can be admitted now, when a folder's size is unknown.
+    fn unknown_folder(&self) -> Option<KeepVideoRefusal> {
+        self.unmeasured.first().map(|(dir, why)| {
+            KeepVideoRefusal::Host(format!(
+                "the size of {} is unknown ({why}), so the cap cannot be checked",
+                dir.display()
+            ))
+        })
     }
 
     /// Every video's reservation but `item`'s own, and the tombstones'.
@@ -383,6 +401,7 @@ impl Inner {
             match outcome {
                 Ok(()) => {
                     st.tombstones.retain(|(d, _)| *d != dir);
+                    st.unmeasured.retain(|(d, _)| *d != dir);
                     emit(
                         false,
                         format!("pharos: video keep tombstone cleared dir={}", dir.display()),
@@ -395,7 +414,15 @@ impl Inner {
                         .iter()
                         .find(|(d, _)| *d == dir)
                         .map_or(0, |t| t.1);
-                    let bytes = dir_size(&dir).counted(before);
+                    let measured = dir_size(&dir);
+                    let bytes = measured.counted(before);
+                    st.unmeasured.retain(|(d, _)| *d != dir);
+                    if !measured.exact {
+                        st.unmeasured.push((
+                            dir.clone(),
+                            "folder not deleted, not fully readable".to_owned(),
+                        ));
+                    }
                     if let Some(t) = st.tombstones.iter_mut().find(|(d, _)| *d == dir) {
                         t.1 = bytes;
                     }
@@ -551,6 +578,14 @@ impl Inner {
             // the stale (higher) owed figure only makes the check stricter.
             // The other order counts that write as room.
             let outstanding = st.outstanding(user, item);
+            if let Some(refusal) = st.unknown_folder() {
+                return Err(Admission::Refused {
+                    refusal,
+                    used: 0,
+                    free: 0,
+                    outstanding,
+                });
+            }
             let free = self.env.budget.free_bytes();
             let verdict = match check {
                 Check::Fresh { other, cap } => {
@@ -864,6 +899,29 @@ fn clear_parts(dir: &Path) {
     }
 }
 
+/// A folder whose record cannot be read is left alone, never deleted. Its
+/// bytes (as far as they can be read) count against the cap, and since the
+/// record's own reservation is lost, nothing is admitted while it stays.
+fn hold_folder(
+    dir: &Path,
+    why: &str,
+    held: &mut Vec<(PathBuf, u64)>,
+    unmeasured: &mut Vec<(PathBuf, String)>,
+) {
+    let m = dir_size(dir);
+    emit(
+        true,
+        format!(
+            "pharos: video folder held dir={} reason={why} bytes={} exact={} admission=blocked",
+            dir.display(),
+            m.bytes,
+            m.exact
+        ),
+    );
+    held.push((dir.to_path_buf(), m.bytes));
+    unmeasured.push((dir.to_path_buf(), why.to_owned()));
+}
+
 /// What a walk of a folder found.
 struct Measured {
     bytes: u64,
@@ -887,6 +945,13 @@ impl Measured {
 /// Every byte of every file under `dir`, whatever it is. A folder that is
 /// gone holds nothing; one that cannot be read is not counted as empty.
 fn dir_size(dir: &Path) -> Measured {
+    #[cfg(test)]
+    if tests::UNREADABLE.with(|u| u.borrow().iter().any(|p| p == dir)) {
+        return Measured {
+            bytes: 0,
+            exact: false,
+        };
+    }
     let read = match std::fs::read_dir(dir) {
         Ok(read) => read,
         Err(e) => {
@@ -1278,6 +1343,8 @@ impl DiskVideoStore {
         let mut list = Vec::new();
         let mut index = HashMap::new();
         let mut tombstones: Vec<(PathBuf, u64)> = Vec::new();
+        let mut held: Vec<(PathBuf, u64)> = Vec::new();
+        let mut unmeasured: Vec<(PathBuf, String)> = Vec::new();
         for user_dir in dirs(&inner.root) {
             for item_dir in dirs(&user_dir) {
                 let manifest = item_dir.join("manifest.json");
@@ -1285,12 +1352,11 @@ impl DiskVideoStore {
                     Ok(bytes) => match serde_json::from_slice::<KeptVideo>(&bytes) {
                         Ok(v) => v,
                         Err(e) => {
-                            emit(
-                                true,
-                                format!(
-                                    "pharos: video record damaged dir={} error={e}",
-                                    item_dir.display()
-                                ),
+                            hold_folder(
+                                &item_dir,
+                                &format!("record damaged: {e}"),
+                                &mut held,
+                                &mut unmeasured,
                             );
                             continue;
                         }
@@ -1299,20 +1365,39 @@ impl DiskVideoStore {
                         // A record that is there but cannot be read (a
                         // permissions fault, say) is not a removed one:
                         // its folder is left alone, not deleted.
-                        emit(
-                            true,
-                            format!(
-                                "pharos: video record unreadable dir={} error={e}",
-                                item_dir.display()
-                            ),
+                        hold_folder(
+                            &item_dir,
+                            &format!("record unreadable: {e}"),
+                            &mut held,
+                            &mut unmeasured,
                         );
                         continue;
                     }
                     Err(_) => {
                         // No record: a removed download whose folder did
                         // not delete. Try again; what stays still counts.
-                        if (inner.env.remove_dir)(&item_dir).is_err() {
-                            tombstones.push((item_dir.clone(), dir_size(&item_dir).counted(0)));
+                        if let Err(e) = (inner.env.remove_dir)(&item_dir) {
+                            // The figure from before the restart is gone:
+                            // what is measured now is all that counts, and
+                            // a folder not seen whole blocks admission.
+                            let m = dir_size(&item_dir);
+                            emit(
+                                true,
+                                format!(
+                                    "pharos: video keep tombstone dir={} bytes={} exact={} error={e}",
+                                    item_dir.display(),
+                                    m.bytes,
+                                    m.exact
+                                ),
+                            );
+                            if !m.exact {
+                                unmeasured.push((
+                                    item_dir.clone(),
+                                    "removed download's folder not deleted, not fully readable"
+                                        .to_owned(),
+                                ));
+                            }
+                            tombstones.push((item_dir.clone(), m.bytes));
                         }
                         continue;
                     }
@@ -1356,6 +1441,8 @@ impl DiskVideoStore {
             st.list = list;
             st.index = index;
             st.tombstones = tombstones;
+            st.held = held;
+            st.unmeasured = unmeasured;
             st.root.clone_from(&inner.root);
         }
         emit(
@@ -1445,24 +1532,28 @@ impl VideoStore for DiskVideoStore {
             // Owed bytes first, then the free space (as in `admit`).
             let owed = st.outstanding(&user, &item);
             let room = budget.free_bytes().saturating_sub(owed);
-            let started = fits(0, used, cap, room).and_then(|()| {
-                check_not_kept(&st.list, &user, &item)?;
-                let mut record = new_record(&request, (self.inner.env.now)());
-                // A failed attempt's files stay on disk until a plan prunes
-                // them; the replacement keeps counting them meanwhile.
-                if let Some(old) = find(&st.list, &user, &item) {
-                    record.estimated_bytes = old.estimated_bytes;
-                }
-                // So do the bytes of a removed download's folder that would
-                // not delete: once a live record owns the folder they stop
-                // counting as a tombstone.
-                let dir = self.inner.item_dir(&user, &item);
-                if let Some((_, left)) = st.tombstones.iter().find(|(d, _)| *d == dir) {
-                    record.estimated_bytes = record.estimated_bytes.max(*left);
-                }
-                insert_front(&mut st.list, record);
-                Ok(())
-            });
+            let started = st
+                .unknown_folder()
+                .map_or(Ok(()), Err)
+                .and_then(|()| fits(0, used, cap, room))
+                .and_then(|()| {
+                    check_not_kept(&st.list, &user, &item)?;
+                    let mut record = new_record(&request, (self.inner.env.now)());
+                    // A failed attempt's files stay on disk until a plan prunes
+                    // them; the replacement keeps counting them meanwhile.
+                    if let Some(old) = find(&st.list, &user, &item) {
+                        record.estimated_bytes = old.estimated_bytes;
+                    }
+                    // So do the bytes of a removed download's folder that would
+                    // not delete: once a live record owns the folder they stop
+                    // counting as a tombstone.
+                    let dir = self.inner.item_dir(&user, &item);
+                    if let Some((_, left)) = st.tombstones.iter().find(|(d, _)| *d == dir) {
+                        record.estimated_bytes = record.estimated_bytes.max(*left);
+                    }
+                    insert_front(&mut st.list, record);
+                    Ok(())
+                });
             (started, used)
         };
         if let Err(refusal) = started {
@@ -1611,6 +1702,11 @@ mod tests {
         /// With `FAIL_REMOVE`, the folder is also left unreadable: a plain
         /// file stands where it was.
         static LEAVE_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Folders `dir_size` cannot read (a root user cannot be denied).
+        pub(super) static UNREADABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
     thread_local! {
@@ -2838,12 +2934,68 @@ mod tests {
         let store = rig.open();
         assert!(dir.join("files").join("keep").exists(), "the folder went");
         assert!(store.videos("u1").is_empty());
-        assert_eq!(
-            lines("pharos: video record unreadable").len(),
-            1,
-            "{:?}",
-            lines("pharos: video record")
+        let held = lines("pharos: video folder held");
+        assert!(
+            held.len() == 1
+                && held[0].contains("reason=record unreadable")
+                && held[0].contains("admission=blocked"),
+            "{held:?}"
         );
+        // The folder's bytes count against the cap, though it is not swept,
+        // and nothing is admitted while its record's reservation is lost.
+        assert_eq!(store.kept_bytes(), 5, "the held folder counts for nothing");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+        assert!(dir.join("files").join("keep").exists(), "swept");
+    }
+
+    /// A damaged manifest is held the same way.
+    #[tokio::test]
+    async fn a_damaged_manifest_folder_counts_and_blocks_admission() {
+        let rig = Rig::new("manifest-damaged");
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{ not json").unwrap();
+        let store = rig.open();
+        assert_eq!(store.kept_bytes(), 10);
+        assert!(matches!(
+            store.start(request("2")),
+            Err(KeepVideoRefusal::Host(_))
+        ));
+    }
+
+    /// A restart while a removed download's folder will not delete and
+    /// cannot be fully read: the figure from before the restart is gone, so
+    /// nothing is admitted until a sweep deletes it.
+    #[tokio::test]
+    async fn a_restart_over_a_folder_that_will_not_delete_and_is_unreadable_blocks_admission() {
+        let rig = Rig::new("reopen-unreadable");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        drop(store);
+
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let store = rig.open();
+        let line = lines("pharos: video keep tombstone dir=");
+        assert!(line.iter().any(|l| l.contains("exact=false")), "{line:?}");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+
+        // Once the folder can be deleted, the sweep clears the block.
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        FAIL_REMOVE.with(|f| f.set(false));
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the sweep deleted it");
+        assert_eq!(store.videos("u1")[0].state, KeptState::Ready);
     }
 
     /// A manifest that cannot be unlinked would bring the download back at
