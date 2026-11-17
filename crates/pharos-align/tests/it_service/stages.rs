@@ -427,6 +427,22 @@ fn a_named_audio_stream_is_decoded_from_that_stream_only() {
 }
 
 #[test]
+fn a_named_audio_stream_with_the_stages_on_is_refused() {
+    let stream: StreamDecoder = Box::new(|_: &Path, _, _, _| Ok(vec![0.0; 16]));
+    let engine = Engine::new(loader(None), silent(), None)
+        .with_stream_decoder(stream)
+        .with_stages(Box::new(panicking()));
+    let opts = SongOptions {
+        audio_stream: Some(2),
+        stages: true,
+    };
+    match run_with(&engine, opts) {
+        Err(SongError::Internal(m)) => assert!(m.contains("default audio"), "{m}"),
+        other => panic!("{:?}", other.map(|a| a.placement)),
+    }
+}
+
+#[test]
 fn a_named_audio_stream_without_a_stream_decoder_is_refused() {
     let engine = Engine::new(loader(None), silent(), None);
     let opts = SongOptions {

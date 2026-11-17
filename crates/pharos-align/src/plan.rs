@@ -79,6 +79,10 @@ pub enum RequestError {
     Escapes,
     #[error("stages must be a boolean")]
     StagesNotBool,
+    /// The refine stages decode the file's default audio, so a named stream
+    /// would be aligned from one track and refined from another.
+    #[error("audio_stream needs \"stages\": false")]
+    StreamWithStages,
 }
 
 /// Optional `/align` fields beyond the Python service's (spec 040 FR-002a):
@@ -121,6 +125,9 @@ pub fn parse_options(body: &Value) -> Result<SongOptions, RequestError> {
         None | Some(Value::Null) => {}
         Some(Value::Bool(b)) => out.stages = *b,
         Some(_) => return Err(RequestError::StagesNotBool),
+    }
+    if out.audio_stream.is_some() && out.stages {
+        return Err(RequestError::StreamWithStages);
     }
     Ok(out)
 }
@@ -357,6 +364,13 @@ mod tests {
             err(serde_json::json!({"stages": "no"})),
             "stages must be a boolean"
         );
+        // The stages decode the default audio, not the named stream.
+        for extra in [
+            serde_json::json!({"audio_stream": 2}),
+            serde_json::json!({"audio_stream": 2, "stages": true}),
+        ] {
+            assert_eq!(err(extra), "audio_stream needs \"stages\": false");
+        }
     }
 
     /// Lines at the limit go through the line window and the offset probe
