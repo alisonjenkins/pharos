@@ -1473,13 +1473,29 @@ fn disk_bytes(dir: &Path) -> Measured {
 /// forgets them: a retry that planned afresh (a new play session names
 /// every file anew) must not leave the old plan's files on the disk.
 /// Returns the bytes of unplanned files that could not be deleted, which
-/// still count against the cap.
-fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) -> u64 {
+/// still count against the cap; `None` when `run` no longer owns the item.
+/// Ownership is checked under the state lock, and the lock is held through
+/// the deletes and the index, as in `drop_refused_files`, so a removal and
+/// restart in between cannot have the replacement's files deleted. A
+/// listing that came back short never shrinks what the record already
+/// reserved, and leaves the folder unknown until a sweep measures it.
+fn prune_unplanned(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    plan: &[String],
+) -> Option<u64> {
     let dir = inner.item_dir(user, item);
     let keep: HashSet<String> = plan.iter().map(|k| file_name(k)).collect();
     let files = dir.join("files");
+    let mut st = lock(&inner.state);
+    if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+        return None;
+    }
+    let names = stored_names(&dir);
     let (mut removed, mut bytes, mut left) = (0usize, 0u64, 0u64);
-    for (name, len) in stored_names(&dir) {
+    for (name, len) in names {
         if keep.contains(&name) {
             continue;
         }
@@ -1490,12 +1506,13 @@ fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) -> u6
             left = left.saturating_add(len);
         }
     }
-    lock(&inner.state).index.retain(|_, (path, _)| {
+    st.index.retain(|_, (path, _)| {
         path.parent() != Some(files.as_path()) || {
             path.file_name()
                 .is_some_and(|n| keep.contains(n.to_string_lossy().as_ref()))
         }
     });
+    drop(st);
     if removed > 0 {
         emit(
             false,
@@ -1508,7 +1525,7 @@ fn prune_unplanned(inner: &Inner, user: &str, item: &str, plan: &[String]) -> u6
             format!("pharos: video keep prune left item={item} bytes={left}"),
         );
     }
-    left
+    Some(left)
 }
 
 /// One planned file; the sliver of a last segment may go without. The
@@ -1583,7 +1600,11 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     if !inner.wanted(user, item, run) {
         return Err(Stop::Gone);
     }
-    let stale = prune_unplanned(inner, user, item, &all);
+    #[cfg(test)]
+    tests::before_prune();
+    let Some(stale) = prune_unplanned(inner, user, item, run, &all) else {
+        return Err(Stop::Gone);
+    };
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
     let names = stored_names(&inner.item_dir(user, item));
@@ -2487,6 +2508,19 @@ mod tests {
         /// While set, reading a directory entry fails after the directory
         /// opened.
         pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Runs between a plan being wanted and its prune.
+        static BEFORE_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_prune() {
+        BEFORE_PRUNE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     pub(super) fn before_settle_drop() {
@@ -5223,6 +5257,37 @@ mod tests {
         store.settled().await;
         FAIL_REMOVE.with(|f| f.set(false));
         assert_eq!(store.videos("u1").len(), 2);
+    }
+
+    /// A removal and restart that land between a plan being wanted and its
+    /// prune: the old run deletes nothing, because it no longer owns the
+    /// item.
+    #[tokio::test]
+    async fn a_removal_and_restart_before_the_prune_leave_the_replacements_files() {
+        let rig = Rig::new("prune-gap");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        let (s2, d2) = (store.clone(), dir.clone());
+        let fresh = dir.join("files").join(file_name("/new/session/0.m4s"));
+        let f2 = fresh.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PRUNE, move || {
+            if once.replace(true) {
+                return;
+            }
+            s2.remove("u1", "1");
+            s2.start(request("1")).unwrap();
+            // The replacement has stored a file of its own plan.
+            std::fs::create_dir_all(d2.join("files")).unwrap();
+            std::fs::write(&f2, b"replacement").unwrap();
+        });
+        store.start(request("1")).unwrap();
+        // The old run is the first task; the replacement's is the second.
+        let first = store.inner.tasks.lock().unwrap().remove(0);
+        let _ = first.await;
+        assert!(fresh.exists(), "the old run deleted the replacement's file");
+        clear_hook(&BEFORE_PRUNE);
+        store.settled().await;
     }
 
     /// A download removed while it plans answers nothing afterwards: the
