@@ -402,6 +402,33 @@ pub fn stored_for(
     store.stored_file(user, key)
 }
 
+/// What the proxy answers a request for `path_and_query` with from the
+/// stored downloads, decided in one place: the signed-in user as of now
+/// (read on the caller's thread, so a sign-out after it does not change the
+/// request's answer), the request's key, and the store's lookup. `None` with
+/// no store, nobody signed in, another user's file, or nothing stored. The
+/// Android proxy keeps only the WebView glue around this.
+pub fn offline_file_for(
+    store: Option<&dyn super::kept_video::VideoStore>,
+    path_and_query: &str,
+) -> Option<super::kept_video::StoredFile> {
+    let user = last_user();
+    stored_for(
+        store?,
+        user.as_deref(),
+        &super::kept_video::request_key(path_and_query),
+    )
+}
+
+/// The headers a stored file is answered with.
+pub fn offline_headers(file: &super::kept_video::StoredFile) -> [(&'static str, &'static str); 3] {
+    [
+        ("access-control-allow-origin", "*"),
+        ("content-type", file.content_type),
+        ("cache-control", "private, max-age=31536000, immutable"),
+    ]
+}
+
 /// The ready downloads of the remembered user, newest first; empty with no
 /// store or no remembered user.
 pub fn ready_for_last_user() -> Vec<KeptVideo> {
@@ -652,6 +679,85 @@ mod tests {
         set_identity(Identity::Unknown);
         assert_eq!(last_user().as_deref(), Some("B"));
         assert!(!serves(last_user()), "B has nothing downloaded");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A store holding A's file on disk, for the answer the proxy gives.
+    struct OnDisk(std::path::PathBuf);
+
+    impl super::super::kept_video::VideoStore for OnDisk {
+        fn start(
+            &self,
+            _: super::super::kept_video::KeepVideoRequest,
+        ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+        fn stored_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+            (user == "A" && key.starts_with("/videos/1/seg.m4s")).then(|| StoredFile {
+                path: self.0.clone(),
+                len: 5,
+                content_type: "video/mp4",
+            })
+        }
+    }
+
+    /// The whole answer the proxy gives, through the function it calls: A
+    /// keeps a download, signs out with the token's delete failing, B signs
+    /// in, the app restarts: nothing of A's is answered. A signing in again
+    /// gets A's bytes. Real token file; the store holds A's file on disk.
+    #[test]
+    fn the_proxys_answer_after_a_failed_sign_out_and_a_switch_never_gives_a_the_bytes_to_b() {
+        use super::super::token_file;
+        let d = std::env::temp_dir().join(format!("pharos-ov-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join("a.m4s");
+        std::fs::write(&file, b"A-own").unwrap();
+        let store = OnDisk(file.clone());
+        let path = d.join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        let ask = || offline_file_for(Some(&store), "/videos/1/seg.m4s?PlaySessionId=p");
+        let bytes = |f: StoredFile| std::fs::read(f.path).unwrap();
+
+        token_file::store(&path, "tokA").unwrap();
+        remember_user("A");
+        set_identity(Identity::Unknown);
+        assert_eq!(bytes(ask().unwrap()), b"A-own", "A's own restart");
+
+        forget_user();
+        assert!(ask().is_none(), "answered after the sign-out");
+        token_file::store(&path, "tokB").unwrap();
+        // The restart, before B's `me`; the preference still names A.
+        *p.value.borrow_mut() = Some("A".to_owned());
+        set_identity(Identity::Unknown);
+        assert!(ask().is_none(), "A's bytes answered under B's token");
+        remember_user("B");
+        set_identity(Identity::Unknown);
+        assert!(ask().is_none(), "A's bytes answered to B");
+
+        // A signs in again.
+        token_file::store(&path, "tokA2").unwrap();
+        remember_user("A");
+        set_identity(Identity::Unknown);
+        let answer = ask().expect("A gets A's file");
+        assert_eq!(offline_headers(&answer)[1], ("content-type", "video/mp4"));
+        assert_eq!(bytes(answer), b"A-own");
+        assert!(offline_file_for(None, "/videos/1/seg.m4s").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -3275,18 +3275,13 @@ fn log_video_request(key: &str, verdict: Verdict, bytes: u64) {
     }
 }
 
-/// The stored copy of the request for `key`, read whole: the WebView's
-/// response is a buffer, and a segment is a few MB at most. `None` when
-/// nothing is stored, or the file would not read (logged; the network
-/// answers instead).
-///
-/// Only the signed-in user's own downloads answer: the files stay on disk
-/// after a sign-out (the same user gets them back), but with nobody signed
-/// in, or another account, nothing is served from them.
-async fn stored_answer(user: Option<&str>, key: &str) -> Option<(StoredFile, Vec<u8>)> {
-    let file = super::offline_video::stored_for(&*super::ports::video_store()?, user, key)?;
+/// The stored file's bytes, read whole: the WebView's response is a buffer,
+/// and a segment is a few MB at most. `None` when the file would not read
+/// (logged; the network answers instead). Which file answers, and for whom,
+/// is decided by `offline_video::offline_file_for`, off the device.
+async fn read_stored(file: &StoredFile, key: &str) -> Option<Vec<u8>> {
     match tokio::fs::read(&file.path).await {
-        Ok(body) => Some((file, body)),
+        Ok(body) => Some(body),
         Err(e) => {
             log::warn!(
                 "pharos: video request class={} verdict=stored_unreadable url_path={} error={e}",
@@ -3319,30 +3314,35 @@ pub fn use_server_proxy() {
                 .iter()
                 .filter_map(|name| header(name).map(|v| ((*name).to_owned(), v)))
                 .collect();
-            // Read now, on the caller's thread: the signed-in user this
-            // request belongs to (`None` after a sign-out).
-            let user = super::offline_video::last_user();
+            // Decided now, on the caller's thread: the signed-in user this
+            // request belongs to (`None` after a sign-out) picks the stored
+            // file, if any.
+            let offline = super::offline_video::offline_file_for(
+                super::ports::video_store().as_deref(),
+                &path,
+            );
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 // A downloaded video's files answer from disk, online or
                 // not: no data used, and the same bytes the player was
                 // given when it was kept.
                 let key = request_key(&path);
-                if let Some((file, body)) = stored_answer(user.as_deref(), &key).await {
+                let stored = match &offline {
+                    Some(file) => read_stored(file, &key).await.map(|body| (file, body)),
+                    None => None,
+                };
+                if let Some((file, body)) = stored {
                     log_video_request(&key, Verdict::ServedOffline, file.len);
-                    let response = dioxus::mobile::wry::http::Response::builder()
-                        .status(200)
-                        .header("access-control-allow-origin", "*")
-                        .header("content-type", file.content_type)
-                        .header("cache-control", "private, max-age=31536000, immutable")
-                        .body(body)
-                        .unwrap_or_else(|e| {
-                            log::warn!("pharos: proxy response build failed error={e}");
-                            let mut fallback = dioxus::mobile::wry::http::Response::new(Vec::new());
-                            *fallback.status_mut() =
-                                dioxus::mobile::wry::http::StatusCode::BAD_GATEWAY;
-                            fallback
-                        });
+                    let mut builder = dioxus::mobile::wry::http::Response::builder().status(200);
+                    for (name, value) in super::offline_video::offline_headers(file) {
+                        builder = builder.header(name, value);
+                    }
+                    let response = builder.body(body).unwrap_or_else(|e| {
+                        log::warn!("pharos: proxy response build failed error={e}");
+                        let mut fallback = dioxus::mobile::wry::http::Response::new(Vec::new());
+                        *fallback.status_mut() = dioxus::mobile::wry::http::StatusCode::BAD_GATEWAY;
+                        fallback
+                    });
                     responder.respond(response);
                     return;
                 }
