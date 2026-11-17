@@ -463,6 +463,15 @@ impl Engine {
         let stream_decode;
         let decode: &Decode<'_> = match (opts.audio_stream, self.stream_decoder.as_ref()) {
             (None, _) => &*self.decoder,
+            // The stages decode the file's default audio: refining a named
+            // stream's answer from another track could replace it with
+            // placements from the wrong audio.
+            (Some(stream), _) if opts.stages && self.stages.is_some() => {
+                let e = SongError::Internal(format!(
+                    "audio_stream {stream} asked for with the refine stages on; they hear only the default audio"
+                ));
+                return (Err(e), None, None);
+            }
             (Some(stream), Some(d)) => {
                 stream_decode = move |p: &Path, start: i64, end: i64| d(p, stream, start, end);
                 &stream_decode
