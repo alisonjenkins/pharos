@@ -770,6 +770,14 @@ enum FetchOnce {
     Gone,
 }
 
+/// Waits for a chunk's write to complete. In a test the write can be held
+/// pending first, to show nothing is counted as staged meanwhile.
+async fn flush_chunk(file: &mut tokio::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::hold_write().await;
+    file.flush().await
+}
+
 /// One attempt: the body into `<path>.part`, then renamed into place.
 ///
 /// The body is staged in a file named for `run` (`<name>.<run>.part`), so
@@ -823,7 +831,9 @@ async fn fetch_once(
                 // pending, and the free-space reading does not lack those
                 // bytes yet. They count as staged (and so stop being owed)
                 // only once the write has completed.
-                file.flush().await.map_err(|e| store_err("write", e))?;
+                flush_chunk(&mut file)
+                    .await
+                    .map_err(|e| store_err("write", e))?;
                 len = len.saturating_add(chunk.len() as u64);
                 staged.add(chunk.len() as u64);
             }
@@ -1756,6 +1766,17 @@ mod tests {
     thread_local! {
         /// Folders `dir_size` cannot read (a root user cannot be denied).
         pub(super) static UNREADABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// While set, a chunk's write is held pending before its flush.
+        static HOLD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) async fn hold_write() {
+        while HOLD_WRITE.with(std::cell::Cell::get) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     thread_local! {
@@ -3073,6 +3094,50 @@ mod tests {
         std::os::unix::fs::symlink(rig.dir.join("gone"), &item).unwrap();
         let store = rig.open();
         assert!(!store.size_unknown(), "a dangling link blocked admission");
+    }
+
+    /// A chunk counts as staged only once its write has completed: with
+    /// the write held pending the bytes are on their way to disk but the
+    /// free-space reading does not lack them yet, so they are still owed.
+    #[tokio::test]
+    async fn a_chunk_is_not_staged_until_its_write_completes() {
+        let rig = Rig::new("pending-write");
+        HOLD_WRITE.with(|h| h.set(true));
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first chunk is written and held before its flush.
+        let mut waited = 0;
+        loop {
+            let started = std::fs::read_dir(rig.dir.join("u1").join("1").join("files"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    e.path().extension().is_some_and(|x| x == "part")
+                        && e.metadata().is_ok_and(|m| m.len() > 0)
+                });
+            if started {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "no write began");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Give a counted chunk every chance to show.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            matches!(only(&store).state, KeptState::Downloading { .. }),
+            "went on past a write that had not completed: {:?}",
+            only(&store).state
+        );
+        assert_eq!(
+            store.staged_bytes(),
+            0,
+            "counted before the write completed"
+        );
+        HOLD_WRITE.with(|h| h.set(false));
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
     }
 
     /// A damaged manifest is held the same way.
