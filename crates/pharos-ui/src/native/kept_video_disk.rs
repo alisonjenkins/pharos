@@ -919,6 +919,18 @@ impl Inner {
             }
             let free = self.env.budget.free_bytes();
             let verdict = match check {
+                // A new plan is checked against the shared cap, so it needs
+                // the other kinds' figures: a download restarted with no
+                // plan (and none of its files) is fresh too, and must pass
+                // the gate `start` applies.
+                Check::Fresh { .. } if !self.env.budget.accounting_ready() => Err((
+                    KeepVideoRefusal::Host(
+                        "the music cache is not up yet, so the shared cap cannot be checked"
+                            .to_owned(),
+                    ),
+                    0,
+                    free,
+                )),
                 Check::Fresh { other, cap } => {
                     let used = st.reserved_by_others(user, item).saturating_add(other);
                     fits(
@@ -4441,6 +4453,24 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready());
+    }
+
+    /// A download that restarts with no plan and none of its files is fresh:
+    /// it passes the same readiness gate as a start, or it would be admitted
+    /// against the default cap and no music.
+    #[tokio::test]
+    async fn a_restarted_download_with_no_plan_waits_for_the_shared_accounting() {
+        let rig = Rig::new("fresh-not-ready");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The music cache went away between the start and the run's plan.
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("a fresh plan was admitted without the shared accounting");
+        };
+        assert!(reason.contains("music cache is not up"), "{reason}");
+        assert_eq!(store.kept_bytes(), 0);
     }
 
     /// A staging file that cannot be deleted does not drop out of the
