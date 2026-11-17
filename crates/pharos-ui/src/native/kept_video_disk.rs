@@ -147,19 +147,27 @@ struct State {
     /// Folders found at open whose record could not be read: kept, never
     /// swept, and counted against the cap at the bytes measured.
     held: Vec<(PathBuf, u64)>,
-    /// Folders whose size, or whose record's reservation, is not known:
-    /// no download is admitted while one exists, since the cap cannot be
-    /// checked against what is on disk. Each carries the reason.
+    /// Folders found at open whose size or record is not known (unlistable,
+    /// unreadable, damaged): no download is admitted while one exists. The
+    /// reason travels with it. Folders of removed downloads are not here:
+    /// whether those are known is derived (`State::unknown_reason`) from
+    /// the facts below, never stored as a mark that has to be cleared.
     unmeasured: Vec<(PathBuf, String)>,
     /// Folders a `remove` is working on right now. A sweep leaves them
-    /// alone, so the removal's tombstone and mark outlive it only to the
-    /// removal's own end, never to a sweep's earlier one.
+    /// alone, and while one is listed its folder is of unknown size.
     removing: Vec<PathBuf>,
     /// Staging files being written, by run (a run writes several at once).
     /// A removal revokes its run, but a write already under way goes on to
-    /// the next chunk's check, so a folder with a writer left is not
-    /// measured or swept: its size is not yet bounded.
+    /// the next chunk's check: while a revoked run has a writer its folder
+    /// is of unknown size.
     writers: HashMap<(String, String, u64), usize>,
+    /// The last measurement of each tombstoned folder: the epoch it was
+    /// taken at, and whether the walk read everything.
+    measured: HashMap<PathBuf, (u64, bool)>,
+    /// Per folder, moved by every event that can change its size under a
+    /// measurement: a writer starting or stopping, a removal beginning. A
+    /// measurement is valid only at the epoch it was taken at.
+    epochs: HashMap<PathBuf, u64>,
     /// The store's root, to tell a record's folder from a tombstone's.
     root: PathBuf,
     last_saved: Option<Instant>,
@@ -292,11 +300,72 @@ fn reserved(v: &KeptVideo) -> u64 {
 }
 
 impl State {
+    fn dir_of(&self, user: &str, item: &str) -> PathBuf {
+        self.root.join(safe_name(user)).join(safe_name(item))
+    }
+
     /// Whether a staging file is still being written in `dir`.
     fn writing(&self, dir: &Path) -> bool {
         self.writers
             .keys()
-            .any(|(u, i, _)| self.root.join(safe_name(u)).join(safe_name(i)) == *dir)
+            .any(|(u, i, _)| self.dir_of(u, i) == *dir)
+    }
+
+    fn epoch(&self, dir: &Path) -> u64 {
+        self.epochs.get(dir).copied().unwrap_or(0)
+    }
+
+    /// Something that can change `dir`'s size happened: measurements taken
+    /// before it no longer count.
+    fn bump(&mut self, dir: &Path) {
+        *self.epochs.entry(dir.to_path_buf()).or_default() += 1;
+    }
+
+    /// Forgets a tombstone and everything derived about it.
+    fn drop_tombstone(&mut self, dir: &Path) {
+        self.tombstones.retain(|(d, _)| d != dir);
+        self.measured.remove(dir);
+        self.removing.retain(|d| d != dir);
+    }
+
+    /// The first folder whose size is not known, and why. Derived from the
+    /// facts each time: a stored mark is only the open's findings. A folder
+    /// is unknown while a revoked run's writer is running in it with no
+    /// run owning the item (whether or not its record is back), while its removal is in flight, and, once
+    /// tombstoned, until a measurement that read everything was taken after
+    /// the last event that could change it.
+    fn unknown_reason(&self) -> Option<(PathBuf, String)> {
+        if let Some((dir, why)) = self.unmeasured.first() {
+            return Some((dir.clone(), why.clone()));
+        }
+        for (user, item, _) in self.writers.keys() {
+            // With another run owning the item, the stale run's bytes are
+            // counted under it (`staged`, the owner's estimate); with none
+            // (a removal, or a record put back) nothing bounds them.
+            // A folder that was deleted has nothing left to bound: the
+            // writer's file is an unlinked one.
+            let dir = self.dir_of(user, item);
+            let kept = find(&self.list, user, item).is_some()
+                || self.tombstones.iter().any(|(d, _)| *d == dir);
+            if kept && !self.runs.contains_key(&(user.clone(), item.clone())) {
+                return Some((
+                    self.dir_of(user, item),
+                    "a revoked run's writer is still running".to_owned(),
+                ));
+            }
+        }
+        for (dir, _) in &self.tombstones {
+            if self.removing.contains(dir) {
+                return Some((dir.clone(), "being removed, not yet measured".to_owned()));
+            }
+            if self.measured.get(dir) != Some(&(self.epoch(dir), true)) {
+                return Some((
+                    dir.clone(),
+                    "folder not deleted, not measured whole since it last changed".to_owned(),
+                ));
+            }
+        }
+        None
     }
 
     /// Bytes in the folders of removed downloads that would not delete,
@@ -316,7 +385,7 @@ impl State {
 
     /// Why nothing can be admitted now, when a folder's size is unknown.
     fn unknown_folder(&self) -> Option<KeepVideoRefusal> {
-        self.unmeasured.first().map(|(dir, why)| {
+        self.unknown_reason().map(|(dir, why)| {
             KeepVideoRefusal::Host(format!(
                 "the size of {} is unknown ({why}), so the cap cannot be checked",
                 dir.display()
@@ -367,6 +436,7 @@ struct Staged<'a> {
     inner: &'a Inner,
     who: (String, String, u64),
     len: u64,
+    part: PathBuf,
 }
 
 impl Staged<'_> {
@@ -381,6 +451,14 @@ impl Staged<'_> {
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
         let mut st = lock(&self.inner.state);
+        // A revoked run's staging file goes before its writer is
+        // unregistered, so a folder is not bounded while it could be there.
+        let revoked = st.runs.get(&(self.who.0.clone(), self.who.1.clone())) != Some(&self.who.2);
+        if revoked {
+            let _ = std::fs::remove_file(&self.part);
+        }
+        let dir = st.dir_of(&self.who.0, &self.who.1);
+        st.bump(&dir);
         if let Some(n) = st.writers.get_mut(&self.who) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -430,49 +508,74 @@ impl Inner {
         };
         for dir in pending {
             let outcome = (self.env.remove_dir)(&dir);
-            let mut st = lock(&self.state);
-            if st.removing.contains(&dir) || st.writing(&dir) {
-                // A removal began while the delete ran: it owns the folder.
-                continue;
-            }
-            match outcome {
-                Ok(()) => {
-                    st.tombstones.retain(|(d, _)| *d != dir);
-                    st.unmeasured.retain(|(d, _)| *d != dir);
+            {
+                let mut st = lock(&self.state);
+                if st.removing.contains(&dir) || st.writing(&dir) {
+                    // A removal began while the delete ran: it owns the folder.
+                    continue;
+                }
+                if outcome.is_ok() {
+                    st.drop_tombstone(&dir);
+                    drop(st);
                     emit(
                         false,
                         format!("pharos: video keep tombstone cleared dir={}", dir.display()),
                     );
-                }
-                Err(e) => {
-                    // An unreadable folder keeps the figure it had.
-                    let before = st
-                        .tombstones
-                        .iter()
-                        .find(|(d, _)| *d == dir)
-                        .map_or(0, |t| t.1);
-                    let measured = dir_size(&dir);
-                    let bytes = measured.counted(before);
-                    st.unmeasured.retain(|(d, _)| *d != dir);
-                    if !measured.exact {
-                        st.unmeasured.push((
-                            dir.clone(),
-                            "folder not deleted, not fully readable".to_owned(),
-                        ));
-                    }
-                    if let Some(t) = st.tombstones.iter_mut().find(|(d, _)| *d == dir) {
-                        t.1 = bytes;
-                    }
-                    emit(
-                        true,
-                        format!(
-                            "pharos: video keep tombstone kept dir={} bytes={bytes} error={e}",
-                            dir.display()
-                        ),
-                    );
+                    continue;
                 }
             }
+            if let Err(e) = outcome {
+                let bytes = self.measure_tombstone(&dir);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep tombstone kept dir={} bytes={bytes} error={e}",
+                        dir.display()
+                    ),
+                );
+            }
         }
+    }
+
+    /// Measures a tombstoned folder and records the figure, unless something
+    /// that could change it happened meanwhile: the walk is made outside the
+    /// lock, and its result is taken only if the folder's epoch has not
+    /// moved and no removal or writer owns the folder; otherwise it is made
+    /// again. With a writer or a removal in flight nothing is measured (the
+    /// folder stays unknown): the party that ends last measures. Returns the
+    /// figure counted for the folder. An unreadable folder keeps the figure
+    /// it had.
+    fn measure_tombstone(&self, dir: &Path) -> u64 {
+        let mut figure = 0;
+        for _ in 0..4 {
+            let epoch = {
+                let st = lock(&self.state);
+                let Some((_, bytes)) = st.tombstones.iter().find(|(d, _)| d == dir) else {
+                    return 0;
+                };
+                figure = *bytes;
+                if st.removing.iter().any(|d| d == dir) || st.writing(dir) {
+                    return figure;
+                }
+                st.epoch(dir)
+            };
+            let measured = dir_size(dir);
+            #[cfg(test)]
+            tests::during_measure();
+            let mut st = lock(&self.state);
+            if st.removing.iter().any(|d| d == dir) || st.writing(dir) || st.epoch(dir) != epoch {
+                continue;
+            }
+            let Some(t) = st.tombstones.iter_mut().find(|(d, _)| d == dir) else {
+                return 0;
+            };
+            t.1 = measured.counted(t.1);
+            figure = t.1;
+            st.measured
+                .insert(dir.to_path_buf(), (epoch, measured.exact));
+            return figure;
+        }
+        figure
     }
 
     /// Puts back the record of a removal that could not take its manifest
@@ -484,9 +587,7 @@ impl Inner {
         let mut st = lock(&self.state);
         // The record comes back and the removal's tombstone, mark and
         // in-removal entry go in this one hold: no admission sees neither.
-        st.tombstones.retain(|(d, _)| d != dir);
-        st.unmeasured.retain(|(d, _)| d != dir);
-        st.removing.retain(|d| d != dir);
+        st.drop_tombstone(dir);
         for key in &record.files {
             if let Some(len) = names.get(&file_name(key)) {
                 st.index.insert(
@@ -954,7 +1055,17 @@ async fn fetch_once(
             .map_err(|e| store_err("create", e))?;
         // Registered as a writer with the file, under the same hold.
         *st.writers.entry(who.clone()).or_default() += 1;
-        (file, Staged { inner, who, len: 0 })
+        let dir = st.dir_of(user, item);
+        st.bump(&dir);
+        (
+            file,
+            Staged {
+                inner,
+                who,
+                len: 0,
+                part: part.clone(),
+            },
+        )
     };
     let mut len = 0u64;
     loop {
@@ -1550,6 +1661,7 @@ impl DiskVideoStore {
         let mut tombstones: Vec<(PathBuf, u64)> = Vec::new();
         let mut held: Vec<(PathBuf, u64)> = Vec::new();
         let mut unmeasured: Vec<(PathBuf, String)> = Vec::new();
+        let mut measured: HashMap<PathBuf, (u64, bool)> = HashMap::new();
         for user_dir in list_dirs(&inner.root, &mut unmeasured) {
             for item_dir in list_dirs(&user_dir, &mut unmeasured) {
                 let manifest = item_dir.join("manifest.json");
@@ -1595,13 +1707,7 @@ impl DiskVideoStore {
                                     m.exact
                                 ),
                             );
-                            if !m.exact {
-                                unmeasured.push((
-                                    item_dir.clone(),
-                                    "removed download's folder not deleted, not fully readable"
-                                        .to_owned(),
-                                ));
-                            }
+                            measured.insert(item_dir.clone(), (0, m.exact));
                             tombstones.push((item_dir.clone(), m.bytes));
                         }
                         continue;
@@ -1648,6 +1754,7 @@ impl DiskVideoStore {
             st.tombstones = tombstones;
             st.held = held;
             st.unmeasured = unmeasured;
+            st.measured = measured;
             st.root.clone_from(&inner.root);
         }
         emit(
@@ -1861,14 +1968,14 @@ impl VideoStore for DiskVideoStore {
             let dir = self.inner.item_dir(user, item);
             st.tombstones.retain(|(d, _)| *d != dir);
             st.tombstones.push((dir.clone(), reserved(&record)));
-            st.removing.push(dir.clone());
             // The reservation is an estimate, not a bound on the folder
             // (staged `.part` files, files an earlier plan left, a file
             // larger than planned), so until the folder is deleted or
-            // measured its size is not known: nothing is admitted.
-            st.unmeasured.retain(|(d, _)| *d != dir);
-            st.unmeasured
-                .push((dir, "being removed, not yet measured".to_owned()));
+            // measured after the last thing that can change it, its size
+            // is not known (`State::unknown_reason`): nothing is admitted.
+            st.removing.push(dir.clone());
+            st.measured.remove(&dir);
+            st.bump(&dir);
             record
         };
         let dir = self.inner.item_dir(user, item);
@@ -1888,49 +1995,18 @@ impl VideoStore for DiskVideoStore {
         let removed = (self.inner.env.remove_dir)(&dir);
         let mut left = 0;
         if removed.is_ok() {
-            let mut st = lock(&self.inner.state);
-            st.tombstones.retain(|(d, _)| *d != dir);
-            st.unmeasured.retain(|(d, _)| *d != dir);
-            st.removing.retain(|d| *d != dir);
+            lock(&self.inner.state).drop_tombstone(&dir);
         } else {
             // The bytes still on disk keep counting against the cap until
-            // a later sweep deletes the folder.
-            //
-            // A staging file of the revoked run may still be growing: no
-            // new writer can start, so this is checked once. With one left
-            // the folder's size is not bounded yet: it counts at what the
-            // record reserved, stays unknown, and the run's end sweeps it.
-            let writing = lock(&self.inner.state).writing(&dir);
-            if writing {
-                left = reserved(&record);
-                let mut st = lock(&self.inner.state);
-                st.unmeasured.retain(|(d, _)| *d != dir);
-                st.unmeasured.push((
-                    dir.clone(),
-                    "removed download's writer is still running".to_owned(),
-                ));
-                st.tombstones.retain(|(d, _)| *d != dir);
-                st.tombstones.push((dir.clone(), left));
-                st.removing.retain(|d| *d != dir);
-            } else {
-                // A folder that cannot be measured counts as much as the
-                // record reserved for it.
-                let measured = dir_size(&dir);
-                left = measured.counted(reserved(&record));
-                let mut st = lock(&self.inner.state);
-                // A folder not read whole is of unknown size from now, not
-                // from the next sweep: nothing is admitted meanwhile.
-                st.unmeasured.retain(|(d, _)| *d != dir);
-                if !measured.exact {
-                    st.unmeasured.push((
-                        dir.clone(),
-                        "removed download's folder not deleted, not fully readable".to_owned(),
-                    ));
-                }
-                st.tombstones.retain(|(d, _)| *d != dir);
-                st.tombstones.push((dir.clone(), left));
-                st.removing.retain(|d| *d != dir);
-            }
+            // a later sweep deletes the folder. The removal is over: the
+            // folder is no longer in removal, and is measured now unless a
+            // revoked run's writer is still in it, in which case that
+            // run's end measures (it sweeps after its writer stopped). The
+            // folder is unknown until then, by derivation.
+            lock(&self.inner.state).removing.retain(|d| *d != dir);
+            #[cfg(test)]
+            tests::after_removal_unmarked();
+            left = self.inner.measure_tombstone(&dir);
         }
         emit(
             false,
@@ -2006,7 +2082,7 @@ impl VideoStore for DiskVideoStore {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use std::cell::RefCell;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
     use crate::native::kept_video::DEFAULT_QUALITY_BPS;
@@ -2054,6 +2130,30 @@ mod tests {
     }
 
     type SaveHook = Box<dyn Fn(&KeptVideo)>;
+
+    thread_local! {
+        /// Runs as a tombstoned folder has been walked, before the result is
+        /// taken.
+        static DURING_MEASURE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// Runs once a removal has left its folder, before it is measured.
+        static AFTER_UNMARKED: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn during_measure() {
+        DURING_MEASURE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    pub(super) fn after_removal_unmarked() {
+        AFTER_UNMARKED.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
 
     thread_local! {
         /// Runs as a record is about to be written, with that record.
@@ -2917,6 +3017,7 @@ mod tests {
             inner: &store.inner,
             who: ("u1".to_owned(), "1".to_owned(), run + 1_000),
             len: 0,
+            part: PathBuf::new(),
         };
         stale.add(7_000);
         assert_eq!(store.staged_bytes(), 7_050);
@@ -4111,6 +4212,118 @@ mod tests {
             !rig.dir.join("u1").join("1").exists(),
             "the folder was not deleted once the writer stopped"
         );
+    }
+
+    /// Parks a download's SEG0 body mid-way, with its staging file open.
+    async fn park_writer(rig: &Rig, store: &Arc<DiskVideoStore>) -> Arc<AtomicBool> {
+        let release = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.staged_bytes() == 0 {
+            waited += 1;
+            assert!(waited < 2_000, "the write never started");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release
+    }
+
+    /// What the revoked writer's end does to the books, done by hand where a
+    /// test cannot let the task run: it unregisters (moving the folder's
+    /// epoch) and the run's end sweeps.
+    fn end_writer(store: &Arc<DiskVideoStore>) {
+        {
+            let mut st = lock(&store.inner.state);
+            let dir = st.dir_of("u1", "1");
+            st.writers.clear();
+            st.bump(&dir);
+        }
+        store.inner.sweep_tombstones();
+    }
+
+    /// A removal whose manifest will not unlink puts the record back; a
+    /// revoked run's writer still in its folder keeps the folder unknown
+    /// (its staging file is not counted) until the writer has stopped.
+    #[tokio::test]
+    async fn a_restored_record_with_a_revoked_writer_running_stays_unknown() {
+        let rig = Rig::new("restore-writer");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).ok();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        assert!(
+            store.size_unknown(),
+            "the mark cleared with a writer still in the folder"
+        );
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        while store.size_unknown() {
+            waited += 1;
+            assert!(waited < 2_000, "still unknown after the writer stopped");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let parts = std::fs::read_dir(dir.join("files"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(parts, 0, "the revoked run's staging file was left");
+    }
+
+    /// The writer stops while the removal is still deleting (the sweep its
+    /// run's end makes finds the folder in removal and leaves it): the
+    /// removal measures at its end, so the mark does not stick.
+    #[tokio::test]
+    async fn a_writer_that_stops_during_the_removal_does_not_leave_the_folder_unknown() {
+        let rig = Rig::new("writer-during-removal");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let (s2, entered) = (store.clone(), std::cell::Cell::new(false));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    end_writer(&s2);
+                }
+            }));
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        assert!(
+            !store.size_unknown(),
+            "the mark stuck after the writer stopped mid-removal"
+        );
+        release.store(true, Ordering::SeqCst);
+    }
+
+    /// The writer stops just after the removal has left its folder and
+    /// before it is measured: whichever of the two measures last, the folder
+    /// ends up known.
+    #[tokio::test]
+    async fn a_writer_that_stops_between_the_removal_and_its_measurement_is_measured() {
+        let rig = Rig::new("writer-after-removal");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let (s2, entered) = (store.clone(), std::cell::Cell::new(false));
+        AFTER_UNMARKED.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    end_writer(&s2);
+                }
+            }));
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        AFTER_UNMARKED.with(|d| *d.borrow_mut() = None);
+        assert!(!store.size_unknown(), "the mark stuck");
+        release.store(true, Ordering::SeqCst);
     }
 
     /// A running download put back after a failed unlink becomes a Failed
