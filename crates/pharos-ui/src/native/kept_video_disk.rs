@@ -1259,18 +1259,36 @@ async fn playlist(
 
 /// The files under `dir/files` as (name, length).
 fn stored_names(dir: &Path) -> HashMap<String, u64> {
-    let Ok(read) = std::fs::read_dir(dir.join("files")) else {
-        return HashMap::new();
+    stored_names_checked(dir).0
+}
+
+/// The files under `dir/files` as (name, length), and whether the walk
+/// completed: false when the folder, an entry or a file's length could not
+/// be read (anything but being gone), so the list may be short.
+fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
+    let read = match std::fs::read_dir(dir.join("files")) {
+        Ok(read) => read,
+        Err(e) => return (HashMap::new(), e.kind() == std::io::ErrorKind::NotFound),
     };
-    read.filter_map(Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".part") {
-                return None;
+    let mut complete = true;
+    let mut names = HashMap::new();
+    for entry in read {
+        let Ok(e) = entry else {
+            complete = false;
+            continue;
+        };
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".part") {
+            continue;
+        }
+        match e.metadata() {
+            Ok(m) => {
+                names.insert(name, m.len());
             }
-            Some((name, e.metadata().ok()?.len()))
-        })
-        .collect()
+            Err(err) => complete &= err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    (names, complete)
 }
 
 /// Deletes the staging files a closed app left in `dir/files`.
@@ -1376,10 +1394,23 @@ fn dir_size(dir: &Path) -> Measured {
 }
 
 /// Bytes of whole files on disk under `dir`, whatever plan they belong to.
-fn disk_bytes(dir: &Path) -> u64 {
-    stored_names(dir)
-        .values()
-        .fold(0u64, |sum, len| sum.saturating_add(*len))
+/// Not exact when the walk could not complete: the bytes are then a lower
+/// bound, and must not be taken as what the folder holds.
+fn disk_bytes(dir: &Path) -> Measured {
+    #[cfg(test)]
+    if tests::FAIL_DISK_WALK.with(std::cell::Cell::get) {
+        return Measured {
+            bytes: 0,
+            exact: false,
+        };
+    }
+    let (names, exact) = stored_names_checked(dir);
+    Measured {
+        bytes: names
+            .values()
+            .fold(0u64, |sum, len| sum.saturating_add(*len)),
+        exact,
+    }
 }
 
 /// Deletes the stored files of `item` that `plan` does not name, and
@@ -1620,7 +1651,13 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         );
     };
     // What the item's folder holds now, whatever plan the files are of.
-    let held = disk_bytes(&inner.item_dir(&user, &item));
+    let disk = disk_bytes(&inner.item_dir(&user, &item));
+    let held = disk.bytes;
+    // The record's figure for the folder: what was found, or, when the walk
+    // fell short (a transient EMFILE reads as nothing), no less than what
+    // the record held before. A short walk also leaves the folder unknown
+    // until a sweep measures it whole (below).
+    let figure = |v: &KeptVideo| disk.counted(v.estimated_bytes.max(v.bytes()));
     match outcome {
         Ok(Finished {
             bytes,
@@ -1634,7 +1671,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 v.state = KeptState::Ready;
                 // What the folder holds, a file a failed prune could not
                 // delete included: the record reports all storage used.
-                v.estimated_bytes = held;
+                v.estimated_bytes = figure(v);
             });
             match saved {
                 Ok(true) => emit(
@@ -1680,7 +1717,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 bytes = v.bytes();
                 // A failed attempt's files stay for a retry; the record
                 // holds what is really on disk, not what was planned.
-                v.estimated_bytes = held;
+                v.estimated_bytes = figure(v);
                 v.state = KeptState::Failed {
                     reason: reason.clone(),
                 };
@@ -1702,7 +1739,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     let cleaned = drop_parts_of(&inner.item_dir(&user, &item), Some(run));
     let owned = {
         let mut st = lock(&inner.state);
-        if !cleaned {
+        if !cleaned || !disk.exact {
             let dir = inner.item_dir(&user, &item);
             if !st.leftover.contains(&dir) {
                 st.leftover.push(dir);
@@ -1716,7 +1753,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     };
     // A revoked run's writer is done: a folder its removal could not
     // delete or bound while it ran is deleted or measured now.
-    if !owned || !cleaned {
+    if !owned || !cleaned || !disk.exact {
         inner.sweep_tombstones();
     }
 }
@@ -2338,6 +2375,12 @@ mod tests {
                 f();
             }
         });
+    }
+
+    thread_local! {
+        /// While set, the walk of a folder's whole files comes back short
+        /// (as a transient EMFILE would leave it).
+        pub(super) static FAIL_DISK_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     thread_local! {
@@ -3449,7 +3492,7 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         let dir = rig.dir.join("u1").join("1");
-        let on_disk = disk_bytes(&dir);
+        let on_disk = disk_bytes(&dir).bytes;
         assert!(on_disk > 0);
         assert_eq!(
             store.kept_bytes(),
@@ -3470,7 +3513,7 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         assert_eq!(
-            disk_bytes(&dir),
+            disk_bytes(&dir).bytes,
             on_disk,
             "nothing was pruned without a plan"
         );
@@ -3526,7 +3569,10 @@ mod tests {
             "the record counts the stuck entry: {} vs {planned}",
             v.estimated_bytes
         );
-        assert_eq!(v.estimated_bytes, disk_bytes(&rig.dir.join("u1").join("1")));
+        assert_eq!(
+            v.estimated_bytes,
+            disk_bytes(&rig.dir.join("u1").join("1")).bytes
+        );
     }
 
     /// While the retry runs, the stale file the prune could not delete is
@@ -4473,6 +4519,30 @@ mod tests {
         assert_eq!(store.kept_bytes(), 0);
     }
 
+    /// A walk of the folder that comes back short (a transient EMFILE) must
+    /// not persist as an empty folder: the record keeps its figure, and the
+    /// folder is unknown until a sweep measures it whole.
+    #[tokio::test]
+    async fn a_short_walk_of_the_folder_does_not_record_it_as_empty() {
+        let rig = Rig::new("short-walk");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        // The sweep's measure is unreadable too, so the fact stays.
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        assert!(only(&store).ready());
+        assert!(
+            store.kept_bytes() > 0,
+            "the record fell to {} after a short walk",
+            store.kept_bytes()
+        );
+        assert!(store.size_unknown(), "a short walk left the folder known");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
     /// A staging file that cannot be deleted does not drop out of the
     /// accounting: with the manifest unlink failing too, the folder stays
     /// unknown after the writer has stopped, until a later sweep deletes the
@@ -4565,7 +4635,7 @@ mod tests {
             "the folder a record owns is still unknown"
         );
         assert!(
-            store.kept_bytes() >= floor.min(disk_bytes(&dir)),
+            store.kept_bytes() >= floor.min(disk_bytes(&dir).bytes),
             "the folder's bytes are not counted"
         );
         // Another item is admitted.
