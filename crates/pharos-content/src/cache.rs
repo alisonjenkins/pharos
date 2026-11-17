@@ -42,6 +42,8 @@ const PART_EXT: &str = ".audio.part";
 thread_local! {
     /// Makes the part scan fail: 1 the folder, 2 an entry, 3 a length.
     static PART_SCAN_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Part scans made on this thread.
+    static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -839,24 +841,37 @@ impl Cache {
     /// Delete least-recently-played unpinned finished tracks until the cache
     /// fits; skip the current and protected ones.
     fn evict_locked(&self, s: &mut State) -> Vec<String> {
-        let mut evicted = Vec::new();
-        loop {
-            let (_, music) = Self::totals(s);
-            let outside = self.outside_bytes().held;
-            // Parts count against the cap (a cancelled download keeps its
-            // one) but are never victims: only finished tracks are evicted,
-            // so an active download's file is safe.
-            // An incomplete scan counts what it did read, a lower bound: the
-            // cache trims for at least that much and never deletes on a guess.
-            let (parts, parts_whole) = self.scan_parts();
-            if !parts_whole {
+        // Parts count against the cap (a cancelled download keeps its one)
+        // but are never victims: only finished tracks are evicted, so an
+        // active download's file is safe, and an eviction does not change
+        // the figure. They are read once, not per victim (this runs under
+        // the shared admission lock), and once more before the cache is
+        // declared within the cap, since a download may have written since.
+        // An incomplete scan counts what it did read, a lower bound: the
+        // cache trims for at least that much and never deletes on a guess.
+        let parts_now = || {
+            let (parts, whole) = self.scan_parts();
+            if !whole {
                 log::warn!(
                     "cache trim with parts unknown parts_known={parts} reason=part_scan_incomplete"
                 );
             }
+            parts
+        };
+        let mut parts = parts_now();
+        let mut fresh = true;
+        let mut evicted = Vec::new();
+        loop {
+            let (_, music) = Self::totals(s);
+            let outside = self.outside_bytes().held;
             let used = music.saturating_add(outside).saturating_add(parts);
             if used <= self.cap() {
-                break;
+                if fresh {
+                    break;
+                }
+                parts = parts_now();
+                fresh = true;
+                continue;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
                 log::warn!(
@@ -870,6 +885,7 @@ impl Cache {
             }
             log::info!("cache evict id={id} bytes={bytes} reason=over_cap outside={outside}");
             evicted.push(id);
+            fresh = false;
         }
         evicted
     }
@@ -983,6 +999,8 @@ impl Cache {
     /// fails, or an entry or a length that cannot be read, is not a 0. A
     /// file that vanished mid-scan (renamed by a commit) is nothing to read.
     fn scan_parts(&self) -> (u64, bool) {
+        #[cfg(test)]
+        PART_SCANS.with(|n| n.set(n.get() + 1));
         #[cfg(test)]
         if PART_SCAN_FAULT.with(std::cell::Cell::get) == 1 {
             return (0, false);
@@ -1302,6 +1320,27 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert_eq!(c.cap(), 500);
+    }
+
+    /// A trim reads the parts folder once, and once more before it calls
+    /// the cache within the cap, not once per track it evicts.
+    #[test]
+    fn a_trim_scans_the_parts_once_not_per_victim() {
+        let d = tmp("trim-scans");
+        let c = Cache::open(&d, 10_000).unwrap();
+        for i in 0..6 {
+            put(&c, &format!("track/{i}"), 100);
+        }
+        c.protect(&[]);
+        let before = PART_SCANS.with(std::cell::Cell::get);
+        let evicted = c.set_cap(150).unwrap();
+        let scans = PART_SCANS.with(std::cell::Cell::get) - before;
+        assert_eq!(evicted.len(), 5);
+        assert!(
+            scans <= 2,
+            "scanned {scans} times for {} victims",
+            evicted.len()
+        );
     }
 
     #[test]
