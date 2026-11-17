@@ -2860,6 +2860,30 @@ impl Inner {
     }
 }
 
+/// Where this open's run ids start: past every id an earlier open of this
+/// process or an earlier process can have used. The clock's nanoseconds
+/// (an earlier process's ids are far below them), and at least 2^32 past
+/// the last base this process handed out.
+fn open_run_base() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX >> 1));
+    let mut prev = LAST.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let base = now.max(prev.saturating_add(1 << 32));
+        match LAST.compare_exchange(
+            prev,
+            base,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return base,
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
 /// The least time between sweeps started by the host's size check.
 const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -3316,6 +3340,11 @@ impl DiskVideoStore {
         });
         let mut st = State::default();
         st.root.clone_from(&inner.root);
+        // Run ids name staging files (`<name>.<run>.part`): ids that started
+        // at 1 on every open made an earlier process's `.1.part` look like
+        // the new run's own. Each open starts from its own base instead, so
+        // anything inherited is foreign and is settled or counted.
+        st.next_run = open_run_base();
         let mut found = Listing::default();
         scan_tree(
             &inner.env,
@@ -7642,6 +7671,16 @@ mod tests {
         rig: &Rig,
         big: u64,
     ) -> (Arc<DiskVideoStore>, PathBuf, PathBuf) {
+        host_recovers_an_interrupted_download_with_a_part(rig, big, "x.99.part").await
+    }
+
+    /// [`host_recovers_an_interrupted_download_with_an_old_part`] with the
+    /// staging file named `name`.
+    async fn host_recovers_an_interrupted_download_with_a_part(
+        rig: &Rig,
+        big: u64,
+        name: &str,
+    ) -> (Arc<DiskVideoStore>, PathBuf, PathBuf) {
         {
             let store = rig.open();
             store.start(request("1")).unwrap();
@@ -7658,7 +7697,7 @@ mod tests {
         };
         std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
         std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
-        let part = dir.join("files").join("x.99.part");
+        let part = dir.join("files").join(name);
         std::fs::File::create(&part).unwrap().set_len(big).unwrap();
         UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
         let store = rig.open();
@@ -7719,6 +7758,37 @@ mod tests {
             "after completion: kept {} of {on_disk} on disk (old part there: {})",
             store.kept_bytes(),
             part.exists()
+        );
+    }
+
+    /// An earlier process's staging file named for run 1, the id a new
+    /// open used to give its first run: inherited, so foreign, and dropped
+    /// before the resume's plan is admitted, never taken for the new run's
+    /// own and left uncounted.
+    #[tokio::test]
+    async fn an_inherited_part_named_for_run_one_is_not_the_new_runs_own() {
+        let rig = Rig::new("host-resume-run-one");
+        let big = 20_000_000;
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_a_part(&rig, big, "x.1.part").await;
+        let release = rig.server.hold_mid_body(SEG1);
+        let admitted = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(admitted.state, KeptState::Failed { .. }),
+            "{admitted:?}"
+        );
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after admission: kept {} of {on_disk} on disk (inherited part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !part.exists(),
+            "the inherited part was taken for the run's own"
         );
     }
 
