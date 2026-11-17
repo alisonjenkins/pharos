@@ -411,10 +411,15 @@ impl Gate {
         if self.closed() {
             return false;
         }
+        // The verdict and the release of `current` are one step under the
+        // queue lock. A pin that arrives after a "no" must find the track
+        // queueable: were `current` still set, `enqueue` would take it for
+        // in-flight work this job is about to abandon and the pin would be
+        // lost (B1477).
+        let mut q = self.lock();
         if self.is_pin_work(id) {
             return true;
         }
-        let mut q = self.lock();
         if q.generation == *generation {
             return true;
         }
@@ -422,6 +427,9 @@ impl Gate {
             q.wanted.remove(pos);
             *generation = q.generation;
             return true;
+        }
+        if q.current.as_deref() == Some(id) {
+            q.current = None;
         }
         false
     }
@@ -1045,6 +1053,49 @@ mod tests {
         for id in ["track/1", "track/2", "track/3"] {
             assert!(r.cache.is_complete(id), "{id}");
         }
+    }
+
+    /// A job decides to cancel, then a pin of its track arrives before the
+    /// downloader clears the in-flight mark. The pin must be queued. There
+    /// is no downloader thread here, so nothing races the test's stand-in
+    /// for the job.
+    #[test]
+    fn a_pin_arriving_after_a_job_decided_to_cancel_is_not_lost() {
+        let cache = Arc::new(Cache::open(&tmp("pin-after-cancel"), 1 << 20).unwrap());
+        let gate = Arc::new(Gate {
+            cache: cache.clone(),
+            resolve: Arc::new(|_| Err(ResolveError::Transient("unused".into()))),
+            tuning: fast(),
+            online: AtomicBool::new(true),
+            online_epoch: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            yields: AtomicU64::new(0),
+            queue: Mutex::new(Queue {
+                wanted: VecDeque::new(),
+                pinned: VecDeque::new(),
+                deferred: HashMap::new(),
+                // A newer request has dropped the read-ahead being fetched.
+                generation: 1,
+                budget: 0,
+                busy: true,
+                current: Some("track/1".to_owned()),
+            }),
+            idle: Condvar::new(),
+            wake: Notify::new(),
+        });
+        let dl = Downloader {
+            gate: gate.clone(),
+            thread: None,
+        };
+        let mut stale = 0u64;
+        assert!(!gate.still_wanted("track/1", &mut stale), "cancelled");
+        cache.pin("album/a", &ids(&["track/1"]));
+        dl.enqueue(&ids(&["track/1"]));
+        assert_eq!(
+            gate.lock().pinned,
+            VecDeque::from(ids(&["track/1"])),
+            "the pin was lost"
+        );
     }
 
     fn pin_rig(name: &str, tuning: Tuning, n: usize, size: usize) -> Rig {
