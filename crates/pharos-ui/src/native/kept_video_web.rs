@@ -20,10 +20,11 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
-    absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, needs_admission, new_record, progress_due, put_is_retryable, reserved_by,
-    retry_delay_secs, stale_files, still_needed, take, url_path, used_by, KeepVideoRefusal,
-    KeepVideoRequest, KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES, RECORDS_KEY,
+    absolute_url, cache_name, cap_from_stored, cap_selected, check_not_kept, find, fits,
+    insert_front, interrupted, is_retryable, missing_files, needs_admission, new_record,
+    progress_due, put_is_retryable, reserved_by, retry_delay_secs, stale_files, still_needed, take,
+    url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+    CAP_KEY, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -33,6 +34,8 @@ const CONCURRENCY: usize = 2;
 thread_local! {
     static LIST: RefCell<Option<Vec<KeptVideo>>> = const { RefCell::new(None) };
     static FREE: Cell<u64> = const { Cell::new(0) };
+    /// The viewer's cap, read from `localStorage` on first use.
+    static CAP: Cell<Option<u64>> = const { Cell::new(None) };
     static PERSIST_ASKED: Cell<bool> = const { Cell::new(false) };
     static LAST_SAVE_MS: Cell<f64> = const { Cell::new(0.0) };
 }
@@ -52,6 +55,22 @@ fn local_storage() -> Result<web_sys::Storage, String> {
         .local_storage()
         .map_err(|e| describe(&e))?
         .ok_or_else(|| "localStorage is unavailable".to_owned())
+}
+
+/// The cap in force: the viewer's stored choice, else the default.
+fn current_cap() -> u64 {
+    if let Some(cap) = CAP.with(Cell::get) {
+        return cap;
+    }
+    let stored = local_storage()
+        .and_then(|s| s.get_item(CAP_KEY).map_err(|e| describe(&e)))
+        .unwrap_or_else(|e| {
+            warn(&format!("pharos: video cap unreadable reason={e}"));
+            None
+        });
+    let cap = cap_from_stored(stored.as_deref());
+    CAP.with(|c| c.set(Some(cap)));
+    cap
 }
 
 fn load() -> Vec<KeptVideo> {
@@ -454,7 +473,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         if let Err(refusal) = fits(
             needed,
             used.saturating_add(stored_bytes),
-            DEFAULT_CAP_BYTES,
+            current_cap(),
             free,
         ) {
             warn(&format!(
@@ -706,7 +725,17 @@ impl VideoStore for WebVideoStore {
     }
 
     fn cap_bytes(&self) -> u64 {
-        DEFAULT_CAP_BYTES
+        current_cap()
+    }
+
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        let option = cap_selected(bytes);
+        if option.is_empty() {
+            return Err(format!("{bytes} bytes is not a cap this page offers"));
+        }
+        local_storage().and_then(|s| s.set_item(CAP_KEY, &option).map_err(|e| describe(&e)))?;
+        CAP.with(|c| c.set(Some(bytes)));
+        Ok(())
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
