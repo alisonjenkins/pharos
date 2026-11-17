@@ -474,6 +474,14 @@ impl State {
         reserved_by_others(&self.list, user, item).saturating_add(self.tombstoned())
     }
 
+    /// Names a new run the owner of `user`'s `item` and returns its id.
+    fn claim_run(&mut self, user: &str, item: &str) -> u64 {
+        self.next_run = self.next_run.wrapping_add(1);
+        let id = self.next_run;
+        self.runs.insert((user.to_owned(), item.to_owned()), id);
+        id
+    }
+
     /// What the other running downloads have yet to write: their estimate
     /// less what they have stored whole and what they have staged. The free
     /// space already lacks what is on disk, so only the rest is still to
@@ -2582,13 +2590,12 @@ fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
 
 impl Inner {
     fn spawn_run(self: &Arc<Self>, user: String, item: String) {
-        let run_id = {
-            let mut st = lock(&self.state);
-            st.next_run = st.next_run.wrapping_add(1);
-            let id = st.next_run;
-            st.runs.insert((user.clone(), item.clone()), id);
-            id
-        };
+        let run_id = lock(&self.state).claim_run(&user, &item);
+        self.spawn_claimed(user, item, run_id);
+    }
+
+    /// Runs `run_id`, already named the item's run by [`State::claim_run`].
+    fn spawn_claimed(self: &Arc<Self>, user: String, item: String, run_id: u64) {
         let handle = self
             .env
             .runtime
@@ -3187,6 +3194,7 @@ impl VideoStore for DiskVideoStore {
         // The figure of a tombstone this start absorbed, to put back if the
         // start is rolled back.
         let mut absorbed: Option<u64> = None;
+        let mut run_id = 0u64;
         let (started, used) = {
             let _admission = budget.admission_guard();
             // Readiness first, then the figures (see `Check::Fresh`): the
@@ -3275,6 +3283,9 @@ impl VideoStore for DiskVideoStore {
                         st.drop_tombstone(&dir);
                     }
                     insert_front(&mut st.list, record);
+                    // The run is named in the same hold: a rollback below
+                    // touches the record only while this start still owns it.
+                    run_id = st.claim_run(&user, &item);
                     // A settlement that began before this start must not act
                     // on the folder as it saw it.
                     st.bump(&dir);
@@ -3295,30 +3306,46 @@ impl VideoStore for DiskVideoStore {
         if let Err(e) = self.inner.save_record(&user, &item) {
             let refusal =
                 KeepVideoRefusal::Host(format!("the download's record could not be saved: {e}"));
-            {
+            #[cfg(test)]
+            tests::before_start_rollback();
+            let rolled_back = {
                 let _admission = budget.admission_guard();
                 let mut st = lock(&self.inner.state);
-                take(&mut st.list, &user, &item);
-                if let Some(old) = replaced {
-                    insert_front(&mut st.list, old);
+                // A removal and a newer start may have taken the item over
+                // since: their record is theirs, and stays.
+                let key = (user.clone(), item.clone());
+                let ours = st.runs.get(&key) == Some(&run_id);
+                if ours {
+                    st.runs.remove(&key);
+                    take(&mut st.list, &user, &item);
+                    if let Some(old) = replaced {
+                        insert_front(&mut st.list, old);
+                    }
+                    if let Some(left) = absorbed {
+                        // The folder is the tombstone's again, as it was
+                        // measured.
+                        let dir = self.inner.item_dir(&user, &item);
+                        let epoch = st.epoch(&dir);
+                        st.tombstones.push((dir.clone(), left));
+                        st.measured.insert(dir, (epoch, true));
+                    }
                 }
-                if let Some(left) = absorbed {
-                    // The folder is the tombstone's again, as it was measured.
-                    let dir = self.inner.item_dir(&user, &item);
-                    let epoch = st.epoch(&dir);
-                    st.tombstones.push((dir.clone(), left));
-                    st.measured.insert(dir, (epoch, true));
-                }
-            }
+                ours
+            };
             emit(
                 true,
                 format!(
-                    "pharos: video keep refused item={item} reason={refusal} verdict=rolled_back"
+                    "pharos: video keep refused item={item} reason={refusal} verdict={} run={run_id}",
+                    if rolled_back {
+                        "rolled_back"
+                    } else {
+                        "superseded_left_alone"
+                    }
                 ),
             );
             return Err(refusal);
         }
-        self.inner.spawn_run(user, item);
+        self.inner.spawn_claimed(user, item, run_id);
         Ok(())
     }
 
@@ -3556,6 +3583,20 @@ mod tests {
         /// While set, reading a directory entry fails after the directory
         /// opened.
         pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Runs once a start's record has failed to save, before it is
+        /// rolled back.
+        pub(super) static BEFORE_START_ROLLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_start_rollback() {
+        BEFORE_START_ROLLBACK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -5806,6 +5847,46 @@ mod tests {
         std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
         assert!(store.start(request("1")).is_err());
         assert_eq!(only(&store), failed, "the replaced record was lost");
+    }
+
+    /// A removal and a newer start of the same item land while a start's
+    /// failed save is about to be rolled back: the rollback is that start's
+    /// alone, and the newer record survives it.
+    #[tokio::test]
+    async fn a_rollback_leaves_a_newer_start_of_the_same_item_alone() {
+        let rig = Rig::new("rollback-newer");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let newer = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (s2, d2, n2) = (store.clone(), dir.clone(), newer.clone());
+        set_hook(&BEFORE_START_ROLLBACK, move || {
+            std::fs::remove_dir_all(d2.join("manifest.json.part")).unwrap();
+            s2.remove("u1", "1");
+            n2.set(s2.start(request("1")).is_ok());
+        });
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(newer.get(), "the newer start was refused");
+        assert_eq!(
+            store.videos("u1").len(),
+            1,
+            "the rollback took the newer record"
+        );
+        assert!(
+            lines("pharos: video keep refused")
+                .iter()
+                .any(|l| l.contains("verdict=superseded_left_alone")),
+            "{:?}",
+            captured()
+        );
+        store.settled().await;
+        assert_eq!(
+            only(&store).state,
+            KeptState::Ready,
+            "the newer download did not run"
+        );
     }
 
     /// A change whose save fails is kept in memory and the error comes
