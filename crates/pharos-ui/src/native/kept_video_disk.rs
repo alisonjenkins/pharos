@@ -85,6 +85,12 @@ pub trait Budget: Send + Sync {
     fn other_used_bytes(&self) -> u64;
     /// Free space on the device, measured now.
     fn free_bytes(&self) -> u64;
+    /// Whether the other kinds' figures can be had yet. A host whose music
+    /// cache is not up reports the default cap and no music, so a new
+    /// download is refused until it is. Ready by default.
+    fn accounting_ready(&self) -> bool {
+        true
+    }
     /// What the other kinds have been approved to write and not yet landed:
     /// the free space does not lack these yet, but will. Read under the
     /// admission lock, before the free space is measured. None by default.
@@ -1911,6 +1917,16 @@ impl VideoStore for DiskVideoStore {
                 .unknown_folder()
                 .map_or(Ok(()), Err)
                 .and_then(|()| {
+                    if budget.accounting_ready() {
+                        Ok(())
+                    } else {
+                        Err(KeepVideoRefusal::Host(
+                            "the music cache is not up yet, so the shared cap cannot be checked"
+                                .to_owned(),
+                        ))
+                    }
+                })
+                .and_then(|()| {
                     // The folder is being swept: a download begun in it now
                     // would have its files deleted.
                     if st.deleting.contains(&dir) {
@@ -2406,6 +2422,7 @@ mod tests {
         cap: AtomicU64,
         other: AtomicU64,
         other_outstanding: AtomicU64,
+        ready: AtomicBool,
         free: AtomicU64,
         /// Admission guards held now, taken in all, and readings made with
         /// none held.
@@ -2438,6 +2455,7 @@ mod tests {
                 cap: AtomicU64::new(4 * GIB),
                 other: AtomicU64::new(0),
                 other_outstanding: AtomicU64::new(0),
+                ready: AtomicBool::new(true),
                 free: AtomicU64::new(100 * GIB),
                 held: Arc::default(),
                 taken: AtomicUsize::new(0),
@@ -2459,6 +2477,9 @@ mod tests {
         fn other_outstanding_bytes(&self) -> u64 {
             self.read();
             self.other_outstanding.load(Ordering::SeqCst)
+        }
+        fn accounting_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
         }
         fn free_bytes(&self) -> u64 {
             self.read();
@@ -4273,6 +4294,23 @@ mod tests {
             !rig.dir.join("u1").join("1").exists(),
             "the folder was not deleted once the writer stopped"
         );
+    }
+
+    /// With the music cache not up, the shared cap cannot be checked: a new
+    /// download is refused, and starts again once it is.
+    #[tokio::test]
+    async fn a_start_is_refused_until_the_shared_accounting_is_ready() {
+        let rig = Rig::new("accounting-not-ready");
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        let refusal = store.start(request("1")).unwrap_err();
+        assert!(matches!(refusal, KeepVideoRefusal::Host(_)), "{refusal:?}");
+        assert!(store.videos("u1").is_empty());
+        assert!(rig.server.asked().is_empty());
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
     }
 
     /// A download restarted between a sweep's choosing a folder and its

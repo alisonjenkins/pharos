@@ -249,6 +249,12 @@ impl Budget for PhoneBudget {
             .map_or(0, |s| s.used_bytes)
     }
 
+    fn accounting_ready(&self) -> bool {
+        // Without the music cache the cap is the default and the music
+        // counts as nothing: a new download waits for it.
+        pharos_android::library().is_some()
+    }
+
     fn other_outstanding_bytes(&self) -> u64 {
         // Music writes the cache has approved and not yet landed.
         pharos_android::library().map_or(0, content::Library::music_outstanding_bytes)
