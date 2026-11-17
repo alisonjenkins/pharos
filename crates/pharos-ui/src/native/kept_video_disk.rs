@@ -1648,7 +1648,13 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             // default cap and no music.
             let ready = inner.env.budget.accounting_ready();
             Check::Fresh {
-                other: inner.env.budget.other_used_bytes(),
+                // What music holds, and what it has approved and not yet
+                // written: both are part of the shared cap.
+                other: inner
+                    .env
+                    .budget
+                    .other_used_bytes()
+                    .saturating_add(inner.env.budget.other_outstanding_bytes()),
                 cap: inner.env.budget.cap_bytes(),
                 ready,
             }
@@ -2200,7 +2206,12 @@ impl VideoStore for DiskVideoStore {
             let _admission = budget.admission_guard();
             // Readiness first, then the figures (see `Check::Fresh`).
             let ready = budget.accounting_ready();
-            let (other, cap) = (budget.other_used_bytes(), budget.cap_bytes());
+            let (other, cap) = (
+                budget
+                    .other_used_bytes()
+                    .saturating_add(budget.other_outstanding_bytes()),
+                budget.cap_bytes(),
+            );
             let mut st = lock(&self.inner.state);
             let used = st.reserved_by_others(&user, &item).saturating_add(other);
             // Owed bytes first, then the free space (as in `admit`).
@@ -3173,6 +3184,8 @@ mod tests {
         let rig = Rig::new("music-approved");
         let free = 100 * GIB;
         rig.budget.free.store(free, Ordering::SeqCst);
+        // The cap is out of the way: this is about the free space.
+        rig.budget.cap.store(1_000 * GIB, Ordering::SeqCst);
         // Music is approved for all the room above the guard, and has yet to
         // write it.
         rig.budget
@@ -3270,6 +3283,62 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// Music approved and not yet written is part of the shared cap: a
+    /// video that fits beside the music's finished bytes only is refused
+    /// while a music download is in flight, and admitted once it lands or
+    /// releases. The free space is ample, so only the cap decides.
+    #[tokio::test]
+    async fn a_video_admission_counts_music_in_flight_against_the_cap() {
+        let rig = Rig::new("music-cap-outstanding");
+        // Room for the film (about 3 MB) beside the finished music, but not
+        // beside an approved 500 kB write too.
+        rig.budget
+            .other
+            .store(4 * GIB - 3_100_000, Ordering::SeqCst);
+        rig.budget
+            .other_outstanding
+            .store(500_000, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted past the cap with a music write in flight");
+        };
+        assert!(
+            reason.contains("cap") || reason.contains("room"),
+            "{reason}"
+        );
+        rig.budget.other_outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// The music side's cap check reads the video's whole reservation: a
+    /// download in flight counts at its estimate, not at the bytes written
+    /// so far, so music cannot take what the video has been admitted for.
+    #[tokio::test]
+    async fn a_video_in_flight_is_counted_at_its_estimate_for_the_music_cap() {
+        let rig = Rig::new("video-in-flight-held");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        // The playlists are staged before the plan is admitted: wait for the
+        // reservation.
+        let mut waited = 0;
+        while only(&store).estimated_bytes == 0 {
+            waited += 1;
+            assert!(waited < 2_000, "the plan was never admitted");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            store.kept_bytes() >= estimate_bytes(2_000_000, 12_000),
+            "an in-flight video counted at {}",
+            store.kept_bytes()
+        );
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
     }
 
     #[tokio::test]
