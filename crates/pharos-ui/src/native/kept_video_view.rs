@@ -125,6 +125,11 @@ pub fn VideoList(
     on_play: EventHandler<String>,
     on_remove: EventHandler<String>,
     #[props(default)] problem: Option<String>,
+    /// Downloads on the device whose record cannot be read: they block new
+    /// downloads until removed. The row shows only when there are some.
+    #[props(default)]
+    unreadable: usize,
+    #[props(default)] on_discard: EventHandler<()>,
 ) -> Element {
     rsx! {
         p { class: "pharos-muted", id: "pharos-video-total",
@@ -132,6 +137,23 @@ pub fn VideoList(
         }
         if let Some(text) = problem {
             p { class: "pharos-notice", role: "alert", "{text}" }
+        }
+        if unreadable > 0 {
+            div { class: "pharos-download-head", id: "pharos-video-unreadable",
+                span { class: "pharos-muted",
+                    if unreadable == 1 {
+                        "1 download couldn't be read."
+                    } else {
+                        "{unreadable} downloads couldn't be read."
+                    }
+                }
+                button {
+                    class: "pharos-button pharos-button-danger is-small",
+                    r#type: "button",
+                    onclick: move |_| on_discard.call(()),
+                    "Remove them"
+                }
+            }
         }
         if videos.is_empty() {
             p { class: "pharos-empty", id: "pharos-video-empty",
@@ -347,6 +369,10 @@ pub fn VideoDownloads() -> Element {
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
+    let mut problem = use_signal(|| None::<String>);
+    // Read at each render; a discard sets `problem`, which renders again.
+    let unreadable = store.unreadable_count();
+    let discard_store = store.clone();
     rsx! {
         section { class: "pharos-downloads", aria_labelledby: "video-downloads-title",
             h2 { id: "video-downloads-title", "Downloaded videos" }
@@ -354,6 +380,16 @@ pub fn VideoDownloads() -> Element {
                 videos: videos(),
                 used,
                 cap: store.cap_bytes(),
+                problem: problem(),
+                unreadable,
+                on_discard: move |()| {
+                    let outcome = discard_store.discard_unreadable();
+                    platform::info(&format!("pharos: video discard unreadable result={outcome:?}"));
+                    problem.set(match outcome {
+                        Ok(_) => None,
+                        Err(e) => Some(format!("Some downloads could not be removed: {e}")),
+                    });
+                },
                 on_play: move |item: String| match item.parse::<ItemRef>() {
                     Ok(id) => nav.0.call(Route::Watch(id)),
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
@@ -492,6 +528,36 @@ mod tests {
                 on_remove: |_| {},
             }
         }
+    }
+
+    /// The unreadable-downloads row shows only when some exist, in the slim
+    /// pill family, and counts them.
+    #[test]
+    fn the_unreadable_row_shows_only_when_there_are_some() {
+        fn with(n: usize) -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    unreadable: n,
+                }
+            }
+        }
+        let none = render(|| with(0));
+        assert!(!none.contains("be read."), "{none}");
+        assert!(!none.contains("Remove them"), "{none}");
+        let one = render(|| with(1));
+        assert!(one.contains(">1 download couldn"), "{one}");
+        let two = render(|| with(2));
+        assert!(two.contains(">2 downloads couldn"), "{two}");
+        assert!(
+            two.contains("pharos-button pharos-button-danger is-small")
+                && two.contains("Remove them"),
+            "{two}"
+        );
     }
 
     /// Only a ready video has Play; both have Remove; the total heads it.
