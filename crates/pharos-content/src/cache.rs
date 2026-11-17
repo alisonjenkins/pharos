@@ -833,13 +833,17 @@ impl Cache {
         loop {
             let (_, music) = Self::totals(s);
             let outside = self.outside_bytes().held;
-            let used = music.saturating_add(outside);
+            // Parts count against the cap (a cancelled download keeps its
+            // one) but are never victims: only finished tracks are evicted,
+            // so an active download's file is safe.
+            let parts = self.in_progress_bytes();
+            let used = music.saturating_add(outside).saturating_add(parts);
             if used <= self.cap() {
                 break;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
                 log::warn!(
-                    "cache over cap used={used} music={music} outside={outside} cap={} and nothing is evictable (pinned, queued or playing)",
+                    "cache over cap used={used} music={music} outside={outside} parts={parts} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap()
                 );
                 break;
@@ -1272,6 +1276,28 @@ mod tests {
         assert_eq!(c.in_progress_bytes(), 30);
         c.discard_part("track/y");
         assert_eq!(c.in_progress_bytes(), 0);
+    }
+
+    /// A cancelled download's kept `.part` counts against the cap when the
+    /// cache trims: finished tracks go to make room for it, and the part is
+    /// not touched.
+    #[test]
+    fn eviction_counts_a_kept_part_and_never_deletes_it() {
+        let d = tmp("evict-part");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 400]).unwrap();
+        c.commit("track/a", Some(400)).unwrap();
+        // A cancelled download: its part stays, its reservation is gone.
+        std::fs::write(c.part_path("track/y"), vec![0u8; 500]).unwrap();
+        std::fs::write(c.part_path("track/b"), vec![0u8; 300]).unwrap();
+        let evicted = c.commit("track/b", Some(300)).unwrap();
+        assert_eq!(evicted, ["track/a"], "700 + a 500 part is over 1000");
+        assert!(
+            c.part_path("track/y").exists(),
+            "an active part was deleted"
+        );
+        assert!(c.is_complete("track/b"));
+        assert_eq!(c.in_progress_bytes(), 500);
     }
 
     /// What `ensure_free` approves is reserved until the write lands or the
