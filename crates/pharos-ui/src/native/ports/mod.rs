@@ -255,12 +255,21 @@ pub fn outside_bytes(
     }
 }
 
-/// The hook the phone registers with the music cache (see `outside_bytes`).
-/// The phone registers exactly this (`pharos-phone` cannot host a test, being
-/// Android-only), and the integration tests call it too.
+/// The hook the phone registers with the music cache (see `outside_bytes`),
+/// over the process's video store slot. The phone registers exactly this
+/// (`pharos-phone` cannot host a test, being Android-only).
 #[cfg(any(feature = "mobile", test))]
 pub fn outside_bytes_hook() -> pharos_content::OutsideUsed {
-    Arc::new(|| outside_bytes(video_store().as_deref()))
+    outside_bytes_hook_for(&VIDEO_STORE)
+}
+
+/// `outside_bytes_hook` over a slot of the caller's: a test gives each case
+/// a slot of its own, so none depends on what another put in the global.
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes_hook_for(
+    slot: &'static Slot<dyn super::kept_video::VideoStore>,
+) -> pharos_content::OutsideUsed {
+    Arc::new(move || outside_bytes(slot.get().as_deref()))
 }
 
 /// What the host app runs when the user signs in or out, so a second client

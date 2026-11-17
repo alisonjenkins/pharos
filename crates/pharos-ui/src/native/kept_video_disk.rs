@@ -5459,14 +5459,17 @@ mod tests {
         )
         .unwrap();
         lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        static NO_STORE: crate::native::ports::Slot<dyn VideoStore> =
+            crate::native::ports::Slot::new();
         let once = crate::native::ports::OpenOnce::new();
         let opened = std::cell::Cell::new(false);
         let outcome = crate::native::ports::register_video_root(
             &root,
             &once,
             // The phone: `set_outside_used(outside_bytes_hook())` on its
-            // library; here the same hook on this one.
-            || lib.set_outside_used(crate::native::ports::outside_bytes_hook()),
+            // library; here the same hook over a slot of this test's own,
+            // which nothing fills.
+            || lib.set_outside_used(crate::native::ports::outside_bytes_hook_for(&NO_STORE)),
             || {
                 opened.set(true);
                 Ok(())
@@ -5535,9 +5538,10 @@ mod tests {
             },
         )
         .unwrap();
-        // The port slot is set once per process; no other test registers.
-        crate::native::ports::register_video_store(store.clone()).unwrap();
-        lib.set_outside_used(crate::native::ports::outside_bytes_hook());
+        // A slot of this test's own, filled as the phone fills the global.
+        static SLOT: crate::native::ports::Slot<dyn VideoStore> = crate::native::ports::Slot::new();
+        SLOT.set(store.clone()).unwrap();
+        lib.set_outside_used(crate::native::ports::outside_bytes_hook_for(&SLOT));
         lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
         lib.prefetch(&["track/1".to_owned()]);
         let mut waited = 0;
