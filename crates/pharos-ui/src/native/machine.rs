@@ -130,6 +130,11 @@ pub struct Machine {
     /// Connecting again after a signed-in socket dropped: the screens stay
     /// up, so a playing video is not torn down by a network blip.
     reconnecting: bool,
+    /// A session has been Ready and has not ended since: set on Ready,
+    /// cleared only when the app shows sign-in. Kept apart from the phase
+    /// and `reconnecting`, which a failed open or a retry clears, so a
+    /// revoked close after such a detour still ends the session.
+    had_session: bool,
     /// A non-blocking message for the signed-in shell, e.g. a failed
     /// sign-out.
     notice: Option<String>,
@@ -153,6 +158,7 @@ impl Machine {
             attempt: 0,
             signing_out: false,
             reconnecting: false,
+            had_session: false,
             notice: None,
             waiting: None,
             on_session_end: SessionEnd(None),
@@ -216,9 +222,9 @@ impl Machine {
     }
 
     pub fn apply(&mut self, event: Event) {
-        // A session also ends when the socket dropped and the reconnect finds
-        // it revoked: the screens were still up.
-        let was_ready = self.phase == Phase::Ready || self.reconnecting;
+        // A session ends whenever the app shows sign-in after it was
+        // Ready, whatever failed opens or retries came in between.
+        let was_ready = self.had_session;
         self.step(event);
         if was_ready && matches!(self.phase, Phase::SignIn { .. }) {
             if let Some(hook) = self.on_session_end.0 {
@@ -234,6 +240,7 @@ impl Machine {
                 self.attempt = 0;
                 self.waiting = None;
                 self.phase = Phase::Ready;
+                self.had_session = true;
             }
             Event::ResumeRefused { epoch } if current(epoch) => self.sign_in(None),
             // The server is up but could not answer (its database may be
@@ -323,6 +330,7 @@ impl Machine {
 
     fn sign_in(&mut self, error: Option<String>) {
         self.signing_out = false;
+        self.had_session = false;
         self.notice = None;
         self.phase = Phase::SignIn { error, busy: false };
     }
@@ -532,6 +540,53 @@ mod tests {
 
     fn count_end() {
         SESSIONS_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static DETOUR_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_detour_end() {
+        DETOUR_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A drop, a failed open that does not clear by itself (405), a retry,
+    /// then a revoked close: the session the user was signed into ends and
+    /// the hook runs, though the detour cleared the phase and the
+    /// reconnecting flag. A second sign-in screen runs it no more.
+    #[test]
+    fn a_revoked_close_after_a_failed_open_and_a_retry_ends_the_session() {
+        use std::sync::atomic::Ordering;
+        let mut m = Machine::new().with_session_end(count_detour_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        m.apply(Event::NotOpened {
+            epoch: 1,
+            probe: Probe::Status(405),
+        });
+        assert!(
+            matches!(m.phase, Phase::Unreachable { .. }),
+            "{:?}",
+            m.phase
+        );
+        m.apply(Event::Retry);
+        let epoch = m.epoch();
+        m.apply(Event::Closed {
+            epoch,
+            reason: REVOKED.into(),
+        });
+        assert!(matches!(m.phase, Phase::SignIn { .. }), "{:?}", m.phase);
+        assert_eq!(
+            DETOUR_ENDED.load(Ordering::SeqCst),
+            1,
+            "the signed-in session ended without its hook"
+        );
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 401,
+            retry_after: None,
+        }));
+        assert_eq!(DETOUR_ENDED.load(Ordering::SeqCst), 1, "the hook ran twice");
     }
 
     /// The session-end hook runs when a session revoked after a dropped
