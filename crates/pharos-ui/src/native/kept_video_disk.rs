@@ -1902,6 +1902,9 @@ impl VideoStore for DiskVideoStore {
         // taken, and the check and the new record sit under one hold of it.
         self.inner.sweep_tombstones();
         let mut replaced: Option<KeptVideo> = None;
+        // The figure of a tombstone this start absorbed, to put back if the
+        // start is rolled back.
+        let mut absorbed: Option<u64> = None;
         let (started, used) = {
             let _admission = budget.admission_guard();
             let (other, cap) = (budget.other_used_bytes(), budget.cap_bytes());
@@ -1949,11 +1952,18 @@ impl VideoStore for DiskVideoStore {
                         record.estimated_bytes = old.estimated_bytes;
                     }
                     // So do the bytes of a removed download's folder that would
-                    // not delete: once a live record owns the folder they stop
-                    // counting as a tombstone.
-                    let dir = self.inner.item_dir(&user, &item);
+                    // not delete: the record takes the folder over whole. Its
+                    // reservation floor becomes the tombstone's figure (a
+                    // valid measurement, or the start was refused above as
+                    // unknown), and the tombstone goes in the same hold, so
+                    // the folder is accounted by the record as any running
+                    // download's is, and a later writer's epoch bump cannot
+                    // mark a folder the record owns as unknown.
                     if let Some((_, left)) = st.tombstones.iter().find(|(d, _)| *d == dir) {
-                        record.estimated_bytes = record.estimated_bytes.max(*left);
+                        let left = *left;
+                        record.estimated_bytes = record.estimated_bytes.max(left);
+                        absorbed = Some(left);
+                        st.drop_tombstone(&dir);
                     }
                     insert_front(&mut st.list, record);
                     Ok(())
@@ -1979,6 +1989,13 @@ impl VideoStore for DiskVideoStore {
                 take(&mut st.list, &user, &item);
                 if let Some(old) = replaced {
                     insert_front(&mut st.list, old);
+                }
+                if let Some(left) = absorbed {
+                    // The folder is the tombstone's again, as it was measured.
+                    let dir = self.inner.item_dir(&user, &item);
+                    let epoch = st.epoch(&dir);
+                    st.tombstones.push((dir.clone(), left));
+                    st.measured.insert(dir, (epoch, true));
                 }
             }
             emit(
@@ -4311,6 +4328,45 @@ mod tests {
         store.start(request("1")).unwrap();
         store.settled().await;
         assert!(only(&store).ready());
+    }
+
+    /// A same-item retry takes over a folder that would not delete: the
+    /// record absorbs the tombstone, so the retry's writes do not leave the
+    /// folder "unknown" for every other admission, and its floor is kept.
+    #[tokio::test]
+    async fn a_retry_over_an_undeletable_folder_absorbs_it_and_blocks_nothing() {
+        let rig = Rig::new("takeover");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let floor = store.kept_bytes();
+        assert!(floor > 0, "no tombstone");
+        assert!(!store.size_unknown(), "the folder was not measured");
+        // The delete keeps failing and part of what was there is gone, so
+        // the retry has files to fetch again: it takes the folder over and
+        // writes (a writer starting and stopping moves the folder's epoch).
+        let dir = rig.dir.join("u1").join("1");
+        for e in std::fs::read_dir(dir.join("files")).unwrap().flatten() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        assert!(
+            !store.size_unknown(),
+            "the folder a record owns is still unknown"
+        );
+        assert!(
+            store.kept_bytes() >= floor.min(disk_bytes(&dir)),
+            "the folder's bytes are not counted"
+        );
+        // Another item is admitted.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(store.videos("u1").len(), 2);
     }
 
     /// A download restarted between a sweep's choosing a folder and its
