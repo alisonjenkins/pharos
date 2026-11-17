@@ -3975,20 +3975,12 @@ mod tests {
         FAIL_REMOVE.with(|f| f.set(false));
     }
 
-    /// The whole path of the unknown-size block into music: a real store
-    /// with a subtree it cannot read, registered as the phone registers it,
-    /// the very hook the phone installs (`ports::outside_bytes_hook`), and
-    /// a real music download through `Library`, which the cache refuses
-    /// before any network use.
-    ///
-    /// Stubbed: only the server, one nothing listens on. The phone crate is
-    /// Android-only and cannot host a test; it registers the same hook.
-    #[test]
-    fn music_is_refused_through_the_real_hook_while_a_video_subtree_is_unreadable() {
-        use std::sync::atomic::AtomicBool;
+    /// The process's one log capture, for the tests that read the music
+    /// cache's log: a logger can be installed once per process.
+    fn capture_music_log() -> &'static Mutex<Vec<String>> {
         struct Capture;
         static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        static INSTALL: std::sync::Once = std::sync::Once::new();
         impl log::Log for Capture {
             fn enabled(&self, _: &log::Metadata) -> bool {
                 true
@@ -3999,14 +3991,78 @@ mod tests {
             fn flush(&self) {}
         }
         static CAPTURE: Capture = Capture;
-        if log::set_logger(&CAPTURE).is_ok() {
+        INSTALL.call_once(|| {
+            assert!(
+                log::set_logger(&CAPTURE).is_ok(),
+                "another logger was installed first"
+            );
             log::set_max_level(log::LevelFilter::Info);
-            INSTALLED.store(true, Ordering::SeqCst);
-        }
+        });
+        &LINES
+    }
+
+    /// The phone registers its video store after creating its folder, and a
+    /// folder that cannot be created leaves no store. The hook the music
+    /// cache holds then reads the size as unknown, and the cache refuses a
+    /// download rather than counting the video as zero. (The phone's
+    /// registration is Android-only; the hook's no-store answer, which it
+    /// installs before creating the folder, is `ports::outside_bytes(None)`.)
+    /// The refusal is read from a real `Library`'s cache on a prefetch,
+    /// which is the admission a pin's downloads go through.
+    #[test]
+    fn a_store_that_could_not_be_created_leaves_music_refused() {
+        let rig = Rig::new("no-store");
+        std::fs::create_dir_all(&rig.dir).unwrap();
+        let root = rig.dir.join("video");
+        std::fs::write(&root, b"a file where the folder should be").unwrap();
         assert!(
-            INSTALLED.load(Ordering::SeqCst),
-            "another logger was installed first"
+            std::fs::create_dir_all(&root).is_err(),
+            "the folder was made"
         );
+        let lines = capture_music_log();
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        lib.set_outside_used(Arc::new(|| crate::native::ports::outside_bytes(None)));
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        lib.prefetch(&["track/2".to_owned()]);
+        let mut waited = 0;
+        let refused = loop {
+            let found = lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/2"));
+            if found || waited > 5_000 {
+                break found;
+            }
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(refused, "music was admitted with no video store");
+    }
+
+    /// The whole path of the unknown-size block into music: a real store
+    /// with a subtree it cannot read, registered as the phone registers it,
+    /// the very hook the phone installs (`ports::outside_bytes_hook`), and
+    /// a real music download through `Library`, which the cache refuses
+    /// before any network use.
+    ///
+    /// Stubbed: only the server, one nothing listens on. The phone crate is
+    /// Android-only and cannot host a test; it registers the same hook.
+    #[test]
+    fn music_is_refused_through_the_real_hook_while_a_video_subtree_is_unreadable() {
+        let lines = capture_music_log();
 
         // A real store, with its root unreadable the way a restart can find it.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4044,7 +4100,7 @@ mod tests {
         lib.prefetch(&["track/1".to_owned()]);
         let mut waited = 0;
         let refused = loop {
-            let found = LINES
+            let found = lines
                 .lock()
                 .unwrap()
                 .iter()
@@ -4062,7 +4118,7 @@ mod tests {
         assert!(
             refused,
             "music was not refused: {:?}",
-            LINES.lock().unwrap()
+            lines.lock().unwrap()
         );
     }
 
