@@ -216,6 +216,8 @@ struct Inner {
     state: Mutex<State>,
     /// Held while a record is written or an item's folder is removed.
     saves: Mutex<()>,
+    /// When the unknown-size sweep last ran from the host's size check.
+    last_sweep: Mutex<Option<std::time::Instant>>,
     #[cfg(test)]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -2204,6 +2206,9 @@ impl Inner {
     }
 }
 
+/// The least time between sweeps started by the host's size check.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What a held folder's record reads as now.
 enum HeldNow {
     /// It parses: the folder is a download again.
@@ -2232,6 +2237,39 @@ fn read_held(dir: &Path) -> HeldNow {
 }
 
 impl Inner {
+    /// The sweep of unknown folders, at most once per [`SWEEP_EVERY`] when
+    /// the host's size check asks. Logs the verdict.
+    fn sweep_if_due(self: &Arc<Self>) {
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            if last.is_some_and(|t| now.duration_since(t) < SWEEP_EVERY) {
+                return;
+            }
+            *last = Some(now);
+        }
+        let before = lock(&self.state).unknown_reason();
+        self.sweep_held();
+        let after = lock(&self.state).unknown_reason();
+        emit(
+            false,
+            format!(
+                "pharos: video unknown-size sweep from=host_size_check before={} after={}",
+                before.map_or("known".to_owned(), |(d, w)| format!(
+                    "unknown({}: {w})",
+                    d.display()
+                )),
+                after.map_or("known".to_owned(), |(d, w)| format!(
+                    "unknown({}: {w})",
+                    d.display()
+                )),
+            ),
+        );
+    }
+
     /// Claims the held folders nothing else is working on.
     fn claim_held(&self) -> Vec<PathBuf> {
         let mut st = lock(&self.state);
@@ -2518,6 +2556,7 @@ impl DiskVideoStore {
             env,
             state: Mutex::new(State::default()),
             saves: Mutex::new(()),
+            last_sweep: Mutex::new(None),
             #[cfg(test)]
             tasks: Mutex::new(Vec::new()),
         });
@@ -2870,6 +2909,16 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn size_unknown(&self) -> bool {
+        if lock(&self.inner.state).unknown_folder().is_none() {
+            return false;
+        }
+        // The music cache asks this on its admission path; in a process
+        // that never lists the downloads (the car's) nothing else would
+        // read the held folders again. Rate-limited, and safe where the
+        // cache holds its lock: the sweep takes only this store's state
+        // lock and reads files, never a budget or the shared admission
+        // lock (order: shared lock, then store lock).
+        self.inner.sweep_if_due();
         lock(&self.inner.state).unknown_folder().is_some()
     }
 
@@ -5322,6 +5371,26 @@ mod tests {
         assert!(!dir.exists(), "the removed download's folder stayed");
         assert!(!store.size_unknown());
         assert!(!lines("pharos: video held folder verdict=tombstoned").is_empty());
+    }
+
+    /// A process that never lists the downloads (the car's) still recovers:
+    /// the music cache's size check through the hook sweeps the held
+    /// folders, at most once per interval, with no `videos()` call.
+    #[tokio::test]
+    async fn the_music_size_check_sweeps_the_held_folders_without_listing() {
+        let (_rig, store, good, manifest) = held_download("held-hook").await;
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the manifest is bad");
+        // Readable again; the sweep ran just now, so it is not due.
+        std::fs::write(&manifest, &good).unwrap();
+        assert!(hook().unknown, "swept again inside the interval");
+        // Due: the check alone releases the folder.
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook still reports unknown");
+        assert!(outside.held > 0, "the released download is not counted");
+        assert_eq!(store.unreadable_count(), 0);
+        assert!(!lines("pharos: video unknown-size sweep from=host_size_check").is_empty());
     }
 
     /// Discarding deletes the folders whose record is still unreadable and
