@@ -1341,6 +1341,8 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
     let mut complete = true;
     let mut names = HashMap::new();
     for entry in read {
+        #[cfg(test)]
+        let entry = tests::entry_read(entry);
         let Ok(e) = entry else {
             complete = false;
             continue;
@@ -1493,7 +1495,7 @@ fn prune_unplanned(
     if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
         return None;
     }
-    let names = stored_names(&dir);
+    let (names, complete) = stored_names_checked(&dir);
     let (mut removed, mut bytes, mut left) = (0usize, 0u64, 0u64);
     for (name, len) in names {
         if keep.contains(&name) {
@@ -1504,6 +1506,13 @@ fn prune_unplanned(
             bytes = bytes.saturating_add(len);
         } else {
             left = left.saturating_add(len);
+        }
+    }
+    if !complete {
+        let held = find(&st.list, user, item).map_or(0, reserved);
+        left = left.max(held);
+        if !st.leftover.contains(&dir) {
+            st.leftover.push(dir.clone());
         }
     }
     st.index.retain(|_, (path, _)| {
@@ -1605,6 +1614,8 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     let Some(stale) = prune_unplanned(inner, user, item, run, &all) else {
         return Err(Stop::Gone);
     };
+    #[cfg(test)]
+    tests::pruned(stale, inner, user, item);
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
     let names = stored_names(&inner.item_dir(user, item));
@@ -2513,6 +2524,8 @@ mod tests {
     thread_local! {
         /// Runs between a plan being wanted and its prune.
         static BEFORE_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// What the last prune returned, and whether it left the folder unknown.
+        static PRUNED: RefCell<Option<(u64, bool)>> = const { RefCell::new(None) };
     }
 
     pub(super) fn before_prune() {
@@ -2521,6 +2534,13 @@ mod tests {
                 f();
             }
         });
+    }
+
+    pub(super) fn pruned(stale: u64, inner: &Inner, user: &str, item: &str) {
+        let unknown = lock(&inner.state)
+            .leftover
+            .contains(&inner.item_dir(user, item));
+        PRUNED.with(|p| *p.borrow_mut() = Some((stale, unknown)));
     }
 
     pub(super) fn before_settle_drop() {
@@ -5257,6 +5277,31 @@ mod tests {
         store.settled().await;
         FAIL_REMOVE.with(|f| f.set(false));
         assert_eq!(store.videos("u1").len(), 2);
+    }
+
+    /// A listing that comes back short at the prune never shrinks the
+    /// record's reservation, and leaves the folder unknown.
+    #[tokio::test]
+    async fn a_short_listing_at_the_prune_keeps_the_reservation_and_marks_the_folder() {
+        let rig = Rig::new("prune-short");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = only(&store).estimated_bytes;
+        assert!(held > 0, "no reservation to keep");
+        rig.server.fail(SEG1, &[]);
+        set_hook(&BEFORE_PRUNE, || FAIL_ENTRY_READ.with(|f| f.set(true)));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&BEFORE_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        let (stale, unknown) = PRUNED.with(|p| p.borrow_mut().take()).unwrap();
+        assert!(
+            stale >= held,
+            "the reservation shrank to {stale} from {held}"
+        );
+        assert!(unknown, "the folder was not marked unknown");
     }
 
     /// A removal and restart that land between a plan being wanted and its
