@@ -508,8 +508,17 @@ impl Inner {
         result
     }
 
-    /// Changes the record of `item` and saves it; false when it is gone.
-    fn update(&self, user: &str, item: &str, f: impl FnOnce(&mut KeptVideo)) -> bool {
+    /// Changes the record of `item` and saves it: `Ok(false)` when it is
+    /// gone. When the save fails the change is kept in memory, not rolled
+    /// back, and the error is returned: memory is what the UI shows, the
+    /// next successful save writes it, and undoing a play position or a
+    /// progress figure over a transient disk fault would only lose it.
+    fn update(
+        &self,
+        user: &str,
+        item: &str,
+        f: impl FnOnce(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
         {
             let mut st = lock(&self.state);
             let Some(v) = st
@@ -517,13 +526,11 @@ impl Inner {
                 .iter_mut()
                 .find(|v| v.user == user && v.item == item)
             else {
-                return false;
+                return Ok(false);
             };
             f(v);
         }
-        // Logged by `save_record`; the change stays in memory.
-        let _ = self.save_record(user, item);
-        true
+        self.save_record(user, item).map(|()| true)
     }
 
     /// [`Inner::update`] for the run that owns the download: the run id is
@@ -1731,7 +1738,10 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn save_position(&self, user: &str, item: &str, position_ms: u64) {
-        self.inner
+        // The position stays in memory if the save fails, and the failure
+        // is logged by `save_record` (the trait has no way to return it).
+        let _ = self
+            .inner
             .update(user, item, |v| v.position_ms = position_ms);
     }
 
@@ -3323,6 +3333,32 @@ mod tests {
         std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
         assert!(store.start(request("1")).is_err());
         assert_eq!(only(&store), failed, "the replaced record was lost");
+    }
+
+    /// A change whose save fails is kept in memory and the error comes
+    /// back, so a caller can tell the record is not durable.
+    #[tokio::test]
+    async fn an_update_whose_save_fails_reports_it_and_keeps_the_change() {
+        let rig = Rig::new("update-save-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let saved = store.inner.update("u1", "1", |v| v.position_ms = 4_200);
+        assert!(saved.is_err(), "a failed save went unreported");
+        assert_eq!(only(&store).position_ms, 4_200, "the change was undone");
+        assert!(!lines("pharos: video record not saved").is_empty());
+        // Gone is not a failure.
+        assert!(matches!(
+            store.inner.update("u1", "nope", |_| {}),
+            Ok(false)
+        ));
+        // Once the disk is well again the next save writes it.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        assert!(matches!(store.inner.update("u1", "1", |_| {}), Ok(true)));
+        drop(store);
+        assert_eq!(rig.open().videos("u1")[0].position_ms, 4_200);
     }
 
     /// A damaged manifest is held the same way.
