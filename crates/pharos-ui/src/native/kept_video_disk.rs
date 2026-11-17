@@ -1035,15 +1035,8 @@ impl Inner {
             if durable {
                 #[cfg(test)]
                 tests::sync_step("rename manifest".to_owned());
-                if let Err(e) = sync_dir(&dir) {
-                    emit(
-                        true,
-                        format!(
-                            "pharos: video keep sync failed item={} what=item_dir error={e}",
-                            video.item
-                        ),
-                    );
-                }
+                durable_dir(&dir, &video.item, "item_dir")
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("item folder sync: {e}")))?;
             }
             Ok(())
         })();
@@ -1699,6 +1692,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
         dir.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
     ));
+    #[cfg(test)]
+    tests::dir_sync_fault(dir)?;
     #[cfg(unix)]
     {
         std::fs::File::open(dir)?.sync_all()
@@ -1708,6 +1703,57 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// Makes `dir` durable for a record about to be published Ready: a failed
+/// sync is tried once more, then sorted. A filesystem that cannot sync a
+/// folder (EINVAL, ENOTSUP: some FUSE and sdcard layers) counts as synced,
+/// logged once per sync point, or a download there could never finish. Any
+/// other error is returned, logged with the error, and Ready is not
+/// published.
+fn durable_dir(dir: &Path, item: &str, what: &'static str) -> std::io::Result<()> {
+    let Err(first) = sync_dir(dir) else {
+        return Ok(());
+    };
+    let Err(e) = sync_dir(dir) else {
+        emit(
+            false,
+            format!(
+                "pharos: video keep sync verdict=retried what={what} item={item} first_error={first}"
+            ),
+        );
+        return Ok(());
+    };
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    ) {
+        static LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let first_time = {
+            let mut logged = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
+            let new = !logged.contains(&what);
+            if new {
+                logged.push(what);
+            }
+            new
+        };
+        if first_time {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep sync verdict=unsupported what={what} item={item} error={e}"
+                ),
+            );
+        }
+        return Ok(());
+    }
+    emit(
+        true,
+        format!(
+            "pharos: video keep sync failed verdict=not_ready what={what} item={item} error={e}"
+        ),
+    );
+    Err(e)
 }
 
 /// The final name of a stored file, for the logs and the test's record.
@@ -2759,24 +2805,25 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             cleaned = Some(clean);
             // The stored files' names are durable before the record that
             // names them Ready: one folder sync for the whole download, not
-            // one per file. A failure is logged; a reopen that finds a file
-            // gone fetches it again.
-            if let Err(e) = sync_dir(&dir.join("files")) {
-                emit(
-                    true,
-                    format!("pharos: video keep sync failed item={item} what=files_dir error={e}"),
-                );
-            }
-            let saved = inner.update_run_saved(&user, &item, run, |v| {
-                // A skipped file is not on disk: left in the record, a
-                // reopen would count it missing and resume the copy.
-                v.files.retain(|k| !skipped.contains(k));
-                let completed = v.bytes();
-                v.state = KeptState::Ready;
-                // What the folder holds, a file a failed prune could not
-                // delete included: the record reports all storage used.
-                v.estimated_bytes = figure(v, completed);
-            });
+            // one per file. One that fails is not Ready: the run fails,
+            // its files kept for a retry.
+            let saved = match durable_dir(&dir.join("files"), &item, "files_dir") {
+                Err(e) => Err(format!(
+                    "finished but its files could not be made durable: {e}"
+                )),
+                Ok(()) => inner
+                    .update_run_saved(&user, &item, run, |v| {
+                        // A skipped file is not on disk: left in the record, a
+                        // reopen would count it missing and resume the copy.
+                        v.files.retain(|k| !skipped.contains(k));
+                        let completed = v.bytes();
+                        v.state = KeptState::Ready;
+                        // What the folder holds, a file a failed prune could not
+                        // delete included: the record reports all storage used.
+                        v.estimated_bytes = figure(v, completed);
+                    })
+                    .map_err(|e| format!("finished but its record could not be saved: {e}")),
+            };
             match saved {
                 Ok(true) => {
                     #[cfg(test)]
@@ -2789,12 +2836,11 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     );
                 }
                 Ok(false) => superseded("superseded"),
-                Err(e) => {
+                Err(reason) => {
                     // Ready that is not on disk would resume at the next
                     // open: it is reported as what it is, a failure, and
                     // the memory and the disk then tell the same story
                     // (the files stay; a retry finds them).
-                    let reason = format!("finished but its record could not be saved: {e}");
                     let _ = inner.update_run(&user, &item, run, |v| {
                         // A Failed record reports its estimate as its bytes:
                         // what the folder holds must not drop out of it.
@@ -4015,6 +4061,25 @@ mod tests {
         /// While `Some`, every sync, rename and the Ready publication, in
         /// the order they happen.
         static SYNC_STEPS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    thread_local! {
+        /// A folder sync of the folder named `.0` fails with OS error `.1`,
+        /// `.2` more times.
+        static DIR_SYNC_FAULT: RefCell<Option<(String, i32, usize)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn dir_sync_fault(dir: &Path) -> std::io::Result<()> {
+        DIR_SYNC_FAULT.with(|f| {
+            let mut f = f.borrow_mut();
+            if let Some((name, code, left)) = f.as_mut() {
+                if *left > 0 && dir.file_name().is_some_and(|n| n == name.as_str()) {
+                    *left -= 1;
+                    return Err(std::io::Error::from_raw_os_error(*code));
+                }
+            }
+            Ok(())
+        })
     }
 
     pub(super) fn sync_step(step: String) {
@@ -9001,6 +9066,51 @@ mod tests {
             );
             if stuck {
                 assert!(unknown, "the stuck staging file was uncounted at Ready");
+            }
+        }
+    }
+
+    /// A folder sync before Ready that keeps failing with an I/O error
+    /// fails the download (its files kept, its figure counting them); one
+    /// that fails once is tried again and the download is Ready; one the
+    /// filesystem does not support (EINVAL) counts as done, logged. For both
+    /// sync points: the files' folder and the item's folder.
+    #[tokio::test]
+    async fn a_folder_sync_that_fails_before_ready_is_retried_then_sorted() {
+        const EIO: i32 = 5;
+        const EINVAL: i32 = 22;
+        for (folder, what) in [("files", "files_dir"), ("1", "item_dir")] {
+            for (code, times, ready) in [(EIO, 2, false), (EIO, 1, true), (EINVAL, 2, true)] {
+                let rig = Rig::new(&format!("dir-sync-{what}-{code}-{times}"));
+                let store = rig.open();
+                DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = Some((folder.to_owned(), code, times)));
+                store.start(request("1")).unwrap();
+                store.settled().await;
+                DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = None);
+                let v = only(&store);
+                let case = format!("{what} errno={code} times={times}");
+                if ready {
+                    assert_eq!(v.state, KeptState::Ready, "{case}");
+                } else {
+                    let KeptState::Failed { reason } = &v.state else {
+                        panic!("{case}: published Ready over a failed sync: {v:?}");
+                    };
+                    assert!(reason.contains("os error 5"), "{case}: {reason}");
+                    let on_disk = dir_size(&rig.dir.join("u1").join("1").join("files")).bytes;
+                    assert!(store.kept_bytes() >= on_disk, "{case}: files uncounted");
+                    assert!(
+                        store.stored_file("u1", SEG0).is_some(),
+                        "{case}: files dropped"
+                    );
+                }
+                if code == EINVAL {
+                    assert!(
+                        lines("pharos: video keep sync verdict=unsupported")
+                            .iter()
+                            .any(|l| l.contains(&format!("what={what}"))),
+                        "{case}: no unsupported line"
+                    );
+                }
             }
         }
     }
