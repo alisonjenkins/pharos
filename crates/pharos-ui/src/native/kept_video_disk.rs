@@ -2314,6 +2314,15 @@ impl Inner {
         }
         let before = lock(&self.state).unknown_reason();
         self.sweep_held();
+        // The tombstones and leftovers recover too, as `sweep_tombstones`
+        // would recover them, with its claims and writer checks. Measured,
+        // not deleted: this runs under the music cache's locks, and deleting
+        // a whole download there would stall it. A tombstone measured whole
+        // is known and counted at its bytes; its deletion waits for the next
+        // `sweep_tombstones` (a listing, a start or a discard). Settling a
+        // leftover deletes only staging files.
+        self.settle_leftovers();
+        self.measure_unknown_tombstones();
         let after = lock(&self.state).unknown_reason();
         emit(
             false,
@@ -2329,6 +2338,39 @@ impl Inner {
                 )),
             ),
         );
+    }
+
+    /// Measures the tombstones not measured whole since they last changed,
+    /// leaving any a removal, a writer or a delete is working on. Deletes
+    /// nothing.
+    fn measure_unknown_tombstones(&self) {
+        let dirs: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.tombstones
+                .iter()
+                .map(|(d, _)| d.clone())
+                .filter(|d| {
+                    st.measured.get(d) != Some(&(st.epoch(d), true))
+                        && !st.removing.contains(d)
+                        && !st.deleting.contains(d)
+                        && !st.writing(d)
+                })
+                .collect()
+        };
+        for dir in dirs {
+            let bytes = self.measure_tombstone(&dir);
+            let known = {
+                let st = lock(&self.state);
+                st.measured.get(&dir) == Some(&(st.epoch(&dir), true))
+            };
+            emit(
+                !known,
+                format!(
+                    "pharos: video keep tombstone measured dir={} bytes={bytes} whole={known} from=host_size_check",
+                    dir.display()
+                ),
+            );
+        }
     }
 
     /// Claims the held folders nothing else is working on.
@@ -6346,6 +6388,32 @@ mod tests {
         (rig, store, dir)
     }
 
+    /// A car-only process: a removed download's folder that would not
+    /// delete and could not be read, with a staging file that would not go,
+    /// recovers through the music hook alone once the folder reads again.
+    /// The tombstone is measured, not deleted (the hook runs under the
+    /// music cache's locks), and the leftover settles.
+    #[tokio::test]
+    async fn the_music_size_check_recovers_tombstones_and_leftovers() {
+        let (_rig, store, dir) = tomb_with_leftover("hook-tomb").await;
+        lock(&store.inner.state).bump(&dir);
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the folder is unreadable");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(outside.held > 0, "the tombstone stopped counting");
+        assert!(dir.exists(), "the hook deleted a folder");
+        let st = lock(&store.inner.state);
+        assert!(st.leftover.is_empty(), "the leftover did not settle");
+        assert_eq!(st.tombstones.len(), 1);
+        drop(st);
+        assert!(!lines("pharos: video keep tombstone measured").is_empty());
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
     type Hook = std::thread::LocalKey<RefCell<Option<Box<dyn Fn()>>>>;
 
     fn set_hook(hook: &'static Hook, f: impl Fn() + 'static) {
@@ -6489,7 +6557,12 @@ mod tests {
         std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
         FAIL_PART_DELETE.with(|f| f.set(true));
         let store = rig.open();
-        assert!(store.size_unknown(), "the folder was read as known");
+        // Read as the open left it: the host's size check would settle it
+        // (it measures the folder whole, the staging file included).
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "the folder was read as known"
+        );
         FAIL_PART_DELETE.with(|f| f.set(false));
         store.inner.sweep_tombstones();
         assert!(!store.size_unknown(), "the sweep did not resolve it");
