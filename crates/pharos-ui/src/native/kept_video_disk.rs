@@ -2341,6 +2341,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             st.leftover.push(dir);
         }
     }
+    let mut cleaned = None;
     match outcome {
         Ok(Finished {
             bytes,
@@ -2390,6 +2391,26 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         }
         Err(Stop::Gone) => superseded("removed"),
         Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
+            // The fetches cancelled with the failure leave their staging
+            // files, which the figure below does not count: they go first,
+            // and one that will not leaves the folder unknown before the
+            // smaller figure is published.
+            let dir = inner.item_dir(&user, &item);
+            let clean = drop_parts_of(&dir, Some(run));
+            if !clean {
+                let mut st = lock(&inner.state);
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir.clone());
+                }
+            }
+            emit(
+                !clean,
+                format!(
+                    "pharos: video keep staging after failure item={item} run={run} verdict={}",
+                    if clean { "dropped" } else { "leftover_unknown" }
+                ),
+            );
+            cleaned = Some(clean);
             let (mut files, mut bytes) = (0, 0);
             let applied = inner.update_run(&user, &item, run, |v| {
                 // Not durable when the save fails (logged by `save_record`):
@@ -2406,6 +2427,8 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     reason: reason.clone(),
                 };
             });
+            #[cfg(test)]
+            tests::after_failed_save();
             if applied.unwrap_or(true) {
                 emit(
                     true,
@@ -2419,8 +2442,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         }
     }
     // Whatever this run left half staged (a file in flight when the
-    // download failed or was dropped) goes with it.
-    let cleaned = drop_parts_of(&inner.item_dir(&user, &item), Some(run));
+    // download was dropped) goes with it; a failure dropped its files above.
+    let cleaned =
+        cleaned.unwrap_or_else(|| drop_parts_of(&inner.item_dir(&user, &item), Some(run)));
     let owned = {
         let mut st = lock(&inner.state);
         if !cleaned || !disk.exact {
@@ -3532,6 +3556,20 @@ mod tests {
         /// While set, reading a directory entry fails after the directory
         /// opened.
         pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Runs once a failed or refused download's record is saved, before
+        /// the run ends.
+        pub(super) static AFTER_FAILED_SAVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_failed_save() {
+        AFTER_FAILED_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -6949,6 +6987,75 @@ mod tests {
         assert!(!orphan.exists(), "the ordinary sweep left the orphan");
         assert!(!part.exists(), "the ordinary sweep left the staging file");
         assert!(!store.size_unknown());
+    }
+
+    /// A segment fails while a parallel fetch has a large staging file in
+    /// flight. The cancelled fetch's file goes before the Failed record's
+    /// smaller figure is published; when it will not go, the folder is
+    /// unknown first, so an admission planned right then is refused.
+    #[tokio::test]
+    async fn a_failed_download_drops_or_counts_its_cancelled_parts_before_its_figure_falls() {
+        for stuck in [false, true] {
+            let rig = Rig::new(if stuck {
+                "failed-parts-stuck"
+            } else {
+                "failed-parts"
+            });
+            let _gate = rig.server.hold_mid_body(SEG0);
+            let fail = rig.server.hold_first(SEG1);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            let files = rig.dir.join("u1").join("1").join("files");
+            let part = || {
+                std::fs::read_dir(&files).ok().and_then(|r| {
+                    r.flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().is_some_and(|x| x == "part"))
+                })
+            };
+            let mut waited = 0;
+            let part = loop {
+                if let Some(p) = part() {
+                    break p;
+                }
+                waited += 1;
+                assert!(waited < 2_000, "no fetch staged a file");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            };
+            // Larger than the plan's whole estimate.
+            let big = 20_000_000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .unwrap()
+                .set_len(big)
+                .unwrap();
+            FAIL_PART_DELETE.with(|f| f.set(stuck));
+            let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+            let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+            set_hook(&AFTER_FAILED_SAVE, move || {
+                let on_disk = dir_size(&files2).bytes;
+                // What an admission planned now would find: `admit` refuses
+                // while any folder is unknown. (Read from the state: the
+                // host's check behind `size_unknown` would settle it.)
+                let refused = lock(&s2.inner.state).unknown_folder().is_some();
+                *seen2.borrow_mut() = Some((refused, s2.kept_bytes(), on_disk));
+            });
+            fail.store(true, Ordering::SeqCst);
+            store.settled().await;
+            clear_hook(&AFTER_FAILED_SAVE);
+            FAIL_PART_DELETE.with(|f| f.set(false));
+            let (refused, kept, on_disk) = (*seen.borrow()).expect("the download did not fail");
+            assert!(
+                refused || kept >= on_disk,
+                "stuck={stuck}: the figure fell to {kept} with {on_disk} on disk"
+            );
+            if stuck {
+                assert!(refused, "admissible while the stuck file was uncounted");
+            } else {
+                assert!(!part.exists(), "the cancelled fetch's file stayed");
+            }
+        }
     }
 
     /// An interrupted download (a segment missing) with an old run's
