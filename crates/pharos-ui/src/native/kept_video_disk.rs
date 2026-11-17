@@ -3134,6 +3134,86 @@ mod tests {
         assert!(only(&store).ready(), "still refused after the release");
     }
 
+    /// The music side as the library reports it: a window held mid-download
+    /// (`Library::music_outstanding_bytes`, covered in pharos-content by
+    /// `a_download_held_mid_window_is_outstanding_until_the_job_ends`).
+    struct FakeMusic {
+        outstanding: AtomicU64,
+    }
+
+    impl crate::native::ports::MusicSide for FakeMusic {
+        fn cache_cap(&self) -> Option<u64> {
+            Some(100 * GIB)
+        }
+        fn used_bytes(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn cache_enabled(&self) -> bool {
+            true
+        }
+        fn outstanding_bytes(&self) -> u64 {
+            self.outstanding.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The phone's budget: every music figure through the shared functions
+    /// `PhoneBudget` calls, the free space and the lock from the rig.
+    struct MusicBudget {
+        music: Arc<FakeMusic>,
+        base: Arc<FakeBudget>,
+    }
+
+    impl Budget for MusicBudget {
+        fn cap_bytes(&self) -> u64 {
+            crate::native::ports::music_cap(Some(&*self.music))
+        }
+        fn other_used_bytes(&self) -> u64 {
+            crate::native::ports::music_used(Some(&*self.music))
+        }
+        fn accounting_ready(&self) -> bool {
+            crate::native::ports::music_ready(Some(&*self.music))
+        }
+        fn other_outstanding_bytes(&self) -> u64 {
+            crate::native::ports::music_outstanding(Some(&*self.music))
+        }
+        fn free_bytes(&self) -> u64 {
+            self.base.free_bytes()
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            self.base.admission_guard()
+        }
+    }
+
+    /// A music download held mid-window leaves one window of free space
+    /// owed: a video that fits the free space only if that window is
+    /// ignored is refused by the 2 GiB guard, and admitted once the
+    /// music's reservation is released.
+    #[tokio::test]
+    async fn a_video_is_refused_by_the_guard_while_a_music_window_is_held() {
+        let rig = Rig::new("music-window");
+        // Room for the film above the guard, but not for it and the window.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + 4_000_000, Ordering::SeqCst);
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(8 * 1024 * 1024),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        let refusal = store.start(request("1")).unwrap_err();
+        assert!(
+            refusal.to_string().contains("guard"),
+            "refused, but not by the guard: {refusal}"
+        );
+        assert!(store.videos("u1").is_empty());
+        music.outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
     #[tokio::test]
     async fn a_download_that_would_leave_under_the_guard_is_refused() {
         let rig = Rig::new("guard");
