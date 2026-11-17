@@ -15,22 +15,28 @@
 //! - **An aligner failure is not a result** (FR-015a). It stores an attempt
 //!   count and a retry time an hour on, and only after three attempts an
 //!   `unknown` verdict. While `/healthz` fails the job pauses.
-//! - **Stage 1 only.** The wide search (stage 2) is slice 3: until then a
-//!   track that does not fit is `unknown`, `not_searched`, never `wrong_video`.
+//! - **Two stages** (FR-007, FR-008). Stage 1 sends the probes at their own
+//!   times. A track that does not fit goes to stage 2: the coarse search
+//!   ([`pharos_subs::check::coarse`]) decodes the audio once at 8 kHz, finds
+//!   where the cue pattern lines up with speech within ±120 s and at four speed
+//!   ratios, and the best [`MAX_STAGE2`] of those are tried with the aligner
+//!   until one fits. Only stage 2 can call a track `wrong_video`.
 //! - **Log only.** Nothing reads the rows to change what is served until
 //!   `[subtitle_check].apply` and slice 5.
 //!
 //! # Signals
 //!
 //! ```text
-//! pharos_subtitle_check_total{verdict,reason_class,stage}  stage: gate | 1
+//! pharos_subtitle_check_total{verdict,reason_class,stage}  stage: gate | 1 | 2
 //! pharos_subtitle_check_aligner_seconds                    aligner time per check
+//! pharos_subtitle_check_coarse_seconds                     coarse search per stage-2 check
 //! pharos_subtitle_check_pending                            tracks left at the start of a pass
 //! ```
 //!
 //! Every track leaves one `subtitle check` log line with its item, source,
-//! languages, verdict, reason, every probe and decoy score and the aligner
-//! time; a failure carries the same fields.
+//! languages, verdict, reason, every probe and decoy score at each timing
+//! tried, the aligner time and the coarse-search time; a failure carries the
+//! same fields.
 
 use crate::bg_io::BgPermit;
 use crate::services::lyrics::align::{Aligned, Aligner};
@@ -38,7 +44,10 @@ use crate::subtitle_styling::{
     candidates_for, read_source, signature, SubtitleCandidate, TranscodeQueue,
 };
 use pharos_cache::SubtitleCache;
-use pharos_core::{MediaItem, MediaKind, MediaStore, SubtitleCheckRow, SubtitleCheckStore};
+use pharos_core::{
+    AudioTrack, MediaItem, MediaKind, MediaStore, SubtitleCheckRow, SubtitleCheckStore,
+};
+use pharos_subs::check::coarse::{self, Shift, Speech};
 use pharos_subs::check::lang;
 use pharos_subs::check::probes::{self, Probe};
 use pharos_subs::check::verdict::{self, Candidate, Thresholds, UnknownClass, Verdict};
@@ -52,7 +61,7 @@ use tokio::sync::Semaphore;
 
 /// Bumped when the probe picker, the rules or the request change, so every
 /// track is checked again.
-pub const CHECK_VERSION: u32 = 1;
+pub const CHECK_VERSION: u32 = 2;
 /// FR-007: each probe's window ends this much after the cue.
 pub const PAD_MS: u64 = 2_000;
 /// FR-015a: an aligner failure is retried no sooner than this (seconds), as
@@ -60,6 +69,12 @@ pub const PAD_MS: u64 = 2_000;
 pub const RETRY_AFTER_SECS: i64 = 3_600;
 /// FR-015a: attempts before an aligner failure is stored as `unknown`.
 pub const MAX_ATTEMPTS: u32 = 3;
+/// FR-006: stage-2 candidates tried, two requests each, so a track costs at
+/// most 8 requests with stage 1's two.
+pub const MAX_STAGE2: usize = 3;
+/// How far the aligner's own offset search reaches (±8 s): stage 1 has looked
+/// there already, so stage 2 does not try a ratio-1 offset inside it.
+pub const ALIGNER_REACH_MS: i64 = 8_000;
 
 /// Delay before the first pass, so boot I/O settles (as the other sweeps).
 const WARMUP: Duration = Duration::from_secs(240);
@@ -94,6 +109,82 @@ impl Scorer for Arc<Aligner> {
     }
 }
 
+/// FR-009: hears where a file's audio holds speech. [`FfmpegEars`] in
+/// production.
+pub trait Listen: Send + Sync {
+    /// The speech map of `stream` (an absolute stream index), or of the first
+    /// audio stream when `None`.
+    fn speech(
+        &self,
+        path: &Path,
+        stream: Option<u32>,
+    ) -> impl Future<Output = Result<Speech, String>> + Send;
+}
+
+/// Decodes with the `ffmpeg` binary at 8 kHz mono and folds the samples into
+/// a [`coarse::Listener`] as they arrive, so the audio is never held.
+pub struct FfmpegEars;
+
+/// Bytes of ffmpeg's stderr kept for an error message.
+const STDERR_TAIL: usize = 2_048;
+
+impl Listen for FfmpegEars {
+    async fn speech(&self, path: &Path, stream: Option<u32>) -> Result<Speech, String> {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+        let map = stream.map_or_else(|| "0:a:0".to_owned(), |i| format!("0:{i}"));
+        let mut child = tokio::process::Command::new(pharos_transcode::worker::exec::ffmpeg_bin())
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", &map, "-vn", "-sn", "-dn", "-ac", "1", "-ar"])
+            .arg(coarse::RATE.to_string())
+            .args(["-f", "s16le", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("spawn: {e}"))?;
+        let mut stderr = child.stderr.take().ok_or("no stderr")?;
+        let errs = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut buf).await;
+            let start = buf.len().saturating_sub(STDERR_TAIL);
+            String::from_utf8_lossy(&buf[start..]).trim().to_owned()
+        });
+        let mut stdout = child.stdout.take().ok_or("no stdout")?;
+        let mut ears = coarse::Listener::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut carry: Option<u8> = None;
+        let mut samples: Vec<i16> = Vec::with_capacity(buf.len() / 2 + 1);
+        loop {
+            let n = stdout
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            samples.clear();
+            let mut bytes = &buf[..n];
+            if let Some(lo) = carry.take() {
+                samples.push(i16::from_le_bytes([lo, bytes[0]]));
+                bytes = &bytes[1..];
+            }
+            let mut pairs = bytes.chunks_exact(2);
+            samples.extend(pairs.by_ref().map(|b| i16::from_le_bytes([b[0], b[1]])));
+            carry = pairs.remainder().first().copied();
+            ears.push(&samples);
+        }
+        let status = child.wait().await.map_err(|e| format!("wait: {e}"))?;
+        let errs = errs.await.unwrap_or_default();
+        if !status.success() {
+            return Err(format!("ffmpeg {status}: {errs}"));
+        }
+        Ok(ears.finish())
+    }
+}
+
 pub trait CheckStore: MediaStore + SubtitleCheckStore {}
 impl<S: MediaStore + SubtitleCheckStore> CheckStore for S {}
 
@@ -104,15 +195,18 @@ pub enum Stage {
     Gate,
     /// FR-007: the probes at their own times.
     One,
+    /// FR-008: the wide search.
+    Two,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 2] = [Stage::Gate, Stage::One];
+    pub const ALL: [Stage; 3] = [Stage::Gate, Stage::One, Stage::Two];
 
     pub fn label(self) -> &'static str {
         match self {
             Stage::Gate => "gate",
             Stage::One => "1",
+            Stage::Two => "2",
         }
     }
 }
@@ -137,12 +231,16 @@ pub fn source_key(c: &SubtitleCandidate) -> String {
 /// The language of the audio a track plays over (FR-002): the default audio
 /// stream, else the first.
 pub fn audio_language(item: &MediaItem) -> Option<&str> {
+    audio_stream(item).and_then(|t| t.language.as_deref())
+}
+
+/// The audio stream a track is checked against: the default, else the first.
+pub fn audio_stream(item: &MediaItem) -> Option<&AudioTrack> {
     let tracks = &item.probe.audio_tracks;
     tracks
         .iter()
         .find(|t| t.is_default)
         .or_else(|| tracks.first())
-        .and_then(|t| t.language.as_deref())
 }
 
 /// Films, then episodes (FR-016a), each in library order.
@@ -211,10 +309,11 @@ pub struct PassSummary {
 }
 
 /// The job. Fields are public for the tests.
-pub struct Checker<S, A, Q> {
+pub struct Checker<S, A, Q, L> {
     pub store: S,
     pub aligner: A,
     pub queue: Q,
+    pub ears: L,
     pub bg_io: Arc<Semaphore>,
     pub cache: Option<SubtitleCache>,
     pub thresholds: Thresholds,
@@ -257,6 +356,7 @@ pub fn spawn<S, Q>(
         store,
         aligner,
         queue,
+        ears: FfmpegEars,
         bg_io,
         cache,
         thresholds,
@@ -291,6 +391,32 @@ fn window(p: &Probe) -> (u64, u64) {
     (start, end.saturating_add(PAD_MS))
 }
 
+/// A probe's window at a stage-2 timing: `video = sub * ratio + offset`, end
+/// padded as in [`window`]. `None` when it would start before the file.
+fn window_at(p: &Probe, at: Option<Shift>) -> Option<(u64, u64)> {
+    let Some(s) = at else {
+        return Some(window(p));
+    };
+    let moved = |ms: i64| -> Option<u64> {
+        let scaled = (ms as f64 * s.ratio).round();
+        // A film's milliseconds fit an i64; the cast saturates otherwise.
+        #[allow(clippy::cast_possible_truncation)]
+        let scaled = scaled as i64;
+        u64::try_from(scaled.saturating_add(s.offset_ms)).ok()
+    };
+    Some((moved(p.start_ms)?, moved(p.end_ms)?.saturating_add(PAD_MS)))
+}
+
+/// What one timing's requests came back with.
+enum Asked {
+    Scored(Candidate),
+    /// The decoy request failed; the probes' scores are kept as evidence.
+    ProbesOnly(Candidate, String),
+    Failed(String),
+    /// No probe falls inside the file at this timing.
+    Outside,
+}
+
 /// Scores in thousandths to `f32`; a line with no score is NaN, which the
 /// verdict counts as 0 and never as a hit.
 fn scores(a: &Aligned, n: usize) -> Vec<f32> {
@@ -319,36 +445,60 @@ fn record(v: &Verdict, stage: Stage) {
 #[derive(Debug, Default)]
 struct Measured {
     stage1: Option<Candidate>,
+    /// FR-008: each stage-2 candidate tried, with the coarse match it came from.
+    stage2: Vec<(Shift, Candidate)>,
     aligner_s: f64,
+    /// FR-009: time spent decoding and matching, when stage 2 ran.
+    coarse_s: Option<f64>,
 }
 
 impl Measured {
     fn scores_json(&self) -> Option<String> {
         let c = self.stage1.as_ref()?;
+        let round = |v: f64| (v * 1000.0).round() / 1000.0;
         let finite = |v: &[f32]| -> Vec<Option<f64>> {
             v.iter()
-                .map(|s| {
-                    s.is_finite()
-                        .then(|| (f64::from(*s) * 1000.0).round() / 1000.0)
-                })
+                .map(|s| s.is_finite().then(|| round(f64::from(*s))))
                 .collect()
         };
-        Some(
+        let mut stages = vec![serde_json::json!({
+            "stage": 1,
+            "offset_ms": c.offset_ms,
+            "ratio": c.ratio,
+            "probes": finite(&c.probes),
+            "decoys": finite(&c.decoys),
+        })];
+        stages.extend(self.stage2.iter().map(|(shift, c)| {
             serde_json::json!({
-                "stages": [{
-                    "stage": 1,
-                    "offset_ms": c.offset_ms,
-                    "ratio": c.ratio,
-                    "probes": finite(&c.probes),
-                    "decoys": finite(&c.decoys),
-                }]
+                "stage": 2,
+                "coarse_offset_ms": shift.offset_ms,
+                "lift": round(shift.lift),
+                "offset_ms": c.offset_ms,
+                "ratio": c.ratio,
+                "probes": finite(&c.probes),
+                "decoys": finite(&c.decoys),
             })
-            .to_string(),
-        )
+        }));
+        Some(serde_json::json!({ "stages": stages }).to_string())
+    }
+
+    /// The stage-2 timings tried, `offset@ratio:median/decoy` each, for the log.
+    fn stage2_summary(&self, t: &Thresholds) -> String {
+        self.stage2
+            .iter()
+            .map(|(_, c)| {
+                let f = c.fit(t);
+                format!(
+                    "{}@{:.5}:{:.2}/{:.2}",
+                    c.offset_ms, c.ratio, f.median, f.decoy
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
-impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
+impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L> {
     /// One pass over the library.
     pub async fn run_pass(&self) -> PassSummary {
         let mut sum = PassSummary::default();
@@ -486,10 +636,13 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
         };
         let script = Script::parse(&text);
         let mut measured = Measured::default();
-        let (verdict, stage) = match self
+        let judged = self
             .judge(item, c, &script, audio_lang, &mut measured)
-            .await
-        {
+            .await;
+        if measured.aligner_s > 0.0 {
+            metrics::histogram!("pharos_subtitle_check_aligner_seconds").record(measured.aligner_s);
+        }
+        let (verdict, stage) = match judged {
             Ok(v) => v,
             Err(e) => {
                 let attempts = match d {
@@ -513,7 +666,11 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
                         UnknownClass::AlignerError,
                         format_args!("aligner_error:{e}"),
                     ),
-                    Stage::One,
+                    if measured.coarse_s.is_some() {
+                        Stage::Two
+                    } else {
+                        Stage::One
+                    },
                 )
             }
         };
@@ -539,7 +696,8 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
         }
     }
 
-    /// The gate, then stage 1. `Err` is an aligner failure.
+    /// The gate, stage 1, then stage 2 for a track that does not fit.
+    /// `Err` is an aligner failure.
     async fn judge(
         &self,
         item: &MediaItem,
@@ -566,51 +724,138 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
                 ))
             }
         };
-        self.wait_for_turn().await;
-        let lines = |text: fn(&Probe) -> &str| -> Vec<(u64, u64, String)> {
-            picked
-                .iter()
-                .map(|p| {
-                    let (a, b) = window(p);
-                    (a, b, text(p).to_owned())
-                })
-                .collect()
-        };
-        let asked = Instant::now();
-        let probe_answer = self.aligner.score(&item.path, &lines(|p| &p.text)).await;
-        measured.aligner_s = asked.elapsed().as_secs_f64();
-        let probe_answer = match probe_answer {
-            Ok(a) => a,
-            Err(e) => {
-                metrics::histogram!("pharos_subtitle_check_aligner_seconds")
-                    .record(measured.aligner_s);
+        let asked = self.ask(item, &picked, None, &mut measured.aligner_s).await;
+        let stage1 = match asked {
+            Asked::Scored(c) => c,
+            Asked::ProbesOnly(c, e) => {
+                // The probes' evidence is kept even when the decoy request fails.
+                measured.stage1 = Some(c);
                 return Err(e);
             }
+            Asked::Failed(e) => return Err(e),
+            Asked::Outside => {
+                return Ok((
+                    Verdict::unknown(UnknownClass::TooFewLines, "too_few_lines:0"),
+                    Stage::Gate,
+                ))
+            }
+        };
+        measured.stage1 = Some(stage1.clone());
+        if stage1.fit(&self.thresholds).fits(&self.thresholds) {
+            return Ok((verdict::decide(&stage1, None, &self.thresholds), Stage::One));
+        }
+        // FR-008/FR-009: the wide search.
+        let cues: Vec<(i64, i64)> = script
+            .events
+            .iter()
+            .filter(|e| !e.positioned && e.end_ms > e.start_ms)
+            .map(|e| (e.start_ms, e.end_ms))
+            .collect();
+        self.wait_for_transcodes().await;
+        let heard_at = Instant::now();
+        let speech = {
+            let _permit = BgPermit::acquire(&self.bg_io).await;
+            self.ears
+                .speech(&item.path, audio_stream(item).map(|t| t.stream_index))
+                .await
+        };
+        let shifts = speech.map(|sp| coarse::candidates(&sp, &cues, ALIGNER_REACH_MS, MAX_STAGE2));
+        let coarse_s = heard_at.elapsed().as_secs_f64();
+        measured.coarse_s = Some(coarse_s);
+        metrics::histogram!("pharos_subtitle_check_coarse_seconds").record(coarse_s);
+        let shifts = match shifts {
+            Ok(s) => s,
+            Err(e) => {
+                let fit1 = stage1.fit(&self.thresholds);
+                return Ok((
+                    Verdict::unknown(
+                        UnknownClass::Inconclusive,
+                        format_args!("inconclusive coarse_error:{e} {fit1}"),
+                    ),
+                    Stage::Two,
+                ));
+            }
+        };
+        for shift in shifts {
+            match self
+                .ask(item, &picked, Some(shift), &mut measured.aligner_s)
+                .await
+            {
+                Asked::Scored(c) => {
+                    let fits = c.fit(&self.thresholds).fits(&self.thresholds);
+                    measured.stage2.push((shift, c));
+                    if fits {
+                        break;
+                    }
+                }
+                Asked::ProbesOnly(c, e) => {
+                    measured.stage2.push((shift, c));
+                    return Err(e);
+                }
+                Asked::Failed(e) => return Err(e),
+                Asked::Outside => {}
+            }
+        }
+        let tried: Vec<Candidate> = measured.stage2.iter().map(|(_, c)| c.clone()).collect();
+        Ok((
+            verdict::decide(&stage1, Some(&tried), &self.thresholds),
+            Stage::Two,
+        ))
+    }
+
+    /// FR-006: one timing's two requests, the probes and then their decoys in
+    /// the same windows. `at` is `None` for stage 1 (the cues' own times).
+    async fn ask(
+        &self,
+        item: &MediaItem,
+        picked: &[Probe],
+        at: Option<Shift>,
+        aligner_s: &mut f64,
+    ) -> Asked {
+        let duration = item.probe.duration_ms;
+        let windows: Vec<(u64, u64, &Probe)> = picked
+            .iter()
+            .filter_map(|p| {
+                let (a, b) = window_at(p, at)?;
+                duration.map_or(true, |d| a < d).then_some((a, b, p))
+            })
+            .collect();
+        if windows.is_empty() {
+            return Asked::Outside;
+        }
+        let lines = |text: fn(&Probe) -> &str| -> Vec<(u64, u64, String)> {
+            windows
+                .iter()
+                .map(|&(a, b, p)| (a, b, text(p).to_owned()))
+                .collect()
+        };
+        let (offset_ms, ratio) = at.map_or((0, 1.0), |s| (s.offset_ms, s.ratio));
+        self.wait_for_turn().await;
+        let asked = Instant::now();
+        let probe_answer = self.aligner.score(&item.path, &lines(|p| &p.text)).await;
+        *aligner_s += asked.elapsed().as_secs_f64();
+        let probe_answer = match probe_answer {
+            Ok(a) => a,
+            Err(e) => return Asked::Failed(e),
+        };
+        let mut cand = Candidate {
+            offset_ms: offset_ms.saturating_add(probe_answer.offset_ms),
+            ratio,
+            probes: scores(&probe_answer, windows.len()),
+            decoys: Vec::new(),
         };
         // FR-016: one request at a time, and a song may have come in between.
         self.wait_for_turn().await;
-        let decoy_asked = Instant::now();
+        let asked = Instant::now();
         let decoy_answer = self.aligner.score(&item.path, &lines(|p| &p.decoy)).await;
-        measured.aligner_s += decoy_asked.elapsed().as_secs_f64();
-        metrics::histogram!("pharos_subtitle_check_aligner_seconds").record(measured.aligner_s);
-        // The probes' evidence is kept even when the decoy request fails.
-        let probes = scores(&probe_answer, picked.len());
-        measured.stage1 = Some(Candidate {
-            offset_ms: probe_answer.offset_ms,
-            ratio: 1.0,
-            probes: probes.clone(),
-            decoys: Vec::new(),
-        });
-        let decoy_answer = decoy_answer?;
-        let cand = Candidate {
-            offset_ms: probe_answer.offset_ms,
-            ratio: 1.0,
-            probes,
-            decoys: scores(&decoy_answer, picked.len()),
-        };
-        let v = verdict::decide(&cand, None, &self.thresholds);
-        measured.stage1 = Some(cand);
-        Ok((v, Stage::One))
+        *aligner_s += asked.elapsed().as_secs_f64();
+        match decoy_answer {
+            Ok(a) => {
+                cand.decoys = scores(&a, windows.len());
+                Asked::Scored(cand)
+            }
+            Err(e) => Asked::ProbesOnly(cand, e),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -684,7 +929,9 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue> Checker<S, A, Q> {
             stage1_ratio = ratio,
             probe_scores = %probes,
             decoy_scores = %decoys,
+            stage2 = %measured.stage2_summary(&self.thresholds),
             aligner_s = measured.aligner_s,
+            coarse_s = measured.coarse_s,
             elapsed_s = started.elapsed().as_secs_f64(),
             "subtitle check"
         );
@@ -719,6 +966,10 @@ mod tests {
         fail_call: Option<usize>,
         calls: Mutex<Vec<(String, usize)>>,
         starts: Mutex<Vec<u64>>,
+        /// When set, the video's real timing of [`srt`]'s cues,
+        /// `video = sub * ratio + offset`: a probe scores `probe` only when
+        /// sent within the aligner's reach of it, and `offset_ms` is the rest.
+        truth: Option<(i64, f64)>,
     }
 
     impl Fake {
@@ -735,6 +986,7 @@ mod tests {
                 fail_call: None,
                 calls: Mutex::default(),
                 starts: Mutex::default(),
+                truth: None,
             }
         }
         fn calls(&self) -> Vec<(String, usize)> {
@@ -788,13 +1040,85 @@ mod tests {
             {
                 return Err("request: connection refused".into());
             }
-            let s = if is_decoy { self.decoy } else { self.probe };
+            let Some((offset, ratio)) = self.truth else {
+                let s = if is_decoy { self.decoy } else { self.probe };
+                return Ok(Aligned {
+                    lines: vec![Vec::new(); lines.len()],
+                    offset_ms: self.offset_ms,
+                    scores: vec![Some(s); lines.len()],
+                });
+            };
+            // How far each sent line is from where its cue is really spoken.
+            let off: Vec<i64> = lines
+                .iter()
+                .map(|(start, _, text)| {
+                    let i: i64 = text
+                        .split("line ")
+                        .nth(1)
+                        .and_then(|t| t.split(' ').next())
+                        .and_then(|n| n.parse().ok())
+                        .unwrap();
+                    let real = ((i * 60_000 + 1_000) as f64 * ratio).round() as i64 + offset;
+                    real - i64::try_from(*start).unwrap()
+                })
+                .collect();
+            let near = |o: &i64| o.abs() <= 8_000;
+            let scores = off
+                .iter()
+                .map(|o| {
+                    Some(if !is_decoy && near(o) {
+                        self.probe
+                    } else {
+                        self.decoy
+                    })
+                })
+                .collect();
+            let rest = off.iter().copied().find(near).unwrap_or(0);
             Ok(Aligned {
                 lines: vec![Vec::new(); lines.len()],
-                offset_ms: self.offset_ms,
-                scores: vec![Some(s); lines.len()],
+                offset_ms: if rest.abs() < 400 { 0 } else { rest },
+                scores,
             })
         }
+    }
+
+    /// Hears `speech`, and notes the stream asked for.
+    struct Ears {
+        speech: Result<Speech, String>,
+        streams: Mutex<Vec<Option<u32>>>,
+    }
+
+    impl Ears {
+        fn hearing(speech: Result<Speech, String>) -> Self {
+            Self {
+                speech,
+                streams: Mutex::default(),
+            }
+        }
+        /// No speech: stage 2 finds no candidate.
+        fn deaf() -> Self {
+            Self::hearing(Ok(Speech::from_frames(vec![false; 15_000])))
+        }
+    }
+
+    impl Listen for Ears {
+        async fn speech(&self, _: &Path, stream: Option<u32>) -> Result<Speech, String> {
+            self.streams.lock().unwrap().push(stream);
+            self.speech.clone()
+        }
+    }
+
+    /// Speech where [`srt`]'s cues are spoken at `video = sub * ratio + offset`.
+    fn spoken(offset_ms: i64, ratio: f64) -> Speech {
+        let mut on = vec![false; 15_000];
+        for i in 0..20i64 {
+            let at = |ms: i64| ((ms as f64 * ratio).round() as i64 + offset_ms) / 100;
+            let (a, b) = (at(i * 60_000 + 1_000), at(i * 60_000 + 4_000));
+            for f in a.max(0)..b.min(15_000) {
+                on[usize::try_from(f).unwrap()] = true;
+            }
+        }
+        Speech::from_frames(on)
     }
 
     struct Idle;
@@ -870,11 +1194,20 @@ mod tests {
         Lib { _dir: dir, store }
     }
 
-    fn job<'a>(lib: &Lib, fake: &'a Fake) -> Checker<SqliteStore, &'a Fake, Idle> {
+    fn job<'a>(lib: &Lib, fake: &'a Fake) -> Checker<SqliteStore, &'a Fake, Idle, Ears> {
+        job_hearing(lib, fake, Ears::deaf())
+    }
+
+    fn job_hearing<'a>(
+        lib: &Lib,
+        fake: &'a Fake,
+        ears: Ears,
+    ) -> Checker<SqliteStore, &'a Fake, Idle, Ears> {
         Checker {
             store: lib.store.clone(),
             aligner: fake,
             queue: Idle,
+            ears,
             bg_io: Arc::new(Semaphore::new(1)),
             cache: None,
             thresholds: Thresholds::default(),
@@ -945,14 +1278,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_the_wide_search_a_misfit_is_unknown_not_wrong() {
+    async fn ffmpeg_ears_hear_where_the_sound_is_and_name_a_failure() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sound.mka");
+        // Room tone, then 2 s of a loud voice-like tone, then room tone.
+        let status = tokio::process::Command::new(pharos_transcode::worker::exec::ffmpeg_bin())
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=if(between(t\\,2\\,4)\\,0.5\\,0.0005)*sin(2*PI*220*t):s=48000:d=6")
+            .args(["-c:a", "pcm_s16le"])
+            .arg(&path)
+            .status()
+            .await
+            .expect("ffmpeg must be on PATH inside the devShell (see CLAUDE.md)");
+        assert!(status.success());
+        let speech = FfmpegEars.speech(&path, None).await.unwrap();
+        assert_eq!(speech.frames(), 60);
+        assert!((19..=21).contains(&speech.speech_frames()), "{speech:?}");
+
+        let err = FfmpegEars
+            .speech(&dir.path().join("missing.mkv"), Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.contains("missing.mkv"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stage_two_finds_a_shift_beyond_the_aligners_reach() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&rec);
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let mut fake = Fake::new(900, 250);
+        fake.truth = Some((20_000, 1.0));
+        let checker = job_hearing(&lib, &fake, Ears::hearing(Ok(spoken(20_000, 1.0))));
+        checker.run_pass().await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("retimed"), "{}", r.reason);
+        assert_eq!((r.offset_ms, r.ratio), (Some(20_000), Some(1.0)));
+        // Stage 1, then the first stage-2 candidate fits: four requests.
+        assert_eq!(fake.calls().len(), 4);
+        assert_eq!(
+            *checker.ears.streams.lock().unwrap(),
+            [Some(1)],
+            "the gate's stream"
+        );
+        assert!(r.scores_json.unwrap().contains("\"stage\":2"));
+        assert_eq!(counts(&snap), [("retimed,offset,2".to_owned(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn stage_two_finds_a_speed_ratio() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let ratio = 25.0 / 23.976;
+        let mut fake = Fake::new(900, 250);
+        fake.truth = Some((1_500, ratio));
+        job_hearing(&lib, &fake, Ears::hearing(Ok(spoken(1_500, ratio))))
+            .run_pass()
+            .await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("retimed"), "{}", r.reason);
+        assert_eq!(r.ratio, Some(ratio));
+        assert!(
+            (r.offset_ms.unwrap() - 1_500).abs() <= 100,
+            "{:?}",
+            r.offset_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_that_fits_nowhere_is_wrong_after_at_most_eight_requests() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let fake = Fake::new(270, 250);
+        job_hearing(&lib, &fake, Ears::hearing(Ok(spoken(30_000, 1.0))))
+            .run_pass()
+            .await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("wrong_video"), "{}", r.reason);
+        assert_eq!(fake.calls().len(), 2 + 2 * MAX_STAGE2);
+    }
+
+    #[tokio::test]
+    async fn no_speech_match_is_inconclusive_not_wrong() {
         let text = srt();
         let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
         let fake = Fake::new(270, 250);
         job(&lib, &fake).run_pass().await;
         let r = row(&lib, 1).await;
         assert_eq!(r.verdict.as_deref(), Some("unknown"));
-        assert!(r.reason.starts_with("not_searched"), "{}", r.reason);
+        assert!(
+            r.reason.starts_with("inconclusive no_candidates"),
+            "{}",
+            r.reason
+        );
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_decode_is_inconclusive_and_names_the_error() {
+        let text = srt();
+        let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
+        let fake = Fake::new(270, 250);
+        let ears = Ears::hearing(Err("ffmpeg exit status: 1: no audio".into()));
+        job_hearing(&lib, &fake, ears).run_pass().await;
+        let r = row(&lib, 1).await;
+        assert_eq!(r.verdict.as_deref(), Some("unknown"));
+        assert!(
+            r.reason
+                .starts_with("inconclusive coarse_error:ffmpeg exit status: 1: no audio"),
+            "{}",
+            r.reason
+        );
+        assert_eq!(fake.calls().len(), 2, "no stage-2 request");
     }
 
     #[tokio::test]
@@ -1044,6 +1483,7 @@ mod tests {
             store: lib.store.clone(),
             aligner: &fake,
             queue: &queued,
+            ears: Ears::deaf(),
             bg_io: Arc::new(Semaphore::new(1)),
             cache: None,
             thresholds: Thresholds::default(),
