@@ -43,6 +43,20 @@ pub(crate) fn accounting_installed() -> bool {
     OUTSIDE_USED.get().is_some()
 }
 
+/// What the library's hook reports. With no accounting installed nothing is
+/// known of what the app's downloads hold, so the size is unknown and the
+/// music cache admits nothing, as prefetch (`prefetch_refusal`) does; it is
+/// not read as zero usage.
+pub(crate) fn outside_bytes(used: Option<&content::OutsideUsed>) -> content::OutsideBytes {
+    used.map_or(
+        content::OutsideBytes {
+            unknown: true,
+            ..content::OutsideBytes::default()
+        },
+        |used| used(),
+    )
+}
+
 /// Why prefetch must not run, when it must not.
 pub(crate) fn prefetch_refusal(installed: bool) -> Option<&'static str> {
     (!installed).then_some("video accounting is not installed")
@@ -120,11 +134,7 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         content::AuthState::SignedIn => "signed_in",
     };
     log(&format!("library server_from={server_from} auth={auth}"));
-    lib.set_outside_used(std::sync::Arc::new(|| {
-        OUTSIDE_USED
-            .get()
-            .map_or_else(content::OutsideBytes::default, |used| used())
-    }));
+    lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
     let cache_dir = Path::new(&files).join("audio-cache");
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
         Ok(()) => log(&format!(
@@ -486,7 +496,20 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 
 #[cfg(test)]
 mod tests {
-    use super::{access, Caller};
+    use super::{access, outside_bytes, Caller};
+    use pharos_content as content;
+
+    #[test]
+    fn no_installed_accounting_reads_as_unknown_not_zero() {
+        assert!(outside_bytes(None).unknown);
+        let used: content::OutsideUsed = std::sync::Arc::new(|| content::OutsideBytes {
+            held: 5,
+            outstanding: 2,
+            unknown: false,
+        });
+        let o = outside_bytes(Some(&used));
+        assert_eq!((o.held, o.outstanding, o.unknown), (5, 2, false));
+    }
 
     fn caller(uid: i32, owns_package: bool, system_app: bool) -> Caller {
         Caller {
