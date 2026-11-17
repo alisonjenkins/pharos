@@ -228,6 +228,9 @@ struct Inner {
     /// Called by `sweep_relist` at its steps, for a test to interleave two.
     #[cfg(test)]
     relist_hook: Mutex<Option<RelistHook>>,
+    /// Sweeps the host's size check has run, on any thread.
+    #[cfg(test)]
+    host_sweeps: std::sync::atomic::AtomicUsize,
 }
 
 /// A test's hook into `sweep_relist`, given the step reached.
@@ -2312,6 +2315,9 @@ impl Inner {
             }
             *last = Some(now);
         }
+        #[cfg(test)]
+        self.host_sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let before = lock(&self.state).unknown_reason();
         self.sweep_held();
         // The tombstones and leftovers recover too, as `sweep_tombstones`
@@ -2711,6 +2717,8 @@ impl DiskVideoStore {
             tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
             relist_hook: Mutex::new(None),
+            #[cfg(test)]
+            host_sweeps: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut st = State::default();
         st.root.clone_from(&inner.root);
@@ -5178,9 +5186,6 @@ mod tests {
             .unwrap();
         let _enter = rt.enter();
         let (rig, store, good, manifest) = rt.block_on(held_download("music-sweep"));
-        std::fs::write(&manifest, &good).unwrap();
-        // The open's own check swept just now; make the next one due.
-        *store.inner.last_sweep.lock().unwrap() = None;
 
         let base = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5200,6 +5205,13 @@ mod tests {
             crate::native::ports::outside_bytes(Some(&*hooked))
         }));
         lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        // Repaired only now, with the sweep made due: the cache's own start
+        // (which runs the hook) cannot have released the folder, so only the
+        // music job's check can.
+        std::fs::write(&manifest, &good).unwrap();
+        assert_eq!(store.unreadable_count(), 1, "released before the job ran");
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let swept = store.inner.host_sweeps.load(Ordering::SeqCst);
         lib.prefetch(&["track/3".to_owned()]);
         // Admitted: the job passes `ensure_free` and goes on to resolve the
         // track (nothing listens, so the resolve is retried).
@@ -5223,7 +5235,12 @@ mod tests {
         );
         assert!(seen("reason=resolve"), "music was not admitted");
         assert_eq!(store.unreadable_count(), 0, "the folder is still held");
-        assert!(!lines("pharos: video unknown-size sweep from=host_size_check").is_empty());
+        // The job's thread ran the sweep (the log capture is per thread, so
+        // the count is what proves it).
+        assert!(
+            store.inner.host_sweeps.load(Ordering::SeqCst) > swept,
+            "the music job did not start the sweep"
+        );
     }
 
     /// A record that cannot be written is refused at the start, and the
