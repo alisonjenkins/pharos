@@ -135,6 +135,12 @@ ignore = [
     # 8.2.0, which is fixed. Re-check if anything enables Burn's `tch`
     # backend, and drop the entry when burn-tch moves off zip 0.6.
     "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0543 — `chrono` is "unmaintained" (all versions; no safe
+    # upgrade), not vulnerable. pharos does not depend on it: it arrives only
+    # through Burn's `cubecl-environment` -> `turso` -> `turso_core` /
+    # `turso_ext` (pharos-align's GPU aligner build chain, `cargo tree -i
+    # chrono --all-features`). Drop the entry when Burn/cubecl move off it.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
