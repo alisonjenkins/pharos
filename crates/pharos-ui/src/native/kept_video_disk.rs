@@ -1957,36 +1957,55 @@ async fn fetch_planned(
     }
 }
 
-async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
-    let record = find(&lock(&inner.state).list, user, item)
-        .cloned()
-        .ok_or(Stop::Gone)?;
+/// The playlists a run's planning read, and those of them it fetched.
+#[derive(Default)]
+struct Playlists {
+    read: Vec<String>,
+    fetched: Vec<String>,
+}
+
+/// What an admitted plan leaves for the fetching.
+struct Planned {
+    all: Vec<String>,
+    have: HashSet<String>,
+    names: HashMap<String, u64>,
+    total: u32,
+    short_tails: HashSet<String>,
+}
+
+/// Reads (or reserves and fetches) the playlists, plans the files and
+/// admits the plan. Every playlist read is put in `playlists`, so the
+/// caller can clean up however this ends.
+async fn plan_and_admit(
+    inner: &Arc<Inner>,
+    user: &str,
+    item: &str,
+    run: u64,
+    record: &KeptVideo,
+    playlists: &mut Playlists,
+) -> Result<Planned, Stop> {
     let resume = !record.files.is_empty();
     let master = request_key(&record.master_url);
-
-    // Playlists this run fetches before its plan is admitted: reserved at
-    // their limit until the admission sets the estimate, and deleted if
-    // the admission refuses, so a refused download keeps nothing it
-    // fetched to plan.
-    let mut fetched: Vec<String> = Vec::new();
-    let text = playlist(inner, user, item, run, &master, &mut fetched).await?;
+    // Playlists fetched before the plan is admitted are reserved at their
+    // limit until the admission sets the estimate.
+    let text = playlist(inner, user, item, run, &master, &mut playlists.fetched).await?;
     let plan = plan_master(&format!("{PLAN_ORIGIN}{master}"), &text)
         .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
-    let mut stored = vec![master.clone()];
+    playlists.read.push(master.clone());
     let mut files: Vec<String> = Vec::new();
     let mut duration_ms = 0u64;
     let mut short_tails: HashSet<String> = HashSet::new();
     for url in &plan.media_playlists {
         let key = request_key(url);
-        let text = playlist(inner, user, item, run, &key, &mut fetched).await?;
+        let text = playlist(inner, user, item, run, &key, &mut playlists.fetched).await?;
         let media = plan_media(url, &text)
             .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(&key))))?;
-        stored.push(key);
+        playlists.read.push(key);
         duration_ms = duration_ms.max(media.duration_ms);
         short_tails.extend(media.short_tail.iter().map(|u| request_key(u)));
         files.extend(media.files.iter().map(|u| request_key(u)));
     }
-    let mut all = stored.clone();
+    let mut all = playlists.read.clone();
     all.extend(files);
     all.extend(record.subtitles.iter().map(|s| request_key(&s.url)));
     let mut seen = HashSet::new();
@@ -2122,19 +2141,56 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
                     "pharos: video keep refused item={item} reason={refusal} {detail} free={free} outstanding={outstanding}"
                 ),
             );
-            // Nothing fetched to plan is kept: a new download drops its
-            // playlists, a resumed one those this run fetched (its other
-            // files stay for a later retry).
-            drop_refused_files(
-                inner,
-                user,
-                item,
-                run,
-                if resume { &fetched } else { &stored },
-            );
             return Err(Stop::Refused(refusal.to_string()));
         }
     }
+    Ok(Planned {
+        all,
+        have,
+        names,
+        total,
+        short_tails,
+    })
+}
+
+async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
+    let record = find(&lock(&inner.state).list, user, item)
+        .cloned()
+        .ok_or(Stop::Gone)?;
+    let resume = !record.files.is_empty();
+    // Every way out of planning passes here: a refusal there (a playlist's
+    // reservation or size limit, the plan's admission) keeps nothing this
+    // run fetched to plan. A new download drops the playlists it read; a
+    // resumed one only those this run fetched, its other files kept for a
+    // later retry.
+    let mut playlists = Playlists::default();
+    let planned = match plan_and_admit(inner, user, item, run, &record, &mut playlists).await {
+        Ok(p) => p,
+        Err(Stop::Refused(reason)) => {
+            let dropped = if resume {
+                &playlists.fetched
+            } else {
+                &playlists.read
+            };
+            drop_refused_files(inner, user, item, run, dropped);
+            emit(
+                false,
+                format!(
+                    "pharos: video keep planning refused item={item} resume={resume} playlists_dropped={}",
+                    dropped.len()
+                ),
+            );
+            return Err(Stop::Refused(reason));
+        }
+        Err(e) => return Err(e),
+    };
+    let Planned {
+        all,
+        have,
+        names,
+        total,
+        short_tails,
+    } = planned;
     let mut bytes = 0u64;
     for key in &have {
         if let Some(len) = names.get(&file_name(key)) {
@@ -4390,6 +4446,69 @@ mod tests {
             refused.iter().any(|l| l.contains("step=playlist")),
             "{refused:?}"
         );
+    }
+
+    /// A cap with room for one playlist's reservation and not two: the
+    /// master is fetched, the media playlist's reservation refuses, and the
+    /// planning keeps nothing it fetched, on disk or in the index. A new
+    /// download drops what it read; a resume only what this run fetched,
+    /// its media kept.
+    #[tokio::test]
+    async fn a_refusal_while_planning_keeps_no_playlist_it_fetched() {
+        // A new download.
+        let rig = Rig::new("plan-refused-new");
+        rig.budget
+            .cap
+            .store(PLAYLIST_MAX_BYTES + 100, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("planning went on past the cap");
+        };
+        assert!(rig.server.asked().contains(&MASTER_KEY.to_owned()));
+        assert!(!rig.server.asked().contains(&MEDIA_KEY.to_owned()));
+        assert!(store.stored_file("u1", MASTER_KEY).is_none(), "indexed");
+        let files = rig.dir.join("u1").join("1").join("files");
+        assert_eq!(dir_size(&files).bytes, 0, "a playlist was kept");
+        drop(store);
+
+        // A resume missing both playlists.
+        let rig = Rig::new("plan-refused-resume");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = store.kept_bytes();
+        let master = store.stored_file("u1", MASTER_KEY).unwrap().path;
+        let media = store.stored_file("u1", MEDIA_KEY).unwrap().path;
+        let seg = store.stored_file("u1", SEG0).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&master).unwrap();
+        std::fs::remove_file(&media).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        // What the record counts once adopted: no less than its folder.
+        let own = held.max(dir_size(&rig.dir.join("u1").join("1")).bytes);
+        rig.budget
+            .cap
+            .store(own + PLAYLIST_MAX_BYTES + 100, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume went on past the cap");
+        };
+        assert_eq!(
+            rig.server.asked(),
+            [MASTER_KEY.to_owned()],
+            "{:?} held={held}",
+            lines("pharos: video")
+        );
+        assert!(!master.exists(), "the fetched master was kept");
+        assert!(store.stored_file("u1", MASTER_KEY).is_none(), "indexed");
+        assert!(seg.exists(), "the resume's media was dropped");
+        assert!(!lines(
+            "pharos: video keep planning refused item=1 resume=true playlists_dropped=1"
+        )
+        .is_empty());
     }
 
     /// A playlist past its limit is refused and not kept: its reservation
