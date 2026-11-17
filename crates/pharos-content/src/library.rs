@@ -1815,6 +1815,15 @@ mod tests {
         use crate::testserver::{Script, TestServer};
         let dir = std::env::temp_dir().join(format!("pharos-lib-window-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        /// Removes the test's directory last: declared before the library
+        /// and downloader, it drops after them, even when an assertion fails.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(dir.clone());
         let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
         let (script, release) = Script::default()
             .file("/audio/1", vec![7u8; size])
