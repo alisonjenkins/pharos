@@ -340,7 +340,8 @@ struct Plan {
     files: Vec<String>,
     estimate: u64,
     total: u32,
-    /// Bytes of the plan already on disk (a resumed download).
+    /// Bytes of the plan already on disk: a resumed download's, or files a
+    /// failed attempt left that a new download's plan names again.
     stored: u64,
     /// Bytes of an earlier plan's files that could not be deleted: on disk
     /// and against the cap, though the plan does not name them.
@@ -2405,7 +2406,11 @@ async fn plan_and_admit(
         files: all.clone(),
         estimate,
         total: u32::try_from(all.len()).unwrap_or(u32::MAX),
-        stored: if resume { stored_bytes } else { 0 },
+        // What the plan names is on disk whatever the record says: a new
+        // download over an earlier attempt's files is admitted holding them.
+        // The record's figure is the larger of this and its reservation, so
+        // nothing is counted twice.
+        stored: stored_bytes,
         stale,
     };
     let total = plan.total;
@@ -2469,7 +2474,10 @@ async fn plan_and_admit(
         )
     };
     match admitted {
-        Ok(()) => {}
+        Ok(()) => {
+            #[cfg(test)]
+            tests::admitted(inner, user, item);
+        }
         Err(Admission::Gone) => return Err(Stop::Gone),
         // A plan the disk does not hold would be lost at a restart: the
         // download stops with the reason rather than fetching on.
@@ -3965,6 +3973,17 @@ mod tests {
         });
     }
 
+    thread_local! {
+        /// The admitted record's figure (`reserved`), set as a plan is
+        /// admitted, before anything is fetched.
+        static ADMITTED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn admitted(inner: &Inner, user: &str, item: &str) {
+        let figure = find(&lock(&inner.state).list, user, item).map(reserved);
+        ADMITTED.with(|a| a.set(figure));
+    }
+
     pub(super) fn pruned(stale: u64, inner: &Inner, user: &str, item: &str) {
         let unknown = lock(&inner.state)
             .leftover
@@ -5324,6 +5343,46 @@ mod tests {
         }
     }
 
+    /// A new download (not a resume: its record names no files) over files
+    /// a failed attempt left is admitted holding the bytes its plan finds on
+    /// disk, not 0: before its first progress save, the record already
+    /// counts files larger than its estimate.
+    #[tokio::test]
+    async fn a_new_download_over_stored_files_counts_them_from_admission() {
+        let rig = Rig::new("fresh-over-stored");
+        // Larger than the plan's whole estimate.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![1; 4_000_000]);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.stored_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let files = rig.dir.join("u1").join("1").join("files");
+        let on_disk = dir_size(&files).bytes;
+        ADMITTED.with(|a| a.set(None));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let admitted = ADMITTED
+            .with(std::cell::Cell::get)
+            .expect("no plan was admitted");
+        assert!(
+            admitted >= on_disk,
+            "admitted at {admitted} with {on_disk} of its files on disk"
+        );
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
     /// A playlist past its limit is refused and not kept: its reservation
     /// was for the limit.
     #[tokio::test]
@@ -6512,9 +6571,12 @@ mod tests {
         // The owed figure worked out from the plan, not read from the
         // store: whole files stored and the 50 staged, nothing pending.
         let owed = estimate - stored - 50;
+        // The second's playlists are on disk when its plan is admitted: it
+        // needs room for the rest of its estimate.
+        let second_needs = estimate - (MASTER.len() + MEDIA.len()) as u64;
         rig.budget
             .free
-            .store(owed + estimate + FREE_GUARD_BYTES - 1, Ordering::SeqCst);
+            .store(owed + second_needs + FREE_GUARD_BYTES - 1, Ordering::SeqCst);
         store.start(request("2")).unwrap();
         // The pending write stays held until the second's plan is decided.
         let second = plan_decided(&store, "2").await;
