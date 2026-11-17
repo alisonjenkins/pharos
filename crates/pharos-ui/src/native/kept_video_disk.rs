@@ -155,6 +155,11 @@ struct State {
     /// alone, so the removal's tombstone and mark outlive it only to the
     /// removal's own end, never to a sweep's earlier one.
     removing: Vec<PathBuf>,
+    /// Staging files being written, by run (a run writes several at once).
+    /// A removal revokes its run, but a write already under way goes on to
+    /// the next chunk's check, so a folder with a writer left is not
+    /// measured or swept: its size is not yet bounded.
+    writers: HashMap<(String, String, u64), usize>,
     /// The store's root, to tell a record's folder from a tombstone's.
     root: PathBuf,
     last_saved: Option<Instant>,
@@ -287,6 +292,13 @@ fn reserved(v: &KeptVideo) -> u64 {
 }
 
 impl State {
+    /// Whether a staging file is still being written in `dir`.
+    fn writing(&self, dir: &Path) -> bool {
+        self.writers
+            .keys()
+            .any(|(u, i, _)| self.root.join(safe_name(u)).join(safe_name(i)) == *dir)
+    }
+
     /// Bytes in the folders of removed downloads that would not delete,
     /// leaving out one a live record has since taken over.
     fn tombstoned(&self) -> u64 {
@@ -369,6 +381,12 @@ impl Staged<'_> {
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
         let mut st = lock(&self.inner.state);
+        if let Some(n) = st.writers.get_mut(&self.who) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.writers.remove(&self.who);
+            }
+        }
         if let Some(held) = st.staged.get_mut(&self.who) {
             *held = held.saturating_sub(self.len);
             if *held == 0 {
@@ -402,6 +420,7 @@ impl Inner {
                 .map(|(dir, _)| dir.clone())
                 .filter(|dir| {
                     !st.removing.contains(dir)
+                        && !st.writing(dir)
                         && !st
                             .list
                             .iter()
@@ -412,7 +431,7 @@ impl Inner {
         for dir in pending {
             let outcome = (self.env.remove_dir)(&dir);
             let mut st = lock(&self.state);
-            if st.removing.contains(&dir) {
+            if st.removing.contains(&dir) || st.writing(&dir) {
                 // A removal began while the delete ran: it owns the folder.
                 continue;
             }
@@ -639,6 +658,13 @@ impl Inner {
         };
         f(v);
         Ok(true)
+    }
+
+    fn owns(&self, user: &str, item: &str, run: u64) -> bool {
+        lock(&self.state)
+            .runs
+            .get(&(user.to_owned(), item.to_owned()))
+            == Some(&run)
     }
 
     fn wanted(&self, user: &str, item: &str, run: u64) -> bool {
@@ -914,27 +940,31 @@ async fn fetch_once(
     // cannot bring the folder or a file back after a sweep measured it.
     // (A write to a handle opened before the revocation lands in an
     // unlinked file.)
-    let mut file = {
-        let st = lock(&inner.state);
+    let who = (user.to_owned(), item.to_owned(), run);
+    let (mut file, mut staged) = {
+        let mut st = lock(&inner.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return Err(FetchOnce::Gone);
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| store_err("create the folder for", e))?;
         }
-        std::fs::File::create(&part)
+        let file = std::fs::File::create(&part)
             .map(tokio::fs::File::from_std)
-            .map_err(|e| store_err("create", e))?
+            .map_err(|e| store_err("create", e))?;
+        // Registered as a writer with the file, under the same hold.
+        *st.writers.entry(who.clone()).or_default() += 1;
+        (file, Staged { inner, who, len: 0 })
     };
     let mut len = 0u64;
-    let mut staged = Staged {
-        inner,
-        who: (user.to_owned(), item.to_owned(), run),
-        len: 0,
-    };
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
+                // A run a removal or restart has revoked writes no more.
+                if !inner.owns(user, item, run) {
+                    drop(file);
+                    return Err(FetchOnce::Gone);
+                }
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| store_err("write", e))?;
@@ -1437,9 +1467,18 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     // Whatever this run left half staged (a file in flight when the
     // download failed or was dropped) goes with it.
     drop_parts_of(&inner.item_dir(&user, &item), run);
-    let mut st = lock(&inner.state);
-    if st.runs.get(&(user.clone(), item.clone())) == Some(&run) {
-        st.runs.remove(&(user, item));
+    let owned = {
+        let mut st = lock(&inner.state);
+        let owned = st.runs.get(&(user.clone(), item.clone())) == Some(&run);
+        if owned {
+            st.runs.remove(&(user, item));
+        }
+        owned
+    };
+    // A revoked run's writer is done: a folder its removal could not
+    // delete or bound while it ran is deleted or measured now.
+    if !owned {
+        inner.sweep_tombstones();
     }
 }
 
@@ -1856,23 +1895,42 @@ impl VideoStore for DiskVideoStore {
         } else {
             // The bytes still on disk keep counting against the cap until
             // a later sweep deletes the folder.
-            // A folder that cannot be measured counts as much as the
-            // record reserved for it.
-            let measured = dir_size(&dir);
-            left = measured.counted(reserved(&record));
-            let mut st = lock(&self.inner.state);
-            // A folder not read whole is of unknown size from now, not
-            // from the next sweep: nothing is admitted meanwhile.
-            st.unmeasured.retain(|(d, _)| *d != dir);
-            if !measured.exact {
+            //
+            // A staging file of the revoked run may still be growing: no
+            // new writer can start, so this is checked once. With one left
+            // the folder's size is not bounded yet: it counts at what the
+            // record reserved, stays unknown, and the run's end sweeps it.
+            let writing = lock(&self.inner.state).writing(&dir);
+            if writing {
+                left = reserved(&record);
+                let mut st = lock(&self.inner.state);
+                st.unmeasured.retain(|(d, _)| *d != dir);
                 st.unmeasured.push((
                     dir.clone(),
-                    "removed download's folder not deleted, not fully readable".to_owned(),
+                    "removed download's writer is still running".to_owned(),
                 ));
+                st.tombstones.retain(|(d, _)| *d != dir);
+                st.tombstones.push((dir.clone(), left));
+                st.removing.retain(|d| *d != dir);
+            } else {
+                // A folder that cannot be measured counts as much as the
+                // record reserved for it.
+                let measured = dir_size(&dir);
+                left = measured.counted(reserved(&record));
+                let mut st = lock(&self.inner.state);
+                // A folder not read whole is of unknown size from now, not
+                // from the next sweep: nothing is admitted meanwhile.
+                st.unmeasured.retain(|(d, _)| *d != dir);
+                if !measured.exact {
+                    st.unmeasured.push((
+                        dir.clone(),
+                        "removed download's folder not deleted, not fully readable".to_owned(),
+                    ));
+                }
+                st.tombstones.retain(|(d, _)| *d != dir);
+                st.tombstones.push((dir.clone(), left));
+                st.removing.retain(|d| *d != dir);
             }
-            st.tombstones.retain(|(d, _)| *d != dir);
-            st.tombstones.push((dir.clone(), left));
-            st.removing.retain(|d| *d != dir);
         }
         emit(
             false,
@@ -4010,6 +4068,49 @@ mod tests {
         let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path).await;
         assert!(matches!(out, Err(FetchOnce::Gone)), "{}", out.is_ok());
         assert!(!dir.exists(), "a revoked run brought the folder back");
+    }
+
+    /// A removal whose folder will not delete, while the revoked run's
+    /// staging file is still open: the folder's size is not bounded until
+    /// the writer stops, so it stays unknown and is measured (here deleted)
+    /// only then.
+    #[tokio::test]
+    async fn a_folder_with_a_running_writer_stays_unknown_until_the_writer_stops() {
+        let rig = Rig::new("writer-running");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.staged_bytes() == 0 {
+            waited += 1;
+            assert!(waited < 2_000, "the write never started");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(
+            store.size_unknown(),
+            "measured while a writer could still grow the folder"
+        );
+        // The writer is let go, sees it is revoked and stops; the sweep at
+        // its end deletes the folder and the block lifts.
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        while store.size_unknown() || store.kept_bytes() > 0 {
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "unknown={} kept={}",
+                store.size_unknown(),
+                store.kept_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !rig.dir.join("u1").join("1").exists(),
+            "the folder was not deleted once the writer stopped"
+        );
     }
 
     /// A running download put back after a failed unlink becomes a Failed
