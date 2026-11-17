@@ -171,6 +171,10 @@ pub struct Library {
     network_known: AtomicBool,
     /// Restored pins were queued (once, after the state is known).
     pins_resumed: AtomicBool,
+    /// The cache has been told what other downloads hold (or there is no
+    /// hook to tell it): until then restored pins must not queue, or they
+    /// would write before the cap counts the video.
+    outside_ready: AtomicBool,
     /// What other downloads hold of the cache's cap; applied to the cache
     /// when it is enabled, or at once if it already is.
     outside_used: Mutex<Option<cache::OutsideUsed>>,
@@ -343,6 +347,7 @@ impl Library {
             network_up: AtomicBool::new(true),
             network_known: AtomicBool::new(false),
             pins_resumed: AtomicBool::new(false),
+            outside_ready: AtomicBool::new(false),
             outside_used: Mutex::new(None),
         })
     }
@@ -588,6 +593,7 @@ impl Library {
             if let Some(outside) = outside.clone() {
                 cache.set_outside_used(outside);
             }
+            self.outside_ready.store(true, Ordering::SeqCst);
         }
         // A `set_online` that landed before the downloader was published
         // could not reach it. Re-apply the state now it can, before pins run.
@@ -632,6 +638,12 @@ impl Library {
     /// space; 0 with no cache. Read under [`admission_guard`].
     pub fn music_outstanding_bytes(&self) -> u64 {
         self.offline.get().map_or(0, |o| o.cache.reserved_bytes())
+    }
+
+    /// Whether the music cache is enabled: it is what the cap, the free
+    /// space guard and the music's bytes are read from.
+    pub fn cache_enabled(&self) -> bool {
+        self.offline.get().is_some()
     }
 
     /// The cap in force, when the cache is enabled.
@@ -781,6 +793,7 @@ impl Library {
             return;
         };
         if self.network_known.load(Ordering::SeqCst)
+            && self.outside_ready.load(Ordering::SeqCst)
             && !self.pins_resumed.swap(true, Ordering::SeqCst)
         {
             o.downloader.resume_pins();
@@ -1403,6 +1416,53 @@ mod tests {
         handle.unwrap().join().unwrap();
         let held = lib.offline.get().unwrap().cache.outside_for_test().held;
         assert_eq!(held, 2, "the cache kept the older hook");
+    }
+
+    /// Restored pins do not queue between the cache being published and the
+    /// outside-bytes hook being applied.
+    #[test]
+    fn restored_pins_wait_for_the_outside_hook() {
+        let tok =
+            std::env::temp_dir().join(format!("pharos-auto-lib-pins-wait-{}", std::process::id()));
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        lib.set_outside_used(Arc::new(cache::OutsideBytes::default));
+        let mid = std::cell::Cell::new(None);
+        lib.enable_cache_with(
+            &cache_dir("pins-wait"),
+            1 << 20,
+            || {},
+            || {
+                // The cache is published, the hook not yet applied.
+                lib.set_online(true);
+                mid.set(Some(lib.pins_resumed.load(Ordering::SeqCst)));
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mid.get(),
+            Some(false),
+            "pins queued before the hook applied"
+        );
+        assert!(
+            lib.pins_resumed.load(Ordering::SeqCst),
+            "pins never resumed after"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_enabled_only_once_it_is_up() {
+        let tok =
+            std::env::temp_dir().join(format!("pharos-auto-lib-enabled-{}", std::process::id()));
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        assert!(!lib.cache_enabled());
+        // A cache directory that cannot be made leaves it disabled.
+        let file =
+            std::env::temp_dir().join(format!("pharos-auto-lib-notadir-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        assert!(lib.enable_cache(&file.join("sub"), 1 << 20).is_err());
+        assert!(!lib.cache_enabled());
+        lib.enable_cache(&cache_dir("enabled"), 1 << 20).unwrap();
+        assert!(lib.cache_enabled());
     }
 
     #[test]
