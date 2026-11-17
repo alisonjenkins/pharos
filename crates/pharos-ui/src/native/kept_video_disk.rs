@@ -172,6 +172,11 @@ struct State {
     /// lists them again, and their block lifts only once the listing succeeds
     /// and everything found is counted.
     relist: Vec<PathBuf>,
+    /// Folders of `relist` a sweep has claimed and is listing now. Held
+    /// from before the listing until what it found is adopted and its runs
+    /// installed: a second sweep that scanned the same folder meanwhile
+    /// would adopt a record again and delete the new run's staging files.
+    relisting: Vec<PathBuf>,
     /// Folders of adopted records whose walk was not whole: a sweep measures
     /// them again, and the record's floor is taken from the whole walk.
     remeasure: Vec<PathBuf>,
@@ -220,7 +225,14 @@ struct Inner {
     last_sweep: Mutex<Option<std::time::Instant>>,
     #[cfg(test)]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Called by `sweep_relist` at its steps, for a test to interleave two.
+    #[cfg(test)]
+    relist_hook: Mutex<Option<RelistHook>>,
 }
+
+/// A test's hook into `sweep_relist`, given the step reached.
+#[cfg(test)]
+type RelistHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 /// The store of downloaded video on disk.
 pub struct DiskVideoStore {
@@ -2357,10 +2369,42 @@ impl Inner {
     /// download's folder deleted or tombstoned. The block on a folder lifts
     /// only once its listing succeeds, with everything found counted.
     fn sweep_relist(self: &Arc<Self>) {
-        let dirs: Vec<PathBuf> = lock(&self.state).relist.clone();
+        // Claimed under the hold that picks them: a sweep already listing a
+        // folder keeps it to itself until its adoptions are in.
+        let (dirs, skipped) = {
+            let mut st = lock(&self.state);
+            let (dirs, skipped): (Vec<PathBuf>, Vec<PathBuf>) = st
+                .relist
+                .iter()
+                .cloned()
+                .partition(|d| !st.relisting.contains(d));
+            st.relisting.extend(dirs.iter().cloned());
+            (dirs, skipped)
+        };
+        for dir in &skipped {
+            emit(
+                false,
+                format!(
+                    "pharos: video folder relist skipped dir={} reason=claimed_by_another_sweep",
+                    dir.display()
+                ),
+            );
+        }
         for dir in dirs {
             let mut found = Listing::default();
-            let known = |p: &Path| lock(&self.state).knows(p);
+            let known = |p: &Path| {
+                let st = lock(&self.state);
+                let skip = st.knows(p)
+                    || st.deleting.iter().any(|d| d == p)
+                    || st.removing.iter().any(|d| d == p)
+                    || st.settling.iter().any(|d| d == p);
+                drop(st);
+                #[cfg(test)]
+                if !skip {
+                    self.relist_step("checked");
+                }
+                skip
+            };
             scan_tree(&self.env, &dir, dir == self.root, &known, &mut found);
             let mut resume = Vec::new();
             let mut st = lock(&self.state);
@@ -2397,6 +2441,21 @@ impl Inner {
             for (user, item) in resume {
                 self.spawn_run(user, item);
             }
+            lock(&self.state).relisting.retain(|d| *d != dir);
+            #[cfg(test)]
+            self.relist_step("adopted");
+        }
+    }
+
+    #[cfg(test)]
+    fn relist_step(&self, step: &'static str) {
+        let hook = self
+            .relist_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(f) = hook {
+            f(step);
         }
     }
 
@@ -2608,6 +2667,8 @@ impl DiskVideoStore {
             last_sweep: Mutex::new(None),
             #[cfg(test)]
             tasks: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            relist_hook: Mutex::new(None),
         });
         let mut st = State::default();
         st.root.clone_from(&inner.root);
@@ -5789,6 +5850,61 @@ mod tests {
             store.start(request("2")).unwrap();
             store.settled().await;
         }
+    }
+
+    /// Two sweeps that overlap on a folder listed again: the second, which
+    /// picked the folder before the first adopted what it hides, must not
+    /// scan it after that adoption, or its own adopt deletes the staging
+    /// files written in between. The folder is claimed by one sweep.
+    #[tokio::test]
+    async fn overlapping_sweeps_relist_a_folder_once_and_keep_its_staging_files() {
+        let rig = Rig::new("relist-overlap");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let user = rig.dir.join("u1");
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let staging = user.join("1").join("files").join("x.7.part");
+
+        let (at_check, wait_check) = std::sync::mpsc::channel::<()>();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let wait_go = Mutex::new(wait_go);
+        let checks = AtomicUsize::new(0);
+        let adoptions = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let (staging, adoptions) = (staging.clone(), adoptions.clone());
+            Arc::new(move |step: &'static str| match step {
+                // The first sweep to reach a folder's scan waits there.
+                "checked" if checks.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    at_check.send(()).unwrap();
+                    wait_go.lock().unwrap().recv().unwrap();
+                }
+                // The first adoption is followed by a run's staging file.
+                "adopted" if adoptions.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    std::fs::write(&staging, b"half a segment").unwrap();
+                }
+                _ => {}
+            })
+        };
+        *store.inner.relist_hook.lock().unwrap() = Some(hook);
+
+        let slow = {
+            let inner = store.inner.clone();
+            std::thread::spawn(move || inner.sweep_relist())
+        };
+        wait_check.recv().unwrap();
+        // A second sweep while the first is between its check and its scan.
+        store.inner.sweep_relist();
+        go.send(()).unwrap();
+        slow.join().unwrap();
+        *store.inner.relist_hook.lock().unwrap() = None;
+
+        assert!(staging.exists(), "a second adopt deleted the staging file");
+        assert_eq!(store.videos("u1").len(), 1);
+        assert!(!lines("pharos: video folder relist skipped").is_empty());
     }
 
     /// A restart while a removed download's folder will not delete and
