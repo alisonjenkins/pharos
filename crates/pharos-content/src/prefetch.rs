@@ -722,7 +722,11 @@ impl Gate {
                     .map_err(|e| Fail::Permanent(format!("write part: {e}")))?;
                 written = written.saturating_add(len);
                 since_check = since_check.saturating_add(len);
-                if since_check >= FREE_CHECK_BYTES {
+                // With no length, the window is renewed when another chunk
+                // arrives (above, before it is written), never to read the
+                // end of the body: a download that has all it will get must
+                // not be refused room for bytes that are not coming.
+                if since_check >= FREE_CHECK_BYTES && st.total.is_some() {
                     since_check = 0;
                     reserved_ahead = left(written);
                     self.cache
@@ -1464,6 +1468,37 @@ mod tests {
         assert!(seen.len() >= 3, "{seen:?}");
         assert_eq!(seen[2], FREE_CHECK_BYTES, "window not reserved: {seen:?}");
         assert_eq!(r.cache.reserved_bytes(), 0, "kept after the job ended");
+    }
+
+    /// A body of unknown length that ends exactly at a window boundary
+    /// completes with only the room it used: the window is not renewed to
+    /// read the end of the body.
+    #[test]
+    fn a_body_of_unknown_length_ending_at_a_window_completes_in_low_space() {
+        let size = usize::try_from(FREE_CHECK_BYTES).unwrap();
+        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let slot2 = slot.clone();
+        let r = rig_with_free(
+            "unknown-length-low-space",
+            Script::default().file("/audio/1", body(size, 1)).chunked(),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                // Room is MIN_FREE plus 12 MiB, less what is on the disk.
+                let on_disk = slot2.lock().unwrap().as_ref().map_or(0, |c| {
+                    std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len())
+                });
+                Ok((MIN_FREE_BYTES + 12 * 1024 * 1024).saturating_sub(on_disk))
+            }),
+        );
+        *slot.lock().unwrap() = Some(r.cache.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(
+            r.cache.is_complete("track/1"),
+            "refused room for bytes that were not coming"
+        );
     }
 
     /// A chunk that crosses the reserved window is reserved for before it is
