@@ -407,6 +407,12 @@ fn window_at(p: &Probe, at: Option<Shift>) -> Option<(u64, u64)> {
     Some((moved(p.start_ms)?, moved(p.end_ms)?.saturating_add(PAD_MS)))
 }
 
+/// A window starting at `start_ms` begins inside the file (or its length is
+/// not known).
+fn inside(item: &MediaItem, start_ms: u64) -> bool {
+    item.probe.duration_ms.map_or(true, |d| start_ms < d)
+}
+
 /// A timing with nothing sent: every score NaN.
 fn unsent(n: usize, offset_ms: i64, ratio: f64) -> Candidate {
     Candidate {
@@ -767,11 +773,11 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
                 .speech(&item.path, audio_stream(item).map(|t| t.stream_index))
                 .await
         };
-        // Stage 1's own search covered ±8 s only if it sent anything.
-        let searched = stage1
-            .probes
+        // Stage 1's own search covered ±8 s only if it sent every probe: one
+        // left out as past the end scores 0 there, and may be why it missed.
+        let searched = picked
             .iter()
-            .any(|s| s.is_finite())
+            .all(|p| inside(item, window(p).0))
             .then_some(ALIGNER_REACH_MS);
         let shifts = speech.map(|sp| coarse::candidates(&sp, &cues, searched, MAX_STAGE2));
         let coarse_s = heard_at.elapsed().as_secs_f64();
@@ -826,14 +832,13 @@ impl<S: CheckStore, A: Scorer, Q: TranscodeQueue, L: Listen> Checker<S, A, Q, L>
         at: Option<Shift>,
         aligner_s: &mut f64,
     ) -> Asked {
-        let duration = item.probe.duration_ms;
         // `(probe index, start, end)`: a probe outside the file is not sent.
         let windows: Vec<(usize, u64, u64)> = picked
             .iter()
             .enumerate()
             .filter_map(|(i, p)| {
                 let (a, b) = window_at(p, at)?;
-                duration.map_or(true, |d| a < d).then_some((i, a, b))
+                inside(item, a).then_some((i, a, b))
             })
             .collect();
         if windows.is_empty() {
@@ -1444,13 +1449,19 @@ mod tests {
 
     #[tokio::test]
     async fn cues_past_the_end_can_fit_within_the_aligners_reach() {
-        // Dense cues from 100 s in a 100 s file: none starts inside it, but
-        // they are spoken 8 s earlier, which stage 1 never got to try.
+        // Dense cues from 100 s, spoken 8 s earlier. In a 100 s file stage 1
+        // sends nothing; in a 104 s one it sends a few, too few to fit.
+        for duration in [100_000, 104_000] {
+            cues_past_the_end_fit_at_minus_8_s(duration).await;
+        }
+    }
+
+    async fn cues_past_the_end_fit_at_minus_8_s(duration: u64) {
         let start: fn(i64) -> i64 = |i| 100_000 + i * 700;
         let text = srt_with(start, 650);
         let lib = library(&[(1, "film.mkv", MediaKind::Movie, "eng", Some(&text))]).await;
         let mut item = lib.store.get(1).await.unwrap();
-        item.probe.duration_ms = Some(100_000);
+        item.probe.duration_ms = Some(duration);
         lib.store.put(item).await.unwrap();
         let mut fake = Fake::new(900, 250);
         fake.truth = Some((-8_000, 1.0));
@@ -1463,8 +1474,17 @@ mod tests {
         .run_pass()
         .await;
         let r = row(&lib, 1).await;
-        assert_eq!(r.verdict.as_deref(), Some("retimed"), "{}", r.reason);
-        assert_eq!((r.offset_ms, r.ratio), (Some(-8_000), Some(1.0)));
+        assert_eq!(
+            r.verdict.as_deref(),
+            Some("retimed"),
+            "{duration}: {}",
+            r.reason
+        );
+        assert_eq!(
+            (r.offset_ms, r.ratio),
+            (Some(-8_000), Some(1.0)),
+            "{duration}"
+        );
     }
 
     #[tokio::test]
