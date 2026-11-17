@@ -24,7 +24,9 @@ web = [
 
 # 025: the Android TV app (`nix run .#android-apk`, or `dx build --platform
 # android --package pharos-ui --bin pharos-tv --features mobile`).
-mobile = ["dioxus/mobile", "dioxus/launch", "dioxus/document"]
+# `dep:pharos-content`: the phone hands the music cache the video store's
+# bytes (`native::ports::outside_bytes_hook`).
+mobile = ["dioxus/mobile", "dioxus/launch", "dioxus/document", "dep:pharos-content"]
 
 [[bin]]
 name = "pharos-tv"
@@ -185,6 +187,8 @@ ndk-context = "0.1"
 # The server proxy (native/android_page.rs): images and streams with the token in a header.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 log = "0.4"
+# Only the phone build (feature `mobile`) and the tests use it.
+pharos-content = { path = "../pharos-content", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

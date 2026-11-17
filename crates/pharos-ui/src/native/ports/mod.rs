@@ -103,6 +103,19 @@ pub fn kept_video_size_unknown() -> bool {
     video_store().is_some_and(|s| s.size_unknown())
 }
 
+/// The hook the phone registers with the music cache: what the registered
+/// video store holds, still owes, and whether it knows its own size. The
+/// phone registers exactly this (`pharos-phone` cannot host a test, being
+/// Android-only), and the integration tests call it too.
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes_hook() -> pharos_content::OutsideUsed {
+    Arc::new(|| pharos_content::OutsideBytes {
+        held: kept_video_bytes(),
+        outstanding: kept_video_outstanding(),
+        unknown: kept_video_size_unknown(),
+    })
+}
+
 /// What the host app runs when the user signs in or out, so a second client
 /// in the same process (the car's media service) re-reads the token.
 static ON_CREDENTIALS_CHANGED: OnceLock<fn()> = OnceLock::new();

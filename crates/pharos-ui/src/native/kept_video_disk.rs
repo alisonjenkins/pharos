@@ -3209,12 +3209,13 @@ mod tests {
     }
 
     /// The whole path of the unknown-size block into music: a real store
-    /// with a subtree it cannot read, the hook the phone installs (the
-    /// same three fields, read from the store), and a real music download
-    /// through `Library`, which the cache refuses before any network use.
+    /// with a subtree it cannot read, registered as the phone registers it,
+    /// the very hook the phone installs (`ports::outside_bytes_hook`), and
+    /// a real music download through `Library`, which the cache refuses
+    /// before any network use.
     ///
-    /// Stubbed: the phone crate itself (Android only) is not here, so its
-    /// closure is restated, and the server is one nothing listens on.
+    /// Stubbed: only the server, one nothing listens on. The phone crate is
+    /// Android-only and cannot host a test; it registers the same hook.
     #[test]
     fn music_is_refused_through_the_real_hook_while_a_video_subtree_is_unreadable() {
         use std::sync::atomic::AtomicBool;
@@ -3269,12 +3270,9 @@ mod tests {
             },
         )
         .unwrap();
-        let hook_store = store.clone();
-        lib.set_outside_used(Arc::new(move || pharos_content::OutsideBytes {
-            held: hook_store.kept_bytes(),
-            outstanding: hook_store.outstanding_bytes(),
-            unknown: hook_store.size_unknown(),
-        }));
+        // The port slot is set once per process; no other test registers.
+        crate::native::ports::register_video_store(store.clone()).unwrap();
+        lib.set_outside_used(crate::native::ports::outside_bytes_hook());
         lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
         lib.prefetch(&["track/1".to_owned()]);
         let mut waited = 0;
