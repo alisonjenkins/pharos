@@ -782,9 +782,11 @@ enum FetchOnce {
 
 /// Waits for a chunk's write to complete. In a test the write can be held
 /// pending first, to show nothing is counted as staged meanwhile.
-async fn flush_chunk(file: &mut tokio::fs::File) -> std::io::Result<()> {
+async fn flush_chunk(file: &mut tokio::fs::File, item: &str) -> std::io::Result<()> {
     #[cfg(test)]
-    tests::hold_write().await;
+    tests::hold_write(item).await;
+    #[cfg(not(test))]
+    let _ = item;
     file.flush().await
 }
 
@@ -841,7 +843,7 @@ async fn fetch_once(
                 // pending, and the free-space reading does not lack those
                 // bytes yet. They count as staged (and so stop being owed)
                 // only once the write has completed.
-                flush_chunk(&mut file)
+                flush_chunk(&mut file, item)
                     .await
                     .map_err(|e| store_err("write", e))?;
                 len = len.saturating_add(chunk.len() as u64);
@@ -1819,8 +1821,15 @@ mod tests {
         static HOLD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    pub(super) async fn hold_write() {
-        while HOLD_WRITE.with(std::cell::Cell::get) {
+    thread_local! {
+        /// While set, the chunk writes of this item alone are held.
+        static HOLD_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) async fn hold_write(item: &str) {
+        while HOLD_WRITE.with(std::cell::Cell::get)
+            || HOLD_ITEM.with(|h| h.borrow().as_deref() == Some(item))
+        {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -3357,6 +3366,90 @@ mod tests {
         assert!(matches!(store.inner.update("u1", "1", |_| {}), Ok(true)));
         drop(store);
         assert_eq!(rig.open().videos("u1")[0].position_ms, 4_200);
+    }
+
+    /// An admission made while a chunk's write is pending: the pending
+    /// bytes are not on the disk's books yet, so the first download still
+    /// owes them and a second that fits only if they were counted as
+    /// already written is refused.
+    #[tokio::test]
+    async fn an_admission_during_a_pending_write_still_counts_those_bytes_as_owed() {
+        let rig = Rig::new("pending-admission");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first download is admitted and parked in SEG0 with 50 staged.
+        // (Everything else stored whole: a playlist's first half can also
+        // be 50 staged for an instant.)
+        let stored = (MASTER.len() + MEDIA.len() + 10 + 100) as u64;
+        let mut waited = 0;
+        loop {
+            let bytes = match store.videos("u1").first().map(|v| v.state.clone()) {
+                Some(KeptState::Downloading { bytes, .. }) => bytes,
+                _ => 0,
+            };
+            if bytes == stored && store.staged_bytes() == 50 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "bytes={bytes} staged={}",
+                store.staged_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // From here its writes are held pending after `write_all`.
+        HOLD_ITEM.with(|h| *h.borrow_mut() = Some("1".to_owned()));
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        loop {
+            let pending = std::fs::read_dir(rig.dir.join("u1").join("1").join("files"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    e.path().extension().is_some_and(|x| x == "part")
+                        && e.metadata().is_ok_and(|m| m.len() > 50)
+                });
+            if pending {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "no pending write");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(store.staged_bytes(), 50, "the pending bytes were staged");
+
+        // Room for a second film only if the pending bytes were not owed:
+        // one byte short with them owed.
+        // The owed figure worked out from the plan, not read from the
+        // store: whole files stored and the 50 staged, nothing pending.
+        let owed = estimate - stored - 50;
+        rig.budget
+            .free
+            .store(owed + estimate + FREE_GUARD_BYTES - 1, Ordering::SeqCst);
+        store.start(request("2")).unwrap();
+        let mut waited = 0;
+        let second = loop {
+            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
+            if let Some(v) = second
+                .filter(|v| v.estimated_bytes > 0 || matches!(v.state, KeptState::Failed { .. }))
+            {
+                break v;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "the second never settled");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        HOLD_ITEM.with(|h| *h.borrow_mut() = None);
+        let KeptState::Failed { reason } = &second.state else {
+            panic!("admitted on room the pending write still owes: {second:?}");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+        store.settled().await;
     }
 
     /// A damaged manifest is held the same way.
