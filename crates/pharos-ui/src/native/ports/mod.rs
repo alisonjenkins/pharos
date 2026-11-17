@@ -564,6 +564,41 @@ mod tests {
         let _ = std::fs::remove_file(&root);
     }
 
+    /// On success the hook goes in before the folder is created, and the
+    /// store is registered after it: the hook sees no folder, the store
+    /// sees one.
+    #[test]
+    fn the_hook_goes_in_before_the_folder_exists_and_the_store_after() {
+        use std::cell::Cell;
+        let root =
+            std::env::temp_dir().join(format!("pharos-register-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let once = OpenOnce::new();
+        let (hook_saw_folder, register_saw_folder) = (Cell::new(None), Cell::new(None));
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || hook_saw_folder.set(Some(root.exists())),
+            || {
+                register_saw_folder.set(Some(root.is_dir()));
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, Registration::Registered);
+        assert_eq!(
+            hook_saw_folder.get(),
+            Some(false),
+            "the hook came after the folder"
+        );
+        assert_eq!(
+            register_saw_folder.get(),
+            Some(true),
+            "the store came before the folder"
+        );
+        assert!(root.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_hook_with_no_notifier_is_dropped_not_run_on_the_caller() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
