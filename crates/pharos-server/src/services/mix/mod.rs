@@ -73,6 +73,8 @@ pub struct Mixed {
     pub eligible: usize,
     pub exhausted: bool,
     pub relaxed: Vec<Relax>,
+    /// Audiobook tracks the user may hear that were kept out of the pool.
+    pub books_left_out: usize,
 }
 
 #[derive(Debug)]
@@ -178,6 +180,7 @@ pub async fn mix(state: &AppState, user: &User, ask: MixAsk, now: i64) -> Result
                 asked,
                 picked = m.picks.len(),
                 pool = m.pool,
+                books_left_out = m.books_left_out,
                 eligible = m.eligible,
                 exhausted = m.exhausted,
                 relaxed = ?relaxed,
@@ -230,9 +233,10 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         limit: None,
         ..ItemQuery::default()
     };
-    let page = library::query(state, user, None, &q)
+    let mut page = library::query(state, user, None, &q)
         .await
         .map_err(|e| MixError::Store(e.to_string()))?;
+    let books_left_out = keep_music(&mut page.items, &state.course_roots());
     let ids: Vec<u64> = page.items.iter().map(|i| i.id).collect();
     // In chunks: the store binds one variable per id, and SQLite allows
     // 32766 in one statement.
@@ -305,7 +309,16 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         eligible: batch.eligible,
         exhausted: batch.exhausted,
         relaxed: batch.relaxed,
+        books_left_out,
     })
+}
+
+/// Drops an audiobook's tracks (ADR-0132: a song whose innermost library is
+/// a Books library), so a mix plays music only. Returns how many it dropped.
+fn keep_music(items: &mut Vec<MediaItem>, roots: &pharos_scanner::course::CourseRoots) -> usize {
+    let before = items.len();
+    items.retain(|i| roots.root_of(&i.path).is_none());
+    before - items.len()
 }
 
 /// A fresh random seed per call; a clock-derived one if the OS has none.
@@ -339,6 +352,7 @@ mod tests {
                 eligible: 0,
                 exhausted,
                 relaxed: vec![],
+                books_left_out: 0,
             })
         };
         let labels = [
@@ -351,6 +365,31 @@ mod tests {
         ];
         let set: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(set.len(), labels.len(), "{labels:?}");
+    }
+
+    #[test]
+    fn an_audiobooks_tracks_never_join_the_pool() {
+        let at = |id: u64, path: &str| MediaItem {
+            id,
+            path: path.into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        };
+        let mut items = vec![
+            at(1, "/media/Music/Artist/01.flac"),
+            at(2, "/media/Ebooks/Author/Book/01.mp3"),
+            at(3, "/media/Ebooks/Songs/01.flac"),
+            at(4, "/media/Loose/01.flac"),
+        ];
+        // A music library nested inside the Books root still holds music.
+        let roots = pharos_scanner::course::CourseRoots::new([
+            ("/media/Music".into(), false),
+            ("/media/Ebooks".into(), true),
+            ("/media/Ebooks/Songs".into(), false),
+        ]);
+        assert_eq!(keep_music(&mut items, &roots), 1);
+        let ids: Vec<u64> = items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]);
     }
 
     #[test]
