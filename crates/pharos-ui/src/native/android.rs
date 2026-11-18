@@ -151,6 +151,12 @@ pub fn store_token_user(user: &str) -> Result<(), String> {
     token_file::store_user(&token_path()?, user)
 }
 
+/// Keeps `user` with the token on file only while it is `seen`
+/// (`token_file::store_user_if`).
+pub fn store_token_user_if(seen: &str, user: &str) -> Result<token_file::Pairing, String> {
+    token_file::store_user_if(&token_path()?, seen, user)
+}
+
 /// Removes the older layout's sidecar, best effort.
 fn drop_legacy_user(path: &std::path::Path) {
     match std::fs::remove_file(token_file::legacy_user_path(path)) {

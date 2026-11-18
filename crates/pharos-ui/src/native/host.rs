@@ -620,8 +620,13 @@ pub fn token_user() -> Result<Option<String>, String> {
 }
 
 /// Keeps `user` with the device token; nothing to do where there is none.
-pub fn note_token_user(_user: &str) -> Result<(), String> {
+pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
     Ok(())
+}
+
+/// The device token a request is built with; none where there is none.
+pub fn token_seen() -> Option<String> {
+    None
 }
 
 pub fn apply_subtitle_size(_size: SubtitleSize) {}

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use pharos_content::token::Stored;
+pub use pharos_content::token::{Pairing, Stored};
 
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.
@@ -26,6 +26,12 @@ pub fn store(path: &Path, token: &str) -> Result<(), String> {
 /// there is none: an id with no token to belong to is nobody's.
 pub fn store_user(path: &Path, user: &str) -> Result<(), String> {
     pharos_content::token::store_user(path, user).map_err(|e| e.to_string())
+}
+
+/// Pairs `user` with the token on file only while it is `seen`, under the
+/// file's lock: a token replaced since is left unpaired.
+pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, String> {
+    pharos_content::token::store_user_if(path, seen, user).map_err(|e| e.to_string())
 }
 
 /// Removes the token and its user, under the file's lock; absent is fine.

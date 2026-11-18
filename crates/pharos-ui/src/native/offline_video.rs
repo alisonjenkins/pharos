@@ -441,7 +441,32 @@ pub fn last_user() -> Option<String> {
 /// preference follows, and a failed write is logged, not served around.
 pub fn remember_user(user: &str) {
     set_identity(Identity::User(user.to_owned()));
-    note_signed_in(user);
+    note_signed_in(user, &token_seen());
+}
+
+/// The device token a request was built with, taken when it is built: its
+/// answer pairs its user with this token only, never with one stored since.
+/// Its `Debug` never shows the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenSeen(Option<String>);
+
+impl std::fmt::Debug for TokenSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "TokenSeen(present)"
+        } else {
+            "TokenSeen(none)"
+        })
+    }
+}
+
+/// The device token on file now ([`TokenSeen`]).
+pub fn token_seen() -> TokenSeen {
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        return TokenSeen(seam.token_seen());
+    }
+    TokenSeen(super::platform::token_seen())
 }
 
 /// A `me` request that may be sent: the API it goes to and the identity
@@ -452,6 +477,9 @@ pub fn remember_user(user: &str) {
 pub struct MeAsk<A> {
     pub api: A,
     pub asked_at: u64,
+    /// The token on file as the request is built: the answer's user is
+    /// paired with this token only.
+    pub token: TokenSeen,
 }
 
 /// Whether to ask who is signed in: only with an API and a ready session
@@ -467,6 +495,7 @@ pub fn me_request<A>(ready: bool, api: Option<A>) -> Option<MeAsk<A>> {
     Some(MeAsk {
         api,
         asked_at: identity_generation(),
+        token: token_seen(),
     })
 }
 
@@ -474,7 +503,7 @@ impl<A> MeAsk<A> {
     /// The answer to this request names `user`: remembered only while no
     /// sign-in or sign-out has landed since the request was taken.
     pub fn answered(&self, user: &str) -> bool {
-        remember_user_if(self.asked_at, user)
+        remember_user_seen(self.asked_at, user, &self.token)
     }
 }
 
@@ -483,9 +512,14 @@ impl<A> MeAsk<A> {
 /// landed since, so a `me` that completes after its session ended cannot
 /// bring the previous user back. Returns whether it was written.
 pub fn remember_user_if(asked_at: u64, user: &str) -> bool {
+    remember_user_seen(asked_at, user, &token_seen())
+}
+
+/// [`remember_user_if`] for an answer to a request built with `seen`.
+fn remember_user_seen(asked_at: u64, user: &str, seen: &TokenSeen) -> bool {
     match set_identity_if(Some(asked_at), Identity::User(user.to_owned())) {
         Ok(()) => {
-            note_signed_in(user);
+            note_signed_in(user, seen);
             true
         }
         Err(now) => {
@@ -509,7 +543,7 @@ fn with_store(f: impl FnOnce(&dyn super::kept_video::VideoStore)) {
     }
 }
 
-fn note_signed_in(user: &str) {
+fn note_signed_in(user: &str, seen: &TokenSeen) {
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
@@ -517,7 +551,7 @@ fn note_signed_in(user: &str) {
     // run again, but only once the token is paired with them: a run resumed
     // before would read an unpaired token, send nothing and park until the
     // next sign-in. A pairing that fails resumes nothing (fail closed).
-    match note_token_user(user) {
+    match note_token_user(user, seen) {
         Ok(()) => {
             super::platform::info(&format!(
                 "pharos: video keep resume verdict=resumed reason=token_paired user={user}"
@@ -539,18 +573,21 @@ fn note_signed_in(user: &str) {
 }
 
 /// Keeps the user id with the device token, so a cold start can tell whose
-/// token it is. Err (logged) when it could not.
-fn note_token_user(user: &str) -> Result<(), String> {
+/// token it is: only with the token `seen` when the user was learned. A
+/// token stored since stays unpaired (`verdict=refused
+/// reason=token_changed`), so a check that needs its user fails closed.
+/// Err (logged) when it could not.
+fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
     #[cfg(test)]
     let kept = match tests::PREF.with(|p| p.borrow().clone()) {
-        Some(seam) => seam.note_token_user(user),
-        None => super::platform::note_token_user(user),
+        Some(seam) => seam.note_token_user(user, seen.0.as_deref()),
+        None => super::platform::note_token_user(user, seen.0.as_deref()),
     };
     #[cfg(not(test))]
-    let kept = super::platform::note_token_user(user);
+    let kept = super::platform::note_token_user(user, seen.0.as_deref());
     if let Err(e) = &kept {
         super::platform::warn(&format!(
-            "pharos: video user not kept with the token error={e}"
+            "pharos: video user pairing verdict=refused reason={e} user={user}"
         ));
     }
     kept
@@ -738,17 +775,34 @@ mod tests {
                 None
             })
         }
-        pub(super) fn note_token_user(&self, user: &str) -> Result<(), String> {
+        pub(super) fn note_token_user(&self, user: &str, seen: Option<&str>) -> Result<(), String> {
             if self.fail_pair.get() {
                 return Err("token file not writable".to_owned());
             }
             if let Some(path) = self.file.borrow().as_ref() {
-                return super::super::token_file::store_user(path, user);
+                // As the phone does it: only with the token seen.
+                let seen = seen.ok_or_else(|| "no_token_seen".to_owned())?;
+                return match super::super::token_file::store_user_if(path, seen, user)? {
+                    super::super::token_file::Pairing::Paired => Ok(()),
+                    super::super::token_file::Pairing::TokenChanged => {
+                        Err("token_changed".to_owned())
+                    }
+                };
             }
             if self.token_present.get() {
                 *self.token_user.borrow_mut() = Some(user.to_owned());
             }
             Ok(())
+        }
+        /// The token a request is built with: the file's, in its mode.
+        pub(super) fn token_seen(&self) -> Option<String> {
+            match self.file.borrow().as_ref() {
+                Some(path) => super::super::token_file::read(path)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.token),
+                None => self.token_present.get().then(|| "tok".to_owned()),
+            }
         }
         /// What the sign-out does to the token: it and its user are gone.
         pub(super) fn clear_token(&self) {
@@ -1214,6 +1268,45 @@ mod tests {
         set_identity(Identity::Unknown);
         assert_eq!(last_user().as_deref(), Some("B"));
         assert!(!serves(last_user()), "B has nothing downloaded");
+    }
+
+    /// Another account's token stored between A's `me` request and its
+    /// answer (a Quick Connect approved meanwhile) is never paired with A:
+    /// the pairing compares the token the request was built with, under the
+    /// file's lock, and refuses. The new token stays unpaired, so a
+    /// download run of A's is refused its token, and A's downloads are not
+    /// resumed.
+    #[test]
+    fn a_token_replaced_between_me_and_the_pairing_is_not_paired_with_a() {
+        use super::super::kept_video::token_for_owner;
+        use super::super::token_file;
+        let d = TmpDir::new("pair-race");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        let runs = Rc::new(Runs::default());
+        STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
+        token_file::store(&path, "tokA").unwrap();
+        let ask = me_request(true, Some(())).unwrap();
+        // B's Quick Connect lands before A's answer is paired.
+        token_file::store(&path, "tokB").unwrap();
+        let _ = ask.answered("A");
+        STORE.with(|s| *s.borrow_mut() = None);
+        let on_file = token_file::read(&path).unwrap().unwrap();
+        assert_eq!(on_file.user, None, "B's token was paired with A");
+        assert!(
+            token_for_owner(Some(&on_file.token), on_file.user.as_deref(), "A").is_err(),
+            "A's run would be sent B's token"
+        );
+        assert!(
+            runs.0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| !r.starts_with("resume")),
+            "{:?}",
+            runs.0.lock().unwrap()
+        );
     }
 
     /// A store holding A's file on disk, for the answer the proxy gives.

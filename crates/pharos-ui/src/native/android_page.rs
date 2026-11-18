@@ -1985,9 +1985,22 @@ pub fn token_user() -> Result<Option<String>, String> {
     android::load_token_user()
 }
 
-/// Keeps `user` with the device token, at sign-in.
-pub fn note_token_user(user: &str) -> Result<(), String> {
-    android::store_token_user(user)
+/// Keeps `user` with the device token, at sign-in, only while the token on
+/// file is still `seen`, the one the request that named `user` was built
+/// with. Err `token_changed` (a new sign-in's token landed in between: it
+/// stays unpaired) or `no_token_seen`; either fails closed.
+pub fn note_token_user(user: &str, seen: Option<&str>) -> Result<(), String> {
+    let seen = seen.ok_or_else(|| "no_token_seen".to_owned())?;
+    match android::store_token_user_if(seen, user)? {
+        super::token_file::Pairing::Paired => Ok(()),
+        super::token_file::Pairing::TokenChanged => Err("token_changed".to_owned()),
+    }
+}
+
+/// The device token on file now, for a request being built: what its
+/// answer is later paired with. Never log it.
+pub fn token_seen() -> Option<String> {
+    android::token_with_user().ok().flatten().map(|s| s.token)
 }
 
 pub fn apply_subtitle_size(size: SubtitleSize) {
