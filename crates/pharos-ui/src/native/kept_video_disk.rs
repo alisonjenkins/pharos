@@ -535,7 +535,33 @@ impl State {
 
     /// Every video's reservation but `item`'s own, and the tombstones'.
     fn reserved_by_others(&self, user: &str, item: &str) -> u64 {
-        reserved_by_others(&self.list, user, item).saturating_add(self.tombstoned())
+        reserved_by_others(&self.list, user, item)
+            .saturating_add(self.tombstoned())
+            .saturating_add(self.draining())
+    }
+
+    /// Bytes revoked runs still have staged where another run now owns the
+    /// item (a park and an immediate resume): on disk, and in no
+    /// reservation, until the revoked writer stops and deletes its file.
+    /// A revoked run whose item no run owns is bounded instead by the
+    /// folder being of unknown size (`unknown_reason`).
+    fn draining(&self) -> u64 {
+        self.staged
+            .iter()
+            .filter(|((user, item, run), _)| {
+                self.runs
+                    .get(&(user.clone(), item.clone()))
+                    .is_some_and(|owner| owner != run)
+            })
+            .fold(0u64, |sum, (_, n)| sum.saturating_add(*n))
+    }
+
+    /// Whether a run of `user`'s `item` other than `run` still has a
+    /// staging file open.
+    fn revoked_writer(&self, user: &str, item: &str, run: u64) -> bool {
+        self.writers
+            .keys()
+            .any(|(u, i, r)| u == user && i == item && *r != run)
     }
 
     /// Names a new run the owner of `user`'s `item` and returns its id.
@@ -2979,11 +3005,58 @@ async fn plan_and_admit(
     })
 }
 
+/// Waits, on this download's own task (never the UI thread), while a
+/// revoked run of the item still has a staging file open (a park and an
+/// immediate resume): this run writes nothing over bytes in no reservation
+/// of its own, and plans only once they are gone. Their bytes count against
+/// the cap meanwhile ([`State::draining`]). Gone if this run is revoked too.
+async fn wait_for_revoked_writers(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+) -> Result<(), Stop> {
+    let started = Instant::now();
+    let mut logged = false;
+    loop {
+        let (busy, staged) = {
+            let st = lock(&inner.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(Stop::Gone);
+            }
+            (st.revoked_writer(user, item, run), st.draining())
+        };
+        if !busy {
+            if logged {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep waited item={item} run={run} reason=revoked_writer_stopped ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
+            return Ok(());
+        }
+        if !logged {
+            logged = true;
+            emit(
+                false,
+                format!(
+                    "pharos: video keep waiting item={item} run={run} reason=revoked_writer_running draining={staged}"
+                ),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
     let record = find(&lock(&inner.state).list, user, item)
         .cloned()
         .ok_or(Stop::Gone)?;
     let resume = !record.files.is_empty();
+    wait_for_revoked_writers(inner, user, item, run).await?;
     // An earlier run's staging files go before the plan is admitted: the
     // admission replaces the floor that counted them, and the walks after it
     // count this run's files only. One that will not go keeps the folder
@@ -4378,6 +4451,7 @@ impl VideoStore for DiskVideoStore {
             .map(reserved)
             .fold(0u64, u64::saturating_add)
             .saturating_add(st.tombstoned())
+            .saturating_add(st.draining())
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
@@ -7953,6 +8027,53 @@ mod tests {
         assert!(
             resumed.iter().any(|l| l.contains("reason=signed_in")),
             "{resumed:?}"
+        );
+    }
+
+    /// A parked run stalled mid-body still has its staging file on disk
+    /// when a sign-in resumes the download at once. Until that writer has
+    /// stopped, its bytes count against the cap, and the new run writes
+    /// nothing over them: the two never hold more than one reservation.
+    #[tokio::test]
+    async fn a_resume_waits_for_a_parked_runs_writer_and_counts_its_bytes() {
+        let rig = Rig::new("park-resume-drain");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let reserved = only(&store).estimated_bytes;
+        until_within(|| store.staged_bytes() == 1_000_000).await;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        let asked = rig.server.asked().len();
+        // The new run is under way while the old writer is held.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.kept_bytes(),
+            reserved + 1_000_000,
+            "the parked writer's staged bytes were not counted"
+        );
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "the new run fetched over the parked writer's bytes"
+        );
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let waited = lines("pharos: video keep waiting item=1");
+        assert!(
+            waited
+                .iter()
+                .any(|l| l.contains("reason=revoked_writer_running")),
+            "{waited:?}"
         );
     }
 
