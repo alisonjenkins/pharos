@@ -847,7 +847,11 @@ impl Inner {
         tests::during_measure();
         let (record, saved_floor) = {
             let mut st = lock(&self.state);
-            if !measured.exact || !Self::unchanged_since(&st, dir, epoch) {
+            // Only a whole measure settles the folder.
+            let Some(measured) = measured.whole() else {
+                return;
+            };
+            if !Self::unchanged_since(&st, dir, epoch) {
                 return;
             }
             let record = st
@@ -858,13 +862,13 @@ impl Inner {
             let mut ident = None;
             if let Some(i) = record {
                 let v = &mut st.list[i];
-                v.estimated_bytes = v.estimated_bytes.max(measured.bytes);
+                v.estimated_bytes = v.estimated_bytes.max(measured);
                 ident = Some((v.user.clone(), v.item.clone()));
             }
             if let Some(i) = tomb {
-                st.tombstones[i].1 = st.tombstones[i].1.max(measured.bytes);
+                st.tombstones[i].1 = st.tombstones[i].1.max(measured);
             }
-            (ident, measured.bytes)
+            (ident, measured)
         };
         // The larger reservation must be on disk before the fact clears: a
         // restart would otherwise read the old, smaller one.
@@ -943,7 +947,7 @@ impl Inner {
             t.1 = measured.counted(t.1);
             figure = t.1;
             st.measured
-                .insert(dir.to_path_buf(), (epoch, measured.exact));
+                .insert(dir.to_path_buf(), (epoch, measured.is_whole()));
             return figure;
         }
         figure
@@ -952,7 +956,12 @@ impl Inner {
     /// Puts back the record of a removal that could not take its manifest
     /// off the disk, with the files it still holds indexed.
     fn keep_after_failed_unlink(&self, mut record: KeptVideo, dir: &Path, e: &std::io::Error) {
-        let names = stored_names(dir);
+        // A regular file found is whole, whether or not the walk read
+        // everything: one it missed is left unindexed, and the folder's own
+        // measure below keeps its bytes counted.
+        let names = match stored_entries(dir) {
+            Measure::Whole(e) | Measure::Short(e) => regular_files(&e),
+        };
         #[cfg(test)]
         tests::at_unlink_failure();
         let mut st = lock(&self.state);
@@ -973,7 +982,8 @@ impl Inner {
             // download had written, or the folder holds, must not drop out
             // of what it reserves in the change.
             // The whole folder, staging files included.
-            let on_disk = dir_size(dir).bytes;
+            // A short walk is a lower bound, and only raises the figure.
+            let on_disk = dir_size(dir).counted(0);
             record.estimated_bytes = reserved(&record).max(on_disk);
             record.state = KeptState::Failed {
                 reason: format!("could not be removed: {e}"),
@@ -1219,7 +1229,7 @@ impl Inner {
                 st.dir_of(user, item),
             )
         };
-        let held = held.unwrap_or_else(|| dir_size(&dir).bytes);
+        let held = held.unwrap_or_else(|| dir_size(&dir).counted(0));
         let mut st = lock(&self.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return Err(Stop::Gone);
@@ -1995,21 +2005,18 @@ async fn playlist(
     String::from_utf8(bytes).map_err(|_| Stop::Failed(format!("{} is not text", url_path(key))))
 }
 
-/// The files under `dir/files` as (name, length).
-fn stored_names(dir: &Path) -> HashMap<String, u64> {
-    stored_names_checked(dir).0
-}
-
-/// The files under `dir/files` as (name, length), and whether the walk
-/// completed: false when the folder, an entry or a file's length could not
-/// be read (anything but being gone), so the list may be short. An entry
-/// that is a folder counts every byte under it ([`dir_size`]), not its own
-/// entry's size, and a walk of it that falls short makes this one short.
-/// Every whole-file measure of a download goes through here.
-fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
+/// The entries under `dir/files` but staging files, by name: `Short` when
+/// the folder, an entry or an entry's length could not be read (anything
+/// but being gone), so the list may lack some. An entry that is a folder
+/// counts every byte under it ([`dir_size`]), not its own entry's size, and
+/// a walk of it that falls short makes this one short. Only an entry that
+/// is a regular file can be a whole stored file ([`regular_files`]). Every
+/// whole-file measure and inventory of a download goes through here.
+fn stored_entries(dir: &Path) -> Measure<HashMap<String, Entry>> {
     let read = match std::fs::read_dir(dir.join("files")) {
         Ok(read) => read,
-        Err(e) => return (HashMap::new(), e.kind() == std::io::ErrorKind::NotFound),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Measure::Whole(HashMap::new()),
+        Err(_) => return Measure::Short(HashMap::new()),
     };
     let mut complete = true;
     let mut names = HashMap::new();
@@ -2024,19 +2031,41 @@ fn stored_names_checked(dir: &Path) -> (HashMap<String, u64>, bool) {
         if name.ends_with(".part") {
             continue;
         }
+        // `DirEntry::metadata` does not follow a link: a link is not regular.
         match e.metadata() {
             Ok(m) if m.is_dir() => {
-                let inner = dir_size(&e.path());
-                complete &= inner.exact;
-                names.insert(name, inner.bytes);
+                let len = match dir_size(&e.path()) {
+                    Measure::Whole(len) => len,
+                    Measure::Short(len) => {
+                        complete = false;
+                        len
+                    }
+                };
+                names.insert(
+                    name,
+                    Entry {
+                        len,
+                        regular: false,
+                    },
+                );
             }
             Ok(m) => {
-                names.insert(name, m.len());
+                names.insert(
+                    name,
+                    Entry {
+                        len: m.len(),
+                        regular: m.is_file(),
+                    },
+                );
             }
             Err(err) => complete &= err.kind() == std::io::ErrorKind::NotFound,
         }
     }
-    (names, complete)
+    if complete {
+        Measure::Whole(names)
+    } else {
+        Measure::Short(names)
+    }
 }
 
 /// A record read from a folder, ready to join the list.
@@ -2080,16 +2109,18 @@ fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
             (!listed, !parts.is_empty())
         }
     };
-    let names = stored_names(item_dir);
+    // A named file is whole only as a regular file under its final name: a
+    // folder in its place (counted by what it holds) is not one, and a
+    // staging file never carries a final name. One a short walk missed
+    // resumes; the folder's own measure below carries the walk's
+    // completeness.
+    let names = match stored_entries(item_dir) {
+        Measure::Whole(e) | Measure::Short(e) => regular_files(&e),
+    };
     let mut whole = 0usize;
     let mut index = Vec::new();
     for key in &record.files {
-        // A named file is whole only as a regular file under its final
-        // name: a folder in its place (counted by what it holds) is not one,
-        // and a staging file never carries a final name.
-        let path = item_dir.join("files").join(file_name(key));
-        let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-        if let Some(len) = names.get(&file_name(key)).filter(|_| regular) {
+        if let Some(len) = names.get(&file_name(key)) {
             whole += 1;
             index.push((
                 (record.user.clone(), key.clone()),
@@ -2123,22 +2154,26 @@ fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
         // No estimate was ever admitted for this record.
         record.estimate_from_adoption = true;
     }
-    if m.bytes > record.estimated_bytes {
+    // A short walk is a lower bound: it only raises the floor.
+    let floor = m.counted(0);
+    if floor > record.estimated_bytes {
         emit(
             false,
             format!(
-                "pharos: video record floor item={} estimate={} measured={} reason=folder_holds_more",
-                record.item, record.estimated_bytes, m.bytes
+                "pharos: video record floor item={} estimate={} measured={floor} whole={} reason=folder_holds_more",
+                record.item,
+                record.estimated_bytes,
+                m.is_whole()
             ),
         );
-        record.estimated_bytes = m.bytes;
+        record.estimated_bytes = floor;
     }
     Adopted {
         record,
         index,
         leftover,
         parts_deferred,
-        exact: m.exact,
+        exact: m.is_whole(),
     }
 }
 
@@ -2149,7 +2184,7 @@ enum Scanned {
     /// A record that cannot be read: left alone, never deleted. Its bytes (as
     /// far as they can be read) count against the cap, and since the
     /// record's own reservation is lost, nothing is admitted while it stays.
-    Held { why: String, m: Measured },
+    Held { why: String, m: Measure<u64> },
     /// No record, a removed download, and the folder would not delete.
     Tombstone {
         bytes: u64,
@@ -2168,8 +2203,8 @@ fn scan_item(env: &Env, item_dir: &Path, sweep: Sweep) -> Scanned {
         HeldNow::NoRecord if sweep == Sweep::HostCheck => {
             let m = dir_size(item_dir);
             Scanned::Tombstone {
-                bytes: m.bytes,
-                exact: m.exact,
+                bytes: m.counted(0),
+                exact: m.is_whole(),
                 error: "deletion deferred to an ordinary sweep (host size check)".to_owned(),
             }
         }
@@ -2188,8 +2223,8 @@ fn scan_item(env: &Env, item_dir: &Path, sweep: Sweep) -> Scanned {
                 // whole blocks admission.
                 let m = dir_size(item_dir);
                 Scanned::Tombstone {
-                    bytes: m.bytes,
-                    exact: m.exact,
+                    bytes: m.counted(0),
+                    exact: m.is_whole(),
                     error: e.to_string(),
                 }
             }
@@ -2267,11 +2302,11 @@ impl State {
                     format!(
                         "pharos: video folder held dir={} reason={why} bytes={} exact={} admission=blocked",
                         dir.display(),
-                        m.bytes,
-                        m.exact
+                        m.counted(0),
+                        m.is_whole()
                     ),
                 );
-                self.held.push((dir.to_path_buf(), m.bytes));
+                self.held.push((dir.to_path_buf(), m.counted(0)));
                 self.unmeasured.push((dir.to_path_buf(), why));
             }
             Scanned::Tombstone {
@@ -2318,69 +2353,112 @@ impl State {
     }
 }
 
-/// What a walk of a folder found.
-struct Measured {
-    bytes: u64,
-    /// False when something under it could not be read (anything but being
-    /// gone): the bytes are then a lower bound.
-    exact: bool,
+/// What a walk of a folder found: everything there is, or only what it
+/// could read before something under it could not be read (anything but
+/// being gone), which is then a lower bound. Nothing reads the finding
+/// without saying which: a reader matches, or asks for [`Measure::whole`]
+/// or [`Measure::counted`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Measure<T> {
+    /// The walk read everything.
+    Whole(T),
+    /// The walk fell short: what it found is a lower bound.
+    Short(T),
 }
 
-impl Measured {
+impl<T> Measure<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Measure<U> {
+        match self {
+            Self::Whole(t) => Measure::Whole(f(t)),
+            Self::Short(t) => Measure::Short(f(t)),
+        }
+    }
+
+    /// What was found, only when it is all there is.
+    fn whole(self) -> Option<T> {
+        match self {
+            Self::Whole(t) => Some(t),
+            Self::Short(_) => None,
+        }
+    }
+
+    fn is_whole(&self) -> bool {
+        matches!(self, Self::Whole(_))
+    }
+
+    /// Two walks as one: whole only if both were.
+    fn and<U, V>(self, other: Measure<U>, f: impl FnOnce(T, U) -> V) -> Measure<V> {
+        let whole = self.is_whole() && other.is_whole();
+        let (Self::Whole(t) | Self::Short(t)) = self;
+        let (Measure::Whole(u) | Measure::Short(u)) = other;
+        if whole {
+            Measure::Whole(f(t, u))
+        } else {
+            Measure::Short(f(t, u))
+        }
+    }
+}
+
+impl Measure<u64> {
     /// The figure to count against the cap: the bytes found, or, when the
     /// walk was cut short, no less than `floor` (what was known before).
     fn counted(&self, floor: u64) -> u64 {
-        if self.exact {
-            self.bytes
-        } else {
-            self.bytes.max(floor)
+        match *self {
+            Self::Whole(bytes) => bytes,
+            Self::Short(bytes) => bytes.max(floor),
         }
     }
+}
+
+/// One entry under a download's `files` folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    /// What it holds: a folder counts every byte under it.
+    len: u64,
+    /// Whether it is a regular file (not a folder, link or anything else).
+    /// Only a regular file can be a whole stored file.
+    regular: bool,
+}
+
+/// The regular files of an inventory, as (name, length).
+fn regular_files(entries: &HashMap<String, Entry>) -> HashMap<String, u64> {
+    entries
+        .iter()
+        .filter(|(_, e)| e.regular)
+        .map(|(n, e)| (n.clone(), e.len))
+        .collect()
 }
 
 /// Every byte of every file under `dir`, whatever it is. A folder that is
 /// gone holds nothing; one that cannot be read is not counted as empty.
-fn dir_size(dir: &Path) -> Measured {
+fn dir_size(dir: &Path) -> Measure<u64> {
     #[cfg(test)]
     if tests::UNREADABLE.with(|u| u.borrow().iter().any(|p| p == dir)) {
-        return Measured {
-            bytes: 0,
-            exact: false,
-        };
+        return Measure::Short(0);
     }
-    let read = match std::fs::read_dir(dir) {
-        Ok(read) => read,
-        Err(e) => {
-            return Measured {
-                bytes: 0,
-                exact: e.kind() == std::io::ErrorKind::NotFound,
-            };
+    let gone_or_short = |e: &std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Measure::Whole(0)
+        } else {
+            Measure::Short(0)
         }
     };
-    let mut total = Measured {
-        bytes: 0,
-        exact: true,
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) => return gone_or_short(&e),
     };
+    let mut total = Measure::Whole(0u64);
     for entry in read {
         let part = match entry {
-            Err(_) => Measured {
-                bytes: 0,
-                exact: false,
-            },
+            Err(_) => Measure::Short(0),
             Ok(e) => match e.metadata() {
                 Ok(m) if m.is_dir() => dir_size(&e.path()),
-                Ok(m) => Measured {
-                    bytes: m.len(),
-                    exact: true,
-                },
-                Err(err) => Measured {
-                    bytes: 0,
-                    exact: err.kind() == std::io::ErrorKind::NotFound,
-                },
+                Ok(m) => Measure::Whole(m.len()),
+                Err(err) => gone_or_short(&err),
             },
         };
-        total.bytes = total.bytes.saturating_add(part.bytes);
-        total.exact &= part.exact;
+        total = total.and(part, u64::saturating_add);
     }
     total
 }
@@ -2388,21 +2466,16 @@ fn dir_size(dir: &Path) -> Measured {
 /// Bytes of whole files on disk under `dir`, whatever plan they belong to.
 /// Not exact when the walk could not complete: the bytes are then a lower
 /// bound, and must not be taken as what the folder holds.
-fn disk_bytes(dir: &Path) -> Measured {
+fn disk_bytes(dir: &Path) -> Measure<u64> {
     #[cfg(test)]
     if tests::FAIL_DISK_WALK.with(std::cell::Cell::get) {
-        return Measured {
-            bytes: 0,
-            exact: false,
-        };
+        return Measure::Short(0);
     }
-    let (names, exact) = stored_names_checked(dir);
-    Measured {
-        bytes: names
+    stored_entries(dir).map(|entries| {
+        entries
             .values()
-            .fold(0u64, |sum, len| sum.saturating_add(*len)),
-        exact,
-    }
+            .fold(0u64, |sum, e| sum.saturating_add(e.len))
+    })
 }
 
 /// Deletes the stored files of `item` that `plan` does not name, and
@@ -2429,9 +2502,12 @@ fn prune_unplanned(
     if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
         return None;
     }
-    let (names, complete) = stored_names_checked(&dir);
+    let (names, complete) = match stored_entries(&dir) {
+        Measure::Whole(e) => (e, true),
+        Measure::Short(e) => (e, false),
+    };
     let (mut removed, mut bytes, mut left) = (0usize, 0u64, 0u64);
-    for (name, len) in names {
+    for (name, Entry { len, .. }) in names {
         if keep.contains(&name) {
             continue;
         }
@@ -2577,7 +2653,12 @@ async fn plan_and_admit(
     tests::pruned(stale, inner, user, item);
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
-    let names = stored_names(&inner.item_dir(user, item));
+    let names = match stored_entries(&inner.item_dir(user, item)) {
+        Measure::Whole(e) | Measure::Short(e) => e
+            .into_iter()
+            .map(|(n, e)| (n, e.len))
+            .collect::<HashMap<_, _>>(),
+    };
     let mut have = HashSet::new();
     let mut stored_bytes = 0u64;
     for key in &all {
@@ -2808,7 +2889,8 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     }
     // What the item's folder holds now, whatever plan the files are of.
     let disk = disk_bytes(&inner.item_dir(&user, &item));
-    let held = disk.bytes;
+    // A lower bound when the walk fell short; only ever taken in a max.
+    let held = disk.counted(0);
     // The record's figure for the folder: what was found, or, when the walk
     // fell short (a transient EMFILE reads as nothing), no less than what
     // the record held before. A short walk also leaves the folder unknown
@@ -2820,7 +2902,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     // A walk that fell short leaves the folder unknown from before the
     // terminal record is published: an admission must not see the low
     // figure first.
-    if !disk.exact {
+    if !disk.is_whole() {
         let dir = inner.item_dir(&user, &item);
         let mut st = lock(&inner.state);
         if !st.leftover.contains(&dir) {
@@ -2972,7 +3054,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         cleaned.unwrap_or_else(|| drop_parts_of(&inner.item_dir(&user, &item), Some(run)));
     let owned = {
         let mut st = lock(&inner.state);
-        if !cleaned || !disk.exact {
+        if !cleaned || !disk.is_whole() {
             let dir = inner.item_dir(&user, &item);
             if !st.leftover.contains(&dir) {
                 st.leftover.push(dir);
@@ -2992,7 +3074,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     };
     // A revoked run's writer is done: a folder its removal could not
     // delete or bound while it ran is deleted or measured now.
-    if !owned || !cleaned || !disk.exact {
+    if !owned || !cleaned || !disk.is_whole() {
         inner.sweep_tombstones();
     }
 }
@@ -3425,17 +3507,16 @@ impl Inner {
                 .collect()
         };
         for dir in dirs {
-            let m = dir_size(&dir);
-            if !m.exact {
+            let Some(m) = dir_size(&dir).whole() else {
                 continue;
-            }
+            };
             let mut st = lock(&self.state);
             let root = st.root.clone();
             for v in &mut st.list {
                 if root.join(safe_name(&v.user)).join(safe_name(&v.item)) == dir
-                    && m.bytes > v.estimated_bytes
+                    && m > v.estimated_bytes
                 {
-                    v.estimated_bytes = m.bytes;
+                    v.estimated_bytes = m;
                 }
             }
             st.remeasure.retain(|d| *d != dir);
@@ -3444,9 +3525,8 @@ impl Inner {
             emit(
                 false,
                 format!(
-                    "pharos: video folder remeasured dir={} bytes={}",
-                    dir.display(),
-                    m.bytes
+                    "pharos: video folder remeasured dir={} bytes={m}",
+                    dir.display()
                 ),
             );
         }
@@ -3501,8 +3581,8 @@ impl Inner {
                     return;
                 }
                 release(&mut st);
-                st.measured.insert(dir.to_path_buf(), (0, m.exact));
-                st.tombstones.push((dir.to_path_buf(), m.bytes));
+                st.measured.insert(dir.to_path_buf(), (0, m.is_whole()));
+                st.tombstones.push((dir.to_path_buf(), m.counted(0)));
                 drop(st);
                 verdict("tombstoned", "no record, a removed download");
             }
@@ -3513,11 +3593,11 @@ impl Inner {
                     .held
                     .iter()
                     .find(|(d, _)| d == dir)
-                    .is_some_and(|(_, b)| *b != m.bytes)
+                    .is_some_and(|(_, b)| *b != m.counted(0))
                     || st.unmeasured.iter().any(|(d, w)| d == dir && *w != why);
                 for (d, b) in &mut st.held {
                     if d == dir {
-                        *b = m.bytes;
+                        *b = m.counted(0);
                     }
                 }
                 for (d, w) in &mut st.unmeasured {
@@ -3529,7 +3609,7 @@ impl Inner {
                 if changed {
                     verdict(
                         "still_held",
-                        &format!("{why} bytes={} exact={}", m.bytes, m.exact),
+                        &format!("{why} bytes={} exact={}", m.counted(0), m.is_whole()),
                     );
                 }
             }
@@ -3576,15 +3656,15 @@ impl Inner {
                             let mut st = lock(&self.state);
                             st.held.retain(|(d, _)| *d != dir);
                             st.unmeasured.retain(|(d, _)| *d != dir);
-                            st.measured.insert(dir.clone(), (0, m.exact));
-                            st.tombstones.push((dir.clone(), m.bytes));
+                            st.measured.insert(dir.clone(), (0, m.is_whole()));
+                            st.tombstones.push((dir.clone(), m.counted(0)));
                             drop(st);
                             emit(
                                 true,
                                 format!(
                                     "pharos: video held folder verdict=discard_failed dir={} bytes={} error={e}",
                                     dir.display(),
-                                    m.bytes
+                                    m.counted(0)
                                 ),
                             );
                             failed.push(dir.display().to_string());
@@ -4075,7 +4155,15 @@ impl VideoStore for DiskVideoStore {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    /// What a folder holds, for a test that needs it whole: a short walk
+    /// fails the test rather than reading as fewer bytes.
+    fn on_disk(dir: &std::path::Path) -> u64 {
+        super::dir_size(dir)
+            .whole()
+            .unwrap_or_else(|| panic!("{} not measured whole", dir.display()))
+    }
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -5300,7 +5388,7 @@ mod tests {
         drop(store);
         std::fs::remove_file(&gone).unwrap();
         rig.server.asked.lock().unwrap().clear();
-        let held = dir_size(&rig.dir.join("u1").join("1")).bytes;
+        let held = on_disk(&rig.dir.join("u1").join("1"));
         let cap = rig.budget.cap.load(Ordering::SeqCst);
         rig.budget.other.store(cap - held, Ordering::SeqCst);
 
@@ -5355,7 +5443,7 @@ mod tests {
         std::fs::remove_file(&master).unwrap();
         rig.server.asked.lock().unwrap().clear();
         let files = rig.dir.join("u1").join("1").join("files");
-        let media = dir_size(&files).bytes;
+        let media = on_disk(&files);
         let cap = rig.budget.cap.load(Ordering::SeqCst);
         rig.budget.other.store(cap - media, Ordering::SeqCst);
 
@@ -5366,7 +5454,7 @@ mod tests {
         };
         assert!(rig.server.asked().is_empty(), "something was fetched");
         assert!(!master.exists(), "the playlist was written");
-        assert_eq!(dir_size(&files).bytes, media, "media written");
+        assert_eq!(on_disk(&files), media, "media written");
         let refused = lines("pharos: video keep refused item=1");
         assert!(
             refused.iter().any(|l| l.contains("step=playlist")),
@@ -5396,7 +5484,7 @@ mod tests {
         assert!(!rig.server.asked().contains(&MEDIA_KEY.to_owned()));
         assert!(store.stored_file("u1", MASTER_KEY).is_none(), "indexed");
         let files = rig.dir.join("u1").join("1").join("files");
-        assert_eq!(dir_size(&files).bytes, 0, "a playlist was kept");
+        assert_eq!(on_disk(&files), 0, "a playlist was kept");
         drop(store);
 
         // A resume missing both playlists.
@@ -5413,7 +5501,7 @@ mod tests {
         std::fs::remove_file(&media).unwrap();
         rig.server.asked.lock().unwrap().clear();
         // What the record counts once adopted: no less than its folder.
-        let own = held.max(dir_size(&rig.dir.join("u1").join("1")).bytes);
+        let own = held.max(on_disk(&rig.dir.join("u1").join("1")));
         rig.budget
             .cap
             .store(own + PLAYLIST_MAX_BYTES + 100, Ordering::SeqCst);
@@ -5464,7 +5552,7 @@ mod tests {
             let files = rig.dir.join("u1").join("1").join("files");
             // The first chunk is written: the disk fills up now.
             let mut waited = 0;
-            while dir_size(&files).bytes < big / 2 {
+            while on_disk(&files) < big / 2 {
                 waited += 1;
                 assert!(waited < 5_000, "{case}: the first chunk never landed");
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -5477,7 +5565,7 @@ mod tests {
             release.store(true, Ordering::SeqCst);
             store.settled().await;
             let v = only(&store);
-            let on_disk = dir_size(&files).bytes;
+            let on_disk = on_disk(&files);
             if case == "roomy" {
                 assert_eq!(v.state, KeptState::Ready, "{case}");
                 assert!(
@@ -5597,7 +5685,7 @@ mod tests {
             let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
             std::fs::create_dir(&stuck).unwrap();
             std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
-            let stale = dir_size(&stuck).bytes;
+            let stale = on_disk(&stuck);
             let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
             {
                 let mut f = rig.server.files.lock().unwrap();
@@ -5623,7 +5711,7 @@ mod tests {
             store.start(again).unwrap();
             store.settled().await;
             let v = only(&store);
-            let media = dir_size(&files).bytes.saturating_sub(stale);
+            let media = on_disk(&files).saturating_sub(stale);
             if big {
                 assert!(
                     matches!(v.state, KeptState::Failed { .. }),
@@ -5662,7 +5750,7 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         let files = rig.dir.join("u1").join("1").join("files");
-        let on_disk = dir_size(&files).bytes;
+        let on_disk = on_disk(&files);
         ADMITTED.with(|a| a.set(None));
         store.start(request("1")).unwrap();
         store.settled().await;
@@ -5714,7 +5802,7 @@ mod tests {
             let kept = store.kept_bytes();
             UNREADABLE.with(|u| u.borrow_mut().clear());
             let v = only(&store);
-            let on_disk = dir_size(&files).bytes;
+            let on_disk = on_disk(&files);
             match case {
                 "ready" => assert_eq!(v.state, KeptState::Ready),
                 _ => assert!(matches!(v.state, KeptState::Failed { .. }), "{case}: {v:?}"),
@@ -5759,7 +5847,7 @@ mod tests {
         let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
         std::fs::create_dir(&stuck).unwrap();
         std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
-        let on_disk = dir_size(&files).bytes;
+        let on_disk = on_disk(&files);
         ADMITTED.with(|a| a.set(None));
         store.start(request("1")).unwrap();
         store.settled().await;
@@ -5792,7 +5880,7 @@ mod tests {
         assert!(reason.contains("playlist_too_large"), "{reason}");
         assert!(store.stored_file("u1", MASTER_KEY).is_none());
         let files = rig.dir.join("u1").join("1").join("files");
-        assert_eq!(dir_size(&files).bytes, 0, "something was kept");
+        assert_eq!(on_disk(&files), 0, "something was kept");
         assert!(!lines("pharos: video keep refused item=1 reason=playlist_too_large").is_empty());
     }
 
@@ -6214,7 +6302,7 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         let dir = rig.dir.join("u1").join("1");
-        let on_disk = disk_bytes(&dir).bytes;
+        let on_disk = disk_bytes(&dir).whole().unwrap();
         assert!(on_disk > 0);
         assert_eq!(
             store.kept_bytes(),
@@ -6235,7 +6323,7 @@ mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         assert_eq!(
-            disk_bytes(&dir).bytes,
+            disk_bytes(&dir).whole().unwrap(),
             on_disk,
             "nothing was pruned without a plan"
         );
@@ -6293,7 +6381,7 @@ mod tests {
         );
         assert_eq!(
             v.estimated_bytes,
-            disk_bytes(&rig.dir.join("u1").join("1")).bytes
+            disk_bytes(&rig.dir.join("u1").join("1")).whole().unwrap()
         );
     }
 
@@ -6312,7 +6400,7 @@ mod tests {
         std::fs::create_dir(&stuck).unwrap();
         std::fs::write(stuck.join("inner"), vec![0u8; 1_000]).unwrap();
         // A folder counts at what it holds.
-        let stuck_len = dir_size(&stuck).bytes;
+        let stuck_len = on_disk(&stuck);
         assert!(stuck_len > 0);
 
         let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
@@ -7536,7 +7624,7 @@ mod tests {
             );
         }
         std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
-        let held = dir_size(&dir).bytes;
+        let held = on_disk(&dir);
         assert!(held > 0);
         (rig, held)
     }
@@ -7580,8 +7668,8 @@ mod tests {
         std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
         let seg = dir.join("files").join(file_name(SEG1));
         std::fs::remove_file(&seg).unwrap();
-        let held = dir_size(&dir).bytes;
-        let media = dir_size(&dir.join("files")).bytes;
+        let held = on_disk(&dir);
+        let media = on_disk(&dir.join("files"));
         // Music holds the rest of the cap: only the folder's bytes fit.
         let cap = rig.budget.cap.load(Ordering::SeqCst);
         rig.budget.other.store(cap - held, Ordering::SeqCst);
@@ -7597,7 +7685,7 @@ mod tests {
         assert!(!seg.exists(), "the missing segment was fetched");
         // Only the record is saved again (its verdict); no media is.
         assert_eq!(
-            dir_size(&dir.join("files")).bytes,
+            on_disk(&dir.join("files")),
             media,
             "media written beyond what was on disk"
         );
@@ -8273,7 +8361,7 @@ mod tests {
             let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
             let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
             set_hook(&AFTER_FAILED_SAVE, move || {
-                let on_disk = dir_size(&files2).bytes;
+                let on_disk = on_disk(&files2);
                 // What an admission planned now would find: `admit` refuses
                 // while any folder is unknown. (Read from the state: the
                 // host's check behind `size_unknown` would settle it.)
@@ -8347,7 +8435,7 @@ mod tests {
         let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
         let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
         set_hook(&AFTER_FAILED_SAVE, move || {
-            let on_disk = dir_size(&files2).bytes;
+            let on_disk = on_disk(&files2);
             let refused = lock(&s2.inner.state).unknown_folder().is_some();
             *seen2.borrow_mut() = Some((refused, s2.kept_bytes(), on_disk));
         });
@@ -8416,7 +8504,7 @@ mod tests {
     /// The media files and every staging file in `dir`: what a download's
     /// figure must cover (its own manifest is not part of it).
     fn media_on_disk(dir: &Path) -> u64 {
-        dir_size(&dir.join("files")).bytes
+        on_disk(&dir.join("files"))
     }
 
     /// The host's check recovers an interrupted download with an old run's
@@ -8791,7 +8879,7 @@ mod tests {
             "the folder a record owns is still unknown"
         );
         assert!(
-            store.kept_bytes() >= floor.min(disk_bytes(&dir).bytes),
+            store.kept_bytes() >= floor.min(disk_bytes(&dir).whole().unwrap()),
             "the folder's bytes are not counted"
         );
         // Another item is admitted.
@@ -8913,7 +9001,7 @@ mod tests {
         FAIL_REMOVE.with(|f| f.set(true));
         store.remove("u1", "1");
         let dir = rig.dir.join("u1").join("1");
-        let old = disk_bytes(&dir).bytes;
+        let old = disk_bytes(&dir).whole().unwrap();
         assert!(old > 0, "no old files");
         // The same stream under a new session id.
         {
@@ -8944,7 +9032,7 @@ mod tests {
         store.settled().await;
         assert!(only(&store).ready(), "{:?}", only(&store).state);
         assert!(
-            store.kept_bytes() >= disk_bytes(&dir).bytes,
+            store.kept_bytes() >= disk_bytes(&dir).whole().unwrap(),
             "the folder's bytes are not counted"
         );
         assert!(!store.size_unknown(), "the folder stayed unknown");
@@ -9168,7 +9256,7 @@ mod tests {
         store.settled().await;
         let dir = rig.dir.join("u1").join("1");
         // What stays once the record's manifest is gone: the files.
-        let left = dir_size(&dir.join("files")).bytes;
+        let left = on_disk(&dir.join("files"));
         assert!(left > 0);
 
         FAIL_REMOVE.with(|f| f.set(true));
@@ -9384,8 +9472,7 @@ mod tests {
                 *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
                     if v.ready() {
                         let unknown = lock(&s2.inner.state).unknown_folder().is_some();
-                        *seen2.borrow_mut() =
-                            Some((unknown, v.estimated_bytes, dir_size(&files2).bytes));
+                        *seen2.borrow_mut() = Some((unknown, v.estimated_bytes, on_disk(&files2)));
                     }
                 }));
             });
@@ -9432,7 +9519,7 @@ mod tests {
                         panic!("{case}: published Ready over a failed sync: {v:?}");
                     };
                     assert!(reason.contains("os error 5"), "{case}: {reason}");
-                    let on_disk = dir_size(&rig.dir.join("u1").join("1").join("files")).bytes;
+                    let on_disk = on_disk(&rig.dir.join("u1").join("1").join("files"));
                     assert!(store.kept_bytes() >= on_disk, "{case}: files uncounted");
                     assert!(
                         store.stored_file("u1", SEG0).is_some(),
