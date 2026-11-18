@@ -34,7 +34,7 @@ use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::music_bridge::{self, Follow, MediaIo, Step};
-use super::offline_video;
+use super::offline_video::{self, Session};
 use super::palette::{self, Row};
 use super::person::PersonView;
 use super::platform::{self, OpenError};
@@ -1920,13 +1920,14 @@ pub(crate) type MeFetch<A, M> =
 
 /// The signed-in user's `me`, as the app asks it: again whenever the
 /// screens come up or go (a session ending clears the name; a reconnect
-/// keeps the screens, and the name, until the new API resumes), through
+/// keeps the screens, and the name, until the new session resumes), through
 /// [`offline_video::me_request`], and remembered only under the identity
-/// generation it was asked at. `fetch` sends the request, `id` names the
-/// answer's user and `on_me` runs with each answer.
+/// generation it was asked at, paired only with the token of the session it
+/// was sent on. `fetch` sends the request, `id` names the answer's user and
+/// `on_me` runs with each answer.
 pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
     machine: Signal<Machine>,
-    api: Signal<Option<A>>,
+    session: Signal<Option<Session<A>>>,
     fetch: MeFetch<A, M>,
     id: fn(&M) -> &str,
     on_me: Rc<dyn Fn(&M)>,
@@ -1935,12 +1936,13 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
     let screens = use_memo(move || machine.read().shows_screens());
     use_resource(move || {
         let _ = screens();
-        // The API and the identity generation are taken together, here,
-        // before the request's future is built: a session that ends after
-        // this point signs the user out, and the answer must not undo that.
-        // Sent only to a ready session's API.
+        // The session (its API and its token, one value) and the identity
+        // generation are taken together, here, before the request's future
+        // is built: a session that ends after this point signs the user
+        // out, and the answer must not undo that. Sent only to a ready
+        // session's API.
         let ready = matches!(machine.peek().phase(), Phase::Ready);
-        let ask = offline_video::me_request(ready, api.read().clone());
+        let ask = offline_video::me_request(ready, session.read().clone());
         let (fetch, on_me) = (fetch.clone(), on_me.clone());
         async move {
             let ask = ask?;
@@ -1966,6 +1968,9 @@ fn NativeApp(route: Route) -> Element {
     let connection_lost = use_memo(move || machine.read().reconnecting());
     use_context_provider(|| ConnectionLost(connection_lost));
     let mut api = use_signal(|| None::<NativeApi>);
+    // The session `api` came from, with the token it was resumed with: set
+    // and cleared with `api`, read only by `use_me`.
+    let mut session = use_signal(|| None::<Session<NativeApi>>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
     // A connection attempt that has not answered in a while (a tunnel, where
@@ -2262,7 +2267,9 @@ fn NativeApp(route: Route) -> Element {
                 }
                 // A reconnect keeps the old API until the new one resumes,
                 // so the screens keep what they loaded.
-                task.set(Some(spawn(connect(machine, api, outdated, epoch, delay))));
+                task.set(Some(spawn(connect(
+                    machine, api, session, outdated, epoch, delay,
+                ))));
             }
             Phase::Connecting => {}
             Phase::Ready => {
@@ -2273,6 +2280,9 @@ fn NativeApp(route: Route) -> Element {
             _ => {
                 if let Some(old) = task.write().take() {
                     old.cancel();
+                }
+                if session.peek().is_some() {
+                    session.set(None);
                 }
                 if api.peek().is_some() {
                     api.set(None);
@@ -2291,7 +2301,7 @@ fn NativeApp(route: Route) -> Element {
     // API resumes. A memo, so other machine changes do not ask again.
     let me = use_me(
         machine,
-        api,
+        session,
         Rc::new(|api| {
             Box::pin(async move {
                 let info = call("shell", "me");
@@ -2484,6 +2494,7 @@ fn QuickConnectSignIn(on_signed_in: EventHandler<SignInReply>) -> Element {
 async fn connect(
     mut machine: Signal<Machine>,
     mut api: Signal<Option<NativeApi>>,
+    mut session: Signal<Option<Session<NativeApi>>>,
     mut outdated: Signal<Option<u32>>,
     epoch: u32,
     delay_ms: u32,
@@ -2501,8 +2512,9 @@ async fn connect(
                 ));
                 outdated.set(Some(server));
             }
-            api.set(Some(open.api.clone()));
-            platform::install_telemetry(&open.api);
+            api.set(Some(open.session.api().clone()));
+            session.set(Some(open.session.clone()));
+            platform::install_telemetry(open.session.api());
             machine.write().apply(Event::Resumed { epoch });
             let reason = platform::closed(&mut open.conn).await;
             Event::Closed { epoch, reason }

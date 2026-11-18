@@ -465,11 +465,9 @@ pub trait Resumer {
 
 /// What [`resume_session`] gave.
 pub enum Resumed<A, E> {
-    /// A session, and the token it was resumed with: the one read for it.
-    Opened {
-        api: A,
-        token: String,
-    },
+    /// A session, carrying the token it was resumed with: the one read for
+    /// it.
+    Opened(Session<A>),
     /// No token on file: nothing was sent.
     NoToken,
     /// The server refused the token, which is dropped.
@@ -484,7 +482,7 @@ pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
         return Resumed::NoToken;
     };
     match r.resume(&token).await {
-        Ok(api) => Resumed::Opened { api, token },
+        Ok(api) => Resumed::Opened(Session::opened(api, Some(token))),
         Err(ResumeError::Refused) => {
             r.forget_token();
             Resumed::Refused
@@ -493,11 +491,14 @@ pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
     }
 }
 
-/// Notes the user who has signed in. Known in this process first; the
-/// preference follows, and a failed write is logged, not served around.
-pub fn remember_user(user: &str) {
+/// Notes the user who has signed in, paired with the test seam's token.
+/// Known in this process first; the preference follows, and a failed write
+/// is logged, not served around. The app learns its user only through
+/// [`MeAsk::answered`], with the session's token.
+#[cfg(test)]
+pub(crate) fn remember_user(user: &str) {
     set_identity(Identity::User(user.to_owned()));
-    note_signed_in(user, &token_seen());
+    note_signed_in(user, &tests::seam_token());
 }
 
 /// The device token a request was built with, taken when it is built: its
@@ -516,15 +517,30 @@ impl std::fmt::Debug for TokenSeen {
     }
 }
 
-/// The token the current session was authenticated with ([`TokenSeen`]),
-/// as the platform kept it when the session opened: never a fresh read of
-/// the token file, which another sign-in may have replaced since.
-pub fn token_seen() -> TokenSeen {
-    #[cfg(test)]
-    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
-        return TokenSeen(seam.token_seen());
+/// A signed-in session as `open` gave it: its API and the device token it
+/// was resumed with, one value. Made only where a session is opened
+/// ([`resume_session`], or a platform with no device token); nothing sets
+/// or clears the token after, so a re-open is a new value and a request
+/// built from the old one still carries the old token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session<A> {
+    api: A,
+    token: TokenSeen,
+}
+
+impl<A> Session<A> {
+    /// A session resumed with `token` (none where the platform has no
+    /// device token).
+    pub(crate) fn opened(api: A, token: Option<String>) -> Self {
+        Self {
+            api,
+            token: TokenSeen(token),
+        }
     }
-    TokenSeen(super::platform::token_seen())
+
+    pub fn api(&self) -> &A {
+        &self.api
+    }
 }
 
 /// A `me` request that may be sent: the API it goes to and the identity
@@ -535,25 +551,26 @@ pub fn token_seen() -> TokenSeen {
 pub struct MeAsk<A> {
     pub api: A,
     pub asked_at: u64,
-    /// The token on file as the request is built: the answer's user is
-    /// paired with this token only.
+    /// The token the session was resumed with: the answer's user is paired
+    /// with this token only.
     pub token: TokenSeen,
 }
 
-/// Whether to ask who is signed in: only with an API and a ready session
-/// (the machine `Ready` at this point). The generation is taken here, at
-/// the same point as the API, never later in the request's future. Logs a
-/// refusal with its reason.
-pub fn me_request<A>(ready: bool, api: Option<A>) -> Option<MeAsk<A>> {
-    let api = api?;
+/// Whether to ask who is signed in: only with a session and a ready
+/// machine (`Ready` at this point). The generation is taken here, at the
+/// same point as the session, never later in the request's future; the API
+/// and the token come from that one session value. Logs a refusal with its
+/// reason.
+pub fn me_request<A>(ready: bool, session: Option<Session<A>>) -> Option<MeAsk<A>> {
+    let session = session?;
     if !ready {
         super::platform::info("pharos: video user me verdict=not_sent reason=session_not_ready");
         return None;
     }
     Some(MeAsk {
-        api,
+        api: session.api,
         asked_at: identity_generation(),
-        token: token_seen(),
+        token: session.token,
     })
 }
 
@@ -569,8 +586,9 @@ impl<A> MeAsk<A> {
 /// [`identity_generation`]): written only while no sign-in or sign-out has
 /// landed since, so a `me` that completes after its session ended cannot
 /// bring the previous user back. Returns whether it was written.
-pub fn remember_user_if(asked_at: u64, user: &str) -> bool {
-    remember_user_seen(asked_at, user, &token_seen())
+#[cfg(test)]
+pub(crate) fn remember_user_if(asked_at: u64, user: &str) -> bool {
+    remember_user_seen(asked_at, user, &tests::seam_token())
 }
 
 /// [`remember_user_if`] for an answer to a request built with `seen`.
@@ -820,9 +838,6 @@ mod tests {
         reads: Rc<Cell<usize>>,
         /// When set, pairing the user with the token fails.
         fail_pair: Rc<Cell<bool>>,
-        /// The token the session was opened with, as the platform keeps it
-        /// beside its API; unset, the file's token stands for it.
-        pub(super) session: Rc<RefCell<Option<String>>>,
     }
 
     impl Pref {
@@ -849,12 +864,9 @@ mod tests {
             }
             Ok(())
         }
-        /// The token a request is built with: the session's, or the file's
-        /// when the test opened no session.
+        /// The token a test session is opened with: the file's, or "tok"
+        /// while the modelled token is present.
         pub(super) fn token_seen(&self) -> Option<String> {
-            if let Some(session) = self.session.borrow().clone() {
-                return Some(session);
-            }
             match self.file.borrow().as_ref() {
                 Some(path) => super::super::token_file::read(path)
                     .ok()
@@ -894,7 +906,17 @@ mod tests {
     thread_local! {
         pub(super) static PREF: RefCell<Option<Pref>> = const { RefCell::new(None) };
         /// The store the session hooks reach, in place of the registered one.
-        pub(super) static STORE: RefCell<Option<Rc<dyn VideoStore>>> = const { RefCell::new(None) };
+        pub(super) static STORE: RefCell<Option<std::sync::Arc<dyn VideoStore>>> = const { RefCell::new(None) };
+    }
+
+    /// The token a test's `remember_user` pairs with: the seam's.
+    pub(super) fn seam_token() -> TokenSeen {
+        TokenSeen(PREF.with(|p| p.borrow().as_ref().and_then(Pref::token_seen)))
+    }
+
+    /// A session opened with the seam's token, as a test's `open` gives it.
+    fn session<A>(api: A) -> Session<A> {
+        Session::opened(api, seam_token().0)
     }
 
     fn pref() -> Pref {
@@ -1019,7 +1041,7 @@ mod tests {
     #[test]
     fn a_sign_in_resumes_downloads_only_once_the_token_is_paired() {
         let p = pref();
-        let runs = Rc::new(TokenRuns::default());
+        let runs = std::sync::Arc::new(TokenRuns::default());
         STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
         remember_user("A");
         assert_eq!(*runs.0.lock().unwrap(), ["resume A sent"]);
@@ -1042,7 +1064,7 @@ mod tests {
     #[test]
     fn a_session_end_parks_the_users_downloads_and_a_sign_in_resumes_theirs() {
         let _p = pref();
-        let runs = Rc::new(Runs::default());
+        let runs = std::sync::Arc::new(Runs::default());
         STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
         remember_user("A");
         forget_user();
@@ -1123,17 +1145,17 @@ mod tests {
     fn a_me_taken_before_its_session_ended_does_not_bring_the_user_back() {
         let p = pref();
         remember_user("A");
-        let ask = me_request(true, Some(())).expect("a ready session asks");
+        let ask = me_request(true, Some(session(()))).expect("a ready session asks");
         // The session ends after the request was taken, before it is sent.
         forget_user();
         assert!(!ask.answered("A"), "the stale answer was written");
         assert_eq!(last_user(), None, "the user came back after the sign-out");
         assert_eq!(p.value.borrow().as_deref(), Some(""));
         // A session that is not ready sends nothing.
-        assert_eq!(me_request(false, Some(())), None);
+        assert_eq!(me_request(false, Some(session(()))), None);
         assert_eq!(me_request::<()>(true, None), None);
         // The next session's request is remembered.
-        let ask = me_request(true, Some(())).unwrap();
+        let ask = me_request(true, Some(session(()))).unwrap();
         assert!(ask.answered("A"));
         assert_eq!(last_user().as_deref(), Some("A"));
     }
@@ -1168,10 +1190,10 @@ mod tests {
                 m.apply(Event::Resumed { epoch: 0 });
                 m
             });
-            let api = use_signal(|| Some(()));
+            let session = use_signal(|| Some(session(())));
             let me = use_me(
                 machine,
-                api,
+                session,
                 Rc::new(|()| {
                     Box::pin(async {
                         let rx = ANSWER.with(|a| a.borrow_mut().take())?;
@@ -1343,10 +1365,10 @@ mod tests {
         let path = d.path().join("device-token");
         let p = pref();
         *p.file.borrow_mut() = Some(path.clone());
-        let runs = Rc::new(Runs::default());
+        let runs = std::sync::Arc::new(Runs::default());
         STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
         token_file::store(&path, "tokA").unwrap();
-        let ask = me_request(true, Some(())).unwrap();
+        let ask = me_request(true, Some(session(()))).unwrap();
         // B's Quick Connect lands before A's answer is paired.
         token_file::store(&path, "tokB").unwrap();
         let _ = ask.answered("A");
@@ -1368,31 +1390,255 @@ mod tests {
         );
     }
 
-    /// The session opened with A's token, and another account's token was
-    /// stored before `me` was asked (the media service's sign-in landed in
-    /// between). The `me` request is A's session's, so it carries A's
-    /// token, not the file's: the pairing compares A's token with the file
-    /// and refuses, and A's run is refused B's token.
+    /// The phone's download client, over a real token file: each request
+    /// takes its token through `token_file::run_token`, as the phone's
+    /// fetcher does, and what went out is captured.
+    struct FileFetcher {
+        file: std::path::PathBuf,
+        /// (owner, key, token) of each request sent.
+        sent: std::sync::Mutex<Vec<(String, String, String)>>,
+        /// (owner, reason) of each request not sent.
+        refused: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FileFetcher {
+        fn new(file: &std::path::Path) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                file: file.to_owned(),
+                sent: std::sync::Mutex::default(),
+                refused: std::sync::Mutex::default(),
+            })
+        }
+        fn decide(&self, owner: &str) -> Result<String, String> {
+            let decided = super::super::token_file::run_token(&self.file, owner);
+            if let Err(e) = &decided {
+                self.refused
+                    .lock()
+                    .unwrap()
+                    .push((owner.to_owned(), e.clone()));
+            }
+            decided
+        }
+        fn sent(&self) -> Vec<(String, String, String)> {
+            self.sent.lock().unwrap().clone()
+        }
+        fn refused(&self) -> Vec<(String, String)> {
+            self.refused.lock().unwrap().clone()
+        }
+    }
+
+    impl super::super::kept_video_disk::Fetcher for FileFetcher {
+        fn open<'a>(
+            &'a self,
+            owner: &'a str,
+            key: &'a str,
+        ) -> super::super::kept_video_disk::BoxFut<
+            'a,
+            Result<
+                Box<dyn super::super::kept_video_disk::Body>,
+                super::super::kept_video_disk::OpenFailed,
+            >,
+        > {
+            use super::super::kept_video_disk::{FetchError, OpenFailed};
+            Box::pin(async move {
+                let token = self.decide(owner).map_err(OpenFailed::NotOwner)?;
+                self.sent
+                    .lock()
+                    .unwrap()
+                    .push((owner.to_owned(), key.to_owned(), token));
+                Err(OpenFailed::Fetch(FetchError {
+                    status: Some(403),
+                    message: String::new(),
+                }))
+            })
+        }
+        fn check_owner(&self, owner: &str) -> Result<(), String> {
+            self.decide(owner).map(|_| ())
+        }
+    }
+
+    struct Roomy;
+
+    impl super::super::kept_video_disk::Budget for Roomy {
+        fn cap_bytes(&self) -> u64 {
+            1 << 40
+        }
+        fn other_used_bytes(&self) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            1 << 41
+        }
+    }
+
+    /// The phone's store of downloads in `dir`, fetching through `fetcher`.
+    fn disk_store(
+        dir: &std::path::Path,
+        fetcher: std::sync::Arc<FileFetcher>,
+    ) -> std::sync::Arc<super::super::kept_video_disk::DiskVideoStore> {
+        super::super::kept_video_disk::DiskVideoStore::open(
+            dir.to_owned(),
+            super::super::kept_video_disk::Env {
+                fetcher,
+                budget: std::sync::Arc::new(Roomy),
+                sleep: std::sync::Arc::new(|_| Box::pin(async {})),
+                now: || "2026-11-18T09:00:00Z".to_owned(),
+                runtime: tokio::runtime::Handle::current(),
+                remove_dir: |d| std::fs::remove_dir_all(d),
+            },
+        )
+    }
+
+    fn keep(user: &str, item: &str) -> KeepVideoRequest {
+        KeepVideoRequest {
+            item: item.into(),
+            version: String::new(),
+            user: user.into(),
+            title: "Clip".into(),
+            kind: "movie".into(),
+            runtime_ms: 12_000,
+            master_url: "/videos/1/master.m3u8?PlaySessionId=p".into(),
+            audio: None,
+            subtitles: vec![],
+            quality_bps: super::super::kept_video::DEFAULT_QUALITY_BPS,
+        }
+    }
+
+    /// Starts a download of `user`'s and waits, bounded, until its first
+    /// request has been decided: sent, or refused before it went out.
+    async fn first_request_decided(
+        store: &super::super::kept_video_disk::DiskVideoStore,
+        fetcher: &FileFetcher,
+        user: &str,
+        item: &str,
+    ) {
+        let before = fetcher.sent().len() + fetcher.refused().len();
+        if store.start(keep(user, item)).is_err() {
+            return;
+        }
+        for _ in 0..3000 {
+            if fetcher.sent().len() + fetcher.refused().len() > before {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("{user}'s download never asked for its first file");
+    }
+
+    /// The whole chain on the host, through the code the phone runs: open
+    /// resumes A's session with A's token; B's token is stored before `me`
+    /// answers; `me` names A. The pairing compares A's session token with
+    /// the file and refuses, and A's download sends nothing: the server
+    /// sees no request with B's token.
     #[test]
-    fn a_token_replaced_before_me_is_not_paired_with_the_sessions_user() {
-        use super::super::kept_video::token_for_owner;
+    fn a_token_stored_after_open_and_before_me_is_not_paired_and_a_sends_nothing() {
         use super::super::token_file;
-        let d = TmpDir::new("pair-session");
+        let d = TmpDir::new("open-me-b");
         let path = d.path().join("device-token");
         let p = pref();
         *p.file.borrow_mut() = Some(path.clone());
         token_file::store(&path, "tokA").unwrap();
-        // The session authenticates with A's token.
-        *p.session.borrow_mut() = Some("tokA".to_owned());
-        token_file::store(&path, "tokB").unwrap();
-        let ask = me_request(true, Some(())).unwrap();
-        let _ = ask.answered("A");
-        let on_file = token_file::read(&path).unwrap().unwrap();
-        assert_eq!(on_file.user, None, "B's token was paired with A");
-        assert!(
-            token_for_owner(Some(&on_file.token), on_file.user.as_deref(), "A").is_err(),
-            "A's run would be sent B's token"
-        );
+        run(async {
+            let fetcher = FileFetcher::new(&path);
+            let store = disk_store(&d.path().join("videos"), fetcher.clone());
+            STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+            let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
+                panic!("A's token did not open A's session");
+            };
+            // B signs in on the media service: the file now holds B's token.
+            token_file::store(&path, "tokB").unwrap();
+            let ask = me_request(true, Some(session_a)).unwrap();
+            let _ = ask.answered("A");
+            assert_eq!(
+                token_file::read(&path).unwrap().unwrap().user,
+                None,
+                "B's token was paired with A"
+            );
+            first_request_decided(&store, &fetcher, "A", "1").await;
+            STORE.with(|s| *s.borrow_mut() = None);
+            assert_eq!(fetcher.sent(), [], "A's download sent a request");
+            assert!(
+                fetcher
+                    .refused()
+                    .iter()
+                    .any(|(o, why)| o == "A" && why.contains("token_user_unknown")),
+                "{:?}",
+                fetcher.refused()
+            );
+        });
+    }
+
+    /// A re-open as B races A's `me`: A's request is built on A's session;
+    /// B's token is stored and the app re-opens with it before A's answer
+    /// lands. A's answer carries A's token, so its pairing is refused, and
+    /// no request with B's token goes out for A's run, before B's own `me`
+    /// pairs the token with B or after.
+    #[test]
+    fn a_re_open_as_b_racing_as_me_sends_no_request_with_bs_token_for_a() {
+        use super::super::token_file;
+        let d = TmpDir::new("reopen-race");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let fetcher = FileFetcher::new(&path);
+            let store = disk_store(&d.path().join("videos"), fetcher.clone());
+            STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+            let resumer = FakeResumer::new(&path);
+            let Resumed::Opened(session_a) = resume_session(&resumer).await else {
+                panic!("A's token did not open A's session");
+            };
+            // A's `me` is in flight.
+            let ask_a = me_request(true, Some(session_a)).unwrap();
+            // B signs in and the app re-opens with B's token.
+            token_file::store(&path, "tokB").unwrap();
+            let Resumed::Opened(session_b) = resume_session(&resumer).await else {
+                panic!("B's token did not open B's session");
+            };
+            assert_eq!(*resumer.sent.borrow(), ["tokA", "tokB"]);
+            // A's answer lands after the re-open.
+            let _ = ask_a.answered("A");
+            assert_eq!(
+                token_file::read(&path).unwrap().unwrap().user,
+                None,
+                "A's late answer paired B's token with A"
+            );
+            first_request_decided(&store, &fetcher, "A", "1").await;
+            // B's own `me` pairs B's token with B; A's run still gets none.
+            let ask_b = me_request(true, Some(session_b)).unwrap();
+            assert!(ask_b.answered("B"));
+            assert_eq!(
+                token_file::read(&path).unwrap().unwrap().user.as_deref(),
+                Some("B")
+            );
+            first_request_decided(&store, &fetcher, "A", "2").await;
+            STORE.with(|s| *s.borrow_mut() = None);
+            let for_a: Vec<_> = fetcher
+                .sent()
+                .into_iter()
+                .filter(|(o, _, _)| o == "A")
+                .collect();
+            assert_eq!(for_a, [], "a request went out for A's run");
+            assert!(
+                !fetcher
+                    .sent()
+                    .iter()
+                    .any(|(o, _, t)| o == "A" && t == "tokB"),
+                "B's token went out for A's run"
+            );
+            let why: Vec<_> = fetcher
+                .refused()
+                .into_iter()
+                .filter(|(o, _)| o == "A")
+                .map(|(_, why)| why)
+                .collect();
+            assert!(
+                why.iter().any(|w| w.contains("token_user_unknown"))
+                    && why.iter().any(|w| w.contains("token_owner_mismatch")),
+                "A's requests were not refused for the token's owner: {why:?}"
+            );
+        });
     }
 
     /// The server side of a resume, over a real token file: a token it
@@ -1465,8 +1711,11 @@ mod tests {
         );
         token_file::store(&path, "tokA").unwrap();
         match run(resume_session(&r)) {
-            Resumed::Opened { api, token } => {
-                assert_eq!((api.as_str(), token.as_str()), ("A", "tokA"));
+            Resumed::Opened(session) => {
+                assert_eq!(
+                    session,
+                    Session::opened("A".to_owned(), Some("tokA".to_owned()))
+                );
             }
             _ => panic!("A's token did not resume A's session"),
         }

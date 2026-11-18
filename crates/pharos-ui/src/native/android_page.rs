@@ -35,7 +35,7 @@ use super::kept_video::{
 use super::kept_video_disk::{
     iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
 };
-use super::offline_video::{self, ResumeError, Resumed};
+use super::offline_video::{self, ResumeError, Resumed, Session};
 use super::tv_page::{self, Bridge, Paths};
 use super::tv_turn;
 use pharos_api::pharos_capnp::bootstrap;
@@ -58,7 +58,8 @@ pub struct Connection {
 
 pub struct Open {
     pub conn: Connection,
-    pub api: NativeApi,
+    /// The API and the token it was resumed with, one value.
+    pub session: Session<NativeApi>,
     pub server_schema: Option<u32>,
 }
 
@@ -157,23 +158,19 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     match resumed {
         Resumed::NoToken => {
             log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
-            set_session_token(None);
             Err(OpenError::NotSignedIn)
         }
-        Resumed::Opened { api, token } => {
+        Resumed::Opened(session) => {
             log::info!("pharos: open server={base} signed_in=true {timing}");
-            // The token this session answers for, kept beside its API.
-            set_session_token(Some(token));
-            spawn_forever(keep_media_token(api.clone()));
+            spawn_forever(keep_media_token(session.api().clone()));
             Ok(Open {
-                api,
+                session,
                 conn: Connection { closed },
                 server_schema,
             })
         }
         Resumed::Refused => {
             log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
-            set_session_token(None);
             Err(OpenError::NotSignedIn)
         }
         Resumed::Failed(e) => {
@@ -286,7 +283,6 @@ pub async fn quick_connect(mut show_code: impl FnMut(String) + 'static) -> SignI
 /// Forget the device token. The server keeps the session until it lapses
 /// or is revoked from another device.
 pub async fn sign_out() -> SignOutReply {
-    set_session_token(None);
     android::forget_token();
     SignOutReply::Status(204)
 }
@@ -2029,22 +2025,6 @@ pub fn token_user() -> Result<Option<String>, String> {
 /// stays unpaired) or `no_token_seen`; either fails closed.
 pub fn note_token_user(user: &str, seen: Option<&str>) -> Result<(), String> {
     android::pair_token_user(seen, user)
-}
-
-/// The token the current session was authenticated with, for a request
-/// on that session being built: what its answer is later paired with.
-/// Set by `open` from the token it resumed with, cleared when no session
-/// is; never a fresh read of the file, which the media service may have
-/// replaced since. Never log it.
-pub fn token_seen() -> Option<String> {
-    lock(&SESSION_TOKEN).clone()
-}
-
-/// The token `open` last authenticated a session with ([`token_seen`]).
-static SESSION_TOKEN: Mutex<Option<String>> = Mutex::new(None);
-
-fn set_session_token(token: Option<String>) {
-    *lock(&SESSION_TOKEN) = token;
 }
 
 pub fn apply_subtitle_size(size: SubtitleSize) {

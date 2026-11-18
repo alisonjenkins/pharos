@@ -28,7 +28,8 @@ const SESSION: &str = "/pharos/session";
 /// A signed-in connection. Dropping it closes the socket.
 pub struct Open {
     pub conn: Connection,
-    pub api: NativeApi,
+    /// The API; the web has no device token, so its session carries none.
+    pub session: super::offline_video::Session<NativeApi>,
     /// The server's schemaVersion; `None` when it could not be asked.
     pub server_schema: Option<u32>,
 }
@@ -62,7 +63,7 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         .ok();
     match resumed {
         Ok(session) => Ok(Open {
-            api: NativeApi::new(&session),
+            session: super::offline_video::Session::opened(NativeApi::new(&session), None),
             conn,
             server_schema,
         }),
@@ -4150,11 +4151,6 @@ pub fn token_user() -> Result<Option<String>, String> {
 /// Keeps `user` with the device token; nothing to do where there is none.
 pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
     Ok(())
-}
-
-/// The device token a request is built with; none where there is none.
-pub fn token_seen() -> Option<String> {
-    None
 }
 
 /// Set `data-subtitle-size` on `<html>` so `video::cue` scales to `size`.
