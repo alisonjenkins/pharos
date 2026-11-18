@@ -347,8 +347,10 @@ struct Plan {
     /// Bytes of the plan already on disk: a resumed download's, or files a
     /// failed attempt left that a new download's plan names again.
     stored: u64,
-    /// Bytes of an earlier plan's files that could not be deleted: on disk
-    /// and against the cap, though the plan does not name them.
+    /// Bytes on disk that are no stored file of the plan: an earlier plan's
+    /// files that could not be deleted, and an entry under a planned name
+    /// that is not a regular file. Against the cap, though in no other
+    /// figure.
     stale: u64,
 }
 
@@ -2695,8 +2697,8 @@ async fn plan_and_admit(
     // would be replaced by one counting too little), and the folder stays
     // unknown until a sweep measures it whole.
     let dir = inner.item_dir(user, item);
-    let names = match stored_entries(&dir) {
-        Measure::Whole(entries) => regular_files(&entries),
+    let entries = match stored_entries(&dir) {
+        Measure::Whole(entries) => entries,
         Measure::Short(entries) => {
             {
                 let mut st = lock(&inner.state);
@@ -2722,6 +2724,28 @@ async fn plan_and_admit(
             return Err(Stop::Refused(reason.to_owned()));
         }
     };
+    // Every byte in the folder counts once: a regular file the plan names
+    // is stored, an entry the plan does not name went to the prune (deleted,
+    // or counted in `stale`), and an entry the plan names that is not a
+    // regular file (a folder in a segment's place) is on disk and fetched
+    // again, so it counts in `stale` too.
+    let names = regular_files(&entries);
+    let planned: HashSet<String> = all.iter().map(|k| file_name(k)).collect();
+    let (not_stored, not_stored_bytes) = entries
+        .iter()
+        .filter(|(name, e)| !e.regular && planned.contains(*name))
+        .fold((0usize, 0u64), |(n, b), (_, e)| {
+            (n + 1, b.saturating_add(e.len))
+        });
+    if not_stored > 0 {
+        emit(
+            true,
+            format!(
+                "pharos: video keep inventory item={item} verdict=not_stored reason=not_a_regular_file entries={not_stored} bytes={not_stored_bytes} counted=stale"
+            ),
+        );
+    }
+    let stale = stale.saturating_add(not_stored_bytes);
     let mut have = HashSet::new();
     let mut stored_bytes = 0u64;
     for key in &all {
@@ -7334,6 +7358,44 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("extended=0 from_own=256 ") && l.contains(" taken=0 ")),
             "{reserved:?}"
+        );
+    }
+
+    /// A folder at a planned segment's path is not a stored file, and the
+    /// prune keeps it (its name is planned): its bytes still count in the
+    /// reservation the resume is admitted with, for as long as it runs.
+    #[tokio::test]
+    async fn a_folder_at_a_planned_path_counts_in_the_resumes_reservation() {
+        let rig = Rig::new("planned-folder");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let seg = files.join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        std::fs::create_dir(&seg).unwrap();
+        let big = 20_000_000u64;
+        std::fs::write(seg.join("inner"), vec![1u8; usize::try_from(big).unwrap()]).unwrap();
+        let media = on_disk(&files) - big;
+        let release = rig.server.hold_mid_body(SEG1);
+        let store = rig.open();
+        rig.server.reached_mid_body(SEG1).await;
+        let held = reserved(&only(&store));
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            held >= media + big,
+            "the running resume reserves {held}, less than the folder's {big} and the media's {media}"
+        );
+        let kept = lines("pharos: video keep inventory item=1 verdict=not_stored");
+        assert!(
+            kept.iter()
+                .any(|l| l.contains("reason=not_a_regular_file")
+                    && l.contains(&format!("bytes={big}"))),
+            "{kept:?}"
         );
     }
 
