@@ -616,6 +616,58 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
+    /// A folder only this test made, removed when the guard drops, a
+    /// failed assertion's unwinding included. Its name is new each time,
+    /// and it is made with `create_dir`, so a guard never takes over (or
+    /// later removes) a folder something else made.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            loop {
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos());
+                let path = std::env::temp_dir().join(format!(
+                    "pharos-ov-{tag}-{}-{n}-{nanos}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => panic!("no test folder: {e}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A test that fails part way leaves no folder behind.
+    #[test]
+    fn a_test_folder_goes_when_its_test_panics() {
+        let made = std::sync::Mutex::new(None);
+        let outcome = std::panic::catch_unwind(|| {
+            let d = TmpDir::new("guard");
+            std::fs::write(d.path().join("f"), b"x").unwrap();
+            *made.lock().unwrap() = Some(d.path().to_path_buf());
+            panic!("an assertion failed");
+        });
+        assert!(outcome.is_err());
+        let made = made.lock().unwrap().clone().unwrap();
+        assert!(!made.exists(), "{} was left behind", made.display());
+    }
+
     use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, StoredFile, VideoStore};
 
     type ReadHook = Box<dyn Fn()>;
@@ -973,10 +1025,8 @@ mod tests {
     #[test]
     fn a_failed_sign_out_then_another_sign_in_never_serves_the_first_user() {
         use super::super::token_file;
-        let d = std::env::temp_dir().join(format!("pharos-ov-seq-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("device-token");
+        let d = TmpDir::new("seq");
+        let path = d.path().join("device-token");
         let p = pref();
         *p.file.borrow_mut() = Some(path.clone());
 
@@ -1004,7 +1054,6 @@ mod tests {
         set_identity(Identity::Unknown);
         assert_eq!(last_user().as_deref(), Some("B"));
         assert!(!serves(last_user()), "B has nothing downloaded");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A store holding A's file on disk, for the answer the proxy gives.
@@ -1047,13 +1096,11 @@ mod tests {
     #[test]
     fn the_proxys_answer_after_a_failed_sign_out_and_a_switch_never_gives_a_the_bytes_to_b() {
         use super::super::token_file;
-        let d = std::env::temp_dir().join(format!("pharos-ov-answer-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let file = d.join("a.m4s");
+        let d = TmpDir::new("answer");
+        let file = d.path().join("a.m4s");
         std::fs::write(&file, b"A-own").unwrap();
         let store = OnDisk(file.clone());
-        let path = d.join("device-token");
+        let path = d.path().join("device-token");
         let p = pref();
         *p.file.borrow_mut() = Some(path.clone());
         let ask = || offline_file_for(Some(&store), "/videos/1/seg.m4s?PlaySessionId=p");
@@ -1083,7 +1130,6 @@ mod tests {
         assert_eq!(offline_headers(&answer)[1], ("content-type", "video/mp4"));
         assert_eq!(bytes(answer), b"A-own");
         assert!(offline_file_for(None, "/videos/1/seg.m4s").is_none());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A cold start that found nobody is not run again for each proxied
