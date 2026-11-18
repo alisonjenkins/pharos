@@ -643,6 +643,27 @@ impl Staged<'_> {
     }
 }
 
+impl Staged<'_> {
+    /// Gives up the staging file: deletes it and rolls its accounting back
+    /// (staged and claimed bytes become owed again) in one hold of the
+    /// shared admission lock. A music check reads the video's owed bytes
+    /// and then the free space under that lock: the deletion alone in
+    /// between would show the bytes freed while still counted written.
+    fn abandon(self, why: &str) {
+        let inner = self.inner;
+        let _admission = inner.env.budget.admission_guard();
+        inner.remove_staging(&self.part);
+        let (item, len, claim) = (self.who.1.clone(), self.len, self.claim);
+        drop(self);
+        emit(
+            false,
+            format!(
+                "pharos: video keep staging dropped item={item} reason={why} staged={len} claimed={claim} under=admission_lock"
+            ),
+        );
+    }
+}
+
 /// Why a media chunk was not written.
 enum ClaimRefused {
     /// The run no longer owns the download.
@@ -1935,7 +1956,7 @@ async fn fetch_once(
                 if let Some(limit) = limit {
                     if len.saturating_add(chunk.len() as u64) > limit {
                         drop(file);
-                        inner.remove_staging(&part);
+                        staged.abandon("too_large");
                         return Err(FetchOnce::TooLarge(limit));
                     }
                 } else if let Err(refused) = staged.claim(chunk.len() as u64) {
@@ -1944,34 +1965,42 @@ async fn fetch_once(
                     // reservation has grown to hold it, under the checks
                     // admission makes.
                     drop(file);
-                    inner.remove_staging(&part);
+                    staged.abandon("over_reservation");
                     return Err(match refused {
                         ClaimRefused::Gone => FetchOnce::Gone,
                         ClaimRefused::Reason(why) => FetchOnce::OverReservation(why),
                     });
                 }
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| store_err("write", e))?;
+                if let Err(e) = file.write_all(&chunk).await {
+                    drop(file);
+                    staged.abandon("write_failed");
+                    return Err(store_err("write", e));
+                }
                 // `write_all` can return while tokio's write is still
                 // pending, and the free-space reading does not lack those
                 // bytes yet. They count as staged (and so stop being owed)
                 // only once the write has completed.
-                flush_chunk(&mut file, item, &part)
-                    .await
-                    .map_err(|e| store_err("write", e))?;
+                if let Err(e) = flush_chunk(&mut file, item, &part).await {
+                    drop(file);
+                    staged.abandon("write_failed");
+                    return Err(store_err("write", e));
+                }
                 len = len.saturating_add(chunk.len() as u64);
                 staged.add(chunk.len() as u64);
             }
             Ok(None) => break,
             Err(e) => {
                 drop(file);
-                inner.remove_staging(&part);
+                staged.abandon("body_failed");
                 return Err(FetchOnce::Fetch(e));
             }
         }
     }
-    file.flush().await.map_err(|e| store_err("write", e))?;
+    if let Err(e) = file.flush().await {
+        drop(file);
+        staged.abandon("write_failed");
+        return Err(store_err("write", e));
+    }
     // Its contents are durable before it is promoted: a file under its
     // final name is taken as whole at a reopen, and `flush` alone leaves the
     // bytes in the page cache.
@@ -1979,7 +2008,7 @@ async fn fetch_once(
     tests::sync_step(format!("file {}", shown_name(path)));
     if let Err(e) = file.sync_all().await {
         drop(file);
-        inner.remove_staging(&part);
+        staged.abandon("sync_failed");
         emit(
             true,
             format!(
@@ -2005,9 +2034,12 @@ async fn fetch_once(
     };
     match promoted {
         Some(Ok(())) => Ok(len),
-        Some(Err(e)) => Err(store_err("finish", e)),
+        Some(Err(e)) => {
+            staged.abandon("rename_failed");
+            Err(store_err("finish", e))
+        }
         None => {
-            inner.remove_staging(&part);
+            staged.abandon("not_owned");
             Err(FetchOnce::Gone)
         }
     }
@@ -4590,6 +4622,9 @@ mod tests {
         /// key -> a flag; the first request for the key waits for the flag,
         /// then is answered as any other.
         slow_opens: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// Keys whose held body fails, once released, instead of sending its
+        /// second chunk.
+        mid_fails: Mutex<HashSet<String>>,
     }
 
     impl FakeServer {
@@ -4623,6 +4658,13 @@ mod tests {
                 .unwrap()
                 .insert(key.into(), flag.clone());
             flag
+        }
+
+        /// Holds the first body for `key` after its first chunk, and fails it
+        /// once released.
+        fn fail_mid_body(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            self.mid_fails.lock().unwrap().insert(key.into());
+            self.hold_mid_body(key)
         }
 
         /// Waits until the held body for `key` has stopped at its
@@ -4682,6 +4724,8 @@ mod tests {
         Vec<Vec<u8>>,
         Option<Arc<std::sync::atomic::AtomicBool>>,
         Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Fails once released, rather than sending the rest.
+        bool,
     );
 
     impl Body for FakeBody {
@@ -4695,6 +4739,12 @@ mod tests {
                     }
                     while !flag.load(Ordering::SeqCst) {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    if self.3 {
+                        return Err(FetchError {
+                            status: None,
+                            message: "connection reset mid-body".to_owned(),
+                        });
                     }
                 }
                 Ok(if self.0.is_empty() {
@@ -4742,6 +4792,7 @@ mod tests {
                     Some(b) => {
                         let mid = b.len() / 2;
                         let gate = self.mid_holds.lock().unwrap().remove(key);
+                        let fails = self.mid_fails.lock().unwrap().remove(key);
                         let reached = gate
                             .as_ref()
                             .and_then(|_| self.mid_reached.lock().unwrap().get(key).cloned());
@@ -4752,6 +4803,7 @@ mod tests {
                             ],
                             gate,
                             reached,
+                            fails,
                         )) as Box<dyn Body>)
                     }
                     None => Err(FetchError {
@@ -4778,13 +4830,24 @@ mod tests {
         on_free: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
         /// The other kinds' owed and written figures, in the order read.
         reads: Mutex<Vec<&'static str>>,
+        /// When set, the guard excludes as the host's does: one holder at a
+        /// time, the others wait.
+        exclusive: AtomicBool,
+        lock: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
 
-    struct FakeGuard(Arc<AtomicUsize>);
+    struct FakeGuard(
+        Arc<AtomicUsize>,
+        Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+    );
 
     impl Drop for FakeGuard {
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::SeqCst);
+            if let Some(lock) = &self.1 {
+                *lock.0.lock().unwrap() = false;
+                lock.1.notify_all();
+            }
         }
     }
 
@@ -4809,6 +4872,8 @@ mod tests {
                 unguarded: AtomicUsize::new(0),
                 on_free: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
+                exclusive: AtomicBool::new(false),
+                lock: Arc::default(),
             })
         }
     }
@@ -4843,9 +4908,17 @@ mod tests {
             self.free.load(Ordering::SeqCst)
         }
         fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            let lock = self.exclusive.load(Ordering::SeqCst).then(|| {
+                let mut busy = self.lock.0.lock().unwrap();
+                while *busy {
+                    busy = self.lock.1.wait(busy).unwrap();
+                }
+                *busy = true;
+                self.lock.clone()
+            });
             self.held.fetch_add(1, Ordering::SeqCst);
             self.taken.fetch_add(1, Ordering::SeqCst);
-            Box::new(FakeGuard(self.held.clone()))
+            Box::new(FakeGuard(self.held.clone(), lock))
         }
     }
 
@@ -7359,6 +7432,93 @@ mod tests {
                 .any(|l| l.contains("extended=0 from_own=256 ") && l.contains(" taken=0 ")),
             "{reserved:?}"
         );
+    }
+
+    /// A body that fails mid-way while the music side is checking its room:
+    /// the music check reads the video's owed bytes, then the free space,
+    /// under the shared admission lock. The failed file's deletion and its
+    /// accounting rollback wait for that check, so the check never sees the
+    /// staged bytes freed on disk while still counting them as written.
+    #[tokio::test]
+    async fn a_mid_body_failure_cleans_up_outside_a_music_check() {
+        let rig = Rig::new("mid-fail-locked");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let release = rig.server.fail_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        // The other files are stored first, so only the held body moves the
+        // figures from here.
+        let start = std::time::Instant::now();
+        while [INIT, SEG1]
+            .iter()
+            .any(|k| store.stored_file("u1", k).is_none())
+        {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the other files never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        // The held body's own staging file.
+        let seg = file_name(SEG0);
+        let stem = Path::new(&seg)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let part = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&stem) && name.ends_with(".part")
+            })
+            .expect("no staging file");
+        // The music check, on its own thread: the owed figure, then (after
+        // the failure has had time to clean up) the free-space probe.
+        let (budget, s2, p2, r2) = (
+            rig.budget.clone(),
+            store.clone(),
+            part.clone(),
+            release.clone(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let check = std::thread::spawn(move || {
+            let guard = budget.admission_guard();
+            let owed = s2.outstanding_bytes();
+            r2.store(true, Ordering::SeqCst);
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let probe = (s2.outstanding_bytes(), p2.exists());
+            drop(guard);
+            (owed, probe)
+        });
+        rx.recv().unwrap();
+        store.settled().await;
+        let (owed, (owed_at_probe, part_at_probe)) = check.join().unwrap();
+        assert!(
+            part_at_probe,
+            "the staging file went inside the music check"
+        );
+        assert_eq!(
+            owed_at_probe, owed,
+            "the owed figure moved inside the music check"
+        );
+        assert!(!part.exists(), "the staging file was kept");
+        let dropped = lines("pharos: video keep staging dropped item=1 reason=body_failed");
+        assert!(
+            dropped.iter().any(|l| l.contains("under=admission_lock")),
+            "{dropped:?}"
+        );
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
     }
 
     /// A folder at a planned segment's path is not a stored file, and the
