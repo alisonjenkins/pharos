@@ -30,7 +30,21 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   before the network and answers a hit from disk with the server's `Content-Type`, whether the phone
   is online or not (a stored copy saves mobile data). `Range` is not
   forwarded by the proxy today and the playlists carry no byte ranges, so a
-  stored file is answered whole.
+  stored file is answered whole. A stored file is answered with
+  `cache-control: no-store`: the WebView's cache keys a response by URL
+  alone, not by the signed-in user, so a cached copy could be answered to
+  the next user on the phone. The file on disk is already the cache.
+- The device token is sent only over https, or to the build's own server
+  (`PHAROS_TV_SERVER`) whatever its scheme (`tv_page::token_allowed`).
+- The proxy's client follows no redirect itself (`Policy::none()`). The
+  proxy follows up to 5 hops by hand through `tv_page::redirect_hop`: the
+  token is kept only on its own origin, dropped on another origin, and a
+  hop down to http is refused. The download client follows a redirect only
+  to the same scheme, host and port.
+- Neither client has a fallback. One that cannot be built (its TLS config
+  included) is kept as the error (`tv_page::built_client_for`): every
+  request through it is refused with the logged reason, never sent through a
+  default client with another TLS setup and redirect policy.
 - Video shares the music cache's budget: the cap is the music cache's cap,
   and the music's bytes count against it, so one setting bounds what the phone
   keeps. The 2 GiB free-space guard applies, measured with `statvfs` on the
