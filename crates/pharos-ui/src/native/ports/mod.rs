@@ -11,22 +11,48 @@ use tokio::sync::watch;
 
 pub mod fake;
 
-/// A set-once cell holding a port implementation.
+/// A set-once cell holding a port implementation. A port set after a
+/// reader looked is announced: [`Slot::published`] resolves then.
 pub struct Slot<T: ?Sized> {
     cell: OnceLock<Arc<T>>,
+    /// True once the cell is set; made on first use.
+    published: OnceLock<watch::Sender<bool>>,
 }
 
 impl<T: ?Sized> Slot<T> {
     pub const fn new() -> Self {
         Self {
             cell: OnceLock::new(),
+            published: OnceLock::new(),
         }
+    }
+
+    fn notifier(&self) -> &watch::Sender<bool> {
+        self.published.get_or_init(|| watch::channel(false).0)
     }
 
     /// Refuses a second port, so a late registration cannot silently replace
     /// the one the UI already reads.
     pub fn set(&self, port: Arc<T>) -> Result<(), AlreadyRegistered> {
-        self.cell.set(port).map_err(|_| AlreadyRegistered)
+        self.cell.set(port).map_err(|_| AlreadyRegistered)?;
+        self.notifier().send_replace(true);
+        Ok(())
+    }
+
+    /// The port, once one is set: now if it is, else when it is. Never
+    /// blocks a thread; a reader that must not wait reads [`Slot::get`].
+    pub async fn published(&self) -> Arc<T> {
+        // Subscribed before the cell is read, so a set in between is seen.
+        let mut rx = self.notifier().subscribe();
+        loop {
+            if let Some(port) = self.get() {
+                return port;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives in the slot: it is never dropped.
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     pub fn get(&self) -> Option<Arc<T>> {
@@ -77,9 +103,16 @@ pub fn register_video_store(
     VIDEO_STORE.set(port)
 }
 
-/// The registered store of downloaded videos, if any.
+/// The registered store of downloaded videos, if any. A component reads it
+/// through `kept_video_view::shown_video_store`, which re-renders it when a
+/// store registered after it mounted is published.
 pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
     VIDEO_STORE.get()
+}
+
+/// The slot behind [`video_store`], for a reader that waits for it.
+pub fn video_slot() -> &'static Slot<dyn super::kept_video::VideoStore> {
+    &VIDEO_STORE
 }
 
 /// A claim that succeeds once. Opening the video store twice on one root
