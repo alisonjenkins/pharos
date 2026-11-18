@@ -609,6 +609,12 @@ struct Staged<'a> {
     part: PathBuf,
     /// Bytes claimed against the reservation for the chunk being written.
     claim: u64,
+    /// Set once the file is under its final name: dropping it then only
+    /// moves its bytes from staged to stored.
+    promoted: bool,
+    /// Why the file is given up, for the log; "dropped" when no failure
+    /// path named one: the fetch was cancelled.
+    why: &'static str,
 }
 
 impl Staged<'_> {
@@ -653,23 +659,10 @@ impl Staged<'_> {
 }
 
 impl Staged<'_> {
-    /// Gives up the staging file: deletes it and rolls its accounting back
-    /// (staged and claimed bytes become owed again) in one hold of the
-    /// shared admission lock. A music check reads the video's owed bytes
-    /// and then the free space under that lock: the deletion alone in
-    /// between would show the bytes freed while still counted written.
-    fn abandon(self, why: &str) {
-        let inner = self.inner;
-        let _admission = inner.env.budget.admission_guard();
-        inner.remove_staging(&self.part);
-        let (item, len, claim) = (self.who.1.clone(), self.len, self.claim);
-        drop(self);
-        emit(
-            false,
-            format!(
-                "pharos: video keep staging dropped item={item} reason={why} staged={len} claimed={claim} under=admission_lock"
-            ),
-        );
+    /// Gives up the staging file, naming why. The work is in `Drop`, so a
+    /// path that returns without calling this cleans up the same way.
+    fn abandon(mut self, why: &'static str) {
+        self.why = why;
     }
 }
 
@@ -682,19 +675,33 @@ enum ClaimRefused {
 }
 
 impl Drop for Staged<'_> {
+    /// Deletes a file that was not promoted and rolls its accounting back
+    /// (staged and claimed bytes become owed again) in one hold of the
+    /// shared admission lock, then the store's lock, on every path: a
+    /// failure, a revoked run, a cancelled fetch. A music check reads the
+    /// video's owed bytes and then the free space under the admission lock:
+    /// the deletion alone in between would show the bytes freed while still
+    /// counted written. Never dropped while either lock is held.
     fn drop(&mut self) {
+        let _admission = self.inner.env.budget.admission_guard();
         let mut st = lock(&self.inner.state);
-        // A revoked run's staging file goes before its writer is
-        // unregistered, so a folder is not bounded while it could be there.
-        let revoked = st.runs.get(&(self.who.0.clone(), self.who.1.clone())) != Some(&self.who.2);
         let dir = st.dir_of(&self.who.0, &self.who.1);
-        if revoked {
-            if let Err(e) = remove_part(&self.part) {
-                if e.kind() != std::io::ErrorKind::NotFound && !st.leftover.contains(&dir) {
-                    st.leftover.push(dir.clone());
+        // The file goes before its writer is unregistered, so a folder is
+        // not bounded while it could be there.
+        let part = if self.promoted {
+            None
+        } else {
+            Some(match remove_part(&self.part) {
+                Ok(()) => "removed".to_owned(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+                Err(e) => {
+                    if !st.leftover.contains(&dir) {
+                        st.leftover.push(dir.clone());
+                    }
+                    format!("left error={e}")
                 }
-            }
-        }
+            })
+        };
         st.bump(&dir);
         if let Some(n) = st.writers.get_mut(&self.who) {
             *n = n.saturating_sub(1);
@@ -710,6 +717,16 @@ impl Drop for Staged<'_> {
         }
         let claim = std::mem::take(&mut self.claim);
         st.unclaim(&self.who, claim);
+        drop(st);
+        if let Some(part) = part {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep staging dropped item={} reason={} staged={} claimed={claim} part={part} under=admission_lock",
+                    self.who.1, self.why, self.len
+                ),
+            );
+        }
     }
 }
 
@@ -1202,21 +1219,6 @@ impl Inner {
         };
         f(v);
         Ok(true)
-    }
-
-    /// Deletes a staging file; one that will not go is recorded as a
-    /// leftover of its folder, which is unknown until a sweep resolves it.
-    fn remove_staging(&self, part: &Path) {
-        let Err(e) = remove_part(part) else { return };
-        if e.kind() == std::io::ErrorKind::NotFound {
-            return;
-        }
-        if let Some(dir) = part.parent().and_then(Path::parent) {
-            let mut st = lock(&self.state);
-            if !st.leftover.iter().any(|d| d == dir) {
-                st.leftover.push(dir.to_path_buf());
-            }
-        }
     }
 
     fn owns(&self, user: &str, item: &str, run: u64) -> bool {
@@ -1948,6 +1950,8 @@ async fn fetch_once(
                 len: 0,
                 part: part.clone(),
                 claim: 0,
+                promoted: false,
+                why: "cancelled",
             },
         )
     };
@@ -1958,6 +1962,7 @@ async fn fetch_once(
                 // A run a removal or restart has revoked writes no more.
                 if !inner.owns(user, item, run) {
                     drop(file);
+                    staged.abandon("revoked");
                     return Err(FetchOnce::Gone);
                 }
                 // A body past its limit is not written on: its reservation
@@ -2042,7 +2047,10 @@ async fn fetch_once(
         }
     };
     match promoted {
-        Some(Ok(())) => Ok(len),
+        Some(Ok(())) => {
+            staged.promoted = true;
+            Ok(len)
+        }
         Some(Err(e)) => {
             staged.abandon("rename_failed");
             Err(store_err("finish", e))
@@ -5819,6 +5827,8 @@ mod tests {
             len: 0,
             part: PathBuf::new(),
             claim: 0,
+            promoted: false,
+            why: "cancelled",
         };
         let claimed = estimate - 500_000;
         assert!(pending.claim(claimed).is_ok());
@@ -6290,6 +6300,8 @@ mod tests {
             len: 0,
             part: PathBuf::new(),
             claim: 0,
+            promoted: false,
+            why: "cancelled",
         };
         stale.add(7_000);
         assert_eq!(store.staged_bytes(), 7_050);
@@ -7571,6 +7583,105 @@ mod tests {
             dropped.iter().any(|l| l.contains("under=admission_lock")),
             "{dropped:?}"
         );
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// A run revoked mid-body stops at its next chunk, and its staging file
+    /// goes through the same locked cleanup as every other failure: the
+    /// deletion and the rollback wait for a music check that holds the
+    /// shared admission lock.
+    #[tokio::test]
+    async fn a_revoked_runs_staging_file_goes_outside_a_music_check() {
+        let rig = Rig::new("revoked-locked");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        // The other files are stored first, so the held body is the only
+        // fetch the revocation meets.
+        let start = std::time::Instant::now();
+        while [INIT, SEG1]
+            .iter()
+            .any(|k| store.stored_file("u1", k).is_none())
+        {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the other files never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let seg = file_name(SEG0);
+        let stem = Path::new(&seg)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let part = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&stem) && name.ends_with(".part")
+            })
+            .expect("no staging file");
+        // The music check, on its own thread. Inside it the run is revoked
+        // and the body released: the fetch meets the ownership check at its
+        // next chunk while the check still holds the lock.
+        let (budget, s2, p2) = (rig.budget.clone(), store.clone(), part.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let check = std::thread::spawn(move || {
+            let guard = budget.admission_guard();
+            {
+                let mut st = lock(&s2.inner.state);
+                let key = ("u1".to_owned(), "1".to_owned());
+                let run = st.runs[&key];
+                st.runs.insert(key, run + 1_000);
+            }
+            release.store(true, Ordering::SeqCst);
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let probe = p2.exists();
+            drop(guard);
+            probe
+        });
+        rx.recv().unwrap();
+        // Awaited, not joined: the fetch runs on this test's runtime.
+        while !check.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let part_at_probe = check.join().unwrap();
+        assert!(
+            part_at_probe,
+            "the staging file went inside the music check"
+        );
+        let start = std::time::Instant::now();
+        while part.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the staging file was kept"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let dropped = lines("pharos: video keep staging dropped item=1 reason=revoked");
+            if dropped.iter().any(|l| l.contains("under=admission_lock")) {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "{dropped:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         rig.budget.exclusive.store(false, Ordering::SeqCst);
     }
 
