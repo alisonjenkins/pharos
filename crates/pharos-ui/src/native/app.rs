@@ -2256,15 +2256,7 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
-                start_slow_connect(
-                    SLOW_CONNECT_MS,
-                    move || {
-                        let m = machine.peek();
-                        m.epoch() == epoch && *m.phase() == Phase::Connecting
-                    },
-                    || kept_any() || !offline_video::ready_for_last_user().is_empty(),
-                    slow_connect,
-                );
+                start_attempt_timer(machine, epoch, slow_connect);
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
@@ -2422,28 +2414,7 @@ fn NativeApp(route: Route) -> Element {
     let phase = machine.read().phase().clone();
     match phase {
         Phase::Connecting | Phase::Ready => {
-            let m = machine.read();
-            // Cut off from the server, kept books still open (spec 036 US3).
-            let cut_off = m.waiting().is_some() || platform_offline() || slow_connect();
-            if let Some(offline) = cut_off.then(|| offline_start(&route)).flatten() {
-                return offline;
-            }
-            match m.waiting() {
-                Some(why) => rsx! {
-                    StatusView {
-                        title: "Waiting for the server…",
-                        detail: format!("{why} Trying again in {} s.", m.delay_ms().div_ceil(1000)),
-                        action: None,
-                    }
-                },
-                None => rsx! {
-                    StatusView {
-                        title: "Connecting…",
-                        detail: "Opening a connection to the server.",
-                        action: None,
-                    }
-                },
-            }
+            connecting_screen(&machine.read(), &route, slow_connect())
         }
         Phase::NotEnabled => rsx! {
             StatusView {
@@ -2698,6 +2669,46 @@ fn on_this_device() -> Element {
 /// How long the first connection may take before kept books open without it.
 /// Short, because a phone in a tunnel reports itself online.
 const SLOW_CONNECT_MS: u32 = 3_000;
+
+/// Starts attempt `epoch`'s slow-connect timer: it fires only while that
+/// attempt is still connecting.
+fn start_attempt_timer(machine: Signal<Machine>, epoch: u32, slow_connect: Signal<bool>) {
+    start_slow_connect(
+        SLOW_CONNECT_MS,
+        move || {
+            let m = machine.peek();
+            m.epoch() == epoch && *m.phase() == Phase::Connecting
+        },
+        || kept_any() || !offline_video::ready_for_last_user().is_empty(),
+        slow_connect,
+    );
+}
+
+/// The screen while connecting (or not yet routed once ready): cut off from
+/// the server (waiting, offline, or a slow attempt), what is kept opens
+/// (spec 036 US3); else the waiting page.
+fn connecting_screen(m: &Machine, route: &Route, slow: bool) -> Element {
+    let cut_off = m.waiting().is_some() || platform_offline() || slow;
+    if let Some(offline) = cut_off.then(|| offline_start(route)).flatten() {
+        return offline;
+    }
+    match m.waiting() {
+        Some(why) => rsx! {
+            StatusView {
+                title: "Waiting for the server…",
+                detail: format!("{why} Trying again in {} s.", m.delay_ms().div_ceil(1000)),
+                action: None,
+            }
+        },
+        None => rsx! {
+            StatusView {
+                title: "Connecting…",
+                detail: "Opening a connection to the server.",
+                action: None,
+            }
+        },
+    }
+}
 
 /// Starts one connection attempt's slow-connect timer. Nothing is decided
 /// when the attempt starts: a store published after that (the phone
