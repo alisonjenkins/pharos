@@ -826,8 +826,13 @@ mod tests {
             static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<String>>> =
                 const { RefCell::new(None) };
             static ON_ME_RAN: Cell<bool> = const { Cell::new(false) };
+            /// The resource's value as last rendered: `None` while the
+            /// request is pending, `Some(None)` once a rejected answer is
+            /// through.
+            static SEEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
         }
         ON_ME_RAN.with(|r| r.set(false));
+        SEEN.with(|s| *s.borrow_mut() = None);
         let p = pref();
         remember_user("A");
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -839,7 +844,7 @@ mod tests {
                 m
             });
             let api = use_signal(|| Some(()));
-            let _me = use_me(
+            let me = use_me(
                 machine,
                 api,
                 Rc::new(|()| {
@@ -851,6 +856,8 @@ mod tests {
                 String::as_str,
                 Rc::new(|_: &String| ON_ME_RAN.with(|r| r.set(true))),
             );
+            let value = me.read().clone();
+            SEEN.with(|s| *s.borrow_mut() = value);
             rsx! {}
         }
         let mut dom = VirtualDom::new(probe);
@@ -862,14 +869,25 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // Driven until the answer is through: each wait must find work, so
+        // an answer that never arrives fails here rather than passing.
         rt.block_on(async {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_millis(200), dom.wait_for_work())
-                    .await;
-            dom.render_immediate_to_vec();
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
-                .await;
+            for _ in 0..5 {
+                if SEEN.with(|s| s.borrow().is_some()) {
+                    break;
+                }
+                let woke =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dom.wait_for_work())
+                        .await;
+                assert!(woke.is_ok(), "no work came: the answer never arrived");
+                dom.render_immediate_to_vec();
+            }
         });
+        assert_eq!(
+            SEEN.with(|s| s.borrow().clone()),
+            Some(None),
+            "the late answer was not processed, or was accepted"
+        );
         assert_eq!(last_user(), None, "the stale answer brought the user back");
         assert!(
             !ON_ME_RAN.with(Cell::get),
