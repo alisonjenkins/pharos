@@ -8840,6 +8840,7 @@ fn Player(
                         shuffled: queue.read().shuffled(),
                         on_queue,
                         playing: queued.then_some(playing_id),
+                        audiobook: p.detail.item.audiobook,
                     }
                 }
             }
