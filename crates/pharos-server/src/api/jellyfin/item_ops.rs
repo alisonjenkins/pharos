@@ -854,6 +854,7 @@ async fn instant_mix(
     path: web::Path<String>,
     q: CiQuery<InstantMixQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::MediaQuery;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
@@ -862,8 +863,23 @@ async fn instant_mix(
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    let rows = same_shelf(&state, &user.0, &seed, limit + 1).await?; // +1 so dropping the seed still fills the page
-                                                                     // Seed first, then the rest of the same-kind set (seed de-duplicated).
+    let rows = if seed.kind == MediaKind::Audio {
+        same_shelf_songs(&state, &user.0, &seed).await?
+    } else {
+        let mut mq = MediaQuery {
+            kinds: vec![seed.kind],
+            limit: Some(limit + 1), // +1 so dropping the seed still fills the page
+            ..Default::default()
+        };
+        items::apply_policy_scope(&mut mq, &user.0.policy, &state.parental_ratings);
+        let (rows, _total) = state
+            .stores
+            .query(&mq)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        rows
+    };
+    // Seed first, then the rest of the same-kind set (seed de-duplicated).
     let mut mix: Vec<pharos_core::MediaItem> = vec![seed.clone()];
     for it in rows.into_iter().filter(|i| i.id != seed.id) {
         if mix.len() as u32 >= limit {
@@ -876,63 +892,39 @@ async fn instant_mix(
     Ok(crate::api::jellyfin::wire::json(&page))
 }
 
-/// Rows one instant-mix store read asks for; the read repeats only while
-/// the other shelf's tracks keep a page from filling.
-const INSTANT_MIX_PAGE: u32 = 500;
-
-/// Up to `want` items of the seed's kind that `user` may see, on the seed's
-/// shelf: for audio, music for a song and audiobooks for an audiobook's
-/// track (ADR-0132, V1467). The store cannot tell the two apart, so it is
-/// read a page at a time in id order and filtered until `want` are kept.
-async fn same_shelf(
+/// The songs `user` may hear on the seed's shelf: music for a song, the
+/// audiobooks for an audiobook's track (ADR-0132, V1467). The store cannot
+/// tell the two apart, so the cached audio list is read whole and filtered.
+async fn same_shelf_songs(
     state: &AppState,
     user: &pharos_core::User,
     seed: &MediaItem,
-    want: u32,
 ) -> Result<Vec<MediaItem>, actix_web::Error> {
-    let roots = state.course_roots();
-    let audio = seed.kind == MediaKind::Audio;
-    let book = |i: &MediaItem| audio && roots.root_of(&i.path).is_some();
-    let seed_is_book = book(seed);
-    let page = INSTANT_MIX_PAGE.max(want);
-    let mut mq = pharos_core::MediaQuery {
-        kinds: vec![seed.kind],
-        sort: vec![(pharos_core::SortKey::Id, pharos_core::SortDir::Asc)],
-        limit: Some(page),
+    let q = crate::services::library::ItemQuery {
+        kinds: crate::services::library::KindFilter::Kinds(vec![MediaKind::Audio]),
+        limit: None,
         ..Default::default()
     };
-    items::apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
-    let want = want as usize;
-    let (mut kept, mut left_out, mut reads) = (Vec::new(), 0usize, 0u32);
-    loop {
-        let (rows, _total) = state
-            .stores
-            .query(&mq)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        reads += 1;
-        let full = rows.len() == page as usize;
-        mq.start_index += rows.len() as u64;
-        for row in rows {
-            if book(&row) != seed_is_book {
-                left_out += 1;
-            } else if kept.len() < want {
-                kept.push(row);
-            }
-        }
-        if kept.len() >= want || !full {
-            break;
-        }
-    }
+    let page = crate::services::library::query(state, user, None, &q)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let roots = state.course_roots();
+    let book = |i: &MediaItem| roots.root_of(&i.path).is_some();
+    let seed_is_book = book(seed);
+    let all = page.items.len();
+    let rows: Vec<MediaItem> = page
+        .items
+        .into_iter()
+        .filter(|i| book(i) == seed_is_book)
+        .collect();
     tracing::debug!(
         seed = seed.id,
         seed_is_book,
-        kept = kept.len(),
-        other_shelf_left_out = left_out,
-        reads,
+        kept = rows.len(),
+        other_shelf_left_out = all - rows.len(),
         "instant mix: pool"
     );
-    Ok(kept)
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------
