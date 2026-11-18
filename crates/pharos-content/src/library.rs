@@ -1951,10 +1951,11 @@ mod tests {
     /// `/audio/N` on a local server (the library's own resolver needs the
     /// server's node protocol), with a fixed, ample free space.
     struct HeldRig {
-        // Dropped last, after the library and downloader.
-        _cleanup: RemoveOnDrop,
         lib: Library,
         _srv: Arc<crate::testserver::TestServer>,
+        // Fields drop in declaration order: last, so the folder goes only
+        // after the library's downloader has shut down.
+        _cleanup: RemoveOnDrop,
     }
 
     /// Removes a test's directory last, even when an assertion fails.
