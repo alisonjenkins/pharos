@@ -145,12 +145,6 @@ pub fn load_token_user() -> Result<Option<String>, String> {
     Ok(token_file::read(&token_path()?)?.and_then(|s| s.user))
 }
 
-/// Keeps `user` with the token now on file, in the same file.
-/// The read and the write are one step under the file's lock.
-pub fn store_token_user(user: &str) -> Result<(), String> {
-    token_file::store_user(&token_path()?, user)
-}
-
 /// Keeps `user` with the token on file only while it is `seen`
 /// (`token_file::store_user_if`).
 pub fn store_token_user_if(seen: &str, user: &str) -> Result<token_file::Pairing, String> {
@@ -202,7 +196,7 @@ pub fn token_with_user() -> Result<Option<token_file::Stored>, String> {
 }
 
 /// Replaces the token file whole (`token_file::store`): the new token's user
-/// is unknown until `store_token_user`, never the previous sign-in's.
+/// is unknown until `store_token_user_if`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
     token_file::store(&path, token).map(|()| {
