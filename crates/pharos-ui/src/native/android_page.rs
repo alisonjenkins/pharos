@@ -30,10 +30,11 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::kept_video::{
-    loudness, request_class, request_key, request_line, url_path, Loudness, StoredFile, Verdict,
+    loudness, request_class, request_key, request_line, token_for_owner, url_path, Loudness,
+    StoredFile, Verdict,
 };
 use super::kept_video_disk::{
-    iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher,
+    iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
 };
 use super::tv_page::{self, Bridge, Paths};
 use super::tv_turn;
@@ -3146,7 +3147,12 @@ fn http() -> &'static Result<reqwest::Client, String> {
 /// at warn the first time and at debug after, since every request to a
 /// plain-http server would repeat it.
 fn token_for(url: &str, what: &str) -> Option<String> {
-    let token = android::token()?;
+    allowed_token(url, what, android::token()?)
+}
+
+/// `token` for a request to `url`, when it may go there; logged as
+/// [`token_for`] logs a withheld one.
+fn allowed_token(url: &str, what: &str, token: String) -> Option<String> {
     match tv_page::token_allowed(url, tv_page::DEFAULT_SERVER) {
         Ok(()) => Some(token),
         Err(reason) => {
@@ -3251,6 +3257,16 @@ const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// address as the proxy, the body streamed rather than held.
 struct ServerFetcher;
 
+/// The device token for a download run of `owner`'s: the token and its
+/// user from one read of the token file, the token only while that user is
+/// `owner` ([`token_for_owner`]). Err names the refusal; nothing is sent.
+fn token_for_run(owner: &str) -> Result<String, String> {
+    let stored = android::token_with_user()
+        .map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
+    let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
+    token_for_owner(token.as_deref(), user.as_deref(), owner)
+}
+
 /// The client the downloads use. Its redirect policy follows a redirect
 /// only to the same scheme, host and port as the request (the download
 /// sends the device token): a cross-host redirect or an https-to-http
@@ -3321,8 +3337,20 @@ impl Body for ServerBody {
 }
 
 impl Fetcher for ServerFetcher {
-    fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
+    fn check_owner(&self, owner: &str) -> Result<(), String> {
+        token_for_run(owner).map(|_| ())
+    }
+
+    fn open<'a>(
+        &'a self,
+        owner: &'a str,
+        key: &'a str,
+    ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>> {
         Box::pin(async move {
+            // Bound to the run's owner before anything is sent: another
+            // user's token never goes out for this run, and a refusal sends
+            // nothing at all (fail closed).
+            let token = token_for_run(owner).map_err(OpenFailed::NotOwner)?;
             // No client, no download: never a default one without the
             // redirect policy.
             let client = download_http().as_ref().map_err(|why| FetchError {
@@ -3331,7 +3359,7 @@ impl Fetcher for ServerFetcher {
             })?;
             let url = tv_page::server_url(&server(), key);
             let mut req = client.get(&url);
-            if let Some(token) = token_for(&url, "video_download") {
+            if let Some(token) = allowed_token(&url, "video_download", token) {
                 req = req.header("X-Emby-Token", token);
             }
             let resp = tokio::time::timeout(DOWNLOAD_STALL, req.send())
@@ -3345,10 +3373,10 @@ impl Fetcher for ServerFetcher {
             if status.is_success() {
                 Ok(Box::new(ServerBody(resp)) as Box<dyn Body>)
             } else {
-                Err(FetchError {
+                Err(OpenFailed::Fetch(FetchError {
                     status: Some(status.as_u16()),
                     message: String::new(),
-                })
+                }))
             }
         })
     }

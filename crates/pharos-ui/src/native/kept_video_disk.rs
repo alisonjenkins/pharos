@@ -75,10 +75,39 @@ pub trait Body: Send {
     fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>>;
 }
 
+/// Why a request was not answered with a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenFailed {
+    /// Sent, and failed or answered a non-success status.
+    Fetch(FetchError),
+    /// Not sent: the credentials the request would carry are not the run's
+    /// owner's ([`token_for_owner`](super::kept_video::token_for_owner)),
+    /// and why.
+    NotOwner(String),
+}
+
+impl From<FetchError> for OpenFailed {
+    fn from(e: FetchError) -> Self {
+        Self::Fetch(e)
+    }
+}
+
 /// The app's HTTP to its server: GET a request key (path and query) and
 /// stream the body. A non-success status is an `Err` carrying it.
 pub trait Fetcher: Send + Sync {
-    fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>>;
+    /// GET `key` for a run of `owner`'s. The credentials are read with the
+    /// request and sent only while they belong to `owner`: otherwise
+    /// nothing is sent and the answer is [`OpenFailed::NotOwner`].
+    fn open<'a>(
+        &'a self,
+        owner: &'a str,
+        key: &'a str,
+    ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>>;
+    /// Ok while the credentials requests would carry now belong to `owner`;
+    /// Err names why not. Asked under the store's lock before a fetched
+    /// file is promoted: it takes none of the store's locks (the token
+    /// file's own lock is the innermost).
+    fn check_owner(&self, owner: &str) -> Result<(), String>;
 }
 
 /// How much video may be kept and how much room there is.
@@ -143,6 +172,9 @@ enum Stop {
     Refused(String),
     /// A file could not be fetched or stored; stored files stay for a retry.
     Failed(String),
+    /// The credentials are not the owner's (another user signed in): the
+    /// record and its files stay as they are, to resume for its owner.
+    Parked(String),
 }
 
 #[derive(Default)]
@@ -664,6 +696,16 @@ impl Staged<'_> {
     fn abandon(mut self, why: &'static str) {
         self.why = why;
     }
+}
+
+/// What became of a fetched file at its promotion.
+enum Promote {
+    /// Renamed to its final name, or the rename's error.
+    Renamed(std::io::Result<()>),
+    /// The run no longer owns the download.
+    NotOwned,
+    /// The credentials are not the owner's, and why.
+    NotOwner(String),
 }
 
 /// Why a media chunk was not written.
@@ -1735,6 +1777,16 @@ async fn fetch_file(
                 };
             }
             FetchOnce::Gone => return Err(Stop::Gone),
+            FetchOnce::NotOwner(why) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep fetch verdict=refused item={item} run={run} url_path={} reason={why}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Parked(why));
+            }
             FetchOnce::TooLarge(limit) => {
                 let reason = format!(
                     "{} is larger than the {limit} bytes a playlist may take (reason=playlist_too_large)",
@@ -1796,6 +1848,9 @@ enum FetchOnce {
     OverReservation(String),
     /// The download was removed or restarted while this run was fetching.
     Gone,
+    /// The credentials are not the run's owner's, and why: nothing was
+    /// sent, or a fetched file was not promoted.
+    NotOwner(String),
 }
 
 /// Waits for a chunk's write to complete. In a test the write can be held
@@ -1916,9 +1971,12 @@ async fn fetch_once(
     let mut body = inner
         .env
         .fetcher
-        .open(key)
+        .open(user, key)
         .await
-        .map_err(FetchOnce::Fetch)?;
+        .map_err(|e| match e {
+            OpenFailed::Fetch(e) => FetchOnce::Fetch(e),
+            OpenFailed::NotOwner(why) => FetchOnce::NotOwner(why),
+        })?;
     let part = path.with_extension(format!("{run}.part"));
     // The folder and the staging file are created in one step, with no
     // await to be cancelled in, and only while this run still owns the
@@ -2038,26 +2096,41 @@ async fn fetch_once(
         let owns = st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
             && find(&st.list, user, item)
                 .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }));
-        if owns {
+        if !owns {
+            Promote::NotOwned
+        } else if let Err(why) = inner.env.fetcher.check_owner(user) {
+            // Fetched while another user's credentials were on file: none
+            // of it goes into this user's download.
+            Promote::NotOwner(why)
+        } else {
             #[cfg(test)]
             tests::sync_step(format!("rename {}", shown_name(path)));
-            Some(std::fs::rename(&part, path))
-        } else {
-            None
+            Promote::Renamed(std::fs::rename(&part, path))
         }
     };
     match promoted {
-        Some(Ok(())) => {
+        Promote::Renamed(Ok(())) => {
             staged.promoted = true;
             Ok(len)
         }
-        Some(Err(e)) => {
+        Promote::Renamed(Err(e)) => {
             staged.abandon("rename_failed");
             Err(store_err("finish", e))
         }
-        None => {
+        Promote::NotOwned => {
             staged.abandon("not_owned");
             Err(FetchOnce::Gone)
+        }
+        Promote::NotOwner(why) => {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep promote verdict=refused item={item} run={run} name={} reason={why}",
+                    shown_name(path)
+                ),
+            );
+            staged.abandon("token_owner_mismatch");
+            Err(FetchOnce::NotOwner(why))
         }
     }
 }
@@ -3131,6 +3204,14 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             }
         }
         Err(Stop::Gone) => superseded("removed"),
+        Err(Stop::Parked(why)) => {
+            // Left as it is, Downloading: the record and its files are the
+            // owner's, and its run resumes when the owner signs in again.
+            emit(
+                true,
+                format!("pharos: video keep parked item={item} run={run} reason={why} ms={ms}"),
+            );
+        }
         Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
             // The fetches cancelled with the failure leave their staging
             // files, which the figure below does not count: they go first,
@@ -4642,6 +4723,11 @@ mod tests {
         /// Keys whose held body fails, once released, instead of sending its
         /// second chunk.
         mid_fails: Mutex<HashSet<String>>,
+        /// The token file as the phone's fetcher reads it: the token and its
+        /// user. Unset, the test does not model it and every owner passes.
+        token_file: Mutex<Option<(String, Option<String>)>>,
+        /// Each request sent, with the token it carried.
+        sent: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl FakeServer {
@@ -4735,6 +4821,27 @@ mod tests {
         fn asked(&self) -> Vec<String> {
             self.asked.lock().unwrap().clone()
         }
+
+        /// Puts `user`'s token on file, as a sign-in does.
+        fn sign_in(&self, user: &str) {
+            *self.token_file.lock().unwrap() = Some((format!("tok-{user}"), Some(user.to_owned())));
+        }
+
+        /// The token for a request of `owner`'s run, decided as the phone's
+        /// fetcher decides it; `Ok(None)` when the test models no token.
+        fn token(&self, owner: &str) -> Result<Option<String>, String> {
+            match self.token_file.lock().unwrap().as_ref() {
+                None => Ok(None),
+                Some((token, user)) => {
+                    super::super::kept_video::token_for_owner(Some(token), user.as_deref(), owner)
+                        .map(Some)
+                }
+            }
+        }
+
+        fn sent(&self) -> Vec<(String, Option<String>)> {
+            self.sent.lock().unwrap().clone()
+        }
     }
 
     struct FakeBody(
@@ -4774,7 +4881,15 @@ mod tests {
     }
 
     impl Fetcher for FakeServer {
-        fn open<'a>(&'a self, key: &'a str) -> BoxFut<'a, Result<Box<dyn Body>, FetchError>> {
+        fn check_owner(&self, owner: &str) -> Result<(), String> {
+            self.token(owner).map(|_| ())
+        }
+
+        fn open<'a>(
+            &'a self,
+            owner: &'a str,
+            key: &'a str,
+        ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>> {
             Box::pin(async move {
                 self.asked.lock().unwrap().push(key.to_owned());
                 let slow = self.slow_opens.lock().unwrap().remove(key);
@@ -4783,6 +4898,18 @@ mod tests {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 }
+                // The token is read as the request goes out, as the phone's
+                // fetcher reads it.
+                let token = self.token(owner).map_err(OpenFailed::NotOwner)?;
+                self.sent.lock().unwrap().push((key.to_owned(), token));
+                self.body(key).await.map_err(OpenFailed::Fetch)
+            })
+        }
+    }
+
+    impl FakeServer {
+        async fn body(&self, key: &str) -> Result<Box<dyn Body>, FetchError> {
+            {
                 let hold = self.holds.lock().unwrap().remove(key);
                 if let Some(flag) = hold {
                     while !flag.load(Ordering::SeqCst) {
@@ -4828,7 +4955,7 @@ mod tests {
                         message: String::new(),
                     }),
                 }
-            })
+            }
         }
     }
 
@@ -7683,6 +7810,138 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// Waits, on the test's runtime, until `done` holds; at most 10 s.
+    async fn until_within(done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "never happened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// User u1's run outlives a switch to u2 and starts that run's next
+    /// request after it: the request is not sent (no u2 token goes out for
+    /// u1's run) and the run parks, its record left Downloading for u1.
+    #[tokio::test]
+    async fn another_users_token_never_goes_out_for_a_run() {
+        let rig = Rig::new("token-switch-open");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let later = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.asked_times(SEG1, 1).await;
+        rig.server.sign_in("u2");
+        later.store(true, Ordering::SeqCst);
+        // Bounded: with the guard gone the request goes out and the run
+        // waits on the held body.
+        until_within(|| {
+            !lines("pharos: video keep parked item=1").is_empty()
+                || rig.server.sent().iter().any(|(k, _)| k == SEG1)
+        })
+        .await;
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let sent = rig.server.sent();
+        assert!(
+            sent.iter().all(|(_, t)| t.as_deref() == Some("tok-u1")),
+            "{sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(k, _)| k == SEG1),
+            "sent after the switch: {sent:?}"
+        );
+        assert!(store.stored_file("u1", SEG0).is_none());
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep fetch verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
+        let parked = lines("pharos: video keep parked item=1");
+        assert!(
+            parked.iter().any(|l| l.contains("token_owner_mismatch")),
+            "{parked:?}"
+        );
+    }
+
+    /// A body fetched with u1's token while the token on file became u2's
+    /// is not promoted into u1's record: its staged bytes are discarded and
+    /// the run parks.
+    #[tokio::test]
+    async fn a_body_fetched_across_a_user_switch_is_not_promoted() {
+        let rig = Rig::new("token-switch-promote");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let later = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.sign_in("u2");
+        mid.store(true, Ordering::SeqCst);
+        // Bounded: with the guard gone the body is promoted and the run
+        // goes on to the held request.
+        until_within(|| {
+            store.stored_file("u1", SEG0).is_some()
+                || !lines("pharos: video keep parked item=1").is_empty()
+        })
+        .await;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            store.stored_file("u1", SEG0).is_none(),
+            "a body fetched across the switch was promoted"
+        );
+        let files = rig.dir.join("u1").join("1").join("files");
+        let parts: Vec<_> = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(parts.is_empty(), "{parts:?}");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep promote verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
+        let dropped =
+            lines("pharos: video keep staging dropped item=1 reason=token_owner_mismatch");
+        assert!(!dropped.is_empty());
+    }
+
+    /// A cold start with u2's token on file and u1's download interrupted:
+    /// the resumed run sends nothing, and parks.
+    #[tokio::test]
+    async fn a_cold_start_sends_nothing_for_another_users_interrupted_download() {
+        let (rig, _dir) = resume_missing_its_master("token-cold", 4 * GIB).await;
+        rig.server.sent.lock().unwrap().clear();
+        rig.server.sign_in("u2");
+        let store = rig.open();
+        store.settled().await;
+        let sent = rig.server.sent();
+        assert!(sent.is_empty(), "{sent:?}");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep fetch verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
     }
 
     /// A folder at a planned segment's path is not a stored file, and the

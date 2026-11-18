@@ -188,6 +188,13 @@ pub fn load_token() -> Option<String> {
     token
 }
 
+/// The token and its user from one read of the one file, uncached: for a
+/// request that must carry one user's token (a video download). Never log
+/// the token.
+pub fn token_with_user() -> Result<Option<token_file::Stored>, String> {
+    token_file::read(&token_path()?)
+}
+
 /// Replaces the token file whole (`token_file::store`): the new token's user
 /// is unknown until `store_token_user`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {

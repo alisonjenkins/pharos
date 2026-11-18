@@ -423,6 +423,30 @@ pub fn retry_delay_secs(attempt: u32) -> Option<u64> {
     DELAYS.get(attempt.checked_sub(1)? as usize).copied()
 }
 
+/// The device token a download run for `owner` may send: the stored token,
+/// only while the user stored with it is `owner`. `token` and `token_user`
+/// come from one read of the one token file, so a sign-in landing between
+/// two reads cannot pair one user's token with another user's run. Fails
+/// closed: Err names the refusal, `no_token`, `token_user_unknown` (a token
+/// whose user is not stored yet, as during a sign-in) or
+/// `token_owner_mismatch` with both internal ids.
+pub fn token_for_owner(
+    token: Option<&str>,
+    token_user: Option<&str>,
+    owner: &str,
+) -> Result<String, String> {
+    let Some(token) = token else {
+        return Err(format!("no_token owner={owner}"));
+    };
+    match token_user {
+        None => Err(format!("token_user_unknown owner={owner}")),
+        Some(user) if user != owner => Err(format!(
+            "token_owner_mismatch owner={owner} token_user={user}"
+        )),
+        Some(_) => Ok(token.to_owned()),
+    }
+}
+
 /// Whether a failed fetch is worth another try: no answer at all (`None`),
 /// a segment not ready yet (404) or a busy server (5xx).
 pub fn is_retryable(status: Option<u16>) -> bool {
@@ -557,6 +581,26 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_download_sends_the_token_only_for_the_user_it_belongs_to() {
+        assert_eq!(
+            token_for_owner(Some("tok"), Some("u1"), "u1"),
+            Ok("tok".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(Some("tok"), Some("u2"), "u1"),
+            Err("token_owner_mismatch owner=u1 token_user=u2".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(Some("tok"), None, "u1"),
+            Err("token_user_unknown owner=u1".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(None, Some("u1"), "u1"),
+            Err("no_token owner=u1".to_owned())
+        );
+    }
 
     /// A manifest written before a field existed still parses, and one
     /// written by a newer build (an extra field) does too: a manifest that
