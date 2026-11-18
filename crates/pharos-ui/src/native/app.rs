@@ -2256,15 +2256,15 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
-                if kept_any() || !offline_video::ready_for_last_user().is_empty() {
-                    spawn(async move {
-                        platform::sleep_ms(SLOW_CONNECT_MS).await;
+                start_slow_connect(
+                    SLOW_CONNECT_MS,
+                    move || {
                         let m = machine.peek();
-                        if m.epoch() == epoch && *m.phase() == Phase::Connecting {
-                            slow_connect.set(true);
-                        }
-                    });
-                }
+                        m.epoch() == epoch && *m.phase() == Phase::Connecting
+                    },
+                    || kept_any() || !offline_video::ready_for_last_user().is_empty(),
+                    slow_connect,
+                );
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
@@ -2698,6 +2698,37 @@ fn on_this_device() -> Element {
 /// How long the first connection may take before kept books open without it.
 /// Short, because a phone in a tunnel reports itself online.
 const SLOW_CONNECT_MS: u32 = 3_000;
+
+/// Starts one connection attempt's slow-connect timer. Nothing is decided
+/// when the attempt starts: a store published after that (the phone
+/// registers its video store from two places) still counts. When the timer
+/// fires on an attempt still connecting, the screen is cut off, and the
+/// render decides what shows: `offline_start` reads the stores, subscribed
+/// to a later publish, so the offline list appears whenever there is one.
+/// `kept` is read then only for the log.
+fn start_slow_connect(
+    ms: u32,
+    still_connecting: impl Fn() -> bool + 'static,
+    kept: impl Fn() -> bool + 'static,
+    mut slow: Signal<bool>,
+) {
+    spawn(async move {
+        platform::sleep_ms(ms).await;
+        if !still_connecting() {
+            return;
+        }
+        let kept = kept();
+        platform::info(&format!(
+            "pharos: connect slow verdict={} kept={kept} after_ms={ms}",
+            if kept {
+                "offline_lists"
+            } else {
+                "lists_on_publish"
+            }
+        ));
+        slow.set(true);
+    });
+}
 
 /// Whether anything is kept on this device (a browser's book, a phone's
 /// download): one read, made only when a connection attempt starts.
@@ -9060,6 +9091,49 @@ fn Player(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// The slow-connect timer decides when it fires, not when the attempt
+    /// starts: downloads that appear in between (a store published after
+    /// the attempt began) still cut the screen off to the offline lists.
+    #[test]
+    fn a_store_published_after_the_attempt_started_still_gets_the_slow_connect() {
+        thread_local! {
+            static KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            static SLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        KEPT.with(|k| k.set(false));
+        SLOW.with(|s| s.set(false));
+        fn root() -> Element {
+            let slow = use_signal(|| false);
+            use_hook(|| start_slow_connect(10, || true, || KEPT.with(std::cell::Cell::get), slow));
+            SLOW.with(|s| s.set(slow()));
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        // The attempt has started with nothing kept; the store lands now.
+        KEPT.with(|k| k.set(true));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..5 {
+                if SLOW.with(std::cell::Cell::get) {
+                    break;
+                }
+                let woke =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dom.wait_for_work())
+                        .await;
+                assert!(woke.is_ok(), "no timer ran for the attempt");
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            SLOW.with(std::cell::Cell::get),
+            "the slow connect never came"
+        );
+    }
 
     use super::*;
 
