@@ -7004,6 +7004,57 @@ mod tests {
     /// A download whose terminal record cannot be saved is not reported
     /// Ready: that would resume at the next open. It is reported failed,
     /// with the save error as the reason, and no success is logged.
+    /// The item folder's sync after the Ready record's rename fails, and the
+    /// Failed record that should replace it cannot be written either: the
+    /// Ready record stays on disk. It is adopted as Ready at a restart, and
+    /// that is right: every file it names was synced before its rename and
+    /// the files' folder was synced before the record was written, so every
+    /// file it names is there and whole.
+    #[tokio::test]
+    async fn a_ready_record_left_by_a_failed_item_sync_serves_whole_files_after_a_restart() {
+        const EIO: i32 = 5;
+        let rig = Rig::new("ready-left-unsynced");
+        let dir = rig.dir.join("u1").join("1");
+        let store = rig.open();
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = Some(("1".to_owned(), EIO, 2)));
+        let block = dir.join("manifest.json.part");
+        let blocker = block.clone();
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                // The Failed rewrite after the failed sync cannot be written.
+                if matches!(v.state, KeptState::Failed { .. }) {
+                    let _ = std::fs::create_dir_all(&blocker);
+                }
+            }));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = None);
+        assert!(
+            matches!(only(&store).state, KeptState::Failed { .. }),
+            "{:?}",
+            only(&store).state
+        );
+        std::fs::remove_dir_all(&block).unwrap();
+        drop(store);
+        let reopened = rig.open();
+        let v = only(&reopened);
+        assert_eq!(
+            v.state,
+            KeptState::Ready,
+            "the Ready record on disk was not adopted"
+        );
+        let served = rig.server.files.lock().unwrap().clone();
+        for key in &v.files {
+            let stored = reopened
+                .stored_file("u1", key)
+                .expect("a named file is not served");
+            let on_disk = std::fs::read(&stored.path).unwrap();
+            assert_eq!(Some(&on_disk), served.get(key), "{key} is not whole");
+        }
+    }
+
     #[tokio::test]
     async fn a_completion_whose_record_cannot_be_saved_is_not_reported_ready() {
         let rig = Rig::new("complete-save-fails");
