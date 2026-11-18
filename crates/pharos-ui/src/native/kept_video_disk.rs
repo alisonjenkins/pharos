@@ -1220,20 +1220,51 @@ impl Inner {
         let cap = budget.cap_bytes();
         // What the folder holds before this run fetches anything into it
         // (the run owns the folder, and planning writes nothing else there).
-        // Measured outside the lock, and only on a run's first playlist.
+        // Measured outside the lock, only for a resume (a new download draws
+        // nothing from its reservation) and only on a run's first playlist.
         let who = (user.to_owned(), item.to_owned(), run);
-        let (held, dir) = {
+        let (held, dir, resume) = {
             let st = lock(&self.state);
             (
                 st.playlists_taken.get(&who).map(|t| t.0),
                 st.dir_of(user, item),
+                find(&st.list, user, item).is_some_and(|v| !v.files.is_empty()),
             )
         };
-        let held = held.unwrap_or_else(|| dir_size(&dir).counted(0));
+        let held = match held {
+            Some(held) => Measure::Whole(held),
+            None if resume => dir_size(&dir),
+            None => Measure::Whole(0),
+        };
         let mut st = lock(&self.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return Err(Stop::Gone);
         }
+        // A short walk is no figure for what the folder holds: the
+        // reservation could look unused while the folder fills it. The
+        // folder is unknown until a sweep measures it whole, and the
+        // refusal below follows from that.
+        let held = match held {
+            Measure::Whole(held) => held,
+            Measure::Short(found) => {
+                if !st.unmeasured.iter().any(|(d, _)| *d == dir) {
+                    st.unmeasured.push((
+                        dir.clone(),
+                        "folder not measured whole when a playlist was reserved".to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&dir) {
+                    st.remeasure.push(dir.clone());
+                }
+                emit(
+                    true,
+                    format!(
+                        "pharos: video playlist measure short item={item} found={found} verdict=folder_unknown"
+                    ),
+                );
+                found
+            }
+        };
         let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
         let used = st.reserved_by_others(user, item).saturating_add(other);
         let own = find(&st.list, user, item).map_or(0, reserved);
@@ -7250,6 +7281,60 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("extended=0 from_own=256 ") && l.contains(" taken=0 ")),
             "{reserved:?}"
+        );
+    }
+
+    /// An interrupted download with a 3 GiB reservation whose master
+    /// playlist is gone, reopened under `cap`.
+    async fn resume_missing_its_master(name: &str, cap: u64) -> (Rig, PathBuf) {
+        let rig = Rig::new(name);
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 3,
+            total: 5,
+            bytes: 1,
+        };
+        v.estimated_bytes = 3 * GIB;
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(MASTER_KEY))).unwrap();
+        rig.budget.cap.store(cap, Ordering::SeqCst);
+        rig.server.asked.lock().unwrap().clear();
+        (rig, dir)
+    }
+
+    /// A resume whose folder cannot be measured whole when its playlist is
+    /// reserved does not take a short walk for what the folder holds: the
+    /// reservation could look unused while the folder fills it. The folder
+    /// is unknown and the fetch is refused.
+    #[tokio::test]
+    async fn a_short_measure_at_a_playlists_reservation_refuses_the_fetch() {
+        let (rig, dir) = resume_missing_its_master("playlist-short-measure", 4 * GIB).await;
+        rig.budget.other.store(GIB, Ordering::SeqCst);
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.settled().await;
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let v = only(&store);
+        let KeptState::Failed { reason } = &v.state else {
+            panic!("a resume went on over a short measure: {v:?}");
+        };
+        assert!(
+            rig.server.asked().is_empty(),
+            "fetched {:?}",
+            rig.server.asked()
+        );
+        assert!(reason.contains("not measured whole"), "{reason}");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused.iter().any(|l| l.contains("step=playlist")),
+            "{refused:?}"
         );
     }
 
