@@ -99,6 +99,33 @@ pub fn store_user(path: &Path, user: &str) -> Result<(), ContentError> {
     }
 }
 
+/// What [`store_user_if`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// The user is now paired with the token.
+    Paired,
+    /// The token on file is not the one the user was learned with: nothing
+    /// was written, and the token stays unpaired.
+    TokenChanged,
+}
+
+/// Pairs `user` with the token on file only while that token is `seen`, the
+/// one the request that named `user` was sent with. The compare and the
+/// write are one step under the file's lock. A different token (a new
+/// sign-in landed in between) is left as it is, unpaired: its user is not
+/// known, so a check that needs one fails closed. No token is refused, as
+/// in [`store_user`].
+pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, ContentError> {
+    let _held = hold();
+    match read(path)? {
+        Some(s) if s.token == seen.trim() => write(path, &s.token, Some(user))
+            .map(|()| Pairing::Paired)
+            .map_err(|e| err(path, e)),
+        Some(_) => Ok(Pairing::TokenChanged),
+        None => Err(err(path, "no token to keep the user with")),
+    }
+}
+
 /// Removes the token and its user; absent is fine.
 pub fn forget(path: &Path) -> Result<(), ContentError> {
     let _held = hold();
@@ -239,6 +266,37 @@ mod tests {
                 user: None
             }),
             "the sign-in was overwritten by the pairing"
+        );
+    }
+
+    /// A new token stored between the request that named the user and the
+    /// pairing (another account's Quick Connect approved meanwhile) is not
+    /// paired with that user: the pairing is refused and the new token stays
+    /// with no user.
+    #[test]
+    fn a_pairing_for_a_replaced_token_is_refused() {
+        let d = dir("pair-if");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        assert_eq!(store_user_if(&p, "tokA", "A").unwrap(), Pairing::Paired);
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+        store(&p, "tokB").unwrap();
+        assert_eq!(
+            read(&p).unwrap().unwrap().user,
+            None,
+            "a new token kept the old user"
+        );
+        assert_eq!(
+            store_user_if(&p, "tokA", "A").unwrap(),
+            Pairing::TokenChanged
+        );
+        assert_eq!(
+            read(&p).unwrap(),
+            Some(Stored {
+                token: "tokB".into(),
+                user: None
+            }),
+            "the new token was paired with the old user"
         );
     }
 
