@@ -25,6 +25,8 @@ mod prefetch;
 pub mod ranged;
 mod resume;
 #[cfg(test)]
+mod testdir;
+#[cfg(test)]
 mod testlog;
 #[cfg(test)]
 mod testserver;

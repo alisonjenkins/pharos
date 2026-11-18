@@ -285,12 +285,9 @@ mod tests {
         });
     }
 
-    fn dir(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("pharos-token-file-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A folder of the test's own, removed when the test ends.
+    fn dir(tag: &str) -> crate::testdir::TmpDir {
+        crate::testdir::TmpDir::new(&format!("token-{tag}"))
     }
 
     /// A sign-in that lands while a user id is being paired with the old
