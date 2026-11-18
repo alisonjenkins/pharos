@@ -173,6 +173,9 @@ pub fn VideoList(
     #[props(default)]
     unreadable: usize,
     #[props(default)] on_discard: EventHandler<()>,
+    /// A discard is running: its button is disabled until it ends.
+    #[props(default)]
+    discarding: bool,
 ) -> Element {
     rsx! {
         p { class: "pharos-muted", id: "pharos-video-total",
@@ -193,8 +196,9 @@ pub fn VideoList(
                 button {
                     class: "pharos-button pharos-button-danger is-small",
                     r#type: "button",
+                    disabled: discarding,
                     onclick: move |_| on_discard.call(()),
-                    "Remove them"
+                    if discarding { "Removing…" } else { "Remove them" }
                 }
             }
         }
@@ -412,7 +416,8 @@ pub fn VideoDownloads() -> Element {
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
-    let mut problem = use_signal(|| None::<String>);
+    let problem = use_signal(|| None::<String>);
+    let discarding = use_signal(|| false);
     // Read at each render; a discard sets `problem`, which renders again.
     let unreadable = store.unreadable_count();
     let discard_store = store.clone();
@@ -425,14 +430,8 @@ pub fn VideoDownloads() -> Element {
                 cap: store.cap_bytes(),
                 problem: problem(),
                 unreadable,
-                on_discard: move |()| {
-                    let outcome = discard_store.discard_unreadable();
-                    platform::info(&format!("pharos: video discard unreadable result={outcome:?}"));
-                    problem.set(match outcome {
-                        Ok(_) => None,
-                        Err(e) => Some(format!("Some downloads could not be removed: {e}")),
-                    });
-                },
+                discarding: discarding(),
+                on_discard: move |()| start_discard(discard_store.clone(), discarding, problem),
                 on_play: move |item: String| match item.parse::<ItemRef>() {
                     Ok(id) => nav.0.call(Route::Watch(id)),
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
@@ -446,6 +445,80 @@ pub fn VideoDownloads() -> Element {
             }
         }
     }
+}
+
+/// Discards the folders whose record cannot be read (`discard_unreadable`
+/// deletes folders, so it can take a while). The deleting runs on its own
+/// thread, off the UI executor; `discarding` is set until it ends (the
+/// button is disabled meanwhile) and `problem` is set back on the UI.
+/// Runs once at a time.
+fn start_discard(
+    store: std::sync::Arc<dyn super::kept_video::VideoStore>,
+    mut discarding: Signal<bool>,
+    mut problem: Signal<Option<String>>,
+) {
+    if *discarding.peek() {
+        return;
+    }
+    discarding.set(true);
+    spawn(async move {
+        let outcome = off_ui(move || store.discard_unreadable()).await;
+        platform::info(&format!(
+            "pharos: video discard unreadable result={outcome:?}"
+        ));
+        problem.set(match outcome {
+            Some(Ok(_)) => None,
+            Some(Err(e)) => Some(format!("Some downloads could not be removed: {e}")),
+            None => Some("Some downloads could not be removed: the removal stopped".to_owned()),
+        });
+        discarding.set(false);
+    });
+}
+
+/// Runs `work` on a thread of its own and resolves with its result, so a
+/// blocking job (deleting folders) never holds the UI executor. `None` when
+/// the thread ended without a result (it panicked).
+fn off_ui<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl std::future::Future<Output = Option<T>> {
+    use futures_util::task::AtomicWaker;
+    use std::sync::{Arc, Mutex};
+
+    struct Slot<T> {
+        value: Mutex<Option<Option<T>>>,
+        waker: AtomicWaker,
+    }
+    /// Delivers `None` if the thread unwinds before it delivers a value.
+    struct Deliver<T>(Arc<Slot<T>>, Option<T>);
+    impl<T> Drop for Deliver<T> {
+        fn drop(&mut self) {
+            let value = self.1.take();
+            if let Ok(mut held) = self.0.value.lock() {
+                *held = Some(value);
+            }
+            self.0.waker.wake();
+        }
+    }
+
+    let slot = Arc::new(Slot {
+        value: Mutex::new(None),
+        waker: AtomicWaker::new(),
+    });
+    let sender = Arc::clone(&slot);
+    std::thread::spawn(move || {
+        let mut deliver = Deliver(sender, None);
+        deliver.1 = Some(work());
+    });
+    std::future::poll_fn(move |cx| {
+        slot.waker.register(cx.waker());
+        match slot.value.lock() {
+            Ok(mut held) => match held.take() {
+                Some(value) => std::task::Poll::Ready(value),
+                None => std::task::Poll::Pending,
+            },
+            Err(_) => std::task::Poll::Ready(None),
+        }
+    })
 }
 
 /// The offline start's list of videos: the ready ones, which play with no
@@ -520,6 +593,113 @@ mod tests {
         assert_eq!(SAW.with(std::cell::Cell::get), Some(7));
     }
     use super::*;
+
+    /// Discarding the unreadable folders deletes folders: it runs off the
+    /// UI executor, so a render goes on meanwhile with the button disabled,
+    /// and the result reaches `problem` once the work ends.
+    #[test]
+    fn a_discard_runs_off_the_ui_with_its_button_disabled_until_it_ends() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        use std::sync::{Arc, Mutex};
+        struct Slow(Mutex<std::sync::mpsc::Receiver<()>>);
+        impl VideoStore for Slow {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+            fn discard_unreadable(&self) -> Result<u64, String> {
+                // Held until the test lets it finish.
+                let _ = self.0.lock().unwrap().recv();
+                Err("one folder stayed".to_owned())
+            }
+        }
+        thread_local! {
+            static STORE: RefCell<Option<Arc<dyn VideoStore>>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let discarding = use_signal(|| false);
+            let problem = use_signal(|| None::<String>);
+            use_hook(|| {
+                let store = STORE.with(|s| s.borrow().clone()).unwrap();
+                start_discard(store, discarding, problem);
+            });
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: problem(),
+                    unreadable: 1,
+                    discarding: discarding(),
+                }
+            }
+        }
+        let (release, held) = std::sync::mpsc::channel();
+        STORE.with(|s| *s.borrow_mut() = Some(Arc::new(Slow(Mutex::new(held)))));
+        // A watchdog: an inline discard would block the render forever.
+        let watchdog = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = watchdog.send(());
+        });
+        let started = std::time::Instant::now();
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the discard ran on the UI executor"
+        );
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("disabled"), "{html}");
+        release.send(()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let html = rt.block_on(async {
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("one folder stayed")
+                    || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break html;
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            html.contains("Some downloads could not be removed: one folder stayed"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("disabled"),
+            "the button stayed disabled: {html}"
+        );
+    }
 
     fn video(item: &str, state: KeptState) -> KeptVideo {
         KeptVideo {
