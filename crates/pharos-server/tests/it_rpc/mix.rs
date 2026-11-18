@@ -272,9 +272,11 @@ fn batch_line_has(logs: &Captured, field: &str) -> bool {
 
 /// V1467 — a mix plays music only: an audiobook's tracks (songs whose
 /// innermost library is a Books library, ADR-0132) never join a song's
-/// pool or seed a mix, and the log line counts what was kept out.
+/// pool or seed a mix, and the log line counts what was kept out. A mix
+/// saved with an audiobook's track as its seed plays music unseeded.
 /// Disarm check: with `keep_music` keeping everything, the mix picks book
-/// tracks and `books_left_out` reads 0.
+/// tracks and `books_left_out` reads 0; without the `book_seed` arm, the
+/// book-seeded mix fails as `SeedNotFound`.
 #[actix_web::test]
 async fn a_mix_never_plays_an_audiobooks_tracks() {
     use pharos_core::LibraryKind;
@@ -318,16 +320,28 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
     assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
     assert_eq!(mixed.books_left_out, 5);
     assert!(batch_line_has(&logs, "books_left_out=5"), "{}", logs.text());
+    // A mix saved with an audiobook's track as its seed plays music,
+    // unseeded, and says so.
     let book_seed = MixAsk {
-        rules: vec![],
+        rules: vec![Rule {
+            weight: Weight::Prefer,
+            share: None,
+            test: Test::LikeSeed,
+        }],
         seed: Seed::Song(3_100),
         artist_gap: 0,
         album_gap: 0,
         recent: vec![],
-        count: 1,
+        count: 3,
     };
-    assert!(matches!(
-        mix::mix(&fx.state, &user, book_seed, 0).await,
-        Err(mix::MixError::SeedNotFound(3_100))
-    ));
+    let mixed = mix::mix(&fx.state, &user, book_seed, 0).await.unwrap();
+    let ids: Vec<u64> = mixed.picks.iter().map(|p| p.item.id).collect();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
+    assert!(mixed.book_seed_dropped);
+    assert!(
+        batch_line_has(&logs, "book_seed_dropped=true"),
+        "{}",
+        logs.text()
+    );
 }
