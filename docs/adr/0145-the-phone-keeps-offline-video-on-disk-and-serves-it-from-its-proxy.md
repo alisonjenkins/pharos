@@ -68,10 +68,11 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   parked downloads only after the pairing has succeeded.
 - `proxy_get` itself drops a token that may not go to its URL
   (`token_allowed`), as well as its caller and each redirect hop.
-- A sign-out's token removal is synced to its folder (one retry; EINVAL or
-  ENOTSUP counts as done). A sync that still fails leaves the device signed
+- A sign-out's token removal is synced to its folder (one retry). A sync
+  that still fails, EINVAL or ENOTSUP included, leaves the device signed
   out and is reported (`Forgotten::NotDurable`, logged
-  `verdict=signed_out_not_durable`).
+  `verdict=signed_out_not_durable`); an unsupported sync is named as such,
+  because the removal never reached the disk.
 - A session end parks the ended user's runs before another user's token can
   be used: the session-end hook (`offline_video::forget_user`) calls
   `VideoStore::park_runs`, for every run when whose session it was is not
@@ -115,8 +116,9 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   manifest could not be read is read again when the downloads are listed or
   one is started: a manifest that parses joins the list, a folder that is
   gone is dropped. The Downloads page offers to remove the ones that still
-  cannot be read (`VideoStore::discard_unreadable`); a folder that will not
-  delete stays counted as a tombstone. Manifest fields that only describe the
+  cannot be read (`VideoStore::discard_unreadable`), on a thread of its own
+  so the UI keeps running, with the button disabled until it ends; a folder
+  that will not delete stays counted as a tombstone. Manifest fields that only describe the
   video default, so a field added later does not strand older manifests.
 - One lock is shared between the video store and the music cache:
   `pharos_content::admission_guard()`, taken through
