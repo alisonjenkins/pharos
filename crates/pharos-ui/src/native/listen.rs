@@ -452,7 +452,13 @@ pub fn ListenView(
             // Not while the screen is out of sight: the compact player docks
             // its own (B900/V852), and two panels would share element ids.
             if show_queue() && !compact && in_sight {
-                QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
+                QueuePanel {
+                    queue: queue.clone(),
+                    shuffled,
+                    on_queue,
+                    playing,
+                    audiobook: audiobook.is_some(),
+                }
             }
             div { class: "pharos-listen-body",
                 div { class: "pharos-listen-cover",
@@ -637,6 +643,9 @@ pub(super) fn QueuePanel(
     shuffled: bool,
     on_queue: EventHandler<QueueAction>,
     #[props(default)] playing: Option<ItemRef>,
+    /// The playing track is an audiobook's, so the mix offers nothing like it.
+    #[props(default)]
+    audiobook: bool,
     /// The video queue's panel (V853): it counts videos and has no mix.
     #[props(default)]
     videos: bool,
@@ -757,7 +766,7 @@ pub(super) fn QueuePanel(
                 }
             }
             if !videos {
-                MixBar { playing }
+                MixBar { playing, audiobook }
             }
             if asking {
                 div {
