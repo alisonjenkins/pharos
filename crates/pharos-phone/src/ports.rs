@@ -331,8 +331,11 @@ fn register_video_at(root: std::path::PathBuf) {
         },
     );
     match outcome {
+        // The first caller may still be opening the store: the UI's readers
+        // re-render once it is published (`use_video_store_watch`).
         Registration::AlreadyOpened => log::info!(
-            "pharos: port video_store verdict=already_opened dir={}",
+            "pharos: port video_store verdict=already_opened published={} dir={}",
+            pharos_ui::native::ports::video_store().is_some(),
             root.display()
         ),
         Registration::NoFolder(e) => log::warn!(
