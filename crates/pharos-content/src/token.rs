@@ -151,20 +151,21 @@ pub fn forget(path: &Path) -> Result<Forgotten, ContentError> {
     };
     Ok(match durable_dir(dir) {
         Ok(()) => Forgotten::Durable,
-        Err(e) => {
+        Err(reason) => {
             log::warn!(
-                "token file removed but not synced dir={} reason={e} verdict=signed_out_not_durable",
+                "token file removed but not synced dir={} reason={reason} verdict=signed_out_not_durable",
                 dir.display()
             );
-            Forgotten::NotDurable(e.to_string())
+            Forgotten::NotDurable(reason)
         }
     })
 }
 
-/// Syncs `dir`, once more if the first sync fails; EINVAL or ENOTSUP (a
-/// file system that cannot sync a folder) counts as done, logged. Err with
-/// the second failure.
-fn durable_dir(dir: &Path) -> std::io::Result<()> {
+/// Syncs `dir`, once more if the first sync fails. Err with the reason when
+/// the second sync fails too. EINVAL or ENOTSUP (a file system that cannot
+/// sync a folder) is a failure here, named as unsupported: the removal
+/// never reached the disk, so a sign-out is not claimed durable.
+fn durable_dir(dir: &Path) -> Result<(), String> {
     let Err(first) = sync_dir(dir) else {
         return Ok(());
     };
@@ -179,10 +180,9 @@ fn durable_dir(dir: &Path) -> std::io::Result<()> {
                 std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
             ) =>
         {
-            log::info!("token file dir sync verdict=unsupported error={e}");
-            Ok(())
+            Err(format!("directory sync unsupported: {e}"))
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -379,19 +379,24 @@ mod tests {
     }
 
     /// A sign-out's removal is synced to the folder: a failed sync is tried
-    /// once more, EINVAL or ENOTSUP counts as done, and a sync that still
-    /// fails leaves the token gone (signed out) and reports why.
+    /// once more. A sync that still fails, EINVAL or ENOTSUP included (the
+    /// folder cannot be synced, so the removal never reached the disk),
+    /// leaves the token gone (signed out) and reports why, naming an
+    /// unsupported sync as such.
     #[test]
     fn a_forgotten_token_is_synced_and_a_failed_sync_is_reported() {
         use std::io::ErrorKind::{InvalidInput, Other, Unsupported};
         let d = dir("forget-sync");
         let p = d.join("device-token");
-        for (errors, durable) in [
-            (vec![], true),
-            (vec![Other], true),
-            (vec![InvalidInput, InvalidInput], true),
-            (vec![Other, Unsupported], true),
-            (vec![Other, Other], false),
+        for (errors, reason) in [
+            (vec![], None),
+            (vec![Other], None),
+            (
+                vec![InvalidInput, InvalidInput],
+                Some("directory sync unsupported"),
+            ),
+            (vec![Other, Unsupported], Some("directory sync unsupported")),
+            (vec![Other, Other], Some("directory sync failed")),
         ] {
             store(&p, "tok").unwrap();
             crate::testlog::start();
@@ -401,21 +406,23 @@ mod tests {
             DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
             assert_eq!(read(&p).unwrap(), None, "the token outlived the sign-out");
             assert_eq!(left, 0, "{errors:?}: not every sync was tried");
-            if durable {
-                assert_eq!(forgot, Forgotten::Durable, "{errors:?}");
-            } else {
-                assert!(
-                    matches!(&forgot, Forgotten::NotDurable(why) if why.contains("directory sync failed")),
-                    "{forgot:?}"
-                );
-                let lines = crate::testlog::lines();
-                assert!(
-                    lines
-                        .iter()
-                        .any(|l| l.contains("token file removed but not synced")
-                            && l.contains("verdict=signed_out_not_durable")),
-                    "{lines:?}"
-                );
+            match reason {
+                None => assert_eq!(forgot, Forgotten::Durable, "{errors:?}"),
+                Some(reason) => {
+                    assert!(
+                        matches!(&forgot, Forgotten::NotDurable(why) if why.contains(reason)),
+                        "{errors:?}: {forgot:?}"
+                    );
+                    let lines = crate::testlog::lines();
+                    assert!(
+                        lines
+                            .iter()
+                            .any(|l| l.contains("token file removed but not synced")
+                                && l.contains(reason)
+                                && l.contains("verdict=signed_out_not_durable")),
+                        "{errors:?}: {lines:?}"
+                    );
+                }
             }
         }
     }
