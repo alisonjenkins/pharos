@@ -52,12 +52,31 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   the innermost, taken after the store's. A refused request or promotion
   discards the staged bytes and parks the run: the record and its files stay
   Downloading for the owner (`reason=token_owner_mismatch`).
+- A user is paired with the token only for the token their `me` request was
+  built with. `me_request` takes the token on file then, and the answer
+  pairs through `token::store_user_if`, which compares that token with the
+  one on file under the file's lock. A token stored since (another
+  account's sign-in) is left unpaired (`verdict=refused
+  reason=token_changed`), so a download check that needs its user fails
+  closed. A new token is always written with no user. A sign-in resumes
+  parked downloads only after the pairing has succeeded.
+- `proxy_get` itself drops a token that may not go to its URL
+  (`token_allowed`), as well as its caller and each redirect hop.
+- A sign-out's token removal is synced to its folder (one retry; EINVAL or
+  ENOTSUP counts as done). A sync that still fails leaves the device signed
+  out and is reported (`Forgotten::NotDurable`, logged
+  `verdict=signed_out_not_durable`).
 - A session end parks the ended user's runs before another user's token can
   be used: the session-end hook (`offline_video::forget_user`) calls
   `VideoStore::park_runs`, for every run when whose session it was is not
   known. A sign-in resumes that user's parked downloads
   (`VideoStore::resume_user`). The binding is the guarantee, and the park
-  stops the work.
+  stops the work. A parked run stalled mid-body still has its staging file:
+  until that writer stops, its bytes count against the cap
+  (`State::draining`), and a resumed run waits before it plans.
+- The stale share an admitted plan could not prune is a field of its record
+  (`KeptVideo::stale_on_disk`, not saved), so a removal or a replacing
+  record drops it with the record.
 - A staging file that is not promoted is deleted, and its accounting rolled
   back, in `Staged`'s `Drop`, under the shared admission lock and then the
   store's lock. Every path runs it: a named failure, a revoked run and a
@@ -109,8 +128,16 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 
 ## Consequences
 
-- Video cannot evict music or the reverse: a full shared budget refuses the
-  new download and the viewer frees space by removing something.
+- A video admission never evicts anything: one that does not fit the
+  shared budget is refused, and the viewer frees space by removing
+  something.
+- Music can make room for video: when what video holds grows, the music
+  cache trims (`Cache::set_outside_used`, then `evict_locked`). It evicts the
+  least recently played finished music that is not pinned, queued or
+  playing, and keeps the video. Video is never evicted for music.
+- The cache can stay over its cap when all the music left is protected
+  (pinned, queued or playing): nothing is evictable, and the cache logs
+  `cache over cap ... nothing is evictable`.
 - Before the music cache is enabled there is nothing to ask for the cap or
   the music's bytes, so new video downloads are refused until it is (V1464);
   a cap raised in settings takes effect once the cache is up.
