@@ -75,6 +75,8 @@ pub struct Mixed {
     pub relaxed: Vec<Relax>,
     /// Audiobook tracks the user may hear that were kept out of the pool.
     pub books_left_out: usize,
+    /// The asked seed was an audiobook's track, so the mix ran unseeded.
+    pub book_seed_dropped: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,7 @@ pub async fn mix(state: &AppState, user: &User, ask: MixAsk, now: i64) -> Result
                 picked = m.picks.len(),
                 pool = m.pool,
                 books_left_out = m.books_left_out,
+                book_seed_dropped = m.book_seed_dropped,
                 eligible = m.eligible,
                 exhausted = m.exhausted,
                 relaxed = ?relaxed,
@@ -236,7 +239,17 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
     let mut page = library::query(state, user, None, &q)
         .await
         .map_err(|e| MixError::Store(e.to_string()))?;
-    let books_left_out = keep_music(&mut page.items, &state.course_roots());
+    let roots = state.course_roots();
+    // A mix saved before V1467 may still name an audiobook's track as its
+    // seed: it mixes music as if unseeded rather than failing.
+    let book_seed = match ask.seed {
+        Seed::Song(id) => page
+            .items
+            .iter()
+            .any(|i| i.id == id && roots.root_of(&i.path).is_some()),
+        Seed::None | Seed::Follow => false,
+    };
+    let books_left_out = keep_music(&mut page.items, &roots);
     let ids: Vec<u64> = page.items.iter().map(|i| i.id).collect();
     // In chunks: the store binds one variable per id, and SQLite allows
     // 32766 in one statement.
@@ -260,6 +273,7 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
     let at: HashMap<u64, usize> = pool.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
     spec.seed = match ask.seed {
         Seed::None => None,
+        Seed::Song(_) if book_seed => None,
         Seed::Song(id) => Some(
             at.get(&id)
                 .map(|&i| pool[i].clone())
@@ -274,7 +288,8 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
             .map(|&i| pool[i].clone()),
     };
     if spec.seed.is_none() {
-        // Following with nothing heard yet: nothing to be like.
+        // Following with nothing heard yet, or an audiobook's track as the
+        // seed: nothing to be like.
         spec.rules.retain(|r| r.test != Test::LikeSeed);
     }
 
@@ -310,6 +325,7 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         exhausted: batch.exhausted,
         relaxed: batch.relaxed,
         books_left_out,
+        book_seed_dropped: book_seed,
     })
 }
 
@@ -353,6 +369,7 @@ mod tests {
                 exhausted,
                 relaxed: vec![],
                 books_left_out: 0,
+                book_seed_dropped: false,
             })
         };
         let labels = [
