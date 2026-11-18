@@ -19,7 +19,11 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   `VideoStore` for any host with a directory. The phone registers it under
   `<files dir>/video` from both the root component's first render and the
   media service's init hook, each through `register_video_root`, guarded by
-  `OpenOnce` so the store is opened once per process.
+  `OpenOnce` so the store is opened once per process. The second caller can
+  return while the first is still opening the store, so the UI never takes
+  one read as final: the app's root waits for the slot to be published
+  (`Slot::published`, in a task, never blocking the UI thread) and every
+  reader re-renders then (`kept_video_view::shown_video_store`).
 - Keys are `path + query` (`request_key`). Each key is a file named by a
   128-bit hash under `<root>/<user>/<item>/files/`, beside `manifest.json`
   (the `KeptVideo` record). A file is written as `.part` then renamed, so an
@@ -38,7 +42,8 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   (`PHAROS_TV_SERVER`) whatever its scheme (`tv_page::token_allowed`).
 - The proxy's client follows no redirect itself (`Policy::none()`). The
   proxy follows up to 5 hops by hand through `tv_page::redirect_hop`: the
-  token is kept only on its own origin, dropped on another origin, and a
+  token is kept only on its own origin (an IPv6 host compared by address,
+  whatever its spelling), dropped on another origin, and a
   hop down to http is refused. The download client follows a redirect only
   to the same scheme, host and port.
 - Neither client has a fallback. One that cannot be built (its TLS config
