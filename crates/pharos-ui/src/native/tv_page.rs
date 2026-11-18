@@ -352,6 +352,17 @@ pub async fn proxy_get<T: ProxyTransport>(
         passed_back,
         max_hops,
     } = get;
+    // Checked here as well as by the caller: the core never sends the token
+    // where it may not go, whatever it was handed.
+    if token.is_some() {
+        if let Err(reason) = token_allowed(&url, build_server) {
+            log(
+                Level::Warn,
+                format!("pharos: proxy token withheld reason={reason}"),
+            );
+            token = None;
+        }
+    }
     let mut hops = 0usize;
     let resp = loop {
         let mut sent = Vec::with_capacity(headers.len() + 1);
@@ -1736,6 +1747,70 @@ mod tests {
             .unwrap();
         assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A transport that answers every request with 200 and keeps the
+    /// headers each one was sent with.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<Vec<(String, String)>>>);
+
+    #[allow(clippy::unwrap_used)]
+    impl ProxyTransport for Recording {
+        type Response = TcpAnswer;
+        async fn get(&self, _: &str, headers: &[(String, String)]) -> Result<TcpAnswer, String> {
+            self.0.lock().unwrap().push(headers.to_vec());
+            Ok(TcpAnswer(200, Vec::new()))
+        }
+    }
+
+    /// The proxy core withholds the token itself from a URL it may not go
+    /// to (plain http to a server other than the build's), whatever its
+    /// caller passed in, and logs why.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_proxy_request_to_a_disallowed_url_sends_no_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let logged = std::sync::Mutex::new(Vec::new());
+        let log = |_: Level, line: String| logged.lock().unwrap().push(line);
+        let client = proxy_client(|| Ok(Recording::default()));
+        let get = |url: &str| ProxyGet {
+            url: url.to_owned(),
+            token: Some("tok".to_owned()),
+            headers: &[],
+            build_server: "https://media.example.org",
+            passed_back: &[],
+            max_hops: 5,
+        };
+        rt.block_on(proxy_get(
+            &client,
+            get("http://192.168.1.9:8096/Items"),
+            &log,
+        ))
+        .unwrap();
+        rt.block_on(proxy_get(
+            &client,
+            get("https://media.example.org/Items"),
+            &log,
+        ))
+        .unwrap();
+        let sent = client.as_ref().unwrap().0.lock().unwrap().clone();
+        let carries = |h: &Vec<(String, String)>| h.iter().any(|(n, _)| n == "X-Emby-Token");
+        assert!(
+            !carries(&sent[0]),
+            "the token went over plain http: {sent:?}"
+        );
+        assert!(carries(&sent[1]), "the token was withheld over https");
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("pharos: proxy token withheld reason=")),
+            "{:?}",
+            logged.lock().unwrap()
+        );
     }
 
     /// An IPv6 server spelled two ways is one origin: a relative redirect
