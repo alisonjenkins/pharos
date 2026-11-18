@@ -559,33 +559,42 @@ impl State {
         }
     }
 
-    /// What the other running downloads have yet to write: their estimate
-    /// less what they have stored whole and what they have staged. The free
-    /// space already lacks what is on disk, so only the rest is still to
-    /// come out of it.
+    /// What a running download has yet to write of its reservation: the
+    /// reservation less everything of it already on disk
+    /// ([`State::run_on_disk`]: its whole files, its staged bytes and the
+    /// stale files its plan could not prune). The free space already lacks
+    /// what is on disk, so only the rest is still to come out of it. This is
+    /// the one place a figure owed to the disk is taken: every admission's
+    /// owed figure is built from it. `run` is the run that owns the record;
+    /// with none, nothing is staged under it.
+    fn owed(&self, v: &KeptVideo, run: Option<u64>) -> u64 {
+        let on_disk = match run {
+            Some(run) => self.run_on_disk(v, run),
+            None => {
+                let stored = match v.state {
+                    KeptState::Downloading { bytes, .. } => bytes,
+                    _ => v.bytes(),
+                };
+                stored.saturating_add(
+                    self.stale_floor
+                        .get(&(v.user.clone(), v.item.clone()))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            }
+        };
+        v.estimated_bytes.saturating_sub(on_disk)
+    }
+
+    /// What the other running downloads have yet to write ([`State::owed`]).
     fn outstanding(&self, user: &str, item: &str) -> u64 {
         self.list
             .iter()
             .filter(|v| !(v.user == user && v.item == item))
-            .filter_map(|v| match v.state {
-                KeptState::Downloading { bytes, .. } => {
-                    // Only the run that owns the record: its estimate is
-                    // what these bytes are taken from.
-                    let staged = self
-                        .runs
-                        .get(&(v.user.clone(), v.item.clone()))
-                        .and_then(|run| {
-                            self.staged
-                                .get(&(v.user.clone(), v.item.clone(), *run))
-                                .copied()
-                        })
-                        .unwrap_or(0);
-                    Some(
-                        v.estimated_bytes
-                            .saturating_sub(bytes.saturating_add(staged)),
-                    )
-                }
-                _ => None,
+            .filter(|v| matches!(v.state, KeptState::Downloading { .. }))
+            .map(|v| {
+                let run = self.runs.get(&(v.user.clone(), v.item.clone())).copied();
+                self.owed(v, run)
             })
             .fold(0u64, u64::saturating_add)
     }
@@ -1568,7 +1577,7 @@ impl Inner {
             let owed = st
                 .outstanding(user, item)
                 .saturating_add(other_outstanding)
-                .saturating_add(current.saturating_sub(on_disk));
+                .saturating_add(st.owed(v, Some(run)));
             let free = budget.free_bytes();
             let room = free.saturating_sub(owed);
             let fits_at = |to: u64| {
@@ -6053,6 +6062,50 @@ mod tests {
         let files = rig.dir.join("u1").join("1").join("files");
         assert_eq!(on_disk(&files), 0, "something was kept");
         assert!(!lines("pharos: video keep refused item=1 reason=playlist_too_large").is_empty());
+    }
+
+    /// A running download beside 20 MB of stale files its prune could not
+    /// delete owes only its plan's share: the stale files are on disk
+    /// already, so the free space has lost them. A second download that
+    /// fits the free space left above the guard is admitted beside it.
+    #[tokio::test]
+    async fn stale_files_on_disk_are_not_owed_by_a_running_download() {
+        let rig = Rig::new("stale-not-owed");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 20_000_000]).unwrap();
+        rig.server.failures.lock().unwrap().clear();
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        // Room above the guard for both plans, not for the stale files too.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + 7_000_000, Ordering::SeqCst);
+        let release = rig.server.hold_mid_body(SEG1);
+        store.start(request("1")).unwrap();
+        let first = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(first.state, KeptState::Failed { .. }),
+            "{first:?}"
+        );
+        rig.server.reached_mid_body(SEG1).await;
+        let owed = store.outstanding_bytes();
+        assert!(
+            owed <= estimate,
+            "the running download owes {owed}, past its plan's {estimate}"
+        );
+        store.start(request("2")).unwrap();
+        let second = plan_decided(&store, "2").await;
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !matches!(second.state, KeptState::Failed { .. }),
+            "the second was refused: {second:?}"
+        );
     }
 
     /// Two downloads that each fit alone but not together: the second
