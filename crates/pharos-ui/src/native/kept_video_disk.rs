@@ -1297,12 +1297,17 @@ impl Inner {
                     .to_owned(),
             ))
         } else {
-            fits(
-                shortfall,
-                used.saturating_add(own),
-                cap,
-                budget.free_bytes().saturating_sub(outstanding),
-            )
+            // The cap is asked for the shortfall only; the disk must hold
+            // every byte the playlist can write, whatever the reservation
+            // covers, above the guard and the other downloads' owed bytes.
+            fits(shortfall, used.saturating_add(own), cap, u64::MAX).and_then(|()| {
+                fits(
+                    PLAYLIST_MAX_BYTES,
+                    0,
+                    u64::MAX,
+                    budget.free_bytes().saturating_sub(outstanding),
+                )
+            })
         };
         match verdict {
             Ok(()) => {
@@ -7334,6 +7339,34 @@ mod tests {
         let refused = lines("pharos: video keep refused item=1");
         assert!(
             refused.iter().any(|l| l.contains("step=playlist")),
+            "{refused:?}"
+        );
+    }
+
+    /// A resume whose reservation covers its playlist's allowance still
+    /// needs the disk to hold every byte the playlist can write: with free
+    /// space exactly at the guard, the fetch is refused.
+    #[tokio::test]
+    async fn a_resume_at_the_free_space_guard_fetches_no_playlist() {
+        let (rig, _dir) = resume_missing_its_master("playlist-low-space", 100 * GIB).await;
+        rig.budget.free.store(FREE_GUARD_BYTES, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let v = only(&store);
+        let KeptState::Failed { reason } = &v.state else {
+            panic!("a resume at the guard went on: {v:?}");
+        };
+        assert!(
+            rig.server.asked().is_empty(),
+            "fetched {:?}",
+            rig.server.asked()
+        );
+        assert!(reason.contains("free"), "{reason}");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("step=playlist") && l.contains("extended=0 ")),
             "{refused:?}"
         );
     }
