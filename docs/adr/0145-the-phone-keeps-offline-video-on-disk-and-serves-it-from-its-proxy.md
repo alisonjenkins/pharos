@@ -41,7 +41,11 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   alone, not by the signed-in user, so a cached copy could be answered to
   the next user on the phone. The file on disk is already the cache.
 - The device token is sent only over https, or to the build's own server
-  (`PHAROS_TV_SERVER`) whatever its scheme (`tv_page::token_allowed`).
+  (`PHAROS_TV_SERVER`) whatever its scheme (`tv_page::token_allowed`). A
+  build pointed at a plain-http server outside loopback (one on the LAN)
+  sends the token to it unencrypted, readable by anyone on that network.
+  That is an accepted risk for LAN builds: the build names its server, and
+  https is the remedy.
 - A download carries only its owner's token. Each run belongs to the user
   its record was kept for, also when an open restarts it. Every request reads
   the token and its user in one read of the token file, and is sent only
