@@ -30,6 +30,9 @@ pub enum ClientError {
     Status { status: u16, body: String },
     #[error("parse: {0}")]
     Parse(String),
+    /// The HTTP client could not be built: nothing is sent.
+    #[error("client: {0}")]
+    NoClient(String),
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +58,9 @@ impl Default for DeviceInfo {
 pub struct JellyfinClient {
     base: String,
     device: DeviceInfo,
-    http: Client,
+    /// The client, or why it could not be built; never a default client
+    /// in its place.
+    http: Result<Client, String>,
     token: Option<String>,
 }
 
@@ -63,7 +68,7 @@ pub struct JellyfinClient {
 /// with `rustls-no-provider` (the workspace setting) panics at build time
 /// without a crypto provider. Hand it a ring config with no roots: no TLS
 /// handshake can succeed, and none is ever attempted.
-fn http_client() -> Client {
+fn http_client() -> Result<Client, String> {
     let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -79,7 +84,9 @@ fn http_client() -> Client {
             Client::builder()
         }
     };
-    builder.build().unwrap_or_default()
+    builder
+        .build()
+        .map_err(|e| format!("the test client could not be built: {e}"))
 }
 
 impl JellyfinClient {
@@ -126,9 +133,15 @@ impl JellyfinClient {
 
     // ------ public Jellyfin API surface ------
 
+    fn http(&self) -> Result<&Client, ClientError> {
+        self.http
+            .as_ref()
+            .map_err(|why| ClientError::NoClient(why.clone()))
+    }
+
     pub async fn system_info_public(&self) -> Result<SystemInfo, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/System/Info/Public", self.base),
             HeaderMap::new(),
         )
@@ -154,7 +167,7 @@ impl JellyfinClient {
             "Pw": password,
         });
         let resp = self
-            .http
+            .http()?
             .post(format!("{}/Users/AuthenticateByName", self.base))
             .headers(h)
             .json(&body)
@@ -177,7 +190,7 @@ impl JellyfinClient {
 
     pub async fn users_me(&self) -> Result<User, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/Users/Me", self.base),
             self.auth_headers(),
         )
@@ -186,7 +199,7 @@ impl JellyfinClient {
 
     pub async fn items(&self) -> Result<ItemsResult, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/Items", self.base),
             self.auth_headers(),
         )
@@ -195,7 +208,7 @@ impl JellyfinClient {
 
     pub async fn item(&self, id: &str) -> Result<BaseItem, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/Items/{id}", self.base),
             self.auth_headers(),
         )
@@ -204,7 +217,7 @@ impl JellyfinClient {
 
     pub async fn library_virtual_folders(&self) -> Result<Vec<VirtualFolder>, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/Library/VirtualFolders", self.base),
             self.auth_headers(),
         )
@@ -213,7 +226,7 @@ impl JellyfinClient {
 
     pub async fn videos_stream_head(&self, item_id: &str) -> Result<StatusCode, ClientError> {
         let resp = self
-            .http
+            .http()?
             .head(format!("{}/Videos/{item_id}/stream", self.base))
             .headers(self.auth_headers())
             .send()
@@ -223,7 +236,7 @@ impl JellyfinClient {
 
     pub async fn sessions(&self) -> Result<Vec<SessionInfo>, ClientError> {
         get_json(
-            &self.http,
+            self.http()?,
             &format!("{}/Sessions", self.base),
             self.auth_headers(),
         )
