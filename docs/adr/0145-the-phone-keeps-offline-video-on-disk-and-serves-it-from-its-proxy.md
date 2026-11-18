@@ -131,10 +131,14 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 - A video admission never evicts anything: one that does not fit the
   shared budget is refused, and the viewer frees space by removing
   something.
-- Music can make room for video: when what video holds grows, the music
-  cache trims (`Cache::set_outside_used`, then `evict_locked`). It evicts the
-  least recently played finished music that is not pinned, queued or
-  playing, and keeps the video. Video is never evicted for music.
+- Music can make room for video. The music cache's trim (`evict_locked`)
+  counts what video holds whenever it runs: when the video hook is
+  installed (`Cache::set_outside_used`, also when the cache comes up with a
+  pending hook), when the cap changes (`set_cap`), when a music track
+  commits (`commit`) and when a container is unpinned (`unpin`). Video
+  growth does not start a trim; it is counted at the next one. The trim
+  evicts the least recently played finished music that is not pinned,
+  queued or playing, and keeps the video. Video is never evicted for music.
 - The cache can stay over its cap when all the music left is protected
   (pinned, queued or playing): nothing is evictable, and the cache logs
   `cache over cap ... nothing is evictable`.
