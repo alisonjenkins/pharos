@@ -168,6 +168,10 @@ struct State {
     /// (admitted as estimate plus stale), on disk already, and in none of
     /// its stored or staged figures, so counted here once.
     stale_floor: HashMap<(String, String), u64>,
+    /// Per run of a resume, before its plan is admitted (the admission
+    /// drops it): what its folder held when its first playlist was
+    /// reserved, and the playlist allowances it has taken since.
+    playlists_taken: HashMap<(String, String, u64), (u64, u64)>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -1204,6 +1208,18 @@ impl Inner {
             .saturating_add(other_outstanding)
             .saturating_add(progress.unwrap_or(0));
         let cap = budget.cap_bytes();
+        // What the folder holds before this run fetches anything into it
+        // (the run owns the folder, and planning writes nothing else there).
+        // Measured outside the lock, and only on a run's first playlist.
+        let who = (user.to_owned(), item.to_owned(), run);
+        let (held, dir) = {
+            let st = lock(&self.state);
+            (
+                st.playlists_taken.get(&who).map(|t| t.0),
+                st.dir_of(user, item),
+            )
+        };
+        let held = held.unwrap_or_else(|| dir_size(&dir).bytes);
         let mut st = lock(&self.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return Err(Stop::Gone);
@@ -1211,6 +1227,23 @@ impl Inner {
         let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
         let used = st.reserved_by_others(user, item).saturating_add(other);
         let own = find(&st.list, user, item).map_or(0, reserved);
+        // A resume takes the allowance from what its own reservation has
+        // not used yet: the reservation less what the folder held at the
+        // run's first playlist (or what the run holds, if more) and the
+        // allowances already taken. It asks the cap only for the shortfall.
+        // A new download has no reservation of its own to draw on (a figure
+        // it inherits counts files on disk), so it asks for the whole
+        // allowance.
+        let taken = st.playlists_taken.get(&who).map_or(0, |t| t.1);
+        let shortfall = match find(&st.list, user, item) {
+            Some(v) if !v.files.is_empty() => st
+                .run_holds(v, run)
+                .max(held)
+                .saturating_add(taken)
+                .saturating_add(PLAYLIST_MAX_BYTES)
+                .saturating_sub(own),
+            _ => PLAYLIST_MAX_BYTES,
+        };
         let verdict = if let Some(refusal) = st.unknown_folder() {
             Err(refusal)
         } else if !ready {
@@ -1224,7 +1257,7 @@ impl Inner {
             ))
         } else {
             fits(
-                PLAYLIST_MAX_BYTES,
+                shortfall,
                 used.saturating_add(own),
                 cap,
                 budget.free_bytes().saturating_sub(outstanding),
@@ -1237,14 +1270,16 @@ impl Inner {
                     .iter_mut()
                     .find(|v| v.user == user && v.item == item)
                 {
-                    v.estimated_bytes = own.saturating_add(PLAYLIST_MAX_BYTES);
+                    v.estimated_bytes = own.saturating_add(shortfall);
                 }
+                st.playlists_taken.entry(who).or_insert((held, 0)).1 += PLAYLIST_MAX_BYTES;
                 drop(st);
                 emit(
                     false,
                     format!(
-                        "pharos: video playlist reserved item={item} url_path={} bytes={PLAYLIST_MAX_BYTES} used={} cap={cap}",
+                        "pharos: video playlist reserved item={item} url_path={} bytes={PLAYLIST_MAX_BYTES} extended={shortfall} from_own={} held={held} taken={taken} used={} cap={cap}",
                         url_path(key),
+                        PLAYLIST_MAX_BYTES.saturating_sub(shortfall),
                         used.saturating_add(own)
                     ),
                 );
@@ -1255,7 +1290,7 @@ impl Inner {
                 emit(
                     true,
                     format!(
-                        "pharos: video keep refused item={item} reason={refusal} step=playlist url_path={} reserve={PLAYLIST_MAX_BYTES} used={} cap={cap}",
+                        "pharos: video keep refused item={item} reason={refusal} step=playlist url_path={} reserve={PLAYLIST_MAX_BYTES} extended={shortfall} held={held} taken={taken} used={} cap={cap}",
                         url_path(key),
                         used.saturating_add(own)
                     ),
@@ -1379,6 +1414,8 @@ impl Inner {
             // The reservation holds what the plan will take and what an
             // earlier plan still leaves on disk.
             v.estimated_bytes = plan.wants();
+            // The plan's estimate replaces the playlists' allowances.
+            let who = (user.to_owned(), item.to_owned(), run);
             // A plan is admitted: the estimate is a reserved one now.
             v.estimate_from_adoption = false;
             v.state = KeptState::Downloading {
@@ -1389,6 +1426,7 @@ impl Inner {
             // The stale share is on disk already: media may not grow into it.
             st.stale_floor
                 .insert((user.to_owned(), item.to_owned()), plan.stale);
+            st.playlists_taken.remove(&who);
         }
         #[cfg(test)]
         self.plans_admitted
@@ -7084,6 +7122,46 @@ mod tests {
             only(&reopened).state,
             KeptState::Ready,
             "a folder was taken for a whole file"
+        );
+    }
+
+    /// An interrupted download whose master playlist is gone resumes
+    /// under a shared cap its reservation and music already fill: the
+    /// playlist's allowance comes out of the reservation's unused share, and
+    /// the cap is asked only for any shortfall (none here).
+    #[tokio::test]
+    async fn a_resume_takes_a_missing_playlists_allowance_from_its_own_reservation() {
+        const GIB: u64 = 1 << 30;
+        let rig = Rig::new("resume-playlist-own");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 3,
+            total: 5,
+            bytes: 1,
+        };
+        v.estimated_bytes = 3 * GIB;
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(MASTER_KEY))).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
+        rig.budget.cap.store(4 * GIB, Ordering::SeqCst);
+        rig.budget.other.store(GIB, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        let reserved = lines("pharos: video playlist reserved item=1");
+        assert!(
+            reserved
+                .iter()
+                .any(|l| l.contains("extended=0 from_own=256 ") && l.contains(" taken=0 ")),
+            "{reserved:?}"
         );
     }
 
