@@ -51,6 +51,17 @@ async fn wire_mix(
     recent: &[u64],
     count: u32,
 ) -> Result<Wire, String> {
+    wire_mix_seeded(session, None, rules, recent, count).await
+}
+
+/// [`wire_mix`] with an optional song seed.
+async fn wire_mix_seeded(
+    session: &session::Client,
+    seed: Option<u64>,
+    rules: &[(MixWeight, u8, &str)],
+    recent: &[u64],
+    count: u32,
+) -> Result<Wire, String> {
     let library = session.library_request().send().pipeline.get_library();
     let mut req = library.mix_request();
     {
@@ -58,7 +69,10 @@ async fn wire_mix(
         p.reborrow().init_ctx();
         let mut spec = p.reborrow().init_spec();
         spec.set_artist_gap(1);
-        spec.reborrow().init_seed().set_none(());
+        match seed {
+            Some(id) => spec.reborrow().init_seed().init_song().set_real(id),
+            None => spec.reborrow().init_seed().set_none(()),
+        }
         let mut list = spec.init_rules(rules.len() as u32);
         for (i, (weight, share, genre)) in rules.iter().enumerate() {
             let mut r = list.reborrow().get(i as u32);
@@ -344,4 +358,31 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
         "{}",
         logs.text()
     );
+
+    // Over the wire too: a saved mix whose seed is an audiobook's track
+    // gets a batch of music, not an error.
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            let batch = wire_mix_seeded(
+                &session,
+                Some(3_100),
+                &[(MixWeight::Require, 0, "Pop")],
+                &[],
+                3,
+            )
+            .await
+            .expect("a batch, not an error");
+            assert_eq!(batch.picks.len(), 3);
+            assert!(
+                batch
+                    .picks
+                    .iter()
+                    .all(|(id, _)| (3_000..3_005).contains(id)),
+                "{:?}",
+                batch.picks
+            );
+        })
+        .await;
 }
