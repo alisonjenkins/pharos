@@ -348,6 +348,16 @@ struct Plan {
     stale: u64,
 }
 
+impl Plan {
+    /// What the plan holds against the cap: the larger of its estimate and
+    /// the planned bytes already on disk (a file can be larger than
+    /// planned), plus the stale files it could not prune, which are on disk
+    /// too and in neither figure.
+    fn wants(&self) -> u64 {
+        self.estimate.max(self.stored).saturating_add(self.stale)
+    }
+}
+
 /// The room a download is admitted against, read by the caller.
 #[derive(Clone, Copy)]
 enum Check {
@@ -1324,7 +1334,7 @@ impl Inner {
                     // only to what is not on disk yet (a re-planned resume
                     // has stored bytes the disk already lacks).
                     fits(
-                        plan.estimate,
+                        plan.estimate.max(plan.stored),
                         used.saturating_add(plan.stale),
                         cap,
                         u64::MAX,
@@ -1368,7 +1378,7 @@ impl Inner {
             v.files.clone_from(&plan.files);
             // The reservation holds what the plan will take and what an
             // earlier plan still leaves on disk.
-            v.estimated_bytes = plan.estimate.saturating_add(plan.stale);
+            v.estimated_bytes = plan.wants();
             // A plan is admitted: the estimate is a reserved one now.
             v.estimate_from_adoption = false;
             v.state = KeptState::Downloading {
@@ -2562,7 +2572,7 @@ async fn plan_and_admit(
         // from adoption (the missing files were never reserved), or whose
         // plan asks for more than it holds, passes the shared cap as a fresh
         // download, its own reservation not counted.
-        let wants = plan.estimate.saturating_add(plan.stale);
+        let wants = plan.wants();
         let replan = if !resume {
             None
         } else if record.estimate_from_adoption {
@@ -5674,6 +5684,49 @@ mod tests {
                 "{case}: kept {kept} with {on_disk} on disk"
             );
         }
+    }
+
+    /// A new download over a planned file larger than its estimate and a
+    /// stale file the prune cannot delete is admitted holding both: the
+    /// larger of estimate and stored, plus the stale share, never the larger
+    /// of stored and estimate plus stale.
+    #[tokio::test]
+    async fn an_oversized_planned_file_and_a_stale_one_are_both_reserved() {
+        let rig = Rig::new("oversized-and-stale");
+        // Larger than the plan's whole estimate.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![1; 4_000_000]);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.stored_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        // 2 MB of an earlier plan that the prune cannot delete.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+        let on_disk = dir_size(&files).bytes;
+        ADMITTED.with(|a| a.set(None));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let admitted = ADMITTED
+            .with(std::cell::Cell::get)
+            .expect("no plan was admitted");
+        assert!(
+            admitted >= on_disk,
+            "admitted at {admitted} with {on_disk} on disk"
+        );
     }
 
     /// A playlist past its limit is refused and not kept: its reservation
