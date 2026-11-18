@@ -260,3 +260,87 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
         Err(mix::MixError::SeedNotFound(2_100))
     ));
 }
+
+/// V1467 — a mix plays music only: an audiobook's tracks (songs whose
+/// innermost library is a Books library, ADR-0132) never join a song's
+/// pool, natively or through `InstantMix`, and the log line counts what was
+/// kept out. An audiobook track's instant mix stays on the audiobooks.
+/// Disarm check: with `keep_music` keeping everything, the native mix picks
+/// book tracks and `books_left_out` reads 0; with `same_shelf_songs` not
+/// filtering, the instant mix returns book tracks.
+#[actix_web::test]
+async fn a_mix_never_plays_an_audiobooks_tracks() {
+    use pharos_core::LibraryKind;
+    let fx = crate::common::seed_rich().await;
+    fx.state
+        .stores
+        .upsert_library("Tunes", "/libMusic", LibraryKind::Music, &"e".repeat(32))
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .upsert_library("Reading", "/libBooks", LibraryKind::Books, &"d".repeat(32))
+        .await
+        .unwrap();
+    put_songs(&fx, 3_000, "/libMusic", &[("Band", "Pop", 2001)], 5).await;
+    put_songs(&fx, 3_100, "/libBooks", &[("Author", "Pop", 2001)], 5).await;
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let ask = MixAsk {
+        rules: vec![Rule {
+            weight: Weight::Require,
+            share: None,
+            test: Test::Genre("Pop".into()),
+        }],
+        seed: Seed::None,
+        artist_gap: 0,
+        album_gap: 0,
+        recent: vec![],
+        count: 20,
+    };
+    let mixed = mix::mix(&fx.state, &user, ask, 0).await.unwrap();
+    let ids: Vec<u64> = mixed.picks.iter().map(|p| p.item.id).collect();
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
+    assert_eq!(mixed.books_left_out, 5);
+    assert!(logs.text().contains("books_left_out=5"), "{}", logs.text());
+    let book_seed = MixAsk {
+        rules: vec![],
+        seed: Seed::Song(3_100),
+        artist_gap: 0,
+        album_gap: 0,
+        recent: vec![],
+        count: 1,
+    };
+    assert!(matches!(
+        mix::mix(&fx.state, &user, book_seed, 0).await,
+        Err(mix::MixError::SeedNotFound(3_100))
+    ));
+
+    let app = actix_web::test::init_service(crate::common::build_app(fx.state.clone())).await;
+    for (seed, shelf) in [(3_000u64, 3_000..3_005), (3_100, 3_100..3_105)] {
+        let req = actix_web::test::TestRequest::get()
+            .uri(&format!("/Items/{seed}/InstantMix?Limit=50"))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request();
+        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
+        let got: Vec<u64> = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| pharos_jellyfin_api::dto::parse_item_id(i["Id"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(got.len(), 5, "seed {seed}: {got:?}");
+        assert!(
+            got.iter().all(|id| shelf.contains(id)),
+            "seed {seed}: {got:?}"
+        );
+    }
+}
