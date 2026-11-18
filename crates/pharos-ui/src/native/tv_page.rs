@@ -255,7 +255,17 @@ pub fn redirect_hop(from: &str, to: &str, build_server: &str) -> Hop {
 pub fn built_client<C, E: std::fmt::Display>(
     build: impl FnOnce() -> Result<C, E>,
 ) -> Result<C, String> {
-    build().map_err(|e| format!("the download client could not be built: {e}"))
+    built_client_for("download", build)
+}
+
+/// [`built_client`] for the client named `what` (the proxy's, the
+/// download's): one that cannot be built is the error, naming it, never a
+/// default client in its place.
+pub fn built_client_for<C, E: std::fmt::Display>(
+    what: &str,
+    build: impl FnOnce() -> Result<C, E>,
+) -> Result<C, String> {
+    build().map_err(|e| format!("the {what} client could not be built: {e}"))
 }
 
 /// An error and every cause under it, `outer: inner: ...`, for a log line.
@@ -1468,6 +1478,25 @@ mod tests {
         assert!(why.contains("tls backend unavailable"), "{why}");
         assert!(why.contains("download client"), "{why}");
         assert_eq!(built_client(|| Ok::<_, String>(7)), Ok(7));
+    }
+
+    /// The proxy's client that cannot be built is an error naming the proxy
+    /// and why, so every proxied request is refused, never sent through a
+    /// default client without the TLS config and redirect policy.
+    #[test]
+    fn a_proxy_client_that_cannot_be_built_refuses_every_request() {
+        let mut sent = false;
+        let client = built_client_for("proxy", || Err::<(), _>("tls config: no roots"));
+        let outcome = client.as_ref().map(|c| {
+            sent = true;
+            *c
+        });
+        assert!(!sent, "a request went out without its client");
+        let Err(why) = outcome else {
+            panic!("a client that was never built was used");
+        };
+        assert!(why.contains("proxy client"), "{why}");
+        assert!(why.contains("no roots"), "{why}");
     }
 
     /// A download sends the device token, so it follows a redirect only to

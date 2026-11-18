@@ -3111,8 +3111,12 @@ const PROXY_REDIRECTS: usize = 5;
 /// The response headers passed back to the page.
 const PASSED_BACK: [&str; 4] = ["content-type", "cache-control", "etag", "last-modified"];
 
-fn http() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+/// The proxy's client, or why there is none: one that cannot be built is
+/// never replaced by a default one (no TLS config, the default redirect
+/// policy that would carry the token), so every proxied request is refused.
+fn http() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // reqwest 0.13's default verifier is rustls-platform-verifier, which
@@ -3123,16 +3127,17 @@ fn http() -> &'static reqwest::Client {
         let builder = reqwest::Client::builder()
             .user_agent(tv_page::USER_AGENT)
             .redirect(reqwest::redirect::Policy::none());
-        let builder = match pharos_api::tls::client_config() {
-            Ok(tls) => builder.tls_backend_preconfigured(tls),
-            Err(error) => {
-                // ring is installed above, so this still builds; the platform
-                // verifier it falls back to fails every handshake loudly.
-                log::error!("server proxy TLS config failed to build: {error}");
-                builder
-            }
-        };
-        builder.build().unwrap_or_default()
+        let built = tv_page::built_client_for("proxy", || {
+            let tls = pharos_api::tls::client_config().map_err(|e| format!("tls config: {e}"))?;
+            builder
+                .tls_backend_preconfigured(tls)
+                .build()
+                .map_err(|e| e.to_string())
+        });
+        if let Err(why) = &built {
+            log::error!("pharos: proxy refused reason={why}");
+        }
+        built
     })
 }
 
@@ -3167,8 +3172,12 @@ async fn fetch_server(
     let mut url = tv_page::server_url(&base, path_and_query);
     let mut token = token_for(&url, "proxy");
     let mut hops = 0usize;
+    let client = http().as_ref().map_err(|why| {
+        log::warn!("pharos: proxy request refused reason={why}");
+        format!("stage=client {why}")
+    })?;
     let resp = loop {
-        let mut req = http().get(&url);
+        let mut req = client.get(&url);
         if let Some(token) = &token {
             req = req.header("X-Emby-Token", token);
         }
