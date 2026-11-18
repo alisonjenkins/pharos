@@ -142,7 +142,9 @@ pub fn proxied(segment: &str) -> bool {
 }
 
 /// Scheme, host and port of an absolute `http(s)` URL, lower-cased, the
-/// port defaulted by scheme. None for anything else.
+/// port defaulted by scheme, and an IPv6 literal in its one canonical
+/// spelling (`[2001:db8::1]` however it was written), so two spellings of
+/// one address are one origin. None for anything else.
 fn origin_of(url: &str) -> Option<(String, String, u16)> {
     let (scheme, rest) = url.split_once("://")?;
     let scheme = scheme.to_ascii_lowercase();
@@ -155,6 +157,11 @@ fn origin_of(url: &str) -> Option<(String, String, u16)> {
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
         let (host, after) = v6.split_once(']')?;
+        // An address that does not parse (a zone id, say) keeps its
+        // spelling, lower-cased below: it compares equal only as written.
+        let host = host
+            .parse::<std::net::Ipv6Addr>()
+            .map_or_else(|_| host.to_owned(), |a| a.to_string());
         (format!("[{host}]"), after.strip_prefix(':'))
     } else {
         match hostport.rsplit_once(':') {
@@ -1729,6 +1736,33 @@ mod tests {
             .unwrap();
         assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An IPv6 server spelled two ways is one origin: a relative redirect
+    /// comes back in the compressed spelling and keeps the token, the
+    /// download follows it, and the build's own server matches either way.
+    /// A different address is still another origin.
+    #[test]
+    fn an_ipv6_origin_spelled_two_ways_is_one_origin() {
+        let expanded = "https://[2001:0DB8:0:0:0:0:0:1]:8096/Items";
+        let compressed = "https://[2001:db8::1]:8096/Videos/1/stream";
+        assert_eq!(redirect_hop(expanded, compressed, ""), Hop::FollowWithToken);
+        assert_eq!(redirect_verdict(expanded, compressed), Ok(()));
+        assert_eq!(
+            token_allowed(
+                "http://[2001:db8::1]:8096/Items",
+                "http://[2001:0db8::0:1]:8096"
+            ),
+            Ok(())
+        );
+        let other = "https://[2001:db8::2]:8096/Videos/1/stream";
+        assert_eq!(redirect_hop(expanded, other, ""), Hop::FollowWithoutToken);
+        assert!(redirect_verdict(expanded, other).is_err());
+        assert!(token_allowed(
+            "http://[2001:db8::2]:8096/Items",
+            "http://[2001:db8::1]:8096"
+        )
+        .is_err());
     }
 
     /// The proxy's client that cannot be built is an error naming the proxy
