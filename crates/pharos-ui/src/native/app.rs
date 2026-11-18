@@ -1945,7 +1945,12 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
         async move {
             let ask = ask?;
             let me = fetch(ask.api.clone()).await?;
-            ask.answered(id(&me));
+            // A stale answer (its session ended after it was asked) names a
+            // user who is no longer current: nothing runs for it.
+            if !ask.answered(id(&me)) {
+                platform::info("pharos: video user me verdict=stale_answer_dropped");
+                return None;
+            }
             on_me(&me);
             Some(me)
         }

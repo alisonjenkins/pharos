@@ -825,7 +825,9 @@ mod tests {
         thread_local! {
             static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<String>>> =
                 const { RefCell::new(None) };
+            static ON_ME_RAN: Cell<bool> = const { Cell::new(false) };
         }
+        ON_ME_RAN.with(|r| r.set(false));
         let p = pref();
         remember_user("A");
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -847,7 +849,7 @@ mod tests {
                     })
                 }),
                 String::as_str,
-                Rc::new(|_: &String| {}),
+                Rc::new(|_: &String| ON_ME_RAN.with(|r| r.set(true))),
             );
             rsx! {}
         }
@@ -869,6 +871,10 @@ mod tests {
                 .await;
         });
         assert_eq!(last_user(), None, "the stale answer brought the user back");
+        assert!(
+            !ON_ME_RAN.with(Cell::get),
+            "the stale answer's follow-ups ran"
+        );
         assert!(ready_for_last_user().is_empty());
         assert_eq!(
             p.value.borrow().as_deref(),
