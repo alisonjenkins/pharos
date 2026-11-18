@@ -261,6 +261,15 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
     ));
 }
 
+/// Whether the last `mix: batch picked` line carries `field` as a whole token.
+fn batch_line_has(logs: &Captured, field: &str) -> bool {
+    logs.text()
+        .lines()
+        .rev()
+        .find(|l| l.contains("mix: batch picked"))
+        .is_some_and(|l| l.split_whitespace().any(|t| t == field))
+}
+
 /// V1467 — a mix plays music only: an audiobook's tracks (songs whose
 /// innermost library is a Books library, ADR-0132) never join a song's
 /// pool or seed a mix, and the log line counts what was kept out.
@@ -308,7 +317,7 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
     assert_eq!(ids.len(), 5, "{ids:?}");
     assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
     assert_eq!(mixed.books_left_out, 5);
-    assert!(logs.text().contains("books_left_out=5"), "{}", logs.text());
+    assert!(batch_line_has(&logs, "books_left_out=5"), "{}", logs.text());
     let book_seed = MixAsk {
         rules: vec![],
         seed: Seed::Song(3_100),
