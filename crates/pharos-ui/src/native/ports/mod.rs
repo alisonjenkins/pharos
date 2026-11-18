@@ -107,12 +107,31 @@ pub fn register_video_store(
 /// through `kept_video_view::shown_video_store`, which re-renders it when a
 /// store registered after it mounted is published.
 pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
-    VIDEO_STORE.get()
+    video_slot().get()
 }
 
 /// The slot behind [`video_store`], for a reader that waits for it.
 pub fn video_slot() -> &'static Slot<dyn super::kept_video::VideoStore> {
+    #[cfg(test)]
+    if let Some(slot) = TEST_VIDEO_SLOT.with(std::cell::Cell::get) {
+        return slot;
+    }
     &VIDEO_STORE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own video slot, on this thread, in place of the process's:
+    /// a test can publish a store without reaching every other test.
+    static TEST_VIDEO_SLOT: std::cell::Cell<Option<&'static Slot<dyn super::kept_video::VideoStore>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Puts `slot` in place of the process's video slot on this thread, or
+/// takes it out with `None`.
+#[cfg(test)]
+pub fn use_test_video_slot(slot: Option<&'static Slot<dyn super::kept_video::VideoStore>>) {
+    TEST_VIDEO_SLOT.with(|s| s.set(slot));
 }
 
 /// A claim that succeeds once. Opening the video store twice on one root

@@ -9103,6 +9103,117 @@ fn Player(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// End to end, through the app's own timer, screen and store watch: an
+    /// attempt starts with no video store, goes slow, and a store holding
+    /// one kept video is published while it is still connecting. The
+    /// offline list renders that video.
+    #[test]
+    fn a_store_published_during_a_slow_connect_renders_its_offline_list() {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        use super::super::ports::{use_test_video_slot, Slot};
+        static SLOT: Slot<dyn VideoStore> = Slot::new();
+        thread_local! {
+            static FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        struct OneKept;
+        impl VideoStore for OneKept {
+            fn videos(&self, user: &str) -> Vec<KeptVideo> {
+                vec![KeptVideo {
+                    item: "7".into(),
+                    version: String::new(),
+                    user: user.into(),
+                    title: "Kept Film".into(),
+                    kind: "movie".into(),
+                    runtime_ms: 60_000,
+                    master_url: "/m.m3u8".into(),
+                    audio: None,
+                    subtitles: vec![],
+                    files: vec![],
+                    quality_bps: 1_000_000,
+                    estimated_bytes: 1_000,
+                    state: KeptState::Ready,
+                    position_ms: 0,
+                    saved_at: "2026-11-18T00:00:00Z".into(),
+                    estimate_from_adoption: false,
+                }]
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        fn root() -> Element {
+            use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+            super::super::kept_video_view::use_video_store_watch();
+            let machine = use_signal(Machine::new);
+            let slow = use_signal(|| false);
+            use_hook(|| start_attempt_timer(machine, machine.peek().epoch(), slow));
+            FIRED.with(|f| f.set(slow()));
+            let m = machine.read();
+            connecting_screen(&m, &Route::Home, slow())
+        }
+        use_test_video_slot(Some(&SLOT));
+        FIRED.with(|f| f.set(false));
+        offline_video::remember_user("u1");
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let html = rt.block_on(async {
+            // The attempt goes slow with nothing to list.
+            let start = std::time::Instant::now();
+            while !FIRED.with(std::cell::Cell::get) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "the slow connect never came"
+                );
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+            assert!(dioxus_ssr::render(&dom).contains("Connecting"));
+            // Published from another thread while still connecting.
+            std::thread::spawn(|| SLOT.set(std::sync::Arc::new(OneKept)).unwrap())
+                .join()
+                .unwrap();
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("Kept Film") || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break html;
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        use_test_video_slot(None);
+        offline_video::forget_user();
+        assert!(html.contains("pharos-offline-videos"), "{html}");
+        assert!(html.contains("Kept Film"), "{html}");
+    }
+
     /// The slow-connect timer decides when it fires, not when the attempt
     /// starts: downloads that appear in between (a store published after
     /// the attempt began) still cut the screen off to the offline lists.
