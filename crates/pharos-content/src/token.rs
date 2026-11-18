@@ -126,13 +126,63 @@ pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, Con
     }
 }
 
-/// Removes the token and its user; absent is fine.
-pub fn forget(path: &Path) -> Result<(), ContentError> {
+/// What a [`forget`] that removed the file left on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forgotten {
+    /// Gone for good: the removal reached the disk, or there was nothing.
+    Durable,
+    /// Gone, so signed out now, but the folder's entry could not be made
+    /// durable: a crash may bring the token back. Why, for the caller to
+    /// report.
+    NotDurable(String),
+}
+
+/// Removes the token and its user; absent is fine. Once removed the token
+/// is gone for every reader, whatever the folder sync after it does.
+pub fn forget(path: &Path) -> Result<Forgotten, ContentError> {
     let _held = hold();
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(err(path, e)),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Forgotten::Durable),
+        Err(e) => return Err(err(path, e)),
+    }
+    let Some(dir) = path.parent() else {
+        return Ok(Forgotten::NotDurable("no directory".to_owned()));
+    };
+    Ok(match durable_dir(dir) {
+        Ok(()) => Forgotten::Durable,
+        Err(e) => {
+            log::warn!(
+                "token file removed but not synced dir={} reason={e} verdict=signed_out_not_durable",
+                dir.display()
+            );
+            Forgotten::NotDurable(e.to_string())
+        }
+    })
+}
+
+/// Syncs `dir`, once more if the first sync fails; EINVAL or ENOTSUP (a
+/// file system that cannot sync a folder) counts as done, logged. Err with
+/// the second failure.
+fn durable_dir(dir: &Path) -> std::io::Result<()> {
+    let Err(first) = sync_dir(dir) else {
+        return Ok(());
+    };
+    match sync_dir(dir) {
+        Ok(()) => {
+            log::info!("token file dir sync verdict=retried first_error={first}");
+            Ok(())
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            log::info!("token file dir sync verdict=unsupported error={e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -200,6 +250,13 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     if tests::FAIL_DIR_SYNC.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("directory sync failed"));
     }
+    #[cfg(test)]
+    if let Some(kind) = tests::DIR_SYNC_ERRORS.with(|q| {
+        let mut q = q.borrow_mut();
+        (!q.is_empty()).then(|| q.remove(0))
+    }) {
+        return Err(std::io::Error::new(kind, "directory sync failed"));
+    }
     std::fs::File::open(dir)?.sync_all()
 }
 
@@ -214,6 +271,8 @@ mod tests {
     thread_local! {
         /// While set, syncing the directory after a rename fails.
         pub(super) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The next directory syncs fail with these, one each.
+        pub(super) static DIR_SYNC_ERRORS: RefCell<Vec<std::io::ErrorKind>> = const { RefCell::new(Vec::new()) };
         /// Runs inside `store_user`, between its read and its write.
         static BETWEEN: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
     }
@@ -320,6 +379,48 @@ mod tests {
                 && l.contains("reason=directory sync failed")),
             "{lines:?}"
         );
+    }
+
+    /// A sign-out's removal is synced to the folder: a failed sync is tried
+    /// once more, EINVAL or ENOTSUP counts as done, and a sync that still
+    /// fails leaves the token gone (signed out) and reports why.
+    #[test]
+    fn a_forgotten_token_is_synced_and_a_failed_sync_is_reported() {
+        use std::io::ErrorKind::{InvalidInput, Other, Unsupported};
+        let d = dir("forget-sync");
+        let p = d.join("device-token");
+        for (errors, durable) in [
+            (vec![], true),
+            (vec![Other], true),
+            (vec![InvalidInput, InvalidInput], true),
+            (vec![Other, Unsupported], true),
+            (vec![Other, Other], false),
+        ] {
+            store(&p, "tok").unwrap();
+            crate::testlog::start();
+            DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = errors.clone());
+            let forgot = forget(&p).unwrap();
+            let left = DIR_SYNC_ERRORS.with(|q| q.borrow().len());
+            DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+            assert_eq!(read(&p).unwrap(), None, "the token outlived the sign-out");
+            assert_eq!(left, 0, "{errors:?}: not every sync was tried");
+            if durable {
+                assert_eq!(forgot, Forgotten::Durable, "{errors:?}");
+            } else {
+                assert!(
+                    matches!(&forgot, Forgotten::NotDurable(why) if why.contains("directory sync failed")),
+                    "{forgot:?}"
+                );
+                let lines = crate::testlog::lines();
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("token file removed but not synced")
+                            && l.contains("verdict=signed_out_not_durable")),
+                    "{lines:?}"
+                );
+            }
+        }
     }
 
     #[test]

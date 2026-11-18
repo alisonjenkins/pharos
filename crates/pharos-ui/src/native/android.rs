@@ -217,8 +217,13 @@ pub fn forget_token() {
     let Ok(path) = token_path() else { return };
     drop_legacy_user(&path);
     // One file: the token goes with its user, or both stay.
-    if let Err(e) = token_file::forget(&path) {
-        log::warn!("forget token: {e}");
+    match token_file::forget(&path) {
+        Ok(token_file::Forgotten::Durable) => {}
+        // Signed out all the same: the token is gone for every reader.
+        Ok(token_file::Forgotten::NotDurable(why)) => {
+            log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
+        }
+        Err(e) => log::warn!("forget token: {e}"),
     }
     note_credentials_changed("forgotten");
 }

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use pharos_content::token::{Pairing, Stored};
+pub use pharos_content::token::{Forgotten, Pairing, Stored};
 
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.
@@ -35,7 +35,9 @@ pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, Str
 }
 
 /// Removes the token and its user, under the file's lock; absent is fine.
-pub fn forget(path: &Path) -> Result<(), String> {
+/// Signed out once it returns Ok, whether or not the removal is durable yet
+/// (`Forgotten::NotDurable` says why not).
+pub fn forget(path: &Path) -> Result<Forgotten, String> {
     pharos_content::token::forget(path).map_err(|e| e.to_string())
 }
 
