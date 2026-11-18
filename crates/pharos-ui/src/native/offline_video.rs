@@ -510,13 +510,24 @@ fn with_store(f: impl FnOnce(&dyn super::kept_video::VideoStore)) {
 }
 
 fn note_signed_in(user: &str) {
-    // Their downloads parked at a session end, or by another user's token,
-    // run again.
-    with_store(|store| store.resume_user(user));
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
-    note_token_user(user);
+    // Their downloads parked at a session end, or by another user's token,
+    // run again, but only once the token is paired with them: a run resumed
+    // before would read an unpaired token, send nothing and park until the
+    // next sign-in. A pairing that fails resumes nothing (fail closed).
+    match note_token_user(user) {
+        Ok(()) => {
+            super::platform::info(&format!(
+                "pharos: video keep resume verdict=resumed reason=token_paired user={user}"
+            ));
+            with_store(|store| store.resume_user(user));
+        }
+        Err(e) => super::platform::warn(&format!(
+            "pharos: video keep resume verdict=not_resumed reason=token_not_paired user={user} error={e}"
+        )),
+    }
     if matches!(read_pref(), Ok(Some(p)) if p == user) {
         return;
     }
@@ -528,22 +539,21 @@ fn note_signed_in(user: &str) {
 }
 
 /// Keeps the user id with the device token, so a cold start can tell whose
-/// token it is.
-fn note_token_user(user: &str) {
+/// token it is. Err (logged) when it could not.
+fn note_token_user(user: &str) -> Result<(), String> {
     #[cfg(test)]
-    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
-        if let Err(e) = seam.note_token_user(user) {
-            super::platform::warn(&format!(
-                "pharos: video user not kept with the token error={e}"
-            ));
-        }
-        return;
-    }
-    if let Err(e) = super::platform::note_token_user(user) {
+    let kept = match tests::PREF.with(|p| p.borrow().clone()) {
+        Some(seam) => seam.note_token_user(user),
+        None => super::platform::note_token_user(user),
+    };
+    #[cfg(not(test))]
+    let kept = super::platform::note_token_user(user);
+    if let Err(e) = &kept {
         super::platform::warn(&format!(
             "pharos: video user not kept with the token error={e}"
         ));
     }
+    kept
 }
 
 /// Notes a sign-out. Nobody is signed in from this call on, whatever the
@@ -713,6 +723,8 @@ mod tests {
         on_read: Rc<RefCell<Option<ReadHook>>>,
         /// How many times the preference has been read.
         reads: Rc<Cell<usize>>,
+        /// When set, pairing the user with the token fails.
+        fail_pair: Rc<Cell<bool>>,
     }
 
     impl Pref {
@@ -727,6 +739,9 @@ mod tests {
             })
         }
         pub(super) fn note_token_user(&self, user: &str) -> Result<(), String> {
+            if self.fail_pair.get() {
+                return Err("token file not writable".to_owned());
+            }
             if let Some(path) = self.file.borrow().as_ref() {
                 return super::super::token_file::store_user(path, user);
             }
@@ -838,6 +853,74 @@ mod tests {
         fn resume_user(&self, user: &str) {
             self.0.lock().unwrap().push(format!("resume {user}"));
         }
+    }
+
+    /// A store whose resumed run reads the token as a fetch does: sent only
+    /// while the token on file is paired with the run's owner.
+    #[derive(Default)]
+    struct TokenRuns(std::sync::Mutex<Vec<String>>);
+
+    impl VideoStore for TokenRuns {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+        fn resume_user(&self, user: &str) {
+            let on_file = PREF.with(|p| {
+                p.borrow()
+                    .as_ref()
+                    .and_then(|p| p.token_user.borrow().clone())
+            });
+            let verdict = match super::super::kept_video::token_for_owner(
+                Some("tok"),
+                on_file.as_deref(),
+                user,
+            ) {
+                Ok(_) => "sent".to_owned(),
+                Err(why) => format!("refused {why}"),
+            };
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("resume {user} {verdict}"));
+        }
+    }
+
+    /// A sign-in resumes the user's interrupted downloads only once their
+    /// id is paired with the token: a run resumed before would read an
+    /// unpaired token, send nothing and park until another sign-in. A
+    /// pairing that fails resumes nothing (fail closed), and says so.
+    #[test]
+    fn a_sign_in_resumes_downloads_only_once_the_token_is_paired() {
+        let p = pref();
+        let runs = Rc::new(TokenRuns::default());
+        STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
+        remember_user("A");
+        assert_eq!(*runs.0.lock().unwrap(), ["resume A sent"]);
+        forget_user();
+        p.clear_token();
+        p.token_present.set(true);
+        p.fail_pair.set(true);
+        remember_user("A");
+        STORE.with(|s| *s.borrow_mut() = None);
+        assert_eq!(
+            *runs.0.lock().unwrap(),
+            ["resume A sent"],
+            "resumed with an unpaired token"
+        );
     }
 
     /// The session-end hook parks the ended user's downloads (all of them
