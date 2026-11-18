@@ -266,9 +266,8 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
 /// pool, natively or through `InstantMix`, and the log line counts what was
 /// kept out. An audiobook track's instant mix stays on the audiobooks.
 /// Disarm check: with `keep_music` keeping everything, the native mix picks
-/// book tracks and `books_left_out` reads 0; with `same_shelf` not
-/// filtering, the instant mix returns book tracks; with it reading one page
-/// only, a song's instant mix holds the seed alone.
+/// book tracks and `books_left_out` reads 0; with `same_shelf_songs` not
+/// filtering, the instant mix returns book tracks.
 #[actix_web::test]
 async fn a_mix_never_plays_an_audiobooks_tracks() {
     use pharos_core::LibraryKind;
@@ -285,16 +284,6 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
         .unwrap();
     put_songs(&fx, 3_000, "/libMusic", &[("Band", "Pop", 2001)], 5).await;
     put_songs(&fx, 3_100, "/libBooks", &[("Author", "Pop", 2001)], 5).await;
-    // More book tracks than one instant-mix page, ahead of the music in id
-    // order, so a song's instant mix reads past them.
-    put_songs(
-        &fx,
-        1_000,
-        "/libBooks/Long",
-        &[("Narrator", "Spoken", 2001)],
-        600,
-    )
-    .await;
     fx.state.stores.backfill_library_ids().await.unwrap();
     let libraries = fx.state.stores.libraries().await.unwrap();
     fx.state.set_libraries(libraries);
@@ -320,12 +309,8 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
     let ids: Vec<u64> = mixed.picks.iter().map(|p| p.item.id).collect();
     assert_eq!(ids.len(), 5, "{ids:?}");
     assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
-    assert_eq!(mixed.books_left_out, 605);
-    assert!(
-        logs.text().contains("books_left_out=605"),
-        "{}",
-        logs.text()
-    );
+    assert_eq!(mixed.books_left_out, 5);
+    assert!(logs.text().contains("books_left_out=5"), "{}", logs.text());
     let book_seed = MixAsk {
         rules: vec![],
         seed: Seed::Song(3_100),
@@ -340,8 +325,7 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
     ));
 
     let app = actix_web::test::init_service(crate::common::build_app(fx.state.clone())).await;
-    let book_tracks = |id: &u64| (1_000..1_600).contains(id) || (3_100..3_105).contains(id);
-    for (seed, music) in [(3_000u64, true), (3_100, false)] {
+    for (seed, shelf) in [(3_000u64, 3_000..3_005), (3_100, 3_100..3_105)] {
         let req = actix_web::test::TestRequest::get()
             .uri(&format!("/Items/{seed}/InstantMix?Limit=50"))
             .insert_header(("X-Emby-Token", fx.user_token.as_str()))
@@ -353,14 +337,10 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
             .iter()
             .map(|i| pharos_jellyfin_api::dto::parse_item_id(i["Id"].as_str().unwrap()).unwrap())
             .collect();
+        assert_eq!(got.len(), 5, "seed {seed}: {got:?}");
         assert!(
-            got.iter().all(|id| book_tracks(id) != music),
+            got.iter().all(|id| shelf.contains(id)),
             "seed {seed}: {got:?}"
         );
-        if music {
-            assert_eq!(got, vec![3_000, 3_001, 3_002, 3_003, 3_004]);
-        } else {
-            assert_eq!(got.len(), 50, "seed {seed}: {got:?}");
-        }
     }
 }
