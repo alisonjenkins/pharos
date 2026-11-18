@@ -218,6 +218,36 @@ pub fn token_allowed(url: &str, build_server: &str) -> Result<(), String> {
     ))
 }
 
+/// What a request carrying the device token does with one redirect hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hop {
+    /// Same origin, where the token may go: follow and keep it.
+    FollowWithToken,
+    /// Another origin (artwork on another host, say): follow, without the
+    /// token.
+    FollowWithoutToken,
+    /// Not followed, for the reason given (an https-to-http downgrade, a
+    /// target that is not http(s)).
+    Refuse(String),
+}
+
+/// The proxy's decision for one redirect hop from `from` to `to`. The
+/// token stays only on the same origin, and there only where it may go at
+/// all ([`token_allowed`]: https, or the build's own server); another
+/// origin is followed without it, and a downgrade to http is refused.
+pub fn redirect_hop(from: &str, to: &str, build_server: &str) -> Hop {
+    let (Some(a), Some(b)) = (origin_of(from), origin_of(to)) else {
+        return Hop::Refuse("redirect target is not an http(s) URL".to_owned());
+    };
+    if a.0 == "https" && b.0 == "http" {
+        return Hop::Refuse(format!("https to http downgrade to {}:{}", b.1, b.2));
+    }
+    if a == b && token_allowed(to, build_server).is_ok() {
+        return Hop::FollowWithToken;
+    }
+    Hop::FollowWithoutToken
+}
+
 /// The download client, or why there is none. A client that cannot be built
 /// is never replaced by a default one: its redirect policy is what keeps the
 /// device token on the server's origin, so the download is refused with the
@@ -1375,6 +1405,49 @@ mod tests {
         assert!(token_allowed("http://192.168.1.5:9000/Items", dev).is_err());
         assert!(token_allowed("http://media.example.org/Items", https).is_err());
         assert!(token_allowed("ftp://media.example.org/Items", https).is_err());
+    }
+
+    /// A proxied request's redirect: the same origin keeps the token,
+    /// another https origin is followed without it, a downgrade to http is
+    /// refused, and the build's own plain-http server keeps it on its own
+    /// origin.
+    #[test]
+    fn a_proxy_redirect_keeps_the_token_only_on_its_own_origin() {
+        let https = "https://media.example.org";
+        let from = "https://media.example.org/Items/1/Images/Primary";
+        assert_eq!(
+            redirect_hop(from, "https://media.example.org/cache/1.jpg", https),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(from, "https://art.example.net/1.jpg", https),
+            Hop::FollowWithoutToken
+        );
+        let Hop::Refuse(why) = redirect_hop(from, "http://media.example.org/1.jpg", https) else {
+            panic!("a downgrade to http was followed");
+        };
+        assert!(why.contains("downgrade"), "{why}");
+        let dev = "http://192.168.1.5:8096";
+        assert_eq!(
+            redirect_hop(
+                "http://192.168.1.5:8096/a",
+                "http://192.168.1.5:8096/b",
+                dev
+            ),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(
+                "http://192.168.1.5:8096/a",
+                "http://192.168.1.6:8096/b",
+                dev
+            ),
+            Hop::FollowWithoutToken
+        );
+        assert!(matches!(
+            redirect_hop(from, "ftp://media.example.org/1.jpg", https),
+            Hop::Refuse(_)
+        ));
     }
 
     /// A client that cannot be built is an error naming why, and what would

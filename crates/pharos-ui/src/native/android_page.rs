@@ -3106,6 +3106,8 @@ const PASSED_ON: [&str; 2] = ["accept", "if-none-match"];
 /// into a title in particular, can take the server longer than that. A 503
 /// instead is an ordinary load error that hls.js retries.
 const PROXY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// The most redirects one proxied request follows.
+const PROXY_REDIRECTS: usize = 5;
 /// The response headers passed back to the page.
 const PASSED_BACK: [&str; 4] = ["content-type", "cache-control", "etag", "last-modified"];
 
@@ -3116,7 +3118,11 @@ fn http() -> &'static reqwest::Client {
         // reqwest 0.13's default verifier is rustls-platform-verifier, which
         // on Android needs JNI setup this app does not do. Use the shared
         // ring + webpki-roots config the server uses.
-        let builder = reqwest::Client::builder().user_agent(tv_page::USER_AGENT);
+        // Redirects are followed by hand in `fetch_server`, hop by hop, so
+        // the device token never rides one off its origin.
+        let builder = reqwest::Client::builder()
+            .user_agent(tv_page::USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none());
         let builder = match pharos_api::tls::client_config() {
             Ok(tls) => builder.tls_backend_preconfigured(tls),
             Err(error) => {
@@ -3158,18 +3164,60 @@ async fn fetch_server(
     headers: &[(String, String)],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
     let base = server();
-    let url = tv_page::server_url(&base, path_and_query);
-    let mut req = http().get(&url);
-    if let Some(token) = token_for(&url, "proxy") {
-        req = req.header("X-Emby-Token", token);
-    }
-    for (name, value) in headers {
-        req = req.header(name, value);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("stage=send {}", tv_page::error_chain(&e.without_url())))?;
+    let mut url = tv_page::server_url(&base, path_and_query);
+    let mut token = token_for(&url, "proxy");
+    let mut hops = 0usize;
+    let resp = loop {
+        let mut req = http().get(&url);
+        if let Some(token) = &token {
+            req = req.header("X-Emby-Token", token);
+        }
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("stage=send {}", tv_page::error_chain(&e.without_url())))?;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        let Some(location) = location.filter(|_| resp.status().is_redirection()) else {
+            break resp;
+        };
+        let next = resp
+            .url()
+            .join(location)
+            .map_err(|e| format!("stage=redirect location not understood: {e}"))?
+            .to_string();
+        if hops >= PROXY_REDIRECTS {
+            return Err(format!(
+                "stage=redirect more than {PROXY_REDIRECTS} redirects"
+            ));
+        }
+        hops += 1;
+        let status = resp.status().as_u16();
+        match tv_page::redirect_hop(&url, &next, tv_page::DEFAULT_SERVER) {
+            tv_page::Hop::FollowWithToken => {
+                log::debug!("pharos: proxy redirect verdict=follow_with_token status={status}");
+            }
+            tv_page::Hop::FollowWithoutToken => {
+                if token.take().is_some() {
+                    log::info!(
+                        "pharos: proxy redirect verdict=follow_without_token status={status}"
+                    );
+                }
+            }
+            tv_page::Hop::Refuse(reason) => {
+                log::warn!(
+                    "pharos: proxy redirect verdict=refused reason={reason} status={status}"
+                );
+                return Err(format!("stage=redirect refused: {reason}"));
+            }
+        }
+        url = next;
+    };
     let status = resp.status().as_u16();
     let back = PASSED_BACK
         .iter()
