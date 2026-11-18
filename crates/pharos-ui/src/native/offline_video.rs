@@ -497,7 +497,22 @@ pub fn remember_user_if(asked_at: u64, user: &str) -> bool {
     }
 }
 
+/// Runs `f` on the store of downloaded videos, when there is one.
+fn with_store(f: impl FnOnce(&dyn super::kept_video::VideoStore)) {
+    #[cfg(test)]
+    if let Some(store) = tests::STORE.with(|s| s.borrow().clone()) {
+        f(&*store);
+        return;
+    }
+    if let Some(store) = super::ports::video_store() {
+        f(&*store);
+    }
+}
+
 fn note_signed_in(user: &str) {
+    // Their downloads parked at a session end, or by another user's token,
+    // run again.
+    with_store(|store| store.resume_user(user));
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
@@ -534,6 +549,14 @@ fn note_token_user(user: &str) {
 /// Notes a sign-out. Nobody is signed in from this call on, whatever the
 /// preference write does.
 pub fn forget_user() {
+    // Whose session it was, before it is forgotten: their downloads stop
+    // before another user's token can be used (all of them when it is not
+    // known). Bound to their owner's token as well; this is the hygiene.
+    let ended = match identity() {
+        Identity::User(u) => Some(u),
+        _ => None,
+    };
+    with_store(|store| store.park_runs(ended.as_deref()));
     set_identity(Identity::SignedOut);
     super::platform::info("pharos: video user verdict=none reason=signed_out");
     if let Err(e) = write_pref("") {
@@ -742,6 +765,8 @@ mod tests {
 
     thread_local! {
         pub(super) static PREF: RefCell<Option<Pref>> = const { RefCell::new(None) };
+        /// The store the session hooks reach, in place of the registered one.
+        pub(super) static STORE: RefCell<Option<Rc<dyn VideoStore>>> = const { RefCell::new(None) };
     }
 
     fn pref() -> Pref {
@@ -780,6 +805,58 @@ mod tests {
                 content_type: "video/mp2t",
             })
         }
+    }
+
+    /// Records what the session hooks asked of the store.
+    #[derive(Default)]
+    struct Runs(std::sync::Mutex<Vec<String>>);
+
+    impl VideoStore for Runs {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+        fn park_runs(&self, owner: Option<&str>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("park {}", owner.unwrap_or("all")));
+        }
+        fn resume_user(&self, user: &str) {
+            self.0.lock().unwrap().push(format!("resume {user}"));
+        }
+    }
+
+    /// The session-end hook parks the ended user's downloads (all of them
+    /// when whose session it was is not known), and a sign-in resumes the
+    /// new user's.
+    #[test]
+    fn a_session_end_parks_the_users_downloads_and_a_sign_in_resumes_theirs() {
+        let _p = pref();
+        let runs = Rc::new(Runs::default());
+        STORE.with(|s| *s.borrow_mut() = Some(runs.clone()));
+        remember_user("A");
+        forget_user();
+        forget_user();
+        remember_user("B");
+        STORE.with(|s| *s.borrow_mut() = None);
+        assert_eq!(
+            *runs.0.lock().unwrap(),
+            ["resume A", "park A", "park all", "resume B"]
+        );
     }
 
     fn serves(user: Option<String>) -> bool {

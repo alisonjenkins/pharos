@@ -4035,6 +4035,53 @@ fn dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 impl VideoStore for DiskVideoStore {
+    fn park_runs(&self, owner: Option<&str>) {
+        // Revoked under the store's lock: each run stops at its next check
+        // (a chunk, a promotion, the next file) and its staging file goes
+        // as a revoked run's does. The records are left as they are.
+        let parked: Vec<(String, String, u64)> = {
+            let mut st = lock(&self.inner.state);
+            let mut parked = Vec::new();
+            st.runs.retain(|(user, item), run| {
+                let ours = owner.map_or(true, |o| o == user);
+                if ours {
+                    parked.push((user.clone(), item.clone(), *run));
+                }
+                !ours
+            });
+            parked
+        };
+        for (user, item, run) in parked {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep parked item={item} run={run} reason=session_ended owner={user} ended_for={}",
+                    owner.unwrap_or("unknown")
+                ),
+            );
+        }
+    }
+
+    fn resume_user(&self, user: &str) {
+        let resume: Vec<String> = {
+            let st = lock(&self.inner.state);
+            interrupted(&st.list)
+                .into_iter()
+                .filter(|v| {
+                    v.user == user && !st.runs.contains_key(&(v.user.clone(), v.item.clone()))
+                })
+                .map(|v| v.item)
+                .collect()
+        };
+        for item in resume {
+            emit(
+                false,
+                format!("pharos: video keep resume item={item} reason=signed_in owner={user}"),
+            );
+            self.inner.spawn_run(user.to_owned(), item);
+        }
+    }
+
     fn videos(&self, user: &str) -> Vec<KeptVideo> {
         // The page that lists the downloads reads the held folders again, so
         // one whose record became readable is not stranded.
@@ -7810,6 +7857,49 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// A session end parks the ended user's running download (another
+    /// user's run goes on): it stops fetching, its record stays Downloading
+    /// with its files. It runs again, to Ready, when its user signs in.
+    #[tokio::test]
+    async fn a_session_end_parks_the_users_runs_and_a_sign_in_resumes_them() {
+        let rig = Rig::new("session-park");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u2"));
+        assert_eq!(
+            lock(&store.inner.state).runs.len(),
+            1,
+            "parked another user's run"
+        );
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(lock(&store.inner.state).runs.is_empty());
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        assert!(store.stored_file("u1", SEG0).is_none());
+        let parked = lines("pharos: video keep parked item=1");
+        assert!(
+            parked.iter().any(|l| l.contains("reason=session_ended")),
+            "{parked:?}"
+        );
+        store.resume_user("u2");
+        assert!(
+            lock(&store.inner.state).runs.is_empty(),
+            "resumed for another user"
+        );
+        store.resume_user("u1");
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let resumed = lines("pharos: video keep resume item=1");
+        assert!(
+            resumed.iter().any(|l| l.contains("reason=signed_in")),
+            "{resumed:?}"
+        );
     }
 
     /// Waits, on the test's runtime, until `done` holds; at most 10 s.

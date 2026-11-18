@@ -238,6 +238,16 @@ pub trait VideoStore: Send + Sync {
     fn stored_file(&self, _user: &str, _key: &str) -> Option<StoredFile> {
         None
     }
+    /// A signed-in session ended: every running download of `owner`'s
+    /// (every one, with `None`, when whose session it was is not known)
+    /// stops before another user's token can be used. Each is parked: its
+    /// record and files stay, Downloading, until [`resume_user`]. A store
+    /// whose downloads carry no device token keeps the default.
+    ///
+    /// [`resume_user`]: VideoStore::resume_user
+    fn park_runs(&self, _owner: Option<&str>) {}
+    /// `user` signed in: their parked downloads run again.
+    fn resume_user(&self, _user: &str) {}
 }
 
 /// A file a [`VideoStore`] holds, ready to answer a request with.
