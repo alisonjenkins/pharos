@@ -786,13 +786,7 @@ mod tests {
             }
             if let Some(path) = self.file.borrow().as_ref() {
                 // As the phone does it: only with the token seen.
-                let seen = seen.ok_or_else(|| "no_token_seen".to_owned())?;
-                return match super::super::token_file::store_user_if(path, seen, user)? {
-                    super::super::token_file::Pairing::Paired => Ok(()),
-                    super::super::token_file::Pairing::TokenChanged => {
-                        Err("token_changed".to_owned())
-                    }
-                };
+                return super::super::token_file::pair(path, seen, user);
             }
             if self.token_present.get() {
                 *self.token_user.borrow_mut() = Some(user.to_owned());

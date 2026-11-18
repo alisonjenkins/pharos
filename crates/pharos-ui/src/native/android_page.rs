@@ -30,8 +30,7 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::kept_video::{
-    loudness, request_class, request_key, request_line, token_for_owner, url_path, Loudness,
-    StoredFile, Verdict,
+    loudness, request_class, request_key, request_line, url_path, Loudness, StoredFile, Verdict,
 };
 use super::kept_video_disk::{
     iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
@@ -1995,11 +1994,7 @@ pub fn token_user() -> Result<Option<String>, String> {
 /// with. Err `token_changed` (a new sign-in's token landed in between: it
 /// stays unpaired) or `no_token_seen`; either fails closed.
 pub fn note_token_user(user: &str, seen: Option<&str>) -> Result<(), String> {
-    let seen = seen.ok_or_else(|| "no_token_seen".to_owned())?;
-    match android::store_token_user_if(seen, user)? {
-        super::token_file::Pairing::Paired => Ok(()),
-        super::token_file::Pairing::TokenChanged => Err("token_changed".to_owned()),
-    }
+    android::pair_token_user(seen, user)
 }
 
 /// The token the current session was authenticated with, for a request
@@ -3285,14 +3280,11 @@ const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
 /// address as the proxy, the body streamed rather than held.
 struct ServerFetcher;
 
-/// The device token for a download run of `owner`'s: the token and its
-/// user from one read of the token file, the token only while that user is
-/// `owner` ([`token_for_owner`]). Err names the refusal; nothing is sent.
+/// The device token for a download run of `owner`'s
+/// ([`token_file::run_token`](super::token_file::run_token)). Err names the
+/// refusal; nothing is sent.
 fn token_for_run(owner: &str) -> Result<String, String> {
-    let stored = android::token_with_user()
-        .map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
-    token_for_owner(token.as_deref(), user.as_deref(), owner)
+    android::run_token(owner)
 }
 
 /// The client the downloads use. Its redirect policy follows a redirect

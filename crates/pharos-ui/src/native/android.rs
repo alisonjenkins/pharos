@@ -146,9 +146,9 @@ pub fn load_token_user() -> Result<Option<String>, String> {
 }
 
 /// Keeps `user` with the token on file only while it is `seen`
-/// (`token_file::store_user_if`).
-pub fn store_token_user_if(seen: &str, user: &str) -> Result<token_file::Pairing, String> {
-    token_file::store_user_if(&token_path()?, seen, user)
+/// (`token_file::pair`).
+pub fn pair_token_user(seen: Option<&str>, user: &str) -> Result<(), String> {
+    token_file::pair(&token_path()?, seen, user)
 }
 
 /// Removes the older layout's sidecar, best effort.
@@ -188,15 +188,15 @@ pub fn load_token() -> Option<String> {
     token
 }
 
-/// The token and its user from one read of the one file, uncached: for a
-/// request that must carry one user's token (a video download). Never log
-/// the token.
-pub fn token_with_user() -> Result<Option<token_file::Stored>, String> {
-    token_file::read(&token_path()?)
+/// The token for a download request of `owner`'s run, from one uncached
+/// read of the one file (`token_file::run_token`). Never log the token.
+pub fn run_token(owner: &str) -> Result<String, String> {
+    let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
+    token_file::run_token(&path, owner)
 }
 
 /// Replaces the token file whole (`token_file::store`): the new token's user
-/// is unknown until `store_token_user_if`, never the previous sign-in's.
+/// is unknown until `pair_token_user`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
     token_file::store(&path, token).map(|()| {

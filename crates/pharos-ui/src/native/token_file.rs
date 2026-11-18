@@ -34,6 +34,30 @@ pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, Str
     pharos_content::token::store_user_if(path, seen, user).map_err(|e| e.to_string())
 }
 
+/// Pairs `user` with the token on file only while it is `seen`, the token
+/// the session that learned `user` was resumed with. Err names why not:
+/// `no_token_seen` (the session carries none), `token_changed` (a sign-in
+/// replaced it since) or the file's error. The phone and its host tests
+/// pair through this one function.
+pub fn pair(path: &Path, seen: Option<&str>, user: &str) -> Result<(), String> {
+    let seen = seen.ok_or_else(|| "no_token_seen".to_owned())?;
+    match store_user_if(path, seen, user)? {
+        Pairing::Paired => Ok(()),
+        Pairing::TokenChanged => Err("token_changed".to_owned()),
+    }
+}
+
+/// The device token for a download request of `owner`'s run: the token and
+/// its user from one read of the file, the token only while that user is
+/// `owner` ([`token_for_owner`](super::kept_video::token_for_owner)). Err
+/// names the refusal; nothing is sent. The phone's fetcher and its host
+/// tests decide through this one function.
+pub fn run_token(path: &Path, owner: &str) -> Result<String, String> {
+    let stored = read(path).map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
+    let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
+    super::kept_video::token_for_owner(token.as_deref(), user.as_deref(), owner)
+}
+
 /// Removes the token and its user, under the file's lock; absent is fine.
 /// Signed out once it returns Ok, whether or not the removal is durable yet
 /// (`Forgotten::NotDurable` says why not).
