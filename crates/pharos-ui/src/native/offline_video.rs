@@ -582,12 +582,16 @@ pub fn offline_file_for(
     )
 }
 
-/// The headers a stored file is answered with.
+/// The headers a stored file is answered with. Never cached: the WebView
+/// keys its cache by path and query, which do not name the user, so a
+/// cached answer would go to whoever asks next, across a sign-out or an
+/// account switch. The proxy reads the file from local disk, so nothing is
+/// lost.
 pub fn offline_headers(file: &super::kept_video::StoredFile) -> [(&'static str, &'static str); 3] {
     [
         ("access-control-allow-origin", "*"),
         ("content-type", file.content_type),
-        ("cache-control", "private, max-age=31536000, immutable"),
+        ("cache-control", "no-store"),
     ]
 }
 
@@ -871,6 +875,23 @@ mod tests {
             Some(""),
             "the preference was not cleared"
         );
+    }
+
+    /// A stored file's answer is never cached by the WebView, whose cache
+    /// does not know which user asked.
+    #[test]
+    fn a_stored_files_answer_is_never_cached() {
+        let file = super::super::kept_video::StoredFile {
+            path: std::path::PathBuf::new(),
+            len: 0,
+            content_type: "video/mp4",
+        };
+        let headers = offline_headers(&file);
+        let cache = headers
+            .iter()
+            .find(|(name, _)| *name == "cache-control")
+            .map(|(_, value)| *value);
+        assert_eq!(cache, Some("no-store"));
     }
 
     /// A `remember_user` whose write fails still serves that user here.
