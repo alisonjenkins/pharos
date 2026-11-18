@@ -1959,6 +1959,7 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
 
 #[component]
 fn NativeApp(route: Route) -> Element {
+    super::kept_video_view::use_video_store_watch();
     let mut machine = use_signal(app_machine);
     // The player shows a lost connection itself; the shell under it is out
     // of sight (spec 038 FR-503).
@@ -2630,7 +2631,10 @@ fn Screen(route: Route) -> Element {
             rsx! { SettingsLayout { current: Section::OfflineMusic, super::offline_view::OfflineMusicSettings {} } }
         }
         Route::OfflineMusic => rsx! { NotFoundView { path: Route::OfflineMusic.path() } },
-        Route::Downloads if offline_store().is_some() || super::ports::video_store().is_some() => {
+        Route::Downloads
+            if offline_store().is_some()
+                || super::kept_video_view::shown_video_store().is_some() =>
+        {
             rsx! {
                 super::offline_view::DownloadsScreen {}
                 super::kept_video_view::VideoDownloads {}
@@ -2712,6 +2716,8 @@ fn kept_any() -> bool {
 /// device, the videos beside the books or music. `None` when nothing is, so
 /// the usual waiting page shows.
 fn offline_start(route: &Route) -> Option<Element> {
+    // Subscribed: a store published later shows its videos then.
+    let _store = super::kept_video_view::shown_video_store();
     let videos = offline_video::ready_for_last_user();
     if let Route::Watch(id) = route {
         if videos.iter().any(|v| v.item == id.to_string()) {
@@ -5032,7 +5038,7 @@ fn SeenTitle(
 /// video store is registered, else a readable book's Keep offline.
 fn keep_control(detail: &Detail, version: &str) -> Option<Element> {
     let video = matches!(detail.item.kind, ItemKind::Movie | ItemKind::Episode);
-    if video && super::ports::video_store().is_some() {
+    if video && super::kept_video_view::shown_video_store().is_some() {
         return Some(rsx! {
             super::kept_video_view::VideoKeep { detail: detail.clone(), version: version.to_owned() }
         });

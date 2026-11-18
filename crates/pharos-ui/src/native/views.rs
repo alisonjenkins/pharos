@@ -20,7 +20,7 @@ use super::listen::Icon;
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, FailureKind, Left};
-use super::ports::{offline_store, video_store};
+use super::ports::offline_store;
 use super::queue::video_kind;
 use super::reader;
 use super::route::Route;
@@ -292,7 +292,7 @@ pub fn Shell(
                     nav { class: "pharos-shell-nav",
                         {search}
                         Link { to: Route::Favourites, "Favourites" }
-                        if offline_store().is_some() || video_store().is_some() {
+                        if offline_store().is_some() || super::kept_video_view::shown_video_store().is_some() {
                             Link { to: Route::Downloads, "Downloads" }
                         }
                         if in_group {

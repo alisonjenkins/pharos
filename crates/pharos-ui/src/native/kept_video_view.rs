@@ -18,9 +18,52 @@ use super::offline_ui::format_bytes;
 use super::offline_video;
 use super::offline_view::poll_every;
 use super::platform;
-use super::ports::video_store;
+use super::ports::{video_store, Slot};
 use super::route::Route;
 use super::views::Nav;
+
+/// Bumped when the video store is published after the app mounted. Every
+/// component that reads the store through [`shown_video_store`] subscribes
+/// to it, so one that rendered with no store renders again once there is
+/// one. The phone registers its store from two places, and the second caller
+/// can return before the first has published.
+static VIDEO_PUBLISHED: GlobalSignal<u32> = Signal::global(|| 0);
+
+/// The registered video store, read by a component: it renders again when
+/// a store is published after it rendered without one.
+pub fn shown_video_store() -> Option<std::sync::Arc<dyn super::kept_video::VideoStore>> {
+    let _ = VIDEO_PUBLISHED.read();
+    video_store()
+}
+
+/// Run once by the app's root: when no video store is registered at mount,
+/// waits (in a task, never on the UI thread) for one to be published and
+/// then re-renders every reader of [`shown_video_store`].
+pub fn use_video_store_watch() {
+    use_publish_watch(super::ports::video_slot(), &VIDEO_PUBLISHED, "video_store");
+}
+
+fn use_publish_watch<T: ?Sized + Send + Sync + 'static>(
+    slot: &'static Slot<T>,
+    seen: &'static GlobalSignal<u32>,
+    what: &'static str,
+) {
+    use_hook(move || {
+        if slot.get().is_some() {
+            return;
+        }
+        platform::info(&format!(
+            "pharos: port {what} verdict=awaiting_publish reason=not_registered_at_mount"
+        ));
+        spawn(async move {
+            let _ = slot.published().await;
+            platform::info(&format!(
+                "pharos: port {what} verdict=published_after_mount readers=rerendered"
+            ));
+            *seen.write() += 1;
+        });
+    });
+}
 
 /// How often a screen re-reads the store while it is on screen, so a
 /// download's progress shows. The port has no change feed.
@@ -254,7 +297,7 @@ fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
 /// without a registered store.
 #[component]
 pub fn VideoKeep(detail: Detail, version: String) -> Element {
-    let Some(store) = video_store() else {
+    let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let ctx = use_context::<Ctx>();
@@ -360,7 +403,7 @@ async fn start_download(
 /// The Downloads page's videos. Nothing without a registered store.
 #[component]
 pub fn VideoDownloads() -> Element {
-    let Some(store) = video_store() else {
+    let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let user = use_user();
@@ -409,6 +452,8 @@ pub fn VideoDownloads() -> Element {
 /// server. Nothing when there are none.
 #[component]
 pub fn OfflineVideos() -> Element {
+    // Subscribed: a store published later renders the list then.
+    let _store = shown_video_store();
     let videos = offline_video::ready_for_last_user();
     if videos.is_empty() {
         return rsx! {};
@@ -424,6 +469,56 @@ pub fn OfflineVideos() -> Element {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A store published after the app mounted (the second registration
+    /// returned while the first was still opening it) reaches a component
+    /// that rendered without one: the root's watch re-renders it, with no
+    /// remount and nothing blocking.
+    #[test]
+    fn a_store_published_after_mount_reaches_a_component_that_rendered_without_it() {
+        static SLOT: Slot<u32> = Slot::new();
+        static SEEN: GlobalSignal<u32> = Signal::global(|| 0);
+        thread_local! {
+            static SAW: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        }
+        #[component]
+        fn Reader() -> Element {
+            let _ = SEEN.read();
+            SAW.with(|s| s.set(SLOT.get().map(|p| *p)));
+            rsx! {}
+        }
+        fn root() -> Element {
+            use_publish_watch(&SLOT, &SEEN, "test_store");
+            rsx! { Reader {} }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        assert_eq!(
+            SAW.with(std::cell::Cell::get),
+            None,
+            "a store before it was set"
+        );
+        std::thread::spawn(|| SLOT.set(std::sync::Arc::new(7)).unwrap())
+            .join()
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..5 {
+                if SAW.with(std::cell::Cell::get).is_some() {
+                    break;
+                }
+                let woke =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dom.wait_for_work())
+                        .await;
+                assert!(woke.is_ok(), "no work came: the reader was never told");
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert_eq!(SAW.with(std::cell::Cell::get), Some(7));
+    }
     use super::*;
 
     fn video(item: &str, state: KeptState) -> KeptVideo {
