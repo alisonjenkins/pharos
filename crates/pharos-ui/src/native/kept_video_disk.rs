@@ -8496,11 +8496,14 @@ mod tests {
         );
     }
 
-    /// Two opens whose run ids start at the same value (the clock
-    /// repeating, or reading before the epoch, which seeds 0): an inherited
-    /// staging file named for exactly the new run's id is still no live
-    /// writer's, so it goes before the run stages anything and never sits
-    /// uncounted beside the run.
+    /// An open whose first run id is exactly the one an inherited staging
+    /// file is named for: the file is still no live writer's, so it goes
+    /// before the run stages anything and never sits uncounted beside the
+    /// run. `RUN_BASE` sets the base directly and skips `open_run_base`, so
+    /// both bases here (0 included) are seeded by the test, not by a clock.
+    /// A real clock cannot give 0: one that reads before the epoch gives a
+    /// base of at least 2^32 past the last one (the first run in a process
+    /// is 4294967297).
     #[tokio::test]
     async fn an_inherited_part_with_the_new_runs_own_id_is_dropped_before_it_writes() {
         for base in [1_000u64, 0] {
