@@ -2046,7 +2046,12 @@ fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
     let mut whole = 0usize;
     let mut index = Vec::new();
     for key in &record.files {
-        if let Some(len) = names.get(&file_name(key)) {
+        // A named file is whole only as a regular file under its final
+        // name: a folder in its place (counted by what it holds) is not one,
+        // and a staging file never carries a final name.
+        let path = item_dir.join("files").join(file_name(key));
+        let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+        if let Some(len) = names.get(&file_name(key)).filter(|_| regular) {
             whole += 1;
             index.push((
                 (record.user.clone(), key.clone()),
@@ -7053,6 +7058,33 @@ mod tests {
             let on_disk = std::fs::read(&stored.path).unwrap();
             assert_eq!(Some(&on_disk), served.get(key), "{key} is not whole");
         }
+    }
+
+    /// A Ready record whose named file is a folder on disk is not taken
+    /// as Ready at a reopen: the file is not whole, so the download resumes.
+    #[tokio::test]
+    async fn a_ready_record_naming_a_folder_resumes_at_reopen() {
+        let rig = Rig::new("ready-names-folder");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        drop(store);
+        let seg = rig
+            .dir
+            .join("u1")
+            .join("1")
+            .join("files")
+            .join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        std::fs::create_dir(&seg).unwrap();
+        std::fs::write(seg.join("inner"), b"x").unwrap();
+        let reopened = rig.open();
+        assert_ne!(
+            only(&reopened).state,
+            KeptState::Ready,
+            "a folder was taken for a whole file"
+        );
     }
 
     #[tokio::test]
