@@ -195,11 +195,6 @@ struct State {
     /// and is writing now: owed still (not on disk yet), but spoken for, so
     /// two fetches of one run cannot both spend the same headroom.
     claimed: HashMap<(String, String, u64), u64>,
-    /// Per download, the bytes an earlier plan left on disk that the
-    /// admitted plan's prune could not delete: part of its reservation
-    /// (admitted as estimate plus stale), on disk already, and in none of
-    /// its stored or staged figures, so counted here once.
-    stale_floor: HashMap<(String, String), u64>,
     /// Per run of a resume, before its plan is admitted (the admission
     /// drops it): what its folder held when its first playlist was
     /// reserved, and the playlist allowances it has taken since.
@@ -561,11 +556,7 @@ impl State {
             KeptState::Downloading { bytes, .. } => bytes,
             _ => v.bytes(),
         };
-        let stale = self
-            .stale_floor
-            .get(&(v.user.clone(), v.item.clone()))
-            .copied()
-            .unwrap_or(0);
+        let stale = v.stale_on_disk;
         stored
             .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
             .saturating_add(stale)
@@ -607,12 +598,7 @@ impl State {
                     KeptState::Downloading { bytes, .. } => bytes,
                     _ => v.bytes(),
                 };
-                stored.saturating_add(
-                    self.stale_floor
-                        .get(&(v.user.clone(), v.item.clone()))
-                        .copied()
-                        .unwrap_or(0),
-                )
+                stored.saturating_add(v.stale_on_disk)
             }
         };
         v.estimated_bytes.saturating_sub(on_disk)
@@ -1546,8 +1532,8 @@ impl Inner {
                 bytes: plan.stored,
             };
             // The stale share is on disk already: media may not grow into it.
-            st.stale_floor
-                .insert((user.to_owned(), item.to_owned()), plan.stale);
+            // Kept on the record, so it goes with it.
+            v.stale_on_disk = plan.stale;
             st.playlists_taken.remove(&who);
         }
         #[cfg(test)]
@@ -6086,6 +6072,74 @@ mod tests {
                 assert_eq!(v.state, KeptState::Ready, "an exact fit was refused");
             }
         }
+    }
+
+    /// The stale share an admitted plan counts as on disk belongs to its
+    /// record: once the download is removed, a restart of it owes its
+    /// pending playlist reservation in full, not less an obsolete share. A
+    /// second download that fits only if that reservation were already on
+    /// disk is refused at the guard.
+    #[tokio::test]
+    async fn a_removed_downloads_stale_share_is_not_counted_for_its_restart() {
+        let rig = Rig::new("stale-after-remove");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // 2 MB an earlier plan left that the prune cannot delete.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+        rig.server.failures.lock().unwrap().clear();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        store.remove("u1", "1");
+        store.settled().await;
+        assert!(store.videos("u1").is_empty());
+        // The restart waits at its first playlist, reserved and not on disk.
+        let master = rig.server.slow_first_open(MASTER_KEY);
+        rig.server.asked.lock().unwrap().clear();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MASTER_KEY, 1).await;
+        let owed = store.outstanding_bytes();
+        assert_eq!(
+            owed, PLAYLIST_MAX_BYTES,
+            "the restart's reservation is not owed in full"
+        );
+        // Room for the second film above the guard, but not for both it and
+        // the playlist the restart still owes.
+        // What the second film's plan asks of the free space: its estimate
+        // less its two playlists, stored before it is admitted.
+        let need = estimate_bytes(2_000_000, 12_000) - (MASTER.len() + MEDIA.len()) as u64;
+        rig.budget.free.store(
+            FREE_GUARD_BYTES + need + PLAYLIST_MAX_BYTES - 1,
+            Ordering::SeqCst,
+        );
+        store.start(request("2")).unwrap();
+        let start = std::time::Instant::now();
+        let second = loop {
+            let v = store
+                .videos("u1")
+                .into_iter()
+                .find(|v| v.item == "2")
+                .unwrap();
+            if !matches!(v.state, KeptState::Downloading { .. }) {
+                break v;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "{v:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        master.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = &second.state else {
+            panic!("admitted past the guard: {second:?}");
+        };
+        assert!(reason.contains("guard"), "{reason}");
     }
 
     /// A new download (not a resume: its record names no files) over files

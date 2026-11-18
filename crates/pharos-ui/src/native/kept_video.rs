@@ -114,6 +114,14 @@ pub struct KeptVideo {
     /// has been admitted and saved.
     #[serde(default = "estimate_from_adoption_default")]
     pub estimate_from_adoption: bool,
+    /// The store's accounting, never saved: the bytes an earlier plan left
+    /// on disk that this record's admitted plan could not prune. Part of
+    /// its reservation and on disk already, so not owed. It lives and dies
+    /// with the record: a removal or a replacing record drops it, a
+    /// rollback that puts the record back restores it, and no other site
+    /// has to clear it.
+    #[serde(skip)]
+    pub stale_on_disk: u64,
 }
 
 fn estimate_from_adoption_default() -> bool {
@@ -584,6 +592,7 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         position_ms: 0,
         saved_at,
         estimate_from_adoption: false,
+        stale_on_disk: 0,
     }
 }
 

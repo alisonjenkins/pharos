@@ -9137,6 +9137,7 @@ mod tests {
                     position_ms: 0,
                     saved_at: "2026-11-18T00:00:00Z".into(),
                     estimate_from_adoption: false,
+                    stale_on_disk: 0,
                 }]
             }
             fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
