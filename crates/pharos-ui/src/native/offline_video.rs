@@ -437,6 +437,62 @@ pub fn last_user() -> Option<String> {
     }
 }
 
+/// Why a resume did not give a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeError<E> {
+    /// The server knows no session for the token: sign in again.
+    Refused,
+    /// Anything else, kept for the caller to report.
+    Failed(E),
+}
+
+/// The platform side of resuming a session: the device token on file and
+/// the server's resume, so the decision in [`resume_session`] runs the same
+/// on the phone and in a host test with a fake server.
+pub trait Resumer {
+    type Api;
+    type Error;
+    /// The device token on file, read once for this resume.
+    fn load_token(&self) -> Option<String>;
+    /// Resumes the session `token` names.
+    fn resume<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<Self::Api, ResumeError<Self::Error>>>;
+    /// Drops the token on file (the server refused it).
+    fn forget_token(&self);
+}
+
+/// What [`resume_session`] gave.
+pub enum Resumed<A, E> {
+    /// A session, and the token it was resumed with: the one read for it.
+    Opened {
+        api: A,
+        token: String,
+    },
+    /// No token on file: nothing was sent.
+    NoToken,
+    /// The server refused the token, which is dropped.
+    Refused,
+    Failed(E),
+}
+
+/// Reads the token once and resumes with exactly that token: the session
+/// that comes back answers for it, whatever the file holds afterwards.
+pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
+    let Some(token) = r.load_token() else {
+        return Resumed::NoToken;
+    };
+    match r.resume(&token).await {
+        Ok(api) => Resumed::Opened { api, token },
+        Err(ResumeError::Refused) => {
+            r.forget_token();
+            Resumed::Refused
+        }
+        Err(ResumeError::Failed(e)) => Resumed::Failed(e),
+    }
+}
+
 /// Notes the user who has signed in. Known in this process first; the
 /// preference follows, and a failed write is logged, not served around.
 pub fn remember_user(user: &str) {
@@ -1336,6 +1392,91 @@ mod tests {
         assert!(
             token_for_owner(Some(&on_file.token), on_file.user.as_deref(), "A").is_err(),
             "A's run would be sent B's token"
+        );
+    }
+
+    /// The server side of a resume, over a real token file: a token it
+    /// knows resumes the session of the user it was issued to (the API is
+    /// that user's name); any other is refused.
+    struct FakeResumer {
+        file: std::path::PathBuf,
+        users: Vec<(&'static str, &'static str)>,
+        /// The tokens each resume was sent.
+        sent: RefCell<Vec<String>>,
+    }
+
+    impl FakeResumer {
+        fn new(file: &std::path::Path) -> Self {
+            Self {
+                file: file.to_owned(),
+                users: vec![("tokA", "A"), ("tokB", "B")],
+                sent: RefCell::default(),
+            }
+        }
+    }
+
+    impl Resumer for FakeResumer {
+        type Api = String;
+        type Error = String;
+        fn load_token(&self) -> Option<String> {
+            super::super::token_file::read(&self.file)
+                .ok()
+                .flatten()
+                .map(|s| s.token)
+        }
+        fn resume<'a>(
+            &'a self,
+            token: &'a str,
+        ) -> futures_util::future::LocalBoxFuture<'a, Result<String, ResumeError<String>>> {
+            self.sent.borrow_mut().push(token.to_owned());
+            let user = self
+                .users
+                .iter()
+                .find(|(t, _)| *t == token)
+                .map(|(_, u)| u.to_string());
+            Box::pin(async move { user.ok_or(ResumeError::Refused) })
+        }
+        fn forget_token(&self) {
+            let _ = super::super::token_file::forget(&self.file);
+        }
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// A resume reads the token once and the session it gives answers for
+    /// exactly that token; a refused token is dropped; no token sends
+    /// nothing.
+    #[test]
+    fn a_resume_gives_the_session_with_the_token_it_was_sent() {
+        use super::super::token_file;
+        let d = TmpDir::new("resume");
+        let path = d.path().join("device-token");
+        let r = FakeResumer::new(&path);
+        assert!(matches!(run(resume_session(&r)), Resumed::NoToken));
+        assert!(
+            r.sent.borrow().is_empty(),
+            "a resume went out with no token"
+        );
+        token_file::store(&path, "tokA").unwrap();
+        match run(resume_session(&r)) {
+            Resumed::Opened { api, token } => {
+                assert_eq!((api.as_str(), token.as_str()), ("A", "tokA"));
+            }
+            _ => panic!("A's token did not resume A's session"),
+        }
+        assert_eq!(*r.sent.borrow(), ["tokA"]);
+        token_file::store(&path, "tokX").unwrap();
+        assert!(matches!(run(resume_session(&r)), Resumed::Refused));
+        assert_eq!(
+            token_file::read(&path).unwrap(),
+            None,
+            "a refused token was kept"
         );
     }
 

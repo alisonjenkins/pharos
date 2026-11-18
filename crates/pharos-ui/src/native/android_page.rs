@@ -35,8 +35,10 @@ use super::kept_video::{
 use super::kept_video_disk::{
     iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
 };
+use super::offline_video::{self, ResumeError, Resumed};
 use super::tv_page::{self, Bridge, Paths};
 use super::tv_turn;
+use pharos_api::pharos_capnp::bootstrap;
 
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
@@ -116,7 +118,6 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     spawn_forever(system);
     // None of the three needs another's answer, so they share one wait: the
     // capability probe is a WebView round trip and the other two are RPCs.
-    let token = android::load_token();
     let probe = async {
         if lock(&CAPS).is_some() {
             return None;
@@ -131,16 +132,17 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             .ok();
         (schema, now_ms() - connected)
     };
-    let resume = async {
-        match &token {
-            Some(token) => {
-                let resumed = android::resume(&client, &closed, call, token).await;
-                Some((resumed, now_ms() - connected))
-            }
-            None => None,
-        }
+    let resumer = PhoneResumer {
+        client: &client,
+        closed: &closed,
+        call,
     };
-    let (probe_ms, (server_schema, server_info_ms), resumed) =
+    let resume = async {
+        let resumed = offline_video::resume_session(&resumer).await;
+        let ms = (!matches!(resumed, Resumed::NoToken)).then(|| now_ms() - connected);
+        (resumed, ms)
+    };
+    let (probe_ms, (server_schema, server_info_ms), (resumed, resume_ms)) =
         futures_util::join!(probe, info, resume);
     // A step that did not run says so instead of carrying a duration.
     let ms =
@@ -149,20 +151,19 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         "connect_ms={:.0} probe_ms={} server_info_ms={server_info_ms:.0} resume_ms={} total_ms={:.0}",
         connected - started,
         ms(probe_ms, "cached"),
-        ms(resumed.as_ref().map(|(_, d)| *d), "no_token"),
+        ms(resume_ms, "no_token"),
         now_ms() - started,
     );
-    let Some((resumed, _)) = resumed else {
-        log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
-        set_session_token(None);
-        return Err(OpenError::NotSignedIn);
-    };
     match resumed {
-        Ok(session) => {
+        Resumed::NoToken => {
+            log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
+            set_session_token(None);
+            Err(OpenError::NotSignedIn)
+        }
+        Resumed::Opened { api, token } => {
             log::info!("pharos: open server={base} signed_in=true {timing}");
             // The token this session answers for, kept beside its API.
-            set_session_token(token.clone());
-            let api = NativeApi::new(&session);
+            set_session_token(Some(token));
             spawn_forever(keep_media_token(api.clone()));
             Ok(Open {
                 api,
@@ -170,16 +171,49 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
                 server_schema,
             })
         }
-        Err(NetError::Client(e)) if e.needs_sign_in() => {
+        Resumed::Refused => {
             log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
             set_session_token(None);
-            android::forget_token();
             Err(OpenError::NotSignedIn)
         }
-        Err(e) => {
+        Resumed::Failed(e) => {
             log::warn!("pharos: open resume failed server={base} error={e} {timing}");
-            Err(OpenError::Resume(e.to_string()))
+            Err(OpenError::Resume(e))
         }
+    }
+}
+
+/// The phone's side of [`offline_video::resume_session`]: the token file
+/// and the server's resume over `open`'s socket.
+struct PhoneResumer<'a> {
+    client: &'a bootstrap::Client,
+    closed: &'a Closed,
+    call: &'a CallInfo,
+}
+
+impl offline_video::Resumer for PhoneResumer<'_> {
+    type Api = NativeApi;
+    type Error = String;
+
+    fn load_token(&self) -> Option<String> {
+        android::load_token()
+    }
+
+    fn resume<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<NativeApi, ResumeError<String>>> {
+        Box::pin(async move {
+            match android::resume(self.client, self.closed, self.call, token).await {
+                Ok(session) => Ok(NativeApi::new(&session)),
+                Err(NetError::Client(e)) if e.needs_sign_in() => Err(ResumeError::Refused),
+                Err(e) => Err(ResumeError::Failed(e.to_string())),
+            }
+        })
+    }
+
+    fn forget_token(&self) {
+        android::forget_token();
     }
 }
 
