@@ -3288,10 +3288,14 @@ impl Inner {
     }
 }
 
-/// Where this open's run ids start: past every id an earlier open of this
-/// process or an earlier process can have used. The clock's nanoseconds
-/// (an earlier process's ids are far below them), and at least 2^32 past
-/// the last base this process handed out.
+/// Where this open's run ids start: the clock's nanoseconds, and at least
+/// 2^32 past the last base this process handed out. Within one process two
+/// opens never share a base. Across processes nothing is promised: `LAST`
+/// is process-local and the clock can repeat or step back, so a new
+/// process can reuse an earlier one's ids. Inherited staging files do not
+/// rely on the ids: before a run stages anything, every staging file that
+/// no live writer in the registry (`writers`) owns is deleted, whatever its
+/// id (`drop_old_runs_parts`).
 fn open_run_base() -> u64 {
     #[cfg(test)]
     if let Some(base) = tests::RUN_BASE.with(std::cell::Cell::get) {
