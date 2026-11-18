@@ -808,11 +808,23 @@ mod tests {
         d
     }
 
+    /// A test's cache folder, deleted when the test ends.
+    struct TmpDir(std::path::PathBuf);
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Fields drop in order: the downloader is stopped (its thread joined)
+    /// before the folder it writes into is deleted.
     struct Rig {
         srv: Arc<TestServer>,
         cache: Arc<Cache>,
         dl: Downloader,
         resolved: Arc<AtomicUsize>,
+        _dir: TmpDir,
     }
 
     /// `track/N` is served at `/audio/N`. The resolver hands out `tokens[i]`
@@ -838,7 +850,8 @@ mod tests {
         free: FreeProbe,
     ) -> Rig {
         let srv = Arc::new(TestServer::start(script));
-        let cache = Arc::new(Cache::open_with_probe(&tmp(name), cap, free).unwrap());
+        let dir = TmpDir(tmp(name));
+        let cache = Arc::new(Cache::open_with_probe(&dir.0, cap, free).unwrap());
         let resolved = Arc::new(AtomicUsize::new(0));
         let tokens: Vec<String> = tokens.iter().map(|s| (*s).to_owned()).collect();
         let (s2, r2) = (srv.clone(), resolved.clone());
@@ -854,6 +867,7 @@ mod tests {
             cache,
             dl,
             resolved,
+            _dir: dir,
         }
     }
 
@@ -1100,7 +1114,9 @@ mod tests {
     /// for the job.
     #[test]
     fn a_pin_arriving_after_a_job_decided_to_cancel_is_not_lost() {
-        let cache = Arc::new(Cache::open(&tmp("pin-after-cancel"), 1 << 20).unwrap());
+        // Declared first, so dropped last.
+        let dir = TmpDir(tmp("pin-after-cancel"));
+        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
         let gate = Arc::new(Gate {
             cache: cache.clone(),
             resolve: Arc::new(|_| Err(ResolveError::Transient("unused".into()))),
