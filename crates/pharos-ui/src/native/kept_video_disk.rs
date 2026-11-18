@@ -2689,16 +2689,14 @@ async fn plan_and_admit(
     tests::pruned(stale, inner, user, item);
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
-    // An inventory that came back short is no
+    // Only a regular file is a whole stored file: a folder in a file's
+    // place is fetched again. An inventory that came back short is no
     // figure for what is stored: the plan is not admitted (its reservation
     // would be replaced by one counting too little), and the folder stays
     // unknown until a sweep measures it whole.
     let dir = inner.item_dir(user, item);
     let names = match stored_entries(&dir) {
-        Measure::Whole(entries) => entries
-            .into_iter()
-            .map(|(n, e)| (n, e.len))
-            .collect::<HashMap<_, _>>(),
+        Measure::Whole(entries) => regular_files(&entries),
         Measure::Short(entries) => {
             {
                 let mut st = lock(&inner.state);
@@ -7282,6 +7280,16 @@ mod tests {
             only(&reopened).state,
             KeptState::Ready,
             "a folder was taken for a whole file"
+        );
+        // The resume's own inventory does not take the folder for the
+        // segment either: with the folder still in its place, the download
+        // cannot finish.
+        reopened.settled().await;
+        assert!(seg.is_dir(), "a whole segment replaced the folder");
+        assert_ne!(
+            only(&reopened).state,
+            KeptState::Ready,
+            "the resume took the folder for a whole segment"
         );
     }
 
