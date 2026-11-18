@@ -206,9 +206,13 @@ pub fn redirect_verdict(original: &str, next: &str) -> Result<(), String> {
 
 /// Whether the device token may go to `url` in a header: only over https,
 /// or to the server the build was pointed at (`PHAROS_TV_SERVER`, passed as
-/// `build_server`), which a development build may serve on plain http. Any
-/// other plain-http request goes without the token. Err is the reason, for
-/// the log.
+/// `build_server`), whatever its scheme. Any other plain-http request goes
+/// without the token. Err is the reason, for the log.
+///
+/// A build pointed at a plain-http server that is not loopback (a server on
+/// the LAN) sends the token to it unencrypted, readable by anyone on that
+/// network. That is an accepted risk for LAN builds: the build names its
+/// server, and https is the remedy.
 pub fn token_allowed(url: &str, build_server: &str) -> Result<(), String> {
     let Some(to) = origin_of(url) else {
         return Err("not an http(s) URL".to_owned());
