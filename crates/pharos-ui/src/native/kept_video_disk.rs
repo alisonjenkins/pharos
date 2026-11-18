@@ -2689,11 +2689,40 @@ async fn plan_and_admit(
     tests::pruned(stale, inner, user, item);
     // What is on disk already, before the plan is admitted: a resumed
     // download is admitted for what is left.
-    let names = match stored_entries(&inner.item_dir(user, item)) {
-        Measure::Whole(e) | Measure::Short(e) => e
+    // An inventory that came back short is no
+    // figure for what is stored: the plan is not admitted (its reservation
+    // would be replaced by one counting too little), and the folder stays
+    // unknown until a sweep measures it whole.
+    let dir = inner.item_dir(user, item);
+    let names = match stored_entries(&dir) {
+        Measure::Whole(entries) => entries
             .into_iter()
             .map(|(n, e)| (n, e.len))
             .collect::<HashMap<_, _>>(),
+        Measure::Short(entries) => {
+            {
+                let mut st = lock(&inner.state);
+                if !st.unmeasured.iter().any(|(d, _)| *d == dir) {
+                    st.unmeasured.push((
+                        dir.clone(),
+                        "folder not listed whole while planning".to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&dir) {
+                    st.remeasure.push(dir.clone());
+                }
+            }
+            let reason =
+                "the download's folder could not be listed whole, so what it holds is unknown";
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason=inventory_short found={} resume={resume} step=plan",
+                    entries.len()
+                ),
+            );
+            return Err(Stop::Refused(reason.to_owned()));
+        }
     };
     let mut have = HashSet::new();
     let mut stored_bytes = 0u64;
@@ -4378,6 +4407,8 @@ mod tests {
     thread_local! {
         /// Runs between a plan being wanted and its prune.
         static BEFORE_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// Runs once the prune is done, before the plan's inventory.
+        pub(super) static AFTER_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
         /// What the last prune returned, and whether it left the folder unknown.
         static PRUNED: RefCell<Option<(u64, bool)>> = const { RefCell::new(None) };
     }
@@ -4402,6 +4433,11 @@ mod tests {
     }
 
     pub(super) fn pruned(stale: u64, inner: &Inner, user: &str, item: &str) {
+        AFTER_PRUNE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
         let unknown = lock(&inner.state)
             .leftover
             .contains(&inner.item_dir(user, item));
@@ -7367,6 +7403,41 @@ mod tests {
             refused
                 .iter()
                 .any(|l| l.contains("step=playlist") && l.contains("extended=0 ")),
+            "{refused:?}"
+        );
+    }
+
+    /// A retry whose inventory of the folder comes back short (after a
+    /// prune that read it whole) is not admitted: what the folder holds is
+    /// unknown, so its reservation is kept, not replaced by a plan that
+    /// counts nothing stored.
+    #[tokio::test]
+    async fn a_short_inventory_while_planning_admits_nothing_and_keeps_the_reservation() {
+        let rig = Rig::new("plan-inventory-short");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = only(&store).estimated_bytes;
+        assert!(held > 0, "no reservation to keep");
+        rig.server.fail(SEG1, &[]);
+        ADMITTED.with(|a| a.set(None));
+        set_hook(&AFTER_PRUNE, || FAIL_ENTRY_READ.with(|f| f.set(true)));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        assert_eq!(ADMITTED.with(std::cell::Cell::get), None, "admitted");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Failed { .. }), "{:?}", v.state);
+        assert!(
+            v.estimated_bytes >= held,
+            "the reservation shrank to {} from {held}",
+            v.estimated_bytes
+        );
+        let refused = lines("pharos: video keep refused item=1 reason=inventory_short");
+        assert!(
+            refused.iter().any(|l| l.contains("step=plan")),
             "{refused:?}"
         );
     }
