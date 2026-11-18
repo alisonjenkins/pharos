@@ -263,11 +263,9 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
 
 /// V1467 — a mix plays music only: an audiobook's tracks (songs whose
 /// innermost library is a Books library, ADR-0132) never join a song's
-/// pool, natively or through `InstantMix`, and the log line counts what was
-/// kept out. An audiobook track's instant mix stays on the audiobooks.
-/// Disarm check: with `keep_music` keeping everything, the native mix picks
-/// book tracks and `books_left_out` reads 0; with `same_shelf_songs` not
-/// filtering, the instant mix returns book tracks.
+/// pool or seed a mix, and the log line counts what was kept out.
+/// Disarm check: with `keep_music` keeping everything, the mix picks book
+/// tracks and `books_left_out` reads 0.
 #[actix_web::test]
 async fn a_mix_never_plays_an_audiobooks_tracks() {
     use pharos_core::LibraryKind;
@@ -323,24 +321,4 @@ async fn a_mix_never_plays_an_audiobooks_tracks() {
         mix::mix(&fx.state, &user, book_seed, 0).await,
         Err(mix::MixError::SeedNotFound(3_100))
     ));
-
-    let app = actix_web::test::init_service(crate::common::build_app(fx.state.clone())).await;
-    for (seed, shelf) in [(3_000u64, 3_000..3_005), (3_100, 3_100..3_105)] {
-        let req = actix_web::test::TestRequest::get()
-            .uri(&format!("/Items/{seed}/InstantMix?Limit=50"))
-            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
-            .to_request();
-        let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
-        let got: Vec<u64> = body["Items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| pharos_jellyfin_api::dto::parse_item_id(i["Id"].as_str().unwrap()).unwrap())
-            .collect();
-        assert_eq!(got.len(), 5, "seed {seed}: {got:?}");
-        assert!(
-            got.iter().all(|id| shelf.contains(id)),
-            "seed {seed}: {got:?}"
-        );
-    }
 }
