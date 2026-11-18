@@ -3127,7 +3127,7 @@ fn http() -> &'static Result<reqwest::Client, String> {
         let builder = reqwest::Client::builder()
             .user_agent(tv_page::USER_AGENT)
             .redirect(reqwest::redirect::Policy::none());
-        let built = tv_page::built_client_for("proxy", || {
+        let built = tv_page::proxy_client(|| {
             let tls = pharos_api::tls::client_config().map_err(|e| format!("tls config: {e}"))?;
             builder
                 .tls_backend_preconfigured(tls)
@@ -3162,92 +3162,85 @@ fn token_for(url: &str, what: &str) -> Option<String> {
     }
 }
 
-/// GET `path_and_query` from the server with the device token in a header.
-/// Returns the status, the passed-back headers and the body.
+/// The phone's transport for [`tv_page::proxy_get`]: one reqwest GET, no
+/// redirect followed (the client's policy is `none`).
+impl tv_page::ProxyTransport for reqwest::Client {
+    type Response = reqwest::Response;
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<reqwest::Response, String> {
+        let mut req = reqwest::Client::get(self, url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        req.send()
+            .await
+            .map_err(|e| tv_page::error_chain(&e.without_url()))
+    }
+}
+
+impl tv_page::ProxyResponse for reqwest::Response {
+    fn status(&self) -> u16 {
+        reqwest::Response::status(self).as_u16()
+    }
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+    fn redirect(&self) -> Option<Result<String, String>> {
+        if !reqwest::Response::status(self).is_redirection() {
+            return None;
+        }
+        let location = self
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())?;
+        Some(
+            self.url()
+                .join(location)
+                .map(|u| u.to_string())
+                .map_err(|e| e.to_string()),
+        )
+    }
+    async fn body(self) -> Result<Vec<u8>, String> {
+        self.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| tv_page::error_chain(&e.without_url()))
+    }
+}
+
+/// GET `path_and_query` from the server with the device token in a header,
+/// through [`tv_page::proxy_get`]. Returns the status, the passed-back
+/// headers and the body.
 async fn fetch_server(
     path_and_query: &str,
     headers: &[(String, String)],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    let base = server();
-    let mut url = tv_page::server_url(&base, path_and_query);
-    let mut token = token_for(&url, "proxy");
-    let mut hops = 0usize;
-    let client = http().as_ref().map_err(|why| {
-        log::warn!("pharos: proxy request refused reason={why}");
-        format!("stage=client {why}")
-    })?;
-    let resp = loop {
-        let mut req = client.get(&url);
-        if let Some(token) = &token {
-            req = req.header("X-Emby-Token", token);
-        }
-        for (name, value) in headers {
-            req = req.header(name, value);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("stage=send {}", tv_page::error_chain(&e.without_url())))?;
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok());
-        let Some(location) = location.filter(|_| resp.status().is_redirection()) else {
-            break resp;
-        };
-        let next = resp
-            .url()
-            .join(location)
-            .map_err(|e| format!("stage=redirect location not understood: {e}"))?
-            .to_string();
-        if hops >= PROXY_REDIRECTS {
-            return Err(format!(
-                "stage=redirect more than {PROXY_REDIRECTS} redirects"
-            ));
-        }
-        hops += 1;
-        let status = resp.status().as_u16();
-        match tv_page::redirect_hop(&url, &next, tv_page::DEFAULT_SERVER) {
-            tv_page::Hop::FollowWithToken => {
-                log::debug!("pharos: proxy redirect verdict=follow_with_token status={status}");
-            }
-            tv_page::Hop::FollowWithoutToken => {
-                if token.take().is_some() {
-                    log::info!(
-                        "pharos: proxy redirect verdict=follow_without_token status={status}"
-                    );
-                }
-            }
-            tv_page::Hop::Refuse(reason) => {
-                log::warn!(
-                    "pharos: proxy redirect verdict=refused reason={reason} status={status}"
-                );
-                return Err(format!("stage=redirect refused: {reason}"));
-            }
-        }
-        url = next;
+    let url = tv_page::server_url(&server(), path_and_query);
+    let token = token_for(&url, "proxy");
+    let log = |level: tv_page::Level, line: String| match level {
+        tv_page::Level::Debug => log::debug!("{line}"),
+        tv_page::Level::Info => log::info!("{line}"),
+        tv_page::Level::Warn => log::warn!("{line}"),
     };
-    let status = resp.status().as_u16();
-    let back = PASSED_BACK
-        .iter()
-        .filter_map(|name| {
-            resp.headers()
-                .get(*name)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| ((*name).to_owned(), v.to_owned()))
-        })
-        .collect();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            format!(
-                "stage=body status={status} {}",
-                tv_page::error_chain(&e.without_url())
-            )
-        })?
-        .to_vec();
-    Ok((status, back, body))
+    tv_page::proxy_get(
+        http(),
+        tv_page::ProxyGet {
+            url,
+            token,
+            headers,
+            build_server: tv_page::DEFAULT_SERVER,
+            passed_back: &PASSED_BACK,
+            max_hops: PROXY_REDIRECTS,
+        },
+        &log,
+    )
+    .await
 }
 
 /// How long a download's request or one chunk of its body may go without

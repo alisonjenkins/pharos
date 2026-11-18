@@ -268,6 +268,142 @@ pub fn built_client_for<C, E: std::fmt::Display>(
     build().map_err(|e| format!("the {what} client could not be built: {e}"))
 }
 
+/// One hop of a proxied request: a GET of `url` with `headers`, no redirect
+/// followed. The phone's is its reqwest client; a host test's can count
+/// what reaches a server.
+pub trait ProxyTransport: Sync {
+    type Response: ProxyResponse + Send;
+    /// Err is the reason, for `stage=send`.
+    fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> impl std::future::Future<Output = Result<Self::Response, String>> + Send;
+}
+
+/// What one hop answered.
+pub trait ProxyResponse {
+    fn status(&self) -> u16;
+    fn header(&self, name: &str) -> Option<String>;
+    /// The redirect target, made absolute against this response's URL, when
+    /// the answer is a redirect with a `Location`; Err when it cannot be
+    /// read.
+    fn redirect(&self) -> Option<Result<String, String>>;
+    /// Err is the reason, for `stage=body`.
+    fn body(self) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+}
+
+/// How loud a proxy log line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Debug,
+    Info,
+    Warn,
+}
+
+/// A proxied GET: where it goes and what it may carry.
+pub struct ProxyGet<'a> {
+    pub url: String,
+    /// The device token, when it may go to `url` ([`token_allowed`]).
+    pub token: Option<String>,
+    pub headers: &'a [(String, String)],
+    pub build_server: &'a str,
+    /// The response headers passed back.
+    pub passed_back: &'a [&'a str],
+    pub max_hops: usize,
+}
+
+/// The proxy's client from `build`: one that cannot be built is the error,
+/// naming the proxy, never a default client in its place
+/// ([`built_client_for`]).
+pub fn proxy_client<C>(build: impl FnOnce() -> Result<C, String>) -> Result<C, String> {
+    built_client_for("proxy", build)
+}
+
+/// Runs a proxied GET over `client`, following redirects by hand through
+/// [`redirect_hop`]: the token stays only on its own origin, and at most
+/// `max_hops` are followed. With no client, nothing is sent: the request
+/// is refused with the reason (`stage=client`). Returns the status, the
+/// passed-back headers and the body; `log` gets each decision.
+pub async fn proxy_get<T: ProxyTransport>(
+    client: &Result<T, String>,
+    get: ProxyGet<'_>,
+    log: &(dyn Fn(Level, String) + Sync),
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let client = client.as_ref().map_err(|why| {
+        log(
+            Level::Warn,
+            format!("pharos: proxy request refused reason={why}"),
+        );
+        format!("stage=client {why}")
+    })?;
+    let ProxyGet {
+        mut url,
+        mut token,
+        headers,
+        build_server,
+        passed_back,
+        max_hops,
+    } = get;
+    let mut hops = 0usize;
+    let resp = loop {
+        let mut sent = Vec::with_capacity(headers.len() + 1);
+        if let Some(token) = &token {
+            sent.push(("X-Emby-Token".to_owned(), token.clone()));
+        }
+        sent.extend(headers.iter().cloned());
+        let resp = client
+            .get(&url, &sent)
+            .await
+            .map_err(|e| format!("stage=send {e}"))?;
+        let Some(next) = resp.redirect() else {
+            break resp;
+        };
+        let next = next.map_err(|e| format!("stage=redirect location not understood: {e}"))?;
+        if hops >= max_hops {
+            return Err(format!("stage=redirect more than {max_hops} redirects"));
+        }
+        hops += 1;
+        let status = resp.status();
+        match redirect_hop(&url, &next, build_server) {
+            Hop::FollowWithToken => log(
+                Level::Debug,
+                format!("pharos: proxy redirect verdict=follow_with_token status={status}"),
+            ),
+            Hop::FollowWithoutToken => {
+                if token.take().is_some() {
+                    log(
+                        Level::Info,
+                        format!(
+                            "pharos: proxy redirect verdict=follow_without_token status={status}"
+                        ),
+                    );
+                }
+            }
+            Hop::Refuse(reason) => {
+                log(
+                    Level::Warn,
+                    format!(
+                        "pharos: proxy redirect verdict=refused reason={reason} status={status}"
+                    ),
+                );
+                return Err(format!("stage=redirect refused: {reason}"));
+            }
+        }
+        url = next;
+    };
+    let status = resp.status();
+    let back = passed_back
+        .iter()
+        .filter_map(|name| resp.header(name).map(|v| ((*name).to_owned(), v)))
+        .collect();
+    let body = resp
+        .body()
+        .await
+        .map_err(|e| format!("stage=body status={status} {e}"))?;
+    Ok((status, back, body))
+}
+
 /// An error and every cause under it, `outer: inner: ...`, for a log line.
 /// reqwest's own `Display` names only the top layer ("error sending
 /// request"), which hides whether the connection was refused, reset or
@@ -1478,6 +1614,121 @@ mod tests {
         assert!(why.contains("tls backend unavailable"), "{why}");
         assert!(why.contains("download client"), "{why}");
         assert_eq!(built_client(|| Ok::<_, String>(7)), Ok(7));
+    }
+
+    /// A local server that counts the connections it accepts and answers
+    /// each with a 200.
+    #[allow(clippy::unwrap_used)]
+    fn counting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok");
+            }
+        });
+        (base, hits)
+    }
+
+    /// A transport over a plain TCP connection: one request per hop.
+    #[derive(Default)]
+    struct Tcp;
+
+    struct TcpAnswer(u16, Vec<u8>);
+
+    impl ProxyResponse for TcpAnswer {
+        fn status(&self) -> u16 {
+            self.0
+        }
+        fn header(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redirect(&self) -> Option<Result<String, String>> {
+            None
+        }
+        async fn body(self) -> Result<Vec<u8>, String> {
+            Ok(self.1)
+        }
+    }
+
+    impl ProxyTransport for Tcp {
+        type Response = TcpAnswer;
+        async fn get(&self, url: &str, _: &[(String, String)]) -> Result<TcpAnswer, String> {
+            use std::io::{Read as _, Write as _};
+            let rest = url.strip_prefix("http://").ok_or("not http")?;
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let mut s = std::net::TcpStream::connect(host).map_err(|e| e.to_string())?;
+            s.write_all(format!("GET /{path} HTTP/1.0\r\n\r\n").as_bytes())
+                .map_err(|e| e.to_string())?;
+            let mut answer = Vec::new();
+            s.read_to_end(&mut answer).map_err(|e| e.to_string())?;
+            let body = answer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or_else(Vec::new, |i| answer[i + 4..].to_vec());
+            Ok(TcpAnswer(200, body))
+        }
+    }
+
+    /// The proxy path itself with a client that cannot be built: the
+    /// request is refused with the reason, and nothing reaches the server.
+    /// With a client, the same request does reach it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_proxy_client_that_cannot_be_built_sends_nothing() {
+        let (base, hits) = counting_server();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let logged = std::sync::Mutex::new(Vec::new());
+        let log = |_: Level, line: String| logged.lock().unwrap().push(line);
+        let get = |url: String| ProxyGet {
+            url,
+            token: Some("tok".to_owned()),
+            headers: &[],
+            build_server: "",
+            passed_back: &[],
+            max_hops: 5,
+        };
+        let broken = proxy_client::<Tcp>(|| Err("tls config: no roots".to_owned()));
+        let refused = rt.block_on(proxy_get(&broken, get(format!("{base}/Items")), &log));
+        let Err(why) = refused else {
+            panic!("a client that was never built sent the request");
+        };
+        assert!(why.starts_with("stage=client "), "{why}");
+        assert!(
+            why.contains("proxy client") && why.contains("no roots"),
+            "{why}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a request reached the server"
+        );
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("pharos: proxy request refused reason=")
+                    && l.contains("no roots")),
+            "{:?}",
+            logged.lock().unwrap()
+        );
+
+        // The control: a built client reaches the same server.
+        let built = proxy_client(|| Ok(Tcp));
+        let (status, _, body) = rt
+            .block_on(proxy_get(&built, get(format!("{base}/Items")), &log))
+            .unwrap();
+        assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// The proxy's client that cannot be built is an error naming the proxy
