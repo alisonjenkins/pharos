@@ -48,4 +48,10 @@ ignore = [
     # (`cargo tree -i zstd-safe@5.0.2 --all-features --target all` is empty).
     # Full argument, and what invalidates it, in deny.toml.
     "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0545 / -0548 — zip 0.6.6 AES tag check and
+    # ZipStreamReader name mismatch. Same never-built burn-tch -> tch -> zip
+    # 0.6 chain as -0403 (`cargo tree -i zip@0.6.6 --all-features --target
+    # all` is empty). Ignored with Alison's OK; full argument in deny.toml.
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
 ]
