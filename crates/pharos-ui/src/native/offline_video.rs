@@ -460,7 +460,9 @@ impl std::fmt::Debug for TokenSeen {
     }
 }
 
-/// The device token on file now ([`TokenSeen`]).
+/// The token the current session was authenticated with ([`TokenSeen`]),
+/// as the platform kept it when the session opened: never a fresh read of
+/// the token file, which another sign-in may have replaced since.
 pub fn token_seen() -> TokenSeen {
     #[cfg(test)]
     if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
@@ -762,6 +764,9 @@ mod tests {
         reads: Rc<Cell<usize>>,
         /// When set, pairing the user with the token fails.
         fail_pair: Rc<Cell<bool>>,
+        /// The token the session was opened with, as the platform keeps it
+        /// beside its API; unset, the file's token stands for it.
+        pub(super) session: Rc<RefCell<Option<String>>>,
     }
 
     impl Pref {
@@ -794,8 +799,12 @@ mod tests {
             }
             Ok(())
         }
-        /// The token a request is built with: the file's, in its mode.
+        /// The token a request is built with: the session's, or the file's
+        /// when the test opened no session.
         pub(super) fn token_seen(&self) -> Option<String> {
+            if let Some(session) = self.session.borrow().clone() {
+                return Some(session);
+            }
             match self.file.borrow().as_ref() {
                 Some(path) => super::super::token_file::read(path)
                     .ok()
@@ -1306,6 +1315,33 @@ mod tests {
                 .all(|r| !r.starts_with("resume")),
             "{:?}",
             runs.0.lock().unwrap()
+        );
+    }
+
+    /// The session opened with A's token, and another account's token was
+    /// stored before `me` was asked (the media service's sign-in landed in
+    /// between). The `me` request is A's session's, so it carries A's
+    /// token, not the file's: the pairing compares A's token with the file
+    /// and refuses, and A's run is refused B's token.
+    #[test]
+    fn a_token_replaced_before_me_is_not_paired_with_the_sessions_user() {
+        use super::super::kept_video::token_for_owner;
+        use super::super::token_file;
+        let d = TmpDir::new("pair-session");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        // The session authenticates with A's token.
+        *p.session.borrow_mut() = Some("tokA".to_owned());
+        token_file::store(&path, "tokB").unwrap();
+        let ask = me_request(true, Some(())).unwrap();
+        let _ = ask.answered("A");
+        let on_file = token_file::read(&path).unwrap().unwrap();
+        assert_eq!(on_file.user, None, "B's token was paired with A");
+        assert!(
+            token_for_owner(Some(&on_file.token), on_file.user.as_deref(), "A").is_err(),
+            "A's run would be sent B's token"
         );
     }
 
