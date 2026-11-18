@@ -23,7 +23,9 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   return while the first is still opening the store, so the UI never takes
   one read as final: the app's root waits for the slot to be published
   (`Slot::published`, in a task, never blocking the UI thread) and every
-  reader re-renders then (`kept_video_view::shown_video_store`).
+  reader re-renders then (`kept_video_view::shown_video_store`). No
+  decision made at mount reads the store once: the slow-connect timer starts
+  for every attempt and reads what is kept when it fires.
 - Keys are `path + query` (`request_key`). Each key is a file named by a
   128-bit hash under `<root>/<user>/<item>/files/`, beside `manifest.json`
   (the `KeptVideo` record). A file is written as `.part` then renamed, so an
@@ -40,6 +42,26 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   the next user on the phone. The file on disk is already the cache.
 - The device token is sent only over https, or to the build's own server
   (`PHAROS_TV_SERVER`) whatever its scheme (`tv_page::token_allowed`).
+- A download carries only its owner's token. Each run belongs to the user
+  its record was kept for, also when an open restarts it. Every request reads
+  the token and its user in one read of the token file, and is sent only
+  while that user is the run's owner (`kept_video::token_for_owner`). No
+  token, or a token whose user is not stored yet, sends nothing either: the
+  check fails closed. A fetched file is promoted only if the owner still
+  holds the token, checked under the store's lock. The token file's lock is
+  the innermost, taken after the store's. A refused request or promotion
+  discards the staged bytes and parks the run: the record and its files stay
+  Downloading for the owner (`reason=token_owner_mismatch`).
+- A session end parks the ended user's runs before another user's token can
+  be used: the session-end hook (`offline_video::forget_user`) calls
+  `VideoStore::park_runs`, for every run when whose session it was is not
+  known. A sign-in resumes that user's parked downloads
+  (`VideoStore::resume_user`). The binding is the guarantee, and the park
+  stops the work.
+- A staging file that is not promoted is deleted, and its accounting rolled
+  back, in `Staged`'s `Drop`, under the shared admission lock and then the
+  store's lock. Every path runs it: a named failure, a revoked run and a
+  cancelled fetch.
 - The proxy's client follows no redirect itself (`Policy::none()`). The
   proxy follows up to 5 hops by hand through `tv_page::redirect_hop`: the
   token is kept only on its own origin (an IPv6 host compared by address,
