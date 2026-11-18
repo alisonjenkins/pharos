@@ -57,9 +57,16 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   discards the staged bytes and parks the run: the record and its files stay
   Downloading for the owner (`reason=token_owner_mismatch`).
 - A user is paired with the token only for the token their `me` request was
-  built with: the token that authenticated its session, which `open` keeps
-  beside the API it resumed (never a fresh read of the file, which the
-  media service may have replaced since). `me_request` takes it, and the answer
+  built with: the token that authenticated its session (never a fresh read
+  of the file, which the media service may have replaced since). The token
+  travels with the API as one value, `offline_video::Session`:
+  `resume_session` makes it from the token it resumed with, and nothing sets
+  or clears that token after. There is no process-wide copy. A re-open is a
+  new value, so an in-flight `me` keeps its own session's token, and
+  `use_me` takes the session with the identity generation. The resume runs
+  behind a platform seam (`Resumer`), so the open, `me`, pairing and
+  download chain runs on the host with fake transports. `me_request` takes
+  the session's token, and the answer
   pairs through `token::store_user_if`, which compares that token with the
   one on file under the file's lock. A token stored since (another
   account's sign-in) is left unpaired (`verdict=refused
