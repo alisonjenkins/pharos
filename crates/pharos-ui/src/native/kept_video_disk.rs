@@ -3860,41 +3860,37 @@ fn remove_part(path: &Path) -> std::io::Result<()> {
 }
 
 /// The bytes of the staging files in `dir`: whole only when the listing was
-/// complete and every file's length could be read (a file gone since is
-/// none); otherwise a lower bound, never taken as what the folder holds.
+/// complete and every entry could be measured (a file gone since is none);
+/// otherwise a lower bound, never taken as what the folder holds.
 fn parts_bytes(dir: &Path) -> Measure<u64> {
-    let (paths, clean) = part_paths(dir, ".part");
-    let mut total = if clean {
-        Measure::Whole(0u64)
-    } else {
-        Measure::Short(0u64)
-    };
-    for path in paths {
-        let part = match std::fs::metadata(&path) {
-            Ok(m) => Measure::Whole(m.len()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
-            Err(_) => Measure::Short(0),
-        };
-        total = total.and(part, u64::saturating_add);
-    }
-    total
+    parts_measure(dir, None)
 }
 
 /// [`parts_bytes`] without `run`'s own staging files.
 fn parts_bytes_except(dir: &Path, run: u64) -> Measure<u64> {
-    let own = format!(".{run}.part");
+    parts_measure(dir, Some(run))
+}
+
+/// The one measure admission and a run's exit both read the staging files
+/// with, so the two never disagree: a regular file by its length, anything
+/// else (a `.part` entry that is a folder) by everything under it
+/// ([`dir_size`]), so a folder's contents are never taken as its own small
+/// length. A short measure stays a lower bound.
+fn parts_measure(dir: &Path, except: Option<u64>) -> Measure<u64> {
+    let own = except.map(|run| format!(".{run}.part"));
     let (paths, clean) = part_paths(dir, ".part");
     let mut total = if clean {
         Measure::Whole(0u64)
     } else {
         Measure::Short(0u64)
     };
-    for path in paths
-        .iter()
-        .filter(|p| !p.to_string_lossy().ends_with(&own))
-    {
+    for path in paths.iter().filter(|p| {
+        !own.as_deref()
+            .is_some_and(|own| p.to_string_lossy().ends_with(own))
+    }) {
         let part = match std::fs::metadata(path) {
-            Ok(m) => Measure::Whole(m.len()),
+            Ok(m) if m.is_file() => Measure::Whole(m.len()),
+            Ok(_) => dir_size(path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
             Err(_) => Measure::Short(0),
         };
@@ -11069,7 +11065,8 @@ pub(crate) mod tests {
     }
 
     /// [`host_recovers_an_interrupted_download_with_an_old_part`] with the
-    /// staging file named `name`.
+    /// staging file named `name`; a name ending in `/` is a folder holding
+    /// a file of `big` bytes.
     async fn host_recovers_an_interrupted_download_with_a_part(
         rig: &Rig,
         big: u64,
@@ -11091,8 +11088,16 @@ pub(crate) mod tests {
         };
         std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
         std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
-        let part = dir.join("files").join(name);
-        std::fs::File::create(&part).unwrap().set_len(big).unwrap();
+        let part = dir.join("files").join(name.trim_end_matches('/'));
+        if name.ends_with('/') {
+            std::fs::create_dir_all(&part).unwrap();
+            std::fs::File::create(part.join("inner"))
+                .unwrap()
+                .set_len(big)
+                .unwrap();
+        } else {
+            std::fs::File::create(&part).unwrap().set_len(big).unwrap();
+        }
         UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
         let store = rig.open();
         UNREADABLE.with(|u| u.borrow_mut().clear());
@@ -11295,6 +11300,49 @@ pub(crate) mod tests {
             "the finished run dropped the staging file's bytes: kept {} of {on_disk} on disk ({:?})",
             store.kept_bytes(),
             only(&store).state
+        );
+        FAIL_PART_DELETE.with(|f| f.set(false));
+    }
+
+    /// A `.part` entry that is a folder (it would not delete) counts by
+    /// everything under it, the same at admission and at the run's exit:
+    /// never by the folder's own small length, which would let the plan and
+    /// the terminal figure drop the bytes inside it.
+    #[tokio::test]
+    async fn a_staging_folder_counts_by_what_it_holds() {
+        let rig = Rig::new("host-resume-part-dir");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_a_part(&rig, big, "x.99.part/").await;
+        assert!(
+            parts_bytes(&dir).counted(0) >= big,
+            "{:?}",
+            parts_bytes(&dir)
+        );
+        assert!(parts_bytes_except(&dir, 7).counted(0) >= big);
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        assert!(part.is_dir());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the plan took the staging folder at its own length: kept {} of {on_disk} ({decided:?})",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the finished run dropped the staging folder's bytes: kept {} of {on_disk}",
+            store.kept_bytes()
         );
         FAIL_PART_DELETE.with(|f| f.set(false));
     }
