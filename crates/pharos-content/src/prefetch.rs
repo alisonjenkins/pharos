@@ -121,6 +121,9 @@ enum Fail {
     Cancelled,
     /// Writing on would leave less than the minimum free; carries free bytes.
     LowDisk(u64),
+    /// The cap shared with other downloads cannot be checked yet: wait and
+    /// try again, keeping the partial file.
+    AccountingUnknown,
     Unauthorized,
     Transient(String),
     Permanent(String),
@@ -128,15 +131,10 @@ enum Fail {
 
 impl Fail {
     fn no_room(no: NoRoom) -> Self {
-        Self::LowDisk(room_of(no))
-    }
-}
-
-/// The room a refusal reports: none when the cap could not be checked.
-fn room_of(no: NoRoom) -> u64 {
-    match no {
-        NoRoom::LowDisk(room) => room,
-        NoRoom::AccountingUnknown => 0,
+        match no {
+            NoRoom::LowDisk(room) => Self::LowDisk(room),
+            NoRoom::AccountingUnknown => Self::AccountingUnknown,
+        }
     }
 }
 
@@ -499,6 +497,29 @@ impl Gate {
         }
     }
 
+    /// The cap shared with other downloads cannot be checked yet (their
+    /// size is unknown): a wait, never a failure. Logs the wait, backs off
+    /// and asks again; the partial file stays to resume from. True when a
+    /// waiting pin gave the worker to playback read-ahead instead.
+    async fn wait_for_accounting(
+        &self,
+        id: &str,
+        st: &JobState,
+        attempt: u32,
+        started: Instant,
+        backoff: &mut Duration,
+        epoch: &mut u64,
+    ) -> bool {
+        log::info!(
+            "cache download id={id} bytes={} ms={} outcome=retry reason=accounting_unknown attempt={attempt} wait_ms={}",
+            std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len()),
+            started.elapsed().as_millis(),
+            backoff.as_millis()
+        );
+        self.sleep_backoff(backoff, epoch).await;
+        self.yield_to_playback(id, st)
+    }
+
     async fn resolve(&self, id: &str) -> Result<String, ResolveError> {
         let f = self.resolve.clone();
         let id = id.to_owned();
@@ -523,8 +544,21 @@ impl Gate {
             id,
         };
         let outcome = loop {
-            if let Err(no) = self.cache.ensure_free(id, 0) {
-                break Outcome::LowDisk(room_of(no));
+            match self.cache.ensure_free(id, 0) {
+                Ok(_) => {}
+                Err(NoRoom::LowDisk(free)) => break Outcome::LowDisk(free),
+                Err(NoRoom::AccountingUnknown) => {
+                    if self
+                        .wait_for_accounting(id, &st, attempt, started, &mut backoff, &mut epoch)
+                        .await
+                    {
+                        break Outcome::Yielded;
+                    }
+                    if !self.pause_until_online(id, &mut generation).await {
+                        break Outcome::Cancelled;
+                    }
+                    continue;
+                }
             }
             if !self.pause_until_online(id, &mut generation).await {
                 break Outcome::Cancelled;
@@ -564,6 +598,14 @@ impl Gate {
                 Ok(()) => break Outcome::Ok,
                 Err(Fail::Cancelled) => break Outcome::Cancelled,
                 Err(Fail::LowDisk(free)) => break Outcome::LowDisk(free),
+                Err(Fail::AccountingUnknown) => {
+                    if self
+                        .wait_for_accounting(id, &st, attempt, started, &mut backoff, &mut epoch)
+                        .await
+                    {
+                        break Outcome::Yielded;
+                    }
+                }
                 Err(Fail::Unauthorized) if !refreshed => {
                     refreshed = true;
                     url = None;
@@ -1461,6 +1503,102 @@ mod tests {
             "1000 bytes would leave 1 short"
         );
         assert!(!r.cache.part_path("track/1").exists());
+    }
+
+    /// Installs an outside hook whose size is unknown while `unknown` is
+    /// set, and counts how often it was asked while unknown.
+    fn unknown_outside(c: &Cache) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let unknown = Arc::new(AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (u, a) = (unknown.clone(), asked.clone());
+        c.set_outside_used(Arc::new(move || {
+            let unknown = u.load(Ordering::SeqCst);
+            if unknown {
+                a.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::cache::OutsideBytes {
+                held: 0,
+                outstanding: 0,
+                unknown,
+            }
+        }));
+        (unknown, asked)
+    }
+
+    /// Makes the outside size known once it has been asked `times` times
+    /// while unknown: the download waited at least that long.
+    fn known_after(unknown: Arc<AtomicBool>, asked: Arc<AtomicUsize>, times: usize) {
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                if asked.load(Ordering::SeqCst) >= times {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            unknown.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// A pin queued while the other downloads' size is not known yet (a
+    /// resume at start-up before video accounting is ready) waits for it
+    /// and downloads once it is known: it is not failed, and it does not
+    /// stay stopped until the next launch.
+    #[test]
+    fn a_pin_waits_for_unknown_accounting_and_downloads_once_it_is_known() {
+        let r = pin_rig("accounting-wait", fast(), 1, 1000);
+        let (unknown, asked) = unknown_outside(&r.cache);
+        known_after(unknown, asked.clone(), 3);
+        r.cache.pin("album/1", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(asked.load(Ordering::SeqCst) >= 3, "never waited");
+        assert!(
+            r.cache.is_complete("track/1"),
+            "a pin stopped for accounting that was not ready yet"
+        );
+    }
+
+    /// Accounting that becomes unknown in the middle of a download keeps
+    /// the partial file: the job waits and resumes from it once the size
+    /// is known again, rather than deleting it as if the disk were full.
+    #[test]
+    fn a_download_keeps_its_partial_file_while_accounting_is_unknown() {
+        let size = usize::try_from(FREE_CHECK_BYTES * 3).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", body(size, 1))
+            .hold_after(usize::try_from(FREE_CHECK_BYTES).unwrap() + 1);
+        let r = rig("accounting-mid", script, u64::MAX, &["t"], fast());
+        r.dl.prefetch(&ids(&["track/1"]));
+        for _ in 0..5000 {
+            if reached.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "the body never reached its hold"
+        );
+        let (unknown, asked) = unknown_outside(&r.cache);
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..5000 {
+            if asked.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            asked.load(Ordering::SeqCst) >= 2,
+            "the job never asked while unknown"
+        );
+        assert!(
+            r.cache.part_path("track/1").exists(),
+            "the partial file was deleted while accounting was unknown"
+        );
+        unknown.store(false, Ordering::SeqCst);
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(r.cache.is_complete("track/1"));
+        assert_eq!(read(&r.cache, "track/1"), body(size, 1));
     }
 
     /// A response with no length reserves the next check's window of free
