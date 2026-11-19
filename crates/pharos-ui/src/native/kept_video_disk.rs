@@ -1208,6 +1208,23 @@ impl Inner {
                 tests::sync_step("rename manifest".to_owned());
                 durable_dir(&dir, &video.item, "item_dir")
                     .map_err(|e| std::io::Error::new(e.kind(), format!("item folder sync: {e}")))?;
+                // The folders above it may be new too (a first download makes
+                // the user's folder, and on a new store the store's): each is
+                // an entry in its parent, which a power loss can lose with the
+                // whole download under it. Each parent up to the store's own
+                // is synced, as the item's folder is, before Ready.
+                let user_dir = dir.parent().unwrap_or(&self.root);
+                for (at, what) in [
+                    (Some(user_dir), "user_dir"),
+                    (Some(self.root.as_path()), "store_dir"),
+                    (self.root.parent(), "store_parent"),
+                ] {
+                    if let Some(at) = at {
+                        durable_dir(at, &video.item, what).map_err(|e| {
+                            std::io::Error::new(e.kind(), format!("{what} sync: {e}"))
+                        })?;
+                    }
+                }
             }
             Ok(())
         })();
@@ -10877,11 +10894,24 @@ mod tests {
             last_rename = last_rename.max(rename);
         }
         let files_dir = at("dir files");
+        // A first download on a new store makes the user's folder and the
+        // store's: each is an entry in its parent, synced before Ready too.
+        let store_dir = rig.dir.file_name().unwrap().to_string_lossy().into_owned();
+        let parent_dir = rig
+            .dir
+            .parent()
+            .and_then(Path::file_name)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let order = [
             files_dir,
             at("manifest file"),
             at("rename manifest"),
             at("dir 1"),
+            at("dir u1"),
+            at(&format!("dir {store_dir}")),
+            at(&format!("dir {parent_dir}")),
             at("ready"),
         ];
         assert!(last_rename < files_dir, "{steps:?}");
