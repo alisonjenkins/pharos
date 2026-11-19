@@ -918,15 +918,29 @@ struct Worker {
 /// left on disk. The worker has signed out in memory either way; a removal
 /// the folder could not make durable may come back after a crash, so it is
 /// said, with the same verdict the phone uses.
-fn note_forgotten(at: &str, forgot: token::Forgotten) {
-    match forgot {
-        token::Forgotten::Durable => {
+/// Logs what ending the session did to the token file. Err only when
+/// nothing on disk keeps the token from resuming after a restart.
+fn note_forgotten(at: &str, ended: token::Ended) -> Result<(), String> {
+    match ended {
+        token::Ended::Forgotten(token::Forgotten::Durable) | token::Ended::Changed => {
             log::info!("pharos: token forget verdict=signed_out at={at}");
         }
-        token::Forgotten::NotDurable(why) => {
+        token::Ended::Forgotten(token::Forgotten::NotDurable(why)) => {
             log::warn!("pharos: token forget verdict=signed_out_not_durable at={at} reason={why}")
         }
+        token::Ended::Marked(why) => log::warn!(
+            "pharos: token forget verdict=marked_revoked at={at} reason=token_not_removed error={why}"
+        ),
+        token::Ended::Unsafe { removal, marker } => {
+            log::warn!(
+                "pharos: token forget verdict=restart_unsafe at={at} removal_error={removal} marker_error={marker}"
+            );
+            return Err(format!(
+                "signed out, but the token could not be removed ({removal}) or marked revoked ({marker})"
+            ));
+        }
     }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -1041,9 +1055,15 @@ impl Worker {
         if matches!(op, Op::SignOut) {
             self.link = None;
             self.stop_sign_in();
-            note_forgotten("sign_out", token::forget(&self.token_path)?);
+            let ended =
+                note_forgotten("sign_out", token::end_session(&self.token_path, None, None));
             self.shared.set_auth(AuthState::SignedOut);
-            return Ok(Out::Done);
+            return ended
+                .map(|()| Out::Done)
+                .map_err(|why| ContentError::TokenFile {
+                    path: self.token_path.clone(),
+                    why,
+                });
         }
         if matches!(op, Op::Reload) {
             return self.reload(events).await;
@@ -1189,10 +1209,7 @@ impl Worker {
     /// start QuickConnect.
     fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
         self.link = None;
-        match token::forget(&self.token_path) {
-            Ok(forgot) => note_forgotten("revoked", forgot),
-            Err(e) => log::warn!("{}", e.redacted()),
-        }
+        let _ = note_forgotten("revoked", token::end_session(&self.token_path, None, None));
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
         ContentError::NeedsSignIn
@@ -1899,6 +1916,45 @@ mod tests {
                 "{at}: {lines:?}"
             );
         }
+    }
+
+    /// A sign-out whose token is readable but cannot be removed leaves the
+    /// service signed out: the token is marked revoked, and the reload the
+    /// credentials change asks for finds no token.
+    #[test]
+    fn a_sign_out_whose_token_will_not_go_leaves_the_service_signed_out() {
+        let root = test_root("signout-kept");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        crate::testlog::start();
+        token::faults::REMOVE.with(|f| f.set(true));
+        local.block_on(&rt, async {
+            w.execute(&Op::SignOut, &events).await.unwrap();
+        });
+        token::faults::REMOVE.with(|f| f.set(false));
+        assert!(
+            std::fs::metadata(&token_path).is_ok(),
+            "the fault removed it"
+        );
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=marked_revoked at=sign_out")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "{lines:?}"
+        );
     }
 
     #[test]

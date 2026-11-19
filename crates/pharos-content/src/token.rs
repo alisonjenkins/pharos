@@ -63,14 +63,73 @@ fn encode(token: &str, user: Option<&str>) -> String {
     }
 }
 
-/// The stored token and its user; `None` when the file is absent or holds no
-/// token. A replacement is a rename, so a read sees one whole file.
+/// The stored token and its user; `None` when the file is absent, holds no
+/// token, or holds a token a revocation marker names ([`end_session`]): a
+/// session that ended and could not remove its token never resumes from it,
+/// in this process or after a restart. A replacement is a rename, so a read
+/// sees one whole file.
 pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
+    let Some(stored) = read_raw(path)? else {
+        return Ok(None);
+    };
+    match revoked(path) {
+        Some(r) if r.token == fingerprint(&stored.token) => {
+            log::debug!("token read verdict=refused reason=revoked_marker");
+            Ok(None)
+        }
+        _ => Ok(Some(stored)),
+    }
+}
+
+/// The file as it is, marker or not. The writers compare against this.
+fn read_raw(path: &Path) -> Result<Option<Stored>, ContentError> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Ok(decode(&raw)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(err(path, e)),
     }
+}
+
+/// The revocation marker beside the token file: written when a session
+/// ended and its token could not be removed. It names the token's user and
+/// a fingerprint of the token, never the token.
+pub fn revoked_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".revoked");
+    PathBuf::from(name)
+}
+
+/// What a revocation marker holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revoked {
+    /// The user the revoked token was paired with, when it was.
+    pub user: Option<String>,
+    token: String,
+}
+
+/// The marker beside `path`, when there is a readable one.
+pub fn revoked(path: &Path) -> Option<Revoked> {
+    let raw = std::fs::read_to_string(revoked_path(path)).ok()?;
+    let mut lines = raw.lines();
+    let user = lines.next().map(str::trim).filter(|u| !u.is_empty());
+    let token = lines.next()?.trim().to_owned();
+    Some(Revoked {
+        user: user.map(str::to_owned),
+        token,
+    })
+}
+
+/// A fingerprint of a token (64-bit FNV-1a, spelled out here so no
+/// toolchain update changes it), so the marker can name it without holding
+/// it.
+fn fingerprint(token: &str) -> String {
+    let h = token
+        .trim()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{h:016x}")
 }
 
 /// The stored token alone; `None` when the file is absent or empty.
@@ -83,14 +142,22 @@ pub fn load(path: &Path) -> Result<Option<String>, ContentError> {
 /// Surrounding whitespace is not part of a token.
 pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let _held = hold();
-    write(path, token.trim(), None).map_err(|e| err(path, e))
+    write(path, token.trim(), None).map_err(|e| err(path, e))?;
+    // A new sign-in: a marker of an older session no longer has anything to
+    // refuse (it names that token only), so it goes, best effort.
+    match std::fs::remove_file(revoked_path(path)) {
+        Ok(()) => log::info!("token revocation marker verdict=cleared reason=signed_in"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("token revocation marker verdict=kept reason=signed_in error={e}"),
+    }
+    Ok(())
 }
 
 /// Pairs `user` with the token on file, read and written under the lock.
 /// Refused when there is none: an id with no token to belong to is nobody's.
 pub fn store_user(path: &Path, user: &str) -> Result<(), ContentError> {
     let _held = hold();
-    let stored = read(path)?;
+    let stored = read_raw(path)?;
     #[cfg(test)]
     tests::between_read_and_write();
     match stored {
@@ -117,7 +184,7 @@ pub enum Pairing {
 /// in [`store_user`].
 pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, ContentError> {
     let _held = hold();
-    match read(path)? {
+    match read_raw(path)? {
         Some(s) if s.token == seen.trim() => write(path, &s.token, Some(user))
             .map(|()| Pairing::Paired)
             .map_err(|e| err(path, e)),
@@ -161,15 +228,139 @@ pub enum ForgetIf {
 /// between keeps it. No token is nothing to remove.
 pub fn forget_if(path: &Path, seen: &str) -> Result<ForgetIf, ContentError> {
     let _held = hold();
-    match read(path)? {
+    match read_raw(path)? {
         Some(s) if s.token != seen.trim() => Ok(ForgetIf::Changed),
         Some(_) => remove(path).map(ForgetIf::Forgotten),
         None => Ok(ForgetIf::Forgotten(Forgotten::Durable)),
     }
 }
 
+/// What [`end_session`] did to the token of a session that ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// The token is gone (`Forgotten::NotDurable` when its folder could not
+    /// be synced), or there was none.
+    Forgotten(Forgotten),
+    /// A sign-in replaced the token since: the replacement is kept.
+    Changed,
+    /// The token could not be removed (why), but a synced marker now names
+    /// it: no read returns it, here or after a restart.
+    Marked(String),
+    /// Neither the removal nor the marker could be written: a restart may
+    /// resume the ended session's account from the token on file.
+    Unsafe { removal: String, marker: String },
+}
+
+impl Ended {
+    /// The log verdict.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Forgotten(Forgotten::Durable) => "forgotten",
+            Self::Forgotten(Forgotten::NotDurable(_)) => "forgotten_not_durable",
+            Self::Changed => "kept_replacement",
+            Self::Marked(_) => "marked_revoked",
+            Self::Unsafe { .. } => "restart_unsafe",
+        }
+    }
+}
+
+/// Ends a session's hold on the token file, under the file's lock: removes
+/// the token while it is still `seen` (any token with `None`, a sign-out),
+/// and keeps a replacement. A token that will not go is marked revoked by a
+/// synced file beside it naming its user (`user`, else the one paired with
+/// it) and its fingerprint, so it never resumes; when the marker cannot be
+/// written either, says so.
+pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
+    let _held = hold();
+    let stored = match read_raw(path) {
+        Ok(Some(s)) if seen.is_some_and(|seen| s.token != seen.trim()) => return Ended::Changed,
+        Ok(None) => return Ended::Forgotten(Forgotten::Durable),
+        Ok(Some(s)) => Some(s),
+        // Unreadable: try the removal all the same; with no token in hand
+        // there is nothing to fingerprint.
+        Err(_) => None,
+    };
+    let removal = match remove(path) {
+        Ok(f) => return Ended::Forgotten(f),
+        Err(e) => e.to_string(),
+    };
+    let Some(stored) = stored else {
+        return Ended::Unsafe {
+            removal,
+            marker: "the token could not be read to mark it".to_owned(),
+        };
+    };
+    let named = user.map(str::to_owned).or(stored.user.clone());
+    match write_marker(path, named.as_deref(), &fingerprint(&stored.token)) {
+        Ok(()) => {
+            log::warn!(
+                "token revocation marker verdict=written reason=token_not_removed user={} error={removal}",
+                named.as_deref().unwrap_or("")
+            );
+            Ended::Marked(removal)
+        }
+        Err(marker) => Ended::Unsafe {
+            removal,
+            marker: marker.to_string(),
+        },
+    }
+}
+
+/// Writes the marker whole (temp file, fsync, rename, folder sync). The
+/// folder sync must succeed too: a marker a crash can lose is no marker.
+fn write_marker(path: &Path, user: Option<&str>, token: &str) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if faults::MARKER.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("marker write failed"));
+    }
+    let user = user.unwrap_or("");
+    if user.contains('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a value holds a line break",
+        ));
+    }
+    let target = revoked_path(path);
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory"))?;
+    let mut tmp_name = target.as_os_str().to_owned();
+    tmp_name.push(".new");
+    let tmp = PathBuf::from(tmp_name);
+    let go = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(format!("{user}\n{token}\n").as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)?;
+        sync_dir(dir)
+    };
+    go().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Faults a test can set on its own thread, in debug builds only: the
+/// token file's removal, and the marker's write.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod faults {
+    thread_local! {
+        pub static REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub static MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+}
+
 /// Removes the file and syncs its folder. Called with the lock held.
 fn remove(path: &Path) -> Result<Forgotten, ContentError> {
+    #[cfg(debug_assertions)]
+    if faults::REMOVE.with(std::cell::Cell::get) {
+        return Err(err(path, "removal failed"));
+    }
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Forgotten::Durable),
@@ -552,5 +743,47 @@ pub(crate) mod tests {
         let d = dir("bad");
         let e = load(&d).expect_err("a directory is not a token");
         assert!(e.to_string().contains(d.to_str().unwrap()), "{e}");
+    }
+
+    /// A session's token that cannot be removed is marked revoked: no read
+    /// returns it, the marker names its user, a replacement is kept, and a
+    /// new sign-in's token is read again (the marker cleared).
+    #[test]
+    fn a_token_that_will_not_go_is_marked_and_never_read_again() {
+        let d = dir("marked");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        store_user(&p, "A").unwrap();
+        assert_eq!(end_session(&p, Some("tokB"), None), Ended::Changed);
+        faults::REMOVE.with(|f| f.set(true));
+        let ended = end_session(&p, Some("tokA"), None);
+        faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+        assert_eq!(ended.label(), "marked_revoked");
+        assert!(read_raw(&p).unwrap().is_some(), "the fault removed it");
+        assert_eq!(read(&p).unwrap(), None, "a revoked token was read");
+        assert_eq!(load(&p).unwrap(), None);
+        assert_eq!(revoked(&p).unwrap().user.as_deref(), Some("A"));
+        store(&p, "tokC").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
+        assert!(revoked(&p).is_none(), "the sign-in left the marker");
+    }
+
+    /// With neither the removal nor the marker written, the session's end
+    /// says a restart is not safe, and the token is still read (nothing on
+    /// disk refuses it).
+    #[test]
+    fn a_token_neither_removed_nor_marked_is_reported_unsafe() {
+        let d = dir("unsafe");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let ended = end_session(&p, None, Some("A"));
+        faults::REMOVE.with(|f| f.set(false));
+        faults::MARKER.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Unsafe { .. }), "{ended:?}");
+        assert_eq!(ended.label(), "restart_unsafe");
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
     }
 }
