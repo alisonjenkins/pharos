@@ -637,6 +637,7 @@ pub trait OfflineStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_dir::TmpDir;
     use super::*;
 
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -675,10 +676,10 @@ mod tests {
     #[test]
     fn a_registration_with_no_folder_is_retried_and_one_that_opened_is_not() {
         use std::cell::Cell;
-        let root =
-            std::env::temp_dir().join(format!("pharos-register-twice-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_file(&root);
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-twice");
+        let root = scope.path().join("root");
         assert!(std::fs::write(&root, b"a file where the folder should be").is_ok());
         let once = OpenOnce::new();
         let (hooks, registers) = (Cell::new(0), Cell::new(0));
@@ -713,16 +714,16 @@ mod tests {
             (1, 1),
             "a call after the store opened touched the hook or the store"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A store that opened but was not registered keeps the claim: it may
     /// still be open on the root.
     #[test]
     fn a_registration_that_reached_the_store_keeps_its_claim_on_failure() {
-        let root =
-            std::env::temp_dir().join(format!("pharos-register-kept-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-kept");
+        let root = scope.path().join("root");
         let once = OpenOnce::new();
         let outcome = register_video_root(
             &root,
@@ -735,7 +736,6 @@ mod tests {
             register_video_root(&root, &once, || {}, || Ok(())),
             Registration::AlreadyOpened
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A store whose runtime or thread could not start opened nothing on
@@ -744,9 +744,10 @@ mod tests {
     #[test]
     fn a_registration_that_failed_before_the_store_opened_is_retried() {
         use std::cell::Cell;
-        let root =
-            std::env::temp_dir().join(format!("pharos-register-unopened-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-unopened");
+        let root = scope.path().join("root");
         let once = OpenOnce::new();
         let hooks = Cell::new(0);
         let outcome = register_video_root(
@@ -765,7 +766,6 @@ mod tests {
             "a store that never opened kept the claim"
         );
         assert_eq!(hooks.get(), 1, "a second hook");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Two attempts overlap: the second finds the root claimed while the
@@ -775,9 +775,10 @@ mod tests {
     #[test]
     fn an_attempt_that_found_the_store_opening_is_not_done_until_one_is_published() {
         use std::cell::{Cell, RefCell};
-        let root =
-            std::env::temp_dir().join(format!("pharos-register-overlap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-overlap");
+        let root = scope.path().join("root");
         let once = OpenOnce::new();
         let published = Cell::new(false);
         let second = RefCell::new(None);
@@ -811,7 +812,6 @@ mod tests {
         );
         assert_eq!(retry, Registration::Registered);
         assert!(registration_done(&retry, published.get()));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// On success the hook goes in before the folder is created, and the
@@ -820,9 +820,10 @@ mod tests {
     #[test]
     fn the_hook_goes_in_before_the_folder_exists_and_the_store_after() {
         use std::cell::Cell;
-        let root =
-            std::env::temp_dir().join(format!("pharos-register-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-order");
+        let root = scope.path().join("root");
         let once = OpenOnce::new();
         let (hook_saw_folder, register_saw_folder) = (Cell::new(None), Cell::new(None));
         let outcome = register_video_root(
@@ -846,7 +847,6 @@ mod tests {
             "the store came before the folder"
         );
         assert!(root.is_dir());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
