@@ -187,7 +187,7 @@ pub trait Stages: Send + Sync {
         &self,
         vocals: &[f32],
         deadline: Instant,
-    ) -> Result<Vec<transcript::Word>, StageError>;
+    ) -> Result<transcript::Transcript, StageError>;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -856,7 +856,7 @@ fn improve(
         let frames = data.len() / CLASSES;
         let emission = Emission::new(&data, frames, CLASSES)
             .map_err(|e| stage(Fallback::EmissionFailed)(e.to_string()))?;
-        let matched = match_lines(&today.request, &heard, Options { slot_cap: true });
+        let matched = match_lines(&today.request, &heard.words, Options { slot_cap: true });
         let song = Song {
             emission,
             n_samples: vocals.len(),
@@ -865,10 +865,11 @@ fn improve(
             .map_err(stage(Fallback::EmissionFailed))
     });
     times.place_ms = ms_since(t);
-    let refined = match placed {
+    let mut refined = match placed {
         Ok(r) => r,
         Err(e) => return fail(today, times, e),
     };
+    refined.placement.first_words_clipped = heard.first_words_clipped;
     if let Some(why) = refined.placement.fallback {
         let reason = format!(
             "{}: anchor share {:.3}",
