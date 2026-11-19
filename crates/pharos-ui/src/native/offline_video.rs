@@ -373,6 +373,24 @@ fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
     })
 }
 
+/// Installs what a cold start found, only while the identity is still
+/// Unknown at generation `asked_at`. The generation is left as it is: a cold
+/// start only fills in who was already signed in, so a `me` asked on the
+/// current session before it still lands (its answer is authoritative),
+/// while a sign-in, sign-out, revocation or new session since (each
+/// advances the generation) refuses it. Returns the generation found when
+/// it is refused.
+fn install_cold_start(asked_at: u64, found: Identity) -> Result<(), u64> {
+    with_id(|st| {
+        if st.generation != asked_at || st.identity != Identity::Unknown {
+            return Err(st.generation);
+        }
+        st.refusal_logged = false;
+        st.identity = found;
+        Ok(())
+    })
+}
+
 fn read_pref() -> Result<Option<String>, String> {
     #[cfg(test)]
     if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
@@ -515,7 +533,7 @@ pub fn last_user() -> Option<String> {
         } else {
             "none"
         };
-        match set_identity_if(Some(asked_at), found) {
+        match install_cold_start(asked_at, found) {
             Ok(()) => super::platform::info(&format!(
                 "pharos: video user verdict={verdict} reason=cold_start"
             )),
@@ -2579,6 +2597,25 @@ pub(crate) mod tests {
         );
         assert_eq!(identity(), Identity::SignedOut);
         assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+    }
+
+    /// A cold start that finds the user a pending `me` was asked about
+    /// leaves that ask current: its answer still lands, and so does one
+    /// naming another user (the server's answer is authoritative).
+    #[test]
+    fn a_cold_start_leaves_a_pending_me_current() {
+        for answer in ["A", "B"] {
+            let p = pref();
+            *p.value.borrow_mut() = Some("A".to_owned());
+            *p.token_user.borrow_mut() = Some("A".to_owned());
+            let asked_at = identity_generation();
+            assert_eq!(last_user().as_deref(), Some("A"));
+            assert!(
+                remember_user_if(asked_at, answer),
+                "the cold start invalidated the pending me ({answer})"
+            );
+            assert_eq!(identity(), Identity::User(answer.to_owned()));
+        }
     }
 
     #[test]
