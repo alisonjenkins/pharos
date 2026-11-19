@@ -2512,6 +2512,9 @@ async fn connect(
                 ));
                 outdated.set(Some(server));
             }
+            // The session this replaces has ended: a `me` asked on it must
+            // not install its user once this one is up.
+            offline_video::session_replaced();
             api.set(Some(open.session.api().clone()));
             session.set(Some(open.session.clone()));
             platform::install_telemetry(open.session.api());

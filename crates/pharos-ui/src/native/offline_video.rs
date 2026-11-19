@@ -300,6 +300,22 @@ pub fn identity_generation() -> u64 {
     with_identity(|_| generation())
 }
 
+/// A new session replaces the one before it (a reconnect, a sign-in): that
+/// session has ended, so a `me` answer asked on it is out of date and must
+/// not install its user. The identity stays as it is; only answers asked
+/// before this call are refused ([`MeAsk::answered`]). Call it before the
+/// new session is published, so an ask taken on the new one sees the new
+/// generation.
+pub fn session_replaced() {
+    let now = with_identity(|_| {
+        bump_generation();
+        generation()
+    });
+    super::platform::info(&format!(
+        "pharos: video user generation verdict=advanced reason=session_replaced generation={now}"
+    ));
+}
+
 fn set_identity(next: Identity) {
     let _ = set_identity_if(None, next);
 }
@@ -1156,6 +1172,31 @@ mod tests {
         let asked_at = identity_generation();
         assert!(remember_user_if(asked_at, "A"));
         assert_eq!(last_user().as_deref(), Some("A"));
+    }
+
+    /// A `me` asked on a session that a new one replaced (B's, published
+    /// by the connect) names the old session's user: it installs nothing,
+    /// and writes no preference. One asked on the new session does.
+    #[test]
+    fn a_me_asked_on_a_replaced_session_installs_nobody() {
+        let p = pref();
+        remember_user("A");
+        let pref_before = p.value.borrow().clone();
+        let ask = me_request(true, Some(session(()))).expect("a ready session asks");
+        session_replaced();
+        assert!(
+            !ask.answered("C"),
+            "the replaced session's answer was written"
+        );
+        assert_eq!(last_user().as_deref(), Some("A"));
+        assert_eq!(
+            *p.value.borrow(),
+            pref_before,
+            "the stale answer wrote the preference"
+        );
+        let ask = me_request(true, Some(session(()))).unwrap();
+        assert!(ask.answered("B"));
+        assert_eq!(last_user().as_deref(), Some("B"));
     }
 
     /// A `me` request taken while the session is up, the session ending
