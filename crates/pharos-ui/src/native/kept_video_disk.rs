@@ -2269,10 +2269,31 @@ async fn playlist(
     fetched: &mut Vec<String>,
 ) -> Result<String, Stop> {
     let path = inner.file_path(user, item, key);
-    if tokio::fs::metadata(&path).await.is_err() {
-        inner.reserve_playlist(user, item, run, key)?;
-        fetch_file(inner, user, item, run, key, Some(PLAYLIST_MAX_BYTES)).await?;
-        fetched.push(key.to_owned());
+    // `symlink_metadata`: a link at the path is not a stored playlist.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.is_file() => {}
+        Ok(m) => {
+            // A folder (or anything but a regular file) where the playlist
+            // goes: never read as text, and not deleted from under the
+            // folder's accounting. The download must be removed.
+            let kind = if m.is_dir() { "folder" } else { "other" };
+            emit(
+                true,
+                format!(
+                    "pharos: video keep playlist verdict=damaged item={item} run={run} url_path={} kind={kind}",
+                    url_path(key)
+                ),
+            );
+            return Err(Stop::Failed(format!(
+                "{} is stored as a {kind}, not a file: remove this download and keep it again",
+                url_path(key)
+            )));
+        }
+        Err(_) => {
+            inner.reserve_playlist(user, item, run, key)?;
+            fetch_file(inner, user, item, run, key, Some(PLAYLIST_MAX_BYTES)).await?;
+            fetched.push(key.to_owned());
+        }
     }
     let bytes = tokio::fs::read(&path)
         .await
@@ -8708,6 +8729,34 @@ mod tests {
         later.store(true, Ordering::SeqCst);
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// A folder where a planned playlist goes is not read as text: the run
+    /// fails with a reason that says to remove the download.
+    #[tokio::test]
+    async fn a_folder_at_a_playlists_path_fails_with_a_reason_to_remove_it() {
+        let rig = Rig::new("playlist-folder");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let master = files.join(file_name(MASTER_KEY));
+        std::fs::remove_file(&master).unwrap();
+        std::fs::create_dir(&master).unwrap();
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed: {:?}", only(&store).state);
+        };
+        assert!(reason.contains("remove this download"), "{reason}");
+        let damaged = lines("pharos: video keep playlist verdict=damaged item=1");
+        assert!(
+            damaged.iter().any(|l| l.contains("kind=folder")),
+            "{damaged:?}"
+        );
     }
 
     /// A whole record copied into another item's folder is not adopted
