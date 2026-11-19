@@ -1879,13 +1879,16 @@ fn mark_handler(
             return;
         }
         let marking = Rc::clone(&marking);
+        // The session the mark is sent in: a refusal ends only that one,
+        // never a session signed in while the call was out.
+        let session = machine.peek().session();
         spawn(async move {
             let call = call("mark", what);
             let result = match mark {
                 Mark::Played => api.set_played(&call, id, on).await,
                 Mark::Favorite => api.set_favorite(&call, id, on).await,
             };
-            match settle(machine, result) {
+            match settle_session(machine, session, result) {
                 Ok(now) => {
                     if matches!(mark, Mark::Played) {
                         stored.set(Some((id, now)));
@@ -2610,6 +2613,27 @@ fn settle_start<T>(
             machine.write().apply(Event::NeedsSignIn);
         }
         StartFailure::from_client(&e)
+    })
+}
+
+/// As [`settle`], for a call sent in `session`: a refusal ends only that
+/// session ([`Event::SessionNeedsSignIn`]), and says so when it is stale.
+fn settle_session<T>(
+    mut machine: Signal<Machine>,
+    session: u32,
+    result: Result<T, ClientError>,
+) -> Result<T, String> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            let now = machine.peek().session();
+            if now != session {
+                platform::info(&format!(
+                    "pharos: sign-in refusal verdict=ignored reason=stale_session sent_in={session} current={now}"
+                ));
+            }
+            machine.write().apply(Event::SessionNeedsSignIn { session });
+        }
+        e.to_string()
     })
 }
 

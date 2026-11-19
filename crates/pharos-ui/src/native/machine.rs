@@ -84,6 +84,12 @@ pub enum Event {
     },
     /// A call answered `revoked` (FR: a revoked session shows sign-in).
     NeedsSignIn,
+    /// As `NeedsSignIn`, for a call sent in `session` ([`Machine::session`]
+    /// when it was sent): it ends only that session, never one signed in
+    /// since.
+    SessionNeedsSignIn {
+        session: u32,
+    },
     SignInSubmitted,
     SignInAnswered(SignInReply),
     SignOutSubmitted,
@@ -144,6 +150,9 @@ pub struct Machine {
     /// Why the last attempt failed, while connecting again after a failure
     /// that may clear by itself (server down, network gone).
     waiting: Option<String>,
+    /// Counts the sessions begun: bumped when a resume makes a session
+    /// Ready after the sign-in screen (or at start), not on a reconnect's.
+    session: u32,
     on_session_end: SessionEnd,
 }
 
@@ -164,6 +173,7 @@ impl Machine {
             had_session: false,
             notice: None,
             waiting: None,
+            session: 0,
             on_session_end: SessionEnd(None),
         }
     }
@@ -184,6 +194,12 @@ impl Machine {
     /// The current connection attempt; events carry it back.
     pub fn epoch(&self) -> u32 {
         self.epoch
+    }
+
+    /// The session signed in now (or last): a call captures it when it is
+    /// sent, so its refusal ends only that session.
+    pub fn session(&self) -> u32 {
+        self.session
     }
 
     /// Whether attempt `epoch`'s resume would make the app Ready: it is the
@@ -257,6 +273,9 @@ impl Machine {
                 self.attempt = 0;
                 self.waiting = None;
                 self.phase = Phase::Ready;
+                if !self.had_session {
+                    self.session = self.session.wrapping_add(1);
+                }
                 self.had_session = true;
             }
             Event::ResumeRefused { epoch } if current(epoch) => self.sign_in(None),
@@ -285,6 +304,11 @@ impl Machine {
                 }
             }
             Event::NeedsSignIn if self.phase == Phase::Ready => {
+                self.sign_in(Some("Your session ended. Sign in again.".into()));
+            }
+            Event::SessionNeedsSignIn { session }
+                if self.phase == Phase::Ready && session == self.session =>
+            {
                 self.sign_in(Some("Your session ended. Sign in again.".into()));
             }
             Event::SignInSubmitted => {
@@ -754,6 +778,53 @@ mod tests {
         let mut m = ready();
         m.apply(Event::NeedsSignIn);
         assert!(sign_in_error_of(&m).is_some());
+    }
+
+    /// A refusal for a call an earlier session sent does not end the one
+    /// signed in now; the current session's own refusal still does, and
+    /// runs the session-end hook.
+    #[test]
+    fn a_refusal_from_an_earlier_session_leaves_the_current_one() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() {
+            ENDED.with(|n| n.set(n.get() + 1));
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let first = m.session();
+        // Signed out and in again while the first session's call was out.
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::Status(204)));
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 204,
+            retry_after: None,
+        }));
+        let epoch = m.epoch();
+        m.apply(Event::Resumed { epoch });
+        assert_eq!(m.phase(), &Phase::Ready);
+        assert_ne!(m.session(), first);
+        ENDED.with(|n| n.set(0));
+        m.apply(Event::SessionNeedsSignIn { session: first });
+        assert_eq!(
+            m.phase(),
+            &Phase::Ready,
+            "an old call ended the new session"
+        );
+        assert_eq!(ENDED.with(std::cell::Cell::get), 0);
+        // A reconnect keeps the session; its own refusal ends it.
+        m.apply(Event::Closed {
+            epoch,
+            reason: "gone".into(),
+        });
+        let epoch = m.epoch();
+        let now = m.session();
+        m.apply(Event::Resumed { epoch });
+        assert_eq!(m.session(), now, "a reconnect started a new session");
+        m.apply(Event::SessionNeedsSignIn { session: now });
+        assert!(sign_in_error_of(&m).is_some());
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
     }
 
     #[test]
