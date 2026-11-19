@@ -179,8 +179,13 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     let _connecting = CONNECTING
         .lock()
         .map_err(|_| "library connect mutex poisoned".to_owned())?;
-    if LIBRARY.get().is_some() {
+    if let Some(lib) = LIBRARY.get() {
         retry_init("connect");
+        // A cache that could not be enabled at the first connect (its
+        // folder, say) is tried again here; an enabled one is left alone.
+        if let Some(files) = FILES.get() {
+            ensure_cache(lib, files, "connect");
+        }
         return Ok(());
     }
     if ::log::set_logger(&CONTENT_LOG).is_ok() {
@@ -207,16 +212,42 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     };
     log(&format!("library server_from={server_from} auth={auth}"));
     lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
-    let cache_dir = Path::new(&files).join("audio-cache");
-    match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
-        Ok(()) => log(&format!(
-            "cache enabled cap_bytes={}",
-            lib.cache_cap().unwrap_or(0)
-        )),
-        Err(e) => log(&format!("cache disabled: {}", e.redacted())),
-    }
+    ensure_cache(&lib, &files, "first_connect");
     let _ = LIBRARY.set(lib);
     Ok(())
+}
+
+/// What [`ensure_cache`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheSetup {
+    AlreadyEnabled,
+    Enabled,
+    Failed,
+}
+
+/// Enables the music cache under `files` unless it is already, logging the
+/// verdict (`when` names the caller).
+pub(crate) fn ensure_cache(lib: &content::Library, files: &str, when: &str) -> CacheSetup {
+    if lib.cache_enabled() {
+        return CacheSetup::AlreadyEnabled;
+    }
+    let cache_dir = Path::new(files).join("audio-cache");
+    match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
+        Ok(()) => {
+            log(&format!(
+                "cache enabled when={when} cap_bytes={}",
+                lib.cache_cap().unwrap_or(0)
+            ));
+            CacheSetup::Enabled
+        }
+        Err(e) => {
+            log(&format!(
+                "cache disabled when={when} retry=next_connect: {}",
+                e.redacted()
+            ));
+            CacheSetup::Failed
+        }
+    }
 }
 
 #[no_mangle]
@@ -571,6 +602,35 @@ mod tests {
     use super::{access, outside_bytes, rerun_init, Caller, InitRetry};
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A music cache that could not be enabled is tried again by the next
+    /// connect, and an enabled one is left alone.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_cache_that_failed_to_enable_is_tried_again() {
+        use super::{ensure_cache, CacheSetup};
+        let dir =
+            std::env::temp_dir().join(format!("pharos-android-cache-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = dir.to_str().unwrap().to_owned();
+        let lib = content::Library::connect("http://127.0.0.1:9", &dir.join("token")).unwrap();
+        // A file where the cache's folder should be.
+        std::fs::write(dir.join("audio-cache"), b"x").unwrap();
+        assert_eq!(
+            ensure_cache(&lib, &files, "first_connect"),
+            CacheSetup::Failed
+        );
+        std::fs::remove_file(dir.join("audio-cache")).unwrap();
+        assert_eq!(ensure_cache(&lib, &files, "connect"), CacheSetup::Enabled);
+        assert!(lib.cache_enabled());
+        assert_eq!(
+            ensure_cache(&lib, &files, "connect"),
+            CacheSetup::AlreadyEnabled
+        );
+        drop(lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A hook that failed is run again by the next caller, and one that
     /// said it is done is not run again.
