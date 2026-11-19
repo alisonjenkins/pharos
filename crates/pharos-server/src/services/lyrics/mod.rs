@@ -389,6 +389,7 @@ impl LyricsFinder {
             );
             return None;
         }
+        let asked_at = cache::now_secs();
         match online.find(&song).await {
             Ok(found) => {
                 if let Some(standing) =
@@ -396,7 +397,7 @@ impl LyricsFinder {
                 {
                     return standing;
                 }
-                self.write_disk(item.id, online.name(), song, found.clone())
+                self.write_disk(item.id, online.name(), song, found.clone(), asked_at)
                     .await;
                 found
             }
@@ -703,13 +704,21 @@ impl LyricsFinder {
         })
     }
 
-    async fn write_disk(&self, id: u64, provider: &'static str, song: Song, found: Option<Lyrics>) {
+    async fn write_disk(
+        &self,
+        id: u64,
+        provider: &'static str,
+        song: Song,
+        found: Option<Lyrics>,
+        asked_at: u64,
+    ) {
         let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
             return;
         };
-        let written =
-            tokio::task::spawn_blocking(move || disk.put(id, provider, &song, found.as_ref()))
-                .await;
+        let written = tokio::task::spawn_blocking(move || {
+            disk.put_at(id, provider, &song, found.as_ref(), asked_at)
+        })
+        .await;
         if let Err(e) = written {
             tracing::warn!(media.id = id, error = %e, "lyrics: cache write task failed");
         }
