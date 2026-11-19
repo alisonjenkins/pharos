@@ -761,7 +761,13 @@ mod tests {
     fn a_discard_runs_off_the_ui_with_its_button_disabled_until_it_ends() {
         use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
         use std::sync::{Arc, Mutex};
-        struct Slow(Mutex<std::sync::mpsc::Receiver<()>>);
+        /// Says when the removal starts, is held until the test lets it
+        /// finish, and records that it finished.
+        struct Slow {
+            held: Mutex<std::sync::mpsc::Receiver<()>>,
+            started: Mutex<std::sync::mpsc::Sender<()>>,
+            finished: Arc<std::sync::atomic::AtomicBool>,
+        }
         impl VideoStore for Slow {
             fn videos(&self, _: &str) -> Vec<KeptVideo> {
                 Vec::new()
@@ -784,8 +790,11 @@ mod tests {
                 1
             }
             fn discard_unreadable(&self) -> Result<u64, String> {
+                let _ = self.started.lock().unwrap().send(());
                 // Held until the test lets it finish.
-                let _ = self.0.lock().unwrap().recv();
+                let _ = self.held.lock().unwrap().recv();
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 Err("one folder stayed".to_owned())
             }
         }
@@ -813,8 +822,17 @@ mod tests {
             }
         }
         let (release, held) = std::sync::mpsc::channel();
-        STORE.with(|s| *s.borrow_mut() = Some(Arc::new(Slow(Mutex::new(held)))));
-        // A watchdog: an inline discard would block the render forever.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        STORE.with(|s| {
+            *s.borrow_mut() = Some(Arc::new(Slow {
+                held: Mutex::new(held),
+                started: Mutex::new(started_tx),
+                finished: finished.clone(),
+            }))
+        });
+        // A watchdog: an inline discard would block the UI executor until it
+        // fires, and the checks below then see the removal already over.
         let watchdog = release.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(3));
@@ -829,11 +847,39 @@ mod tests {
         );
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("disabled"), "{html}");
-        release.send(()).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        // Drive the UI until the removal has started: the spawned task runs
+        // only once the executor is polled.
+        let seen = rt.block_on(async {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) {
+                if started_rx.try_recv().is_ok() {
+                    return true;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            false
+        });
+        assert!(seen, "the removal never started");
+        // A UI update of its own while the removal is still held.
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the removal ended before the UI rendered beside it: it ran on the UI executor"
+        );
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("disabled") && !html.contains("one folder stayed"),
+            "{html}"
+        );
+        release.send(()).unwrap();
         let html = rt.block_on(async {
             let start = std::time::Instant::now();
             loop {
