@@ -270,6 +270,16 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   fence: every token read refuses that fingerprint (`token read
   verdict=refused reason=service_fence`) until a different token is on
   file. The library's own unsafe sign-out or revocation sets the same fence.
+- The revocation marker fails closed: a marker that is there but cannot be
+  read or parsed refuses every token until a new sign-in replaces both. A
+  session end that cannot read the token to compare it removes nothing and
+  marks the token it ended with; a removal whose folder could not be synced
+  is marked too, and only a failed marker on top makes the end unsafe.
+- Every run claimed for a record, a resume's or a handoff's as well as a
+  start's, moves the record's generation, so a stale run's late exit gives
+  nothing back from the new run's reservation. A `.part` entry that is a
+  folder counts by everything under it, through the one measure admission
+  and a run's exit share.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
