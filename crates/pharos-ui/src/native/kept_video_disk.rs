@@ -252,6 +252,10 @@ struct State {
     /// parked (revoked) that run, and never a newer start's. A removal or a
     /// newer start drops or replaces the entry.
     pending_starts: HashMap<(String, String), u64>,
+    /// Sign-ins that found their download's start not saved yet: resumed
+    /// by the start once its save settles (a saved start whose run a
+    /// sign-out parked starts a new one), dropped by its rollback.
+    resume_after_save: HashSet<(String, String)>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -4437,6 +4441,21 @@ impl VideoStore for DiskVideoStore {
             let mut resume = Vec::new();
             for v in interrupted(&st.list).into_iter().filter(|v| v.user == user) {
                 let key = (v.user.clone(), v.item.clone());
+                // A start whose first record is not saved yet may still be
+                // rolled back: a run started for it now would write on
+                // with no record. The start resumes it once the save
+                // settles.
+                if st.pending_starts.contains_key(&key) {
+                    st.resume_after_save.insert(key);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep resume item={} verdict=deferred reason=start_not_saved owner={user}",
+                            v.item
+                        ),
+                    );
+                    continue;
+                }
                 let Some(&run) = st.runs.get(&key) else {
                     let id = st.claim_run(&v.user, &v.item);
                     resume.push((v.item, id));
@@ -4613,6 +4632,8 @@ impl VideoStore for DiskVideoStore {
         // A record that cannot be written would not survive a restart: the
         // download is refused, and the accounting goes back to what it was
         // (the record it replaced is put back, its reservation with it).
+        #[cfg(test)]
+        tests::before_first_save();
         if let Err(e) = self.inner.save_record(&user, &item) {
             let refusal =
                 KeepVideoRefusal::Host(format!("the download's record could not be saved: {e}"));
@@ -4629,6 +4650,9 @@ impl VideoStore for DiskVideoStore {
                 let ours = st.pending_starts.get(&key) == Some(&run_id);
                 if ours {
                     st.pending_starts.remove(&key);
+                    // The record goes: a sign-in that waited for it has
+                    // nothing to resume.
+                    st.resume_after_save.remove(&key);
                     if st.runs.get(&key) == Some(&run_id) {
                         st.runs.remove(&key);
                     }
@@ -4660,13 +4684,30 @@ impl VideoStore for DiskVideoStore {
             );
             return Err(refusal);
         }
-        {
+        let run_id = {
             let mut st = lock(&self.inner.state);
             let key = (user.clone(), item.clone());
-            if st.pending_starts.get(&key) == Some(&run_id) {
+            let ours = st.pending_starts.get(&key) == Some(&run_id);
+            if ours {
                 st.pending_starts.remove(&key);
             }
-        }
+            // A sign-in that waited for this save: if a sign-out parked the
+            // start's run meanwhile, the download starts again now, claimed
+            // in this hold.
+            let replay = ours && st.resume_after_save.remove(&key);
+            if replay && st.runs.get(&key) != Some(&run_id) {
+                let next = st.claim_run(&user, &item);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume item={item} run={next} reason=signed_in_before_save owner={user}"
+                    ),
+                );
+                next
+            } else {
+                run_id
+            }
+        };
         self.inner.spawn_claimed(user, item, run_id);
         Ok(())
     }
@@ -4686,6 +4727,8 @@ impl VideoStore for DiskVideoStore {
             };
             st.runs.remove(&(user.to_owned(), item.to_owned()));
             st.pending_starts
+                .remove(&(user.to_owned(), item.to_owned()));
+            st.resume_after_save
                 .remove(&(user.to_owned(), item.to_owned()));
             // Every file indexed under the item's folder goes, as in
             // `prune_unplanned`: the playlists are indexed before the plan
@@ -4980,6 +5023,19 @@ mod tests {
         /// Runs once a start's record has failed to save, before it is
         /// rolled back.
         pub(super) static BEFORE_START_ROLLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs as a start is about to save its first record.
+        pub(super) static BEFORE_FIRST_SAVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_first_save() {
+        BEFORE_FIRST_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     pub(super) fn before_start_rollback() {
@@ -7979,6 +8035,69 @@ mod tests {
             lines("pharos: video keep refused")
                 .iter()
                 .any(|l| l.contains("verdict=rolled_back")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A sign-out and a sign-in that land while a start's first save is
+    /// failing start no run for the unsaved record: the sign-in waits for
+    /// the save, the rollback removes the record, and nothing is left
+    /// writing, with the reservations as they were before the start.
+    #[tokio::test]
+    async fn a_sign_in_before_a_failed_first_save_leaves_no_run() {
+        let rig = Rig::new("rollback-resumed");
+        let store = rig.open();
+        let before = (store.outstanding_bytes(), store.kept_bytes());
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let s2 = store.clone();
+        set_hook(&BEFORE_START_ROLLBACK, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+        });
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(
+            lock(&store.inner.state).runs.is_empty(),
+            "a run is writing for a rolled-back record"
+        );
+        store.settled().await;
+        assert!(store.videos("u1").is_empty());
+        assert_eq!(
+            (store.outstanding_bytes(), store.kept_bytes()),
+            before,
+            "the reservations did not go back"
+        );
+        assert!(
+            lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("verdict=deferred reason=start_not_saved")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// The same sign-in before a first save that succeeds resumes the
+    /// download the sign-out parked: the start runs it again.
+    #[tokio::test]
+    async fn a_sign_in_before_a_saved_first_save_resumes_the_download() {
+        let rig = Rig::new("save-resumed");
+        rig.server.sign_in("u1");
+        let store = rig.open();
+        let s2 = store.clone();
+        set_hook(&BEFORE_FIRST_SAVE, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+        });
+        store.start(request("1")).unwrap();
+        clear_hook(&BEFORE_FIRST_SAVE);
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        assert!(
+            lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("reason=signed_in_before_save")),
             "{:?}",
             captured()
         );
