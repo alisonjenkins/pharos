@@ -3480,7 +3480,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         cleaned.unwrap_or_else(|| drop_parts_of(&inner.item_dir(&user, &item), Some(run)));
     #[cfg(test)]
     tests::before_run_exit();
-    let mut resume = false;
+    let mut resume = None;
     let owned = {
         let mut st = lock(&inner.state);
         if !cleaned || !disk.is_whole() {
@@ -3505,11 +3505,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         }
         if st.resume_pending.get(&key) == Some(&run) {
             st.resume_pending.remove(&key);
-            resume = owned;
+            // Claimed in this hold: a removal and restart after it revokes
+            // the claimed id, and the new run's is never overwritten.
+            if owned {
+                resume = Some(st.claim_run(&user, &item));
+            }
         }
         owned
     };
-    if resume {
+    if let Some(next) = resume {
         // A sign-in came while this run was parking: the run it could not
         // start starts now that the id is free.
         emit(
@@ -3518,7 +3522,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 "pharos: video keep resume item={item} run={run} reason=signed_in_while_parking owner={user}"
             ),
         );
-        inner.spawn_run(user.clone(), item.clone());
+        inner.spawn_claimed(user.clone(), item.clone(), next);
     }
     // A revoked run's writer is done: a folder its removal could not
     // delete or bound while it ran is deleted or measured now.
@@ -3653,11 +3657,6 @@ fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
 }
 
 impl Inner {
-    fn spawn_run(self: &Arc<Self>, user: String, item: String) {
-        let run_id = lock(&self.state).claim_run(&user, &item);
-        self.spawn_claimed(user, item, run_id);
-    }
-
     /// Runs `run_id`, already named the item's run by [`State::claim_run`].
     fn spawn_claimed(self: &Arc<Self>, user: String, item: String, run_id: u64) {
         let handle = self
@@ -3898,7 +3897,9 @@ impl Inner {
                 }
                 if let Scanned::Record(a) = &scanned {
                     if !interrupted(std::slice::from_ref(&a.record)).is_empty() {
-                        resume.push((a.record.user.clone(), a.record.item.clone()));
+                        let (user, item) = (a.record.user.clone(), a.record.item.clone());
+                        let id = st.claim_run(&user, &item);
+                        resume.push((user, item, id));
                     }
                 }
                 st.apply_scanned(&d, scanned);
@@ -3922,8 +3923,8 @@ impl Inner {
                     resume.len()
                 ),
             );
-            for (user, item) in resume {
-                self.spawn_run(user, item);
+            for (user, item, id) in resume {
+                self.spawn_claimed(user, item, id);
             }
             lock(&self.state).relisting.retain(|d| *d != dir);
             #[cfg(test)]
@@ -4039,10 +4040,11 @@ impl Inner {
                 release(&mut st);
                 st.apply_scanned(dir, Scanned::Record(Box::new(adopted)));
                 st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+                let resume = resume.then(|| st.claim_run(&user, &item));
                 drop(st);
                 verdict("released", "record readable");
-                if resume {
-                    self.spawn_run(user, item);
+                if let Some(id) = resume {
+                    self.spawn_claimed(user, item, id);
                 }
             }
             HeldNow::Gone => {
@@ -4203,7 +4205,13 @@ impl DiskVideoStore {
             st.note_unlistable(&dir, &error);
         }
         st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
-        let restart = interrupted(&st.list);
+        let restart: Vec<(KeptVideo, u64)> = interrupted(&st.list)
+            .into_iter()
+            .map(|v| {
+                let id = st.claim_run(&v.user, &v.item);
+                (v, id)
+            })
+            .collect();
         *lock(&inner.state) = st;
         emit(
             false,
@@ -4214,7 +4222,7 @@ impl DiskVideoStore {
                 restart.len()
             ),
         );
-        for v in restart {
+        for (v, id) in restart {
             emit(
                 false,
                 format!(
@@ -4223,7 +4231,7 @@ impl DiskVideoStore {
                     v.files.len()
                 ),
             );
-            inner.spawn_run(v.user, v.item);
+            inner.spawn_claimed(v.user, v.item, id);
         }
         Arc::new(Self { inner })
     }
@@ -4317,13 +4325,17 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn resume_user(&self, user: &str) {
-        let resume: Vec<String> = {
+        // Each pick is claimed in the hold that checked it has no run: a
+        // removal and restart after the hold revokes the claimed id, so the
+        // stale resume never takes the replacement's download.
+        let resume: Vec<(String, u64)> = {
             let mut st = lock(&self.inner.state);
             let mut resume = Vec::new();
             for v in interrupted(&st.list).into_iter().filter(|v| v.user == user) {
                 let key = (v.user.clone(), v.item.clone());
                 let Some(&run) = st.runs.get(&key) else {
-                    resume.push(v.item);
+                    let id = st.claim_run(&v.user, &v.item);
+                    resume.push((v.item, id));
                     continue;
                 };
                 // A run still going keeps the download. One that was
@@ -4343,12 +4355,16 @@ impl VideoStore for DiskVideoStore {
             }
             resume
         };
-        for item in resume {
+        #[cfg(test)]
+        tests::after_resume_pick();
+        for (item, id) in resume {
             emit(
                 false,
-                format!("pharos: video keep resume item={item} reason=signed_in owner={user}"),
+                format!(
+                    "pharos: video keep resume item={item} run={id} reason=signed_in owner={user}"
+                ),
             );
-            self.inner.spawn_run(user.to_owned(), item);
+            self.inner.spawn_claimed(user.to_owned(), item, id);
         }
     }
 
@@ -4854,6 +4870,20 @@ mod tests {
         /// Runs once a failed download has dropped (or failed to drop) its
         /// staging files, before its Failed record is published.
         pub(super) static BEFORE_FAILED_UPDATE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs once `resume_user` has picked and claimed its downloads,
+        /// before it starts them.
+        pub(super) static AFTER_RESUME_PICK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_resume_pick() {
+        AFTER_RESUME_PICK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -8396,6 +8426,43 @@ mod tests {
                 .any(|l| l.contains("reason=revoked_writer_running")),
             "{waited:?}"
         );
+    }
+
+    /// A download removed and started again between a sign-in's pick and
+    /// its start keeps its new run: the resume's claim was revoked by the
+    /// removal, so the stale resume never overwrites the replacement's id.
+    #[tokio::test]
+    async fn a_restart_after_a_resumes_pick_keeps_its_own_run() {
+        let rig = Rig::new("resume-pick-race");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(lock(&store.inner.state).runs.is_empty());
+        let key = ("u1".to_owned(), "1".to_owned());
+        let (s1, k1) = (store.clone(), key.clone());
+        let replaced: std::rc::Rc<std::cell::Cell<Option<u64>>> = std::rc::Rc::default();
+        let r1 = replaced.clone();
+        set_hook(&AFTER_RESUME_PICK, move || {
+            if r1.get().is_none() {
+                s1.remove("u1", "1");
+                s1.start(request("1")).unwrap();
+                r1.set(lock(&s1.inner.state).runs.get(&k1).copied());
+            }
+        });
+        store.resume_user("u1");
+        clear_hook(&AFTER_RESUME_PICK);
+        let replacement = replaced.get().expect("the restart claimed no run");
+        assert_eq!(
+            lock(&store.inner.state).runs.get(&key).copied(),
+            Some(replacement),
+            "the stale resume took the replacement's download"
+        );
+        store.settled().await;
+        until_within(|| only(&store).state == KeptState::Ready).await;
     }
 
     /// A sign-in that lands after a fetch was refused the credentials, but
