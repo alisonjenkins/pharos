@@ -1736,7 +1736,7 @@ h.attachMedia(v);
 "#,
             id = js_str(&id),
             mark = js_str(super::resume::ENGINE_MARK),
-            url = js_str(&direct_url(&server(), url)),
+            url = js_str(&hls_source(url)),
             token = android::token().map_or_else(|| "null".to_owned(), |t| js_str(&t)),
             generation = self.generation,
             xhr_setup = super::playback::HLS_XHR_SETUP,
@@ -1921,6 +1921,29 @@ impl Drop for DirectMedia {
 /// server allows the app's origin): through the page proxy each segment
 /// held a WebView request thread, a JNI copy of the body and the 8 s proxy
 /// deadline.
+/// The URL hls.js loads `url` from, logged with its reason: a downloaded
+/// master through the page's own origin (the local handler answers it and
+/// everything under it from disk), anything else from the server
+/// (`direct_url`).
+fn hls_source(url: &str) -> String {
+    let local = super::offline_video::hls_local_source(super::ports::video_store().as_deref(), url);
+    let log_url = url.split('?').next().unwrap_or_default();
+    match local {
+        Some(path) => {
+            log::info!(
+                "pharos: playback hls source verdict=local reason=stored_master url={log_url}"
+            );
+            path
+        }
+        None => {
+            log::info!(
+                "pharos: playback hls source verdict=direct reason=not_stored url={log_url}"
+            );
+            direct_url(&server(), url)
+        }
+    }
+}
+
 fn direct_url(base: &str, url: &str) -> String {
     if url.starts_with('/') {
         tv_page::server_url(base, url)

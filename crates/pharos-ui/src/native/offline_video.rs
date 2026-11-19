@@ -1027,6 +1027,19 @@ pub fn offline_file_for(
     )
 }
 
+/// Where the phone's hls.js loads a stream from. A master the store holds
+/// for the signed-in user loads by its path and query on the page's own
+/// origin, so it and every playlist and segment it names (resolved against
+/// it) reach the local handler, which answers stored files from disk,
+/// online or not: `Some(path)`. Anything else loads straight from the
+/// server (`None`): a stored master sent there would fail with no network.
+pub fn hls_local_source(
+    store: Option<&dyn super::kept_video::VideoStore>,
+    url: &str,
+) -> Option<String> {
+    offline_file_for(store, url).map(|_| super::kept_video::request_key(url))
+}
+
 /// The headers a stored file is answered with. Never cached: the WebView
 /// keys its cache by path and query, which do not name the user, so a
 /// cached answer would go to whoever asks next, across a sign-out or an

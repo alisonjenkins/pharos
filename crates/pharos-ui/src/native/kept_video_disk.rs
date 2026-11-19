@@ -12033,6 +12033,72 @@ pub(crate) mod tests {
         assert!(hit("/Items/1/Images/Primary").is_none());
     }
 
+    /// A kept video plays with no network: hls.js is given the stored
+    /// master on the page's own origin (never the server's URL), and that
+    /// master and the first playlist it names are answered from disk, with
+    /// no request to the server.
+    #[tokio::test]
+    async fn a_kept_videos_master_and_first_playlist_are_served_locally() {
+        let rig = Rig::new("hls-local");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(kept.state, KeptState::Ready);
+        crate::native::offline_video::remember_user("u1");
+        let asked = rig.server.asked.lock().unwrap().len();
+        let store: Arc<dyn VideoStore> = store;
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url);
+        assert_eq!(
+            source.as_deref(),
+            Some(request_key(&kept.master_url).as_str()),
+            "the stored master was not given a local source"
+        );
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+        };
+        let master = local(&source.unwrap()).expect("the master was not served locally");
+        let text = String::from_utf8(master).unwrap();
+        let first = text
+            .lines()
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .expect("the master names no playlist");
+        let first = crate::native::kept_video::absolute_url(
+            "http://local",
+            &resolve_against(&kept.master_url, first),
+        );
+        assert!(
+            local(&first).is_some(),
+            "the first playlist {first} was not served locally"
+        );
+        assert_eq!(
+            rig.server.asked.lock().unwrap().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        // Not kept: straight from the server.
+        assert_eq!(
+            crate::native::offline_video::hls_local_source(
+                Some(&*store),
+                "/videos/2/master.m3u8?PlaySessionId=p"
+            ),
+            None
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// `rel` resolved against `base`'s folder, as hls.js does.
+    fn resolve_against(base: &str, rel: &str) -> String {
+        if rel.starts_with('/') || rel.contains("://") {
+            return rel.to_owned();
+        }
+        let path = base.split('?').next().unwrap_or_default();
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        format!("{dir}/{rel}")
+    }
+
     #[test]
     fn names_are_safe_and_stable() {
         assert_eq!(safe_name("ab-12_Z"), "ab-12_Z");
