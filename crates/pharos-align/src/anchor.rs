@@ -31,6 +31,9 @@ const FILL_MS_PER_WORD: i64 = 300;
 /// the same text; the line is left unanchored.
 const SLOT_CAP_FACTOR: f64 = 2.0;
 const SLOT_CAP_EXTRA_MS: f64 = 3000.0;
+/// A line's first heard word longer than this has a start whisper put back
+/// at a silence or window start; the line starts from its next word.
+const FIRST_WORD_MAX_S: f64 = 3.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
@@ -73,6 +76,9 @@ pub struct LineMatch {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Matched {
     pub lines: Vec<LineMatch>,
+    /// Anchors whose first word was heard too long to start the line, so
+    /// the line starts from its second matched word.
+    pub from_second_word: usize,
 }
 
 impl Matched {
@@ -253,6 +259,7 @@ pub fn match_lines(lines: &[Line], heard: &[Heard], opts: Options) -> Matched {
 
     let mut out = Matched {
         lines: vec![LineMatch::default(); lines.len()],
+        from_second_word: 0,
     };
     let mut used = vec![false; tr.len()];
     for (li, line) in lines.iter().enumerate() {
@@ -308,6 +315,21 @@ pub fn match_lines(lines: &[Line], heard: &[Heard], opts: Options) -> Matched {
         for &(q, j) in &hits {
             starts[lyr[q].word] = Some(ms(tr[j].start_s));
             used[j] = true;
+        }
+        if let Some(&(q, j)) = hits.iter().min_by_key(|&&(q, _)| lyr[q].word) {
+            let span_s = tr[j].end_s - tr[j].start_s;
+            if span_s > FIRST_WORD_MAX_S && hits.len() > 1 {
+                tracing::debug!(
+                    line = li,
+                    word = %String::from_utf8_lossy(&tr[j].norm),
+                    start_s = tr[j].start_s,
+                    end_s = tr[j].end_s,
+                    max_s = FIRST_WORD_MAX_S,
+                    "anchor starts from its second word"
+                );
+                starts[lyr[q].word] = None;
+                out.from_second_word += 1;
+            }
         }
         let end_s = hits
             .iter()
@@ -529,6 +551,38 @@ mod tests {
         assert_eq!(b.starts_ms, vec![14_900, 15_600, 16_100, 16_900]);
         assert_eq!(b.end_ms, 17_200);
         assert_eq!(m.share(), Some(1.0));
+    }
+
+    #[test]
+    fn a_first_word_heard_for_seconds_starts_its_line_from_the_next_word() {
+        let lines = [line(20_000, 24_000, "Morning tide comes in")];
+        let mut h = heard(&[
+            ("morning", 13.3),
+            ("tide", 20.4),
+            ("comes", 20.8),
+            ("in", 21.2),
+        ]);
+        // Whisper put the word's start back at the silence before it.
+        h[0].end_s = 20.4;
+        let m = match_lines(&lines, &h, Options::default());
+        let a = m.lines[0].anchor.as_ref().unwrap();
+        assert_eq!(a.starts_ms, vec![20_100, 20_400, 20_800, 21_200]);
+        assert_eq!(m.from_second_word, 1);
+    }
+
+    #[test]
+    fn a_first_word_heard_for_its_own_length_starts_its_line() {
+        let lines = [line(20_000, 24_000, "Morning tide comes in")];
+        let mut h = heard(&[
+            ("morning", 19.9),
+            ("tide", 20.4),
+            ("comes", 20.8),
+            ("in", 21.2),
+        ]);
+        h[0].end_s = 20.4;
+        let m = match_lines(&lines, &h, Options::default());
+        assert_eq!(m.lines[0].anchor.as_ref().unwrap().starts_ms[0], 19_900);
+        assert_eq!(m.from_second_word, 0);
     }
 
     #[test]
