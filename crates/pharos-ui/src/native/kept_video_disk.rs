@@ -3500,8 +3500,14 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         st.bump(&dir);
         st.terminating.push(dir);
     }
-    // What the item's folder holds now, whatever plan the files are of.
-    let disk = disk_bytes(&inner.item_dir(&user, &item));
+    // What the item's folder holds now, whatever plan the files are of,
+    // and the staging files other runs left that would not go (a
+    // settlement kept them, `retained_parts`): they stay on disk after this
+    // run, so the terminal figure counts them. This run's own go below.
+    let disk = disk_bytes(&inner.item_dir(&user, &item)).and(
+        parts_bytes_except(&inner.item_dir(&user, &item), run),
+        u64::saturating_add,
+    );
     // A lower bound when the walk fell short; only ever taken in a max.
     let held = disk.counted(0);
     // The record's figure for the folder: what was found, or, when the walk
@@ -3865,6 +3871,29 @@ fn parts_bytes(dir: &Path) -> Measure<u64> {
     };
     for path in paths {
         let part = match std::fs::metadata(&path) {
+            Ok(m) => Measure::Whole(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
+            Err(_) => Measure::Short(0),
+        };
+        total = total.and(part, u64::saturating_add);
+    }
+    total
+}
+
+/// [`parts_bytes`] without `run`'s own staging files.
+fn parts_bytes_except(dir: &Path, run: u64) -> Measure<u64> {
+    let own = format!(".{run}.part");
+    let (paths, clean) = part_paths(dir, ".part");
+    let mut total = if clean {
+        Measure::Whole(0u64)
+    } else {
+        Measure::Short(0u64)
+    };
+    for path in paths
+        .iter()
+        .filter(|p| !p.to_string_lossy().ends_with(&own))
+    {
+        let part = match std::fs::metadata(path) {
             Ok(m) => Measure::Whole(m.len()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
             Err(_) => Measure::Short(0),
@@ -11257,6 +11286,16 @@ pub(crate) mod tests {
             store.kept_bytes()
         );
         store.settled().await;
+        // After the run ends too: its terminal figure still counts the
+        // staging file that would not go.
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the finished run dropped the staging file's bytes: kept {} of {on_disk} on disk ({:?})",
+            store.kept_bytes(),
+            only(&store).state
+        );
         FAIL_PART_DELETE.with(|f| f.set(false));
     }
 
