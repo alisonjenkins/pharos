@@ -243,55 +243,68 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     let _ = sock.write_all(&out).await;
     let send = drop_after.map_or(reply.body.len(), |n| n.min(reply.body.len()));
     let part = reply.body.get(..send).unwrap_or_default();
+    let at = hold.as_ref().map(|h| h.at);
     if reply.chunked {
-        let mut sent = 0usize;
-        for piece in part.chunks(piece) {
+        for (start, end) in pieces(part.len(), piece, at) {
+            let piece = part.get(start..end).unwrap_or_default();
             let _ = sock
                 .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
                 .await;
             let _ = sock.write_all(piece).await;
             let _ = sock.write_all(b"\r\n").await;
-            sent += piece.len();
-            if let Some(Hold {
-                at,
-                release,
-                reached,
-            }) = &hold
-            {
-                if sent >= *at {
-                    reached.store(true, std::sync::atomic::Ordering::SeqCst);
-                    while !release.load(std::sync::atomic::Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                    }
-                }
+            if at == Some(end) {
+                wait_at(hold.as_ref()).await;
             }
         }
         if drop_after.is_none() {
             let _ = sock.write_all(b"0\r\n\r\n").await;
         }
-    } else if let Some(Hold {
-        at,
-        release,
-        reached,
-    }) = &hold
-    {
+    } else if hold.is_some() {
         // A known-length body held after `at` bytes: the client has the
         // length, so its reservation is refreshed as the body arrives.
-        let mut sent = 0usize;
-        for piece in part.chunks(piece) {
-            let _ = sock.write_all(piece).await;
-            sent += piece.len();
-            if sent >= *at {
-                reached.store(true, std::sync::atomic::Ordering::SeqCst);
-                while !release.load(std::sync::atomic::Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                }
+        for (start, end) in pieces(part.len(), piece, at) {
+            let _ = sock
+                .write_all(part.get(start..end).unwrap_or_default())
+                .await;
+            if at == Some(end) {
+                wait_at(hold.as_ref()).await;
             }
         }
     } else {
         let _ = sock.write_all(part).await;
     }
     let _ = sock.shutdown().await;
+}
+
+/// The byte ranges a body of `len` is sent in: `piece` bytes each, with the
+/// piece that crosses `at` split there, so a hold stops after exactly `at`
+/// bytes whatever the piece size.
+fn pieces(len: usize, piece: usize, at: Option<usize>) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < len {
+        let mut end = (start + piece).min(len);
+        if let Some(at) = at.filter(|&a| a > start && a < end) {
+            end = at;
+        }
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Marks the hold reached and waits for its release.
+async fn wait_at(hold: Option<&Hold>) {
+    let Some(Hold {
+        release, reached, ..
+    }) = hold
+    else {
+        return;
+    };
+    reached.store(true, std::sync::atomic::Ordering::SeqCst);
+    while !release.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 }
 
 struct Reply {
@@ -355,4 +368,78 @@ fn plan(
     };
     let drop_after = s.drops.pop_front();
     (reply, drop_after)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Reads what the server sends until the hold is reached, then a moment
+    /// more: the body bytes received by then.
+    fn body_at_hold(
+        script: Script,
+        path: &str,
+        reached: &std::sync::atomic::AtomicBool,
+    ) -> Vec<u8> {
+        let server = TestServer::start(script);
+        let mut sock = std::net::TcpStream::connect(server.addr).unwrap();
+        write!(sock, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        let mut waited = 0;
+        while waited < 400 {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(_) if reached.load(std::sync::atomic::Ordering::SeqCst) => break,
+                Err(_) => waited += 1,
+            }
+        }
+        let head = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        got.split_off(head)
+    }
+
+    /// A hold stops after exactly the bytes asked for, on a known-length
+    /// body whose last piece crosses it and on a chunked body whose piece
+    /// boundary does not fall on it.
+    #[test]
+    fn a_hold_stops_after_exactly_the_bytes_asked_for() {
+        let (script, release, reached) = Script::default()
+            .file("/f", vec![7; 10_000])
+            .hold_after(9_999);
+        let body = body_at_hold(script, "/f", &reached);
+        assert_eq!(
+            body.len(),
+            9_999,
+            "the known-length body went past its hold"
+        );
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (script, release, reached) = Script::default()
+            .file("/c", vec![7; 10_000])
+            .chunked()
+            .chunk_bytes(4096)
+            .hold_after(5_000);
+        let body = body_at_hold(script, "/c", &reached);
+        // Chunk framing: 4096 bytes, then the split 904.
+        let data: usize = String::from_utf8_lossy(&body)
+            .split("\r\n")
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| c[1].len())
+            .sum();
+        assert_eq!(data, 5_000, "the chunked body went past its hold");
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn pieces_split_at_the_hold_and_keep_aligned_ones() {
+        assert_eq!(pieces(10, 4, Some(6)), [(0, 4), (4, 6), (6, 10)]);
+        assert_eq!(pieces(10, 4, Some(8)), [(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(pieces(10, 4, None), [(0, 4), (4, 8), (8, 10)]);
+    }
 }
