@@ -253,10 +253,10 @@ struct State {
     /// that landed counted, and only on the record it was taken from (the
     /// record's generation, `record_gen`, beside it).
     playlists_base: HashMap<(String, String, u64), (u64, u64)>,
-    /// Which record an item has, by the run its start claimed: a removal
-    /// and a new start give the item a new record, and a stale run's exit
-    /// must not change the replacement's reservation. Records read at open
-    /// have none (0).
+    /// Which run last took an item's record, by the run id every claim sets
+    /// ([`State::claim_run`]): a new start, a resume or a handoff moves it,
+    /// and a stale run's exit must not change the new run's reservation.
+    /// Records read at open have none (0).
     record_gen: HashMap<(String, String), u64>,
     /// Starts whose first record is not saved yet, by the run they claimed:
     /// a failed save rolls back its own record even when a session end has
@@ -663,10 +663,16 @@ impl State {
     }
 
     /// Names a new run the owner of `user`'s `item` and returns its id.
+    /// Names a new run for `user`'s `item`. The record's generation moves to
+    /// it too, whether a start, a resume or a handoff claimed it: a run
+    /// that took allowances before then is stale on that record, and its
+    /// late exit gives nothing back from the new run's reservation.
     fn claim_run(&mut self, user: &str, item: &str) -> u64 {
         self.next_run = self.next_run.wrapping_add(1);
         let id = self.next_run;
-        self.runs.insert((user.to_owned(), item.to_owned()), id);
+        let key = (user.to_owned(), item.to_owned());
+        self.runs.insert(key.clone(), id);
+        self.record_gen.insert(key, id);
         id
     }
 
@@ -4847,7 +4853,6 @@ impl VideoStore for DiskVideoStore {
                     // The run is named in the same hold: a rollback below
                     // touches the record only while this start still owns it.
                     run_id = st.claim_run(&user, &item);
-                    st.record_gen.insert((user.clone(), item.clone()), run_id);
                     st.pending_starts.insert((user.clone(), item.clone()), run_id);
                     // A settlement that began before this start must not act
                     // on the folder as it saw it.
@@ -9261,6 +9266,32 @@ pub(crate) mod tests {
             only(&store).estimated_bytes,
             before,
             "the stale run changed the replacement's reservation: {:?}",
+            captured()
+        );
+    }
+
+    /// A stale run gives allowances back only while no other run has taken
+    /// its record since: after a sign-out and a resume of the same record
+    /// that went on to Ready, the old run's late exit leaves the Ready
+    /// record's reservation alone.
+    #[tokio::test]
+    async fn a_stale_run_leaves_a_resumed_records_reservation_alone() {
+        let rig = Rig::new("park-resume-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let before = only(&store).estimated_bytes;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(
+            only(&store).estimated_bytes,
+            before,
+            "the stale run changed the resumed record's reservation: {:?}",
             captured()
         );
     }
