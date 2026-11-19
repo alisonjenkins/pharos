@@ -4511,6 +4511,21 @@ impl VideoStore for DiskVideoStore {
                 }
                 !ours
             });
+            // A sign-in's resume deferred to a start's first save belongs to
+            // the session that ended: the save must not start a run for it.
+            let before = st.resume_after_save.len();
+            st.resume_after_save
+                .retain(|(user, _)| owner.is_some_and(|o| o != user));
+            let dropped = before - st.resume_after_save.len();
+            if dropped > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume verdict=dropped reason=session_ended deferred={dropped} ended_for={}",
+                        owner.unwrap_or("unknown")
+                    ),
+                );
+            }
             parked
         };
         for (user, item, run) in parked {
@@ -8292,6 +8307,40 @@ pub(crate) mod tests {
             lines("pharos: video keep resume item=1")
                 .iter()
                 .any(|l| l.contains("reason=signed_in_before_save")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A sign-in's resume deferred to a start's first save is dropped by a
+    /// sign-out before the save lands: signed out, signed in, signed out,
+    /// then the save succeeds, and no run starts after the sign-out.
+    #[tokio::test]
+    async fn a_sign_out_after_a_deferred_resume_starts_no_run_at_the_save() {
+        let rig = Rig::new("save-resume-dropped");
+        rig.server.sign_in("u1");
+        let store = rig.open();
+        let s2 = store.clone();
+        set_hook(&BEFORE_FIRST_SAVE, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+            s2.park_runs(Some("u1"));
+        });
+        store.start(request("1")).unwrap();
+        clear_hook(&BEFORE_FIRST_SAVE);
+        store.settled().await;
+        assert!(
+            !lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("reason=signed_in_before_save")),
+            "a run started after the sign-out: {:?}",
+            captured()
+        );
+        assert_ne!(only(&store).state, KeptState::Ready);
+        assert!(
+            lines("pharos: video keep resume verdict=dropped reason=session_ended")
+                .iter()
+                .any(|l| l.contains("ended_for=u1")),
             "{:?}",
             captured()
         );
