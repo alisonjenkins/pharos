@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_file_is_answered_with_the_type_the_server_sends() {
+    fn a_stored_file_is_answered_with_the_type_its_key_names() {
         for (key, want) in [
             ("/videos/1/master.m3u8?a=b", "application/vnd.apple.mpegurl"),
             (
