@@ -851,7 +851,12 @@ impl Gate {
                 // arrives (above, before it is written), never to read the
                 // end of the body: a download that has all it will get must
                 // not be refused room for bytes that are not coming.
-                if since_check >= FREE_CHECK_BYTES && st.total.is_some() {
+                // Once the advertised length has landed there is nothing
+                // left to admit: the body's end is checked below and the
+                // file finished, never refused because accounting is
+                // unknown for a moment (a restart would need room for a
+                // second copy beside the whole part).
+                if since_check >= FREE_CHECK_BYTES && st.total.is_some() && left(written) > 0 {
                     since_check = 0;
                     reserved_ahead = left(written);
                     self.cache
@@ -1932,6 +1937,31 @@ mod tests {
             "the retry resumed the old bytes with the new version's tag: {seen:?}"
         );
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
+    }
+
+    /// A body of known length whose last chunk reaches the check window is
+    /// finished, not refused, when the accounting turns unknown just then:
+    /// nothing is left to admit.
+    #[test]
+    fn a_body_whose_last_chunk_lands_is_finished_while_accounting_is_unknown() {
+        let size = usize::try_from(FREE_CHECK_BYTES).unwrap();
+        let script = Script::default().file("/audio/1", vec![5u8; size]);
+        let r = rig("whole-then-unknown", script, 1 << 30, &["t"], fast());
+        let part = r.cache.part_path("track/1");
+        let whole = FREE_CHECK_BYTES;
+        r.cache
+            .set_outside_used(Arc::new(move || crate::cache::OutsideBytes {
+                held: 0,
+                outstanding: 0,
+                unknown: std::fs::metadata(&part).is_ok_and(|m| m.len() == whole),
+            }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(
+            r.cache.is_complete("track/1"),
+            "a whole body was refused for unknown accounting"
+        );
+        assert_eq!(r.srv.seen().len(), 1, "{:?}", r.srv.seen());
     }
 
     /// A whole new body that replaces a partial file owes what it has yet to
