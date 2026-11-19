@@ -5,7 +5,7 @@
 
 use pharos_core::lyrics_text::{bigram_recall, words};
 
-use super::Lyrics;
+use super::{align, Lyrics};
 
 /// How far a record's length may be from the song's: LRCLIB stores whole
 /// seconds and a rip's length can differ from the release's by a second,
@@ -70,7 +70,8 @@ pub struct Pick {
 
 /// The best of `candidates` for a song `duration_ms` long, judged against
 /// `heard`: within [`DURATION_WINDOW_MS`], not the text of the lyric that
-/// failed (`current`), the [`MAX_CANDIDATES`] closest in length, and only
+/// failed (`current`), one the aligner takes and so checks against the
+/// song in turn, the [`MAX_CANDIDATES`] closest in length, and only
 /// one with word pairs for [`MIN_PAIRS_OF_HEARD`] of the words heard and
 /// recall reaching [`MIN_RECALL`]. The higher recall wins, and on a tie the
 /// record closer in length. A record is scored as one text, pairs running
@@ -85,6 +86,7 @@ pub fn choose(
         .into_iter()
         .filter(|c| c.duration_ms.abs_diff(duration_ms) <= DURATION_WINDOW_MS)
         .filter(|c| !same_text(&c.lyrics, current))
+        .filter(|c| align::alignable(&c.lyrics))
         .collect();
     near.sort_by_key(|c| c.duration_ms.abs_diff(duration_ms));
     near.truncate(MAX_CANDIDATES);
@@ -264,6 +266,37 @@ mod tests {
                     _ => lyrics(&["the lanterns  swing in the orchard the river keeps its time"]),
                 };
                 candidate(10 + i, SONG_MS + i * 100, copy)
+            })
+            .collect();
+        all.push(candidate(99, SONG_MS + 1_500, sung()));
+        let got = choose(all, &wrong(), SONG_MS, HEARD);
+        assert_eq!(got.map(|p| p.candidate.id), Some(99));
+    }
+
+    #[test]
+    fn records_the_aligner_would_not_take_take_no_slot() {
+        // Five records closer in length the aligner refuses: timed word by
+        // word already, or longer than it takes, so never checked.
+        let mut timed = sung();
+        for line in &mut timed.lines {
+            line.words = vec![super::super::WordStamp {
+                at: 0,
+                start_ms: line.start_ms.unwrap(),
+            }];
+        }
+        let long = lyrics(
+            &std::iter::repeat("grey gulls wheel above the quay low tide hums")
+                .take(501)
+                .collect::<Vec<_>>(),
+        );
+        let mut all: Vec<Candidate> = (0..MAX_CANDIDATES as u64)
+            .map(|i| {
+                let refused = if i % 2 == 0 {
+                    timed.clone()
+                } else {
+                    long.clone()
+                };
+                candidate(10 + i, SONG_MS + i * 100, refused)
             })
             .collect();
         all.push(candidate(99, SONG_MS + 1_500, sung()));
