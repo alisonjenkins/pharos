@@ -1029,7 +1029,20 @@ impl Cache {
     /// has yet to add) until `commit` or `release_reservation` clears it, so a host
     /// admitting against the same free figure sees them as spoken for.
     pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
-        self.approve(downloading, need, true)
+        self.approve(downloading, need, true, false)
+    }
+
+    /// As [`Cache::ensure_free`] (or, with `evict` false, its no-eviction
+    /// form) for a whole new body about to replace `downloading`'s `.part`:
+    /// the part's bytes, read under the admission lock, come back when it is
+    /// truncated, so they count as room. A refusal leaves the part as it is.
+    pub fn ensure_free_replacing_part(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+    ) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, evict, true)
     }
 
     /// As [`Cache::ensure_free`], but never evicts: for room a write may
@@ -1040,12 +1053,30 @@ impl Cache {
         downloading: &str,
         need: u64,
     ) -> Result<u64, NoRoom> {
-        self.approve(downloading, need, false)
+        self.approve(downloading, need, false, false)
     }
 
-    fn approve(&self, downloading: &str, need: u64, evict: bool) -> Result<u64, NoRoom> {
+    fn approve(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+        replacing: bool,
+    ) -> Result<u64, NoRoom> {
         let _admission = admission_guard();
-        let verdict = self.check_free(downloading, need, evict);
+        // An unreadable part reclaims nothing: never room on a guess.
+        let reclaim = if replacing {
+            self.part_len(downloading).unwrap_or(0)
+        } else {
+            0
+        };
+        let verdict = self.check_free(downloading, need, evict, reclaim);
+        if replacing {
+            log::info!(
+                "cache admission id={downloading} need={need} reclaim={reclaim} verdict={} reason=whole_body_replaces_part",
+                if verdict.is_ok() { "approved" } else { "refused" }
+            );
+        }
         match verdict {
             Ok(_) => self.reserve(downloading, need),
             Err(_) => self.unreserve(downloading),
@@ -1258,7 +1289,13 @@ impl Cache {
         (lens, whole)
     }
 
-    fn check_free(&self, downloading: &str, need: u64, evict: bool) -> Result<u64, NoRoom> {
+    fn check_free(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+        reclaim: u64,
+    ) -> Result<u64, NoRoom> {
         // Outstanding first, then the probe: a write that lands between the
         // two lowers free and the stale (higher) outstanding keeps the figure
         // conservative. The other order counts those bytes twice as spent
@@ -1276,7 +1313,8 @@ impl Cache {
         }
         let outstanding = outside.outstanding;
         let raw = match (self.free)(&self.dir) {
-            Ok(f) => f,
+            // What a truncation is about to free is room for the write.
+            Ok(f) => f.saturating_add(reclaim),
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
                 return Ok(u64::MAX);

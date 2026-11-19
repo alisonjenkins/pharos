@@ -807,7 +807,11 @@ impl Gate {
             // What the last check reserved, from where it was made: a chunk
             // that would pass it is reserved for before it is written, not
             // after, so the bytes a host admits against never lag the disk.
-            let mut reserved_ahead = self.reserve(id, left(start), 0, unknown_len)?;
+            // A whole body over a partial file is admitted with the old
+            // bytes as room (they go when the part is truncated, below); a
+            // refusal keeps them and their validator.
+            let replacing = !append && pos > 0;
+            let mut reserved_ahead = self.reserve(id, left(start), 0, unknown_len, replacing)?;
             let mut written = start;
             let mut since_check = 0u64;
             let mut file = self
@@ -837,7 +841,8 @@ impl Gate {
             {
                 let len = chunk.len() as u64;
                 if since_check.saturating_add(len) > reserved_ahead {
-                    reserved_ahead = self.reserve(id, len.max(left(written)), len, unknown_len)?;
+                    reserved_ahead =
+                        self.reserve(id, len.max(left(written)), len, unknown_len, false)?;
                     since_check = 0;
                 }
                 file.write_all(&chunk)
@@ -887,13 +892,25 @@ impl Gate {
     /// `want` is a whole check window, which a small track may not need:
     /// when the window does not fit, only `at_least` (the chunk about to be
     /// written; none before the first) is reserved, and checked again at
-    /// the next chunk. Returns what was reserved.
-    fn reserve(&self, id: &str, want: u64, at_least: u64, unknown_len: bool) -> Result<u64, Fail> {
+    /// the next chunk. Returns what was reserved. `replacing`: a whole body
+    /// is about to truncate the part, whose bytes then count as room.
+    fn reserve(
+        &self,
+        id: &str,
+        want: u64,
+        at_least: u64,
+        unknown_len: bool,
+        replacing: bool,
+    ) -> Result<u64, Fail> {
         // A window of unknown length is speculative: the track may need far
         // less of it. It is taken only from room that is free now, never by
         // evicting a cached track; what the write does need (the chunk) may
         // evict, below.
-        let first = if unknown_len && at_least < want {
+        let speculative = unknown_len && at_least < want;
+        let first = if replacing {
+            self.cache
+                .ensure_free_replacing_part(id, want, !speculative)
+        } else if speculative {
             self.cache.ensure_free_without_eviction(id, want)
         } else {
             self.cache.ensure_free(id, want)
@@ -1995,6 +2012,47 @@ mod tests {
         );
         release.store(true, Ordering::SeqCst);
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
+    }
+
+    /// A whole new body that replaces a partial file is admitted with the
+    /// old part's bytes counted as room: they come back when it is
+    /// truncated, so a disk that holds the new body once the old one goes
+    /// is not refused for both at once.
+    #[test]
+    fn a_replacement_body_counts_the_old_part_as_room() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let s2 = slot.clone();
+        // A disk with room for the body and 100 bytes more, less whatever
+        // the part holds now.
+        let r = rig_with_free(
+            "replacement-room",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let part = s2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                Ok((MIN_FREE_BYTES + 1100).saturating_sub(part))
+            }),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.srv.edit(Script::ignore_range);
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)), "never finished");
+        assert!(
+            r.cache.is_complete("track/1"),
+            "the replacement was refused for the bytes it was about to free"
+        );
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
     }
 
