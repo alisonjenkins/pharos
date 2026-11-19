@@ -173,6 +173,14 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
             Err(OpenError::NotSignedIn)
         }
+        Resumed::Superseded => {
+            log::info!(
+                "pharos: open server={base} signed_in=unknown reason=token_replaced_during_resume {timing}"
+            );
+            Err(OpenError::Resume(
+                "the device token was replaced while it was resumed".to_owned(),
+            ))
+        }
         Resumed::Failed(e) => {
             log::warn!("pharos: open resume failed server={base} error={e} {timing}");
             Err(OpenError::Resume(e))
@@ -209,8 +217,8 @@ impl offline_video::Resumer for PhoneResumer<'_> {
         })
     }
 
-    fn forget_token(&self) {
-        android::forget_token();
+    fn forget_token(&self, refused: &str) -> bool {
+        android::forget_refused_token(refused)
     }
 }
 

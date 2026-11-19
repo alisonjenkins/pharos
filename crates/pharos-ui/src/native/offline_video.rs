@@ -459,8 +459,10 @@ pub trait Resumer {
         &'a self,
         token: &'a str,
     ) -> futures_util::future::LocalBoxFuture<'a, Result<Self::Api, ResumeError<Self::Error>>>;
-    /// Drops the token on file (the server refused it).
-    fn forget_token(&self);
+    /// Drops the token on file while it is still `refused` (the server
+    /// refused it), as one step under the file's lock. False when a sign-in
+    /// replaced it since: the replacement is kept.
+    fn forget_token(&self, refused: &str) -> bool;
 }
 
 /// What [`resume_session`] gave.
@@ -472,23 +474,40 @@ pub enum Resumed<A, E> {
     NoToken,
     /// The server refused the token, which is dropped.
     Refused,
+    /// Each token read was replaced by a sign-in before its refusal came
+    /// back, [`RESUME_TRIES`] times: the latest is kept, for the next
+    /// attempt.
+    Superseded,
     Failed(E),
 }
 
+/// How many tokens one resume tries when each refused one was replaced by
+/// a sign-in in the meantime.
+pub const RESUME_TRIES: u32 = 3;
+
 /// Reads the token once and resumes with exactly that token: the session
 /// that comes back answers for it, whatever the file holds afterwards.
+/// A refused token is dropped only while it is still the one on file; one
+/// a sign-in stored meanwhile is kept and resumed with in turn.
 pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
-    let Some(token) = r.load_token() else {
-        return Resumed::NoToken;
-    };
-    match r.resume(&token).await {
-        Ok(api) => Resumed::Opened(Session::opened(api, Some(token))),
-        Err(ResumeError::Refused) => {
-            r.forget_token();
-            Resumed::Refused
+    for attempt in 1..=RESUME_TRIES {
+        let Some(token) = r.load_token() else {
+            return Resumed::NoToken;
+        };
+        match r.resume(&token).await {
+            Ok(api) => return Resumed::Opened(Session::opened(api, Some(token))),
+            Err(ResumeError::Refused) => {
+                if r.forget_token(&token) {
+                    return Resumed::Refused;
+                }
+                super::platform::info(&format!(
+                    "pharos: resume verdict=superseded reason=token_changed_since_read attempt={attempt} of={RESUME_TRIES}"
+                ));
+            }
+            Err(ResumeError::Failed(e)) => return Resumed::Failed(e),
         }
-        Err(ResumeError::Failed(e)) => Resumed::Failed(e),
     }
+    Resumed::Superseded
 }
 
 /// Notes the user who has signed in, paired with the test seam's token.
@@ -1649,6 +1668,9 @@ mod tests {
         users: Vec<(&'static str, &'static str)>,
         /// The tokens each resume was sent.
         sent: RefCell<Vec<String>>,
+        /// Runs once, as a refused token is about to be dropped: a sign-in
+        /// landing between the refusal and the drop.
+        before_forget: RefCell<Option<Box<dyn FnOnce()>>>,
     }
 
     impl FakeResumer {
@@ -1657,6 +1679,7 @@ mod tests {
                 file: file.to_owned(),
                 users: vec![("tokA", "A"), ("tokB", "B")],
                 sent: RefCell::default(),
+                before_forget: RefCell::default(),
             }
         }
     }
@@ -1682,8 +1705,14 @@ mod tests {
                 .map(|(_, u)| u.to_string());
             Box::pin(async move { user.ok_or(ResumeError::Refused) })
         }
-        fn forget_token(&self) {
-            let _ = super::super::token_file::forget(&self.file);
+        fn forget_token(&self, refused: &str) -> bool {
+            if let Some(f) = self.before_forget.borrow_mut().take() {
+                f();
+            }
+            !matches!(
+                super::super::token_file::forget_if(&self.file, refused),
+                Ok(super::super::token_file::ForgetIf::Changed)
+            )
         }
     }
 
@@ -1726,6 +1755,35 @@ mod tests {
             token_file::read(&path).unwrap(),
             None,
             "a refused token was kept"
+        );
+    }
+
+    /// A sign-in that stores B's token while a refusal of the old token is
+    /// on its way back keeps it: only the refused token is dropped, and the
+    /// resume goes on with B's, which gives B's session.
+    #[test]
+    fn a_refusal_drops_only_the_refused_token_and_resumes_its_replacement() {
+        use super::super::token_file;
+        let d = TmpDir::new("resume-superseded");
+        let path = d.path().join("device-token");
+        let r = FakeResumer::new(&path);
+        token_file::store(&path, "tokX").unwrap();
+        let p2 = path.clone();
+        *r.before_forget.borrow_mut() = Some(Box::new(move || {
+            token_file::store(&p2, "tokB").unwrap();
+        }));
+        match run(resume_session(&r)) {
+            Resumed::Opened(session) => assert_eq!(
+                session,
+                Session::opened("B".to_owned(), Some("tokB".to_owned()))
+            ),
+            _ => panic!("the replacement token was not resumed"),
+        }
+        assert_eq!(*r.sent.borrow(), ["tokX", "tokB"]);
+        assert_eq!(
+            token_file::read(&path).unwrap().map(|s| s.token).as_deref(),
+            Some("tokB"),
+            "the replacement was dropped with the refused token"
         );
     }
 

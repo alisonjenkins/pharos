@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use pharos_content::token::{Forgotten, Pairing, Stored};
+pub use pharos_content::token::{ForgetIf, Forgotten, Pairing, Stored};
 
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.
@@ -63,6 +63,13 @@ pub fn run_token(path: &Path, owner: &str) -> Result<String, String> {
 /// (`Forgotten::NotDurable` says why not).
 pub fn forget(path: &Path) -> Result<Forgotten, String> {
     pharos_content::token::forget(path).map_err(|e| e.to_string())
+}
+
+/// Removes the token and its user only while the token on file is `seen`
+/// (the refused one), under the file's lock: a token stored since is kept
+/// (`ForgetIf::Changed`).
+pub fn forget_if(path: &Path, seen: &str) -> Result<ForgetIf, String> {
+    pharos_content::token::forget_if(path, seen).map_err(|e| e.to_string())
 }
 
 /// The file the older layout kept the user id in. Never read; removed when

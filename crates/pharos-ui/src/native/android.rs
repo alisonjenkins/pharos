@@ -222,6 +222,35 @@ pub fn forget_token() {
     note_credentials_changed("forgotten");
 }
 
+/// Drops the token a resume was refused with, only while it is still the
+/// one on file. False when a sign-in replaced it since: the replacement is
+/// kept, for the caller to resume with.
+pub fn forget_refused_token(refused: &str) -> bool {
+    let Ok(path) = token_path() else {
+        set_cached(None);
+        return true;
+    };
+    let forgot = match token_file::forget_if(&path, refused) {
+        Ok(token_file::ForgetIf::Changed) => {
+            log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
+            return false;
+        }
+        Ok(token_file::ForgetIf::Forgotten(token_file::Forgotten::Durable)) => true,
+        Ok(token_file::ForgetIf::Forgotten(token_file::Forgotten::NotDurable(why))) => {
+            log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
+            true
+        }
+        Err(e) => {
+            log::warn!("forget token: {e}");
+            true
+        }
+    };
+    set_cached(None);
+    drop_legacy_user(&path);
+    note_credentials_changed("forgotten");
+    forgot
+}
+
 /// Tells the host app the token file changed, so the car's media service in
 /// the same process re-reads it (spec 044).
 fn note_credentials_changed(change: &str) {
