@@ -3256,6 +3256,9 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     let resume = !record.files.is_empty();
     wait_for_revoked_writers(inner, user, item, run).await?;
     wait_for_accounting(inner, user, item, run).await?;
+    // A folder whose adoption walk fell short blocks admission, and no
+    // sweep measures it while this run owns it: the run measures it first.
+    inner.remeasure(Some((user, item, run)));
     // An earlier run's staging files go before the plan is admitted: the
     // admission replaces the floor that counted them, and the walks after it
     // count this run's files only. One that will not go keeps the folder
@@ -4003,16 +4006,32 @@ impl Inner {
     /// whole walk sets the record's floor and lifts the block. A folder a
     /// download is writing waits until it is idle.
     fn sweep_remeasure(&self) {
+        self.remeasure(None);
+    }
+
+    /// Measures the folders of `remeasure` again: every idle one, or with
+    /// `own`, only that run's own folder. A run recovered at open whose
+    /// adoption walk fell short owns its folder, so a sweep never measures
+    /// it; before it plans, the run measures it itself while it has no
+    /// writer, and a whole walk lifts the block it would otherwise be
+    /// refused by. A walk that is short again keeps it.
+    fn remeasure(&self, own: Option<(&str, &str, u64)>) {
+        let own_dir = own.map(|(u, i, _)| self.item_dir(u, i));
         let idle = |st: &State, d: &Path| {
-            !st.writing(d)
-                && !st.runs.keys().any(|(u, i)| st.dir_of(u, i) == *d)
-                && !st.removing.iter().any(|r| r == d)
+            let owned_by_others = st.runs.iter().any(|((u, i), r)| {
+                st.dir_of(u, i) == *d && own.map_or(true, |(ou, oi, or)| (ou, oi, or) != (u, i, *r))
+            });
+            let own_still = own.map_or(true, |(u, i, r)| {
+                st.runs.get(&(u.to_owned(), i.to_owned())) == Some(&r)
+            });
+            !st.writing(d) && !owned_by_others && own_still && !st.removing.iter().any(|r| r == d)
         };
         let dirs: Vec<(PathBuf, u64)> = {
             let mut st = lock(&self.state);
             let picked: Vec<(PathBuf, u64)> = st
                 .remeasure
                 .iter()
+                .filter(|d| own_dir.as_ref().map_or(true, |o| o == *d))
                 .filter(|d| idle(&st, d) && !st.remeasuring.iter().any(|(r, _)| r == *d))
                 .map(|d| (d.clone(), st.epoch(d)))
                 .collect();
@@ -4056,8 +4075,9 @@ impl Inner {
             emit(
                 false,
                 format!(
-                    "pharos: video folder remeasured dir={} bytes={m}",
-                    dir.display()
+                    "pharos: video folder remeasured dir={} bytes={m} by={}",
+                    dir.display(),
+                    if own.is_some() { "own_run" } else { "sweep" }
                 ),
             );
         }
@@ -8757,6 +8777,25 @@ mod tests {
             damaged.iter().any(|l| l.contains("kind=folder")),
             "{damaged:?}"
         );
+    }
+
+    /// An interrupted download whose folder could not be walked whole at
+    /// open recovers once the folder reads again: its own run measures the
+    /// folder before it plans, and the download completes.
+    #[tokio::test]
+    async fn a_recovered_run_measures_its_short_folder_before_it_plans() {
+        let (rig, dir) = resume_missing_its_master("short-adoption", 4 * GIB).await;
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let later = rig.server.slow_first_open(MASTER_KEY);
+        let store = rig.open();
+        // The open's walk fell short: the folder is unknown.
+        assert!(lock(&store.inner.state).unknown_folder().is_some());
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let by = lines("pharos: video folder remeasured");
+        assert!(by.iter().any(|l| l.contains("by=own_run")), "{by:?}");
     }
 
     /// A whole record copied into another item's folder is not adopted
