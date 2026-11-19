@@ -441,30 +441,48 @@ impl LyricsFinder {
         if self.cooling_down() {
             return None;
         }
-        let candidates = match online.search(&song).await {
-            Ok(c) => c,
-            Err(e) => {
-                if let Ok(mut until) = self.down_until.lock() {
-                    *until = Some(Instant::now() + ONLINE_COOLDOWN);
+        let search = |song: Song| async move {
+            match online.search(&song).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    if let Ok(mut until) = self.down_until.lock() {
+                        *until = Some(Instant::now() + ONLINE_COOLDOWN);
+                    }
+                    metrics::counter!("pharos_lyrics_online_error_total", "provider" => e.provider)
+                        .increment(1);
+                    repick_counted(repick::Outcome::Error);
+                    tracing::warn!(
+                        media.id = item.id,
+                        origin = current.origin.label(),
+                        text_recall,
+                        album = song.album.is_some(),
+                        error = %e,
+                        "lyrics: not what was sung, and the search for another failed"
+                    );
+                    None
                 }
-                metrics::counter!("pharos_lyrics_online_error_total", "provider" => e.provider)
-                    .increment(1);
-                repick_counted(repick::Outcome::Error);
-                tracing::warn!(
-                    media.id = item.id,
-                    origin = current.origin.label(),
-                    text_recall,
-                    error = %e,
-                    "lyrics: not what was sung, and the search for another failed"
-                );
-                return None;
             }
         };
-        let searched = candidates.len();
-        let pick = item
-            .probe
-            .duration_ms
-            .and_then(|ms| repick::choose(candidates, current, ms, &heard.text));
+        let choose = |candidates| {
+            item.probe
+                .duration_ms
+                .and_then(|ms| repick::choose(candidates, current, ms, &heard.text))
+        };
+        let candidates = search(song.clone()).await?;
+        let mut searched = candidates.len();
+        let mut pick = choose(candidates);
+        // An album tag the provider files differently hides every record;
+        // the search is made once more without it.
+        let without_album = pick.is_none() && song.album.is_some();
+        if without_album {
+            let candidates = search(Song {
+                album: None,
+                ..song.clone()
+            })
+            .await?;
+            searched += candidates.len();
+            pick = choose(candidates);
+        }
         let Some(pick) = pick else {
             self.write_repick(item.id, online.name(), song, current.clone(), None)
                 .await;
@@ -475,6 +493,7 @@ impl LyricsFinder {
                 origin = current.origin.label(),
                 text_recall,
                 searched,
+                without_album,
                 duration_ms = item.probe.duration_ms,
                 "lyrics: not what was sung, and no other record was"
             );
@@ -501,6 +520,7 @@ impl LyricsFinder {
             origin = current.origin.label(),
             text_recall,
             searched,
+            without_album,
             candidate.id = pick.candidate.id,
             candidate.recall = pick.recall,
             "lyrics: not what was sung, another record was and is served instead"
@@ -1176,6 +1196,9 @@ mod tests {
         searches: std::sync::atomic::AtomicUsize,
         /// The search never answers, as one cut off mid-request.
         stalls: bool,
+        /// A search naming the album finds nothing, as a provider that
+        /// files the song under another album.
+        album_hides: bool,
     }
 
     impl OnlineLyrics for Searching {
@@ -1191,13 +1214,16 @@ mod tests {
         }
         fn search<'a>(
             &'a self,
-            _song: &'a Song,
+            song: &'a Song,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
         {
             self.searches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.stalls {
                 return Box::pin(std::future::pending());
+            }
+            if self.album_hides && song.album.is_some() {
+                return Box::pin(std::future::ready(Ok(Vec::new())));
             }
             let out = self.searched.clone().map_err(|detail| OnlineError {
                 provider: "searching",
@@ -1261,6 +1287,7 @@ mod tests {
             searched,
             searches: Default::default(),
             stalls: false,
+            album_hides: false,
         })
     }
 
@@ -1330,6 +1357,27 @@ mod tests {
         assert_eq!(before, wrong());
         assert_eq!(picked, Some(sung()));
         assert_eq!(after, Some(sung()));
+        assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A record filed under another album is found by searching again
+    /// without the album.
+    #[test]
+    fn a_record_filed_under_another_album_is_found_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = timed_item(dir.path());
+        item.probe.album = Some("Record".into());
+        let online = Arc::new(Searching {
+            album_hides: true,
+            ..Arc::into_inner(searching(Ok(records(sung())))).unwrap()
+        });
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (picked, counted) = with_outcomes(async {
+            let before = finder.find(&item).await.unwrap();
+            finder.repick(&item, &before, &heard()).await
+        });
+        assert_eq!(picked, Some(sung()));
+        assert_eq!(searches(&online), 2);
         assert_eq!(counted, [("picked".to_owned(), 1)]);
     }
 
@@ -1471,6 +1519,7 @@ mod tests {
             searched: Ok(records(sung())),
             searches: Default::default(),
             stalls: true,
+            album_hides: false,
         });
         let finder = LyricsFinder::with_online(online.clone());
         let cut_off = std::time::Duration::from_millis(20);
