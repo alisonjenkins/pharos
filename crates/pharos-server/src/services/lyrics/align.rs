@@ -57,6 +57,14 @@ const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// The most lines one request may carry; the aligner refuses more.
 const MAX_LINES: usize = 500;
 
+/// Whether the aligner takes `lyrics`: synced, not already timed word by
+/// word, and at most [`MAX_LINES`] lines.
+pub fn alignable(lyrics: &Lyrics) -> bool {
+    lyrics.synced()
+        && !lyrics.lines.iter().all(|l| !l.words.is_empty())
+        && lyrics.lines.len() <= MAX_LINES
+}
+
 /// One alignment job sent to the background task.
 #[derive(Debug)]
 /// The song's path under the media root, its lines as a job asks for
@@ -898,10 +906,7 @@ impl Aligner {
     /// What a job for `lyrics` of `item` asks and is cached under; `None`
     /// when the aligner has nothing to do for these lyrics.
     fn keyed(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Keyed> {
-        if !lyrics.synced() {
-            return None;
-        }
-        if lyrics.lines.iter().all(|l| !l.words.is_empty()) || lyrics.lines.len() > MAX_LINES {
+        if !alignable(lyrics) {
             return None;
         }
         let rel_path = match item.path.strip_prefix(&self.media_root).ok()?.to_str() {
