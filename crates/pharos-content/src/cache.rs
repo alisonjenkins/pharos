@@ -46,6 +46,8 @@ thread_local! {
     static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs in `set_cap` once the setting is saved, before the live cap is.
     static AFTER_CAP_SAVED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs in a trim once its first part scan is read.
+    static AFTER_TRIM_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -702,14 +704,32 @@ impl Cache {
         self.lock().failed.remove(id);
     }
 
-    /// Remove the in-progress file for `id`.
+    /// Remove the in-progress file for `id`, under the cache's lock: a trim
+    /// reads the parts once under that lock and decides on them, so a part
+    /// it counted cannot go while it decides (a trim never counts bytes a
+    /// discard took off). Lock order: shared admission, then the cache's.
     pub fn discard_part(&self, id: &str) {
         let p = self.part_path(id);
+        let _s = self.lock();
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::warn!("cache id={id}: cannot remove part: {e}"),
         }
+    }
+
+    /// Opens `id`'s `.part` for writing: appended to, or truncated to start
+    /// a whole new body. The truncation is under the cache's lock for the
+    /// same reason as [`Cache::discard_part`]'s removal.
+    pub fn open_part(&self, id: &str, append: bool) -> std::io::Result<std::fs::File> {
+        let p = self.part_path(id);
+        let _s = self.lock();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(&p)
     }
 
     /// The ids the player is about to need; they are exempt from eviction
@@ -893,6 +913,12 @@ impl Cache {
             parts
         };
         let mut parts = parts_now();
+        #[cfg(test)]
+        AFTER_TRIM_SCAN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
         let mut fresh = true;
         let mut evicted = Vec::new();
         loop {
@@ -1536,6 +1562,45 @@ pub(crate) mod tests {
         assert_eq!(c.in_progress_bytes(), Some(30));
         c.discard_part("track/y");
         assert_eq!(c.in_progress_bytes(), Some(0));
+    }
+
+    /// A part a trim counted stays on disk while the trim decides on it: a
+    /// discard racing the trim waits for the cache's lock, so no track is
+    /// evicted for bytes a discard already took off.
+    #[test]
+    fn a_part_a_trim_counted_is_not_discarded_while_it_decides() {
+        let d = tmp("trim-discard");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/p"), vec![0u8; 100]).unwrap();
+        let part = c.part_path("track/p");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let cache = &c;
+            scope.spawn(move || {
+                if rx.recv().is_ok() {
+                    cache.discard_part("track/p");
+                }
+            });
+            let seen2 = seen.clone();
+            let part2 = part.clone();
+            AFTER_TRIM_SCAN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let _ = tx.send(());
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    seen2.store(part2.exists(), std::sync::atomic::Ordering::SeqCst);
+                }));
+            });
+            c.set_cap(150).unwrap();
+            AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
+        });
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "a discard took the counted part off mid-trim"
+        );
+        assert!(!part.exists(), "the discard ran once the trim was done");
     }
 
     /// A reservation made while its `.part`'s length could not be read

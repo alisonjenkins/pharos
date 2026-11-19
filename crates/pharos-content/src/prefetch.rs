@@ -810,12 +810,9 @@ impl Gate {
             let mut reserved_ahead = self.reserve(id, left(start), 0, unknown_len)?;
             let mut written = start;
             let mut since_check = 0u64;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(append)
-                .truncate(!append)
-                .open(&part)
+            let mut file = self
+                .cache
+                .open_part(id, append)
                 .map_err(|e| Fail::Permanent(format!("open part: {e}")))?;
             if !append && pos > 0 {
                 // The room was approved with the old bytes still on disk, so
