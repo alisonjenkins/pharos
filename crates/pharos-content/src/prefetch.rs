@@ -817,6 +817,15 @@ impl Gate {
                 .truncate(!append)
                 .open(&part)
                 .map_err(|e| Fail::Permanent(format!("open part: {e}")))?;
+            if !append && pos > 0 {
+                // The room was approved with the old bytes still on disk, so
+                // a refusal kept them; now they are gone, and what the
+                // reservation owes counts from zero.
+                self.cache.restart_reservation(id);
+                log::info!(
+                    "cache download id={id} reserve verdict=rebased reason=whole_body_replaced_part old_len={pos}"
+                );
+            }
             if validator != st.etag {
                 log::info!(
                     "cache download id={id} validator verdict=replaced reason=whole_body_opened"
@@ -1922,6 +1931,51 @@ mod tests {
             Some("\"vA\""),
             "the retry resumed the old bytes with the new version's tag: {seen:?}"
         );
+        assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
+    }
+
+    /// A whole new body that replaces a partial file owes what it has yet to
+    /// write from zero: the old bytes it truncated are not counted as
+    /// written against its reservation.
+    #[test]
+    fn a_replacement_body_owes_only_what_it_has_not_written() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .drop_first_after(600);
+        let r = rig("replacement-owed", script, 1 << 20, &["t"], fast());
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let part = r.cache.part_path("track/1");
+        type Flags = Option<(Arc<AtomicBool>, Arc<AtomicBool>)>;
+        let flags: Arc<Mutex<Flags>> = Arc::default();
+        let f2 = flags.clone();
+        // Held at 800 bytes: past the 600 the first attempt sends before it
+        // is dropped, so only the replacement reaches the hold, and only
+        // the replacement's file is ever 800 bytes long.
+        r.srv.edit(|s| {
+            let (s, release, reached) = s.ignore_range().hold_after(800);
+            *f2.lock().unwrap() = Some((release, reached));
+            s
+        });
+        r.dl.prefetch(&ids(&["track/1"]));
+        let (release, reached) = flags.lock().unwrap().clone().unwrap();
+        wait("the replacement held", &|| {
+            reached.load(Ordering::SeqCst)
+                && r.srv.seen().len() >= 2
+                && std::fs::metadata(&part).is_ok_and(|m| m.len() == 800)
+        });
+        assert_eq!(
+            r.cache.reserved_bytes(),
+            200,
+            "owed counted from the truncated file's old length"
+        );
+        release.store(true, Ordering::SeqCst);
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
     }
 

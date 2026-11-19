@@ -1000,6 +1000,21 @@ impl Cache {
         }
     }
 
+    /// `id`'s `.part` was truncated to start a whole new body: what its
+    /// reservation owes is counted from an empty file now, not from the
+    /// length it had when the room was approved (that file is gone).
+    pub fn restart_reservation(&self, id: &str) {
+        let _admission = admission_guard();
+        if let Some(r) = self
+            .reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(id)
+        {
+            r.at_len = 0;
+        }
+    }
+
     /// `id`'s reservation and the `.part` length it was made at (tests).
     #[cfg(test)]
     pub(crate) fn reservation(&self, id: &str) -> Option<(u64, u64)> {
