@@ -272,6 +272,8 @@ fn use_user() -> Option<String> {
 /// the list stays the same).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Listing {
+    /// Whose videos these are: the user the listing was read for.
+    owner: Option<String>,
     videos: Vec<KeptVideo>,
     unreadable: usize,
 }
@@ -283,9 +285,33 @@ fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
         return Listing::default();
     };
     Listing {
+        owner: user.map(str::to_owned),
         videos: user.map(|u| store.videos(u)).unwrap_or_default(),
         unreadable: store.unreadable_count(),
     }
+}
+
+/// The rows a screen shows for `user`: the polled listing's while it was
+/// read for that user, else a fresh read for them. Never one user's rows
+/// next to another user's Remove.
+fn rows_for(
+    shown: &Listing,
+    user: Option<&str>,
+    fresh: impl FnOnce() -> Listing,
+) -> Vec<KeptVideo> {
+    if shown.owner.as_deref() == user {
+        return shown.videos.clone();
+    }
+    platform::info(&format!(
+        "pharos: video listing verdict=reread reason=owner_changed from={:?} to={user:?}",
+        shown.owner
+    ));
+    fresh().videos
+}
+
+/// [`listing`] over a store in hand.
+fn listing_now(store: &dyn VideoStore, user: Option<&str>) -> Listing {
+    listing(Some(store), user)
 }
 
 /// The listing a poll sets, when it differs from the one shown.
@@ -345,12 +371,11 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
     let mut busy = use_signal(|| false);
     let mut message = use_signal(|| None::<String>);
-    let video = listing
-        .read()
-        .videos
-        .iter()
-        .find(|v| v.item == item)
-        .cloned();
+    let video = rows_for(&listing.read(), user.as_deref(), || {
+        listing_now(&*store, user.as_deref())
+    })
+    .into_iter()
+    .find(|v| v.item == item);
     let remove_user = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
@@ -490,7 +515,7 @@ pub fn VideoDownloads(
                 }
             }
             VideoList {
-                videos: listing.read().videos.clone(),
+                videos: rows_for(&listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
                 used,
                 cap: store.cap_bytes(),
                 problem: problem(),
@@ -841,10 +866,12 @@ mod tests {
     #[test]
     fn a_poll_refreshes_an_unreadable_count_that_changed_alone() {
         let shown = Listing {
+            owner: None,
             videos: vec![],
             unreadable: 1,
         };
         let now = Listing {
+            owner: None,
             videos: vec![],
             unreadable: 0,
         };
@@ -854,6 +881,28 @@ mod tests {
             "the count changed and the screen kept the old one"
         );
         assert_eq!(refreshed(&shown, shown.clone()), None);
+    }
+
+    /// A listing read for A is never shown once the screen is B's: B's
+    /// rows are read fresh, so A's rows never sit next to B's Remove. A
+    /// listing read for the same user is shown as polled.
+    #[test]
+    fn a_listing_read_for_another_user_is_not_shown() {
+        let a_rows = vec![video("7", KeptState::Ready)];
+        let shown = Listing {
+            owner: Some("A".into()),
+            videos: a_rows.clone(),
+            unreadable: 0,
+        };
+        let rows = rows_for(&shown, Some("B"), || Listing {
+            owner: Some("B".into()),
+            ..Listing::default()
+        });
+        assert!(rows.is_empty(), "A's rows were shown to B: {rows:?}");
+        let rows = rows_for(&shown, Some("A"), || panic!("read again for the same user"));
+        assert_eq!(rows, a_rows);
+        let rows = rows_for(&shown, None, Listing::default);
+        assert!(rows.is_empty(), "A's rows were shown to nobody");
     }
 
     /// The listing carries the store's unreadable count with the videos,
