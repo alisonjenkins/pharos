@@ -218,6 +218,14 @@ pub struct LyricsFinder {
     /// the memo so the memo's emptying cannot lose it: without a disk cache,
     /// or when its write failed, nothing else does.
     repicked: Mutex<HashMap<(u64, String), Option<Lyrics>>>,
+    /// Holds the next disk read: says it began, then waits to be let go.
+    #[cfg(test)]
+    read_disk_paused: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 type Repicked = Mutex<HashMap<(u64, String), Option<Lyrics>>>;
@@ -292,6 +300,8 @@ impl LyricsFinder {
             disk: None,
             aligner: None,
             repicked: Mutex::default(),
+            #[cfg(test)]
+            read_disk_paused: Mutex::default(),
         }
     }
 
@@ -360,6 +370,9 @@ impl LyricsFinder {
     }
 
     async fn online(&self, item: &MediaItem) -> Option<Lyrics> {
+        // Taken with the song, before anything is awaited: a repick for a
+        // retag made while this lookup waits must count as after it.
+        let asked_at = cache::now_secs();
         let online = self.online.as_ref()?;
         let Some(song) = Song::of(item) else {
             tracing::debug!(
@@ -389,7 +402,6 @@ impl LyricsFinder {
             );
             return None;
         }
-        let asked_at = cache::now_secs();
         match online.find(&song).await {
             Ok(found) => {
                 if let Some(standing) =
@@ -687,6 +699,13 @@ impl LyricsFinder {
         provider: &'static str,
         song: &Song,
     ) -> Option<(Option<Lyrics>, Duration)> {
+        #[cfg(test)]
+        let paused = self.read_disk_paused.lock().ok().and_then(|mut p| p.take());
+        #[cfg(test)]
+        if let Some((began, go)) = paused {
+            let _ = began.send(());
+            let _ = go.await;
+        }
         let disk = Arc::clone(self.disk.as_ref()?);
         let song = song.clone();
         let cached = tokio::task::spawn_blocking(move || disk.get(id, provider, &song))
@@ -1687,6 +1706,49 @@ mod tests {
         assert_eq!(kept, Some(wrong()));
         assert_eq!(searches(&online), 1);
         assert_eq!(counted, [("none".to_owned(), 1)]);
+    }
+
+    /// A lookup that took the song as tagged, then waited on the disk cache
+    /// while the item was retagged and repicked, does not replace the
+    /// repick when it answers: it was asked before the repick, though it
+    /// reached the provider after. Disarm check: with `asked_at` taken
+    /// after `read_disk`, this fails.
+    #[test]
+    fn a_lookup_paused_across_a_retag_and_repick_does_not_replace_it() {
+        use tokio::sync::oneshot;
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (began_tx, began) = oneshot::channel();
+        let (go, go_rx) = oneshot::channel();
+        *finder.read_disk_paused.lock().unwrap() = Some((began_tx, go_rx));
+        let next_second = || async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let ((_, picked), _) = with_outcomes(async {
+            tokio::join!(finder.online(&item), async {
+                began.await.unwrap();
+                next_second().await;
+                let picked = finder.repick(&retagged, &wrong(), &heard()).await;
+                next_second().await;
+                go.send(()).unwrap();
+                picked
+            })
+        });
+        assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))));
+        let later = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let song = Song::of(&retagged).unwrap();
+        assert!(later
+            .disk
+            .as_ref()
+            .unwrap()
+            .repicked(retagged.id, online.name(), &song));
     }
 
     #[test]
