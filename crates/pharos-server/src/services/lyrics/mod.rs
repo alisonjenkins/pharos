@@ -324,11 +324,32 @@ impl LyricsFinder {
         self
     }
 
-    pub async fn find(&self, item: &MediaItem) -> Option<Lyrics> {
-        let started = Instant::now();
-        // Taken with the item, before anything is awaited: a repick for a
-        // retag made while this lookup waits must count as after it.
+    /// The lyrics of the song `read` gives, `None` when it is not a song or
+    /// has none. The lookup is asked as of before the read: a repick for a
+    /// retag made while the item is read, or while this lookup waits, must
+    /// count as after it, so an answer for the tags read cannot replace it.
+    pub async fn find_read<E>(
+        &self,
+        read: impl Future<Output = Result<MediaItem, E>>,
+    ) -> Result<Option<(MediaItem, Lyrics)>, E> {
         let asked_at = cache::now_secs();
+        let item = read.await?;
+        if item.kind != MediaKind::Audio {
+            return Ok(None);
+        }
+        Ok(self
+            .find_asked(&item, asked_at)
+            .await
+            .map(|lyrics| (item, lyrics)))
+    }
+
+    #[cfg(test)]
+    pub async fn find(&self, item: &MediaItem) -> Option<Lyrics> {
+        self.find_asked(item, cache::now_secs()).await
+    }
+
+    async fn find_asked(&self, item: &MediaItem, asked_at: u64) -> Option<Lyrics> {
+        let started = Instant::now();
         #[cfg(test)]
         self.pause("local").await;
         let path = item.path.clone();
@@ -793,14 +814,15 @@ pub async fn for_item(
     crate::services::access::check_item(state, user, id, "item")
         .await
         .map_err(DetailError::Hidden)?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        DomainError::NotFound(_) => DetailError::NotFound,
-        other => DetailError::Store(other),
-    })?;
-    if item.kind != MediaKind::Audio {
-        return Ok(None);
-    }
-    let Some(lyrics) = state.lyrics.find(&item).await else {
+    let found = state
+        .lyrics
+        .find_read(state.stores.get(id))
+        .await
+        .map_err(|e| match e {
+            DomainError::NotFound(_) => DetailError::NotFound,
+            other => DetailError::Store(other),
+        })?;
+    let Some((item, lyrics)) = found else {
         return Ok(None);
     };
     Ok(Some(state.lyrics.served(&item, lyrics, want_words).await))
@@ -1762,6 +1784,55 @@ mod tests {
                 "paused at {at}: the repick was replaced"
             );
         }
+    }
+
+    /// A lookup whose item was read before a retag and a repick, and that
+    /// only reached the provider after them, does not replace the repick:
+    /// it is asked as of before the read. Disarm check: with `find_read`
+    /// taking `asked_at` after the read, this fails.
+    #[test]
+    fn a_lookup_for_an_item_read_before_a_retag_and_repick_does_not_replace_it() {
+        use tokio::sync::oneshot;
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (began_tx, began) = oneshot::channel();
+        let (go, go_rx) = oneshot::channel::<()>();
+        let next_second = || async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let read = async {
+            began_tx.send(()).unwrap();
+            go_rx.await.unwrap();
+            Ok::<_, ()>(item.clone())
+        };
+        let ((found, picked), _) = with_outcomes(async {
+            tokio::join!(finder.find_read(read), async {
+                began.await.unwrap();
+                next_second().await;
+                let picked = finder.repick(&retagged, &wrong(), &heard()).await;
+                next_second().await;
+                go.send(()).unwrap();
+                picked
+            })
+        });
+        assert!(matches!(found, Ok(Some(_))));
+        assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))));
+        let song = Song::of(&retagged).unwrap();
+        assert!(
+            finder
+                .disk
+                .as_ref()
+                .unwrap()
+                .repicked(retagged.id, online.name(), &song),
+            "the repick was replaced"
+        );
     }
 
     #[test]
