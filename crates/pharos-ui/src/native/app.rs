@@ -2565,8 +2565,9 @@ async fn connect(
 
 /// The server knows no session for this device: nobody is signed in from
 /// here on, so the proxy and the kept-video list stop serving the previous
-/// user. An answer for an attempt that has since been replaced says nothing
-/// about the current one and is left alone. A refusal of a session that was
+/// user. An answer for an attempt that has since been replaced, or ended by
+/// a sign-out while it was out, says nothing about the current state and is
+/// left alone. A refusal of a session that was
 /// Ready ends it through the machine's session-end hook, which does this
 /// same cleanup with the user still known: doing it here as well would run
 /// the hook with nobody signed in, and park every user's downloads.
@@ -2574,14 +2575,19 @@ async fn connect(
 fn forget_user_on_refused_resume(machine: &Machine, epoch: u32) -> bool {
     let (verdict, reason) = if machine.epoch() != epoch {
         ("skipped", "stale_attempt")
+    } else if *machine.phase() != Phase::Connecting {
+        // A sign-out (or any screen) ended the attempt while it was out:
+        // nobody is signed in from it, and that sign-out cleaned up.
+        ("skipped", "attempt_ended")
     } else if machine.had_session() {
         ("skipped", "session_end_hook_cleans_up")
     } else {
         ("cleaned", "first_resume_refused")
     };
     platform::info(&format!(
-        "pharos: resume refused cleanup verdict={verdict} reason={reason} epoch={epoch} current={}",
-        machine.epoch()
+        "pharos: resume refused cleanup verdict={verdict} reason={reason} epoch={epoch} current={} phase={:?}",
+        machine.epoch(),
+        machine.phase()
     ));
     let clean = verdict == "cleaned";
     if clean {
@@ -9490,6 +9496,42 @@ mod tests {
         assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
         m.apply(Event::ResumeRefused { epoch });
         assert_eq!(ENDED.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// A sign-out that ended a pending reconnect ends its attempt: the
+    /// attempt's refusal then runs no cleanup (nobody is signed in to clean
+    /// up for) and leaves the sign-in screen's warning in place.
+    #[test]
+    fn a_refusal_after_a_sign_out_ended_the_reconnect_changes_nothing() {
+        let sign_in_error = |m: &Machine| match m.phase() {
+            Phase::SignIn { error, .. } => error.clone(),
+            other => panic!("not on sign-in: {other:?}"),
+        };
+        offline_video::remember_user("alice");
+        let mut m = Machine::new();
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        let epoch = m.epoch();
+        m.apply(Event::SignOutAnswered(
+            super::super::machine::SignOutReply::NotSaved("disk full".into()),
+        ));
+        let warning = sign_in_error(&m);
+        assert!(warning.is_some());
+        offline_video::remember_user("bob");
+        assert!(
+            !forget_user_on_refused_resume(&m, epoch),
+            "an ended attempt's refusal cleaned up"
+        );
+        assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(
+            sign_in_error(&m),
+            warning,
+            "the refusal cleared the warning"
+        );
     }
 
     /// However a session ends, through the machine, the previous user is

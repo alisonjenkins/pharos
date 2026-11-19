@@ -268,6 +268,10 @@ impl Machine {
 
     fn step(&mut self, event: Event) {
         let current = |epoch: u32| epoch == self.epoch;
+        // An attempt's open result counts only while it is still connecting:
+        // a sign-out (or any screen) that landed meanwhile ended it, without
+        // a new epoch.
+        let open = |epoch: u32| epoch == self.epoch && self.phase == Phase::Connecting;
         match event {
             Event::Resumed { epoch } if self.accepts_resume(epoch) => {
                 self.attempt = 0;
@@ -278,13 +282,13 @@ impl Machine {
                 }
                 self.had_session = true;
             }
-            Event::ResumeRefused { epoch } if current(epoch) => self.sign_in(None),
+            Event::ResumeRefused { epoch } if open(epoch) => self.sign_in(None),
             // The server is up but could not answer (its database may be
             // down): treat it like an outage.
-            Event::ResumeFailed { epoch, error } if current(epoch) => {
+            Event::ResumeFailed { epoch, error } if open(epoch) => {
                 self.wait_and_retry(format!("The server would not resume the session: {error}"));
             }
-            Event::NotOpened { epoch, probe } if current(epoch) => {
+            Event::NotOpened { epoch, probe } if open(epoch) => {
                 if may_clear(&probe) {
                     self.wait_and_retry(probe_detail(&probe));
                 } else {
