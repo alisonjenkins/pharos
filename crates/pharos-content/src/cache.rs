@@ -46,6 +46,8 @@ thread_local! {
     static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs in `set_cap` once the setting is saved, before the live cap is.
     static AFTER_CAP_SAVED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs each time a `.part`'s length is read, with that length.
+    static AFTER_PART_LEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     /// Runs in a trim once its first part scan is read.
     static AFTER_TRIM_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -283,6 +285,37 @@ pub struct Cache {
     /// when it was made: the bytes written since come off what is still
     /// owed, so a host never counts them both on disk and as owed.
     reserved: Mutex<std::collections::HashMap<String, Reservation>>,
+}
+
+impl Reservation {
+    /// What is still owed when the `.part` is `len` long. An unknown
+    /// baseline or length counts nothing as written: the whole reservation
+    /// stays owed, never less.
+    fn owed(&self, len: Option<u64>) -> u64 {
+        let written = match (self.at_len, len) {
+            (Some(at), Some(now)) => now.saturating_sub(at),
+            _ => 0,
+        };
+        self.bytes.saturating_sub(written)
+    }
+}
+
+/// Music's in-flight bytes, from one observation: see [`Cache::pending`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MusicPending {
+    /// What approved writes have yet to add: free space lacks it still.
+    pub owed: u64,
+    /// What `.part` files hold already: in the cap, not in free space.
+    /// None when they could not all be read.
+    pub written: Option<u64>,
+}
+
+impl MusicPending {
+    /// Nothing in flight: no cache, so no music.
+    pub const NONE: Self = Self {
+        owed: 0,
+        written: Some(0),
+    };
 }
 
 /// What one approved music write still had to add, and from where.
@@ -1058,7 +1091,14 @@ impl Cache {
     /// The length of `id`'s `.part`: 0 when there is none, `None` when its
     /// metadata cannot be read (unknown, never taken as empty).
     fn part_len(&self, id: &str) -> Option<u64> {
-        match std::fs::metadata(self.part_path(id)) {
+        let meta = std::fs::metadata(self.part_path(id));
+        #[cfg(test)]
+        AFTER_PART_LEN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+        match meta {
             Ok(m) => Some(m.len()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
             Err(e) => {
@@ -1095,14 +1135,34 @@ impl Cache {
     pub fn reserved_bytes(&self) -> u64 {
         let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         r.iter().fold(0u64, |sum, (id, v)| {
-            // An unknown baseline or length counts nothing as written: the
-            // whole reservation stays owed, never less.
-            let written = match (v.at_len, self.part_len(id)) {
-                (Some(at), Some(now)) => now.saturating_sub(at),
-                _ => 0,
-            };
-            sum.saturating_add(v.bytes.saturating_sub(written))
+            sum.saturating_add(v.owed(self.part_len(id)))
         })
+    }
+
+    /// What music's approved writes still owe and what its `.part` files
+    /// hold, from one read of each part's length, so a write that lands
+    /// mid-read is counted as owed or as written, never as both or neither.
+    /// Read under the shared admission lock, before any free-space probe.
+    pub fn pending(&self) -> MusicPending {
+        let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let (lens, whole) = self.scan_part_lens();
+        let written = lens
+            .values()
+            .fold(0u64, |sum, len| sum.saturating_add(*len));
+        let owed = r.iter().fold(0u64, |sum, (id, v)| {
+            let name = escape(id) + PART_EXT;
+            // Not found by a whole scan: absent. By a partial one: unknown,
+            // so the whole reservation stays owed.
+            let len = match lens.get(std::ffi::OsStr::new(&name)) {
+                Some(len) => Some(*len),
+                None => whole.then_some(0),
+            };
+            sum.saturating_add(v.owed(len))
+        });
+        MusicPending {
+            owed,
+            written: whole.then_some(written),
+        }
     }
 
     /// Bytes in every `.part` file in the cache folder, reserved or not. A
@@ -1127,21 +1187,32 @@ impl Cache {
     /// fails, or an entry or a length that cannot be read, is not a 0. A
     /// file that vanished mid-scan (renamed by a commit) is nothing to read.
     fn scan_parts(&self) -> (u64, bool) {
+        let (lens, whole) = self.scan_part_lens();
+        let total = lens
+            .values()
+            .fold(0u64, |sum, len| sum.saturating_add(*len));
+        (total, whole)
+    }
+
+    /// Each `.part`'s length, by file name, read once, and whether every
+    /// entry was read (see [`Cache::scan_parts`]).
+    fn scan_part_lens(&self) -> (std::collections::HashMap<std::ffi::OsString, u64>, bool) {
+        let mut lens = std::collections::HashMap::new();
         #[cfg(test)]
         PART_SCANS.with(|n| n.set(n.get() + 1));
         #[cfg(test)]
         if PART_SCAN_FAULT.with(std::cell::Cell::get) == 1 {
-            return (0, false);
+            return (lens, false);
         }
         let read = match std::fs::read_dir(&self.dir) {
             Ok(read) => read,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (lens, true),
             Err(e) => {
                 log::warn!("cache part scan failed dir={}: {e}", self.dir.display());
-                return (0, false);
+                return (lens, false);
             }
         };
-        let (mut total, mut whole) = (0u64, true);
+        let mut whole = true;
         for entry in read {
             #[cfg(test)]
             let entry = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 2 {
@@ -1162,13 +1233,21 @@ impl Cache {
             }
             let meta = entry.metadata();
             #[cfg(test)]
+            AFTER_PART_LEN.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f();
+                }
+            });
+            #[cfg(test)]
             let meta = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 3 {
                 Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
             } else {
                 meta
             };
             match meta {
-                Ok(m) => total = total.saturating_add(m.len()),
+                Ok(m) => {
+                    lens.insert(entry.file_name(), m.len());
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     log::warn!("cache part length unreadable {:?}: {e}", entry.file_name());
@@ -1176,7 +1255,7 @@ impl Cache {
                 }
             }
         }
-        (total, whole)
+        (lens, whole)
     }
 
     fn check_free(&self, downloading: &str, need: u64, evict: bool) -> Result<u64, NoRoom> {
@@ -1656,6 +1735,39 @@ pub(crate) mod tests {
         assert!(c.ensure_free("track/x", 100).is_ok());
         std::fs::write(&part, vec![0u8; 90]).unwrap();
         assert_eq!(c.reserved_bytes(), 70);
+    }
+
+    /// Owed and written come from one read of each part: a write that lands
+    /// between two reads is counted once, so the pair never claims more
+    /// than the reservation's whole claim.
+    #[test]
+    fn pending_reads_each_part_once_for_owed_and_written() {
+        let d = tmp("pending-once");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let part = c.part_path("track/x");
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(&part, vec![0u8; 60]).unwrap();
+        let grown = part.clone();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let r2 = reads.clone();
+        AFTER_PART_LEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                r2.set(r2.get() + 1);
+                if r2.get() == 1 {
+                    let _ = std::fs::write(&grown, vec![0u8; 100]);
+                }
+            }));
+        });
+        let p = c.pending();
+        AFTER_PART_LEN.with(|h| *h.borrow_mut() = None);
+        assert_eq!(reads.get(), 1, "a part's length was read more than once");
+        assert_eq!(
+            p.owed + p.written.unwrap(),
+            100,
+            "owed {} and written {:?} come from different reads",
+            p.owed,
+            p.written
+        );
     }
 
     /// A part scan that fails, or whose entry or length cannot be read, is

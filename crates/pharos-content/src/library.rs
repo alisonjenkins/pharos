@@ -16,7 +16,7 @@ use pharos_api::pharos_capnp::{bootstrap, session};
 use pharos_client::api::{ItemRef, MediaToken};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use super::cache::{self, Cache, Download, OfflineSummary, MIN_FREE_BYTES};
+use super::cache::{self, Cache, Download, MusicPending, OfflineSummary, MIN_FREE_BYTES};
 use super::error::ContentError;
 use super::id::NodeId;
 use super::net::{self, Closed, NativeCatalogue};
@@ -674,6 +674,16 @@ impl Library {
         self.offline
             .get()
             .map_or(Some(0), |o| o.cache.in_progress_bytes())
+    }
+
+    /// What music's approved writes still owe and what its in-flight
+    /// downloads have written, from one read of each `.part`
+    /// ([`crate::cache::Cache::pending`]). Read under [`admission_guard`],
+    /// before any free-space probe; nothing in flight with no cache.
+    pub fn music_pending(&self) -> MusicPending {
+        self.offline
+            .get()
+            .map_or(MusicPending::NONE, |o| o.cache.pending())
     }
 
     /// Whether the music cache is enabled: it is what the cap, the free
@@ -2321,9 +2331,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         // The window is claimed whole: what has landed of it in the `.part`,
-        // and what is still owed of it (never the landed bytes again).
-        let written = lib.music_in_progress_bytes().unwrap_or(0);
-        let outstanding = lib.music_outstanding_bytes();
+        // and what is still owed of it (never the landed bytes again), from
+        // one read, as a host reads them.
+        let pending = lib.music_pending();
+        let written = pending.written.unwrap_or(0);
+        let outstanding = pending.owed;
         assert_eq!(
             written + outstanding,
             FREE_CHECK_BYTES,
