@@ -190,6 +190,11 @@ pub fn token() -> Option<String> {
 
 /// The stored device token, if any. Never log the value.
 pub fn load_token() -> Option<String> {
+    if KEPT_AFTER_SIGN_OUT.load(std::sync::atomic::Ordering::SeqCst) {
+        log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
+        set_cached(None);
+        return None;
+    }
     let path = token_path().ok()?;
     let token = token_file::read(&path).ok().flatten().map(|s| s.token);
     set_cached(token.clone());
@@ -208,27 +213,38 @@ pub fn run_token(owner: &str) -> Result<String, String> {
 pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
     token_file::store(&path, token).map(|()| {
+        KEPT_AFTER_SIGN_OUT.store(false, std::sync::atomic::Ordering::SeqCst);
         drop_legacy_user(&path);
         set_cached(Some(token.to_owned()));
         note_credentials_changed("stored");
     })
 }
 
-pub fn forget_token() {
+/// Signs out on the device: the token and its user go (one file). What
+/// the removal left is the verdict; a file that would not go is
+/// `NotSaved`, and this process stays signed out all the same: the token
+/// is not read again until a new sign-in stores one.
+pub fn forget_token() -> token_file::SignedOut {
     set_cached(None);
-    let Ok(path) = token_path() else { return };
+    let path = match token_path() {
+        Ok(path) => path,
+        Err(e) => return token_file::SignedOut::NotSaved(e),
+    };
     drop_legacy_user(&path);
-    // One file: the token goes with its user, or both stay.
-    match token_file::forget(&path) {
-        Ok(token_file::Forgotten::Durable) => {}
-        // Signed out all the same: the token is gone for every reader.
-        Ok(token_file::Forgotten::NotDurable(why)) => {
-            log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
-        }
-        Err(e) => log::warn!("forget token: {e}"),
-    }
+    let verdict = token_file::sign_out(&path);
+    KEPT_AFTER_SIGN_OUT.store(
+        matches!(verdict, token_file::SignedOut::NotSaved(_)),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     note_credentials_changed("forgotten");
+    verdict
 }
+
+/// Set while a sign-out could not remove the token file: the token on file
+/// is not loaded again in this process (the user signed out), until a new
+/// sign-in stores one.
+static KEPT_AFTER_SIGN_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Drops the token a resume was refused with, only while it is still the
 /// one on file. False when a sign-in replaced it since: the replacement is

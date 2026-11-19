@@ -291,8 +291,10 @@ pub async fn quick_connect(mut show_code: impl FnMut(String) + 'static) -> SignI
 /// Forget the device token. The server keeps the session until it lapses
 /// or is revoked from another device.
 pub async fn sign_out() -> SignOutReply {
-    android::forget_token();
-    SignOutReply::Status(204)
+    match android::forget_token() {
+        super::token_file::SignedOut::NotSaved(why) => SignOutReply::NotSaved(why),
+        _ => SignOutReply::Status(204),
+    }
 }
 
 /// GET a same-server path as text, with the device token in a header.

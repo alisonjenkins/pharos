@@ -52,6 +52,9 @@ pub enum SignInReply {
 pub enum SignOutReply {
     Status(u16),
     Failed(String),
+    /// Signed out in this process, but the device could not forget the
+    /// sign-in (its token file stayed), for the reason given.
+    NotSaved(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +300,14 @@ impl Machine {
                 self.signing_out = true;
                 self.notice = None;
             }
+            Event::SignOutAnswered(SignOutReply::NotSaved(why)) => {
+                // Signed out here all the same; the sign-in screen says the
+                // device kept the sign-in, so the user can sign out again.
+                self.sign_in(Some(format!(
+                    "Signed out, but this device could not forget the sign-in ({why}). \
+                     It may come back when the app restarts: sign in and sign out again to retry."
+                )));
+            }
             Event::SignOutAnswered(reply) => {
                 self.signing_out = false;
                 match sign_out_error(&reply) {
@@ -418,6 +429,7 @@ fn sign_out_error(reply: &SignOutReply) -> Option<String> {
             Some(format!("Could not sign out (HTTP {status}). Try again."))
         }
         SignOutReply::Failed(error) => Some(format!("Could not sign out: {error}")),
+        SignOutReply::NotSaved(_) => None,
     }
 }
 
@@ -753,6 +765,25 @@ mod tests {
         m.apply(Event::SignOutAnswered(SignOutReply::Status(503)));
         assert_eq!(m.phase(), &Phase::Ready);
         assert!(m.notice().is_some_and(|n| n.contains("503")));
+        assert!(!m.signing_out());
+    }
+
+    /// A sign-out the device could not save signs out all the same, and
+    /// the sign-in screen says the device kept the sign-in and how to
+    /// retry; the session-end hook runs.
+    #[test]
+    fn a_sign_out_not_saved_signs_out_and_says_so() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotSaved(
+            "permission denied".into(),
+        )));
+        let error = sign_in_error_of(&m).unwrap_or_default();
+        assert!(
+            error.contains("could not forget the sign-in (permission denied)")
+                && error.contains("sign out again"),
+            "{error}"
+        );
         assert!(!m.signing_out());
     }
 
