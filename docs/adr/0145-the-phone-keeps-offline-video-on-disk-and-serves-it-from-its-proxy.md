@@ -138,6 +138,30 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   while a track lands and the cache trims, and while it approves a write.
   The order is fixed: the shared lock first, then the cache's or the
   store's own lock, never the reverse.
+- Accounting that is not ready is a wait, never a failure. The music
+  downloader keeps a track's `.part` and retries with backoff while the
+  video store's size is unknown (`NoRoom::AccountingUnknown`); a video run
+  waits before it plans until the music accounting is ready. Readiness only
+  moves from false to true in the app, so neither waits for long.
+- Two downloads can store the same request key: the index keeps one copy
+  per item folder, and a removal drops only its own.
+- A Ready record is published only after the folders above it (the user's,
+  the store's and the store's parent) are synced, as well as its own.
+- A record is adopted only in the folder its user and item name, at open as
+  when a held folder is read again; one elsewhere stays held.
+- A sweep that measures a folder again claims it with the folder's epoch;
+  its walk lifts the block only if the folder is still at that epoch and
+  idle, and is logged `verdict=stale` otherwise.
+- A sign-in that lands while a refused run is parking (it still holds its
+  id) is kept as a pending resume and started as the run leaves.
+- A refused reconnect of a session that was Ready is cleaned up once, by
+  the session-end hook, while its user is still known; the connect cleans
+  up only a first resume that never reached Ready. A refused resume drops
+  the token only while it is the refused one (`token::forget_if`, under the
+  file's lock); a replacement is kept and resumed in turn.
+- The connect advances the identity generation before it publishes a new
+  session (`offline_video::session_replaced`): a `me` asked on the replaced
+  session installs nobody and writes no preference.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
