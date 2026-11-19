@@ -369,7 +369,9 @@ impl LyricsFinder {
         }
         match online.find(&song).await {
             Ok(found) => {
-                self.remember(item.id, key, found.clone());
+                if let Some(standing) = self.remember_unless_repicked(item.id, &key, &found) {
+                    return standing;
+                }
                 self.write_disk(item.id, online.name(), song, found.clone())
                     .await;
                 found
@@ -553,6 +555,34 @@ impl LyricsFinder {
         r.lapses_at
             .map_or(true, |at| Instant::now() < at)
             .then_some(r.found)
+    }
+
+    /// Remember a lookup's answer unless a repick of the song was taken
+    /// while it was in flight; then the repick's answer stands and is
+    /// returned, or `found` when the repick has not answered yet.
+    fn remember_unless_repicked(
+        &self,
+        id: u64,
+        key: &str,
+        found: &Option<Lyrics>,
+    ) -> Option<Option<Lyrics>> {
+        // Held across the insert so a repick cannot be taken between the
+        // check and the commit.
+        let held = self
+            .repicked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.contains(&(id, key.to_owned())) {
+            drop(held);
+            tracing::debug!(
+                media.id = id,
+                "lyrics: lookup answer dropped, the song was repicked meanwhile"
+            );
+            return Some(self.remembered(id, key).unwrap_or_else(|| found.clone()));
+        }
+        self.remember(id, key.to_owned(), found.clone());
+        drop(held);
+        None
     }
 
     fn remember(&self, id: u64, key: String, found: Option<Lyrics>) {
@@ -1301,6 +1331,76 @@ mod tests {
         assert_eq!(picked, Some(sung()));
         assert_eq!(after, Some(sung()));
         assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A `Searching` whose first lookup notifies `asked` and answers only
+    /// once `gate` is notified, as a slow provider response; later lookups
+    /// answer at once.
+    struct Held {
+        inner: Arc<Searching>,
+        asked: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+        finds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OnlineLyrics for Held {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn find<'a>(
+            &'a self,
+            song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>
+        {
+            let first = self.finds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    self.asked.notify_one();
+                    self.gate.notified().await;
+                }
+                self.inner.find(song).await
+            })
+        }
+        fn search<'a>(
+            &'a self,
+            song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
+        {
+            self.inner.search(song)
+        }
+    }
+
+    /// A lookup in flight while another request repicks the song does not
+    /// put the record the repick replaced back, in memory or on disk.
+    /// Disarm check: with the commit in `online` unguarded, this fails.
+    #[test]
+    fn a_slow_lookup_does_not_undo_a_repick_made_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let cache = dir.path().join("c");
+        let online = Arc::new(Held {
+            inner: searching(Ok(records(sung()))),
+            asked: tokio::sync::Notify::new(),
+            gate: tokio::sync::Notify::new(),
+            finds: Default::default(),
+        });
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+        let ((slow, picked, after, restarted), _) = with_outcomes(async {
+            let (slow, picked) = tokio::join!(finder.find(&item), async {
+                online.asked.notified().await;
+                let before = finder.find(&item).await?;
+                let picked = finder.repick(&item, &before, &heard()).await;
+                online.gate.notify_one();
+                picked
+            });
+            let after = finder.find(&item).await;
+            let later = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+            (slow, picked, after, later.find(&item).await)
+        });
+        assert_eq!(picked, Some(sung()));
+        assert_eq!(slow, Some(sung()));
+        assert_eq!(after, Some(sung()));
+        assert_eq!(restarted, Some(sung()));
     }
 
     /// V1468's loop guard: a song is searched once, by this finder or by

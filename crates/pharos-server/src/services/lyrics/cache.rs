@@ -26,6 +26,9 @@ pub enum Cached {
 
 pub struct DiskCache {
     dir: PathBuf,
+    /// Held across a write's read of the standing record, so a lookup's
+    /// answer cannot land between a repick's check and its write.
+    writing: std::sync::Mutex<()>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,7 +67,10 @@ struct Word {
 
 impl DiskCache {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            writing: std::sync::Mutex::new(()),
+        }
     }
 
     fn path(&self, id: u64) -> PathBuf {
@@ -158,8 +164,10 @@ impl DiskCache {
         }
     }
 
-    /// Keep the provider's answer. Blocking; a failure is logged and the
-    /// answer is only lost, never wrong.
+    /// Keep the provider's answer, unless the song as tagged now was
+    /// repicked: a lookup that was in flight then answered with the record
+    /// the repick replaced. Blocking; a failure is logged and the answer is
+    /// only lost, never wrong.
     pub fn put(&self, id: u64, provider: &str, song: &Song, found: Option<&Lyrics>) {
         self.put_at(id, provider, song, found, now_secs());
     }
@@ -184,6 +192,18 @@ impl DiskCache {
         at: u64,
         repick: Option<Repick>,
     ) {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if repick.is_none() && self.repicked(id, provider, song) {
+            tracing::debug!(
+                media.id = id,
+                provider,
+                "lyrics: lookup answer not cached, the song was repicked meanwhile"
+            );
+            return;
+        }
         let record = Record {
             repick,
             key: key(provider, song),
@@ -396,5 +416,28 @@ mod tests {
         assert!(!cache.repicked(7, "lrclib", &retagged));
         cache.put_repicked(8, "lrclib", &song(), &words(), None);
         assert!(cache.repicked(8, "lrclib", &song()));
+    }
+
+    /// A lookup's answer landing after a repick of the song as tagged now
+    /// leaves the repick standing; a retag is asked and kept again.
+    /// Disarm check: with the repicked read in `write_at` skipped, this fails.
+    #[test]
+    fn a_lookup_answer_does_not_replace_a_repick() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42));
+        cache.put(7, "lrclib", &song(), None);
+        assert!(cache.repicked(7, "lrclib", &song()));
+        assert_eq!(
+            cache.get(7, "lrclib", &song()),
+            Some(Cached::Found(words()))
+        );
+        let mut retagged = song();
+        retagged.title = "Song (Live)".into();
+        cache.put(7, "lrclib", &retagged, None);
+        assert!(matches!(
+            cache.get(7, "lrclib", &retagged),
+            Some(Cached::Missing { .. })
+        ));
     }
 }
