@@ -7905,14 +7905,28 @@ pub(crate) mod tests {
         set_hook(&AT_REMOVAL_MARK, move || {
             s2.set(Some(held.load(Ordering::SeqCst)))
         });
+        // Read inside the deletion: the admission lock is let go by then.
+        let deleting = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (d2, held2) = (deleting.clone(), rig.budget.held.clone());
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                d2.set(Some(held2.load(Ordering::SeqCst)));
+            }));
+        });
         FAIL_REMOVE.with(|f| f.set(true));
         store.remove("u1", "1");
         FAIL_REMOVE.with(|f| f.set(false));
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
         clear_hook(&AT_REMOVAL_MARK);
         assert!(
             seen.get().is_some_and(|n| n > 0),
             "the folder turned unknown outside the admission lock: {:?}",
             seen.get()
+        );
+        assert_eq!(
+            deleting.get(),
+            Some(0),
+            "the admission lock was held while the folder was deleted"
         );
         assert_eq!(
             rig.budget.held.load(Ordering::SeqCst),
