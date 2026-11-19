@@ -21,7 +21,7 @@
 //! Every attempt logs `cache download id=.. bytes=.. ms=.. outcome=ok|retry|
 //! failed|skipped reason=..`. URLs and tokens are never logged.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -94,6 +94,11 @@ struct Queue {
     /// The track `busy` is about: off the queues, so a request that lists it
     /// again must still see it as queued work.
     current: Option<String>,
+    /// Pins of the track in flight that `enqueue` folded into its job. A
+    /// job that gives up for good queues the pin again (`give_up`), under
+    /// the same lock: one that failed before the pin landed would
+    /// otherwise lose it.
+    pin_requested: HashSet<String>,
 }
 
 struct Gate {
@@ -179,6 +184,7 @@ impl Downloader {
                 budget: 0,
                 busy: false,
                 current: None,
+                pin_requested: HashSet::new(),
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
@@ -260,6 +266,10 @@ impl Downloader {
             // can be dropped, so a pin of it is still queued behind it.
             let in_flight = q.current.as_deref() == Some(id.as_str());
             if in_flight && g.is_pin_work(id) {
+                // Folded into the running job, and remembered: if that job
+                // has already failed for good, `give_up` queues it again.
+                q.pin_requested.insert(id.clone());
+                log::info!("cache enqueue id={id} verdict=folded reason=in_flight");
                 continue;
             }
             // Kept even when read-ahead already lists it: the budget may drop
@@ -364,6 +374,9 @@ impl Gate {
         while let Some((id, generation)) = self.next_job().await {
             self.job(&id, generation).await;
             let mut q = self.lock();
+            // The job is over: a pin folded into it was served, or was
+            // queued again by `give_up`.
+            q.pin_requested.remove(&id);
             if q.budget == 0 && !q.wanted.is_empty() {
                 log::info!(
                     "cache prefetch stopped: byte budget spent, dropping {} queued",
@@ -675,11 +688,23 @@ impl Gate {
     /// still running. Were `current` left set until the worker cleared it,
     /// a pin in between would be taken for in-flight work and lost.
     fn give_up(&self, id: &str) {
+        #[cfg(test)]
+        tests::before_give_up();
         let mut q = self.lock();
         self.cache.discard_part(id);
         self.cache.mark_failed(id);
         if q.current.as_deref() == Some(id) {
             q.current = None;
+        }
+        // A pin that landed after this job had already failed, while it was
+        // still the track in flight, was folded into it: it is queued now.
+        if q.pin_requested.remove(id) && self.is_pin_work(id) {
+            if !q.pinned.iter().any(|p| p == id) {
+                q.pinned.push_back(id.to_owned());
+            }
+            log::info!("cache download id={id} verdict=requeued reason=pinned_while_giving_up");
+            drop(q);
+            self.wake.notify_one();
         }
     }
 
@@ -871,6 +896,21 @@ mod tests {
     use super::*;
     use crate::cache::{FreeProbe, MIN_FREE_BYTES};
     use crate::testserver::{Script, Seen, TestServer};
+
+    thread_local! {
+        /// Runs in `give_up` before it takes the queue lock: after the job
+        /// found its permanent failure.
+        pub(super) static BEFORE_GIVE_UP: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_give_up() {
+        BEFORE_GIVE_UP.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+    }
 
     fn body(n: usize, salt: usize) -> Vec<u8> {
         (0..n)
@@ -1220,6 +1260,7 @@ mod tests {
                 budget: 0,
                 busy: true,
                 current: Some("track/1".to_owned()),
+                pin_requested: HashSet::new(),
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
@@ -1236,6 +1277,59 @@ mod tests {
             gate.lock().pinned,
             VecDeque::from(ids(&["track/1"])),
             "the pin was lost"
+        );
+    }
+
+    /// A pin that lands after a job has found a permanent failure but
+    /// before it gives up is folded into the job (it is still in flight),
+    /// and `give_up` queues it: the pin is never lost.
+    #[test]
+    fn a_pin_between_a_permanent_failure_and_the_give_up_is_queued() {
+        // Declared first, so dropped last.
+        let dir = TmpDir(tmp("pin-before-give-up"));
+        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let gate = Arc::new(Gate {
+            cache: cache.clone(),
+            resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
+            tuning: fast(),
+            online: AtomicBool::new(true),
+            online_epoch: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            yields: AtomicU64::new(0),
+            queue: Mutex::new(Queue {
+                wanted: VecDeque::new(),
+                pinned: VecDeque::new(),
+                deferred: HashMap::new(),
+                generation: 0,
+                budget: u64::MAX,
+                busy: true,
+                current: Some("track/1".to_owned()),
+                pin_requested: HashSet::new(),
+            }),
+            idle: Condvar::new(),
+            wake: Notify::new(),
+        });
+        let dl = Arc::new(Downloader {
+            gate: gate.clone(),
+            thread: None,
+        });
+        let (c2, d2) = (cache.clone(), dl.clone());
+        BEFORE_GIVE_UP.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                c2.pin("album/a", &ids(&["track/1"]));
+                assert_eq!(d2.enqueue(&ids(&["track/1"])), 0, "not folded into the job");
+            }));
+        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(gate.job("track/1", 0));
+        BEFORE_GIVE_UP.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            gate.lock().pinned,
+            VecDeque::from(ids(&["track/1"])),
+            "the pin was lost with the failed job"
         );
     }
 
@@ -1263,6 +1357,7 @@ mod tests {
                 budget: u64::MAX,
                 busy: true,
                 current: Some("track/1".to_owned()),
+                pin_requested: HashSet::new(),
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
