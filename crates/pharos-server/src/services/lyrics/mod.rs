@@ -109,12 +109,17 @@ impl Lyrics {
         };
         let last = self.lines.iter().filter_map(|l| l.start_ms).max();
         if last.is_some_and(|ms| ms > duration_ms.saturating_add(OVERRUN_SLACK_MS)) {
-            for line in &mut self.lines {
-                line.start_ms = None;
-                line.words.clear();
-            }
+            self.unsync();
         }
         self
+    }
+
+    /// Keep the words as plain lyrics, without line or word times.
+    pub fn unsync(&mut self) {
+        for line in &mut self.lines {
+            line.start_ms = None;
+            line.words.clear();
+        }
     }
 }
 
