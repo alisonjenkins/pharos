@@ -281,6 +281,25 @@ fn use_user() -> Option<String> {
     offline_video::last_user()
 }
 
+/// Removes `item` for `rendered` (the owner its row was drawn for) only
+/// while that is still the authorized owner ([`offline_video::last_user`],
+/// read at the click): a sign-out or another user's sign-in since the row
+/// was drawn leaves the download alone. Whether it removed.
+fn remove_if_owner(store: &dyn VideoStore, rendered: Option<&str>, item: &str) -> bool {
+    let now = offline_video::last_user();
+    let Some(user) = rendered.filter(|u| now.as_deref() == Some(*u)) else {
+        platform::info(&format!(
+            "pharos: video remove verdict=skipped reason=owner_changed item={item} rendered_for_set={} owner_set={}",
+            rendered.is_some(),
+            now.is_some()
+        ));
+        return false;
+    };
+    platform::info(&format!("pharos: video removed item={item}"));
+    store.remove(user, item);
+    true
+}
+
 /// What a screen of downloads shows from the store: the user's videos and
 /// how many folders could not be read. Polled as one value, so either one
 /// changing reaches the screen (a sweep can drop an unreadable folder while
@@ -432,10 +451,7 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
                 });
             },
             on_remove: move |()| {
-                if let Some(user) = &remove_user {
-                    platform::info(&format!("pharos: video removed item={remove_item}"));
-                    remove_store.remove(user, &remove_item);
-                }
+                remove_if_owner(&*remove_store, remove_user.as_deref(), &remove_item);
                 message.set(None);
             },
         }
@@ -556,10 +572,7 @@ pub fn VideoDownloads(
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
                 },
                 on_remove: move |item: String| {
-                    if let Some(user) = &remove_user {
-                        platform::info(&format!("pharos: video removed item={item}"));
-                        remove_store.remove(user, &item);
-                    }
+                    remove_if_owner(&*remove_store, remove_user.as_deref(), &item);
                 },
             }
         }
@@ -1231,6 +1244,53 @@ mod tests {
             two.contains("pharos-button pharos-button-danger is-small")
                 && two.contains("Remove them"),
             "{two}"
+        );
+    }
+
+    /// A row's Remove acts only while the owner it was drawn for is still
+    /// the authorized one when it is clicked.
+    #[test]
+    fn a_remove_clicked_after_the_owner_changed_removes_nothing() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        #[derive(Default)]
+        struct Log(std::sync::Mutex<Vec<(String, String)>>);
+        impl VideoStore for Log {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, user: &str, item: &str) {
+                self.0.lock().unwrap().push((user.into(), item.into()));
+            }
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let store = Log::default();
+        offline_video::remember_user("alice");
+        assert!(remove_if_owner(&store, Some("alice"), "7"));
+        offline_video::remember_user("bob");
+        assert!(
+            !remove_if_owner(&store, Some("alice"), "8"),
+            "removed for an old owner"
+        );
+        offline_video::forget_user();
+        assert!(
+            !remove_if_owner(&store, Some("alice"), "9"),
+            "removed with nobody signed in"
+        );
+        assert_eq!(
+            *store.0.lock().unwrap(),
+            vec![("alice".to_owned(), "7".to_owned())]
         );
     }
 
