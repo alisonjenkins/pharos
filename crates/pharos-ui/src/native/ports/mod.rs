@@ -399,16 +399,30 @@ pub fn register_on_credentials_changed(hook: fn()) -> Result<(), AlreadyRegister
         .map_err(|_| AlreadyRegistered)
 }
 
+/// What the host app runs instead of a reload when a sign-out could neither
+/// remove nor mark its token: the second client (the car's media service,
+/// in this same process) stays signed out and refuses the token with this
+/// fingerprint until a different one is stored.
+static ON_CREDENTIALS_KEPT: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Called once by the host app before the UI launches.
+pub fn register_on_credentials_kept(hook: fn(&str)) -> Result<(), AlreadyRegistered> {
+    ON_CREDENTIALS_KEPT.set(hook).map_err(|_| AlreadyRegistered)
+}
+
+/// A queued host call: run on the notifier thread, in order.
+type HostCall = Box<dyn FnOnce() + Send>;
+
 /// The thread that runs the hook, so the caller (the UI) never waits for the
 /// host's reload, which queues behind the content worker. One thread keeps the
 /// changes in the order they happened.
-static CREDENTIALS_NOTIFIER: OnceLock<std::sync::mpsc::Sender<fn()>> = OnceLock::new();
+static CREDENTIALS_NOTIFIER: OnceLock<std::sync::mpsc::Sender<HostCall>> = OnceLock::new();
 
-fn notifier() -> Option<&'static std::sync::mpsc::Sender<fn()>> {
+fn notifier() -> Option<&'static std::sync::mpsc::Sender<HostCall>> {
     if let Some(tx) = CREDENTIALS_NOTIFIER.get() {
         return Some(tx);
     }
-    let (tx, rx) = std::sync::mpsc::channel::<fn()>();
+    let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
     std::thread::Builder::new()
         .name("pharos-credentials".into())
         .spawn(move || {
@@ -426,14 +440,26 @@ pub fn credentials_changed() -> bool {
     let Some(hook) = ON_CREDENTIALS_CHANGED.get() else {
         return false;
     };
-    queue_hook(notifier(), *hook);
+    queue_hook(notifier(), Box::new(*hook));
+    true
+}
+
+/// Queues the host's stay-signed-out hook for the token fingerprinted
+/// `fingerprint`, in order with every other credentials change; returns
+/// whether one was registered.
+pub fn credentials_kept(fingerprint: &str) -> bool {
+    let Some(hook) = ON_CREDENTIALS_KEPT.get() else {
+        return false;
+    };
+    let (hook, fingerprint) = (*hook, fingerprint.to_owned());
+    queue_hook(notifier(), Box::new(move || hook(&fingerprint)));
     true
 }
 
 /// Hands the hook to the notifier thread. It is never run on the caller's
 /// thread: the hook can block on the content worker, and the caller is the UI.
 /// A missing thread or a closed channel drops this call with a warning.
-fn queue_hook(tx: Option<&std::sync::mpsc::Sender<fn()>>, hook: fn()) -> bool {
+fn queue_hook(tx: Option<&std::sync::mpsc::Sender<HostCall>>, hook: HostCall) -> bool {
     match tx {
         Some(tx) => match tx.send(hook) {
             Ok(()) => true,
@@ -852,18 +878,18 @@ mod tests {
     #[test]
     fn a_hook_with_no_notifier_is_dropped_not_run_on_the_caller() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
-        assert!(!queue_hook(None, count));
+        let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
+        assert!(!queue_hook(None, Box::new(count)));
         drop(rx);
-        assert!(!queue_hook(Some(&tx), count));
+        assert!(!queue_hook(Some(&tx), Box::new(count)));
         assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
     }
 
     #[test]
     fn a_hook_is_queued_not_run_inline() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
-        assert!(queue_hook(Some(&tx), count));
+        let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
+        assert!(queue_hook(Some(&tx), Box::new(count)));
         assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
         assert!(rx.try_recv().is_ok());
     }
@@ -948,6 +974,36 @@ mod tests {
             ],
         };
         assert_eq!(d.cached_bytes(), 15);
+    }
+
+    /// A sign-out that kept its token hands the host the token's
+    /// fingerprint, on the notifier thread, in place of a reload.
+    #[test]
+    fn a_kept_token_reaches_the_host_hook_by_fingerprint() {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn hook(fingerprint: &str) {
+            SEEN.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fingerprint.to_owned());
+        }
+        assert!(!credentials_kept("f1"), "a hook ran with none registered");
+        assert_eq!(register_on_credentials_kept(hook), Ok(()));
+        assert!(credentials_kept("f1"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            *SEEN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ["f1"]
+        );
     }
 
     #[test]

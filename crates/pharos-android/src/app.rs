@@ -110,6 +110,28 @@ pub fn credentials_changed() {
     }
 }
 
+/// The phone signed out but its token could be neither removed nor marked
+/// revoked: the car stays signed out and refuses that token (by
+/// `fingerprint`) in this process until a different one is stored, rather
+/// than reloading it. The service runs in the app's own process, so this is
+/// the fence its reads go through.
+pub fn credentials_kept(fingerprint: &str) {
+    let Some(lib) = LIBRARY.get() else {
+        log("app credentials_kept verdict=skipped reason=library_not_connected");
+        return;
+    };
+    match lib.stay_signed_out(fingerprint) {
+        Ok(()) => {
+            log("app credentials_kept verdict=fenced");
+            notify_changed();
+        }
+        Err(e) => log(&format!(
+            "app credentials_kept verdict=failed reason={}",
+            e.redacted()
+        )),
+    }
+}
+
 /// What the notification ask did, for the log and the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationAsk {

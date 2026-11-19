@@ -239,6 +239,9 @@ pub fn forget_token() -> token_file::SignedOut {
         Err(e) => return token_file::SignedOut::NotSaved(e),
     };
     drop_legacy_user(&path);
+    // The token as it stood, so a sign-out that can neither remove nor
+    // mark it can still name it to the media service's fence.
+    let held = token_file::read(&path).ok().flatten().map(|s| s.token);
     let verdict = token_file::sign_out(&path);
     KEPT_AFTER_SIGN_OUT.store(
         matches!(
@@ -247,7 +250,10 @@ pub fn forget_token() -> token_file::SignedOut {
         ),
         std::sync::atomic::Ordering::SeqCst,
     );
-    note_credentials_changed("forgotten");
+    match (&verdict, held) {
+        (token_file::SignedOut::NotSaved(_), Some(token)) => note_credentials_kept(&token),
+        _ => note_credentials_changed("forgotten"),
+    }
     verdict
 }
 
@@ -279,14 +285,25 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
         return ended;
     }
     set_cached(None);
+    drop_legacy_user(&path);
     if matches!(ended, token_file::Ended::Unsafe { .. }) {
-        // Still on file and readable: fence it in this process.
+        // Still on file and readable: fence it in this process, the media
+        // service's reads included, rather than ask it to reload.
         KEPT_AFTER_SIGN_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
         log::warn!("pharos: token forget verdict=fenced reason=token_neither_removed_nor_marked");
+        note_credentials_kept(refused);
+    } else {
+        note_credentials_changed("forgotten");
     }
-    drop_legacy_user(&path);
-    note_credentials_changed("forgotten");
     ended
+}
+
+/// Tells the host app a sign-out left `token` on file, neither removed nor
+/// marked: the car's media service, in this same process, stays signed out
+/// and refuses that token (by fingerprint) instead of reloading it.
+fn note_credentials_kept(token: &str) {
+    let hook = super::ports::credentials_kept(&token_file::fingerprint(token));
+    log::warn!("pharos: credentials change=kept_unsafe action=stay_signed_out host_hook={hook}");
 }
 
 /// Tells the host app the token file changed, so the car's media service in

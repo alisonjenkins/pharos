@@ -41,8 +41,8 @@ pub mod snapshot;
 mod voice;
 
 pub use app::{
-    ask_notification_permission, credentials_changed, library, player, player_within,
-    start_service, NotificationAsk,
+    ask_notification_permission, credentials_changed, credentials_kept, library, player,
+    player_within, start_service, NotificationAsk,
 };
 use browse::*;
 use command::*;

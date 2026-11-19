@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use pharos_content::token::{Ended, ForgetIf, Forgotten, Pairing, Stored};
+pub use pharos_content::token::{fingerprint, Ended, ForgetIf, Forgotten, Pairing, Stored};
 
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.

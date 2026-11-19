@@ -45,6 +45,16 @@ fn main() {
             "already_registered"
         }
     );
+    let kept =
+        pharos_ui::native::ports::register_on_credentials_kept(pharos_android::credentials_kept);
+    log::info!(
+        "pharos: credentials kept hook verdict={}",
+        if kept.is_ok() {
+            "registered"
+        } else {
+            "already_registered"
+        }
+    );
     let config = dioxus::mobile::Config::new()
         .with_background_color((0x0e, 0x11, 0x16, 0xff))
         .with_custom_head(format!(
