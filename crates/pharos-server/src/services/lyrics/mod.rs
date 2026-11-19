@@ -24,7 +24,7 @@ pub mod repick;
 pub mod shadow;
 pub mod sidecar;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -214,24 +214,34 @@ pub struct LyricsFinder {
     /// Songs searched for another lyric since the process started, so a
     /// second ask while one runs, or after one without a disk cache, does
     /// not search again (B1479). Keyed by the song's tags as well, so a
-    /// retagged song is searched again.
-    repicked: Mutex<HashSet<(u64, String)>>,
+    /// retagged song is searched again. Holds the record picked, apart from
+    /// the memo so the memo's emptying cannot lose it: without a disk cache,
+    /// or when its write failed, nothing else does.
+    repicked: Mutex<HashMap<(u64, String), Option<Lyrics>>>,
 }
+
+type Repicked = Mutex<HashMap<(u64, String), Option<Lyrics>>>;
 
 /// A song's place in [`LyricsFinder::repick`]'s guard, given back when
 /// dropped, so a search that fails, waits out a cooldown or is cancelled
 /// can be made again; kept once the search's answer is written.
 struct Reserved<'a> {
-    set: &'a Mutex<HashSet<(u64, String)>>,
+    set: &'a Repicked,
     key: Option<(u64, String)>,
 }
 
 impl<'a> Reserved<'a> {
     /// `None` when the song is held already.
-    fn take(set: &'a Mutex<HashSet<(u64, String)>>, key: (u64, String)) -> Option<Self> {
+    fn take(set: &'a Repicked, key: (u64, String)) -> Option<Self> {
         let first = set
             .lock()
-            .map(|mut held| held.insert(key.clone()))
+            .map(|mut held| match held.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(None);
+                    true
+                }
+            })
             .unwrap_or(false);
         // Lazily: a guard built for a refused take would give back the
         // holder's reservation when dropped.
@@ -243,6 +253,14 @@ impl<'a> Reserved<'a> {
 
     fn keep(mut self) {
         self.key = None;
+    }
+
+    /// Hold `found` as the song's lyric from now on.
+    fn pick(&self, found: &Lyrics) {
+        let Some(key) = &self.key else { return };
+        if let Ok(mut held) = self.set.lock() {
+            held.insert(key.clone(), Some(found.clone()));
+        }
     }
 }
 
@@ -352,6 +370,9 @@ impl LyricsFinder {
             return None;
         };
         let key = cache::key(online.name(), &song);
+        if let Some(picked) = self.picked(item.id, &key) {
+            return Some(picked);
+        }
         if let Some(known) = self.remembered(item.id, &key) {
             return known;
         }
@@ -483,6 +504,9 @@ impl LyricsFinder {
             searched += candidates.len();
             pick = choose(candidates);
         }
+        if let Some(pick) = &pick {
+            reserved.pick(&pick.candidate.lyrics);
+        }
         // Kept before the write is awaited: the write runs on whether or not
         // this request is still waiting for it, and the search is done.
         reserved.keep();
@@ -567,6 +591,16 @@ impl LyricsFinder {
             .is_some_and(|until| Instant::now() < until)
     }
 
+    /// The record a repick of the song as tagged now chose, if one did.
+    fn picked(&self, id: u64, key: &str) -> Option<Lyrics> {
+        self.repicked
+            .lock()
+            .ok()?
+            .get(&(id, key.to_owned()))
+            .cloned()
+            .flatten()
+    }
+
     fn remembered(&self, id: u64, key: &str) -> Option<Option<Lyrics>> {
         let r = self.memo.lock().ok()?.get(&id).cloned()?;
         if r.key != key {
@@ -593,13 +627,19 @@ impl LyricsFinder {
             .repicked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held.contains(&(id, key.to_owned())) {
+        if let Some(picked) = held.get(&(id, key.to_owned())) {
+            let picked = picked.clone();
             drop(held);
             tracing::debug!(
                 media.id = id,
                 "lyrics: lookup answer dropped, the song was repicked meanwhile"
             );
-            return Some(self.remembered(id, key).unwrap_or_else(|| found.clone()));
+            return Some(
+                picked
+                    .map(Some)
+                    .or_else(|| self.remembered(id, key))
+                    .unwrap_or_else(|| found.clone()),
+            );
         }
         self.remember(id, key.to_owned(), found.clone());
         drop(held);
@@ -1382,6 +1422,22 @@ mod tests {
         assert_eq!(counted, [("picked".to_owned(), 1)]);
     }
 
+    /// Without a disk cache the record picked is held apart from the memo,
+    /// so the memo filling and emptying does not bring the wrong lyric back.
+    #[tokio::test]
+    async fn the_record_picked_outlives_the_memo_without_a_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone());
+        let before = finder.find(&item).await.unwrap();
+        assert_eq!(finder.repick(&item, &before, &heard()).await, Some(sung()));
+        for id in 1_000..1_000 + ONLINE_MEMO_MAX as u64 {
+            finder.remember(id, "other".into(), None);
+        }
+        assert_eq!(finder.find(&item).await, Some(sung()));
+    }
+
     /// A request dropped while the search's answer is being written leaves
     /// the song held: the write goes on, and a second search would race it.
     #[tokio::test]
@@ -1406,7 +1462,7 @@ mod tests {
         drop(repick);
         let song = Song::of(&item).unwrap();
         let key = (item.id, cache::key(online.name(), &song));
-        assert!(finder.repicked.lock().unwrap().contains(&key));
+        assert!(finder.repicked.lock().unwrap().contains_key(&key));
     }
 
     /// A `Searching` whose first lookup notifies `asked` and answers only
@@ -1527,7 +1583,7 @@ mod tests {
     /// first take gives the reservation back and the second succeeds.
     #[test]
     fn a_held_song_refuses_every_further_take() {
-        let set = Mutex::new(HashSet::new());
+        let set = Mutex::new(HashMap::new());
         let key = (1, "searching/song".to_owned());
         let held = Reserved::take(&set, key.clone());
         assert!(held.is_some());
