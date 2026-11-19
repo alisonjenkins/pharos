@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::anchor::{match_lines, Options};
 use crate::audio::DecodeError;
-use crate::check::TextCheck;
+use crate::check::{Check, TextCheck};
 use crate::crash::CrashGuard;
 use crate::ctc::Emission;
 use crate::line::LineSpans;
@@ -257,6 +257,10 @@ pub struct Answer {
     pub lines: Vec<LineWords>,
     pub offset_ms: i64,
     pub aligner_version: u32,
+    /// The lyric text against what was heard, sent only when a song with a
+    /// transcript fell back (B1479).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
 }
 
 /// Why a song failed as a whole.
@@ -676,6 +680,9 @@ impl Today {
                 line.placement = Some(Method::Kept);
             }
         }
+        if let (Some(why), Some(check)) = (placement.fallback, &self.check) {
+            self.answer.check = Some(check.answer(why));
+        }
         Aligned {
             answer: self.answer,
             words_aligned: self.words_aligned,
@@ -875,10 +882,21 @@ fn improve(
             .map_err(stage(Fallback::EmissionFailed))
     });
     times.place_ms = ms_since(t);
-    let refined = match placed {
+    let mut refined = match placed {
         Ok(r) => r,
         Err(e) => return fail(today, times, e),
     };
+    let share = refined.placement.anchor_share.unwrap_or(0.0);
+    if let Some(check) = today.check.as_ref().filter(|c| c.mismatch(share)) {
+        refined.placement.fallback = Some(Fallback::LyricsMismatch);
+        let reason = format!(
+            "{}: anchor share {share:.3}, text recall {:.3}, heard {} words",
+            Fallback::LyricsMismatch.label(),
+            check.text_recall.unwrap_or(0.0),
+            check.heard_words
+        );
+        return today.into_aligned(refined.placement, reason, times, 0);
+    }
     if let Some(why) = refined.placement.fallback {
         let reason = format!(
             "{}: anchor share {:.3}",
@@ -1078,6 +1096,7 @@ fn run_song(
             lines: out,
             offset_ms: found.offset_ms,
             aligner_version: ALIGNER_VERSION,
+            check: None,
         },
         words_aligned,
         probes: found.probes,
