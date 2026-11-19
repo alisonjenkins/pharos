@@ -162,6 +162,38 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 - The connect advances the identity generation before it publishes a new
   session (`offline_video::session_replaced`): a `me` asked on the replaced
   session installs nobody and writes no preference.
+- A replaced session whose token is not paired with the user known fences
+  the identity (`Identity::Fenced`): nothing is served from disk until the
+  new session's user is established, and a session end still parks the
+  fenced user's runs. Fence, keep and lift are logged `video user fence`.
+- Work that one side hands to another is never lost between them. Every
+  run start claims its id in the hold that decided it; a run refused its
+  owner's token marks itself parking in that same hold, and a sign-in for
+  a parking or still active run is kept as a pending resume. A pin folded
+  into a running music job is requeued if the job gives up. A sign-in that
+  finds no video store yet owes its resume, under one lock, and the store's
+  registration replays it while that user and their token still hold.
+- Bytes on disk are counted once: a music reservation records the length at
+  which it was taken and owes only what has not landed since, and a
+  promoted pre-plan playlist leaves the run's owed figure. A speculative
+  unknown-length window is checked without eviction. A partial track keeps
+  the validator it was fetched under until a new version's part opens. The
+  music cap is saved in the admission hold that applies it.
+- A recovered run measures its own folder before it plans. A start's
+  rollback follows the starts not yet saved. A playlist path that is not a
+  regular file fails the download with a reason to remove it. A discard
+  removes a held folder whose record names another folder, and never
+  reports success for a folder still on disk.
+- The Downloads page polls the unreadable count with the videos. The
+  discard's thread is made with `thread::Builder`; one that cannot start is
+  reported and the button enabled again.
+- A registration whose folder could not be created opened nothing and gives
+  its claim back, so a later caller tries again; the music hook goes in once
+  and stays fail closed. One that reached the store keeps its claim.
+- A token the proxy dropped on one redirect stays dropped for the rest of
+  the request, back on its own origin too. The library's sign-out logs
+  `token forget verdict=signed_out_not_durable` when its removal could not
+  be synced, as the phone does, and still signs out in memory.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
