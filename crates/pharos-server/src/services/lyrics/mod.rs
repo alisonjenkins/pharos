@@ -213,8 +213,9 @@ pub struct LyricsFinder {
     aligner: Option<Arc<align::Aligner>>,
     /// Songs searched for another lyric since the process started, so a
     /// second ask while one runs, or after one without a disk cache, does
-    /// not search again (B1479).
-    repicked: Mutex<HashSet<u64>>,
+    /// not search again (B1479). Keyed by the song's tags as well, so a
+    /// retagged song is searched again.
+    repicked: Mutex<HashSet<(u64, String)>>,
 }
 
 /// An online answer held in memory: what was asked, so a retagged song is
@@ -381,10 +382,11 @@ impl LyricsFinder {
         }
         let online = self.online.as_ref()?;
         let song = Song::of(item)?;
+        let reserved = (item.id, cache::key(online.name(), &song));
         let first = self
             .repicked
             .lock()
-            .map(|mut set| set.insert(item.id))
+            .map(|mut set| set.insert(reserved.clone()))
             .unwrap_or(false);
         if !first || self.repicked_on_disk(item.id, online.name(), &song).await {
             tracing::debug!(
@@ -394,13 +396,13 @@ impl LyricsFinder {
             return None;
         }
         if self.cooling_down() {
-            self.forget_repick(item.id);
+            self.forget_repick(&reserved);
             return None;
         }
         let candidates = match online.search(&song).await {
             Ok(c) => c,
             Err(e) => {
-                self.forget_repick(item.id);
+                self.forget_repick(&reserved);
                 if let Ok(mut until) = self.down_until.lock() {
                     *until = Some(Instant::now() + ONLINE_COOLDOWN);
                 }
@@ -463,9 +465,9 @@ impl LyricsFinder {
         Some(found.fit_to(item.probe.duration_ms))
     }
 
-    fn forget_repick(&self, id: u64) {
+    fn forget_repick(&self, reserved: &(u64, String)) {
         if let Ok(mut set) = self.repicked.lock() {
-            set.remove(&id);
+            set.remove(reserved);
         }
     }
 
@@ -1254,6 +1256,26 @@ mod tests {
         assert_eq!((again, restarted), (None, None));
         assert_eq!(searches(&online), 1);
         assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// Disarm check: with the guard keyed by item id alone, the retagged
+    /// song is not searched and this fails.
+    #[test]
+    fn a_retagged_song_is_searched_for_another_lyric_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone());
+        let ((first, again), _) = with_outcomes(async {
+            let first = finder.repick(&item, &wrong(), &heard()).await;
+            let again = finder.repick(&retagged, &wrong(), &heard()).await;
+            (first, again)
+        });
+        assert_eq!(first, Some(sung()));
+        assert_eq!(again, Some(sung()));
+        assert_eq!(searches(&online), 2);
     }
 
     #[test]
