@@ -867,7 +867,17 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             .collect();
         let t = Instant::now();
         match aligner.sing(item, &spans).await {
-            Ok(answer) => (sung_lines(lines.len(), &asked, &answer), SungAsk::Asked),
+            Ok(answer) => {
+                if let Some(heard) = &answer.mismatch {
+                    tracing::info!(
+                        item = item.id,
+                        lines = asked.len(),
+                        text_recall = heard.recall(),
+                        "subtitle styling: sung lines are not what was sung; they are paced"
+                    );
+                }
+                (sung_lines(lines.len(), &asked, &answer), SungAsk::Asked)
+            }
             Err(e) => {
                 tracing::warn!(
                     item = item.id,
@@ -1458,13 +1468,18 @@ pub(crate) async fn read_source(
     Ok(text.trim_start_matches('\u{feff}').to_owned())
 }
 
-/// The aligner's answer for the `asked` lines, by source line index.
+/// The aligner's answer for the `asked` lines, by source line index. None
+/// when it found the lines were not what was sung: its words are then
+/// another song's (V1468).
 fn sung_lines(
     n: usize,
     asked: &[usize],
     answer: &crate::services::lyrics::align::Aligned,
 ) -> Vec<Option<SungLine>> {
     let mut out = vec![None; n];
+    if answer.mismatch.is_some() {
+        return out;
+    }
     for (k, &i) in asked.iter().enumerate() {
         let Some(words) = answer.lines.get(k) else {
             continue;
@@ -1542,6 +1557,31 @@ mod tests {
             })
         );
         assert_eq!(sung[3], None, "a line with no words is left to pace");
+    }
+
+    /// V1468: lines the aligner found were not what was sung get no
+    /// karaoke timing. Disarm check: without the mismatch check in
+    /// `sung_lines`, line 1 is timed and this fails.
+    #[test]
+    fn lines_found_not_sung_are_left_to_pace() {
+        use crate::services::lyrics::{
+            align::{Aligned, Heard},
+            WordStamp,
+        };
+        let answer = Aligned {
+            lines: vec![vec![WordStamp {
+                at: 0,
+                start_ms: 1200,
+            }]],
+            offset_ms: 0,
+            scores: vec![Some(640)],
+            mismatch: Some(Heard {
+                text_recall: Some(80),
+                heard_words: 40,
+                text: "grey gulls wheel above the quay".into(),
+            }),
+        };
+        assert_eq!(sung_lines(2, &[1], &answer), vec![None, None]);
     }
 
     #[test]
