@@ -66,9 +66,9 @@ dependencies = [
 
 [[package]]
 name = "actix-http"
-version = "3.21.0"
+version = "3.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3422032be73eeb15bafdb64086386385875b653eb418a80241d1f98473e86ea6"
+checksum = "50f98f47b03911915aa3f0b856749aa3d3915033afabb295ab6ac5ff3b8bd5c1"
 dependencies = [
  "actix-codec",
  "actix-service",
@@ -8488,9 +8488,11 @@ dependencies = [
  "pharos-sync",
  "pharos-test-metrics",
  "pharos-transcode",
+ "png",
  "proptest",
  "quick-xml",
  "quire",
+ "quire-pdf",
  "read-fonts 0.47.0",
  "regex-lite",
  "reqwest",
@@ -8564,6 +8566,7 @@ dependencies = [
  "skrifa 0.50.0",
  "unicode-bidi",
  "unicode-linebreak",
+ "unicode-normalization",
 ]
 
 [[package]]

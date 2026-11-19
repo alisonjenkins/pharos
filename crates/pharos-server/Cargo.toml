@@ -18,10 +18,13 @@ pharos-core = { path = "../pharos-core" }
 pharos-discovery = { path = "../pharos-discovery" }
 pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
 quire = { path = "../quire" }
+quire-pdf = { path = "../quire-pdf" }
 pharos-scanner = { path = "../pharos-scanner" }
 pharos-store-sqlx = { path = "../pharos-store-sqlx" }
 pharos-sync = { path = "../pharos-sync" }
 pharos-styling = { path = "../pharos-styling" }
+# Spec 040: the subtitle check's probe picker, language gate and verdict.
+pharos-subs = { path = "../pharos-subs" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
 actix-cors.workspace = true
 actix-files.workspace = true
@@ -58,6 +61,7 @@ thiserror.workspace = true
 sha2.workspace = true
 base64.workspace = true
 image.workspace = true
+png.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -117,7 +121,6 @@ pharos-test-metrics = { path = "../pharos-test-metrics" }
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"
 regex-lite = "0.1"
-pharos-subs = { path = "../pharos-subs" }
 serde_json = "1"
 # Breaks a table under the stop-path failure tests (spec 038 FR-108).
 sqlx = { workspace = true }

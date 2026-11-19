@@ -47,6 +47,9 @@ const TIMEOUT: Duration = Duration::from_secs(600);
 /// and a stalled aligner must not hold the styling queue for [`TIMEOUT`].
 const SING_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long `/healthz` may take before the aligner counts as down.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a song whose alignment failed is left alone, so a file the
 /// aligner cannot read is not sent again on every poll.
 const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -358,6 +361,16 @@ struct Answered {
     traceparent: Option<String>,
 }
 
+/// What an `/align` request asks for beyond its lines; the default is a
+/// karaoke request as it has always been sent.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ask {
+    /// `Some(false)`: scores only, no refine stages.
+    stages: Option<bool>,
+    /// The container's stream index of the audio to decode.
+    audio_stream: Option<u32>,
+}
+
 /// Client and background worker for lyric forced alignment.
 pub struct Aligner {
     http: Client,
@@ -580,7 +593,13 @@ impl Aligner {
     async fn process_job(&self, job: &Job) -> Result<(), String> {
         metrics::histogram!(WAIT_SECONDS).record(job.queued_at.elapsed().as_secs_f64());
         let answered = self
-            .request(&job.path, &job.lines, TIMEOUT, Some((job.id, &job.key)))
+            .request(
+                &job.path,
+                &job.lines,
+                TIMEOUT,
+                Some((job.id, &job.key)),
+                Ask::default(),
+            )
             .await?;
         let offset_ms = answered.aligned.offset_ms;
         self.store(job.id, job.key.clone(), answered, Source::Song);
@@ -628,11 +647,18 @@ impl Aligner {
         lines: &[(u64, u64, String)],
         timeout: Duration,
         stream: Option<(u64, &str)>,
+        ask: Ask,
     ) -> Result<Answered, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
             path: &'a str,
             lines: Vec<AlignRequestLine<'a>>,
+            // Left out when unset, so a karaoke request is byte-for-byte
+            // today's and an aligner from before options still reads it.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stages: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            audio_stream: Option<u32>,
         }
 
         #[derive(Serialize)]
@@ -654,6 +680,8 @@ impl Aligner {
         let payload = AlignRequest {
             path,
             lines: req_lines,
+            stages: ask.stages,
+            audio_stream: ask.audio_stream,
         };
 
         // Bytes, not `.json()`: the shadow is sent the very same request.
@@ -755,8 +783,65 @@ impl Aligner {
                 return Ok(hit);
             }
         }
-        let answered = self.request(rel, lines, SING_TIMEOUT, None).await?;
+        let answered = self
+            .request(rel, lines, SING_TIMEOUT, None, Ask::default())
+            .await?;
         Ok(self.store(item.id, key, answered, Source::Lines))
+    }
+
+    /// Scores for subtitle probe lines of a video (spec 040), asked now and
+    /// never cached: a check runs once per file, and its decoys would only
+    /// fill the cache with text that belongs elsewhere. Scores only: the
+    /// refine stages are not asked for (FR-002b), and `audio_stream`, the
+    /// container's stream index, names the audio the subtitles belong to
+    /// (FR-002a); `None` leaves the file's default to the aligner.
+    pub async fn score(
+        &self,
+        path: &std::path::Path,
+        lines: &[(u64, u64, String)],
+        audio_stream: Option<u32>,
+    ) -> Result<Aligned, String> {
+        if lines.is_empty() || lines.len() > MAX_LINES {
+            return Err(format!(
+                "{} lines; the aligner takes 1 to {MAX_LINES}",
+                lines.len()
+            ));
+        }
+        let rel = path
+            .strip_prefix(&self.media_root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{} is outside the aligner's media root", path.display()))?;
+        let ask = Ask {
+            stages: Some(false),
+            audio_stream,
+        };
+        Ok(self
+            .request(rel, lines, SING_TIMEOUT, None, ask)
+            .await?
+            .aligned)
+    }
+
+    /// A karaoke song is queued or being aligned (spec 040 FR-016: the
+    /// subtitle check sends nothing meanwhile).
+    pub fn karaoke_busy(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
+    /// The aligner answers `/healthz` (spec 040 FR-015a: the check pauses,
+    /// rather than spending attempts, while it does not).
+    pub async fn healthy(&self) -> bool {
+        self.http
+            .get(format!("{}/healthz", self.base))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
     }
 
     /// Check if word timestamps are ready for `lyrics`, or queue a background job.
@@ -1714,13 +1799,70 @@ mod tests {
         assert_eq!(cache.get(10, "key_a"), None);
     }
 
+    /// Spec 040: probe scores are asked every time, never cached, and the
+    /// queue and health reads the check waits on.
+    #[tokio::test]
+    async fn score_asks_every_time_and_reports_busy_and_health() {
+        let (base, hits, bodies) = recording_service(
+            r#"{"offset_ms": 120, "aligner_version": 5, "lines": [{"words": [], "score": 0.9}]}"#,
+        )
+        .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let aligner = Aligner::for_tests(base, dir.path().to_path_buf());
+        let video = dir.path().join("film.mkv");
+        let lines = [(1_000, 3_000, "a line of speech".to_owned())];
+        for stream in [Some(2), None] {
+            let got = aligner.score(&video, &lines, stream).await.unwrap();
+            assert_eq!((got.offset_ms, got.scores.clone()), (120, vec![Some(900)]));
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // FR-002a/b: scores only, from the named stream; no stream named
+        // leaves the field out rather than sending null.
+        let sent: Vec<serde_json::Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(sent[0]["stages"], serde_json::json!(false));
+        assert_eq!(sent[0]["audio_stream"], serde_json::json!(2));
+        assert_eq!(sent[1]["stages"], serde_json::json!(false));
+        assert!(sent[1].get("audio_stream").is_none(), "{}", sent[1]);
+        let outside = aligner
+            .score(std::path::Path::new("/elsewhere/x.mkv"), &lines, None)
+            .await;
+        assert!(outside
+            .unwrap_err()
+            .contains("outside the aligner's media root"));
+        assert!(aligner.healthy().await);
+        assert!(!aligner.karaoke_busy());
+        aligner.pending.lock().unwrap().insert(7);
+        assert!(aligner.karaoke_busy());
+        let down = Aligner::for_tests("http://127.0.0.1:9".into(), dir.path().to_path_buf());
+        assert!(!down.healthy().await);
+    }
+
     /// Answers every request with `body`, counting them.
     async fn fake_service(body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let (base, hits, _) = recording_service(body).await;
+        (base, hits)
+    }
+
+    /// As [`fake_service`], keeping each request's body too.
+    async fn recording_service(
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&hits);
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&bodies);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1748,6 +1890,10 @@ mod tests {
                         }
                     }
                 }
+                let text = String::from_utf8_lossy(&got);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    kept.lock().unwrap().push(text[end + 4..].to_owned());
+                }
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -1755,7 +1901,7 @@ mod tests {
                 let _ = sock.write_all(reply.as_bytes()).await;
             }
         });
-        (base, hits)
+        (base, hits, bodies)
     }
 
     #[tokio::test]

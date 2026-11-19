@@ -103,6 +103,8 @@ mod ratings;
 mod metadata_edit;
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod subtitle_check;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod subtitle_styling;
 
 /// E-reader passwords for the OPDS catalogue (045, ADR-0128).

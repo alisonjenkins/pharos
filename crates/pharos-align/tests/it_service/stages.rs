@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use pharos_align::crash::{CrashGuard, IN_FLIGHT};
 use pharos_align::line::LineSpans;
 use pharos_align::placement::{Fallback, Method};
-use pharos_align::plan::Line;
+use pharos_align::plan::{Line, SongOptions};
 use pharos_align::service::{
     Aligned, Decoder, DeviceUsed, Engine, LineWords, Loader, Model, ModelError, Progress,
-    StageError, Stages, ALIGNER_VERSION,
+    SongError, StageError, Stages, StreamDecoder, ALIGNER_VERSION,
 };
 use pharos_align::tokens::{label, CLASSES, STAR};
 use pharos_align::transcript::Word;
@@ -373,6 +373,86 @@ fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
     assert_eq!(events.len(), 3);
+}
+
+/// Both stages panic: running either is a failure of the request's options.
+fn panicking() -> Scripted {
+    Scripted {
+        vocals: Step::Panics,
+        recognise: Step::Panics,
+        heard: Vec::new(),
+        slow: Duration::ZERO,
+    }
+}
+
+fn run_with(engine: &Engine, opts: SongOptions) -> Result<Aligned, SongError> {
+    let (r, ..) = engine.align_song_with("a", Path::new("/a"), lines(), opts, &mut |_| {});
+    r
+}
+
+#[test]
+fn a_request_without_stages_keeps_todays_answer_and_says_it_was_not_asked() {
+    let (sung, _) = song();
+    let engine = Engine::new(loader(Some(sung)), silent(), None).with_stages(Box::new(panicking()));
+    let opts = SongOptions {
+        audio_stream: None,
+        stages: false,
+    };
+    let got = run_with(&engine, opts).unwrap();
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::NotAsked));
+    assert_eq!(got.stages.vocals_ms, 0);
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+}
+
+#[test]
+fn a_named_audio_stream_is_decoded_from_that_stream_only() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&asked);
+    let stream: StreamDecoder = Box::new(move |_: &Path, i, _, _| {
+        seen.lock().unwrap().push(i);
+        Ok(vec![0.0; 16])
+    });
+    let default: Decoder = Box::new(|_: &Path, _, _| panic!("the default audio was decoded"));
+    let engine = Engine::new(loader(None), default, None).with_stream_decoder(stream);
+    let opts = SongOptions {
+        audio_stream: Some(3),
+        stages: false,
+    };
+    run_with(&engine, opts).unwrap();
+    let asked = asked.lock().unwrap();
+    assert!(!asked.is_empty());
+    assert!(asked.iter().all(|&i| i == 3), "{asked:?}");
+}
+
+#[test]
+fn a_named_audio_stream_with_the_stages_on_is_refused() {
+    let stream: StreamDecoder = Box::new(|_: &Path, _, _, _| Ok(vec![0.0; 16]));
+    let engine = Engine::new(loader(None), silent(), None)
+        .with_stream_decoder(stream)
+        .with_stages(Box::new(panicking()));
+    let opts = SongOptions {
+        audio_stream: Some(2),
+        stages: true,
+    };
+    match run_with(&engine, opts) {
+        Err(SongError::Internal(m)) => assert!(m.contains("default audio"), "{m}"),
+        other => panic!("{:?}", other.map(|a| a.placement)),
+    }
+}
+
+#[test]
+fn a_named_audio_stream_without_a_stream_decoder_is_refused() {
+    let engine = Engine::new(loader(None), silent(), None);
+    let opts = SongOptions {
+        audio_stream: Some(1),
+        stages: true,
+    };
+    match run_with(&engine, opts) {
+        Err(SongError::Internal(m)) => assert!(m.contains("audio_stream 1"), "{m}"),
+        other => panic!("{:?}", other.map(|a| a.placement)),
+    }
 }
 
 #[test]

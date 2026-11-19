@@ -5,7 +5,7 @@ use super::*;
 const BOOKS: &str = r#"{"Items":[
     {"Id":"b1","Name":"Book One","Path":"/b/one.txt",
      "People":[{"Name":"Author A","Type":"Author"}]},
-    {"Id":"b2","Name":"Book Two","Path":"/b/two.pdf"}
+    {"Id":"b2","Name":"Book Two","Path":"/b/two.cbr"}
 ],"TotalRecordCount":2}"#;
 
 const PROSE: &str = "Chapter one.\n\nSome prose to read.";
@@ -146,13 +146,148 @@ fn a_book_downloads_saves_opens_and_is_marked_downloaded() {
     assert!(screen.contains("Held"), "the downloaded mark: {screen}");
 }
 
+const PDF_LIST: &str =
+    r#"{"Items":[{"Id":"b1","Name":"Book One","Path":"/b/one.pdf"}],"TotalRecordCount":1}"#;
+
+/// A page book of `pages` grey pages, as Pharos draws a PDF.
+fn a_page_book(pages: usize) -> Vec<u8> {
+    let members: Vec<(String, Vec<u8>)> = (0..pages)
+        .map(|index| {
+            let page = kobo_image::encode_png_grey(120, 160, &vec![200; 120 * 160]).expect("a png");
+            (format!("page-{:04}.png", index + 1), page)
+        })
+        .collect();
+    kobo_doc::zip::stored(&members).expect("a page book")
+}
+
 #[test]
-fn a_pdf_says_this_reader_cannot_open_it_and_downloads_nothing() {
-    let (mut runner, _) = books();
-    let commands = runner.action(action_id("book-1"));
-    assert!(asked(&commands, "/Download").is_none());
+fn a_pdf_is_downloaded_as_its_pages_drawn_for_this_panel() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let commands = read(&mut runner, 0);
+    let (_, task) = asked(&commands, "/Items/b1/Download").expect("download");
+    let url = url_of(&task).expect("a url").to_owned();
+    assert!(url.contains("?pages=pictures&maxWidth="), "{url}");
+    assert!(url.contains("&maxHeight="), "{url}");
+
+    let book = a_page_book(12);
+    let all = settle(&mut runner, commands, &book);
+    let file = all
+        .iter()
+        .find_map(|command| match command {
+            Command::Store(StoreRequest::ShelfWrite { name, .. }) => Some(name.clone()),
+            _ => None,
+        })
+        .expect("the pages go to the shelf");
+    assert_eq!(file, "book-b1.cbz");
+    let screen = screen_text(&last_screen(&all).expect("a screen"));
+    // The page viewer's own picture: the page, drawn on its own.
+    assert!(
+        screen.contains("PictureHandle(2000)"),
+        "the page viewer opens: {screen}"
+    );
+    assert!(
+        logged(&all, "pharos: book step=open ms="),
+        "the open is timed: {all:?}"
+    );
+
+    let commands = runner.action(ActionId::BACK);
     let screen = screen_text(&last_screen(&commands).expect("a screen"));
-    assert!(screen.contains("can't open PDF books yet"), "{screen}");
+    assert!(
+        screen.contains("Held"),
+        "back on the list, marked downloaded: {screen}"
+    );
+}
+
+#[test]
+fn a_pdf_reopens_where_it_was_left() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let book = a_page_book(12);
+    let commands = read(&mut runner, 0);
+    let _ = settle(&mut runner, commands, &book);
+    let next = runner.action(action_id("comic-next"));
+    let _ = settle(&mut runner, next, &book);
+    let back = runner.action(ActionId::BACK);
+    let left = settle(&mut runner, back, &book);
+    let _ = runner.action(action_id("book-0"));
+    let kept = left
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            Command::Store(StoreRequest::Save { key, value }) if key == books::KEY => {
+                books::Shelf::decode(value)
+            }
+            _ => None,
+        })
+        .expect("the place is kept on leaving");
+    let memory = &kept.get("b1").expect("the book is on the shelf").memory;
+    assert!(memory.contains("\"page\":1"), "{memory}");
+
+    let again = runner.action(action_id("book-read"));
+    let all = settle(&mut runner, again, &book);
+    assert!(
+        all.iter().any(|command| matches!(
+            command,
+            Command::Store(StoreRequest::ShelfRead { name, .. }) if name == "book-b1.cbz"
+        )),
+        "it opens off the shelf without downloading again"
+    );
+    assert!(asked(&all, "/Download").is_none());
+}
+
+#[test]
+fn a_pdf_keeps_its_place_once_a_page_jumped_to_is_in() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let book = a_page_book(12);
+    let commands = read(&mut runner, 0);
+    let _ = settle(&mut runner, commands, &book);
+    for action in ["comic-controls", "comic-jump", "comic-digit-9"] {
+        let _ = runner.action(action_id(action));
+    }
+    let go = runner.action(action_id("comic-go"));
+    let all = settle(&mut runner, go, &book);
+    let kept = all
+        .iter()
+        .rev()
+        .find_map(|command| match command {
+            Command::Store(StoreRequest::Save { key, value }) if key == books::KEY => {
+                books::Shelf::decode(value)
+            }
+            _ => None,
+        })
+        .expect("the place is kept when page 9 is in");
+    let memory = &kept.get("b1").expect("the book is on the shelf").memory;
+    assert!(memory.contains("\"page\":8"), "{memory}");
+}
+
+#[test]
+fn a_pdf_offers_no_opening_since_pharos_reads_one_only_from_an_epub() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let detail = last_screen(&runner.action(action_id("book-0"))).expect("a screen");
+    let text = screen_text(&detail);
+    assert!(text.contains("Download and read"), "{text}");
+    assert!(!text.contains("Read the opening"), "{text}");
+}
+
+#[test]
+fn a_pdf_pharos_did_not_draw_is_refused_before_it_is_saved() {
+    let (mut runner, _) = books_from(PDF_LIST);
+    let commands = read(&mut runner, 0);
+    let all = settle(&mut runner, commands, b"%PDF-1.7 and the rest");
+    assert!(
+        logged(&all, "kind=a page book head=255044462d312e37"),
+        "{all:?}"
+    );
+    let (mut runner, _) = books_from(PDF_LIST);
+    let commands = read(&mut runner, 0);
+    let all = settle(&mut runner, commands, b"PK\x03\x04junk");
+    assert!(
+        logged(
+            &all,
+            "pharos: book open refused id=b1 from=shelf kind=pages why="
+        ),
+        "{all:?}"
+    );
+    assert!(!logged(&all, "Book One"), "no title in the log: {all:?}");
 }
 
 #[test]
@@ -489,7 +624,7 @@ fn a_tap_opens_the_book_s_detail_page_before_anything_downloads() {
 fn a_book_this_reader_cannot_open_says_why_on_its_detail_page() {
     let (mut runner, _) = books();
     let text = screen_text(&last_screen(&runner.action(action_id("book-1"))).expect("a screen"));
-    assert!(text.contains("can't open PDF books yet"), "{text}");
+    assert!(text.contains("can't open comic books yet"), "{text}");
     assert!(!text.contains("book-read"), "nothing to read: {text}");
 }
 

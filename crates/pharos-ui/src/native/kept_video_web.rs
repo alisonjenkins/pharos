@@ -20,10 +20,11 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
-    absolute_url, cache_name, check_not_kept, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, needs_admission, new_record, progress_due, put_is_retryable, reserved_by,
-    retry_delay_secs, stale_files, still_needed, take, url_path, used_by, KeepVideoRefusal,
-    KeepVideoRequest, KeptState, KeptVideo, VideoStore, DEFAULT_CAP_BYTES, RECORDS_KEY,
+    absolute_url, cache_name, cap_from_stored, cap_selected, check_not_kept, find, fits,
+    insert_front, interrupted, is_retryable, missing_files, needs_admission, new_record,
+    progress_due, put_is_retryable, reserved_by, retry_delay_secs, stale_files, still_needed, take,
+    url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+    CAP_KEY, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -52,6 +53,18 @@ fn local_storage() -> Result<web_sys::Storage, String> {
         .local_storage()
         .map_err(|e| describe(&e))?
         .ok_or_else(|| "localStorage is unavailable".to_owned())
+}
+
+/// The cap in force: the viewer's stored choice, else the default. Read
+/// afresh each time, so a cap another tab set applies here too.
+fn current_cap() -> u64 {
+    let stored = local_storage()
+        .and_then(|s| s.get_item(CAP_KEY).map_err(|e| describe(&e)))
+        .unwrap_or_else(|e| {
+            warn(&format!("pharos: video cap unreadable reason={e}"));
+            None
+        });
+    cap_from_stored(stored.as_deref())
 }
 
 fn load() -> Vec<KeptVideo> {
@@ -454,7 +467,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         if let Err(refusal) = fits(
             needed,
             used.saturating_add(stored_bytes),
-            DEFAULT_CAP_BYTES,
+            current_cap(),
             free,
         ) {
             warn(&format!(
@@ -706,7 +719,15 @@ impl VideoStore for WebVideoStore {
     }
 
     fn cap_bytes(&self) -> u64 {
-        DEFAULT_CAP_BYTES
+        current_cap()
+    }
+
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        let option = cap_selected(bytes);
+        if option.is_empty() {
+            return Err(format!("{bytes} bytes is not a cap this page offers"));
+        }
+        local_storage().and_then(|s| s.set_item(CAP_KEY, &option).map_err(|e| describe(&e)))
     }
 
     fn used_bytes(&self, user: &str) -> u64 {

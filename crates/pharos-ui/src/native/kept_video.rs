@@ -19,6 +19,46 @@ use super::offline_ui::{FREE_GUARD_BYTES, GIB};
 /// raises it (the same default as offline music on the phone).
 pub const DEFAULT_CAP_BYTES: u64 = 4 * GIB;
 
+/// The caps a viewer can pick for downloaded video, in GiB. Wider than
+/// offline music's: a film at 2 Mbps is about 1.5 GiB.
+pub const CAP_CHOICES_GIB: [u64; 7] = [2, 4, 8, 16, 32, 64, 128];
+
+/// Where a device keeps the viewer's chosen cap (the GiB count as text).
+pub const CAP_KEY: &str = "pharos.kept_videos.cap_gib";
+
+/// The cap choices as `Choices` options: the GiB count and its label.
+pub fn cap_options() -> Vec<(String, String)> {
+    CAP_CHOICES_GIB
+        .iter()
+        .map(|g| (g.to_string(), format!("{g} GiB")))
+        .collect()
+}
+
+/// The option a cap presses; empty for a cap that is not a choice.
+pub fn cap_selected(cap_bytes: u64) -> String {
+    CAP_CHOICES_GIB
+        .iter()
+        .find(|g| g.saturating_mul(GIB) == cap_bytes)
+        .map(u64::to_string)
+        .unwrap_or_default()
+}
+
+/// The bytes an option stands for; `None` for anything not offered.
+pub fn cap_from_option(value: &str) -> Option<u64> {
+    let gib: u64 = value.trim().parse().ok()?;
+    CAP_CHOICES_GIB
+        .contains(&gib)
+        .then(|| gib.saturating_mul(GIB))
+}
+
+/// The cap a stored value gives: the choice it names, else the default
+/// (nothing stored, or a value from a build with other choices).
+pub fn cap_from_stored(stored: Option<&str>) -> u64 {
+    stored
+        .and_then(cap_from_option)
+        .unwrap_or(DEFAULT_CAP_BYTES)
+}
+
 /// The qualities a download can be made at, as the video bitrate cap the
 /// player negotiates with (bits per second), lowest first.
 pub const QUALITY_CHOICES_BPS: [u64; 3] = [1_000_000, 2_000_000, 4_000_000];
@@ -233,6 +273,14 @@ pub trait VideoStore: Send + Sync {
     /// no folders to discard (the web's) refuses.
     fn discard_unreadable(&self) -> Result<u64, String> {
         Err("this device keeps no unreadable downloads".to_owned())
+    }
+    /// Set the cap. A host that cannot change it keeps the default and
+    /// says why. Lowering it below what is kept deletes nothing; new
+    /// downloads are refused until there is room.
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        Err(format!(
+            "this device keeps the cap at {DEFAULT_CAP_BYTES} bytes, not {bytes}"
+        ))
     }
     fn used_bytes(&self, user: &str) -> u64;
     /// Free space as the host last measured it.
@@ -972,5 +1020,51 @@ mod tests {
         let new: Vec<String> = ["b", "d"].map(String::from).into();
         assert_eq!(stale_files(&old, &new), ["a", "c"]);
         assert!(stale_files(&[], &new).is_empty());
+    }
+
+    #[test]
+    fn the_stored_cap_is_a_choice_or_the_default() {
+        assert_eq!(cap_from_stored(None), DEFAULT_CAP_BYTES);
+        assert_eq!(cap_from_stored(Some("64")), 64 * GIB);
+        assert_eq!(cap_from_stored(Some("3")), DEFAULT_CAP_BYTES);
+        assert_eq!(cap_from_stored(Some("lots")), DEFAULT_CAP_BYTES);
+    }
+
+    #[test]
+    fn cap_options_round_trip_and_press_only_a_choice() {
+        for (value, label) in cap_options() {
+            let bytes = cap_from_option(&value).unwrap();
+            assert_eq!(cap_selected(bytes), value);
+            assert_eq!(label, format!("{value} GiB"));
+        }
+        assert_eq!(cap_selected(DEFAULT_CAP_BYTES), "4");
+        assert_eq!(cap_selected(GIB), "");
+        assert_eq!(cap_from_option("1"), None);
+    }
+
+    #[test]
+    fn a_store_without_a_cap_setting_refuses_and_names_the_value() {
+        struct Fixed;
+        impl VideoStore for Fixed {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                vec![]
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                DEFAULT_CAP_BYTES
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let err = Fixed.set_cap_bytes(8 * GIB).unwrap_err();
+        assert!(err.contains(&(8 * GIB).to_string()), "{err}");
     }
 }

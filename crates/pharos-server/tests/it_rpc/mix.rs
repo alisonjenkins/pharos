@@ -51,6 +51,17 @@ async fn wire_mix(
     recent: &[u64],
     count: u32,
 ) -> Result<Wire, String> {
+    wire_mix_seeded(session, None, rules, recent, count).await
+}
+
+/// [`wire_mix`] with an optional song seed.
+async fn wire_mix_seeded(
+    session: &session::Client,
+    seed: Option<u64>,
+    rules: &[(MixWeight, u8, &str)],
+    recent: &[u64],
+    count: u32,
+) -> Result<Wire, String> {
     let library = session.library_request().send().pipeline.get_library();
     let mut req = library.mix_request();
     {
@@ -58,7 +69,10 @@ async fn wire_mix(
         p.reborrow().init_ctx();
         let mut spec = p.reborrow().init_spec();
         spec.set_artist_gap(1);
-        spec.reborrow().init_seed().set_none(());
+        match seed {
+            Some(id) => spec.reborrow().init_seed().init_song().set_real(id),
+            None => spec.reborrow().init_seed().set_none(()),
+        }
         let mut list = spec.init_rules(rules.len() as u32);
         for (i, (weight, share, genre)) in rules.iter().enumerate() {
             let mut r = list.reborrow().get(i as u32);
@@ -259,4 +273,116 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
         mix::mix(&fx.state, &user, hidden_seed, 0).await,
         Err(mix::MixError::SeedNotFound(2_100))
     ));
+}
+
+/// Whether the last `mix: batch picked` line carries `field` as a whole token.
+fn batch_line_has(logs: &Captured, field: &str) -> bool {
+    logs.text()
+        .lines()
+        .rev()
+        .find(|l| l.contains("mix: batch picked"))
+        .is_some_and(|l| l.split_whitespace().any(|t| t == field))
+}
+
+/// V1467 — a mix plays music only: an audiobook's tracks (songs whose
+/// innermost library is a Books library, ADR-0132) never join a song's
+/// pool or seed a mix, and the log line counts what was kept out. A mix
+/// saved with an audiobook's track as its seed plays music unseeded.
+/// Disarm check: with `keep_music` keeping everything, the mix picks book
+/// tracks and `books_left_out` reads 0; without the `book_seed` arm, the
+/// book-seeded mix fails as `SeedNotFound`.
+#[actix_web::test]
+async fn a_mix_never_plays_an_audiobooks_tracks() {
+    use pharos_core::LibraryKind;
+    let fx = crate::common::seed_rich().await;
+    fx.state
+        .stores
+        .upsert_library("Tunes", "/libMusic", LibraryKind::Music, &"e".repeat(32))
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .upsert_library("Reading", "/libBooks", LibraryKind::Books, &"d".repeat(32))
+        .await
+        .unwrap();
+    put_songs(&fx, 3_000, "/libMusic", &[("Band", "Pop", 2001)], 5).await;
+    put_songs(&fx, 3_100, "/libBooks", &[("Author", "Pop", 2001)], 5).await;
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let ask = MixAsk {
+        rules: vec![Rule {
+            weight: Weight::Require,
+            share: None,
+            test: Test::Genre("Pop".into()),
+        }],
+        seed: Seed::None,
+        artist_gap: 0,
+        album_gap: 0,
+        recent: vec![],
+        count: 20,
+    };
+    let mixed = mix::mix(&fx.state, &user, ask, 0).await.unwrap();
+    let ids: Vec<u64> = mixed.picks.iter().map(|p| p.item.id).collect();
+    assert_eq!(ids.len(), 5, "{ids:?}");
+    assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
+    assert_eq!(mixed.books_left_out, 5);
+    assert!(batch_line_has(&logs, "books_left_out=5"), "{}", logs.text());
+    // A mix saved with an audiobook's track as its seed plays music,
+    // unseeded, and says so.
+    let book_seed = MixAsk {
+        rules: vec![Rule {
+            weight: Weight::Prefer,
+            share: None,
+            test: Test::LikeSeed,
+        }],
+        seed: Seed::Song(3_100),
+        artist_gap: 0,
+        album_gap: 0,
+        recent: vec![],
+        count: 3,
+    };
+    let mixed = mix::mix(&fx.state, &user, book_seed, 0).await.unwrap();
+    let ids: Vec<u64> = mixed.picks.iter().map(|p| p.item.id).collect();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert!(ids.iter().all(|id| (3_000..3_005).contains(id)), "{ids:?}");
+    assert!(mixed.book_seed_dropped);
+    assert!(
+        batch_line_has(&logs, "book_seed_dropped=true"),
+        "{}",
+        logs.text()
+    );
+
+    // Over the wire too: a saved mix whose seed is an audiobook's track
+    // gets a batch of music, not an error.
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            let batch = wire_mix_seeded(
+                &session,
+                Some(3_100),
+                &[(MixWeight::Require, 0, "Pop")],
+                &[],
+                3,
+            )
+            .await
+            .expect("a batch, not an error");
+            assert_eq!(batch.picks.len(), 3);
+            assert!(
+                batch
+                    .picks
+                    .iter()
+                    .all(|(id, _)| (3_000..3_005).contains(id)),
+                "{:?}",
+                batch.picks
+            );
+        })
+        .await;
 }

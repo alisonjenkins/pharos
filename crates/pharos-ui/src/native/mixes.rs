@@ -350,7 +350,12 @@ pub fn status_text(mix: &ActiveMix) -> Option<String> {
 /// The mix line at the top of the queue panel: the mix that is on with
 /// Edit and Stop, or a Mix button that opens the picker.
 #[component]
-pub fn MixBar(playing: Option<ItemRef>) -> Element {
+pub fn MixBar(
+    playing: Option<ItemRef>,
+    /// The playing track is an audiobook's: no mix can be like it (V1467).
+    #[props(default)]
+    audiobook: bool,
+) -> Element {
     // Every hook runs before the early return, so the hook order never
     // depends on which contexts are present.
     let ctx = try_use_context::<Ctx>();
@@ -534,7 +539,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
         }
         if open() && active.is_none() {
             ul { class: "pharos-mix-menu", aria_label: "Start a mix",
-                if let Some(song) = playing {
+                if let Some(song) = like_seed(playing, audiobook) {
                     li {
                         button {
                             class: "pharos-mix-choice",
@@ -621,7 +626,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             {remount_on(&edits().to_string(), rsx! {
                 MixEditor {
                     draft,
-                    playing,
+                    playing: like_seed(playing, audiobook),
                     can_save: saved().is_some(),
                     save_note: load_error(),
                     on_close: move |_| editing.set(None),
@@ -1008,6 +1013,12 @@ pub fn draft_problem(draft: &SavedMix) -> Option<String> {
         }
     }
     None
+}
+
+/// The playing track a mix may be like: none for an audiobook's, which the
+/// server keeps out of every mix (V1467).
+fn like_seed(playing: Option<ItemRef>, audiobook: bool) -> Option<ItemRef> {
+    playing.filter(|_| !audiobook)
 }
 
 #[component]
@@ -1528,6 +1539,14 @@ mod tests {
         );
         d.spec.seed = Seed::Follow;
         assert_eq!(draft_problem(&d), None);
+    }
+
+    #[test]
+    fn no_mix_is_offered_like_an_audiobooks_track() {
+        let song = Some(ItemRef::Real(7));
+        assert_eq!(like_seed(song, false), song);
+        assert_eq!(like_seed(song, true), None);
+        assert_eq!(like_seed(None, false), None);
     }
 
     #[test]

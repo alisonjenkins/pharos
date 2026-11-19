@@ -91,10 +91,21 @@ pub fn clean_text(text: &str) -> String {
         .join(" ")
 }
 
-/// Words with at least one letter: what the aligner can place.
+/// Words the aligner can place: those with a letter that folds into `a`-`z`.
+/// The aligner folds accents and keeps only `a`-`z` and `'`, so a word in
+/// another script is dropped there and is not counted here.
 pub fn alignable_words(text: &str) -> usize {
+    use unicode_normalization::char::canonical_combining_class;
+    use unicode_normalization::UnicodeNormalization;
+    // `pharos_align::text::fold`: NFKD, marks dropped, lower-cased, `a`-`z` only.
+    // A letter such as `ø` or `æ` has no decomposition there, so it is dropped.
     text.split_whitespace()
-        .filter(|w| w.chars().any(char::is_alphabetic))
+        .filter(|w| {
+            w.nfkd()
+                .filter(|&c| canonical_combining_class(c) == 0)
+                .flat_map(char::to_lowercase)
+                .any(|c| c.is_ascii_lowercase())
+        })
         .count()
 }
 
@@ -260,6 +271,16 @@ mod tests {
         assert_eq!(clean_text("I said (quietly) no"), "I said (quietly) no");
         assert_eq!(clean_text("Time: half past"), "Time: half past");
         assert_eq!(clean_text("MAN 2: Over here"), "Over here");
+    }
+
+    #[test]
+    fn only_latin_words_count_as_alignable() {
+        assert_eq!(alignable_words("Go 李 雷"), 1);
+        assert_eq!(alignable_words("Ça va, Zoë?"), 3);
+        assert_eq!(alignable_words("42 ... !!"), 0);
+        // No decomposition to a-z: the aligner drops these letters.
+        assert_eq!(alignable_words("Go ø æ"), 1);
+        assert_eq!(alignable_words("ﬁne ｗord"), 2);
     }
 
     #[test]

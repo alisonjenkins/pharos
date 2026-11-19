@@ -135,6 +135,23 @@ ignore = [
     # 8.2.0, which is fixed. Re-check if anything enables Burn's `tch`
     # backend, and drop the entry when burn-tch moves off zip 0.6.
     "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0543 — `chrono` is "unmaintained" (all versions; no safe
+    # upgrade), not vulnerable. pharos does not depend on it: it arrives only
+    # through Burn's `cubecl-environment` -> `turso` -> `turso_core` /
+    # `turso_ext` (pharos-align's GPU aligner build chain, `cargo tree -i
+    # chrono --all-features`). Drop the entry when Burn/cubecl move off it.
+    "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0545 / -0548 — zip < 9: AES entries returned without
+    # their authentication code checked when the data ends early, and
+    # `ZipStreamReader` extracting under local-header names that differ from
+    # the central directory. The zip 0.6.6 in Cargo.lock comes only from
+    # tch / torch-sys <- burn-tch, Burn's optional libtorch backend, the same
+    # never-built chain as RUSTSEC-2026-0403: `cargo tree -i zip@0.6.6
+    # --workspace --all-features --target all -e all` is EMPTY. Ignored with
+    # Alison's OK (2026-11-18). Drop both when burn-tch moves off zip 0.6, and
+    # re-check if anything enables Burn's `tch` backend.
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
 ]
 
 [licenses]

@@ -17,9 +17,9 @@ use pharos_core::{
     MediaStore, MetadataEdit, MetadataEditStore, MetadataTranslationStore, PersistedSyncGroup,
     PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
     RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
-    StudioStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore, TagStore, TokenStore,
-    TranscodeSessionStore, TranslationOwner, UserDataStore, UserId, UserItemData, UserPolicy,
-    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    StudioStore, SubtitleCheckStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore,
+    TagStore, TokenStore, TranscodeSessionStore, TranslationOwner, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -96,6 +96,7 @@ where
         + pharos_core::MetadataTranslationStore
         + pharos_core::MediaSegmentStore
         + pharos_core::SubtitleStylingStore
+        + pharos_core::SubtitleCheckStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -2897,6 +2898,77 @@ where
             .unwrap(),
         Some(remeasured)
     );
+    // Spec 040: subtitle checks, one row per track source, upserted, scores
+    // left out of the index, gone with the item.
+    assert!(SubtitleCheckStore::subtitle_checks(&store, film)
+        .await
+        .unwrap()
+        .is_empty());
+    let pending = pharos_core::SubtitleCheckRow {
+        item_id: film,
+        source_key: "stream:3".into(),
+        source_mtime: 1_700_000_000,
+        source_size: u64::from(u32::MAX) + 7,
+        sidecar_mtime: None,
+        sidecar_size: None,
+        check_version: 1,
+        verdict: None,
+        reason: "aligner timed out".into(),
+        offset_ms: None,
+        ratio: None,
+        scores_json: None,
+        attempts: 1,
+        retry_at: Some(1_700_003_600),
+        checked_at: 1_700_000_000,
+    };
+    let checked = pharos_core::SubtitleCheckRow {
+        verdict: Some("retimed".into()),
+        reason: "median=0.90 decoy=0.25 hits=11/12 offset_ms=-1500 ratio=1.042709".into(),
+        offset_ms: Some(-1_500),
+        ratio: Some(25.0 / 23.976),
+        scores_json: Some(r#"{"stages":[]}"#.into()),
+        attempts: 0,
+        retry_at: None,
+        checked_at: 1_700_004_000,
+        ..pending.clone()
+    };
+    let sidecar = pharos_core::SubtitleCheckRow {
+        source_key: "sidecar:00ff".into(),
+        sidecar_mtime: Some(1_700_000_002),
+        sidecar_size: Some(2_048),
+        verdict: Some("unknown".into()),
+        reason: "too_few_lines:3".into(),
+        attempts: 0,
+        retry_at: None,
+        ..pending.clone()
+    };
+    for row in [pending, checked.clone(), sidecar.clone()] {
+        SubtitleCheckStore::put_subtitle_check(&store, row)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        SubtitleCheckStore::subtitle_checks(&store, film)
+            .await
+            .unwrap(),
+        vec![sidecar.clone(), checked.clone()]
+    );
+    let index: Vec<_> = SubtitleCheckStore::subtitle_check_index(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.item_id == film)
+        .collect();
+    assert_eq!(
+        index,
+        vec![
+            sidecar,
+            pharos_core::SubtitleCheckRow {
+                scores_json: None,
+                ..checked
+            }
+        ]
+    );
     // Deleting the item cascades.
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
         .await
@@ -2917,6 +2989,10 @@ where
             .unwrap(),
         None
     );
+    assert!(SubtitleCheckStore::subtitle_checks(&store, film)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Spec 033 — the series split's store contract: a put keeps a key the

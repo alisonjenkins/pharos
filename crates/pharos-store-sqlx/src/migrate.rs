@@ -71,6 +71,7 @@ pub const COPIED_TABLES: &[&str] = &[
     "media_segments_snapshot",
     "subtitle_styling",
     "subtitle_signals",
+    "subtitle_check",
     "transcode_sessions",
 ];
 
