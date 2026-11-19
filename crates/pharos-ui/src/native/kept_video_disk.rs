@@ -247,6 +247,11 @@ struct State {
     /// has fetched and promoted. On disk, so no longer owed, but in no
     /// stored figure until the plan's inventory counts them.
     playlists_landed: HashMap<(String, String, u64), u64>,
+    /// Starts whose first record is not saved yet, by the run they claimed:
+    /// a failed save rolls back its own record even when a session end has
+    /// parked (revoked) that run, and never a newer start's. A removal or a
+    /// newer start drops or replaces the entry.
+    pending_starts: HashMap<(String, String), u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -4590,6 +4595,7 @@ impl VideoStore for DiskVideoStore {
                     // The run is named in the same hold: a rollback below
                     // touches the record only while this start still owns it.
                     run_id = st.claim_run(&user, &item);
+                    st.pending_starts.insert((user.clone(), item.clone()), run_id);
                     // A settlement that began before this start must not act
                     // on the folder as it saw it.
                     st.bump(&dir);
@@ -4616,11 +4622,16 @@ impl VideoStore for DiskVideoStore {
                 let _admission = budget.admission_guard();
                 let mut st = lock(&self.inner.state);
                 // A removal and a newer start may have taken the item over
-                // since: their record is theirs, and stays.
+                // since: their record is theirs, and stays. A session end
+                // that parked this start's run leaves the record this
+                // start's all the same: it is rolled back.
                 let key = (user.clone(), item.clone());
-                let ours = st.runs.get(&key) == Some(&run_id);
+                let ours = st.pending_starts.get(&key) == Some(&run_id);
                 if ours {
-                    st.runs.remove(&key);
+                    st.pending_starts.remove(&key);
+                    if st.runs.get(&key) == Some(&run_id) {
+                        st.runs.remove(&key);
+                    }
                     take(&mut st.list, &user, &item);
                     if let Some(old) = replaced {
                         insert_front(&mut st.list, old);
@@ -4649,6 +4660,13 @@ impl VideoStore for DiskVideoStore {
             );
             return Err(refusal);
         }
+        {
+            let mut st = lock(&self.inner.state);
+            let key = (user.clone(), item.clone());
+            if st.pending_starts.get(&key) == Some(&run_id) {
+                st.pending_starts.remove(&key);
+            }
+        }
         self.inner.spawn_claimed(user, item, run_id);
         Ok(())
     }
@@ -4667,6 +4685,8 @@ impl VideoStore for DiskVideoStore {
                 return;
             };
             st.runs.remove(&(user.to_owned(), item.to_owned()));
+            st.pending_starts
+                .remove(&(user.to_owned(), item.to_owned()));
             // Every file indexed under the item's folder goes, as in
             // `prune_unplanned`: the playlists are indexed before the plan
             // is admitted and are not in the record's files, and a folder
@@ -7921,6 +7941,34 @@ mod tests {
         std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
         assert!(store.start(request("1")).is_err());
         assert_eq!(only(&store), failed, "the replaced record was lost");
+    }
+
+    /// A session end that parks a start's run while its first save is
+    /// failing does not keep the unsaved record: the start is rolled back
+    /// all the same, and nothing is left Downloading with no run.
+    #[tokio::test]
+    async fn a_rollback_still_happens_when_a_sign_out_parked_the_start() {
+        let rig = Rig::new("rollback-parked");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let s2 = store.clone();
+        set_hook(&BEFORE_START_ROLLBACK, move || s2.park_runs(Some("u1")));
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(
+            store.videos("u1").is_empty(),
+            "the unsaved record stayed: {:?}",
+            store.videos("u1")
+        );
+        assert!(
+            lines("pharos: video keep refused")
+                .iter()
+                .any(|l| l.contains("verdict=rolled_back")),
+            "{:?}",
+            captured()
+        );
     }
 
     /// A removal and a newer start of the same item land while a start's
