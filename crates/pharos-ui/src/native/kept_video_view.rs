@@ -256,14 +256,14 @@ thread_local! {
     static HELD_GRANTS: RefCell<Vec<pharos_client::api::NativeGrant>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The signed-in user: the account when it has loaded, else the one
-/// remembered on this device.
+/// The user whose downloads this screen may list, remove and play: the
+/// authorized offline owner ([`offline_video::last_user`]), never the
+/// account result itself. A replaced session's `me` can still hold the
+/// previous user while the identity is fenced; it decides nothing here.
+/// The account is read only so a sign-in renders the screen again.
 fn use_user() -> Option<String> {
-    let account = try_use_context::<AccountMe>();
-    let me = account
-        .and_then(|a| a.0.read().clone().flatten())
-        .map(|m| m.id);
-    me.or_else(offline_video::last_user)
+    let _ = try_use_context::<AccountMe>().map(|a| a.0.read().clone());
+    offline_video::last_user()
 }
 
 /// What a screen of downloads shows from the store: the user's videos and

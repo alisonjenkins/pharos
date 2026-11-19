@@ -985,7 +985,7 @@ pub fn ready_for_last_user() -> Vec<KeptVideo> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::super::kept_video::KeptState;
     use super::*;

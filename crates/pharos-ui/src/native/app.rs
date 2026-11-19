@@ -5442,9 +5442,12 @@ fn downloaded_copy(
     std::sync::Arc<dyn super::kept_video::VideoStore>,
 )> {
     let store = super::ports::video_store()?;
-    let Some(user) = signed_in.or_else(offline_video::last_user) else {
+    // Only the authorized offline owner selects a copy: an account result
+    // still held from a replaced session (fenced) decides nothing.
+    let Some(user) = offline_video::last_user() else {
         platform::info(&format!(
-            "pharos: playback copy item={id} downloaded=false reason=no_user"
+            "pharos: playback copy item={id} downloaded=false reason=no_authorized_user account={}",
+            signed_in.is_some()
         ));
         return None;
     };
@@ -9135,6 +9138,55 @@ fn Player(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A replaced session's account result still naming A selects none of
+    /// A's downloads while the identity is fenced: only the authorized
+    /// offline owner picks a copy to play.
+    #[test]
+    fn a_fenced_users_account_result_selects_no_downloaded_copy() {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        use super::super::ports::{use_test_video_slot, Slot};
+        static SLOT: Slot<dyn VideoStore> = Slot::new();
+        struct AsOnly;
+        impl VideoStore for AsOnly {
+            fn videos(&self, user: &str) -> Vec<KeptVideo> {
+                if user != "A" {
+                    return Vec::new();
+                }
+                let mut v = offline_video::tests::video("7", "", KeptState::Ready);
+                v.user = user.into();
+                vec![v]
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let _ = SLOT.set(std::sync::Arc::new(AsOnly));
+        use_test_video_slot(Some(&SLOT));
+        let id: ItemRef = "7".parse().unwrap();
+        offline_video::remember_user("A");
+        assert!(downloaded_copy(id, None, Some("A".into())).is_some());
+        offline_video::session_replaced(&offline_video::Session::opened(
+            (),
+            Some("tokB".to_owned()),
+        ));
+        let copy = downloaded_copy(id, None, Some("A".into()));
+        use_test_video_slot(None);
+        assert!(copy.is_none(), "a fenced user's copy was selected");
+    }
 
     /// End to end, through the app's own timer, screen and store watch: an
     /// attempt starts with no video store, goes slow, and a store holding
