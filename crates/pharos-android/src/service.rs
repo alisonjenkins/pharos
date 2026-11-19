@@ -2,6 +2,7 @@
 //! library connection.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Used when the app has stored no `https://` server (`credentials::SERVER_FILE`).
 pub(crate) const DEFAULT_SERVER: &str = "https://prototype.aliflix.alison-jenkins.com";
@@ -29,11 +30,82 @@ pub fn set_outside_used(used: content::OutsideUsed) {
 /// connected: it registers the video accounting (`set_outside_used` and the
 /// video store). The app's own start-up does not run in a process the car
 /// started with no activity, so the app fills this slot as its library
-/// loads. Set once.
-static INIT_HOOK: OnceLock<fn(&str)> = OnceLock::new();
+/// loads. Set once. It answers whether it is done: `false` when the video
+/// store could not be opened (its folder or its thread), so a later connect
+/// or prefetch runs it again (`retry_init`). Music stays refused meanwhile:
+/// the accounting reads unknown while no store is registered.
+static INIT_HOOK: OnceLock<fn(&str) -> bool> = OnceLock::new();
 
-pub fn set_init_hook(hook: fn(&str)) {
+pub fn set_init_hook(hook: fn(&str) -> bool) {
     let _ = INIT_HOOK.set(hook);
+}
+
+/// The files directory the library was connected with, for `retry_init`.
+static FILES: OnceLock<String> = OnceLock::new();
+/// Whether `INIT_HOOK` has said it is done.
+static INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Runs the init hook again unless it is done, so a service-only process
+/// whose video folder failed at connect registers the store once the folder
+/// can be made, with no activity to do it. `when` names the caller in the
+/// log line.
+pub(crate) fn retry_init(when: &str) {
+    let verdict = rerun_init(
+        &INIT_DONE,
+        FILES.get().map(String::as_str),
+        INIT_HOOK.get().copied(),
+    );
+    if verdict != InitRetry::AlreadyDone {
+        log(&format!(
+            "video accounting retry when={when} verdict={}",
+            verdict.label()
+        ));
+    }
+}
+
+/// What `rerun_init` did.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum InitRetry {
+    /// The hook said it was done before: not run.
+    AlreadyDone,
+    /// No hook, or no library connected yet: nothing to run.
+    NothingToRun,
+    /// Run, and done now.
+    Done,
+    /// Run, and still not done: a later caller tries again.
+    StillMissing,
+}
+
+impl InitRetry {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AlreadyDone => "already_done",
+            Self::NothingToRun => "nothing_to_run",
+            Self::Done => "done",
+            Self::StillMissing => "still_missing",
+        }
+    }
+}
+
+/// Runs `hook` over `files` unless `done` says it is done, and records its
+/// answer.
+pub(crate) fn rerun_init(
+    done: &AtomicBool,
+    files: Option<&str>,
+    hook: Option<fn(&str) -> bool>,
+) -> InitRetry {
+    if done.load(Ordering::Acquire) {
+        return InitRetry::AlreadyDone;
+    }
+    let (Some(files), Some(hook)) = (files, hook) else {
+        return InitRetry::NothingToRun;
+    };
+    if hook(files) {
+        done.store(true, Ordering::Release);
+        InitRetry::Done
+    } else {
+        InitRetry::StillMissing
+    }
 }
 
 /// Whether the video's bytes are counted against the music cache. Music
@@ -108,6 +180,7 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         .lock()
         .map_err(|_| "library connect mutex poisoned".to_owned())?;
     if LIBRARY.get().is_some() {
+        retry_init("connect");
         return Ok(());
     }
     if ::log::set_logger(&CONTENT_LOG).is_ok() {
@@ -124,9 +197,8 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
     // Before the cache is enabled or anything prefetches: the app's video
     // accounting, in a process that never ran the app's own start-up.
-    if let Some(hook) = INIT_HOOK.get() {
-        hook(&files);
-    }
+    let _ = FILES.set(files.clone());
+    retry_init("first_connect");
     lib.on_auth_change(|_| notify_changed());
     let auth = match lib.auth_state() {
         content::AuthState::SignedOut => "signed_out",
@@ -496,8 +568,39 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 
 #[cfg(test)]
 mod tests {
-    use super::{access, outside_bytes, Caller};
+    use super::{access, outside_bytes, rerun_init, Caller, InitRetry};
     use pharos_content as content;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A hook that failed is run again by the next caller, and one that
+    /// said it is done is not run again.
+    #[test]
+    fn an_init_hook_that_is_not_done_is_run_again_until_it_is() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn hook(files: &str) -> bool {
+            assert_eq!(files, "/files");
+            RUNS.fetch_add(1, Ordering::SeqCst) >= 1
+        }
+        let done = AtomicBool::new(false);
+        assert_eq!(rerun_init(&done, None, Some(hook)), InitRetry::NothingToRun);
+        assert_eq!(
+            rerun_init(&done, Some("/files"), None),
+            InitRetry::NothingToRun
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::StillMissing
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::Done
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::AlreadyDone
+        );
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2, "a done hook ran again");
+    }
 
     #[test]
     fn no_installed_accounting_reads_as_unknown_not_zero() {

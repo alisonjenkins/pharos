@@ -210,6 +210,9 @@ const FALLBACK_TITLE: &str = "Downloaded track";
 /// music would then spend room an admitted video needs. Refused with a log
 /// line, as nothing queued.
 fn prefetch_ahead(lib: &content::Library, id: &str) -> usize {
+    // A video store that could not open at connect is tried again here, the
+    // service-only process's only later chance.
+    crate::service::retry_init("prefetch");
     if let Some(why) = prefetch_refusal(accounting_installed()) {
         log(&format!("prefetch refused id={id} reason={why}"));
         return 0;

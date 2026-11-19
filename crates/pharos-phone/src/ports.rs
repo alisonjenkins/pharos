@@ -291,7 +291,9 @@ impl Budget for PhoneBudget {
 /// sees the store.
 pub fn register_video() {
     match crate::activity::files_dir() {
-        Ok(dir) => register_video_at(dir.join("video")),
+        Ok(dir) => {
+            register_video_at(dir.join("video"));
+        }
         Err(e) => log::warn!(
             "pharos: port video_store verdict=not_registered reason=no_files_dir error={e}"
         ),
@@ -300,9 +302,11 @@ pub fn register_video() {
 
 /// What the media service runs when it connects the library, so a process
 /// the car started with no activity (where `register_video` never runs)
-/// still counts the video's bytes before music prefetches.
-fn accounting_init(files: &str) {
-    register_video_at(std::path::Path::new(files).join("video"));
+/// still counts the video's bytes before music prefetches. `false` while
+/// the store could not be opened: the service runs it again on its next
+/// connect or prefetch, and music stays refused until then.
+fn accounting_init(files: &str) -> bool {
+    register_video_at(std::path::Path::new(files).join("video"))
 }
 
 /// Installs `accounting_init` in `pharos_android` as this library loads: a
@@ -319,7 +323,9 @@ static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
 /// Claimed by the first `register_video_at`, before it touches the folder.
 static OPENED: pharos_ui::native::ports::OpenOnce = pharos_ui::native::ports::OpenOnce::new();
 
-fn register_video_at(root: std::path::PathBuf) {
+/// Whether a store is, or is being, registered on `root`: `false` only when
+/// none was opened and a later caller may try again.
+fn register_video_at(root: std::path::PathBuf) -> bool {
     use pharos_ui::native::ports::{register_video_root, Registration};
     let outcome = register_video_root(
         &root,
@@ -329,6 +335,10 @@ fn register_video_at(root: std::path::PathBuf) {
             let budget = Arc::new(PhoneBudget { dir: root.clone() });
             pharos_ui::native::register_phone_video_store(root.clone(), budget)
         },
+    );
+    let settled = !matches!(
+        outcome,
+        Registration::NoFolder(_) | Registration::NotOpened(_)
     );
     match outcome {
         // The first caller may still be opening the store: the UI's readers
@@ -354,6 +364,7 @@ fn register_video_at(root: std::path::PathBuf) {
             root.display()
         ),
     }
+    settled
 }
 
 /// The UI's container for a library id; `None` for anything but an album or
