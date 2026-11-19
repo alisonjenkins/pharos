@@ -218,15 +218,17 @@ pub struct LyricsFinder {
     /// the memo so the memo's emptying cannot lose it: without a disk cache,
     /// or when its write failed, nothing else does.
     repicked: Mutex<HashMap<(u64, String), Option<Lyrics>>>,
-    /// Holds the next disk read: says it began, then waits to be let go.
+    /// Holds the next read at a named point (`"local"`, `"disk"`): says it
+    /// began, then waits to be let go.
     #[cfg(test)]
-    read_disk_paused: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
+    paused: Mutex<HashMap<&'static str, Pause>>,
 }
+
+#[cfg(test)]
+type Pause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 type Repicked = Mutex<HashMap<(u64, String), Option<Lyrics>>>;
 
@@ -301,7 +303,7 @@ impl LyricsFinder {
             aligner: None,
             repicked: Mutex::default(),
             #[cfg(test)]
-            read_disk_paused: Mutex::default(),
+            paused: Mutex::default(),
         }
     }
 
@@ -324,6 +326,11 @@ impl LyricsFinder {
 
     pub async fn find(&self, item: &MediaItem) -> Option<Lyrics> {
         let started = Instant::now();
+        // Taken with the item, before anything is awaited: a repick for a
+        // retag made while this lookup waits must count as after it.
+        let asked_at = cache::now_secs();
+        #[cfg(test)]
+        self.pause("local").await;
         let path = item.path.clone();
         let local = tokio::task::spawn_blocking(move || local(&path))
             .await
@@ -333,7 +340,7 @@ impl LyricsFinder {
             });
         let found = match local {
             Some(found) => Some(found),
-            None => self.online(item).await,
+            None => self.online(item, asked_at).await,
         }
         .map(|l| {
             let last_line_ms = l.lines.iter().filter_map(|line| line.start_ms).max();
@@ -369,10 +376,8 @@ impl LyricsFinder {
         found
     }
 
-    async fn online(&self, item: &MediaItem) -> Option<Lyrics> {
-        // Taken with the song, before anything is awaited: a repick for a
-        // retag made while this lookup waits must count as after it.
-        let asked_at = cache::now_secs();
+    /// The online answer for `item`, as snapshotted at `asked_at`.
+    async fn online(&self, item: &MediaItem, asked_at: u64) -> Option<Lyrics> {
         let online = self.online.as_ref()?;
         let Some(song) = Song::of(item) else {
             tracing::debug!(
@@ -691,6 +696,15 @@ impl LyricsFinder {
         }
     }
 
+    #[cfg(test)]
+    async fn pause(&self, at: &'static str) {
+        let held = self.paused.lock().ok().and_then(|mut p| p.remove(at));
+        if let Some((began, go)) = held {
+            let _ = began.send(());
+            let _ = go.await;
+        }
+    }
+
     /// A standing answer from the disk cache and how old it is, `None` when
     /// there is none.
     async fn read_disk(
@@ -700,12 +714,7 @@ impl LyricsFinder {
         song: &Song,
     ) -> Option<(Option<Lyrics>, Duration)> {
         #[cfg(test)]
-        let paused = self.read_disk_paused.lock().ok().and_then(|mut p| p.take());
-        #[cfg(test)]
-        if let Some((began, go)) = paused {
-            let _ = began.send(());
-            let _ = go.await;
-        }
+        self.pause("disk").await;
         let disk = Arc::clone(self.disk.as_ref()?);
         let song = song.clone();
         let cached = tokio::task::spawn_blocking(move || disk.get(id, provider, &song))
@@ -1708,47 +1717,51 @@ mod tests {
         assert_eq!(counted, [("none".to_owned(), 1)]);
     }
 
-    /// A lookup that took the song as tagged, then waited on the disk cache
-    /// while the item was retagged and repicked, does not replace the
-    /// repick when it answers: it was asked before the repick, though it
-    /// reached the provider after. Disarm check: with `asked_at` taken
-    /// after `read_disk`, this fails.
+    /// A lookup that snapshotted the item, then waited on the local read or
+    /// the disk cache while the item was retagged and repicked, does not
+    /// replace the repick when it answers: it was asked before the repick,
+    /// though it reached the provider after. Disarm check: with `asked_at`
+    /// taken in `online` after `read_disk`, this fails at both points.
     #[test]
     fn a_lookup_paused_across_a_retag_and_repick_does_not_replace_it() {
         use tokio::sync::oneshot;
-        let dir = tempfile::tempdir().unwrap();
-        let item = timed_item(dir.path());
-        let mut retagged = item.clone();
-        retagged.probe.title = Some("Another Song".into());
-        let online = searching(Ok(records(sung())));
-        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
-        let (began_tx, began) = oneshot::channel();
-        let (go, go_rx) = oneshot::channel();
-        *finder.read_disk_paused.lock().unwrap() = Some((began_tx, go_rx));
-        let next_second = || async {
-            let now = cache::now_secs();
-            while cache::now_secs() == now {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        let ((_, picked), _) = with_outcomes(async {
-            tokio::join!(finder.online(&item), async {
-                began.await.unwrap();
-                next_second().await;
-                let picked = finder.repick(&retagged, &wrong(), &heard()).await;
-                next_second().await;
-                go.send(()).unwrap();
-                picked
-            })
-        });
-        assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))));
-        let later = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
-        let song = Song::of(&retagged).unwrap();
-        assert!(later
-            .disk
-            .as_ref()
-            .unwrap()
-            .repicked(retagged.id, online.name(), &song));
+        for at in ["local", "disk"] {
+            let dir = tempfile::tempdir().unwrap();
+            let item = timed_item(dir.path());
+            let mut retagged = item.clone();
+            retagged.probe.title = Some("Another Song".into());
+            let online = searching(Ok(records(sung())));
+            let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+            let (began_tx, began) = oneshot::channel();
+            let (go, go_rx) = oneshot::channel();
+            finder.paused.lock().unwrap().insert(at, (began_tx, go_rx));
+            let next_second = || async {
+                let now = cache::now_secs();
+                while cache::now_secs() == now {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let ((_, picked), _) = with_outcomes(async {
+                tokio::join!(finder.find(&item), async {
+                    began.await.unwrap();
+                    next_second().await;
+                    let picked = finder.repick(&retagged, &wrong(), &heard()).await;
+                    next_second().await;
+                    go.send(()).unwrap();
+                    picked
+                })
+            });
+            assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))), "{at}");
+            let song = Song::of(&retagged).unwrap();
+            assert!(
+                finder
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .repicked(retagged.id, online.name(), &song),
+                "paused at {at}: the repick was replaced"
+            );
+        }
     }
 
     #[test]
