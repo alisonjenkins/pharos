@@ -491,8 +491,15 @@ enum Check {
         ready: bool,
         unknown: bool,
     },
-    /// A resumed one.
-    Resume,
+    /// A resumed one, with the shared figures read as for `Fresh`: a plan
+    /// that admission widens past the reservation (staging files a
+    /// settlement kept) is checked against the shared cap with them.
+    Resume {
+        other: u64,
+        cap: u64,
+        ready: bool,
+        unknown: bool,
+    },
 }
 
 enum Admission {
@@ -1612,6 +1619,37 @@ impl Inner {
             } else {
                 plan
             };
+            // A resume keeps the cap it was admitted under only while its
+            // reservation holds the plan: one the kept staging files widened
+            // past it passes the shared cap as a fresh download.
+            let held = st
+                .list
+                .iter()
+                .find(|v| v.user == user && v.item == item)
+                .map_or(0, |v| v.estimated_bytes);
+            let check = match check {
+                Check::Resume {
+                    other,
+                    cap,
+                    ready,
+                    unknown,
+                } if retained > 0 && plan.wants() > held => {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video resume replanned item={item} run={run} reason=retained_parts_raised_estimate estimated={held} wants={} retained_parts={retained}",
+                            plan.wants()
+                        ),
+                    );
+                    Check::Fresh {
+                        other,
+                        cap,
+                        ready,
+                        unknown,
+                    }
+                }
+                check => check,
+            };
             // What the running downloads still owe is read before the free
             // space is measured: a write landing in between lowers free, and
             // the stale (higher) owed figure only makes the check stricter.
@@ -1678,7 +1716,7 @@ impl Inner {
                 // The cap was met when the download began and its stored
                 // bytes are counted; what is left needs room, and 0 free
                 // (an unreadable measure) is no room.
-                Check::Resume => fits(
+                Check::Resume { .. } => fits(
                     plan.estimate.saturating_sub(plan.stored),
                     0,
                     u64::MAX,
@@ -3143,31 +3181,39 @@ async fn plan_and_admit(
         } else {
             None
         };
+        if let Some(reason) = replan {
+            emit(
+                false,
+                format!(
+                    "pharos: video resume replanned item={item} reason={reason} estimated={} wants={wants} stored={stored_bytes}",
+                    record.estimated_bytes
+                ),
+            );
+        }
+        let progress = inner.env.budget.other_in_progress_bytes();
+        // What music holds, and what it has approved and not yet written:
+        // both are part of the shared cap.
+        let other = inner
+            .env
+            .budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = inner.env.budget.cap_bytes();
+        let unknown = progress.is_none();
         let check = if resume && replan.is_none() {
-            Check::Resume
-        } else {
-            if let Some(reason) = replan {
-                emit(
-                    false,
-                    format!(
-                        "pharos: video resume replanned item={item} reason={reason} estimated={} wants={wants} stored={stored_bytes}",
-                        record.estimated_bytes
-                    ),
-                );
-            }
-            let progress = inner.env.budget.other_in_progress_bytes();
-            Check::Fresh {
-                // What music holds, and what it has approved and not yet
-                // written: both are part of the shared cap.
-                other: inner
-                    .env
-                    .budget
-                    .other_used_bytes()
-                    .saturating_add(other_outstanding)
-                    .saturating_add(progress.unwrap_or(0)),
-                cap: inner.env.budget.cap_bytes(),
+            Check::Resume {
+                other,
+                cap,
                 ready,
-                unknown: progress.is_none(),
+                unknown,
+            }
+        } else {
+            Check::Fresh {
+                other,
+                cap,
+                ready,
+                unknown,
             }
         };
         (
@@ -3198,7 +3244,7 @@ async fn plan_and_admit(
                 Check::Fresh { cap, .. } => {
                     format!("resume={resume} estimate={estimate} used={used} cap={cap}")
                 }
-                Check::Resume => format!(
+                Check::Resume { .. } => format!(
                     "resume=true remaining={} stored={stored_bytes}",
                     estimate.saturating_sub(stored_bytes)
                 ),
@@ -11133,6 +11179,43 @@ pub(crate) mod tests {
         );
         store.settled().await;
         FAIL_PART_DELETE.with(|f| f.set(false));
+    }
+
+    /// A resume whose plan the kept staging file widens past its
+    /// reservation is checked against the shared cap, not only the free
+    /// space: here the widened plan does not fit the cap, and is refused.
+    #[tokio::test]
+    async fn a_resume_widened_by_a_kept_staging_file_is_checked_against_the_cap() {
+        let rig = Rig::new("host-resume-part-cap");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, _dir, _part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        rig.budget.cap.store(big + 1_000_000, Ordering::SeqCst);
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        let log = captured();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("reason=retained_parts_raised_estimate")),
+            "{log:?}"
+        );
+        assert!(
+            matches!(decided.state, KeptState::Failed { .. })
+                || log
+                    .iter()
+                    .any(|l| l.contains("pharos: video keep refused item=1")),
+            "a widened resume passed on free space alone: {decided:?} {log:?}"
+        );
     }
 
     /// A car-only process: a removed download's folder that would not
