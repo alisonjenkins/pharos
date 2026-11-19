@@ -154,6 +154,12 @@ impl Metrics {
             .and_then(|b| {
                 b.set_buckets_for_metric(Matcher::Full(SEPARATION_SECONDS.into()), SONG_BUCKETS)
             })
+            .and_then(|b| {
+                b.set_buckets_for_metric(
+                    Matcher::Full(crate::check::TEXT_RECALL.into()),
+                    crate::check::TEXT_RECALL_BUCKETS,
+                )
+            })
             .and_then(PrometheusBuilder::install_recorder)
             .map_err(|e| format!("prometheus recorder: {e}"))?;
         let process = metrics_process::Collector::default();
@@ -183,6 +189,10 @@ impl Metrics {
             SEPARATION_SECONDS,
             metrics::Unit::Seconds,
             "Wall time of one song's vocal separation, by outcome"
+        );
+        metrics::describe_histogram!(
+            crate::check::TEXT_RECALL,
+            "Share of the lyric's word pairs the recogniser heard, per song with a transcript"
         );
         metrics::describe_histogram!(
             SONG_SECONDS,

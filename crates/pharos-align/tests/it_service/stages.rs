@@ -353,6 +353,43 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
     assert_eq!(events.len(), 3);
 }
 
+/// V1468: every song with a transcript says how much of its lyric text was
+/// heard, on the placed path, the fallback path and a failed later stage;
+/// a song with no transcript says nothing.
+#[test]
+fn every_song_with_a_transcript_carries_its_text_check() {
+    let (sung, _) = song();
+    let (placed, _) = with(Step::Works, Step::Works, Some(sung));
+    let check = placed.check.expect("a placed song carries its check");
+    assert_eq!(check.text_recall, Some(1.0));
+    assert_eq!(check.heard_words, 6);
+
+    let (no_emission, _) = with(Step::Works, Step::Works, None);
+    assert_eq!(
+        no_emission.placement.fallback,
+        Some(Fallback::EmissionFailed)
+    );
+    assert_eq!(no_emission.check.map(|c| c.heard_words), Some(6));
+
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: heard("the lanterns swing in the orchard", 1.0),
+        slow: Duration::ZERO,
+    };
+    let (got, _) =
+        run(&Engine::new(loader(Some(song().0)), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::LowAnchorShare));
+    let check = got.check.expect("a fallen-back song carries its check");
+    assert_eq!(check.text_recall, Some(0.0));
+    assert_eq!(check.heard_words, 6);
+
+    let (failed, _) = with(Step::Works, Step::Fails, None);
+    assert_eq!(failed.check, None);
+    let (before, _) = today();
+    assert_eq!(before.check, None);
+}
+
 #[test]
 fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let (sung, _) = song();
