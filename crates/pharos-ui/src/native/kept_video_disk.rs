@@ -353,6 +353,11 @@ struct Inner {
     env: Env,
     state: Mutex<State>,
     /// Held while a record is written or an item's folder is removed.
+    ///
+    /// Lock order: the host's admission guard (`Budget::admission_guard`)
+    /// first, then `saves`, then `state`. A save made under admission (a
+    /// plan's, an extended reservation's) takes them in that order, so
+    /// nothing may take admission while holding `saves`.
     saves: Mutex<()>,
     /// When the unknown-size sweep last ran from the host's size check.
     last_sweep: Mutex<Option<std::time::Instant>>,
@@ -4820,6 +4825,12 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn remove(&self, user: &str, item: &str) {
+        // The folder turns unknown in this hold: under the lock the host
+        // shares with music admission, so an admission never reads its
+        // figures half before and half after. Held for the transition only,
+        // never while the folder is deleted. Taken before `saves`, in the
+        // order a save under admission takes them (see `Inner::saves`).
+        let admission = self.inner.env.budget.admission_guard();
         // Held to the end: no record is written into the folder while it
         // goes, and none after.
         let _saving = self
@@ -4827,11 +4838,6 @@ impl VideoStore for DiskVideoStore {
             .saves
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // The folder turns unknown in this hold: under the lock the host
-        // shares with music admission, so an admission never reads its
-        // figures half before and half after. Held for the transition only,
-        // never while the folder is deleted.
-        let admission = self.inner.env.budget.admission_guard();
         let record = {
             let mut st = lock(&self.inner.state);
             let Some(record) = take(&mut st.list, user, item) else {
@@ -7947,6 +7953,38 @@ pub(crate) mod tests {
             rig.budget.held.load(Ordering::SeqCst),
             0,
             "held through the delete"
+        );
+    }
+
+    /// A removal waits for the admission lock before it takes the saves
+    /// lock, the order a save under admission takes them in: a save made
+    /// while admission is held (as a plan's is) is not blocked by a removal
+    /// waiting on that admission.
+    #[tokio::test]
+    async fn a_removal_takes_admission_before_the_saves_lock() {
+        let rig = Rig::new("remove-lock-order");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let guard = rig.budget.admission_guard();
+        let s2 = store.clone();
+        let removal = std::thread::spawn(move || s2.remove("u1", "1"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s3 = store.clone();
+        let save = std::thread::spawn(move || {
+            s3.save_position("u1", "1", 5_000);
+            let _ = tx.send(());
+        });
+        let saved = rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok();
+        drop(guard);
+        removal.join().unwrap();
+        save.join().unwrap();
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
+        assert!(
+            saved,
+            "a save under admission waited on a removal holding the saves lock"
         );
     }
 
