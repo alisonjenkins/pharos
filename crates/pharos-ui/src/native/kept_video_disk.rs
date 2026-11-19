@@ -3095,12 +3095,65 @@ async fn wait_for_revoked_writers(
     }
 }
 
+/// Holds a run until the music cache's figures can be read: its cap is
+/// checked against them, so planning before they are refuses, and a
+/// refused run (a download restarted at launch, before the music cache is
+/// up) would end Failed with nothing to restart it. A wait, never a
+/// failure: each look that finds them not ready is logged with what was
+/// missing, and the run asks again after a backoff of up to 30 s, so it
+/// resumes once they are. Nothing is reserved meanwhile. Err(Gone) when
+/// the run no longer owns the download.
+async fn wait_for_accounting(
+    inner: &Arc<Inner>,
+    user: &str,
+    item: &str,
+    run: u64,
+) -> Result<(), Stop> {
+    let mut wait_s = 1u64;
+    let mut logged = None;
+    loop {
+        let (ready, known) = {
+            let budget = &inner.env.budget;
+            let _admission = budget.admission_guard();
+            (
+                budget.accounting_ready(),
+                budget.other_in_progress_bytes().is_some(),
+            )
+        };
+        if ready && known {
+            return Ok(());
+        }
+        if lock(&inner.state)
+            .runs
+            .get(&(user.to_owned(), item.to_owned()))
+            != Some(&run)
+        {
+            return Err(Stop::Gone);
+        }
+        // Logged when the wait starts and when what is missing changes.
+        if logged != Some((ready, known)) {
+            logged = Some((ready, known));
+            emit(
+                true,
+                format!(
+                    "pharos: video keep waiting item={item} run={run} reason=accounting_not_ready music_ready={ready} music_in_progress_known={known} wait_s={wait_s}"
+                ),
+            );
+        }
+        (inner.env.sleep)(wait_s).await;
+        // A host whose sleep returns at once still lets other work run.
+        tokio::task::yield_now().await;
+        wait_s = (wait_s * 2).min(30);
+    }
+}
+
 async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
     let record = find(&lock(&inner.state).list, user, item)
         .cloned()
         .ok_or(Stop::Gone)?;
     let resume = !record.files.is_empty();
     wait_for_revoked_writers(inner, user, item, run).await?;
+    wait_for_accounting(inner, user, item, run).await?;
     // An earlier run's staging files go before the plan is admitted: the
     // admission replaces the floor that counted them, and the walks after it
     // count this run's files only. One that will not go keeps the folder
@@ -5443,6 +5496,48 @@ mod tests {
         assert!(store.stored_file("u1", SEG1).is_some());
     }
 
+    /// A download interrupted by a restart that opens before the music
+    /// cache's figures are ready waits for them, Downloading, and resumes
+    /// once they are: it does not end Failed with nothing to restart it.
+    #[tokio::test]
+    async fn a_restart_before_accounting_is_ready_waits_and_resumes() {
+        let rig = Rig::new("restart-not-ready");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let manifest = rig.dir.join("u1").join("1").join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 4,
+            total: 5,
+            bytes: 1,
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        rig.slept.lock().unwrap().clear();
+        let store = rig.open();
+        for _ in 0..2000 {
+            if rig.slept.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let v = only(&store);
+        assert!(
+            matches!(v.state, KeptState::Downloading { .. }),
+            "the restarted download did not wait for accounting: {v:?}"
+        );
+        assert!(
+            !lines("pharos: video keep waiting item=1").is_empty(),
+            "the wait was not logged"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
     #[tokio::test]
     async fn an_interrupted_download_resumes_after_a_restart() {
         let rig = Rig::new("interrupted");
@@ -5920,8 +6015,13 @@ mod tests {
         store.settled().await;
         assert!(only(&store).ready());
         let reads = rig.budget.reads.lock().unwrap().clone();
-        // The start, the two playlists' reservations, then the plan.
-        assert_eq!(reads, ["outstanding", "in_progress"].repeat(4));
+        // The start; the run's look at whether the music's figures can be
+        // read (`wait_for_accounting`, not an admission: it reads only
+        // whether the written figure is known); the two playlists'
+        // reservations, then the plan.
+        let mut want = vec!["outstanding", "in_progress", "in_progress"];
+        want.extend(["outstanding", "in_progress"].repeat(3));
+        assert_eq!(reads, want);
     }
 
     /// A resume missing its playlist with no room left under the shared cap
@@ -9213,45 +9313,63 @@ mod tests {
         assert!(only(&store).ready());
     }
 
+    /// Waits, bounded, until the run has logged that it waits for the
+    /// accounting and slept at least once.
+    async fn until_waiting(rig: &Rig, item: &str) {
+        for _ in 0..2000 {
+            if !lines(&format!("pharos: video keep waiting item={item}")).is_empty()
+                && !rig.slept.lock().unwrap().is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the run of {item} never waited for the accounting");
+    }
+
     /// A download that restarts with no plan and none of its files is fresh:
-    /// it passes the same readiness gate as a start, or it would be admitted
-    /// against the default cap and no music.
+    /// it plans only once the shared accounting is ready, or it would be
+    /// admitted against the default cap and no music. It waits for it,
+    /// admitting nothing meanwhile, and does not end Failed.
     #[tokio::test]
     async fn a_restarted_download_with_no_plan_waits_for_the_shared_accounting() {
         let rig = Rig::new("fresh-not-ready");
-        let store = rig.open();
-        store.start(request("1")).unwrap();
-        // The music cache went away between the start and the run's plan.
+        // The music cache is not up when the run would plan.
         rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        until_waiting(&rig, "1").await;
+        assert!(matches!(only(&store).state, KeptState::Downloading { .. }));
+        assert_eq!(store.kept_bytes(), 0, "admitted without the accounting");
+        assert!(
+            rig.server.asked().is_empty(),
+            "planned without the accounting"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
         store.settled().await;
-        let KeptState::Failed { reason } = only(&store).state else {
-            panic!("a fresh plan was admitted without the shared accounting");
-        };
-        assert!(reason.contains("music cache is not up"), "{reason}");
-        assert_eq!(store.kept_bytes(), 0);
+        assert!(only(&store).ready());
     }
 
-    /// The music library is published while a fresh plan is being admitted,
-    /// after the figures were read: the plan is refused, not checked against
-    /// the default cap and no music.
+    /// The music library is published while a run waits for it: the plan
+    /// is checked against the library's real cap, never the default cap and
+    /// no music it saw before.
     #[tokio::test]
     async fn a_library_published_during_admission_does_not_pass_a_stale_check() {
         let rig = Rig::new("publish-during-run");
         let store = rig.open();
         store.start(request("1")).unwrap();
         rig.budget.ready.store(false, Ordering::SeqCst);
-        let b = rig.budget.clone();
-        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
-            // The library goes up, with the real (tiny) cap.
-            b.cap.store(1, Ordering::SeqCst);
-            b.ready.store(true, Ordering::SeqCst);
-        }));
+        until_waiting(&rig, "1").await;
+        // The library goes up, with the real (tiny) cap.
+        rig.budget.cap.store(1, Ordering::SeqCst);
+        rig.budget.ready.store(true, Ordering::SeqCst);
         store.settled().await;
-        *rig.budget.on_free.lock().unwrap() = None;
         let KeptState::Failed { reason } = only(&store).state else {
             panic!("the plan was admitted against the default cap");
         };
-        assert!(reason.contains("music cache is not up"), "{reason}");
+        assert!(!reason.contains("music cache is not up"), "{reason}");
     }
 
     /// The same for a start.
@@ -9272,7 +9390,8 @@ mod tests {
     }
 
     /// An interrupted download reopened with no plan and none of its files
-    /// is fresh: reopened with the accounting not up, it waits for it.
+    /// is fresh: reopened with the accounting not up, it waits for it, and
+    /// downloads once it is.
     #[tokio::test]
     async fn a_reopened_interrupted_download_with_no_plan_waits_for_the_accounting() {
         let rig = Rig::new("reopen-no-plan");
@@ -9284,12 +9403,16 @@ mod tests {
         }
         drop(first);
         rig.budget.ready.store(false, Ordering::SeqCst);
+        rig.slept.lock().unwrap().clear();
         let store = rig.open();
+        until_waiting(&rig, "1").await;
+        assert!(
+            matches!(only(&store).state, KeptState::Downloading { .. }),
+            "the restarted download was admitted without the accounting"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
         store.settled().await;
-        let KeptState::Failed { reason } = only(&store).state else {
-            panic!("the restarted download was admitted without the accounting");
-        };
-        assert!(reason.contains("music cache is not up"), "{reason}");
+        assert!(only(&store).ready());
     }
 
     /// A walk of the folder that comes back short (a transient EMFILE) must
