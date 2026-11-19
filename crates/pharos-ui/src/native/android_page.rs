@@ -2033,6 +2033,13 @@ pub fn token_user_if(seen: &str) -> Result<Option<String>, String> {
     android::load_token_user_if(seen)
 }
 
+/// Drops the device token an ended session was opened with, only while it
+/// is still the one on file (`token_file::forget_if`): a replacement a new
+/// sign-in stored is kept. False when it was kept.
+pub fn forget_token_if(seen: &str) -> bool {
+    android::forget_refused_token(seen)
+}
+
 /// Keeps `user` with the device token, at sign-in, only while the token on
 /// file is still `seen`, the one the request that named `user` was built
 /// with. Err `token_changed` (a new sign-in's token landed in between: it

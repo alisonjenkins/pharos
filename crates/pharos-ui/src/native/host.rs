@@ -624,6 +624,11 @@ pub fn token_user_if(_seen: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Drops an ended session's device token; there is none here.
+pub fn forget_token_if(_seen: &str) -> bool {
+    true
+}
+
 /// Keeps `user` with the device token; nothing to do where there is none.
 pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
     Ok(())

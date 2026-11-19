@@ -899,6 +899,45 @@ fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
     kept
 }
 
+/// A signed-in session has ended for good (the app shows sign-in after it
+/// was Ready: a revocation, a refused resume, a sign-out). Its user is
+/// forgotten ([`forget_user`]), and the device token the session was
+/// opened with is invalidated, only while it is still the one on file: a
+/// replacement a new sign-in stored is kept. Without that, a revoked user's
+/// token and a preference whose clearing failed would both still name
+/// them, and an offline restart would show their downloads again. An
+/// outage never comes here (the machine keeps the session).
+pub fn session_ended() {
+    let ended = with_session_token(Option::take);
+    forget_user();
+    let Some(token) = ended.and_then(|t| t.0) else {
+        super::platform::info("pharos: token forget verdict=none reason=no_session_token");
+        return;
+    };
+    let forgot = forget_session_token(&token);
+    super::platform::info(&format!(
+        "pharos: token forget verdict={} reason=session_ended",
+        if forgot {
+            "forgotten"
+        } else {
+            "kept_replacement"
+        }
+    ));
+}
+
+/// Drops `token` only while it is the one on file. False when a new
+/// sign-in replaced it.
+fn forget_session_token(token: &str) -> bool {
+    #[cfg(test)]
+    if let Some(path) = tests::PREF.with(|p| p.borrow().as_ref().and_then(tests::Pref::file)) {
+        return !matches!(
+            super::token_file::forget_if(&path, token),
+            Ok(super::token_file::ForgetIf::Changed)
+        );
+    }
+    super::platform::forget_token_if(token)
+}
+
 /// Notes a sign-out. Nobody is signed in from this call on, whatever the
 /// preference write does.
 pub fn forget_user() {
@@ -1104,6 +1143,10 @@ pub(crate) mod tests {
                     .map(|s| s.token),
                 None => self.token_present.get().then(|| "tok".to_owned()),
             }
+        }
+        /// The real token file the seam reads, when it has one.
+        pub(super) fn file(&self) -> Option<std::path::PathBuf> {
+            self.file.borrow().clone()
         }
         /// What the sign-out does to the token: it and its user are gone.
         pub(super) fn clear_token(&self) {
@@ -1929,6 +1972,55 @@ pub(crate) mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("{user}'s download never asked for its first file");
+    }
+
+    /// A session that ends for good (a revocation from Ready) drops the
+    /// token it was opened with, so an offline restart whose preference
+    /// could not be cleared serves nobody; a token a new sign-in stored
+    /// since is kept.
+    #[test]
+    fn a_session_end_drops_its_own_token_and_keeps_a_replacement() {
+        use super::super::token_file;
+        let d = TmpDir::new("session-end-token");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let resumer = FakeResumer::new(&path);
+            let Resumed::Opened(session_a) = resume_session(&resumer).await else {
+                panic!("A's token did not open A's session");
+            };
+            session_replaced(&session_a);
+            assert!(me_request(true, Some(session_a)).unwrap().answered("A"));
+            // The preference cannot be cleared.
+            p.fail_write.set(true);
+            session_ended();
+            assert_eq!(
+                token_file::read(&path).unwrap(),
+                None,
+                "the revoked token stayed"
+            );
+            // An offline restart.
+            set_identity(Identity::Unknown);
+            assert_eq!(last_user(), None, "the revoked user came back offline");
+            p.fail_write.set(false);
+
+            token_file::store(&path, "tokA").unwrap();
+            let Resumed::Opened(session_a) = resume_session(&resumer).await else {
+                panic!("A's new token did not open A's session");
+            };
+            session_replaced(&session_a);
+            assert!(me_request(true, Some(session_a)).unwrap().answered("A"));
+            // B signs in on the media service before A's session ends.
+            token_file::store(&path, "tokB").unwrap();
+            session_ended();
+            assert_eq!(
+                token_file::read(&path).unwrap().map(|s| s.token).as_deref(),
+                Some("tokB"),
+                "the replacement token was dropped"
+            );
+        });
     }
 
     /// The late store, end to end on the host, through the code the phone

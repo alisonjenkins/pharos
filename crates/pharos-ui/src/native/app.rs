@@ -1910,7 +1910,7 @@ fn mark_handler(
 /// the previous user's offline identity goes with it (the machine runs the
 /// hook). The one place it is built, so a test of the hook tests the app's.
 fn app_machine() -> Machine {
-    Machine::new().with_session_end(offline_video::forget_user)
+    Machine::new().with_session_end(offline_video::session_ended)
 }
 
 /// What a `me` fetch returns, built by the caller (the app's retried call,
