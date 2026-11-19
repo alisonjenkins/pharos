@@ -276,6 +276,12 @@ pub trait VideoStore: Send + Sync {
     fn unreadable_count(&self) -> usize {
         0
     }
+    /// How many folders a removal or discard could not delete: they still
+    /// count against the cap, and a sweep or a discard tries them again.
+    /// Zero for a store with no such folders.
+    fn leftover_count(&self) -> usize {
+        0
+    }
     /// Deletes the folders whose record still cannot be read, returning the
     /// bytes freed. Err names why it could not, or what stayed. A store with
     /// no folders to discard (the web's) refuses.

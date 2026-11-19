@@ -5084,6 +5084,10 @@ impl VideoStore for DiskVideoStore {
         lock(&self.inner.state).held.len()
     }
 
+    fn leftover_count(&self) -> usize {
+        lock(&self.inner.state).tombstones.len()
+    }
+
     fn discard_unreadable(&self) -> Result<u64, String> {
         let freed = self.inner.discard_held();
         // What would not delete is a tombstone now: try it again at once.
@@ -10173,11 +10177,16 @@ pub(crate) mod tests {
         assert!(dir.exists());
         assert!(store.kept_bytes() > 0, "counted for nothing");
         assert!(!lines("pharos: video held folder verdict=discard_failed").is_empty());
+        // No longer unreadable, but still there: Downloads still offers to
+        // remove it.
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(store.leftover_count(), 1, "the folder left is not offered");
         // The next sweep deletes it and the block lifts.
         store.start(request("2")).unwrap();
         store.settled().await;
         assert!(!dir.exists());
         assert!(!store.size_unknown());
+        assert_eq!(store.leftover_count(), 0, "cleanup done but still offered");
     }
 
     /// A discard never deletes a download whose manifest reads: it is

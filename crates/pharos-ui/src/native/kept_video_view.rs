@@ -174,6 +174,10 @@ pub fn VideoList(
     /// downloads until removed. The row shows only when there are some.
     #[props(default)]
     unreadable: usize,
+    /// Folders a removal could not delete: still on the device and in the
+    /// cap. They keep the row (and Remove them) up until they are gone.
+    #[props(default)]
+    leftover: usize,
     #[props(default)] on_discard: EventHandler<()>,
     /// A discard is running: its button is disabled until it ends.
     #[props(default)]
@@ -186,13 +190,24 @@ pub fn VideoList(
         if let Some(text) = problem {
             p { class: "pharos-notice", role: "alert", "{text}" }
         }
-        if unreadable > 0 {
+        if unreadable > 0 || leftover > 0 {
             div { class: "pharos-download-head", id: "pharos-video-unreadable",
-                span { class: "pharos-muted",
-                    if unreadable == 1 {
-                        "1 download couldn't be read."
-                    } else {
-                        "{unreadable} downloads couldn't be read."
+                if unreadable > 0 {
+                    span { class: "pharos-muted",
+                        if unreadable == 1 {
+                            "1 download couldn't be read."
+                        } else {
+                            "{unreadable} downloads couldn't be read."
+                        }
+                    }
+                }
+                if leftover > 0 {
+                    span { class: "pharos-muted",
+                        if leftover == 1 {
+                            "1 download couldn't be removed."
+                        } else {
+                            "{leftover} downloads couldn't be removed."
+                        }
                     }
                 }
                 button {
@@ -276,6 +291,8 @@ struct Listing {
     owner: Option<String>,
     videos: Vec<KeptVideo>,
     unreadable: usize,
+    /// Folders a removal left: see [`VideoStore::leftover_count`].
+    leftover: usize,
 }
 
 /// The listing to show for `user` now: nothing without a store or a user,
@@ -288,6 +305,7 @@ fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
         owner: user.map(str::to_owned),
         videos: user.map(|u| store.videos(u)).unwrap_or_default(),
         unreadable: store.unreadable_count(),
+        leftover: store.leftover_count(),
     }
 }
 
@@ -336,13 +354,22 @@ fn use_listing(user: Option<String>) -> Signal<Listing> {
                 platform::SLEEP_IS_REAL,
                 || platform::sleep_ms(POLL_MS),
                 || {
-                    let was = shown.peek().unreadable;
+                    let (was, was_left) = {
+                        let s = shown.peek();
+                        (s.unreadable, s.leftover)
+                    };
                     let next = refreshed(&shown.peek(), read());
                     if let Some(now) = next {
                         if now.unreadable != was {
                             platform::info(&format!(
                                 "pharos: video listing unreadable verdict=changed from={was} to={}",
                                 now.unreadable
+                            ));
+                        }
+                        if now.leftover != was_left {
+                            platform::info(&format!(
+                                "pharos: video listing leftover verdict=changed from={was_left} to={}",
+                                now.leftover
                             ));
                         }
                         shown.set(now);
@@ -490,6 +517,7 @@ pub fn VideoDownloads(
     // a sweep makes renders again even when the list is the same; a discard
     // sets `problem`, which renders again too.
     let unreadable = store.unreadable_count();
+    let leftover = store.leftover_count();
     let discard_store = store.clone();
     let mut cap = use_signal(|| store.cap_bytes());
     let mut cap_notice = use_signal(|| None::<String>);
@@ -520,6 +548,7 @@ pub fn VideoDownloads(
                 cap: store.cap_bytes(),
                 problem: problem(),
                 unreadable,
+                leftover,
                 discarding: discarding(),
                 on_discard: move |()| start_discard(discard_store.clone(), discarding, problem),
                 on_play: move |item: String| match item.parse::<ItemRef>() {
@@ -915,11 +944,13 @@ mod tests {
             owner: None,
             videos: vec![],
             unreadable: 1,
+            leftover: 0,
         };
         let now = Listing {
             owner: None,
             videos: vec![],
             unreadable: 0,
+            leftover: 0,
         };
         assert_eq!(
             refreshed(&shown, now.clone()),
@@ -939,6 +970,7 @@ mod tests {
             owner: Some("A".into()),
             videos: a_rows.clone(),
             unreadable: 0,
+            leftover: 0,
         };
         let rows = rows_for(&shown, Some("B"), || Listing {
             owner: Some("B".into()),
@@ -1200,6 +1232,41 @@ mod tests {
                 && two.contains("Remove them"),
             "{two}"
         );
+    }
+
+    /// Folders a removal left behind keep the row, and its Remove them, up
+    /// after the unreadable ones are gone; the row goes once cleanup is done.
+    #[test]
+    fn folders_left_after_a_failed_removal_keep_remove_them() {
+        fn with(unreadable: usize, leftover: usize) -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    unreadable,
+                    leftover,
+                }
+            }
+        }
+        let left = render(|| with(0, 2));
+        assert!(
+            left.contains(">2 downloads couldn&#39;t be removed."),
+            "{left}"
+        );
+        assert!(left.contains("Remove them"), "{left}");
+        assert!(!left.contains("be read."), "{left}");
+        let both = render(|| with(1, 1));
+        assert!(both.contains(">1 download couldn&#39;t be read."), "{both}");
+        assert!(
+            both.contains(">1 download couldn&#39;t be removed."),
+            "{both}"
+        );
+        assert_eq!(both.matches("Remove them").count(), 1, "{both}");
+        let done = render(|| with(0, 0));
+        assert!(!done.contains("Remove them"), "{done}");
     }
 
     /// Only a ready video has Play; both have Remove; the total heads it.
