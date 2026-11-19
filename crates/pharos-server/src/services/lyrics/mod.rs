@@ -20,6 +20,7 @@ pub mod embedded;
 pub mod eta;
 pub mod lrc;
 pub mod lrclib;
+pub mod repick;
 pub mod shadow;
 pub mod sidecar;
 
@@ -176,6 +177,17 @@ pub trait OnlineLyrics: Send + Sync {
         &'a self,
         song: &'a Song,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>;
+
+    /// Every synced record the service holds under the song's title and
+    /// artist, in its own order, for picking another when the one found was
+    /// not what was sung (B1479). A service that cannot search has none.
+    fn search<'a>(
+        &'a self,
+        _song: &'a Song,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
+    {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
 }
 
 /// Online answers kept before the memo is emptied and starts again; bounds
