@@ -141,6 +141,35 @@ pub enum Forgotten {
 /// is gone for every reader, whatever the folder sync after it does.
 pub fn forget(path: &Path) -> Result<Forgotten, ContentError> {
     let _held = hold();
+    remove(path)
+}
+
+/// What [`forget_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetIf {
+    /// The token on file was the refused one, and it is gone (or there was
+    /// none).
+    Forgotten(Forgotten),
+    /// A sign-in replaced the token since it was read: the replacement is
+    /// kept, and nothing was removed.
+    Changed,
+}
+
+/// Removes the token and its user only while the token on file is `seen`,
+/// the one a refused resume was sent with. The compare and the removal are
+/// one step under the file's lock, so a sign-in that stored a new token in
+/// between keeps it. No token is nothing to remove.
+pub fn forget_if(path: &Path, seen: &str) -> Result<ForgetIf, ContentError> {
+    let _held = hold();
+    match read(path)? {
+        Some(s) if s.token != seen.trim() => Ok(ForgetIf::Changed),
+        Some(_) => remove(path).map(ForgetIf::Forgotten),
+        None => Ok(ForgetIf::Forgotten(Forgotten::Durable)),
+    }
+}
+
+/// Removes the file and syncs its folder. Called with the lock held.
+fn remove(path: &Path) -> Result<Forgotten, ContentError> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Forgotten::Durable),
@@ -383,6 +412,34 @@ mod tests {
     /// folder cannot be synced, so the removal never reached the disk),
     /// leaves the token gone (signed out) and reports why, naming an
     /// unsupported sync as such.
+    /// A refused token is removed only while it is still the one on file:
+    /// a sign-in that stored another since keeps it, with its user.
+    #[test]
+    fn a_refused_token_is_forgotten_only_while_it_is_on_file() {
+        let d = dir("forget-if");
+        let p = d.join("device-token");
+        store(&p, "tokB").unwrap();
+        store_user(&p, "B").unwrap();
+        assert_eq!(forget_if(&p, "tokA").unwrap(), ForgetIf::Changed);
+        assert_eq!(
+            read(&p).unwrap(),
+            Some(Stored {
+                token: "tokB".to_owned(),
+                user: Some("B".to_owned())
+            }),
+            "the replacement was removed with the refused token"
+        );
+        assert_eq!(
+            forget_if(&p, "tokB").unwrap(),
+            ForgetIf::Forgotten(Forgotten::Durable)
+        );
+        assert_eq!(read(&p).unwrap(), None);
+        assert_eq!(
+            forget_if(&p, "tokB").unwrap(),
+            ForgetIf::Forgotten(Forgotten::Durable)
+        );
+    }
+
     #[test]
     fn a_forgotten_token_is_synced_and_a_failed_sync_is_reported() {
         use std::io::ErrorKind::{InvalidInput, Other, Unsupported};
