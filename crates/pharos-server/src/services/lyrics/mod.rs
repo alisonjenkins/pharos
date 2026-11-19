@@ -803,11 +803,15 @@ impl LyricsFinder {
                     align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
                     // The lines timed so far, the rest still guessed by the
                     // client until the next answer (ADR-0121).
-                    align::Lookup::Partial(eta_ms, aligned) => {
+                    align::Lookup::Partial(eta_ms, aligned, held) => {
+                        if held {
+                            hold_words(&mut lyrics);
+                        }
                         with_words(&mut lyrics, &aligned);
                         words_pending = Some(WordsPending { eta_ms });
                     }
                     align::Lookup::Pending(eta_ms) => {
+                        hold_words(&mut lyrics);
                         words_pending = Some(WordsPending { eta_ms });
                     }
                     align::Lookup::Mismatch(_) => unsync_mismatch(&mut lyrics, item.id),
@@ -867,6 +871,15 @@ async fn mismatched(aligner: &Arc<align::Aligner>, item: &MediaItem, lyrics: &Ly
     tokio::task::spawn_blocking(move || aligner.mismatched(&item, &lyrics).is_some())
         .await
         .unwrap_or(false)
+}
+
+/// The lyrics' own word times, held back while the aligner has not yet
+/// heard whether they are what was sung (V1468): an online record's
+/// enhanced-LRC words may follow another song. The line times stay.
+fn hold_words(lyrics: &mut Lyrics) {
+    for line in &mut lyrics.lines {
+        line.words.clear();
+    }
 }
 
 /// The aligner's words onto `lyrics`. The aligner moved the song's lines onto
@@ -1730,6 +1743,54 @@ mod tests {
         assert!(not_sung.lines.iter().all(|l| l.start_ms.is_none()));
         let (other, _) = rt.block_on(finder.served(&item, sung(), false));
         assert_eq!(other, sung());
+    }
+
+    /// V1468: an online lyric with words on some lines (partly enhanced
+    /// LRC) is aligned, and its own words may follow another song as much
+    /// as the aligner's, so they are held back with them, pending and
+    /// partial alike, and come back once the aligner clears the text.
+    /// Disarm check: with `hold_words` emptied, this fails.
+    #[test]
+    fn a_lyrics_own_words_are_held_until_its_text_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        std::fs::write(&item.path, b"audio").unwrap();
+        let mut lyrics = synced(
+            &[
+                "grey gulls wheel above the quay",
+                "the river keeps its time",
+            ],
+            Origin::Online,
+        );
+        lyrics.lines[0].words = vec![WordStamp {
+            at: 0,
+            start_ms: 200,
+        }];
+        let (aligner, key) = align::tests::in_flight(dir.path(), &item, &lyrics);
+        let finder = LyricsFinder::default().with_aligner(Arc::clone(&aligner));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let serve = || rt.block_on(finder.served(&item, lyrics.clone(), true));
+        let words = |l: &Lyrics| l.lines.iter().map(|l| l.words.len()).collect::<Vec<_>>();
+
+        let (pending, waiting) = serve();
+        assert!(waiting.is_some());
+        assert_eq!(words(&pending), [0, 0], "pending");
+        assert_eq!(pending.lines[0].start_ms, Some(0));
+
+        let send = |e: &str| align::tests::send(&aligner, &item, &key, e, 2);
+        send(r#"{"event":"offset","offset_ms":0,"aligner_version":6,"lines":2}"#);
+        send(r#"{"event":"line","index":1,"words":[{"at":0,"start_ms":4100}],"score":null}"#);
+        let (partial, waiting) = serve();
+        assert!(waiting.is_some());
+        assert_eq!(words(&partial), [0, 0], "partial before text_clear");
+
+        send(r#"{"event":"text_clear"}"#);
+        let (cleared, _) = serve();
+        assert_eq!(words(&cleared), [1, 1], "after text_clear");
+        assert_eq!(cleared.lines[0].words[0].start_ms, 200);
     }
 
     #[test]

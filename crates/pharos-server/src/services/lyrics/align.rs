@@ -175,8 +175,10 @@ pub enum Lookup {
     Pending(Option<u32>),
     /// In flight with some lines already timed (ADR-0121): those lines'
     /// words and the song's offset, an empty line for each one still to
-    /// come, and the estimate as for [`Lookup::Pending`].
-    Partial(Option<u32>, Aligned),
+    /// come, and the estimate as for [`Lookup::Pending`]. The flag is set
+    /// until the aligner clears the song's text (V1468): the words are then
+    /// held back, the lyrics' own included, and only the offset is shown.
+    Partial(Option<u32>, Aligned, bool),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
     /// The song was aligned and found sung to other words (B1479, V1468):
@@ -685,19 +687,22 @@ impl Aligner {
     /// timed, or when the job in flight was for other lyrics. Until the
     /// aligner clears the song's text every line is empty, so only the
     /// offset moves the lines (V1468).
-    fn partial_for(&self, id: u64, key: &str) -> Option<Aligned> {
+    fn partial_for(&self, id: u64, key: &str) -> Option<(Aligned, bool)> {
         let partial = self.partial_lock();
         let p = partial.get(&id).filter(|p| p.key == key)?;
         let shown = p.text_clear_at.is_some();
-        p.lines.iter().any(Option::is_some).then(|| Aligned {
-            lines: p
-                .lines
-                .iter()
-                .map(|l| l.clone().filter(|_| shown).unwrap_or_default())
-                .collect(),
-            offset_ms: p.offset_ms,
-            scores: Vec::new(),
-            mismatch: None,
+        p.lines.iter().any(Option::is_some).then(|| {
+            let aligned = Aligned {
+                lines: p
+                    .lines
+                    .iter()
+                    .map(|l| l.clone().filter(|_| shown).unwrap_or_default())
+                    .collect(),
+                offset_ms: p.offset_ms,
+                scores: Vec::new(),
+                mismatch: None,
+            };
+            (aligned, !shown)
         })
     }
 
@@ -1057,7 +1062,7 @@ impl Aligner {
                 .eta_ms(item.id, self.now_ms())
                 .map(clamp_u32);
             return match self.partial_for(item.id, &key) {
-                Some(partial) => Lookup::Partial(left, partial),
+                Some((partial, held)) => Lookup::Partial(left, partial, held),
                 None => Lookup::Pending(left),
             };
         }
@@ -1260,6 +1265,33 @@ pub(super) mod tests {
         let aligned = parse_answer(&answer_with_check(LYRICS_MISMATCH), 1).unwrap();
         aligner.cache.put(item.id, job.key, aligned);
         Arc::new(aligner)
+    }
+
+    /// An aligner with `lyrics` of `item` in flight, and the key its
+    /// events are sent under.
+    pub(in crate::services::lyrics) fn in_flight(
+        media_root: &Path,
+        item: &MediaItem,
+        lyrics: &Lyrics,
+    ) -> (Arc<Aligner>, String) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root.to_path_buf(), AlignCache::new(None), tx);
+        assert_eq!(aligner.words_for(item, lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        (Arc::new(aligner), job.key)
+    }
+
+    /// Sends `event` for `item` under `key` to an aligner from [`in_flight`].
+    pub(in crate::services::lyrics) fn send(
+        aligner: &Aligner,
+        item: &MediaItem,
+        key: &str,
+        event: &str,
+        n_lines: usize,
+    ) {
+        aligner
+            .event((item.id, key), event.as_bytes(), n_lines)
+            .unwrap();
     }
 
     fn sample_item(path: PathBuf) -> MediaItem {
@@ -2402,7 +2434,7 @@ pub(super) mod tests {
 
         let mut partial = None;
         for _ in 0..200 {
-            partial = aligner.partial_for(job.id, &job.key);
+            partial = aligner.partial_for(job.id, &job.key).map(|(a, _)| a);
             if partial.is_some() {
                 break;
             }
@@ -2477,6 +2509,7 @@ pub(super) mod tests {
         for _ in 0..200 {
             shown = aligner
                 .partial_for(job.id, &job.key)
+                .map(|(a, _)| a)
                 .filter(|p| p.lines.first() == Some(&corrected));
             if shown.is_some() {
                 break;
@@ -2611,7 +2644,7 @@ pub(super) mod tests {
             .unwrap();
         // V1468: until the aligner clears the song's text, its words may
         // follow another song, so only the offset is shown.
-        let Lookup::Partial(None, held) = aligner.words_for(&item, &lyrics) else {
+        let Lookup::Partial(None, held, true) = aligner.words_for(&item, &lyrics) else {
             panic!("expected a partial answer");
         };
         assert_eq!(held.offset_ms, 50);
@@ -2619,7 +2652,7 @@ pub(super) mod tests {
         aligner
             .event((item.id, &key), br#"{"event":"text_clear"}"#, 2)
             .unwrap();
-        let Lookup::Partial(None, partial) = aligner.words_for(&item, &lyrics) else {
+        let Lookup::Partial(None, partial, false) = aligner.words_for(&item, &lyrics) else {
             panic!("expected a partial answer");
         };
         assert_eq!(partial.offset_ms, 50);
@@ -2668,7 +2701,7 @@ pub(super) mod tests {
         let labels = [
             Lookup::Ready(aligned.clone()).label(),
             Lookup::Pending(None).label(),
-            Lookup::Partial(None, aligned).label(),
+            Lookup::Partial(None, aligned, false).label(),
             Lookup::Unavailable.label(),
             Lookup::Mismatch(Heard::default()).label(),
         ];
