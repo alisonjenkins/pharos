@@ -1582,6 +1582,32 @@ mod tests {
         );
     }
 
+    /// A Unicode host is the punycode origin the client sends to: a redirect
+    /// between the two spellings keeps the token, and one to another IDN
+    /// host goes without it.
+    #[test]
+    fn a_unicode_host_compares_as_its_punycode_origin() {
+        let lan = "http://xn--mdia-bpa.example.org:8096";
+        assert_eq!(
+            redirect_hop(
+                "https://m\u{e9}dia.example.org/a",
+                "https://xn--mdia-bpa.example.org/b",
+                lan
+            ),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(
+                "https://xn--mdia-bpa.example.org/a",
+                "https://m\u{e8}dia.example.org/b",
+                lan
+            ),
+            Hop::FollowWithoutToken
+        );
+        assert!(token_allowed("http://m\u{e9}dia.example.org:8096/Items", lan).is_ok());
+        assert!(token_allowed("http://m\u{e8}dia.example.org:8096/Items", lan).is_err());
+    }
+
     /// A proxied request's redirect: the same origin keeps the token,
     /// another https origin is followed without it, a downgrade to http is
     /// refused, and the build's own plain-http server keeps it on its own
