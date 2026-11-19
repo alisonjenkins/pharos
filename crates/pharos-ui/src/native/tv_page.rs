@@ -146,37 +146,17 @@ pub fn proxied(segment: &str) -> bool {
 /// spelling (`[2001:db8::1]` however it was written), so two spellings of
 /// one address are one origin. None for anything else.
 fn origin_of(url: &str) -> Option<(String, String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let default = match scheme.as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
-    };
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
-        let (host, after) = v6.split_once(']')?;
-        // An address that does not parse (a zone id, say) keeps its
-        // spelling, lower-cased below: it compares equal only as written.
-        let host = host
-            .parse::<std::net::Ipv6Addr>()
-            .map_or_else(|_| host.to_owned(), |a| a.to_string());
-        (format!("[{host}]"), after.strip_prefix(':'))
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_owned(), Some(p)),
-            None => (hostport.to_owned(), None),
-        }
-    };
-    if host.is_empty() {
+    // The same parser the HTTP client sends with (reqwest's `Url`), so an
+    // origin compares as the request will reach it: IDNA, percent-encoding,
+    // IPv4 shorthands and IPv6 spellings all canonical.
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = parsed.scheme().to_owned();
+    if scheme != "http" && scheme != "https" {
         return None;
     }
-    let port = match port {
-        Some(p) => p.parse().ok()?,
-        None => default,
-    };
-    Some((scheme, host.to_ascii_lowercase(), port))
+    let host = parsed.host_str().filter(|h| !h.is_empty())?.to_owned();
+    let port = parsed.port_or_known_default()?;
+    Some((scheme, host, port))
 }
 
 /// Whether a download's request to `original` may follow a redirect to
@@ -1573,6 +1553,33 @@ mod tests {
         assert!(token_allowed("http://192.168.1.5:9000/Items", dev).is_err());
         assert!(token_allowed("http://media.example.org/Items", https).is_err());
         assert!(token_allowed("ftp://media.example.org/Items", https).is_err());
+    }
+
+    /// Origins compare as the HTTP client reaches them. A backslash ends
+    /// the authority for http(s) there, so a URL that reads as the build's
+    /// server after an `@` goes to another host, and gets no token; an IPv4
+    /// shorthand or a percent-encoded host is the same origin it names.
+    #[test]
+    fn origins_compare_as_the_http_client_parses_them() {
+        let lan = "http://media.example.org:8096";
+        assert!(
+            token_allowed(
+                "http://other.example.net\\@media.example.org:8096/Items",
+                lan
+            )
+            .is_err(),
+            "a request reqwest sends to another host was given the token"
+        );
+        assert!(token_allowed("http://127.1:8096/Items", "http://127.0.0.1:8096").is_ok());
+        assert!(token_allowed("http://medi%61.example.org:8096/Items", lan).is_ok());
+        assert_eq!(
+            redirect_hop(
+                "https://media.example.org/a",
+                "https://other.example.net\\@media.example.org/b",
+                lan
+            ),
+            Hop::FollowWithoutToken
+        );
     }
 
     /// A proxied request's redirect: the same origin keeps the token,
