@@ -861,7 +861,16 @@ impl Gate {
     /// written; none before the first) is reserved, and checked again at
     /// the next chunk. Returns what was reserved.
     fn reserve(&self, id: &str, want: u64, at_least: u64, unknown_len: bool) -> Result<u64, Fail> {
-        match self.cache.ensure_free(id, want) {
+        // A window of unknown length is speculative: the track may need far
+        // less of it. It is taken only from room that is free now, never by
+        // evicting a cached track; what the write does need (the chunk) may
+        // evict, below.
+        let first = if unknown_len && at_least < want {
+            self.cache.ensure_free_without_eviction(id, want)
+        } else {
+            self.cache.ensure_free(id, want)
+        };
+        match first {
             Ok(_) => Ok(want),
             Err(NoRoom::LowDisk(room)) if unknown_len && at_least < want => {
                 log::info!(
@@ -1972,6 +1981,58 @@ mod tests {
             "a 1 MiB track was refused for want of an 8 MiB window"
         );
         assert_eq!(read(&r.cache, "track/1"), body(size, 1));
+    }
+
+    /// A speculative window never costs a cached track: with 4 MiB free
+    /// above the guard and a 5 MiB track that eviction could free, a 1 MiB
+    /// track of unknown length downloads and the cached track stays.
+    #[test]
+    fn a_speculative_window_does_not_evict_a_cached_track() {
+        let size = 1024 * 1024;
+        let cached = 5 * 1024 * 1024;
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
+        let slot2 = slot.clone();
+        let r = rig_with_free(
+            "window-no-evict",
+            Script::default()
+                .file("/audio/1", body(size, 1))
+                .chunked()
+                .chunk_bytes(64 * 1024),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let cache = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let (on_disk, freed) = cache.as_ref().map_or((0, 0), |c| {
+                    let part = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
+                    let gone = if c.final_path("track/9").exists() {
+                        0
+                    } else {
+                        cached
+                    };
+                    (part, gone)
+                });
+                Ok((MIN_FREE_BYTES + 4 * 1024 * 1024 + freed).saturating_sub(on_disk))
+            }),
+        );
+        std::fs::write(
+            r.cache.part_path("track/9"),
+            vec![9u8; usize::try_from(cached).unwrap()],
+        )
+        .unwrap();
+        r.cache.commit("track/9", Some(cached)).unwrap();
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(r.cache.is_complete("track/1"));
+        assert!(
+            r.cache.is_complete("track/9"),
+            "a cached track was evicted for a window the new track did not need"
+        );
     }
 
     /// A chunk that crosses the reserved window is reserved for before it is

@@ -956,8 +956,23 @@ impl Cache {
     /// has yet to add) until `commit` or `release_reservation` clears it, so a host
     /// admitting against the same free figure sees them as spoken for.
     pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, true)
+    }
+
+    /// As [`Cache::ensure_free`], but never evicts: for room a write may
+    /// not need (a speculative window), which must not cost a cached track.
+    /// A refusal reserves nothing.
+    pub fn ensure_free_without_eviction(
+        &self,
+        downloading: &str,
+        need: u64,
+    ) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, false)
+    }
+
+    fn approve(&self, downloading: &str, need: u64, evict: bool) -> Result<u64, NoRoom> {
         let _admission = admission_guard();
-        let verdict = self.check_free(downloading, need);
+        let verdict = self.check_free(downloading, need, evict);
         match verdict {
             Ok(_) => self.reserve(downloading, need),
             Err(_) => self.unreserve(downloading),
@@ -1095,7 +1110,7 @@ impl Cache {
         (total, whole)
     }
 
-    fn check_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
+    fn check_free(&self, downloading: &str, need: u64, evict: bool) -> Result<u64, NoRoom> {
         // Outstanding first, then the probe: a write that lands between the
         // two lowers free and the stale (higher) outstanding keeps the figure
         // conservative. The other order counts those bytes twice as spent
@@ -1128,6 +1143,9 @@ impl Cache {
             .saturating_add(outstanding);
         if raw >= want {
             return Ok(raw.saturating_sub(outstanding));
+        }
+        if !evict {
+            return Err(NoRoom::LowDisk(raw.saturating_sub(outstanding)));
         }
         let mut s = self.lock();
         let mut now = raw;
