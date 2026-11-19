@@ -12,7 +12,7 @@ use crate::recognise::whisper::Recogniser;
 use crate::separate::htdemucs::Separator;
 use crate::separate::{self, separate_on};
 use crate::service::{StageError, Stages};
-use crate::transcript::Word;
+use crate::transcript::Transcript;
 
 pub struct Live {
     pub ffmpeg: String,
@@ -50,7 +50,7 @@ impl Stages for Live {
             .map_err(|e| failed(Fallback::DecodeFailed)(e.to_string()))
     }
 
-    fn recognise(&self, vocals: &[f32], deadline: Instant) -> Result<Vec<Word>, StageError> {
+    fn recognise(&self, vocals: &[f32], deadline: Instant) -> Result<Transcript, StageError> {
         let fail = |e: crate::recognise::whisper::RecogniseError| {
             failed(Fallback::RecogniseFailed)(e.to_string())
         };
@@ -71,6 +71,6 @@ impl Stages for Live {
             first_words_clipped = heard.transcript.first_words_clipped,
             "recognised"
         );
-        Ok(heard.transcript.words)
+        Ok(heard.transcript)
     }
 }
