@@ -6,7 +6,14 @@ use super::{
     retry_windows, segment_words, wants_retry, words, Decode, Outcome, Retry, Segment, Token,
     RETRY_MIN_DISTINCT, RETRY_MIN_WORDS,
 };
+use crate::audio::RATE;
+use crate::loudness::{test_vocals, Loudness};
 use crate::obs::RECOGNISE_RETRY_TOTAL;
+
+/// The vocals' loudness over `(seconds, loud)` spans in order.
+fn loud(spans: &[(f64, bool)]) -> Loudness {
+    Loudness::of(&test_vocals(spans, RATE), RATE)
+}
 
 fn tok(text: &str, t0_s: f64, dtw_s: f64) -> Token {
     Token {
@@ -80,10 +87,13 @@ fn a_word_after_a_clamped_end_starts_where_that_word_ends() {
 
 #[test]
 fn each_segments_first_word_starts_at_its_own_t0() {
-    let w = segment_words(&[
-        seg(1.0, 2.0, vec![tok(" a", 1.0, 1.5)]),
-        seg(30.0, 31.0, vec![tok(" b", 30.0, 30.6)]),
-    ])
+    let w = segment_words(
+        &[
+            seg(1.0, 2.0, vec![tok(" a", 1.0, 1.5)]),
+            seg(30.0, 31.0, vec![tok(" b", 30.0, 30.6)]),
+        ],
+        &Loudness::default(),
+    )
     .words;
     // Not at 1.5, where the segment before the gap ended.
     assert_eq!((w[1].start_s, w[1].end_s), (30.0, 30.6));
@@ -93,11 +103,14 @@ fn each_segments_first_word_starts_at_its_own_t0() {
 fn a_first_word_spanning_seconds_starts_as_long_before_its_end_as_it_takes_to_sing() {
     // Whisper's start for a retried window's first word is the window's
     // start; DTW hears it end where it was sung.
-    let t = segment_words(&[seg(
-        10.0,
-        20.0,
-        vec![tok(" Sing", 10.0, 17.4), tok(" on", 17.5, 17.8)],
-    )]);
+    let t = segment_words(
+        &[seg(
+            10.0,
+            20.0,
+            vec![tok(" Sing", 10.0, 17.4), tok(" on", 17.5, 17.8)],
+        )],
+        &loud(&[(16.8, false), (3.2, true)]),
+    );
     let w = &t.words;
     assert!((w[0].start_s - (17.4 - 4.0 * 0.14)).abs() < 1e-9, "{w:?}");
     assert_eq!(w[0].end_s, 17.4);
@@ -107,10 +120,13 @@ fn a_first_word_spanning_seconds_starts_as_long_before_its_end_as_it_takes_to_si
 
 #[test]
 fn a_clipped_word_is_sung_for_at_least_and_at_most_a_bound() {
-    let t = segment_words(&[
-        seg(0.0, 9.0, vec![tok(" I", 0.0, 8.0)]),
-        seg(20.0, 29.0, vec![tok(" Wonderfully", 20.0, 28.0)]),
-    ]);
+    let t = segment_words(
+        &[
+            seg(0.0, 9.0, vec![tok(" I", 0.0, 8.0)]),
+            seg(20.0, 29.0, vec![tok(" Wonderfully", 20.0, 28.0)]),
+        ],
+        &loud(&[(7.7, false), (0.3, true), (19.0, false), (2.0, true)]),
+    );
     assert!((t.words[0].start_s - 7.7).abs() < 1e-9, "{:?}", t.words);
     assert!((t.words[1].start_s - 27.0).abs() < 1e-9, "{:?}", t.words);
     assert_eq!(t.first_words_clipped, 2);
@@ -118,9 +134,62 @@ fn a_clipped_word_is_sung_for_at_least_and_at_most_a_bound() {
 
 #[test]
 fn a_first_word_within_the_bound_keeps_whispers_start() {
-    let t = segment_words(&[seg(1.0, 5.0, vec![tok(" Long", 1.0, 3.4)])]);
+    let t = segment_words(
+        &[seg(1.0, 5.0, vec![tok(" Long", 1.0, 3.4)])],
+        &loud(&[(1.0, false), (4.0, true)]),
+    );
     assert_eq!((t.words[0].start_s, t.words[0].end_s), (1.0, 3.4));
     assert_eq!(t.first_words_clipped, 0);
+}
+
+/// Disarm check: with the silence check in `timed_words` skipped, the held
+/// word is clipped and this fails.
+#[test]
+fn a_first_word_held_for_seconds_over_loud_vocals_keeps_its_start() {
+    let t = segment_words(
+        &[seg(
+            10.0,
+            15.0,
+            vec![tok(" Hold", 10.0, 14.0), tok(" on", 14.0, 14.4)],
+        )],
+        &loud(&[(15.0, true)]),
+    );
+    assert_eq!((t.words[0].start_s, t.words[0].end_s), (10.0, 14.0));
+    assert!(!t.words[0].silent_lead);
+    assert_eq!(t.first_words_clipped, 0);
+}
+
+#[test]
+fn a_first_word_spanning_a_silence_in_the_vocals_is_clipped() {
+    let t = segment_words(
+        &[seg(
+            10.0,
+            15.0,
+            vec![tok(" Hold", 10.0, 14.0), tok(" on", 14.0, 14.4)],
+        )],
+        &loud(&[(13.4, false), (1.6, true)]),
+    );
+    assert!(
+        (t.words[0].start_s - (14.0 - 4.0 * 0.14)).abs() < 1e-9,
+        "{:?}",
+        t.words
+    );
+    assert_eq!(t.first_words_clipped, 1);
+}
+
+#[test]
+fn a_word_stretched_over_a_silence_inside_a_segment_says_so() {
+    let t = segment_words(
+        &[seg(
+            1.0,
+            15.0,
+            vec![tok(" Go", 1.0, 1.5), tok(" home", 1.6, 14.0)],
+        )],
+        &loud(&[(1.5, true), (12.0, false), (1.5, true)]),
+    );
+    assert_eq!((t.words[1].start_s, t.words[1].end_s), (1.5, 14.0));
+    assert!(t.words[1].silent_lead);
+    assert!(!t.words[0].silent_lead);
 }
 
 #[test]

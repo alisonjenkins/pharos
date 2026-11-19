@@ -95,6 +95,7 @@ fn heard(text: &str, start_s: f64) -> Vec<Word> {
             start_s: start_s + 0.5 * k as f64,
             end_s: start_s + 0.5 * k as f64 + 0.4,
             prob: 0.9,
+            silent_lead: false,
         })
         .collect()
 }
@@ -243,6 +244,7 @@ fn the_song_says_how_many_first_words_were_clipped_and_anchors_started_late() {
     let (sung, mut heard) = song();
     // "low" heard from just after the line before it to where it was sung.
     heard[3].start_s = 3.2;
+    heard[3].silent_lead = true;
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
