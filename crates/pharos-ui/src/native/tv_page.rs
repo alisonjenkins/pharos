@@ -358,6 +358,11 @@ pub async fn proxy_get<T: ProxyTransport>(
             .get(&url, &sent)
             .await
             .map_err(|e| format!("stage=send {e}"))?;
+        // Only a real redirect is followed: a 304 (or any other 3xx) is the
+        // answer, its ETag passed back, whatever Location it carries.
+        if !follows(resp.status()) {
+            break resp;
+        }
         let Some(next) = resp.redirect() else {
             break resp;
         };
@@ -404,6 +409,11 @@ pub async fn proxy_get<T: ProxyTransport>(
         .await
         .map_err(|e| format!("stage=body status={status} {e}"))?;
     Ok((status, back, body))
+}
+
+/// Whether a response with `status` is a redirect the proxy follows.
+fn follows(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 /// An error and every cause under it, `outer: inner: ...`, for a log line.
@@ -1852,6 +1862,61 @@ mod tests {
             self.sent.lock().unwrap().push((url.to_owned(), carries));
             Ok(ScriptedAnswer(self.redirects.lock().unwrap().pop_front()))
         }
+    }
+
+    /// A 304 that carries a Location (as some servers send) is returned with
+    /// its ETag after one request: nothing is followed.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_not_modified_answer_is_returned_without_following_its_location() {
+        struct NotModified(std::sync::Mutex<usize>);
+        struct Answer;
+        impl ProxyResponse for Answer {
+            fn status(&self) -> u16 {
+                304
+            }
+            fn header(&self, name: &str) -> Option<String> {
+                (name == "ETag").then(|| "\"v1\"".to_owned())
+            }
+            fn redirect(&self) -> Option<Result<String, String>> {
+                Some(Ok("https://a.example.org/elsewhere".to_owned()))
+            }
+            async fn body(self) -> Result<Vec<u8>, String> {
+                Ok(Vec::new())
+            }
+        }
+        impl ProxyTransport for NotModified {
+            type Response = Answer;
+            async fn get(&self, _: &str, _: &[(String, String)]) -> Result<Answer, String> {
+                *self.0.lock().unwrap() += 1;
+                Ok(Answer)
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(NotModified(std::sync::Mutex::new(0))));
+        let (status, back, _) = rt
+            .block_on(proxy_get(
+                &client,
+                ProxyGet {
+                    url: "https://a.example.org/1".to_owned(),
+                    token: Some("tok".to_owned()),
+                    headers: &[],
+                    build_server: "https://a.example.org",
+                    passed_back: &["ETag"],
+                    max_hops: 5,
+                },
+                &|_, _| {},
+            ))
+            .unwrap();
+        assert_eq!(status, 304);
+        assert_eq!(back, [("ETag".to_owned(), "\"v1\"".to_owned())]);
+        assert_eq!(
+            *client.as_ref().unwrap().0.lock().unwrap(),
+            1,
+            "the 304's Location was followed"
+        );
     }
 
     /// Which requests of a proxied GET over `redirects` carried the token,
