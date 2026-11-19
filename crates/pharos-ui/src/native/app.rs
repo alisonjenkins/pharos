@@ -2521,7 +2521,7 @@ async fn connect(
         }
         Err(OpenError::NotOpened(probe)) => Event::NotOpened { epoch, probe },
         Err(OpenError::NotSignedIn) => {
-            forget_user_on_refused_resume(&machine.peek(), epoch);
+            let _cleaned = forget_user_on_refused_resume(&machine.peek(), epoch);
             Event::ResumeRefused { epoch }
         }
         Err(OpenError::Resume(error)) => Event::ResumeFailed { epoch, error },
@@ -2532,11 +2532,28 @@ async fn connect(
 /// The server knows no session for this device: nobody is signed in from
 /// here on, so the proxy and the kept-video list stop serving the previous
 /// user. An answer for an attempt that has since been replaced says nothing
-/// about the current one and is left alone.
-fn forget_user_on_refused_resume(machine: &Machine, epoch: u32) {
-    if machine.epoch() == epoch {
+/// about the current one and is left alone. A refusal of a session that was
+/// Ready ends it through the machine's session-end hook, which does this
+/// same cleanup with the user still known: doing it here as well would run
+/// the hook with nobody signed in, and park every user's downloads.
+/// Returns whether it cleaned up.
+fn forget_user_on_refused_resume(machine: &Machine, epoch: u32) -> bool {
+    let (verdict, reason) = if machine.epoch() != epoch {
+        ("skipped", "stale_attempt")
+    } else if machine.had_session() {
+        ("skipped", "session_end_hook_cleans_up")
+    } else {
+        ("cleaned", "first_resume_refused")
+    };
+    platform::info(&format!(
+        "pharos: resume refused cleanup verdict={verdict} reason={reason} epoch={epoch} current={}",
+        machine.epoch()
+    ));
+    let clean = verdict == "cleaned";
+    if clean {
         offline_video::forget_user();
     }
+    clean
 }
 
 pub(super) fn call(route: &str, action: &str) -> CallInfo {
@@ -9288,6 +9305,35 @@ mod tests {
         assert_eq!(offline_video::last_user(), None, "the previous user stayed");
         offline_video::remember_user("bob");
         assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
+    }
+
+    /// A refused reconnect of a session that was Ready cleans up once,
+    /// through the session-end hook, while its user is still known: the
+    /// connect's own cleanup is skipped, so the hook never runs with nobody
+    /// signed in (which parks every user's downloads).
+    #[test]
+    fn a_refused_reconnect_after_ready_cleans_up_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        fn count_end() {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+        }
+        offline_video::remember_user("alice");
+        let mut m = Machine::new().with_session_end(count_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        let epoch = m.epoch();
+        let before = ENDED.load(Ordering::SeqCst);
+        assert!(
+            !forget_user_on_refused_resume(&m, epoch),
+            "the connect cleaned up a session the hook ends"
+        );
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(ENDED.load(Ordering::SeqCst), before + 1);
     }
 
     /// However a session ends, through the machine, the previous user is

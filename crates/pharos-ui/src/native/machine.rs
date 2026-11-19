@@ -183,6 +183,12 @@ impl Machine {
         self.epoch
     }
 
+    /// Whether a session has been Ready since the last sign-in screen: a
+    /// refusal then ends it through the session-end hook.
+    pub fn had_session(&self) -> bool {
+        self.had_session
+    }
+
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
