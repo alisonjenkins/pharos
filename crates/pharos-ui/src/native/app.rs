@@ -1913,6 +1913,15 @@ fn app_machine() -> Machine {
     Machine::new().with_session_end(offline_video::session_ended)
 }
 
+/// Applies a sign-out's answer to the machine: true when it signed out.
+/// The machine's session-end hook has then parked the user's downloads and
+/// forgotten them; nothing here runs it again (a second run, with no user
+/// left, would park every user's downloads).
+fn sign_out_answered(machine: &mut Machine, reply: super::machine::SignOutReply) -> bool {
+    machine.apply(Event::SignOutAnswered(reply));
+    matches!(machine.phase(), Phase::SignIn { .. })
+}
+
 /// What a `me` fetch returns, built by the caller (the app's retried call,
 /// or a test's hand-completed one).
 pub(crate) type MeFetch<A, M> =
@@ -2366,12 +2375,11 @@ fn NativeApp(route: Route) -> Element {
                             report::forget();
                             spawn(async move {
                                 let reply = platform::sign_out().await;
-                                machine.write().apply(Event::SignOutAnswered(reply));
+                                let out = sign_out_answered(&mut machine.write(), reply);
                                 // Signed out: no kept book stays on the device.
                                 // The queue is emptied by the sign-in effect.
-                                if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
+                                if out {
                                     forget_kept_books("sign-out").await;
-                                    offline_video::forget_user();
                                 }
                             });
                         },
@@ -9138,6 +9146,54 @@ fn Player(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A sign-out from Ready parks the signed-out user's downloads once,
+    /// through the machine's session-end hook, and never every user's.
+    #[test]
+    fn a_sign_out_from_ready_parks_only_its_users_downloads() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, KeptVideo, VideoStore};
+        use super::super::machine::SignOutReply;
+        use super::super::ports::{use_test_video_slot, Slot};
+        #[derive(Default)]
+        struct Parks(std::sync::Mutex<Vec<String>>);
+        impl VideoStore for Parks {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn park_runs(&self, owner: Option<&str>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("park {}", owner.unwrap_or("all")));
+            }
+        }
+        let slot: &'static Slot<dyn VideoStore> = Box::leak(Box::new(Slot::new()));
+        let parks = std::sync::Arc::new(Parks::default());
+        let _ = slot.set(parks.clone());
+        use_test_video_slot(Some(slot));
+        offline_video::remember_user("A");
+        let mut m = app_machine();
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::SignOutSubmitted);
+        let out = sign_out_answered(&mut m, SignOutReply::Status(204));
+        use_test_video_slot(None);
+        assert!(out);
+        assert_eq!(*parks.0.lock().unwrap(), ["park A"], "parked more than A's");
+    }
 
     /// A replaced session's account result still naming A selects none of
     /// A's downloads while the identity is fenced: only the authorized
