@@ -619,6 +619,11 @@ pub fn token_user() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// The user kept with the device token `seen`; none where there is no token.
+pub fn token_user_if(_seen: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
 /// Keeps `user` with the device token; nothing to do where there is none.
 pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
     Ok(())

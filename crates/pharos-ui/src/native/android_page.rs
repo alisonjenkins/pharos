@@ -2027,6 +2027,12 @@ pub fn token_user() -> Result<Option<String>, String> {
     android::load_token_user()
 }
 
+/// The user kept with the device token, only while that token is `seen`
+/// (the one a new session was resumed with).
+pub fn token_user_if(seen: &str) -> Result<Option<String>, String> {
+    android::load_token_user_if(seen)
+}
+
 /// Keeps `user` with the device token, at sign-in, only while the token on
 /// file is still `seen`, the one the request that named `user` was built
 /// with. Err `token_changed` (a new sign-in's token landed in between: it

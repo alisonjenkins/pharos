@@ -145,6 +145,14 @@ pub fn load_token_user() -> Result<Option<String>, String> {
     Ok(token_file::read(&token_path()?)?.and_then(|s| s.user))
 }
 
+/// The user stored with the token on file, from one read, only while that
+/// token is `seen`.
+pub fn load_token_user_if(seen: &str) -> Result<Option<String>, String> {
+    Ok(token_file::read(&token_path()?)?
+        .filter(|s| s.token == seen.trim())
+        .and_then(|s| s.user))
+}
+
 /// Keeps `user` with the token on file only while it is `seen`
 /// (`token_file::pair`).
 pub fn pair_token_user(seen: Option<&str>, user: &str) -> Result<(), String> {

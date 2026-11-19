@@ -201,6 +201,12 @@ enum Identity {
     /// Signed out, or no user was ever remembered.
     SignedOut,
     User(String),
+    /// A new session replaced the one this user was learned on, and its
+    /// credentials are not known to be theirs: nothing is served from disk
+    /// until the new session's user is established (its `me` answers, or
+    /// its token is paired with this same user). Whose downloads to park
+    /// at a session end is still this user.
+    Fenced(String),
 }
 
 #[cfg(not(test))]
@@ -306,14 +312,69 @@ pub fn identity_generation() -> u64 {
 /// before this call are refused ([`MeAsk::answered`]). Call it before the
 /// new session is published, so an ask taken on the new one sees the new
 /// generation.
-pub fn session_replaced() {
-    let now = with_identity(|_| {
+pub fn session_replaced<A>(session: &Session<A>) {
+    // Who the new session's token is paired with, from one read of the
+    // token file, and only while it is still that token: pairing is written
+    // under the file's compare-and-set, so the user named belongs to it.
+    let paired = paired_user(&session.token);
+    let (now, verdict, reason, user) = with_identity(|i| {
         bump_generation();
-        generation()
+        let (verdict, reason, user) = match i.clone() {
+            Identity::User(u) | Identity::Fenced(u) if paired.as_deref() == Some(u.as_str()) => {
+                *i = Identity::User(u.clone());
+                ("kept", "token_paired_with_same_user", u)
+            }
+            Identity::User(u) | Identity::Fenced(u) => {
+                *i = Identity::Fenced(u.clone());
+                let why = if paired.is_some() {
+                    "token_paired_with_another_user"
+                } else {
+                    "token_not_paired"
+                };
+                ("fenced", why, u)
+            }
+            _ => ("unchanged", "no_user_known", String::new()),
+        };
+        (generation(), verdict, reason, user)
     });
     super::platform::info(&format!(
         "pharos: video user generation verdict=advanced reason=session_replaced generation={now}"
     ));
+    note_fence(format!(
+        "pharos: video user fence verdict={verdict} reason={reason} user={user} generation={now}"
+    ));
+}
+
+/// Logs a fence verdict (and keeps it for a test to read).
+fn note_fence(line: String) {
+    #[cfg(test)]
+    tests::LOGGED.with(|l| l.borrow_mut().push(line.clone()));
+    super::platform::info(&line);
+}
+
+/// The user stored with the device token, only while the token on file is
+/// the one `seen`; `None` where no token decides sign-in, with no token,
+/// an unpaired one, or one replaced since.
+fn paired_user(seen: &TokenSeen) -> Option<String> {
+    let seen = seen.0.as_deref()?;
+    #[cfg(test)]
+    if let Some(seam) = tests::PREF.with(|p| p.borrow().clone()) {
+        return (seam.token_seen().as_deref() == Some(seen))
+            .then(|| seam.token_user().ok().flatten())
+            .flatten();
+    }
+    if !super::platform::TOKEN_DECIDES_SIGN_IN {
+        return None;
+    }
+    match super::platform::token_user_if(seen) {
+        Ok(user) => user,
+        Err(e) => {
+            super::platform::warn(&format!(
+                "pharos: video user fence pairing_unreadable error={e}"
+            ));
+            None
+        }
+    }
 }
 
 fn set_identity(next: Identity) {
@@ -328,6 +389,11 @@ fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
         let now = generation();
         if expected.is_some_and(|e| e != now) {
             return Err(now);
+        }
+        if let (Identity::Fenced(was), Identity::User(now)) = (&*i, &next) {
+            note_fence(format!(
+                "pharos: video user fence verdict=lifted reason=user_established was={was} user={now}"
+            ));
         }
         // A new identity state is a new chance for a cold start (only a
         // test's restart sets Unknown) and a new refusal to log.
@@ -711,7 +777,7 @@ pub fn forget_user() {
     // before another user's token can be used (all of them when it is not
     // known). Bound to their owner's token as well; this is the hygiene.
     let ended = match identity() {
-        Identity::User(u) => Some(u),
+        Identity::User(u) | Identity::Fenced(u) => Some(u),
         _ => None,
     };
     with_store(|store| store.park_runs(ended.as_deref()));
@@ -949,6 +1015,21 @@ mod tests {
         TokenSeen(PREF.with(|p| p.borrow().as_ref().and_then(Pref::token_seen)))
     }
 
+    thread_local! {
+        /// The fence verdicts logged on this thread.
+        pub(super) static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn logged(prefix: &str) -> Vec<String> {
+        LOGGED.with(|l| {
+            l.borrow()
+                .iter()
+                .filter(|x| x.starts_with(prefix))
+                .cloned()
+                .collect()
+        })
+    }
+
     /// A session opened with the seam's token, as a test's `open` gives it.
     fn session<A>(api: A) -> Session<A> {
         Session::opened(api, seam_token().0)
@@ -1174,6 +1255,57 @@ mod tests {
         assert_eq!(last_user().as_deref(), Some("A"));
     }
 
+    /// A reconnect with B's token fences A at once: while B's `me` is
+    /// pending, and after it fails, nothing of A's is served. A `me` of the
+    /// new session lifts the fence for its user.
+    #[test]
+    fn a_reconnect_with_another_token_serves_nothing_until_its_user_is_known() {
+        let _p = pref();
+        remember_user("A");
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_some());
+        let b = Session::opened((), Some("tokB".to_owned()));
+        session_replaced(&b);
+        // B's `me` is pending.
+        assert_eq!(last_user(), None, "A was served on B's session");
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+        // B's `me` failed: nothing answered, so nothing changes.
+        assert_eq!(last_user(), None, "a failed me lifted the fence");
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+        let fence = logged("pharos: video user fence verdict=fenced");
+        assert!(
+            fence
+                .iter()
+                .any(|l| l.contains("reason=token_not_paired user=A")),
+            "{fence:?}"
+        );
+        let ask = me_request(true, Some(b)).unwrap();
+        assert!(ask.answered("B"));
+        assert_eq!(last_user().as_deref(), Some("B"));
+    }
+
+    /// A reconnect as the same user, with a token paired with them, keeps
+    /// them served; one fenced by an unpaired token is served again once
+    /// its own `me` names them.
+    #[test]
+    fn a_reconnect_as_the_same_user_is_served_once_established() {
+        let _p = pref();
+        remember_user("A");
+        // The seam's token is paired with A: the reconnect keeps A.
+        session_replaced(&session(()));
+        assert_eq!(last_user().as_deref(), Some("A"));
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_some());
+        // A reconnect with a token not yet paired fences A until A's `me`.
+        let fresh = Session::opened((), Some("tokA2".to_owned()));
+        session_replaced(&fresh);
+        assert_eq!(last_user(), None);
+        let ask = me_request(true, Some(fresh)).unwrap();
+        assert!(ask.answered("A"));
+        assert_eq!(last_user().as_deref(), Some("A"));
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_some());
+        let lifted = logged("pharos: video user fence verdict=lifted");
+        assert!(!lifted.is_empty());
+    }
+
     /// A `me` asked on a session that a new one replaced (B's, published
     /// by the connect) names the old session's user: it installs nothing,
     /// and writes no preference. One asked on the new session does.
@@ -1183,12 +1315,13 @@ mod tests {
         remember_user("A");
         let pref_before = p.value.borrow().clone();
         let ask = me_request(true, Some(session(()))).expect("a ready session asks");
-        session_replaced();
+        // The new session carries a token nobody is paired with yet.
+        session_replaced(&Session::opened((), Some("tokB".to_owned())));
         assert!(
             !ask.answered("C"),
             "the replaced session's answer was written"
         );
-        assert_eq!(last_user().as_deref(), Some("A"));
+        assert_eq!(last_user(), None, "A was served on another user's session");
         assert_eq!(
             *p.value.borrow(),
             pref_before,
