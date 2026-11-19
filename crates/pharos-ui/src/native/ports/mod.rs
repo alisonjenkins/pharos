@@ -198,11 +198,11 @@ pub trait MusicSide {
     fn used_bytes(&self) -> Option<u64>;
     /// Whether the music cache is enabled.
     fn cache_enabled(&self) -> bool;
-    /// Music writes approved and not yet landed.
-    fn outstanding_bytes(&self) -> u64;
-    /// Bytes music's in-flight downloads have already written: in the cap,
-    /// not in the free-space figure. None when they could not all be read.
-    fn in_progress_bytes(&self) -> Option<u64>;
+    /// Music writes approved and not yet landed, and the bytes its
+    /// in-flight downloads have already written (in the cap, not in the
+    /// free-space figure; None when they could not all be read), from one
+    /// read of each part.
+    fn pending(&self) -> (u64, Option<u64>);
 }
 
 #[cfg(any(feature = "mobile", test))]
@@ -216,11 +216,9 @@ impl MusicSide for pharos_content::Library {
     fn cache_enabled(&self) -> bool {
         pharos_content::Library::cache_enabled(self)
     }
-    fn outstanding_bytes(&self) -> u64 {
-        self.music_outstanding_bytes()
-    }
-    fn in_progress_bytes(&self) -> Option<u64> {
-        self.music_in_progress_bytes()
+    fn pending(&self) -> (u64, Option<u64>) {
+        let p = self.music_pending();
+        (p.owed, p.written)
     }
 }
 
@@ -245,18 +243,13 @@ pub fn music_ready(music: Option<&dyn MusicSide>) -> bool {
     music.is_some_and(MusicSide::cache_enabled)
 }
 
-/// Music writes approved and not yet landed: room the free space does not
-/// lack yet but will.
+/// Music writes approved and not yet landed (room the free space does not
+/// lack yet but will), and the bytes its in-flight downloads have written
+/// already (part of the cap with `music_used`, never of free space), from
+/// one observation. Nothing while there is no cache.
 #[cfg(any(feature = "mobile", test))]
-pub fn music_outstanding(music: Option<&dyn MusicSide>) -> u64 {
-    music.map_or(0, MusicSide::outstanding_bytes)
-}
-
-/// Bytes music's in-flight downloads have written already: part of the cap
-/// (with `music_used` and `music_outstanding`), never of free space.
-#[cfg(any(feature = "mobile", test))]
-pub fn music_in_progress(music: Option<&dyn MusicSide>) -> Option<u64> {
-    music.map_or(Some(0), MusicSide::in_progress_bytes)
+pub fn music_pending(music: Option<&dyn MusicSide>) -> (u64, Option<u64>) {
+    music.map_or((0, Some(0)), MusicSide::pending)
 }
 
 /// How `register_video_root` ended.

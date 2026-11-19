@@ -256,12 +256,8 @@ impl Budget for PhoneBudget {
         pharos_ui::native::ports::music_ready(music())
     }
 
-    fn other_outstanding_bytes(&self) -> u64 {
-        pharos_ui::native::ports::music_outstanding(music())
-    }
-
-    fn other_in_progress_bytes(&self) -> Option<u64> {
-        pharos_ui::native::ports::music_in_progress(music())
+    fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+        pharos_ui::native::ports::music_pending(music())
     }
 
     fn admission_guard(&self) -> Box<dyn std::any::Any> {

@@ -124,11 +124,18 @@ pub trait Budget: Send + Sync {
     fn accounting_ready(&self) -> bool {
         true
     }
-    /// What the other kinds have been approved to write and not yet landed:
-    /// the free space does not lack these yet, but will. Read under the
-    /// admission lock, before the free space is measured. None by default.
-    fn other_outstanding_bytes(&self) -> u64 {
-        0
+    /// The other kinds' in-flight bytes, from one observation: what they
+    /// have been approved to write and not yet landed (the free space does
+    /// not lack it yet, but will), and what their running downloads have
+    /// already written (in the cap with `other_used_bytes`, never in the
+    /// free-space figure, since the disk already lacks it). One read, so a
+    /// write landing mid-read is counted in one figure, never both or
+    /// neither. Read under the admission lock, before the free space is
+    /// measured. The written figure is None when it could not all be read:
+    /// a new download is refused (`reason=music_size_unknown`) until it
+    /// can. (0, Some(0)) by default.
+    fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+        (0, Some(0))
     }
     /// Holds the lock a host shares between its kinds of download while an
     /// admission reads the other kinds' bytes and reserves its own, so
@@ -136,15 +143,6 @@ pub trait Budget: Send + Sync {
     /// before the store's own lock, always. No lock by default.
     fn admission_guard(&self) -> Box<dyn std::any::Any> {
         Box::new(())
-    }
-    /// What the other kinds' running downloads have already written: in the
-    /// cap with `other_used_bytes` and `other_outstanding_bytes`, never in
-    /// the free-space figure (the disk already lacks them). Read after
-    /// `other_outstanding_bytes`. None when they could not all be read: a
-    /// new download is refused (`reason=music_size_unknown`) until they can.
-    /// Some(0) by default.
-    fn other_in_progress_bytes(&self) -> Option<u64> {
-        Some(0)
     }
 }
 
@@ -1465,8 +1463,7 @@ impl Inner {
         let budget = &self.env.budget;
         let _admission = budget.admission_guard();
         let ready = budget.accounting_ready();
-        let other_outstanding = budget.other_outstanding_bytes();
-        let progress = budget.other_in_progress_bytes();
+        let (other_outstanding, progress) = budget.other_pending_bytes();
         let other = budget
             .other_used_bytes()
             .saturating_add(other_outstanding)
@@ -1815,10 +1812,9 @@ impl Inner {
     ) -> Result<(), ClaimRefused> {
         let budget = &self.env.budget;
         let _admission = budget.admission_guard();
-        // In admission's order: readiness, the owed bytes, the written ones.
+        // In admission's order: readiness, then the owed and written bytes.
         let ready = budget.accounting_ready();
-        let other_outstanding = budget.other_outstanding_bytes();
-        let progress = budget.other_in_progress_bytes();
+        let (other_outstanding, progress) = budget.other_pending_bytes();
         let other = budget
             .other_used_bytes()
             .saturating_add(other_outstanding)
@@ -3194,11 +3190,11 @@ async fn plan_and_admit(
         let _admission = inner.env.budget.admission_guard();
         // Readiness first, then the figures: a library published in between
         // leaves the check refusing, never passing on the default cap and no
-        // music. The owed bytes before the written ones (a write that lands
-        // in between moves from the first figure to the second, never out of
-        // both); each is read once, for the cap and for the free space.
+        // music. The owed and written bytes come from one read (a write that
+        // lands mid-read is in one figure, never both or neither), once, for
+        // the cap and for the free space.
         let ready = inner.env.budget.accounting_ready();
-        let other_outstanding = inner.env.budget.other_outstanding_bytes();
+        let (other_outstanding, progress) = inner.env.budget.other_pending_bytes();
         // A resume keeps the cap it was admitted under only while its
         // reservation already holds the new plan. One whose estimate came
         // from adoption (the missing files were never reserved), or whose
@@ -3223,7 +3219,6 @@ async fn plan_and_admit(
                 ),
             );
         }
-        let progress = inner.env.budget.other_in_progress_bytes();
         // What music holds, and what it has approved and not yet written:
         // both are part of the shared cap.
         let other = inner
@@ -3368,7 +3363,7 @@ async fn wait_for_accounting(
             let _admission = budget.admission_guard();
             (
                 budget.accounting_ready(),
-                budget.other_in_progress_bytes().is_some(),
+                budget.other_pending_bytes().1.is_some(),
             )
         };
         if ready && known {
@@ -4765,10 +4760,9 @@ impl VideoStore for DiskVideoStore {
         let (started, used) = {
             let _admission = budget.admission_guard();
             // Readiness first, then the figures (see `Check::Fresh`): the
-            // owed bytes before the written ones, each read once.
+            // owed and written bytes from one read.
             let ready = budget.accounting_ready();
-            let other_outstanding = budget.other_outstanding_bytes();
-            let progress = budget.other_in_progress_bytes();
+            let (other_outstanding, progress) = budget.other_pending_bytes();
             let (other, cap) = (
                 budget
                     .other_used_bytes()
@@ -5909,15 +5903,10 @@ pub(crate) mod tests {
             self.read();
             self.other.load(Ordering::SeqCst)
         }
-        fn other_outstanding_bytes(&self) -> u64 {
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
             self.read();
-            self.reads.lock().unwrap().push("outstanding");
-            self.other_outstanding.load(Ordering::SeqCst)
-        }
-        fn other_in_progress_bytes(&self) -> Option<u64> {
-            self.read();
-            self.reads.lock().unwrap().push("in_progress");
-            Some(0)
+            self.reads.lock().unwrap().push("pending");
+            (self.other_outstanding.load(Ordering::SeqCst), Some(0))
         }
         fn accounting_ready(&self) -> bool {
             self.ready.load(Ordering::SeqCst)
@@ -6383,12 +6372,12 @@ pub(crate) mod tests {
         fn cache_enabled(&self) -> bool {
             true
         }
-        fn outstanding_bytes(&self) -> u64 {
-            self.outstanding.load(Ordering::SeqCst)
-        }
-        fn in_progress_bytes(&self) -> Option<u64> {
-            (!self.in_progress_unknown.load(Ordering::SeqCst))
-                .then(|| self.in_progress.load(Ordering::SeqCst))
+        fn pending(&self) -> (u64, Option<u64>) {
+            (
+                self.outstanding.load(Ordering::SeqCst),
+                (!self.in_progress_unknown.load(Ordering::SeqCst))
+                    .then(|| self.in_progress.load(Ordering::SeqCst)),
+            )
         }
     }
 
@@ -6409,11 +6398,8 @@ pub(crate) mod tests {
         fn accounting_ready(&self) -> bool {
             crate::native::ports::music_ready(Some(&*self.music))
         }
-        fn other_outstanding_bytes(&self) -> u64 {
-            crate::native::ports::music_outstanding(Some(&*self.music))
-        }
-        fn other_in_progress_bytes(&self) -> Option<u64> {
-            crate::native::ports::music_in_progress(Some(&*self.music))
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+            crate::native::ports::music_pending(Some(&*self.music))
         }
         fn free_bytes(&self) -> u64 {
             self.base.free_bytes()
@@ -6677,11 +6663,11 @@ pub(crate) mod tests {
     }
 
     /// Each admission (the start's, each playlist's and the plan's) reads
-    /// the other kinds' owed bytes once, and before their written ones, as
-    /// `Budget` orders them: a write landing in between moves between the
-    /// figures, never out of both.
+    /// the other kinds' owed and written bytes once, together, as `Budget`
+    /// hands them: a write landing mid-read is in one figure, never both or
+    /// neither.
     #[tokio::test]
-    async fn an_admission_reads_the_owed_bytes_once_and_before_the_written() {
+    async fn an_admission_reads_the_pending_bytes_once() {
         let rig = Rig::new("read-order");
         let store = rig.open();
         store.start(request("1")).unwrap();
@@ -6692,9 +6678,7 @@ pub(crate) mod tests {
         // read (`wait_for_accounting`, not an admission: it reads only
         // whether the written figure is known); the two playlists'
         // reservations, then the plan.
-        let mut want = vec!["outstanding", "in_progress", "in_progress"];
-        want.extend(["outstanding", "in_progress"].repeat(3));
-        assert_eq!(reads, want);
+        assert_eq!(reads, vec!["pending"; 5]);
     }
 
     /// A resume missing its playlist with no room left under the shared cap
