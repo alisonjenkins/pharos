@@ -1767,6 +1767,121 @@ mod tests {
         }
     }
 
+    /// A transport that answers each request with the next redirect of its
+    /// script (200 once the script is done), keeping each request's URL and
+    /// whether it carried the token.
+    struct Scripted {
+        redirects: std::sync::Mutex<std::collections::VecDeque<String>>,
+        sent: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    impl Scripted {
+        fn new(redirects: &[&str]) -> Self {
+            Self {
+                redirects: std::sync::Mutex::new(
+                    redirects.iter().map(|r| (*r).to_owned()).collect(),
+                ),
+                sent: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    struct ScriptedAnswer(Option<String>);
+
+    impl ProxyResponse for ScriptedAnswer {
+        fn status(&self) -> u16 {
+            if self.0.is_some() {
+                302
+            } else {
+                200
+            }
+        }
+        fn header(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redirect(&self) -> Option<Result<String, String>> {
+            self.0.clone().map(Ok)
+        }
+        async fn body(self) -> Result<Vec<u8>, String> {
+            Ok(b"ok".to_vec())
+        }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    impl ProxyTransport for Scripted {
+        type Response = ScriptedAnswer;
+        async fn get(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<ScriptedAnswer, String> {
+            let carries = headers.iter().any(|(n, _)| n == "X-Emby-Token");
+            self.sent.lock().unwrap().push((url.to_owned(), carries));
+            Ok(ScriptedAnswer(self.redirects.lock().unwrap().pop_front()))
+        }
+    }
+
+    /// Which requests of a proxied GET over `redirects` carried the token,
+    /// starting at `from` with it.
+    #[allow(clippy::unwrap_used)]
+    fn token_per_hop(from: &str, redirects: &[&str]) -> Vec<(String, bool)> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(redirects)));
+        let (status, _, body) = rt
+            .block_on(proxy_get(
+                &client,
+                ProxyGet {
+                    url: from.to_owned(),
+                    token: Some("tok".to_owned()),
+                    headers: &[],
+                    build_server: "https://a.example.org",
+                    passed_back: &[],
+                    max_hops: 5,
+                },
+                &|_, _| {},
+            ))
+            .unwrap();
+        assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+        let sent = client.as_ref().unwrap().sent.lock().unwrap().clone();
+        sent
+    }
+
+    /// Once a redirect leaves the token's origin the token is gone for the
+    /// rest of the request: A to B to B and back to A sends it on the first
+    /// request only, never again, even back on A.
+    #[test]
+    fn a_token_dropped_on_one_hop_stays_dropped_for_the_rest() {
+        let sent = token_per_hop(
+            "https://a.example.org/1",
+            &[
+                "https://b.example.net/2",
+                "https://b.example.net/3",
+                "https://a.example.org/4",
+            ],
+        );
+        let carried: Vec<bool> = sent.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            carried,
+            [true, false, false, false],
+            "the token went past its origin: {sent:?}"
+        );
+        assert_eq!(sent[3].0, "https://a.example.org/4");
+    }
+
+    /// The control: redirects that stay on the token's origin keep it on
+    /// every request.
+    #[test]
+    fn a_token_is_kept_on_redirects_within_its_origin() {
+        let sent = token_per_hop(
+            "https://a.example.org/1",
+            &["https://a.example.org/2", "https://a.example.org/3"],
+        );
+        let carried: Vec<bool> = sent.iter().map(|(_, c)| *c).collect();
+        assert_eq!(carried, [true, true, true], "{sent:?}");
+    }
+
     /// The proxy core withholds the token itself from a URL it may not go
     /// to (plain http to a server other than the build's), whatever its
     /// caller passed in, and logs why.
