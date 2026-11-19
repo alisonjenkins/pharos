@@ -2520,13 +2520,33 @@ async fn connect(
                 ));
                 outdated.set(Some(server));
             }
+            // Published only while the machine still accepts this attempt:
+            // a sign-out (or any screen) that won while it was in flight
+            // keeps it, and its session, out. Decided and applied in one
+            // step, before any other event can land.
+            let accepted = {
+                let mut m = machine.write();
+                let accepted = m.accepts_resume(epoch);
+                if accepted {
+                    m.apply(Event::Resumed { epoch });
+                }
+                accepted
+            };
+            if !accepted {
+                let m = machine.peek();
+                platform::info(&format!(
+                    "pharos: resume publish verdict=dropped reason=attempt_no_longer_accepted epoch={epoch} current={} phase={:?}",
+                    m.epoch(),
+                    m.phase()
+                ));
+                return;
+            }
             // The session this replaces has ended: a `me` asked on it must
             // not install its user once this one is up.
             offline_video::session_replaced(&open.session);
             api.set(Some(open.session.api().clone()));
             session.set(Some(open.session.clone()));
             platform::install_telemetry(open.session.api());
-            machine.write().apply(Event::Resumed { epoch });
             let reason = platform::closed(&mut open.conn).await;
             Event::Closed { epoch, reason }
         }

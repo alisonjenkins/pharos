@@ -186,6 +186,14 @@ impl Machine {
         self.epoch
     }
 
+    /// Whether attempt `epoch`'s resume would make the app Ready: it is the
+    /// current attempt and the app is still connecting. A sign-out (or any
+    /// other move to a screen) that landed while the attempt was in flight
+    /// refuses it, so the attempt publishes no session.
+    pub fn accepts_resume(&self, epoch: u32) -> bool {
+        epoch == self.epoch && self.phase == Phase::Connecting
+    }
+
     /// Whether a session has been Ready since the last sign-in screen: a
     /// refusal then ends it through the session-end hook.
     pub fn had_session(&self) -> bool {
@@ -245,7 +253,7 @@ impl Machine {
     fn step(&mut self, event: Event) {
         let current = |epoch: u32| epoch == self.epoch;
         match event {
-            Event::Resumed { epoch } if current(epoch) => {
+            Event::Resumed { epoch } if self.accepts_resume(epoch) => {
                 self.attempt = 0;
                 self.waiting = None;
                 self.phase = Phase::Ready;
@@ -766,6 +774,31 @@ mod tests {
         assert_eq!(m.phase(), &Phase::Ready);
         assert!(m.notice().is_some_and(|n| n.contains("503")));
         assert!(!m.signing_out());
+    }
+
+    /// A sign-out that lands while a reconnect is in flight wins: that
+    /// attempt's resume is refused, and the app stays on sign-in.
+    #[test]
+    fn a_resume_after_a_sign_out_won_is_refused() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "network".into(),
+        });
+        let attempt = m.epoch();
+        assert!(m.accepts_resume(attempt));
+        m.apply(Event::SignOutAnswered(SignOutReply::Status(204)));
+        assert!(
+            !m.accepts_resume(attempt),
+            "a won sign-out still accepts the attempt"
+        );
+        m.apply(Event::Resumed { epoch: attempt });
+        assert_eq!(
+            sign_in_error_of(&m),
+            None,
+            "the attempt resumed over the sign-out"
+        );
     }
 
     /// A sign-out the device could not save signs out all the same, and
