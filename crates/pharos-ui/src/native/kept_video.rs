@@ -337,10 +337,12 @@ fn after_scheme(url: &str) -> Option<&str> {
 
 /// The key a request is stored under on a host that sees no scheme or
 /// host: the path and the query, which names the play session. An absolute
-/// URL is cut down to the same, so both spellings of one file agree.
+/// URL is cut down to the same, so both spellings of one file agree. Its
+/// authority ends at the first `/`, `?` or `#`: a URL with no path keeps
+/// its query, under the path `/`.
 pub fn request_key(url: &str) -> String {
     let path_and_query = match after_scheme(url) {
-        Some(rest) => rest.find('/').map_or("/", |i| &rest[i..]),
+        Some(rest) => rest.find(['/', '?', '#']).map_or("", |i| &rest[i..]),
         None => url,
     };
     let key = path_and_query.split('#').next().unwrap_or_default();
@@ -480,7 +482,11 @@ pub fn absolute_url(origin: &str, url: &str) -> String {
 /// play session).
 pub fn url_path(url: &str) -> &str {
     let rest = after_scheme(url).unwrap_or(url);
-    let from_path = rest.find('/').map_or("", |i| &rest[i..]);
+    let from_path = match after_scheme(url) {
+        // The authority ends where `request_key`'s does.
+        Some(_) => rest.find(['/', '?', '#']).map_or("", |i| &rest[i..]),
+        None => rest.find('/').map_or("", |i| &rest[i..]),
+    };
     from_path.split(['?', '#']).next().unwrap_or("")
 }
 
@@ -851,6 +857,19 @@ mod tests {
         );
         assert_eq!(request_key("videos/1/0.m4s?PlaySessionId=z"), k);
         assert_eq!(request_key("http://h"), "/");
+        // No path: the query stays, under `/`, as the slash spelling has it.
+        assert_eq!(
+            request_key("https://h?PlaySessionId=z"),
+            request_key("/?PlaySessionId=z")
+        );
+        assert_eq!(
+            request_key("https://h:8096?PlaySessionId=z#f"),
+            "/?PlaySessionId=z"
+        );
+        assert_eq!(request_key("https://h#f"), "/");
+        // A `/` inside a query with no path before it is not the path.
+        assert_eq!(request_key("https://h?next=/a"), "/?next=/a");
+        assert_eq!(url_path("https://h?next=/a"), "");
         // A `://` inside the query is not a scheme.
         let redirect = "/videos/1/0.m4s?next=https://x.test/a&PlaySessionId=z";
         assert_eq!(request_key(redirect), redirect);
