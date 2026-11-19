@@ -711,6 +711,11 @@ impl LyricsFinder {
                 // counts against the ready share like the aligner refusing it.
                 count_words_answer(&align::Lookup::Unavailable);
             }
+        } else if let Some(aligner) = &self.aligner {
+            // Lines alone still follow another song, so they go too.
+            if mismatched(aligner, item, &lyrics).await {
+                unsync_mismatch(&mut lyrics, item.id);
+            }
         }
         (lyrics, words_pending)
     }
@@ -745,6 +750,16 @@ async fn words_for(
     tokio::task::spawn_blocking(move || aligner.words_for(&item, &lyrics))
         .await
         .unwrap_or(align::Lookup::Unavailable)
+}
+
+/// Whether the aligner found `lyrics` of `item` not what was sung, read
+/// from its cache alone, which stats the file, so off the async threads.
+async fn mismatched(aligner: &Arc<align::Aligner>, item: &MediaItem, lyrics: &Lyrics) -> bool {
+    let aligner = Arc::clone(aligner);
+    let (item, lyrics) = (item.clone(), lyrics.clone());
+    tokio::task::spawn_blocking(move || aligner.mismatched(&item, &lyrics).is_some())
+        .await
+        .unwrap_or(false)
 }
 
 /// The aligner's words onto `lyrics`. The aligner moved the song's lines onto
@@ -1415,6 +1430,28 @@ mod tests {
     /// V1468: a lyric found not to be what was sung is never served synced,
     /// and each time it is served so is counted. Disarm check: with
     /// `unsync()` removed from `unsync_mismatch`, this fails.
+    /// V1468 on an ask for lines alone: the lines of a lyric found not
+    /// sung follow another song too, so are not served with times; another
+    /// lyric's keep theirs. Disarm check: with the lines-only branch of
+    /// `served` removed, this fails.
+    #[test]
+    fn a_lines_only_ask_for_a_lyric_not_sung_is_served_unsynced() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        std::fs::write(&item.path, b"audio").unwrap();
+        let aligner = align::tests::found_not_sung(dir.path(), &item, &wrong());
+        let finder = LyricsFinder::default().with_aligner(aligner);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (not_sung, pending) = rt.block_on(finder.served(&item, wrong(), false));
+        assert_eq!(pending, None);
+        assert!(not_sung.lines.iter().all(|l| l.start_ms.is_none()));
+        let (other, _) = rt.block_on(finder.served(&item, sung(), false));
+        assert_eq!(other, sung());
+    }
+
     #[test]
     fn a_lyric_not_sung_is_served_unsynced_and_counted() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};

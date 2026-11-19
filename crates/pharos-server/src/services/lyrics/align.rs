@@ -59,6 +59,14 @@ const MAX_LINES: usize = 500;
 
 /// One alignment job sent to the background task.
 #[derive(Debug)]
+/// The song's path under the media root, its lines as a job asks for
+/// them, and the cache key both are kept under.
+struct Keyed {
+    rel_path: String,
+    job_lines: Vec<(u64, u64, String)>,
+    key: String,
+}
+
 struct Job {
     id: u64,
     path: String,
@@ -880,20 +888,25 @@ impl Aligner {
             .is_ok_and(|r| r.status().is_success())
     }
 
-    /// Check if word timestamps are ready for `lyrics`, or queue a background job.
-    pub fn words_for(&self, item: &MediaItem, lyrics: &Lyrics) -> Lookup {
+    /// The aligner's answer for `lyrics` of `item` when it found them not
+    /// what was sung, read from the cache alone: nothing is queued.
+    pub fn mismatched(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Heard> {
+        let keyed = self.keyed(item, lyrics)?;
+        self.cache.get(item.id, &keyed.key)?.mismatch
+    }
+
+    /// What a job for `lyrics` of `item` asks and is cached under; `None`
+    /// when the aligner has nothing to do for these lyrics.
+    fn keyed(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Keyed> {
         if !lyrics.synced() {
-            return Lookup::Unavailable;
+            return None;
         }
         if lyrics.lines.iter().all(|l| !l.words.is_empty()) || lyrics.lines.len() > MAX_LINES {
-            return Lookup::Unavailable;
+            return None;
         }
-        let rel_path = match item.path.strip_prefix(&self.media_root) {
-            Ok(p) => match p.to_str() {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => return Lookup::Unavailable,
-            },
-            Err(_) => return Lookup::Unavailable,
+        let rel_path = match item.path.strip_prefix(&self.media_root).ok()?.to_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return None,
         };
 
         let mut job_lines = Vec::with_capacity(lyrics.lines.len());
@@ -908,8 +921,24 @@ impl Aligner {
             let end_ms = end_ms.max(start_ms);
             job_lines.push((start_ms, end_ms, line.text.clone()));
         }
-
         let key = cache_key(&[], &rel_path, &item.path, &job_lines);
+        Some(Keyed {
+            rel_path,
+            job_lines,
+            key,
+        })
+    }
+
+    /// Check if word timestamps are ready for `lyrics`, or queue a background job.
+    pub fn words_for(&self, item: &MediaItem, lyrics: &Lyrics) -> Lookup {
+        let Some(Keyed {
+            rel_path,
+            job_lines,
+            key,
+        }) = self.keyed(item, lyrics)
+        else {
+            return Lookup::Unavailable;
+        };
 
         if let Some(aligned) = self.cache.get(item.id, &key) {
             if let Some(heard) = aligned.mismatch {
@@ -1097,7 +1126,7 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -1117,6 +1146,23 @@ mod tests {
             tx,
             shadow: None,
         }
+    }
+
+    /// An aligner whose cache holds a verdict that `lyrics` of `item`, a
+    /// file under `media_root`, were not what was sung.
+    pub(in crate::services::lyrics) fn found_not_sung(
+        media_root: &Path,
+        item: &MediaItem,
+        lyrics: &Lyrics,
+    ) -> Arc<Aligner> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root.to_path_buf(), AlignCache::new(None), tx);
+        assert_eq!(aligner.words_for(item, lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check(LYRICS_MISMATCH), 1).unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+        Arc::new(aligner)
     }
 
     fn sample_item(path: PathBuf) -> MediaItem {
