@@ -202,10 +202,18 @@ pub fn load_token() -> Option<String> {
 }
 
 /// The token for a download request of `owner`'s run, from one uncached
-/// read of the one file (`token_file::run_token`). Never log the token.
+/// read of the one file (`token_file::run_token`), behind the same
+/// sign-out fence as `load_token`. Never log the token.
 pub fn run_token(owner: &str) -> Result<String, String> {
     let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    token_file::run_token(&path, owner)
+    let fenced = KEPT_AFTER_SIGN_OUT.load(std::sync::atomic::Ordering::SeqCst);
+    let decided = token_file::run_token(&path, owner, fenced);
+    if fenced {
+        log::info!(
+            "pharos: run token verdict=refused reason=signed_out_token_not_removed owner={owner}"
+        );
+    }
+    decided
 }
 
 /// Replaces the token file whole (`token_file::store`): the new token's user
@@ -271,6 +279,11 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
         return ended;
     }
     set_cached(None);
+    if matches!(ended, token_file::Ended::Unsafe { .. }) {
+        // Still on file and readable: fence it in this process.
+        KEPT_AFTER_SIGN_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
+        log::warn!("pharos: token forget verdict=fenced reason=token_neither_removed_nor_marked");
+    }
     drop_legacy_user(&path);
     note_credentials_changed("forgotten");
     ended

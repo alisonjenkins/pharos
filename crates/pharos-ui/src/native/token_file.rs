@@ -51,8 +51,13 @@ pub fn pair(path: &Path, seen: Option<&str>, user: &str) -> Result<(), String> {
 /// its user from one read of the file, the token only while that user is
 /// `owner` ([`token_for_owner`](super::kept_video::token_for_owner)). Err
 /// names the refusal; nothing is sent. The phone's fetcher and its host
-/// tests decide through this one function.
-pub fn run_token(path: &Path, owner: &str) -> Result<String, String> {
+/// tests decide through this one function. `signed_out` is the process's
+/// sign-out fence: set while a sign-out left the token on file, it refuses
+/// every request before the file is read, until a new sign-in lifts it.
+pub fn run_token(path: &Path, owner: &str, signed_out: bool) -> Result<String, String> {
+    if signed_out {
+        return Err(format!("signed_out_token_not_removed owner={owner}"));
+    }
     let stored = read(path).map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
     let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
     super::kept_video::token_for_owner(token.as_deref(), user.as_deref(), owner)
@@ -150,6 +155,26 @@ mod sign_out_tests {
             matches!(sign_out(&path), SignedOut::NotSaved(_)),
             "an unlink that failed was reported saved"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A download request after a sign-out that left the token on file is
+    /// refused by the fence, even though the file still names the owner;
+    /// with the fence lifted the same file serves it.
+    #[test]
+    fn a_fenced_sign_out_refuses_the_download_token() {
+        let d = std::env::temp_dir().join(format!("pharos-run-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("device-token");
+        store(&path, "tok").unwrap();
+        pair(&path, Some("tok"), "u1").unwrap();
+        assert_eq!(
+            run_token(&path, "u1", true),
+            Err("signed_out_token_not_removed owner=u1".to_owned()),
+            "a fenced process sent the signed-out token"
+        );
+        assert_eq!(run_token(&path, "u1", false), Ok("tok".to_owned()));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
