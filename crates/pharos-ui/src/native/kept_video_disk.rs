@@ -247,6 +247,11 @@ struct State {
     /// has fetched and promoted. On disk, so no longer owed, but in no
     /// stored figure until the plan's inventory counts them.
     playlists_landed: HashMap<(String, String, u64), u64>,
+    /// Per run, before its plan is admitted: the record's reservation
+    /// before the run's first playlist allowance. A run that ends with no
+    /// plan gives its allowances back down to this, keeping the playlists
+    /// that landed counted.
+    playlists_base: HashMap<(String, String, u64), u64>,
     /// Starts whose first record is not saved yet, by the run they claimed:
     /// a failed save rolls back its own record even when a session end has
     /// parked (revoked) that run, and never a newer start's. A removal or a
@@ -1527,6 +1532,7 @@ impl Inner {
                 {
                     v.estimated_bytes = own.saturating_add(shortfall);
                 }
+                st.playlists_base.entry(who.clone()).or_insert(own);
                 st.playlists_taken.entry(who).or_insert((held, 0)).1 += PLAYLIST_MAX_BYTES;
                 drop(st);
                 emit(
@@ -1708,6 +1714,7 @@ impl Inner {
             v.stale_on_disk = plan.stale;
             st.playlists_taken.remove(&who);
             st.playlists_landed.remove(&who);
+            st.playlists_base.remove(&who);
         }
         #[cfg(test)]
         self.plans_admitted
@@ -3611,8 +3618,32 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             st.runs.remove(&key);
         }
         let who = (user.clone(), item.clone(), run);
-        st.playlists_taken.remove(&who);
-        st.playlists_landed.remove(&who);
+        let pre_plan = st.playlists_taken.remove(&who).is_some();
+        let landed = st.playlists_landed.remove(&who).unwrap_or(0);
+        let base = st.playlists_base.remove(&who);
+        // A run that ends before its plan is admitted (it parked, or
+        // failed) gives back the playlist allowances it did not use: what
+        // the record reserved before them, and the playlists that landed.
+        // Never under another run, whose reservation it is now.
+        if let (true, Some(base), false) = (pre_plan, base, st.runs.contains_key(&key)) {
+            if let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            {
+                let to = base.saturating_add(landed).min(v.estimated_bytes);
+                if to < v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed}",
+                            v.estimated_bytes
+                        ),
+                    );
+                    v.estimated_bytes = to;
+                }
+            }
+        }
         if owned {
             st.retained_parts.remove(&inner.item_dir(&user, &item));
         }
@@ -8944,6 +8975,42 @@ pub(crate) mod tests {
         assert!(
             pending.iter().any(|l| l.contains("verdict=pending")),
             "{pending:?}"
+        );
+    }
+
+    /// A run that parks before its plan gives back the playlist allowance it
+    /// did not use: with room for two allowances only, a download refused
+    /// the credentials at its media playlist resumes and reserves that
+    /// playlist again, rather than being refused over the first run's
+    /// unused share.
+    #[tokio::test]
+    async fn a_run_parked_before_its_plan_gives_back_unused_playlist_allowances() {
+        let rig = Rig::new("park-releases-allowance");
+        rig.server.sign_in("u1");
+        rig.budget
+            .cap
+            .store(2 * PLAYLIST_MAX_BYTES + 120, Ordering::SeqCst);
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        rig.server.sign_in("u2");
+        later.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        let after_park = only(&store).estimated_bytes;
+        assert!(
+            after_park < 2 * PLAYLIST_MAX_BYTES,
+            "the unused allowance stayed reserved: {after_park}"
+        );
+        rig.server.sign_in("u1");
+        store.resume_user("u1");
+        store.settled().await;
+        let reserved = lines("pharos: video playlist reserved item=1");
+        assert!(
+            reserved.iter().filter(|l| l.contains("main.m3u8")).count() >= 2,
+            "the media playlist was not reserved again: {reserved:?} {:?}",
+            captured()
         );
     }
 
