@@ -262,6 +262,14 @@ pub trait VideoStore: Send + Sync {
     fn size_unknown(&self) -> bool {
         false
     }
+    /// The three figures the music cache reads, as one snapshot: what is
+    /// held, what is still owed, and whether a size is unknown. A store
+    /// with state of its own reads them in one hold, so the verdict and the
+    /// bytes describe the same moment.
+    fn accounting(&self) -> (u64, u64, bool) {
+        let unknown = self.size_unknown();
+        (self.kept_bytes(), self.outstanding_bytes(), unknown)
+    }
     /// How many folders hold downloads whose record cannot be read: they
     /// are kept, counted and block every admission until they read again or
     /// are discarded. Zero for a store with no such folders.

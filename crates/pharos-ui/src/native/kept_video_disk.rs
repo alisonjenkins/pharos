@@ -706,6 +706,17 @@ impl State {
     }
 
     /// What the other running downloads have yet to write ([`State::owed`]).
+    /// What every record holds or has reserved, with the tombstones and
+    /// the revoked runs still draining.
+    fn kept(&self) -> u64 {
+        self.list
+            .iter()
+            .map(reserved)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(self.tombstoned())
+            .saturating_add(self.draining())
+    }
+
     fn outstanding(&self, user: &str, item: &str) -> u64 {
         self.list
             .iter()
@@ -4720,11 +4731,18 @@ impl VideoStore for DiskVideoStore {
             .saves
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // The folder turns unknown in this hold: under the lock the host
+        // shares with music admission, so an admission never reads its
+        // figures half before and half after. Held for the transition only,
+        // never while the folder is deleted.
+        let admission = self.inner.env.budget.admission_guard();
         let record = {
             let mut st = lock(&self.inner.state);
             let Some(record) = take(&mut st.list, user, item) else {
                 return;
             };
+            #[cfg(test)]
+            tests::at_removal_mark();
             st.runs.remove(&(user.to_owned(), item.to_owned()));
             st.pending_starts
                 .remove(&(user.to_owned(), item.to_owned()));
@@ -4753,6 +4771,7 @@ impl VideoStore for DiskVideoStore {
             st.bump(&dir);
             record
         };
+        drop(admission);
         let dir = self.inner.item_dir(user, item);
         // The record goes first, so a folder that will not delete cannot
         // bring the download back at the next open.
@@ -4822,6 +4841,20 @@ impl VideoStore for DiskVideoStore {
         lock(&self.inner.state).unknown_folder().is_some()
     }
 
+    fn accounting(&self) -> (u64, u64, bool) {
+        // A sweep first when a folder is unknown (it may adopt or measure
+        // it; see `size_unknown`), then every figure in one hold.
+        if lock(&self.inner.state).unknown_folder().is_some() {
+            self.inner.sweep_if_due();
+        }
+        let st = lock(&self.inner.state);
+        (
+            st.kept(),
+            st.outstanding("", ""),
+            st.unknown_folder().is_some(),
+        )
+    }
+
     fn unreadable_count(&self) -> usize {
         lock(&self.inner.state).held.len()
     }
@@ -4839,13 +4872,7 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn kept_bytes(&self) -> u64 {
-        let st = lock(&self.inner.state);
-        st.list
-            .iter()
-            .map(reserved)
-            .fold(0u64, u64::saturating_add)
-            .saturating_add(st.tombstoned())
-            .saturating_add(st.draining())
+        lock(&self.inner.state).kept()
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
@@ -5023,6 +5050,19 @@ pub(crate) mod tests {
         /// Runs once a start's record has failed to save, before it is
         /// rolled back.
         pub(super) static BEFORE_START_ROLLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs as a removal marks its folder of unknown size.
+        pub(super) static AT_REMOVAL_MARK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn at_removal_mark() {
+        AT_REMOVAL_MARK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -7751,6 +7791,39 @@ pub(crate) mod tests {
         assert!(why.contains("unknown"), "{why}");
         UNREADABLE.with(|u| u.borrow_mut().clear());
         FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// A removal turns its folder unknown under the lock music admission
+    /// takes, so an admission never trusts a "known" read from before the
+    /// mark with figures from after it; the lock is let go before the
+    /// folder is deleted. The figures the music cache reads come from one
+    /// snapshot that shows the mark.
+    #[tokio::test]
+    async fn a_removal_marks_its_folder_unknown_under_the_admission_lock() {
+        let rig = Rig::new("remove-under-admission");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = rig.budget.held.clone();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let s2 = seen.clone();
+        set_hook(&AT_REMOVAL_MARK, move || {
+            s2.set(Some(held.load(Ordering::SeqCst)))
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        clear_hook(&AT_REMOVAL_MARK);
+        assert!(
+            seen.get().is_some_and(|n| n > 0),
+            "the folder turned unknown outside the admission lock: {:?}",
+            seen.get()
+        );
+        assert_eq!(
+            rig.budget.held.load(Ordering::SeqCst),
+            0,
+            "held through the delete"
+        );
     }
 
     /// The process's one log capture, for the tests that read the music

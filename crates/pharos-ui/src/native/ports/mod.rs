@@ -321,12 +321,11 @@ pub fn outside_bytes(
 ) -> pharos_content::OutsideBytes {
     match store {
         Some(s) => {
-            // The size check first: it may sweep and adopt folders, and the
-            // figures read after it are the ones that sweep left.
-            let unknown = s.size_unknown();
+            // One snapshot: the verdict and the bytes from the same moment.
+            let (held, outstanding, unknown) = s.accounting();
             pharos_content::OutsideBytes {
-                held: s.kept_bytes(),
-                outstanding: s.outstanding_bytes(),
+                held,
+                outstanding,
                 unknown,
             }
         }
