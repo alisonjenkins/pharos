@@ -44,6 +44,8 @@ thread_local! {
     static PART_SCAN_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Part scans made on this thread.
     static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs in `set_cap` once the setting is saved, before the live cap is.
+    static AFTER_CAP_SAVED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,11 +506,19 @@ impl Cache {
         let path = self.dir.join(SETTINGS_FILE);
         let bytes = serde_json::to_vec(&Settings { cap_bytes })
             .map_err(|e| err("encode settings", &path, e))?;
-        write_atomic(&path, &bytes).map_err(|e| err("save settings", &path, e))?;
-        // The cap is part of what a host's admission reads: changed and
-        // trimmed to as one step against it (shared lock, then the cache's).
-        // No caller holds the shared lock here.
+        // The cap is part of what a host's admission reads: saved, changed
+        // and trimmed to as one step against it (shared lock, then the
+        // cache's), so two changes land on disk in the order they apply and
+        // a restart restores the cap admission saw. No caller holds the
+        // shared lock here. A failed save leaves the live cap as it was.
         let _admission = admission_guard();
+        write_atomic(&path, &bytes).map_err(|e| err("save settings", &path, e))?;
+        #[cfg(test)]
+        AFTER_CAP_SAVED.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
         let mut s = self.lock();
         self.cap.store(cap_bytes, Ordering::SeqCst);
         let evicted = self.evict_locked(&mut s);
@@ -1382,6 +1392,29 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert_eq!(c.cap(), 500);
+    }
+
+    /// The cap is saved under the shared admission lock, in the same hold
+    /// that applies it: two changes cannot save in one order and apply in
+    /// the other, leaving a restart a cap admission never saw.
+    #[test]
+    fn a_cap_is_saved_in_the_same_hold_that_applies_it() {
+        let d = tmp("cap-save-hold");
+        let c = Cache::open(&d, 1000).unwrap();
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        let h2 = held.clone();
+        AFTER_CAP_SAVED.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                h2.set(Some(ADMISSION.try_lock().is_err()))
+            }));
+        });
+        c.set_cap(500).unwrap();
+        AFTER_CAP_SAVED.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            held.get(),
+            Some(true),
+            "the cap was saved outside the admission lock"
+        );
     }
 
     /// A trim reads the parts folder once, and once more before it calls
