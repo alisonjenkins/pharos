@@ -7,7 +7,7 @@
 pub mod whisper;
 
 use crate::obs::RECOGNISE_RETRY_TOTAL;
-use crate::transcript::Word;
+use crate::transcript::{Transcript, Word};
 
 /// Seconds of audio whisper decodes at once.
 pub const WINDOW_S: f64 = 30.0;
@@ -92,33 +92,82 @@ fn groups(tokens: &[Token]) -> Vec<&[Token]> {
     out
 }
 
-/// The words in `tokens`, in order. DTW times mark where a token ends, so a
-/// word starts where the word before it ends (taking a word's own first DTW
-/// time put starts ~380 ms late); the first word starts at its own `t0`.
-pub fn words(tokens: &[Token]) -> Vec<Word> {
+/// A segment's first word longer than this is whisper's timestamp rule
+/// putting its start back at the window's start or the last silence, not
+/// where it was sung: one sung at 143.0 s came out spanning 136.3-143.4 s.
+pub const FIRST_WORD_MAX_S: f64 = 2.5;
+/// How long a word is sung, per letter, clamped to the range below: the
+/// median of one song's 199 words was 0.14 s.
+const SUNG_S_PER_LETTER: f64 = 0.14;
+const SUNG_MIN_S: f64 = 0.3;
+const SUNG_MAX_S: f64 = 1.0;
+
+/// How long `text` takes to sing, from its letters.
+fn sung_s(text: &str) -> f64 {
+    let letters = text.chars().filter(|c| c.is_alphanumeric()).count();
+    (letters as f64 * SUNG_S_PER_LETTER).clamp(SUNG_MIN_S, SUNG_MAX_S)
+}
+
+/// The words in `tokens`, in order, and whether the first was clipped.
+/// DTW times mark where a token ends, so a word starts where the word
+/// before it ends (taking a word's own first DTW time put starts ~380 ms
+/// late). The first word starts at its own `t0`, unless that makes it
+/// longer than [`FIRST_WORD_MAX_S`]; it then starts as long before its end
+/// as its letters take to sing (its DTW end is where it was heard).
+fn timed_words(tokens: &[Token]) -> (Vec<Word>, bool) {
     let mut prev_end: Option<f64> = None;
-    groups(tokens)
+    let mut clipped = false;
+    let words = groups(tokens)
         .into_iter()
         .filter_map(|g| {
             let (first, last) = (g.first()?, g.last()?);
-            let start_s = prev_end.unwrap_or(first.t0_s);
-            let end_s = last.dtw_s.max(start_s);
+            let text: String = g.iter().map(|t| t.text.as_str()).collect();
+            let end_s = last.dtw_s.max(prev_end.unwrap_or(first.t0_s));
+            let start_s = prev_end.unwrap_or_else(|| {
+                if end_s - first.t0_s <= FIRST_WORD_MAX_S {
+                    return first.t0_s;
+                }
+                let start_s = first.t0_s.max(end_s - sung_s(&text));
+                tracing::debug!(
+                    word = %text,
+                    t0_s = first.t0_s,
+                    end_s,
+                    start_s,
+                    max_s = FIRST_WORD_MAX_S,
+                    "segment's first word clipped"
+                );
+                clipped = true;
+                start_s
+            });
             prev_end = Some(end_s);
             Some(Word {
-                text: g.iter().map(|t| t.text.as_str()).collect(),
+                text,
                 start_s,
                 end_s,
                 prob: g.iter().map(|t| f64::from(t.prob)).sum::<f64>() / g.len() as f64,
             })
         })
-        .collect()
+        .collect();
+    (words, clipped)
 }
 
-/// The words of every segment, in order. Each segment's first word starts
-/// at its own `t0`: a segment after a gap would otherwise open on a word
-/// stretched back to the end of the segment before it.
-pub fn segment_words(segments: &[Segment]) -> Vec<Word> {
-    segments.iter().flat_map(|s| words(&s.tokens)).collect()
+/// The words in `tokens`, in order; see [`timed_words`].
+pub fn words(tokens: &[Token]) -> Vec<Word> {
+    timed_words(tokens).0
+}
+
+/// The words of every segment, in order, with how many segments' first
+/// words were clipped. Each segment's first word starts at its own `t0`:
+/// a segment after a gap would otherwise open on a word stretched back to
+/// the end of the segment before it.
+pub fn segment_words(segments: &[Segment]) -> Transcript {
+    let mut out = Transcript::default();
+    for s in segments {
+        let (words, clipped) = timed_words(&s.tokens);
+        out.words.extend(words);
+        out.first_words_clipped += usize::from(clipped);
+    }
+    out
 }
 
 /// Whether whisper put one caption over a whole window.
