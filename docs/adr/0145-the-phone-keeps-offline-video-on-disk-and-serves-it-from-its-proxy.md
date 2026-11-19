@@ -194,6 +194,37 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   the request, back on its own origin too. The library's sign-out logs
   `token forget verdict=signed_out_not_durable` when its removal could not
   be synced, as the phone does, and still signs out in memory.
+- Only the authorized offline owner reaches the downloads. A cold start
+  installs its remembered user only when no session or identity change
+  overtook its reads, and, once a device-token session exists, only the user
+  paired with that token. The Downloads page and the local-copy choice use
+  that owner, never a pinned account result; a listing read for one user is
+  never shown beside another user's Remove.
+- A session that ends drops its own token, conditionally, so a replacement
+  token is kept (`token forget verdict=forgotten|kept_replacement
+  reason=session_ended`). A phone sign-out whose token file could not be
+  removed still signs out, says so (`SignOutReply::NotSaved`), and refuses
+  that token for the rest of the process. The offline cleanup of a sign-out
+  runs once, through the session-end hook.
+- A sign-in that finds a start whose record is not saved yet defers its
+  resume until the save, which replays it with a run of its own; a rollback
+  or removal drops the deferral.
+- A removal turns its folder unknown under the music admission lock, and
+  the music hook reads the video figures in one snapshot. A settled staging
+  file stays reserved through the plan admitted after it. A run that parks
+  before its plan gives back the playlist allowances it did not use, the
+  bytes on disk still counted.
+- On the music side, a pin folded into a job whose track is missing after
+  the job is queued again; a replacement body owes only what it has not
+  written since its file was emptied; and a body whose advertised length has
+  landed is finished, not refused, while the accounting is unknown.
+- A registration whose store's runtime or thread could not start gives its
+  claim back too (`Registration::NotOpened`). A service-only process reruns
+  the registration on each later connect and prefetch until it is done
+  (`video accounting retry when=… verdict=…`); music stays refused meanwhile.
+- A request key's authority ends at the first `/`, `?` or `#`, so an
+  absolute URL with no path keeps its query under `/`. Stored keys are
+  unchanged: the server's URLs always have a path.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
