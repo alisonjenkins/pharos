@@ -250,8 +250,14 @@ struct State {
     /// Per run, before its plan is admitted: the record's reservation
     /// before the run's first playlist allowance. A run that ends with no
     /// plan gives its allowances back down to this, keeping the playlists
-    /// that landed counted.
-    playlists_base: HashMap<(String, String, u64), u64>,
+    /// that landed counted, and only on the record it was taken from (the
+    /// record's generation, `record_gen`, beside it).
+    playlists_base: HashMap<(String, String, u64), (u64, u64)>,
+    /// Which record an item has, by the run its start claimed: a removal
+    /// and a new start give the item a new record, and a stale run's exit
+    /// must not change the replacement's reservation. Records read at open
+    /// have none (0).
+    record_gen: HashMap<(String, String), u64>,
     /// Starts whose first record is not saved yet, by the run they claimed:
     /// a failed save rolls back its own record even when a session end has
     /// parked (revoked) that run, and never a newer start's. A removal or a
@@ -1560,7 +1566,12 @@ impl Inner {
                 {
                     v.estimated_bytes = own.saturating_add(shortfall);
                 }
-                st.playlists_base.entry(who.clone()).or_insert(own);
+                let gen = st
+                    .record_gen
+                    .get(&(user.to_owned(), item.to_owned()))
+                    .copied()
+                    .unwrap_or(0);
+                st.playlists_base.entry(who.clone()).or_insert((own, gen));
                 st.playlists_taken.entry(who).or_insert((held, 0)).1 += PLAYLIST_MAX_BYTES;
                 drop(st);
                 emit(
@@ -3692,6 +3703,17 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         // failed) gives back the playlist allowances it did not use: what
         // the record reserved before them, and the playlists that landed.
         // Never under another run, whose reservation it is now.
+        let same_record =
+            base.is_some_and(|(_, gen)| st.record_gen.get(&key).copied().unwrap_or(0) == gen);
+        if pre_plan && base.is_some() && !same_record {
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance kept item={item} run={run} reason=record_replaced"
+                ),
+            );
+        }
+        let base = base.filter(|_| same_record).map(|(b, _)| b);
         if let (true, Some(base), false) = (pre_plan, base, st.runs.contains_key(&key)) {
             if let Some(v) = st
                 .list
@@ -4800,6 +4822,7 @@ impl VideoStore for DiskVideoStore {
                     // The run is named in the same hold: a rollback below
                     // touches the record only while this start still owns it.
                     run_id = st.claim_run(&user, &item);
+                    st.record_gen.insert((user.clone(), item.clone()), run_id);
                     st.pending_starts.insert((user.clone(), item.clone()), run_id);
                     // A settlement that began before this start must not act
                     // on the folder as it saw it.
@@ -4924,6 +4947,7 @@ impl VideoStore for DiskVideoStore {
                 .remove(&(user.to_owned(), item.to_owned()));
             st.resume_after_save
                 .remove(&(user.to_owned(), item.to_owned()));
+            st.record_gen.remove(&(user.to_owned(), item.to_owned()));
             st.retained_parts.remove(&self.inner.item_dir(user, item));
             // Every file indexed under the item's folder goes, as in
             // `prune_unplanned`: the playlists are indexed before the plan
@@ -9185,6 +9209,33 @@ pub(crate) mod tests {
         assert!(
             reserved.iter().filter(|l| l.contains("main.m3u8")).count() >= 2,
             "the media playlist was not reserved again: {reserved:?} {:?}",
+            captured()
+        );
+    }
+
+    /// A stale run that ends before its plan gives allowances back only on
+    /// the record it took them from: after a removal and a new start that
+    /// went on to Ready, its exit leaves the replacement's reservation
+    /// alone.
+    #[tokio::test]
+    async fn a_stale_run_leaves_a_replacement_records_reservation_alone() {
+        let rig = Rig::new("park-replacement-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        store.park_runs(Some("u1"));
+        store.remove("u1", "1");
+        store.start(request("1")).unwrap();
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let before = only(&store).estimated_bytes;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(
+            only(&store).estimated_bytes,
+            before,
+            "the stale run changed the replacement's reservation: {:?}",
             captured()
         );
     }
