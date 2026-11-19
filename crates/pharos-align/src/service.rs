@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::anchor::{match_lines, Options};
 use crate::audio::DecodeError;
+use crate::check::TextCheck;
 use crate::crash::CrashGuard;
 use crate::ctc::Emission;
 use crate::line::LineSpans;
@@ -324,6 +325,9 @@ pub struct Aligned {
     pub stages: StageTimes,
     /// Lines reported again because the recogniser moved them.
     pub corrected: usize,
+    /// The lyric's text against what the recogniser heard; `None` when no
+    /// transcript was made.
+    pub check: Option<TextCheck>,
 }
 
 struct Slot {
@@ -650,6 +654,7 @@ struct Today {
     reason: String,
     phases: Phases,
     with_words: usize,
+    check: Option<TextCheck>,
 }
 
 impl Today {
@@ -681,6 +686,7 @@ impl Today {
             fallback_reason,
             stages,
             corrected,
+            check: self.check,
         }
     }
 }
@@ -817,6 +823,10 @@ fn improve(
     let heard = match heard {
         Ok(h) => h,
         Err(e) => return fail(today, times, 0, e),
+    };
+    let today = Today {
+        check: Some(TextCheck::new(&today.request, &heard.words)),
+        ..today
     };
 
     let t = Instant::now();
@@ -1078,6 +1088,7 @@ fn run_song(
         reason: found.reason,
         phases,
         with_words,
+        check: None,
     })
 }
 

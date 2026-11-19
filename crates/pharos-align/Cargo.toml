@@ -34,6 +34,8 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 metrics-process.workspace = true
 opentelemetry.workspace = true
+# The lyric text check shared with the server (B1479).
+pharos-core = { path = "../pharos-core" }
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 libc = "0.2"
