@@ -256,6 +256,12 @@ struct State {
     /// by the start once its save settles (a saved start whose run a
     /// sign-out parked starts a new one), dropped by its rollback.
     resume_after_save: HashSet<(String, String)>,
+    /// Staging files a settlement measured but could not delete, in a
+    /// folder a run owns (its plan not yet admitted): bytes on disk that
+    /// no plan inventory counts. The plan admitted next reserves them on
+    /// top of its own; cleared when the run leaves (its exit drops or
+    /// counts them again).
+    retained_parts: HashMap<PathBuf, u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -435,6 +441,7 @@ fn iso_from_secs(secs: u64) -> String {
 }
 
 /// The planned download, as [`Inner::admit`] records it.
+#[derive(Clone)]
 struct Plan {
     files: Vec<String>,
     estimate: u64,
@@ -1071,11 +1078,17 @@ impl Inner {
                 return;
             }
         }
+        // A run owns the folder: its staging files stay, and the plan it
+        // admits next must reserve them (its inventory leaves `.part` out).
+        let retained = if owned { parts_bytes(dir) } else { 0 };
         let mut st = lock(&self.state);
         if !Self::unchanged_since(&st, dir, epoch) {
             return;
         }
         st.leftover.retain(|d| d != dir);
+        if retained > 0 {
+            st.retained_parts.insert(dir.to_path_buf(), retained);
+        }
         drop(st);
         emit(
             false,
@@ -1558,11 +1571,36 @@ impl Inner {
         check: Check,
         other_outstanding: u64,
     ) -> Result<(), Admission> {
+        #[cfg(test)]
+        tests::before_plan_admit();
         {
             let mut st = lock(&self.state);
             if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
                 return Err(Admission::Gone);
             }
+            // Staging files a settlement kept in this folder are on disk and
+            // in no inventory: the plan reserves them as stale.
+            let retained = st
+                .retained_parts
+                .get(&self.item_dir(user, item))
+                .copied()
+                .unwrap_or(0);
+            let widened;
+            let plan = if retained > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep plan item={item} run={run} retained_parts={retained} verdict=reserved"
+                    ),
+                );
+                widened = Plan {
+                    stale: plan.stale.saturating_add(retained),
+                    ..plan.clone()
+                };
+                &widened
+            } else {
+                plan
+            };
             // What the running downloads still owe is read before the free
             // space is measured: a write landing in between lowers free, and
             // the stale (higher) owed figure only makes the check stricter.
@@ -3575,6 +3613,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         let who = (user.clone(), item.clone(), run);
         st.playlists_taken.remove(&who);
         st.playlists_landed.remove(&who);
+        if owned {
+            st.retained_parts.remove(&inner.item_dir(&user, &item));
+        }
         let parked = st.parking.get(&key) == Some(&run);
         if parked {
             st.parking.remove(&key);
@@ -3695,6 +3736,15 @@ fn remove_part(path: &Path) -> std::io::Result<()> {
 /// The staging files ending in `suffix` in `dir/files`, and whether the
 /// listing was complete: false when the folder or an entry could not be
 /// read (anything but the folder being gone).
+/// The bytes of the staging files in `dir` (those that can be read).
+fn parts_bytes(dir: &Path) -> u64 {
+    part_paths(dir, ".part")
+        .0
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .fold(0u64, |sum, m| sum.saturating_add(m.len()))
+}
+
 fn part_paths(dir: &Path, suffix: &str) -> (Vec<PathBuf>, bool) {
     let read = match std::fs::read_dir(dir.join("files")) {
         Ok(read) => read,
@@ -4748,6 +4798,7 @@ impl VideoStore for DiskVideoStore {
                 .remove(&(user.to_owned(), item.to_owned()));
             st.resume_after_save
                 .remove(&(user.to_owned(), item.to_owned()));
+            st.retained_parts.remove(&self.inner.item_dir(user, item));
             // Every file indexed under the item's folder goes, as in
             // `prune_unplanned`: the playlists are indexed before the plan
             // is admitted and are not in the record's files, and a folder
@@ -5050,6 +5101,19 @@ pub(crate) mod tests {
         /// Runs once a start's record has failed to save, before it is
         /// rolled back.
         pub(super) static BEFORE_START_ROLLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs as a plan is about to be admitted.
+        pub(super) static BEFORE_PLAN_ADMIT: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_plan_admit() {
+        BEFORE_PLAN_ADMIT.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -10870,6 +10934,37 @@ pub(crate) mod tests {
             "kept {} of {on_disk} on disk",
             store.kept_bytes()
         );
+    }
+
+    /// The same, with the music hook settling the folder before the plan is
+    /// admitted (the run owns it, no writer is in it): the staging file
+    /// that would not go stays counted through the admitted plan, never
+    /// replaced by an inventory that leaves it out.
+    #[tokio::test]
+    async fn a_settled_staging_file_stays_reserved_through_the_plan() {
+        let rig = Rig::new("host-resume-part-settled");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the plan replaced the staging file's floor: kept {} of {on_disk} on disk ({decided:?})",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
     }
 
     /// A car-only process: a removed download's folder that would not
