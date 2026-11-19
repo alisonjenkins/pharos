@@ -142,10 +142,8 @@ mod sign_out_tests {
     /// saved.
     #[test]
     fn a_token_that_cannot_be_removed_is_a_sign_out_not_saved() {
-        let d = std::env::temp_dir().join(format!("pharos-sign-out-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("device-token");
+        let d = super::super::test_dir::TmpDir::new("sign-out");
+        let path = d.path().join("device-token");
         store(&path, "tok").unwrap();
         assert_eq!(sign_out(&path), SignedOut::Saved);
         assert_eq!(read(&path).unwrap(), None);
@@ -155,7 +153,6 @@ mod sign_out_tests {
             matches!(sign_out(&path), SignedOut::NotSaved(_)),
             "an unlink that failed was reported saved"
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A download request after a sign-out that left the token on file is
@@ -163,10 +160,8 @@ mod sign_out_tests {
     /// with the fence lifted the same file serves it.
     #[test]
     fn a_fenced_sign_out_refuses_the_download_token() {
-        let d = std::env::temp_dir().join(format!("pharos-run-fence-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("device-token");
+        let d = super::super::test_dir::TmpDir::new("run-fence");
+        let path = d.path().join("device-token");
         store(&path, "tok").unwrap();
         pair(&path, Some("tok"), "u1").unwrap();
         assert_eq!(
@@ -175,6 +170,5 @@ mod sign_out_tests {
             "a fenced process sent the signed-out token"
         );
         assert_eq!(run_token(&path, "u1", false), Ok("tok".to_owned()));
-        let _ = std::fs::remove_dir_all(&d);
     }
 }
