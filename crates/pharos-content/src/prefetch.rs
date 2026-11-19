@@ -849,6 +849,12 @@ impl Gate {
                     .map_err(|e| Fail::Permanent(format!("write part: {e}")))?;
                 written = written.saturating_add(len);
                 since_check = since_check.saturating_add(len);
+                // Spent as soon as it is on disk, before a check below can
+                // end the attempt: the budget counts what the disk took.
+                if !self.is_pin_work(id) {
+                    let mut q = self.lock();
+                    q.budget = q.budget.saturating_sub(len);
+                }
                 // With no length, the window is renewed when another chunk
                 // arrives (above, before it is written), never to read the
                 // end of the body: a download that has all it will get must
@@ -864,10 +870,6 @@ impl Gate {
                     self.cache
                         .ensure_free(id, reserved_ahead)
                         .map_err(Fail::no_room)?;
-                }
-                if !self.is_pin_work(id) {
-                    let mut q = self.lock();
-                    q.budget = q.budget.saturating_sub(chunk.len() as u64);
                 }
                 if !self.still_wanted(id, generation) {
                     return Err(Fail::Cancelled);
@@ -1738,6 +1740,51 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         assert!(r.cache.is_complete("track/1") && r.cache.is_complete("track/2"));
         assert!(!r.cache.is_complete("track/3"));
+    }
+
+    /// A chunk that was written is spent from the read-ahead budget even
+    /// when the free-space check after it fails: the budget counts what the
+    /// disk took, not what was checked.
+    #[test]
+    fn a_written_chunk_is_spent_from_the_budget_before_a_failed_check() {
+        let size = usize::try_from(FREE_CHECK_BYTES).unwrap() + 100_000;
+        let max = 64 * FREE_CHECK_BYTES;
+        let r = rig(
+            "budget-before-check",
+            Script::default()
+                .file("/audio/1", body(size, 1))
+                .chunk_bytes(4096),
+            1 << 30,
+            &["t"],
+            Tuning {
+                max_bytes: max,
+                ..fast()
+            },
+        );
+        let part = r.cache.part_path("track/1");
+        let p2 = part.clone();
+        // Unknown once the first check window has landed: the check after
+        // that chunk fails.
+        r.cache
+            .set_outside_used(Arc::new(move || crate::cache::OutsideBytes {
+                held: 0,
+                outstanding: 0,
+                unknown: std::fs::metadata(&p2).is_ok_and(|m| m.len() >= FREE_CHECK_BYTES),
+            }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        let on_disk = || std::fs::metadata(&part).map_or(0, |m| m.len());
+        let spent = || max - r.dl.gate.lock().budget;
+        let until = Instant::now() + Duration::from_secs(10);
+        while on_disk() < FREE_CHECK_BYTES || spent() != on_disk() {
+            assert!(
+                Instant::now() < until,
+                "spent {} of the budget for {} bytes on disk",
+                spent(),
+                on_disk()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!r.cache.is_complete("track/1"));
     }
 
     #[test]
