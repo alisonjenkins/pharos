@@ -233,7 +233,9 @@ impl<'a> Reserved<'a> {
             .lock()
             .map(|mut held| held.insert(key.clone()))
             .unwrap_or(false);
-        first.then_some(Self {
+        // Lazily: a guard built for a refused take would give back the
+        // holder's reservation when dropped.
+        first.then(|| Self {
             set,
             key: Some(key),
         })
@@ -1343,6 +1345,19 @@ mod tests {
         assert_eq!(first, Some(sung()));
         assert_eq!(again, Some(sung()));
         assert_eq!(searches(&online), 2);
+    }
+
+    /// Disarm check: with the guard built eagerly in `take`, the refused
+    /// first take gives the reservation back and the second succeeds.
+    #[test]
+    fn a_held_song_refuses_every_further_take() {
+        let set = Mutex::new(HashSet::new());
+        let key = (1, "searching/song".to_owned());
+        let held = Reserved::take(&set, key.clone());
+        assert!(held.is_some());
+        assert!(Reserved::take(&set, key.clone()).is_none());
+        assert!(Reserved::take(&set, key).is_none());
+        drop(held);
     }
 
     /// Disarm check: with the guard kept when `repick` is dropped, the
