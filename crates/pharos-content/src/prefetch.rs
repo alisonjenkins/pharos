@@ -374,9 +374,7 @@ impl Gate {
         while let Some((id, generation)) = self.next_job().await {
             self.job(&id, generation).await;
             let mut q = self.lock();
-            // The job is over: a pin folded into it was served, or was
-            // queued again by `give_up`.
-            q.pin_requested.remove(&id);
+            self.job_over(&mut q, &id);
             if q.budget == 0 && !q.wanted.is_empty() {
                 log::info!(
                     "cache prefetch stopped: byte budget spent, dropping {} queued",
@@ -426,6 +424,25 @@ impl Gate {
     }
 
     /// `id` belongs to a pinned container that still needs it.
+    /// The job for `id` is over: a pin folded into it was served if the
+    /// track is whole now. One whose track is still missing (a trim evicted
+    /// it after its commit, or the job stopped short) is queued again, so
+    /// the pin is never lost to the fold; a track that survived is not
+    /// fetched twice. Under the queue lock.
+    fn job_over(&self, q: &mut Queue, id: &str) {
+        if !q.pin_requested.remove(id) {
+            return;
+        }
+        if self.cache.is_complete(id) || !self.is_pin_work(id) {
+            return;
+        }
+        if !q.pinned.iter().any(|p| p == id) {
+            q.pinned.push_back(id.to_owned());
+        }
+        log::info!("cache download id={id} verdict=requeued reason=pinned_and_missing_after_job");
+        self.wake.notify_one();
+    }
+
     fn is_pin_work(&self, id: &str) -> bool {
         self.cache.entry(id).is_some_and(|e| e.pinned)
     }
@@ -1301,6 +1318,51 @@ mod tests {
     /// A pin that lands after a job has found a permanent failure but
     /// before it gives up is folded into the job (it is still in flight),
     /// and `give_up` queues it: the pin is never lost.
+    #[test]
+    fn a_folded_pin_whose_track_is_missing_after_the_job_is_queued() {
+        let dir = TmpDir(tmp("pin-missing-after-job"));
+        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let gate = Gate {
+            cache: cache.clone(),
+            resolve: Arc::new(|_| Err(ResolveError::Permanent("unused".into()))),
+            tuning: fast(),
+            online: AtomicBool::new(true),
+            online_epoch: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            yields: AtomicU64::new(0),
+            queue: Mutex::new(Queue {
+                wanted: VecDeque::new(),
+                pinned: VecDeque::new(),
+                deferred: HashMap::new(),
+                generation: 0,
+                budget: u64::MAX,
+                busy: true,
+                current: Some("track/1".to_owned()),
+                pin_requested: HashSet::from(["track/1".to_owned()]),
+            }),
+            idle: Condvar::new(),
+            wake: Notify::new(),
+        };
+        cache.pin("album/a", &ids(&["track/1"]));
+        // The job ended with the track not whole (evicted after commit).
+        let mut q = gate.lock();
+        gate.job_over(&mut q, "track/1");
+        assert_eq!(
+            q.pinned,
+            VecDeque::from(ids(&["track/1"])),
+            "the folded pin was dropped with its track missing"
+        );
+        assert!(q.pin_requested.is_empty());
+        // A pin folded into a job whose track is whole asks nothing more.
+        q.pinned.clear();
+        q.pin_requested.insert("track/1".to_owned());
+        drop(q);
+        crate::cache::tests::put(&cache, "track/1", 5);
+        let mut q = gate.lock();
+        gate.job_over(&mut q, "track/1");
+        assert!(q.pinned.is_empty(), "a whole track was queued again");
+    }
+
     #[test]
     fn a_pin_between_a_permanent_failure_and_the_give_up_is_queued() {
         // Declared first, so dropped last.
