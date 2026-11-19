@@ -35,6 +35,16 @@ struct Record {
     /// Unix seconds when the provider answered.
     fetched_at: u64,
     lines: Option<Vec<Line>>,
+    /// Set once the song's found lyric was not what was sung and the
+    /// provider was searched for another (B1479), so it is searched once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repick: Option<Repick>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Repick {
+    /// The provider's id for the record picked; `None` when none was.
+    picked: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +74,14 @@ impl DiskCache {
     /// The cached answer for `id` asked of `provider` about `song`, or `None`
     /// when there is none still standing. Blocking.
     pub fn get(&self, id: u64, provider: &str, song: &Song) -> Option<Cached> {
+        let record = self.read(id)?;
+        if record.key != key(provider, song) {
+            return None;
+        }
+        Self::cached(record)
+    }
+
+    fn read(&self, id: u64) -> Option<Record> {
         let path = self.path(id);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -73,16 +91,44 @@ impl DiskCache {
                 return None;
             }
         };
-        let record: Record = match serde_json::from_slice(&bytes) {
-            Ok(r) => r,
+        match serde_json::from_slice(&bytes) {
+            Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "lyrics: cache entry unreadable");
-                return None;
+                None
             }
-        };
-        if record.key != key(provider, song) {
-            return None;
         }
+    }
+
+    /// Whether the provider was already searched for another lyric for
+    /// this song as tagged now (B1479). Blocking.
+    pub fn repicked(&self, id: u64, provider: &str, song: &Song) -> bool {
+        self.read(id)
+            .is_some_and(|r| r.key == key(provider, song) && r.repick.is_some())
+    }
+
+    /// Keep `lyrics` as the song's answer once the provider was searched
+    /// for another, with the id of the record picked or `None` when the
+    /// search found none and `lyrics` is the one that failed. Blocking.
+    pub fn put_repicked(
+        &self,
+        id: u64,
+        provider: &str,
+        song: &Song,
+        lyrics: &Lyrics,
+        picked: Option<u64>,
+    ) {
+        self.write_at(
+            id,
+            provider,
+            song,
+            Some(lyrics),
+            now_secs(),
+            Some(Repick { picked }),
+        );
+    }
+
+    fn cached(record: Record) -> Option<Cached> {
         match record.lines {
             Some(lines) => Lyrics::from_lines(
                 lines
@@ -126,7 +172,20 @@ impl DiskCache {
         found: Option<&Lyrics>,
         at: u64,
     ) {
+        self.write_at(id, provider, song, found, at, None);
+    }
+
+    fn write_at(
+        &self,
+        id: u64,
+        provider: &str,
+        song: &Song,
+        found: Option<&Lyrics>,
+        at: u64,
+        repick: Option<Repick>,
+    ) {
         let record = Record {
+            repick,
             key: key(provider, song),
             fetched_at: at,
             lines: found.map(|l| {
@@ -316,5 +375,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cache.get(7, "lrclib", &song), Some(Cached::Found(expected)));
+        assert!(!cache.repicked(7, "lrclib", &song));
+    }
+
+    /// B1479: the search for another lyric is made once per song as tagged.
+    #[test]
+    fn a_repicked_song_is_known_as_one_until_it_is_retagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        cache.put(7, "lrclib", &song(), Some(&words()));
+        assert!(!cache.repicked(7, "lrclib", &song()));
+        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42));
+        assert!(cache.repicked(7, "lrclib", &song()));
+        assert_eq!(
+            cache.get(7, "lrclib", &song()),
+            Some(Cached::Found(words()))
+        );
+        let mut retagged = song();
+        retagged.title = "Song (Live)".into();
+        assert!(!cache.repicked(7, "lrclib", &retagged));
+        cache.put_repicked(8, "lrclib", &song(), &words(), None);
+        assert!(cache.repicked(8, "lrclib", &song()));
     }
 }
