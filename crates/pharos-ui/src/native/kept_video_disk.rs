@@ -1869,6 +1869,8 @@ async fn fetch_file(
                         url_path(key)
                     ),
                 );
+                #[cfg(test)]
+                tests::before_park_mark();
                 lock(&inner.state)
                     .parking
                     .insert((user.to_owned(), item.to_owned()), run);
@@ -2062,7 +2064,14 @@ async fn fetch_once(
         .await
         .map_err(|e| match e {
             OpenFailed::Fetch(e) => FetchOnce::Fetch(e),
-            OpenFailed::NotOwner(why) => FetchOnce::NotOwner(why),
+            OpenFailed::NotOwner(why) => {
+                // Marked at the refusal: a sign-in from here on finds the
+                // run parking and leaves it a pending resume.
+                lock(&inner.state)
+                    .parking
+                    .insert((user.to_owned(), item.to_owned()), run);
+                FetchOnce::NotOwner(why)
+            }
         })?;
     let part = path.with_extension(format!("{run}.part"));
     // The folder and the staging file are created in one step, with no
@@ -2179,7 +2188,7 @@ async fn fetch_once(
     }
     drop(file);
     let promoted = {
-        let st = lock(&inner.state);
+        let mut st = lock(&inner.state);
         let owns = st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
             && find(&st.list, user, item)
                 .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }));
@@ -2187,7 +2196,9 @@ async fn fetch_once(
             Promote::NotOwned
         } else if let Err(why) = inner.env.fetcher.check_owner(user) {
             // Fetched while another user's credentials were on file: none
-            // of it goes into this user's download.
+            // of it goes into this user's download. Marked parking in the
+            // hold that refused it, so no sign-in falls in between.
+            st.parking.insert((user.to_owned(), item.to_owned()), run);
             Promote::NotOwner(why)
         } else {
             #[cfg(test)]
@@ -3500,14 +3511,17 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         if owned {
             st.runs.remove(&key);
         }
-        if st.parking.get(&key) == Some(&run) {
+        let parked = st.parking.get(&key) == Some(&run);
+        if parked {
             st.parking.remove(&key);
         }
         if st.resume_pending.get(&key) == Some(&run) {
             st.resume_pending.remove(&key);
-            // Claimed in this hold: a removal and restart after it revokes
-            // the claimed id, and the new run's is never overwritten.
-            if owned {
+            // Only a run that parked leaves its download to resume; one
+            // that ended any other way has nothing to resume. Claimed in
+            // this hold: a removal and restart after it revokes the claimed
+            // id, and the new run's is never overwritten.
+            if owned && parked {
                 resume = Some(st.claim_run(&user, &item));
             }
         }
@@ -4338,20 +4352,25 @@ impl VideoStore for DiskVideoStore {
                     resume.push((v.item, id));
                     continue;
                 };
-                // A run still going keeps the download. One that was
-                // refused the credentials and is parking would leave it
-                // stranded until the next sign-in: it starts the new run
-                // as it gives up its id.
-                if st.parking.get(&key) == Some(&run) {
-                    st.resume_pending.insert(key, run);
-                    emit(
-                        false,
-                        format!(
-                            "pharos: video keep resume item={} run={run} verdict=pending reason=run_parking owner={user}",
-                            v.item
-                        ),
-                    );
-                }
+                // A run still going keeps the download. The sign-in is kept
+                // for it all the same: a run refused the credentials just
+                // before this (parking, or about to be marked so) would
+                // leave the download stranded until the next sign-in. If
+                // the run ends parked it starts the new run as it gives up
+                // its id; any other end drops the request.
+                let why = if st.parking.get(&key) == Some(&run) {
+                    "run_parking"
+                } else {
+                    "run_active"
+                };
+                st.resume_pending.insert(key, run);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume item={} run={run} verdict=pending reason={why} owner={user}",
+                        v.item
+                    ),
+                );
             }
             resume
         };
@@ -4870,6 +4889,20 @@ mod tests {
         /// Runs once a failed download has dropped (or failed to drop) its
         /// staging files, before its Failed record is published.
         pub(super) static BEFORE_FAILED_UPDATE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs after a fetch was refused the credentials, at the point the
+        /// run used to mark itself parking.
+        pub(super) static BEFORE_PARK_MARK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_park_mark() {
+        BEFORE_PARK_MARK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
     }
 
     thread_local! {
@@ -8426,6 +8459,36 @@ mod tests {
                 .any(|l| l.contains("reason=revoked_writer_running")),
             "{waited:?}"
         );
+    }
+
+    /// A sign-in that lands right after a fetch was refused the
+    /// credentials, before the run used to mark itself parking, is kept:
+    /// the download resumes once the run has parked.
+    #[tokio::test]
+    async fn a_sign_in_right_after_the_refusal_resumes_the_download() {
+        let rig = Rig::new("sign-in-at-refusal");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        rig.server.sign_in("u2");
+        let (s1, server, once) = (
+            store.clone(),
+            rig.server.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                server.sign_in("u1");
+                s1.resume_user("u1");
+            }
+        });
+        later.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        until_within(|| only(&store).state == KeptState::Ready).await;
     }
 
     /// A download removed and started again between a sign-in's pick and
