@@ -268,6 +268,10 @@ struct State {
     /// Folders of adopted records whose walk was not whole: a sweep measures
     /// them again, and the record's floor is taken from the whole walk.
     remeasure: Vec<PathBuf>,
+    /// Folders of `remeasure` a sweep is walking now, with the epoch it
+    /// claimed them at: a second sweep leaves them alone, and the walk is
+    /// applied only if the folder is still at that epoch and idle.
+    remeasuring: Vec<(PathBuf, u64)>,
     /// Folders a `remove` is working on right now. A sweep leaves them
     /// alone, and while one is listed its folder is of unknown size.
     removing: Vec<PathBuf>,
@@ -3943,23 +3947,45 @@ impl Inner {
     /// whole walk sets the record's floor and lifts the block. A folder a
     /// download is writing waits until it is idle.
     fn sweep_remeasure(&self) {
-        let dirs: Vec<PathBuf> = {
-            let st = lock(&self.state);
-            st.remeasure
-                .iter()
-                .filter(|d| {
-                    !st.writing(d)
-                        && !st.runs.keys().any(|(u, i)| st.dir_of(u, i) == **d)
-                        && !st.removing.contains(d)
-                })
-                .cloned()
-                .collect()
+        let idle = |st: &State, d: &Path| {
+            !st.writing(d)
+                && !st.runs.keys().any(|(u, i)| st.dir_of(u, i) == *d)
+                && !st.removing.iter().any(|r| r == d)
         };
-        for dir in dirs {
-            let Some(m) = dir_size(&dir).whole() else {
+        let dirs: Vec<(PathBuf, u64)> = {
+            let mut st = lock(&self.state);
+            let picked: Vec<(PathBuf, u64)> = st
+                .remeasure
+                .iter()
+                .filter(|d| idle(&st, d) && !st.remeasuring.iter().any(|(r, _)| r == *d))
+                .map(|d| (d.clone(), st.epoch(d)))
+                .collect();
+            st.remeasuring.extend(picked.iter().cloned());
+            picked
+        };
+        for (dir, epoch) in dirs {
+            let walked = dir_size(&dir).whole();
+            #[cfg(test)]
+            tests::before_remeasure_apply();
+            let mut st = lock(&self.state);
+            st.remeasuring.retain(|(r, _)| *r != dir);
+            let Some(m) = walked else {
                 continue;
             };
-            let mut st = lock(&self.state);
+            // A download started, wrote or was removed since the claim: its
+            // inventory is newer than this walk, which must not lift the block.
+            let now = st.epoch(&dir);
+            if now != epoch || !idle(&st, &dir) || !st.remeasure.contains(&dir) {
+                drop(st);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video folder remeasure verdict=stale dir={} bytes={m} claimed_epoch={epoch} epoch={now}",
+                        dir.display()
+                    ),
+                );
+                continue;
+            }
             let root = st.root.clone();
             for v in &mut st.list {
                 if root.join(safe_name(&v.user)).join(safe_name(&v.item)) == dir
@@ -4837,6 +4863,20 @@ mod tests {
 
     pub(super) fn before_run_exit() {
         BEFORE_RUN_EXIT.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a remeasure has walked its folder, before the walk is
+        /// applied.
+        pub(super) static BEFORE_REMEASURE_APPLY: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_remeasure_apply() {
+        BEFORE_REMEASURE_APPLY.with(|d| {
             if let Some(f) = d.borrow().as_ref() {
                 f();
             }
@@ -8385,6 +8425,58 @@ mod tests {
                 .any(|l| l.contains("verdict=pending reason=run_parking")),
             "{pending:?}"
         );
+    }
+
+    /// A remeasure whose folder changed while it walked (a retry started
+    /// and wrote) does not lift the block with the old walk, and a second
+    /// sweep meanwhile leaves the claimed folder alone. Once nothing
+    /// changes under a walk, the folder recovers.
+    #[tokio::test]
+    async fn a_remeasure_overtaken_by_a_change_keeps_the_block() {
+        let rig = Rig::new("remeasure-stale");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let dir = rig.dir.join("u1").join("1");
+        {
+            let mut st = lock(&store.inner.state);
+            st.remeasure.push(dir.clone());
+            st.unmeasured.push((dir.clone(), "test".to_owned()));
+        }
+        let (s1, d1, once) = (
+            store.clone(),
+            dir.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_REMEASURE_APPLY, move || {
+            if !once.replace(true) {
+                s1.inner.sweep_remeasure();
+                lock(&s1.inner.state).bump(&d1);
+            }
+        });
+        store.inner.sweep_remeasure();
+        clear_hook(&BEFORE_REMEASURE_APPLY);
+        let shown = dir.display().to_string();
+        let ours = |prefix: &str| {
+            lines(prefix)
+                .into_iter()
+                .filter(|l| l.contains(&format!("dir={shown} ")))
+                .count()
+        };
+        assert_eq!(
+            ours("pharos: video folder remeasured"),
+            0,
+            "a stale walk was applied"
+        );
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "the block was lifted by a walk the folder had changed under"
+        );
+        assert_eq!(ours("pharos: video folder remeasure verdict=stale"), 1);
+        store.inner.sweep_remeasure();
+        assert_eq!(ours("pharos: video folder remeasured"), 1);
+        assert!(lock(&store.inner.state).unknown_folder().is_none());
     }
 
     /// A whole record copied into another item's folder is not adopted
