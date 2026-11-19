@@ -8361,6 +8361,14 @@ mod tests {
         rig.server.reached_mid_body(SEG0).await;
         let reserved = only(&store).estimated_bytes;
         until_within(|| store.staged_bytes() == 1_000_000).await;
+        // The held body must be the run's only work left. A file of the run
+        // still being fetched when the park lands sees the revocation, the
+        // run stops, and the held fetch is dropped with its staging file:
+        // there is then no writer to drain, and nothing to count.
+        until_within(|| {
+            store.stored_file("u1", INIT).is_some() && store.stored_file("u1", SEG1).is_some()
+        })
+        .await;
         store.park_runs(Some("u1"));
         store.resume_user("u1");
         let asked = rig.server.asked().len();
