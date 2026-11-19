@@ -262,6 +262,40 @@ fn the_song_says_how_many_first_words_were_clipped_and_anchors_started_late() {
 }
 
 #[test]
+fn a_stage_failing_after_the_recogniser_still_says_how_many_first_words_it_clipped() {
+    let (sung, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: Transcript {
+            words: heard,
+            first_words_clipped: 2,
+        },
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(
+        &Engine::new(singers(Some(sung), "vulkan", true), silent(), None)
+            .with_stages(Box::new(stages)),
+    );
+    assert_eq!(got.placement.fallback, Some(Fallback::EmissionFailed));
+    assert_eq!(got.placement.first_words_clipped, 2);
+
+    let (_, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Fails,
+        heard: Transcript {
+            words: heard,
+            first_words_clipped: 2,
+        },
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(&Engine::new(loader(None), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::RecogniseFailed));
+    assert_eq!(got.placement.first_words_clipped, 0);
+}
+
+#[test]
 fn a_placed_song_reports_each_moved_line_again_and_says_how_it_was_placed() {
     let (sung, _) = song();
     let (got, events) = with(Step::Works, Step::Works, Some(sung));
