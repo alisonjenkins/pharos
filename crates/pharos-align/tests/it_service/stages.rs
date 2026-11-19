@@ -503,7 +503,8 @@ fn a_song_sung_to_other_words_is_a_lyrics_mismatch() {
         .get("check")
         .is_none());
 
-    // Too little heard is a low anchor share, with the check for the server.
+    // A failed emission after the recogniser heard the song falls back as
+    // EmissionFailed, still with the check for the server.
     let (barely, _) = with(Step::Works, Step::Works, None);
     assert_eq!(barely.placement.fallback, Some(Fallback::EmissionFailed));
     let answer = serde_json::to_value(&barely.answer).unwrap();
