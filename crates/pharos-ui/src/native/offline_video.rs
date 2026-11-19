@@ -342,14 +342,16 @@ fn paired_user(seen: &TokenSeen) -> Option<String> {
     }
 }
 
-fn set_identity(next: Identity) {
-    let _ = set_identity_if(None, next);
+#[cfg(test)]
+fn set_identity(next: Identity) -> u64 {
+    set_identity_if(None, next).unwrap_or_else(|now| now)
 }
 
 /// Sets the identity, under the identity lock, only while the generation is
-/// still `expected` (any generation with `None`), and starts a new one.
-/// Returns the generation found when it is not the expected one.
-fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
+/// still `expected` (any generation with `None`), and starts a new one,
+/// which it returns. Returns the generation found when it is not the
+/// expected one.
+fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<u64, u64> {
     with_id(|st| {
         let now = st.generation;
         if expected.is_some_and(|e| e != now) {
@@ -369,7 +371,7 @@ fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
         }
         st.identity = next;
         st.generation = st.generation.wrapping_add(1);
-        Ok(())
+        Ok(st.generation)
     })
 }
 
@@ -627,8 +629,8 @@ pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
 /// [`MeAsk::answered`], with the session's token.
 #[cfg(test)]
 pub(crate) fn remember_user(user: &str) {
-    set_identity(Identity::User(user.to_owned()));
-    note_signed_in(user, &tests::seam_token());
+    let at = set_identity(Identity::User(user.to_owned()));
+    note_signed_in(user, &tests::seam_token(), at);
 }
 
 /// The device token a request was built with, taken when it is built: its
@@ -724,8 +726,8 @@ pub(crate) fn remember_user_if(asked_at: u64, user: &str) -> bool {
 /// [`remember_user_if`] for an answer to a request built with `seen`.
 fn remember_user_seen(asked_at: u64, user: &str, seen: &TokenSeen) -> bool {
     match set_identity_if(Some(asked_at), Identity::User(user.to_owned())) {
-        Ok(()) => {
-            note_signed_in(user, seen);
+        Ok(at) => {
+            note_signed_in(user, seen, at);
             true
         }
         Err(now) => {
@@ -779,9 +781,32 @@ fn with_owed<R>(f: impl FnOnce(&mut Option<(String, TokenSeen)>) -> R) -> R {
     }
 }
 
+/// Starts `user`'s parked downloads on `store`, under the identity lock,
+/// only while the identity is still `user` at generation `at` (taken under
+/// that lock when the resume was decided). A session end fences the state
+/// (signed out, a new generation) under the same lock before it parks, so
+/// a resume either starts before the fence, and the park that follows
+/// stops it, or finds the fence and starts nothing. Lock order: the
+/// identity, then the store's own; the store never calls back into the
+/// identity. Returns the generation found when it refuses.
+fn start_resume_if(
+    at: u64,
+    user: &str,
+    store: &dyn super::kept_video::VideoStore,
+) -> Result<(), u64> {
+    with_id(|st| {
+        if st.generation != at || st.identity != Identity::User(user.to_owned()) {
+            return Err(st.generation);
+        }
+        store.resume_user(user);
+        Ok(())
+    })
+}
+
 /// Resumes `user`'s downloads on the store now, or, with no store published
-/// yet, owes the resume to its publication.
-fn resume_or_owe(user: &str, seen: &TokenSeen) {
+/// yet, owes the resume to its publication. `at` is the generation the
+/// sign-in installed `user` at.
+fn resume_or_owe(user: &str, seen: &TokenSeen, at: u64) {
     let now = with_owed(|owed| {
         let store = store();
         if store.is_none() {
@@ -790,12 +815,14 @@ fn resume_or_owe(user: &str, seen: &TokenSeen) {
         store
     });
     match now {
-        Some(store) => {
-            super::platform::info(&format!(
+        Some(store) => match start_resume_if(at, user, &*store) {
+            Ok(()) => super::platform::info(&format!(
                 "pharos: video keep resume verdict=resumed reason=token_paired user={user}"
-            ));
-            store.resume_user(user);
-        }
+            )),
+            Err(now) => super::platform::info(&format!(
+                "pharos: video keep resume verdict=not_resumed reason=identity_changed_since_sign_in user={user} at={at} now={now}"
+            )),
+        },
         None => super::platform::info(&format!(
             "pharos: video keep resume verdict=owed reason=store_not_published user={user}"
         )),
@@ -810,20 +837,33 @@ pub fn store_published() {
     let Some((user, seen)) = with_owed(Option::take) else {
         return;
     };
-    let reason = if identity() != Identity::User(user.clone()) {
+    // Validated against a generation taken with the identity, and started
+    // only while that generation still holds (`start_resume_if`), so a
+    // session end that fences between the two starts nothing.
+    let (at, signed_in) =
+        with_id(|st| (st.generation, st.identity == Identity::User(user.clone())));
+    let reason = if !signed_in {
         Some("identity_changed")
     } else if paired_user(&seen).as_deref() != Some(user.as_str()) {
         Some("token_not_paired")
     } else {
         None
     };
-    match (reason, store()) {
-        (None, Some(store)) => {
-            super::platform::info(&format!(
-                "pharos: video keep resume verdict=resumed reason=store_published_after_sign_in user={user}"
-            ));
-            store.resume_user(&user);
+    #[cfg(test)]
+    tests::AFTER_RESUME_VALIDATED.with(|h| {
+        if let Some(f) = h.borrow_mut().take() {
+            f();
         }
+    });
+    match (reason, store()) {
+        (None, Some(store)) => match start_resume_if(at, &user, &*store) {
+            Ok(()) => super::platform::info(&format!(
+                "pharos: video keep resume verdict=resumed reason=store_published_after_sign_in user={user}"
+            )),
+            Err(now) => super::platform::info(&format!(
+                "pharos: video keep resume verdict=not_resumed reason=identity_changed_since_validated user={user} at={at} now={now}"
+            )),
+        },
         (why, _) => super::platform::info(&format!(
             "pharos: video keep resume verdict=not_resumed reason={} user={user}",
             why.unwrap_or("store_not_published")
@@ -831,7 +871,7 @@ pub fn store_published() {
     }
 }
 
-fn note_signed_in(user: &str, seen: &TokenSeen) {
+fn note_signed_in(user: &str, seen: &TokenSeen, at: u64) {
     super::platform::info(&format!(
         "pharos: video user verdict=known reason=signed_in user={user}"
     ));
@@ -840,7 +880,7 @@ fn note_signed_in(user: &str, seen: &TokenSeen) {
     // before would read an unpaired token, send nothing and park until the
     // next sign-in. A pairing that fails resumes nothing (fail closed).
     match note_token_user(user, seen) {
-        Ok(()) => resume_or_owe(user, seen),
+        Ok(()) => resume_or_owe(user, seen, at),
         Err(e) => super::platform::warn(&format!(
             "pharos: video keep resume verdict=not_resumed reason=token_not_paired user={user} error={e}"
         )),
@@ -885,20 +925,67 @@ fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
 /// them, and an offline restart would show their downloads again. An
 /// outage never comes here (the machine keeps the session).
 pub fn session_ended() {
-    let (ended, user) = with_id(|s| {
-        let user = match &s.identity {
+    let end = fence_signed_out(true);
+    park_ended(&end);
+    tear_down_session(end);
+}
+
+/// Who a session end or sign-out ended, and the session's token, taken
+/// under the identity lock by the fence.
+struct SessionEnded {
+    user: Option<String>,
+    token: Option<TokenSeen>,
+}
+
+/// The first step of every sign-out and session end: fence first, then
+/// tear down. Under the identity lock, the state becomes signed out and
+/// its generation advances (taking the session's token with `take_token`),
+/// before anything is parked or any token removed, so a resume validated
+/// before it starts nothing after it ([`start_resume_if`]).
+fn fence_signed_out(take_token: bool) -> SessionEnded {
+    let (end, now) = with_id(|st| {
+        let user = match &st.identity {
             Identity::User(u) | Identity::Fenced(u) => Some(u.clone()),
             _ => None,
         };
-        (s.session_token.take(), user)
+        let token = if take_token {
+            st.session_token.take()
+        } else {
+            None
+        };
+        st.identity = Identity::SignedOut;
+        st.refusal_logged = false;
+        st.generation = st.generation.wrapping_add(1);
+        (SessionEnded { user, token }, st.generation)
     });
-    forget_user();
-    let Some(token) = ended.and_then(|t| t.0) else {
+    super::platform::info(&format!(
+        "pharos: video user verdict=none reason=signed_out fence=first generation={now}"
+    ));
+    end
+}
+
+/// The second step: the ended user's downloads stop (all of them when it
+/// is not known), after the fence, before any token is removed.
+fn park_ended(end: &SessionEnded) {
+    with_store(|store| store.park_runs(end.user.as_deref()));
+    #[cfg(test)]
+    tests::AFTER_PARK.with(|h| {
+        if let Some(f) = h.borrow_mut().take() {
+            f();
+        }
+    });
+}
+
+/// The last step of a session end: the preference is cleared and the
+/// session's token dropped, only while it is still the one on file.
+fn tear_down_session(end: SessionEnded) {
+    forget_pref();
+    let Some(token) = end.token.and_then(|t| t.0) else {
         super::platform::info("pharos: token forget verdict=none reason=no_session_token");
         return;
     };
-    let outcome = forget_session_token(&token, user.as_deref());
-    note_session_token(&outcome, user.as_deref());
+    let outcome = forget_session_token(&token, end.user.as_deref());
+    note_session_token(&outcome, end.user.as_deref());
 }
 
 /// What a session's end did to its device token, on every platform (the
@@ -990,16 +1077,15 @@ fn forget_session_token(token: &str, user: Option<&str>) -> TokenEnd {
 /// Notes a sign-out. Nobody is signed in from this call on, whatever the
 /// preference write does.
 pub fn forget_user() {
-    // Whose session it was, before it is forgotten: their downloads stop
-    // before another user's token can be used (all of them when it is not
-    // known). Bound to their owner's token as well; this is the hygiene.
-    let ended = match identity() {
-        Identity::User(u) | Identity::Fenced(u) => Some(u),
-        _ => None,
-    };
-    with_store(|store| store.park_runs(ended.as_deref()));
-    set_identity(Identity::SignedOut);
-    super::platform::info("pharos: video user verdict=none reason=signed_out");
+    // Fence first, then tear down: signed out under the identity lock,
+    // then whose session it was has their downloads stopped (all of them
+    // when it is not known), before another user's token can be used.
+    let end = fence_signed_out(false);
+    park_ended(&end);
+    forget_pref();
+}
+
+fn forget_pref() {
     if let Err(e) = write_pref("") {
         super::platform::warn(&format!(
             "pharos: video user not forgotten on disk (nobody served for this run) error={e}"
@@ -1204,6 +1290,12 @@ pub(crate) mod tests {
         pub(super) static AFTER_COLD_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         /// Runs once `last_user` has taken its snapshot of the state.
         pub(super) static AFTER_STATE_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        /// Runs in `store_published` once the owed resume is validated,
+        /// before it starts.
+        pub(super) static AFTER_RESUME_VALIDATED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        /// Runs in a session end once the runs are parked, before the
+        /// token is removed.
+        pub(super) static AFTER_PARK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         /// The fence verdicts logged on this thread.
         pub(super) static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
@@ -2149,6 +2241,78 @@ pub(crate) mod tests {
                 matches!(store.videos("A")[0].state, KeptState::Ready),
                 "{:?}",
                 store.videos("A")
+            );
+        });
+    }
+
+    /// A session end that lands between an owed resume's validation and
+    /// its start wins. Publication is paused once it has validated A's
+    /// resume; the session end fences and parks; publication continues
+    /// before the token is removed (it is still readable and paired with
+    /// A). No run starts, and no request goes out.
+    #[test]
+    fn a_session_end_between_a_resumes_validation_and_its_start_starts_nothing() {
+        use super::super::kept_video_disk::tests::stream_files;
+        use super::super::token_file;
+        let d = TmpDir::new("end-mid-resume");
+        let path = d.path().join("device-token");
+        let videos = d.path().join("videos");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let fetcher = FileFetcher::serving(&path, stream_files());
+            {
+                let before = disk_store(&videos, fetcher.clone());
+                first_request_decided(&before, &fetcher, "A", "1").await;
+                before.settled().await;
+            }
+            late_slot();
+            let store = disk_store(&videos, fetcher.clone());
+            store.settled().await;
+            let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
+                panic!("A's token did not open A's session");
+            };
+            session_replaced(&session_a);
+            let ask = me_request(true, Some(session_a)).unwrap();
+            assert!(ask.answered("A"));
+            assert_eq!(fetcher.sent(), [], "a request went out before publication");
+            // Validated, paused: the session end fences and parks, and the
+            // rest of it (the token's removal) waits until after.
+            let ended = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let ended2 = ended.clone();
+            AFTER_RESUME_VALIDATED.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let end = fence_signed_out(true);
+                    park_ended(&end);
+                    *ended2.borrow_mut() = Some(end);
+                }));
+            });
+            super::super::ports::register_video_store(store.clone()).unwrap();
+            assert_eq!(
+                token_file::read(&path).unwrap().map(|s| s.token).as_deref(),
+                Some("tokA"),
+                "the token went before the resume continued"
+            );
+            store.settled().await;
+            let sent = fetcher.sent();
+            let end = ended
+                .borrow_mut()
+                .take()
+                .expect("the session end did not run");
+            tear_down_session(end);
+            store.settled().await;
+            super::super::ports::use_test_video_slot(None);
+            assert_eq!(sent, [], "a run started after the fence sent a request");
+            assert_eq!(
+                fetcher.sent(),
+                [],
+                "a request went out after the session end"
+            );
+            assert_eq!(
+                store.used_bytes("A"),
+                0,
+                "bytes landed after the session end"
             );
         });
     }
