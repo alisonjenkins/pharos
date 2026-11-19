@@ -18,6 +18,35 @@ pub const MAX_CANDIDATES: usize = 5;
 /// record that is only partly right is worse than none.
 pub const MIN_RECALL: f64 = 0.6;
 
+/// Searches for another lyric by how they ended, as
+/// [`Outcome::label`] names it.
+pub const REPICK_TOTAL: &str = "pharos_lyrics_repick_total";
+
+/// How a search for another lyric ended. `label()` is a metric label value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Another record was heard and is served instead.
+    Picked,
+    /// No record was close enough in length and heard well enough.
+    None,
+    /// The provider's search failed; asked again after the cooldown.
+    Error,
+    /// The lyric came from beside the file or its tags, which the listener
+    /// put there, so the provider is not searched.
+    SkippedLocal,
+}
+
+impl Outcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Picked => "picked",
+            Self::None => "none",
+            Self::Error => "error",
+            Self::SkippedLocal => "skipped_local",
+        }
+    }
+}
+
 /// One record a provider holds for a song.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -123,6 +152,18 @@ mod tests {
             duration_ms,
             lyrics,
         }
+    }
+
+    #[test]
+    fn outcome_labels_are_distinct() {
+        let all = [
+            Outcome::Picked,
+            Outcome::None,
+            Outcome::Error,
+            Outcome::SkippedLocal,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), all.len());
     }
 
     #[test]
