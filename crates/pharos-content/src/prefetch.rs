@@ -656,17 +656,30 @@ impl Gate {
                     "cache download id={id} bytes={} ms={ms} outcome=skipped reason=low_disk free_bytes={free}",
                     part_len()
                 );
-                self.cache.discard_part(id);
-                self.cache.mark_failed(id);
+                self.give_up(id);
             }
             Outcome::Failed(why) => {
                 log::warn!(
                     "cache download id={id} bytes={} ms={ms} outcome=failed reason={why} attempts={attempt}",
                     part_len()
                 );
-                self.cache.discard_part(id);
-                self.cache.mark_failed(id);
+                self.give_up(id);
             }
+        }
+    }
+
+    /// Ends a job that gave up: its partial file goes, the track is marked
+    /// failed and the job stops being the track in flight, in one step under
+    /// the queue lock. A pin of the track that `enqueue` sees after this is
+    /// queued as new work; one it saw before was folded into a job that was
+    /// still running. Were `current` left set until the worker cleared it,
+    /// a pin in between would be taken for in-flight work and lost.
+    fn give_up(&self, id: &str) {
+        let mut q = self.lock();
+        self.cache.discard_part(id);
+        self.cache.mark_failed(id);
+        if q.current.as_deref() == Some(id) {
+            q.current = None;
         }
     }
 
@@ -1223,6 +1236,53 @@ mod tests {
             gate.lock().pinned,
             VecDeque::from(ids(&["track/1"])),
             "the pin was lost"
+        );
+    }
+
+    /// A pin of a track whose read-ahead job has just failed for good,
+    /// before the worker clears the job, is queued: the failed job takes no
+    /// more work, so the pin must not be folded into it.
+    #[test]
+    fn a_pin_arriving_after_a_job_failed_for_good_is_queued() {
+        // Declared first, so dropped last.
+        let dir = TmpDir(tmp("pin-after-fail"));
+        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let gate = Arc::new(Gate {
+            cache: cache.clone(),
+            resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
+            tuning: fast(),
+            online: AtomicBool::new(true),
+            online_epoch: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            yields: AtomicU64::new(0),
+            queue: Mutex::new(Queue {
+                wanted: VecDeque::new(),
+                pinned: VecDeque::new(),
+                deferred: HashMap::new(),
+                generation: 0,
+                budget: u64::MAX,
+                busy: true,
+                current: Some("track/1".to_owned()),
+            }),
+            idle: Condvar::new(),
+            wake: Notify::new(),
+        });
+        let dl = Downloader {
+            gate: gate.clone(),
+            thread: None,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(gate.job("track/1", 0));
+        // The worker has not cleared the job yet.
+        cache.pin("album/a", &ids(&["track/1"]));
+        assert_eq!(dl.enqueue(&ids(&["track/1"])), 1, "the pin was not counted");
+        assert_eq!(
+            gate.lock().pinned,
+            VecDeque::from(ids(&["track/1"])),
+            "the pin was folded into the failed job"
         );
     }
 
