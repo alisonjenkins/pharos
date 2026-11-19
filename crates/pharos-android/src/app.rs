@@ -116,8 +116,11 @@ pub fn credentials_changed() {
 /// than reloading it. The service runs in the app's own process, so this is
 /// the fence its reads go through.
 pub fn credentials_kept(fingerprint: &str) {
+    // Fenced for the whole process first, so a service that connects
+    // after this reads through it too.
+    content::fence_token(fingerprint);
     let Some(lib) = LIBRARY.get() else {
-        log("app credentials_kept verdict=skipped reason=library_not_connected");
+        log("app credentials_kept verdict=fenced reason=library_not_connected");
         return;
     };
     match lib.stay_signed_out(fingerprint) {
