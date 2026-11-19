@@ -974,20 +974,9 @@ mod tests {
         }
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("pharos-auto-dl-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    /// A test's cache folder, deleted when the test ends.
-    struct TmpDir(std::path::PathBuf);
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    // A test's cache folder of its own, made fresh and deleted when the
+    // test ends.
+    use crate::testdir::TmpDir;
 
     /// Fields drop in order: the downloader is stopped (its thread joined)
     /// before the folder it writes into is deleted.
@@ -1022,8 +1011,8 @@ mod tests {
         free: FreeProbe,
     ) -> Rig {
         let srv = Arc::new(TestServer::start(script));
-        let dir = TmpDir(tmp(name));
-        let cache = Arc::new(Cache::open_with_probe(&dir.0, cap, free).unwrap());
+        let dir = TmpDir::new(&format!("auto-dl-{name}"));
+        let cache = Arc::new(Cache::open_with_probe(&dir, cap, free).unwrap());
         let resolved = Arc::new(AtomicUsize::new(0));
         let tokens: Vec<String> = tokens.iter().map(|s| (*s).to_owned()).collect();
         let (s2, r2) = (srv.clone(), resolved.clone());
@@ -1287,8 +1276,8 @@ mod tests {
     #[test]
     fn a_pin_arriving_after_a_job_decided_to_cancel_is_not_lost() {
         // Declared first, so dropped last.
-        let dir = TmpDir(tmp("pin-after-cancel"));
-        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let dir = TmpDir::new("auto-dl-pin-after-cancel");
+        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
         let gate = Arc::new(Gate {
             cache: cache.clone(),
             resolve: Arc::new(|_| Err(ResolveError::Transient("unused".into()))),
@@ -1331,8 +1320,8 @@ mod tests {
     /// and `give_up` queues it: the pin is never lost.
     #[test]
     fn a_folded_pin_whose_track_is_missing_after_the_job_is_queued() {
-        let dir = TmpDir(tmp("pin-missing-after-job"));
-        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let dir = TmpDir::new("auto-dl-pin-missing-after-job");
+        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
         let gate = Gate {
             cache: cache.clone(),
             resolve: Arc::new(|_| Err(ResolveError::Permanent("unused".into()))),
@@ -1377,8 +1366,8 @@ mod tests {
     #[test]
     fn a_pin_between_a_permanent_failure_and_the_give_up_is_queued() {
         // Declared first, so dropped last.
-        let dir = TmpDir(tmp("pin-before-give-up"));
-        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let dir = TmpDir::new("auto-dl-pin-before-give-up");
+        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
         let gate = Arc::new(Gate {
             cache: cache.clone(),
             resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
@@ -1430,8 +1419,8 @@ mod tests {
     #[test]
     fn a_pin_arriving_after_a_job_failed_for_good_is_queued() {
         // Declared first, so dropped last.
-        let dir = TmpDir(tmp("pin-after-fail"));
-        let cache = Arc::new(Cache::open(&dir.0, 1 << 20).unwrap());
+        let dir = TmpDir::new("auto-dl-pin-after-fail");
+        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
         let gate = Arc::new(Gate {
             cache: cache.clone(),
             resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
