@@ -6,6 +6,7 @@
 #[cfg(feature = "recognise")]
 pub mod whisper;
 
+use crate::loudness::Loudness;
 use crate::obs::RECOGNISE_RETRY_TOTAL;
 use crate::transcript::{Transcript, Word};
 
@@ -112,9 +113,11 @@ fn sung_s(text: &str) -> f64 {
 /// DTW times mark where a token ends, so a word starts where the word
 /// before it ends (taking a word's own first DTW time put starts ~380 ms
 /// late). The first word starts at its own `t0`, unless that makes it
-/// longer than [`FIRST_WORD_MAX_S`]; it then starts as long before its end
-/// as its letters take to sing (its DTW end is where it was heard).
-fn timed_words(tokens: &[Token]) -> (Vec<Word>, bool) {
+/// longer than [`FIRST_WORD_MAX_S`] and `loud` has the vocals silent over
+/// it; it then starts as long before its end as its letters take to sing
+/// (its DTW end is where it was heard). A word held that long keeps its
+/// start.
+fn timed_words(tokens: &[Token], loud: &Loudness) -> (Vec<Word>, bool) {
     let mut prev_end: Option<f64> = None;
     let mut clipped = false;
     let words = groups(tokens)
@@ -123,11 +126,24 @@ fn timed_words(tokens: &[Token]) -> (Vec<Word>, bool) {
             let (first, last) = (g.first()?, g.last()?);
             let text: String = g.iter().map(|t| t.text.as_str()).collect();
             let end_s = last.dtw_s.max(prev_end.unwrap_or(first.t0_s));
+            let sung_from_s = end_s - sung_s(&text);
+            let silent_lead =
+                |start_s: f64| sung_from_s > start_s && loud.silent(start_s, sung_from_s);
             let start_s = prev_end.unwrap_or_else(|| {
                 if end_s - first.t0_s <= FIRST_WORD_MAX_S {
                     return first.t0_s;
                 }
-                let start_s = first.t0_s.max(end_s - sung_s(&text));
+                if !silent_lead(first.t0_s) {
+                    tracing::debug!(
+                        word = %text,
+                        t0_s = first.t0_s,
+                        end_s,
+                        max_s = FIRST_WORD_MAX_S,
+                        "segment's long first word kept, sung through"
+                    );
+                    return first.t0_s;
+                }
+                let start_s = first.t0_s.max(sung_from_s);
                 tracing::debug!(
                     word = %text,
                     t0_s = first.t0_s,
@@ -141,6 +157,7 @@ fn timed_words(tokens: &[Token]) -> (Vec<Word>, bool) {
             });
             prev_end = Some(end_s);
             Some(Word {
+                silent_lead: silent_lead(start_s),
                 text,
                 start_s,
                 end_s,
@@ -151,19 +168,20 @@ fn timed_words(tokens: &[Token]) -> (Vec<Word>, bool) {
     (words, clipped)
 }
 
-/// The words in `tokens`, in order; see [`timed_words`].
+/// The words in `tokens`, in order, with no vocals to check a long first
+/// word against, so none is clipped; see [`timed_words`].
 pub fn words(tokens: &[Token]) -> Vec<Word> {
-    timed_words(tokens).0
+    timed_words(tokens, &Loudness::default()).0
 }
 
 /// The words of every segment, in order, with how many segments' first
-/// words were clipped. Each segment's first word starts at its own `t0`:
+/// words were clipped against the vocals' `loud`ness. Each segment's first word starts at its own `t0`:
 /// a segment after a gap would otherwise open on a word stretched back to
 /// the end of the segment before it.
-pub fn segment_words(segments: &[Segment]) -> Transcript {
+pub fn segment_words(segments: &[Segment], loud: &Loudness) -> Transcript {
     let mut out = Transcript::default();
     for s in segments {
-        let (words, clipped) = timed_words(&s.tokens);
+        let (words, clipped) = timed_words(&s.tokens, loud);
         out.words.extend(words);
         out.first_words_clipped += usize::from(clipped);
     }
