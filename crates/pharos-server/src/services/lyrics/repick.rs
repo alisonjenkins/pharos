@@ -97,13 +97,16 @@ pub fn choose(
 }
 
 /// The record that failed comes back from a search too, and so may a copy
-/// of it under another id; either fails the same way.
+/// of it under another id, its lines broken in other places; each fails
+/// the same way. Compared word by word over the whole text.
 fn same_text(a: &Lyrics, b: &Lyrics) -> bool {
-    a.lines.len() == b.lines.len()
-        && a.lines
+    let words = |l: &Lyrics| {
+        l.lines
             .iter()
-            .zip(&b.lines)
-            .all(|(x, y)| x.text.trim() == y.text.trim())
+            .flat_map(|line| line.text.split_whitespace().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    words(a) == words(b)
 }
 
 #[cfg(test)]
@@ -225,6 +228,28 @@ mod tests {
         all.push(candidate(99, SONG_MS + 1_500, sung()));
         assert_eq!(choose(all.clone(), &wrong(), SONG_MS, HEARD), None);
         all.truncate(MAX_CANDIDATES - 1);
+        all.push(candidate(99, SONG_MS + 1_500, sung()));
+        let got = choose(all, &wrong(), SONG_MS, HEARD);
+        assert_eq!(got.map(|p| p.candidate.id), Some(99));
+    }
+
+    #[test]
+    fn copies_of_the_failed_lyric_broken_into_other_lines_take_no_slot() {
+        // Five copies of the failed text, each broken differently, are
+        // closer in length than the record that was sung.
+        let mut all: Vec<Candidate> = (0..MAX_CANDIDATES as u64)
+            .map(|i| {
+                let copy = match i % 2 {
+                    0 => lyrics(&[
+                        "the lanterns swing",
+                        "in the orchard the river",
+                        "keeps its time",
+                    ]),
+                    _ => lyrics(&["the lanterns  swing in the orchard the river keeps its time"]),
+                };
+                candidate(10 + i, SONG_MS + i * 100, copy)
+            })
+            .collect();
         all.push(candidate(99, SONG_MS + 1_500, sung()));
         let got = choose(all, &wrong(), SONG_MS, HEARD);
         assert_eq!(got.map(|p| p.candidate.id), Some(99));
