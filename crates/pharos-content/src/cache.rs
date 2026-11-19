@@ -287,8 +287,11 @@ pub struct Cache {
 #[derive(Debug, Clone, Copy)]
 struct Reservation {
     bytes: u64,
-    /// The `.part`'s length when the reservation was made.
-    at_len: u64,
+    /// The `.part`'s length when the reservation was made; `None` when it
+    /// could not be read (not absent: unreadable). Nothing is then counted
+    /// as written against it, so the whole reservation stays owed until a
+    /// later refresh reads a baseline.
+    at_len: Option<u64>,
 }
 
 /// Space available to an unprivileged writer, as `df` reports it.
@@ -1011,7 +1014,7 @@ impl Cache {
             .unwrap_or_else(PoisonError::into_inner)
             .get_mut(id)
         {
-            r.at_len = 0;
+            r.at_len = Some(0);
         }
     }
 
@@ -1022,13 +1025,22 @@ impl Cache {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
-            .map(|r| (r.bytes, r.at_len))
+            .map(|r| (r.bytes, r.at_len.unwrap_or(0)))
     }
 
-    /// The length of `id`'s `.part`; 0 when there is none (or it cannot
-    /// be read: what is owed is then the whole reservation, never less).
-    fn part_len(&self, id: &str) -> u64 {
-        std::fs::metadata(self.part_path(id)).map_or(0, |m| m.len())
+    /// The length of `id`'s `.part`: 0 when there is none, `None` when its
+    /// metadata cannot be read (unknown, never taken as empty).
+    fn part_len(&self, id: &str) -> Option<u64> {
+        match std::fs::metadata(self.part_path(id)) {
+            Ok(m) => Some(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(e) => {
+                log::warn!(
+                    "cache part length unknown id={id} reason=metadata_unreadable error={e}"
+                );
+                None
+            }
+        }
     }
 
     /// Drops what was reserved for `id`: its write landed, failed or was
@@ -1056,7 +1068,12 @@ impl Cache {
     pub fn reserved_bytes(&self) -> u64 {
         let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         r.iter().fold(0u64, |sum, (id, v)| {
-            let written = self.part_len(id).saturating_sub(v.at_len);
+            // An unknown baseline or length counts nothing as written: the
+            // whole reservation stays owed, never less.
+            let written = match (v.at_len, self.part_len(id)) {
+                (Some(at), Some(now)) => now.saturating_sub(at),
+                _ => 0,
+            };
             sum.saturating_add(v.bytes.saturating_sub(written))
         })
     }
@@ -1519,6 +1536,32 @@ pub(crate) mod tests {
         assert_eq!(c.in_progress_bytes(), Some(30));
         c.discard_part("track/y");
         assert_eq!(c.in_progress_bytes(), Some(0));
+    }
+
+    /// A reservation made while its `.part`'s length could not be read
+    /// keeps its whole claim owed: the bytes found on file later were there
+    /// already, not written against it. A refresh that reads a baseline
+    /// then counts from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reservation_over_an_unreadable_part_owes_its_whole_claim() {
+        let d = tmp("unreadable-baseline");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let part = c.part_path("track/x");
+        // A link to itself: its metadata fails, and not as absent.
+        std::os::unix::fs::symlink(&part, &part).unwrap();
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::remove_file(&part).unwrap();
+        std::fs::write(&part, vec![0u8; 60]).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            100,
+            "bytes already on file were taken as written against the claim"
+        );
+        // A refresh reads the baseline; writes from it count.
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(&part, vec![0u8; 90]).unwrap();
+        assert_eq!(c.reserved_bytes(), 70);
     }
 
     /// A part scan that fails, or whose entry or length cannot be read, is
