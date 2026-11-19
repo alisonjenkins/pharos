@@ -772,14 +772,17 @@ fn improve(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Aligned {
     let mut times = StageTimes::default();
-    let fail = |today: Today, times: StageTimes, e: StageError| {
+    // `clipped` is the recogniser's count once it has finished, so a later
+    // stage's failure still says what the recogniser did.
+    let fail = |today: Today, times: StageTimes, clipped: usize, e: StageError| {
         tracing::warn!(
             path = %rel_path,
             fallback = e.fallback.label(),
             reason = %e.reason,
             "recogniser stages fell back to today's answer"
         );
-        let placement = Placement::kept(today.with_words, e.fallback);
+        let mut placement = Placement::kept(today.with_words, e.fallback);
+        placement.first_words_clipped = clipped;
         today.into_aligned(placement, e.reason, times, 0)
     };
     let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
@@ -795,7 +798,7 @@ fn improve(
     times.vocals_ms = ms_since(t);
     let vocals = match vocals {
         Ok(v) => v,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, 0, e),
     };
 
     let t = Instant::now();
@@ -813,7 +816,7 @@ fn improve(
     times.recognise_ms = ms_since(t);
     let heard = match heard {
         Ok(h) => h,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, 0, e),
     };
 
     let t = Instant::now();
@@ -845,7 +848,7 @@ fn improve(
     times.emission_ms = ms_since(t);
     let data = match emission {
         Ok(d) => d,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, heard.first_words_clipped, e),
     };
 
     let t = Instant::now();
@@ -867,7 +870,7 @@ fn improve(
     times.place_ms = ms_since(t);
     let mut refined = match placed {
         Ok(r) => r,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, heard.first_words_clipped, e),
     };
     refined.placement.first_words_clipped = heard.first_words_clipped;
     if let Some(why) = refined.placement.fallback {
