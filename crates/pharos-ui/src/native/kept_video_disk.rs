@@ -1097,7 +1097,23 @@ impl Inner {
         }
         // A run owns the folder: its staging files stay, and the plan it
         // admits next must reserve them (its inventory leaves `.part` out).
-        let retained = if owned { parts_bytes(dir) } else { 0 };
+        let retained = if owned {
+            parts_bytes(dir)
+        } else {
+            Measure::Whole(0)
+        };
+        // Staging files that could not all be measured: what the plan
+        // would reserve for them is not known, so the folder stays unknown.
+        let Some(retained) = retained.whole() else {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep leftover verdict=kept reason=staging_files_unmeasured dir={}",
+                    dir.display()
+                ),
+            );
+            return;
+        };
         let mut st = lock(&self.state);
         if !Self::unchanged_since(&st, dir, epoch) {
             return;
@@ -3815,18 +3831,30 @@ fn remove_part(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
+/// The bytes of the staging files in `dir`: whole only when the listing was
+/// complete and every file's length could be read (a file gone since is
+/// none); otherwise a lower bound, never taken as what the folder holds.
+fn parts_bytes(dir: &Path) -> Measure<u64> {
+    let (paths, clean) = part_paths(dir, ".part");
+    let mut total = if clean {
+        Measure::Whole(0u64)
+    } else {
+        Measure::Short(0u64)
+    };
+    for path in paths {
+        let part = match std::fs::metadata(&path) {
+            Ok(m) => Measure::Whole(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
+            Err(_) => Measure::Short(0),
+        };
+        total = total.and(part, u64::saturating_add);
+    }
+    total
+}
+
 /// The staging files ending in `suffix` in `dir/files`, and whether the
 /// listing was complete: false when the folder or an entry could not be
 /// read (anything but the folder being gone).
-/// The bytes of the staging files in `dir` (those that can be read).
-fn parts_bytes(dir: &Path) -> u64 {
-    part_paths(dir, ".part")
-        .0
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .fold(0u64, |sum, m| sum.saturating_add(m.len()))
-}
-
 fn part_paths(dir: &Path, suffix: &str) -> (Vec<PathBuf>, bool) {
     let read = match std::fs::read_dir(dir.join("files")) {
         Ok(read) => read,
@@ -11179,6 +11207,47 @@ pub(crate) mod tests {
         );
         store.settled().await;
         FAIL_PART_DELETE.with(|f| f.set(false));
+    }
+
+    /// A staging file listing that could not be read whole leaves the
+    /// folder unknown: the settlement keeps the leftover, never a floor of
+    /// zero retained bytes.
+    #[tokio::test]
+    async fn a_short_staging_listing_keeps_the_folder_unknown() {
+        let rig = Rig::new("host-resume-part-short");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, _part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let kept = std::rc::Rc::new(std::cell::Cell::new(None));
+        let k2 = kept.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                FAIL_ENTRY_READ.with(|f| f.set(true));
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+                FAIL_ENTRY_READ.with(|f| f.set(false));
+                k2.set(Some(
+                    lock(&s2.inner.state).leftover.contains(&d2),
+                ));
+            }
+        });
+        let _ = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert_eq!(
+            kept.get(),
+            Some(true),
+            "a short staging listing settled the folder: {:?}",
+            captured()
+        );
+        assert!(
+            !lines("pharos: video keep leftover verdict=kept reason=staging_files_unmeasured")
+                .is_empty()
+        );
     }
 
     /// A resume whose plan the kept staging file widens past its
