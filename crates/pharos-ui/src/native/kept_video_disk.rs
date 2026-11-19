@@ -243,6 +243,10 @@ struct State {
     /// drops it): what its folder held when its first playlist was
     /// reserved, and the playlist allowances it has taken since.
     playlists_taken: HashMap<(String, String, u64), (u64, u64)>,
+    /// Per run, before its plan is admitted: the bytes of the playlists it
+    /// has fetched and promoted. On disk, so no longer owed, but in no
+    /// stored figure until the plan's inventory counts them.
+    playlists_landed: HashMap<(String, String, u64), u64>,
     /// Folders of removed downloads that could not be deleted, with the
     /// bytes left in them: counted against the cap until a later sweep
     /// deletes them.
@@ -673,7 +677,14 @@ impl State {
     /// with none, nothing is staged under it.
     fn owed(&self, v: &KeptVideo, run: Option<u64>) -> u64 {
         let on_disk = match run {
-            Some(run) => self.run_on_disk(v, run),
+            // A playlist promoted before the plan is on disk too: what it
+            // took of its allowance is written, not owed.
+            Some(run) => self.run_on_disk(v, run).saturating_add(
+                self.playlists_landed
+                    .get(&(v.user.clone(), v.item.clone(), run))
+                    .copied()
+                    .unwrap_or(0),
+            ),
             None => {
                 let stored = match v.state {
                     KeptState::Downloading { bytes, .. } => bytes,
@@ -823,6 +834,11 @@ impl Drop for Staged<'_> {
             if *held == 0 {
                 st.staged.remove(&self.who);
             }
+        }
+        // A playlist promoted before the plan moves from staged to landed
+        // in this hold, so it is never counted as owed in between.
+        if self.promoted && st.playlists_taken.contains_key(&self.who) {
+            *st.playlists_landed.entry(self.who.clone()).or_default() += self.len;
         }
         let claim = std::mem::take(&mut self.claim);
         st.unclaim(&self.who, claim);
@@ -1633,6 +1649,7 @@ impl Inner {
             // Kept on the record, so it goes with it.
             v.stale_on_disk = plan.stale;
             st.playlists_taken.remove(&who);
+            st.playlists_landed.remove(&who);
         }
         #[cfg(test)]
         self.plans_admitted
@@ -3511,6 +3528,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         if owned {
             st.runs.remove(&key);
         }
+        let who = (user.clone(), item.clone(), run);
+        st.playlists_taken.remove(&who);
+        st.playlists_landed.remove(&who);
         let parked = st.parking.get(&key) == Some(&run);
         if parked {
             st.parking.remove(&key);
@@ -8666,6 +8686,28 @@ mod tests {
         );
         assert!(freed.unwrap() > 0, "the freed bytes were not counted");
         assert_eq!(only(&store).item, "1");
+    }
+
+    /// A playlist promoted before the plan is on disk: while the next
+    /// playlist is held, the run owes its allowance less what the first
+    /// one wrote, not both allowances whole.
+    #[tokio::test]
+    async fn a_promoted_playlist_is_not_still_owed() {
+        let rig = Rig::new("playlist-landed");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let estimate = only(&store).estimated_bytes;
+        let master = u64::try_from(MASTER.len()).unwrap();
+        assert_eq!(
+            store.outstanding_bytes(),
+            estimate - master,
+            "the promoted playlist is still counted as owed"
+        );
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
     }
 
     /// A whole record copied into another item's folder is not adopted
