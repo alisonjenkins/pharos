@@ -225,6 +225,35 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 - A request key's authority ends at the first `/`, `?` or `#`, so an
   absolute URL with no path keeps its query under `/`. Stored keys are
   unchanged: the server's URLs always have a path.
+- A token that a sign-out or session end could not remove is marked
+  revoked: a synced `<token file>.revoked` marker names its user and a
+  fingerprint of the token, written under the token file's lock. Every read
+  of the token file refuses the token the marker names, so nothing resumes
+  or downloads with it, here or after a restart; a new sign-in's store
+  clears the marker, and a different token is never blocked by it. A token
+  that could be neither removed nor marked is reported as such
+  (`Ended::Unsafe`, `restart_safety=not_guaranteed`), and the process stays
+  signed out, its download credentials included, behind the in-process
+  fence until a new sign-in.
+- Who the offline owner is lives in one state behind one lock: the
+  identity, its generation, the session's token and the cold-start flags.
+  A cold start reads that state once, and fills in the user only while it
+  is still Unknown at that generation, without advancing it, so a `me`
+  asked on the current session still lands. A resumed session is published
+  only while the connection machine still accepts that attempt: a sign-out
+  that won keeps it out.
+- A stored video's HLS master is given to the player through the page's
+  own origin, so it plays from the phone's copy, not from the server.
+- Lock order on the video side is admission, then the manifest saves, then
+  the state. A resumed plan widened by a kept staging file is checked
+  against the shared cap as a fresh one; a staging listing that falls short
+  keeps the folder unknown; a run's terminal figure counts the staging files
+  other runs left; and a stale run gives back no playlist allowance from a
+  replacement record. On the music side, a part is discarded or truncated
+  under the cache's lock, so a trim never evicts for bytes that went, and a
+  part whose length cannot be read is unknown, never 0.
+- The TV page compares origins with the URL parser the HTTP client sends
+  with, so a token or redirect decision sees the host the request reaches.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
