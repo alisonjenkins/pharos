@@ -914,6 +914,21 @@ struct Worker {
     limit: Duration,
 }
 
+/// Reports what a sign-out (`at`: the user's, or the server's refusal)
+/// left on disk. The worker has signed out in memory either way; a removal
+/// the folder could not make durable may come back after a crash, so it is
+/// said, with the same verdict the phone uses.
+fn note_forgotten(at: &str, forgot: token::Forgotten) {
+    match forgot {
+        token::Forgotten::Durable => {
+            log::info!("pharos: token forget verdict=signed_out at={at}");
+        }
+        token::Forgotten::NotDurable(why) => {
+            log::warn!("pharos: token forget verdict=signed_out_not_durable at={at} reason={why}")
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1026,7 +1041,7 @@ impl Worker {
         if matches!(op, Op::SignOut) {
             self.link = None;
             self.stop_sign_in();
-            token::forget(&self.token_path)?;
+            note_forgotten("sign_out", token::forget(&self.token_path)?);
             self.shared.set_auth(AuthState::SignedOut);
             return Ok(Out::Done);
         }
@@ -1174,8 +1189,9 @@ impl Worker {
     /// start QuickConnect.
     fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
         self.link = None;
-        if let Err(e) = token::forget(&self.token_path) {
-            log::warn!("{}", e.redacted());
+        match token::forget(&self.token_path) {
+            Ok(forgot) => note_forgotten("revoked", forgot),
+            Err(e) => log::warn!("{}", e.redacted()),
         }
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
@@ -1848,6 +1864,39 @@ mod tests {
                 .await;
         });
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
+    }
+
+    /// A sign-out whose removal the folder could not make durable still
+    /// signs out in memory, and says it is not durable (both the user's
+    /// sign-out and the server's refusal).
+    #[test]
+    fn a_sign_out_that_is_not_durable_is_reported_and_still_signs_out() {
+        use std::io::ErrorKind::Other;
+        let (mut w, shared, token_path) = worker("signout-not-durable");
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        for at in ["sign_out", "revoked"] {
+            token::store(&token_path, "tok").unwrap();
+            crate::testlog::start();
+            crate::token::tests::DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+            local.block_on(&rt, async {
+                if at == "sign_out" {
+                    w.execute(&Op::SignOut, &events).await.unwrap();
+                } else {
+                    let _ = w.revoked(&events);
+                }
+            });
+            crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+            assert_eq!(shared.lock().auth, AuthState::SignedOut, "{at}");
+            assert!(token::load(&token_path).unwrap().is_none(), "{at}");
+            let lines = crate::testlog::lines();
+            assert!(
+                lines.iter().any(|l| l.contains(&format!(
+                    "pharos: token forget verdict=signed_out_not_durable at={at} reason="
+                ))),
+                "{at}: {lines:?}"
+            );
+        }
     }
 
     #[test]

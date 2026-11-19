@@ -290,7 +290,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::cell::RefCell;
@@ -301,7 +301,7 @@ mod tests {
         /// While set, syncing the directory after a rename fails.
         pub(super) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The next directory syncs fail with these, one each.
-        pub(super) static DIR_SYNC_ERRORS: RefCell<Vec<std::io::ErrorKind>> = const { RefCell::new(Vec::new()) };
+        pub(crate) static DIR_SYNC_ERRORS: RefCell<Vec<std::io::ErrorKind>> = const { RefCell::new(Vec::new()) };
         /// Runs inside `store_user`, between its read and its write.
         static BETWEEN: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
     }
