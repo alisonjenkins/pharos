@@ -280,7 +280,7 @@ pub fn forget_if(path: &Path, seen: &str) -> Result<ForgetIf, ContentError> {
     match read_raw(path)? {
         Some(s) if s.token != seen.trim() => Ok(ForgetIf::Changed),
         Some(_) => remove(path).map(ForgetIf::Forgotten),
-        None => Ok(ForgetIf::Forgotten(Forgotten::Durable)),
+        None => Ok(ForgetIf::Forgotten(absent(path))),
     }
 }
 
@@ -334,7 +334,23 @@ pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended
     };
     let stored = match read {
         Ok(Some(s)) if seen.is_some_and(|seen| s.token != seen.trim()) => return Ended::Changed,
-        Ok(None) => return Ended::Forgotten(Forgotten::Durable),
+        Ok(None) => {
+            return match absent(path) {
+                Forgotten::Durable => Ended::Forgotten(Forgotten::Durable),
+                // Gone, but its absence may not be on disk yet (an earlier
+                // unlink whose sync failed): the token the session ended
+                // with is marked, when one is named.
+                Forgotten::NotDurable(why) => match seen {
+                    Some(seen) => mark(
+                        path,
+                        user,
+                        &fingerprint(seen),
+                        format!("absence not durable: {why}"),
+                    ),
+                    None => Ended::Forgotten(Forgotten::NotDurable(why)),
+                },
+            };
+        }
         Ok(Some(s)) => s,
         // Unreadable: the compare cannot be made, so nothing is removed (it
         // may be a replacement). The token the session ended with is still
@@ -434,6 +450,25 @@ pub mod faults {
     }
 }
 
+/// No token file: durable only once its folder syncs, since the absence may
+/// be an earlier unlink whose sync failed (a crash could still bring the
+/// file back). Called with the lock held.
+fn absent(path: &Path) -> Forgotten {
+    let Some(dir) = path.parent() else {
+        return Forgotten::NotDurable("no directory".to_owned());
+    };
+    match durable_dir(dir) {
+        Ok(()) => Forgotten::Durable,
+        Err(reason) => {
+            log::warn!(
+                "token file absent but not synced dir={} reason={reason} verdict=absence_not_durable",
+                dir.display()
+            );
+            Forgotten::NotDurable(reason)
+        }
+    }
+}
+
 /// Removes the file and syncs its folder. Called with the lock held.
 fn remove(path: &Path) -> Result<Forgotten, ContentError> {
     #[cfg(debug_assertions)]
@@ -442,7 +477,7 @@ fn remove(path: &Path) -> Result<Forgotten, ContentError> {
     }
     match std::fs::remove_file(path) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Forgotten::Durable),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(absent(path)),
         Err(e) => return Err(err(path, e)),
     }
     let Some(dir) = path.parent() else {
@@ -877,6 +912,25 @@ pub(crate) mod tests {
         store(&p, "tokB").unwrap();
         assert_eq!(reader.join().unwrap(), None, "the revoked token was read");
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+    }
+
+    /// A sign-out retried after an unlink whose folder sync failed is
+    /// durable only once the folder syncs: the absence alone is not.
+    #[test]
+    fn a_retried_sign_out_is_durable_only_once_the_folder_syncs() {
+        let d = dir("absent-durable");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let first = forget(&p).unwrap();
+        let retry = forget(&p).unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        assert!(matches!(first, Forgotten::NotDurable(_)), "{first:?}");
+        assert!(
+            matches!(retry, Forgotten::NotDurable(_)),
+            "an unsynced absence was reported durable: {retry:?}"
+        );
+        assert_eq!(forget(&p).unwrap(), Forgotten::Durable);
     }
 
     /// (a) A marker that is there but cannot be read, or holds no
