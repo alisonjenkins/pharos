@@ -218,6 +218,41 @@ pub struct LyricsFinder {
     repicked: Mutex<HashSet<(u64, String)>>,
 }
 
+/// A song's place in [`LyricsFinder::repick`]'s guard, given back when
+/// dropped, so a search that fails, waits out a cooldown or is cancelled
+/// can be made again; kept once the search's answer is written.
+struct Reserved<'a> {
+    set: &'a Mutex<HashSet<(u64, String)>>,
+    key: Option<(u64, String)>,
+}
+
+impl<'a> Reserved<'a> {
+    /// `None` when the song is held already.
+    fn take(set: &'a Mutex<HashSet<(u64, String)>>, key: (u64, String)) -> Option<Self> {
+        let first = set
+            .lock()
+            .map(|mut held| held.insert(key.clone()))
+            .unwrap_or(false);
+        first.then_some(Self {
+            set,
+            key: Some(key),
+        })
+    }
+
+    fn keep(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        if let Ok(mut held) = self.set.lock() {
+            held.remove(&key);
+        }
+    }
+}
+
 /// An online answer held in memory: what was asked, so a retagged song is
 /// asked again, and for a miss when it lapses.
 #[derive(Clone)]
@@ -382,13 +417,17 @@ impl LyricsFinder {
         }
         let online = self.online.as_ref()?;
         let song = Song::of(item)?;
-        let reserved = (item.id, cache::key(online.name(), &song));
-        let first = self
-            .repicked
-            .lock()
-            .map(|mut set| set.insert(reserved.clone()))
-            .unwrap_or(false);
-        if !first || self.repicked_on_disk(item.id, online.name(), &song).await {
+        let Some(reserved) =
+            Reserved::take(&self.repicked, (item.id, cache::key(online.name(), &song)))
+        else {
+            tracing::debug!(
+                media.id = item.id,
+                "lyrics: another lyric is being searched for already"
+            );
+            return None;
+        };
+        if self.repicked_on_disk(item.id, online.name(), &song).await {
+            reserved.keep();
             tracing::debug!(
                 media.id = item.id,
                 "lyrics: another lyric was searched for already"
@@ -396,13 +435,11 @@ impl LyricsFinder {
             return None;
         }
         if self.cooling_down() {
-            self.forget_repick(&reserved);
             return None;
         }
         let candidates = match online.search(&song).await {
             Ok(c) => c,
             Err(e) => {
-                self.forget_repick(&reserved);
                 if let Ok(mut until) = self.down_until.lock() {
                     *until = Some(Instant::now() + ONLINE_COOLDOWN);
                 }
@@ -427,6 +464,7 @@ impl LyricsFinder {
         let Some(pick) = pick else {
             self.write_repick(item.id, online.name(), song, current.clone(), None)
                 .await;
+            reserved.keep();
             repick_counted(repick::Outcome::None);
             tracing::warn!(
                 media.id = item.id,
@@ -452,6 +490,7 @@ impl LyricsFinder {
             Some(pick.candidate.id),
         )
         .await;
+        reserved.keep();
         repick_counted(repick::Outcome::Picked);
         tracing::warn!(
             media.id = item.id,
@@ -463,12 +502,6 @@ impl LyricsFinder {
             "lyrics: not what was sung, another record was and is served instead"
         );
         Some(found.fit_to(item.probe.duration_ms))
-    }
-
-    fn forget_repick(&self, reserved: &(u64, String)) {
-        if let Ok(mut set) = self.repicked.lock() {
-            set.remove(reserved);
-        }
     }
 
     async fn repicked_on_disk(&self, id: u64, provider: &'static str, song: &Song) -> bool {
@@ -1081,6 +1114,8 @@ mod tests {
         found: Lyrics,
         searched: Result<Vec<repick::Candidate>, &'static str>,
         searches: std::sync::atomic::AtomicUsize,
+        /// The search never answers, as one cut off mid-request.
+        stalls: bool,
     }
 
     impl OnlineLyrics for Searching {
@@ -1101,6 +1136,9 @@ mod tests {
         {
             self.searches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stalls {
+                return Box::pin(std::future::pending());
+            }
             let out = self.searched.clone().map_err(|detail| OnlineError {
                 provider: "searching",
                 detail: detail.to_owned(),
@@ -1162,6 +1200,7 @@ mod tests {
             found: wrong(),
             searched,
             searches: Default::default(),
+            stalls: false,
         })
     }
 
@@ -1275,6 +1314,31 @@ mod tests {
         });
         assert_eq!(first, Some(sung()));
         assert_eq!(again, Some(sung()));
+        assert_eq!(searches(&online), 2);
+    }
+
+    /// Disarm check: with the guard kept when `repick` is dropped, the
+    /// second ask finds the song held and does not search.
+    #[test]
+    fn a_search_cut_off_mid_request_is_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = Arc::new(Searching {
+            found: wrong(),
+            searched: Ok(records(sung())),
+            searches: Default::default(),
+            stalls: true,
+        });
+        let finder = LyricsFinder::with_online(online.clone());
+        let cut_off = std::time::Duration::from_millis(20);
+        let (asks, _) = with_outcomes(async {
+            let first =
+                tokio::time::timeout(cut_off, finder.repick(&item, &wrong(), &heard())).await;
+            let again =
+                tokio::time::timeout(cut_off, finder.repick(&item, &wrong(), &heard())).await;
+            (first.is_err(), again.is_err())
+        });
+        assert_eq!(asks, (true, true));
         assert_eq!(searches(&online), 2);
     }
 
