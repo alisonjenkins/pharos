@@ -11561,13 +11561,14 @@ pub(crate) mod tests {
     /// clean-up is not clean.
     #[test]
     fn an_unreadable_entry_makes_the_clean_up_not_clean() {
-        let dir = std::env::temp_dir().join(format!("kvd-entry-{}", std::process::id()));
+        // A folder of its own, gone when the test ends, a failure included.
+        let scope = super::super::test_dir::TmpDir::new("kvd-entry");
+        let dir = scope.path();
         std::fs::create_dir_all(dir.join("files")).unwrap();
         std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
         FAIL_ENTRY_READ.with(|f| f.set(true));
-        let clean = drop_parts_of(&dir, None);
+        let clean = drop_parts_of(dir, None);
         FAIL_ENTRY_READ.with(|f| f.set(false));
-        std::fs::remove_dir_all(&dir).ok();
         assert!(!clean, "an entry read error counted as clean");
     }
 
