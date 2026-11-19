@@ -68,6 +68,7 @@ impl Stages for Live {
             words = heard.transcript.words.len(),
             segments = heard.segments.len(),
             retries = heard.retries.len(),
+            first_words_clipped = heard.transcript.first_words_clipped,
             "recognised"
         );
         Ok(heard.transcript.words)

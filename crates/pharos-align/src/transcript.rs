@@ -31,6 +31,10 @@ fn exact_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 pub struct Transcript {
     pub words: Vec<Word>,
+    /// Segments whose first word the recogniser started from its letters
+    /// rather than whisper's start, which was seconds early.
+    #[serde(default)]
+    pub first_words_clipped: usize,
 }
 
 #[derive(Debug, thiserror::Error)]

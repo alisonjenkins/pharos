@@ -90,9 +90,7 @@ impl Recogniser {
             r.record();
         }
         Ok(Heard {
-            transcript: Transcript {
-                words: segment_words(&segments),
-            },
+            transcript: segment_words(&segments),
             segments,
             retries,
         })
