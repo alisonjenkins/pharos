@@ -33,8 +33,12 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 - Bodies stream to disk chunk by chunk. The downloads run on one dedicated
   thread (a current-thread tokio runtime), two files at a time.
 - The proxy asks `VideoStore::stored_file(user, key)` for the signed-in user
-  before the network and answers a hit from disk with the server's `Content-Type`, whether the phone
-  is online or not (a stored copy saves mobile data). `Range` is not
+  before the network and answers a hit from disk, whether the phone
+  is online or not (a stored copy saves mobile data). The hit's
+  `Content-Type` is derived from the stored request key's extension
+  (`kept_video::content_type_for`, sent by `offline_headers`); the
+  server's own header is not stored with the file, so the two can differ
+  for an unusual extension. `Range` is not
   forwarded by the proxy today and the playlists carry no byte ranges, so a
   stored file is answered whole. A stored file is answered with
   `cache-control: no-store`: the WebView's cache keys a response by URL
