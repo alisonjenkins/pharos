@@ -254,6 +254,22 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   part whose length cannot be read is unknown, never 0.
 - The TV page compares origins with the URL parser the HTTP client sends
   with, so a token or redirect decision sees the host the request reaches.
+- Every sign-out and session end runs in one order: fence first, then tear
+  down. Under the identity lock the state becomes signed out and its
+  generation advances; then the ended user's runs are parked; then the
+  preference is cleared and the session's token removed or marked. Every
+  resume, a sign-in's and the replay at the store's publication, starts
+  under that same lock and only while the generation it validated at still
+  holds (`video keep resume verdict=not_resumed
+  reason=identity_changed_since_validated`), so no run starts between the
+  park and the token's invalidation.
+- A token that a sign-out could neither remove nor mark is not handed to
+  the media service as a reload. The phone queues a stay-signed-out call
+  with the token's fingerprint instead (`credentials change=kept_unsafe`).
+  The service runs in the app's own process, and its library holds the
+  fence: every token read refuses that fingerprint (`token read
+  verdict=refused reason=service_fence`) until a different token is on
+  file. The library's own unsafe sign-out or revocation sets the same fence.
 - Signals are log lines (the phone has no Prometheus): `video keep
   start|ready|failed|refused|resume|remove`, and `video request class=…
   verdict=served_offline|network` (playlists at info, segments at debug); a
