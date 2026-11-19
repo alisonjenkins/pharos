@@ -656,8 +656,8 @@ pub async fn for_item(
                 align::Lookup::Pending(eta_ms) => {
                     words_pending = Some(WordsPending { eta_ms });
                 }
-                // No words for lyrics that were not what was sung (B1479).
-                align::Lookup::Unavailable | align::Lookup::Mismatch(_) => {}
+                align::Lookup::Mismatch(_) => unsync_mismatch(&mut lyrics, item.id),
+                align::Lookup::Unavailable => {}
             }
         } else {
             // No aligner configured: the ask still goes unanswered, so it
@@ -666,6 +666,23 @@ pub async fn for_item(
         }
     }
     Ok(Some((lyrics, words_pending)))
+}
+
+/// A lyric that was not what was sung, with no other record that was, is
+/// shown as plain text (B1479, V1468): its times follow another song.
+fn unsync_mismatch(lyrics: &mut Lyrics, id: u64) {
+    lyrics.unsync();
+    metrics::counter!(
+        "pharos_lyrics_unsynced_total",
+        "reason" => align::LYRICS_MISMATCH,
+        "origin" => lyrics.origin.label()
+    )
+    .increment(1);
+    tracing::info!(
+        media.id = id,
+        origin = lyrics.origin.label(),
+        "lyrics: not what was sung, shown unsynced"
+    );
 }
 
 /// The aligner's answer for `lyrics` of `item`, which stats the file and
@@ -1294,5 +1311,51 @@ mod tests {
         assert_eq!((failed, cooling, retried), (None, None, None));
         assert_eq!(searches(&online), 2);
         assert_eq!(counted, [("error".to_owned(), 2)]);
+    }
+
+    /// V1468: a lyric found not to be what was sung is never served synced,
+    /// and each time it is served so is counted. Disarm check: with
+    /// `unsync()` removed from `unsync_mismatch`, this fails.
+    #[test]
+    fn a_lyric_not_sung_is_served_unsynced_and_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let mut lyrics = wrong();
+        lyrics.lines[0].words = vec![WordStamp {
+            at: 0,
+            start_ms: 10,
+        }];
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || unsync_mismatch(&mut lyrics, 1));
+        assert!(lyrics
+            .lines
+            .iter()
+            .all(|l| l.start_ms.is_none() && l.words.is_empty()));
+        let got: Vec<(Vec<(String, String)>, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_lyrics_unsynced_total")
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((
+                    k.key()
+                        .labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                    n,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [(
+                vec![
+                    ("reason".to_owned(), "lyrics_mismatch".to_owned()),
+                    ("origin".to_owned(), "online".to_owned()),
+                ],
+                1
+            )]
+        );
     }
 }
