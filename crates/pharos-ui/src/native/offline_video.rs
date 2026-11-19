@@ -209,125 +209,64 @@ enum Identity {
     Fenced(String),
 }
 
+/// Everything a sign-in, a sign-out, a session change and a cold start
+/// read and change, behind one lock, so none of them ever sees one field
+/// from before another's change and one from after it.
+#[derive(Debug)]
+struct IdState {
+    identity: Identity,
+    /// Counts every identity change and session replacement, so an answer
+    /// asked before one of them can tell it is out of date (see
+    /// [`remember_user_if`]).
+    generation: u64,
+    /// The device token of the session published last
+    /// ([`session_replaced`]), once there is one. A cold start read after
+    /// it is bound to it: only that token's paired user may be installed.
+    session_token: Option<TokenSeen>,
+    /// A cold start has read and found nobody, so a proxied request does
+    /// not read the preference and the token again.
+    cold_tried: bool,
+    /// The refusal for nobody signed in has been logged since the identity
+    /// last changed.
+    refusal_logged: bool,
+}
+
+const ID_START: IdState = IdState {
+    identity: Identity::Unknown,
+    generation: 0,
+    session_token: None,
+    cold_tried: false,
+    refusal_logged: false,
+};
+
 #[cfg(not(test))]
-static IDENTITY: std::sync::Mutex<Identity> = std::sync::Mutex::new(Identity::Unknown);
+static ID: std::sync::Mutex<IdState> = std::sync::Mutex::new(ID_START);
 
 #[cfg(test)]
 thread_local! {
-    static IDENTITY: std::cell::RefCell<Identity> = const { std::cell::RefCell::new(Identity::Unknown) };
+    static ID: std::cell::RefCell<IdState> = const { std::cell::RefCell::new(ID_START) };
 }
 
-/// Reads or changes the identity under its one lock.
-fn with_identity<R>(f: impl FnOnce(&mut Identity) -> R) -> R {
+/// Reads or changes the identity state under its one lock.
+fn with_id<R>(f: impl FnOnce(&mut IdState) -> R) -> R {
     #[cfg(not(test))]
     {
-        f(&mut IDENTITY
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        f(&mut ID.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
     #[cfg(test)]
     {
-        IDENTITY.with(|i| f(&mut i.borrow_mut()))
+        ID.with(|i| f(&mut i.borrow_mut()))
     }
 }
 
 fn identity() -> Identity {
-    with_identity(|i| i.clone())
-}
-
-/// The device token of the session published last ([`session_replaced`]),
-/// once there is one. Written under the identity lock. A cold start read
-/// after it is bound to it: only that token's paired user may be installed.
-#[cfg(not(test))]
-static SESSION_TOKEN: std::sync::Mutex<Option<TokenSeen>> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static SESSION_TOKEN: std::cell::RefCell<Option<TokenSeen>> = const { std::cell::RefCell::new(None) };
-}
-
-fn with_session_token<R>(f: impl FnOnce(&mut Option<TokenSeen>) -> R) -> R {
-    #[cfg(not(test))]
-    {
-        f(&mut SESSION_TOKEN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    {
-        SESSION_TOKEN.with(|t| f(&mut t.borrow_mut()))
-    }
-}
-
-/// Per-identity-state facts: whether a cold start has read and failed
-/// (so a proxied request does not read the preference and the token again),
-/// and whether the refusal for nobody signed in has been logged since the
-/// identity last changed.
-#[cfg(not(test))]
-static FLAGS: [std::sync::atomic::AtomicBool; 2] = [
-    std::sync::atomic::AtomicBool::new(false),
-    std::sync::atomic::AtomicBool::new(false),
-];
-
-#[cfg(test)]
-thread_local! {
-    static FLAGS: [std::cell::Cell<bool>; 2] = const { [std::cell::Cell::new(false), std::cell::Cell::new(false)] };
-}
-
-const COLD_TRIED: usize = 0;
-const REFUSAL_LOGGED: usize = 1;
-
-fn flag(i: usize) -> bool {
-    #[cfg(not(test))]
-    {
-        FLAGS[i].load(std::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    {
-        FLAGS.with(|f| f[i].get())
-    }
-}
-
-fn set_flag(i: usize, v: bool) {
-    #[cfg(not(test))]
-    FLAGS[i].store(v, std::sync::atomic::Ordering::SeqCst);
-    #[cfg(test)]
-    FLAGS.with(|f| f[i].set(v));
-}
-
-/// Counts sign-ins and sign-outs, so an answer that was asked for before
-/// one of them can tell it is out of date (see [`remember_user_if`]).
-/// Changed only under the identity lock.
-#[cfg(not(test))]
-static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-thread_local! {
-    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-fn generation() -> u64 {
-    #[cfg(not(test))]
-    {
-        GENERATION.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(test)]
-    {
-        GENERATION.with(std::cell::Cell::get)
-    }
-}
-
-fn bump_generation() {
-    #[cfg(not(test))]
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    #[cfg(test)]
-    GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    with_id(|s| s.identity.clone())
 }
 
 /// The identity's generation now: taken before asking who is signed in, and
 /// handed to [`remember_user_if`] with the answer.
 pub fn identity_generation() -> u64 {
-    with_identity(|_| generation())
+    with_id(|s| s.generation)
 }
 
 /// A new session replaces the one before it (a reconnect, a sign-in): that
@@ -341,9 +280,10 @@ pub fn session_replaced<A>(session: &Session<A>) {
     // token file, and only while it is still that token: pairing is written
     // under the file's compare-and-set, so the user named belongs to it.
     let paired = paired_user(&session.token);
-    let (now, verdict, reason, user) = with_identity(|i| {
-        bump_generation();
-        with_session_token(|t| *t = Some(session.token.clone()));
+    let (now, verdict, reason, user) = with_id(|st| {
+        st.generation = st.generation.wrapping_add(1);
+        st.session_token = Some(session.token.clone());
+        let i = &mut st.identity;
         let (verdict, reason, user) = match i.clone() {
             Identity::User(u) | Identity::Fenced(u) if paired.as_deref() == Some(u.as_str()) => {
                 *i = Identity::User(u.clone());
@@ -360,7 +300,7 @@ pub fn session_replaced<A>(session: &Session<A>) {
             }
             _ => ("unchanged", "no_user_known", String::new()),
         };
-        (generation(), verdict, reason, user)
+        (st.generation, verdict, reason, user)
     });
     super::platform::info(&format!(
         "pharos: video user generation verdict=advanced reason=session_replaced generation={now}"
@@ -410,25 +350,25 @@ fn set_identity(next: Identity) {
 /// still `expected` (any generation with `None`), and starts a new one.
 /// Returns the generation found when it is not the expected one.
 fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
-    with_identity(|i| {
-        let now = generation();
+    with_id(|st| {
+        let now = st.generation;
         if expected.is_some_and(|e| e != now) {
             return Err(now);
         }
-        if let (Identity::Fenced(was), Identity::User(now)) = (&*i, &next) {
+        if let (Identity::Fenced(was), Identity::User(now)) = (&st.identity, &next) {
             note_fence(format!(
                 "pharos: video user fence verdict=lifted reason=user_established was={was} user={now}"
             ));
         }
         // A new identity state is a new chance for a cold start (only a
         // test's restart sets Unknown) and a new refusal to log.
-        set_flag(REFUSAL_LOGGED, false);
+        st.refusal_logged = false;
         if next == Identity::Unknown {
-            set_flag(COLD_TRIED, false);
-            with_session_token(|t| *t = None);
+            st.cold_tried = false;
+            st.session_token = None;
         }
-        *i = next;
-        bump_generation();
+        st.identity = next;
+        st.generation = st.generation.wrapping_add(1);
         Ok(())
     })
 }
@@ -465,7 +405,7 @@ fn token_user() -> Option<Result<Option<String>, String>> {
 /// where a token decides sign-in, only with a readable token that was issued
 /// to that same user. No token, an unreadable one, or one with no user id
 /// stored is nobody.
-fn cold_start_identity() -> Identity {
+fn cold_start_identity(session_token: Option<TokenSeen>) -> Identity {
     let pref = match read_pref() {
         Ok(p) => p.filter(|u| !u.is_empty()),
         Err(e) => {
@@ -478,7 +418,7 @@ fn cold_start_identity() -> Identity {
     // Once a session is published, its token decides: the remembered user
     // is installed only if that token is still on file and paired with
     // them, never because the file names them (a token stored since).
-    if let Some(seen) = with_session_token(|t| t.clone()).filter(|t| t.0.is_some()) {
+    if let Some(seen) = session_token.filter(|t| t.0.is_some()) {
         let paired = paired_user(&seen);
         return match (paired, pref) {
             (Some(t), Some(p)) if t == p => Identity::User(p),
@@ -523,7 +463,23 @@ fn cold_start_identity() -> Identity {
 /// meanwhile, so a sign-in or sign-out that lands during the read is never
 /// overwritten by what was read before it.
 pub fn last_user() -> Option<String> {
-    let known = identity();
+    // One snapshot of the state, the generation with it: a sign-out (or
+    // anything else) between reading Unknown and reading the generation
+    // would otherwise be missed by the install's compare-and-set.
+    let (known, asked_at, cold_tried, session_token) = with_id(|s| {
+        (
+            s.identity.clone(),
+            s.generation,
+            s.cold_tried,
+            s.session_token.clone(),
+        )
+    });
+    #[cfg(test)]
+    tests::AFTER_STATE_READ.with(|h| {
+        if let Some(f) = h.borrow_mut().take() {
+            f();
+        }
+    });
     if known != Identity::Unknown {
         return match known {
             Identity::User(u) => Some(u),
@@ -533,15 +489,14 @@ pub fn last_user() -> Option<String> {
     // A cold start that has run and found nobody is not run again for every
     // proxied request: a sign-in or `me` sets the identity, which is what
     // changes the answer.
-    if flag(COLD_TRIED) {
+    if cold_tried {
         return None;
     }
-    // The generation is taken before the reads, while the identity is
-    // Unknown: what they found is installed only through the one
-    // compare-and-set every install uses, so a sign-in, a sign-out or a
-    // session published during them (each advances the generation) wins.
-    let asked_at = identity_generation();
-    let found = cold_start_identity();
+    // What the reads find is installed only through the one compare-and-set
+    // every install uses, against the generation of the snapshot above, so
+    // a sign-in, a sign-out or a session published since (each advances the
+    // generation) wins.
+    let found = cold_start_identity(session_token);
     #[cfg(test)]
     tests::AFTER_COLD_READ.with(|h| {
         if let Some(f) = h.borrow_mut().take() {
@@ -549,7 +504,11 @@ pub fn last_user() -> Option<String> {
         }
     });
     if found == Identity::Unknown {
-        set_flag(COLD_TRIED, true);
+        with_id(|s| {
+            if s.generation == asked_at {
+                s.cold_tried = true;
+            }
+        });
     } else {
         let verdict = if matches!(found, Identity::User(_)) {
             "known"
@@ -908,7 +867,7 @@ fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
 /// them, and an offline restart would show their downloads again. An
 /// outage never comes here (the machine keeps the session).
 pub fn session_ended() {
-    let ended = with_session_token(Option::take);
+    let ended = with_id(|s| s.session_token.take());
     forget_user();
     let Some(token) = ended.and_then(|t| t.0) else {
         super::platform::info("pharos: token forget verdict=none reason=no_session_token");
@@ -967,8 +926,7 @@ pub fn stored_for(
 ) -> Option<super::kept_video::StoredFile> {
     let Some(user) = user else {
         // Once per identity state, not once per segment.
-        if !flag(REFUSAL_LOGGED) {
-            set_flag(REFUSAL_LOGGED, true);
+        if !with_id(|s| std::mem::replace(&mut s.refusal_logged, true)) {
             super::platform::info(&format!(
                 "pharos: video request verdict=not_served_offline reason=no_signed_in_user key_len={}",
                 key.len()
@@ -1191,6 +1149,8 @@ pub(crate) mod tests {
         /// Runs once after a cold start's reads, before what they found is
         /// installed.
         pub(super) static AFTER_COLD_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        /// Runs once `last_user` has taken its snapshot of the state.
+        pub(super) static AFTER_STATE_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         /// The fence verdicts logged on this thread.
         pub(super) static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
@@ -2459,6 +2419,26 @@ pub(crate) mod tests {
     /// install's compare-and-set on the generation refuses A. A cold start
     /// read again after it is bound to B's token, which is not paired with
     /// A, so A's files are never selected.
+    /// A sign-out that lands after a cold start has read the state (Unknown)
+    /// installs nobody: the install compares against the generation of that
+    /// same snapshot, not one read after the sign-out. The preference write
+    /// of the sign-out fails, so the files still name A.
+    #[test]
+    fn a_sign_out_after_the_cold_starts_state_read_installs_nobody() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        p.fail_write.set(true);
+        AFTER_STATE_READ.with(|h| *h.borrow_mut() = Some(Box::new(forget_user)));
+        assert_eq!(
+            last_user(),
+            None,
+            "the cold start installed A over the sign-out"
+        );
+        assert_eq!(identity(), Identity::SignedOut);
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+    }
+
     #[test]
     fn a_cold_start_overtaken_by_a_new_session_installs_nobody() {
         let p = pref();
@@ -2472,7 +2452,7 @@ pub(crate) mod tests {
         assert_eq!(last_user(), None, "the overtaken cold start installed A");
         assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
         // Read again on B's session: bound to B's token, so still nobody.
-        set_flag(COLD_TRIED, false);
+        with_id(|s| s.cold_tried = false);
         assert_eq!(last_user(), None, "a read on B's session installed A");
         assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
 
