@@ -36,6 +36,8 @@ pub struct Script {
     valid_token: Option<String>,
     /// Paths that answer 503 until the script is changed.
     busy: Vec<String>,
+    /// The `ETag` every reply carries; `"v1"` when unset.
+    etag: Option<String>,
     /// Every request seen: path, `Range` header, status sent.
     pub log: Vec<Seen>,
 }
@@ -95,6 +97,18 @@ impl Script {
 
     pub fn drop_first_after(mut self, bytes: usize) -> Self {
         self.drops.push_back(bytes);
+        self
+    }
+
+    /// Every reply carries this `ETag` (quoted), not `"v1"`.
+    pub fn etag(mut self, tag: &str) -> Self {
+        self.etag = Some(tag.to_owned());
+        self
+    }
+
+    /// Serves every request whole (200), whatever `Range` it sends.
+    pub fn ignore_range(mut self) -> Self {
+        self.ignore_range = true;
         self
     }
 
@@ -166,6 +180,13 @@ impl TestServer {
         format!("http://{}{path}?api_key={token}", self.addr)
     }
 
+    /// Changes the script for the requests from now on.
+    pub fn edit(&self, f: impl FnOnce(Script) -> Script) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = std::mem::take(&mut *s);
+        *s = f(now);
+    }
+
     pub fn seen(&self) -> Vec<Seen> {
         self.state
             .lock()
@@ -214,9 +235,13 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         .find_map(|kv| kv.strip_prefix("api_key="))
         .map(str::to_owned);
 
-    let (piece, hold) = {
+    let (piece, hold, etag) = {
         let s = state.lock().unwrap_or_else(PoisonError::into_inner);
-        (s.piece, s.hold.clone())
+        (
+            s.piece,
+            s.hold.clone(),
+            s.etag.clone().unwrap_or_else(|| "v1".to_owned()),
+        )
     };
     let piece = if piece == 0 { 8192 } else { piece };
     let (reply, drop_after) = {
@@ -234,7 +259,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     if let Some(cr) = &reply.content_range {
         out.extend_from_slice(format!("Content-Range: {cr}\r\n").as_bytes());
     }
-    out.extend_from_slice(b"ETag: \"v1\"\r\n");
+    out.extend_from_slice(format!("ETag: \"{etag}\"\r\n").as_bytes());
     if reply.chunked {
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
     } else {
