@@ -341,6 +341,8 @@ fn run_song(
                 anchor_share = p.anchor_share,
                 anchors_dropped = p.dropped_anchors,
                 lines_held = p.held_lines,
+                first_words_clipped = p.first_words_clipped,
+                anchors_from_second_word = p.anchors_from_second_word,
                 fallback = p.fallback_label(),
                 fallback_reason = %a.fallback_reason,
                 lines_corrected = a.corrected,

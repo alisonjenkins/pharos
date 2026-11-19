@@ -108,6 +108,10 @@ pub struct Placement {
     /// Kept lines whose word starts were held between the placed lines
     /// around them (V1373).
     pub held_lines: usize,
+    /// Segments whose first word the recogniser started from its letters.
+    pub first_words_clipped: usize,
+    /// Anchors that started from their second word.
+    pub anchors_from_second_word: usize,
     pub fallback: Option<Fallback>,
 }
 
@@ -121,6 +125,8 @@ impl Placement {
             anchor_share: None,
             dropped_anchors: 0,
             held_lines: 0,
+            first_words_clipped: 0,
+            anchors_from_second_word: 0,
             fallback: Some(why),
         }
     }
@@ -136,6 +142,8 @@ impl Placement {
             anchor_share: Some(anchor_share),
             dropped_anchors: 0,
             held_lines: 0,
+            first_words_clipped: 0,
+            anchors_from_second_word: 0,
             fallback: None,
         }
     }

@@ -487,6 +487,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         let mut placement = Placement::kept(with_words, Fallback::LowAnchorShare);
         placement.anchor_share = Some(share);
         placement.dropped_anchors = n_dropped;
+        placement.anchors_from_second_word = matched.from_second_word;
         return Refined {
             lines: out,
             methods,
@@ -677,6 +678,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
     let mut placement = Placement::from_methods(methods.iter().flatten().copied(), share);
     placement.dropped_anchors = n_dropped;
     placement.held_lines = held;
+    placement.anchors_from_second_word = matched.from_second_word;
     Refined {
         lines: out,
         methods,
