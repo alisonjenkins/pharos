@@ -1308,6 +1308,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::testdir::TmpDir;
 
     fn dead_server() -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1336,21 +1337,18 @@ mod tests {
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
     }
 
-    fn cache_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "pharos-auto-libcache-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    /// A test's own folder, removed when the guard drops: bind it first in
+    /// the test, so it outlives the library and its workers.
+    fn test_root(name: &str) -> TmpDir {
+        TmpDir::new(&format!("lib-{name}"))
     }
 
-    fn offline_lib(name: &str) -> (Library, PathBuf) {
+    /// A library with its token and its cache under `root`; the cache's
+    /// folder comes back with it.
+    fn offline_lib(root: &Path) -> (Library, PathBuf) {
         let base = dead_server();
-        let tok =
-            std::env::temp_dir().join(format!("pharos-auto-lib-{name}-{}", std::process::id()));
-        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
-        let dir = cache_dir(name);
+        let lib = Library::connect_with(&base, &root.join("token"), quick()).unwrap();
+        let dir = root.join("cache");
         lib.enable_cache(&dir, 1 << 20).unwrap();
         (lib, dir)
     }
@@ -1358,10 +1356,11 @@ mod tests {
     #[test]
     fn a_network_loss_while_the_cache_starts_still_reaches_the_downloader() {
         let base = dead_server();
-        let tok = std::env::temp_dir().join(format!("pharos-auto-lib-race-{}", std::process::id()));
+        let root = test_root("race");
+        let tok = root.join("token");
         let lib = Library::connect_with(&base, &tok, quick()).unwrap();
         lib.enable_cache_with(
-            &cache_dir("race"),
+            &root.join("cache"),
             1 << 20,
             || lib.set_online(false),
             || {},
@@ -1374,7 +1373,8 @@ mod tests {
 
     #[test]
     fn a_set_cache_cap_survives_a_restart() {
-        let (lib, dir) = offline_lib("cap");
+        let root = test_root("cap");
+        let (lib, dir) = offline_lib(&root);
         assert_eq!(
             lib.cache_cap(),
             Some(1 << 20),
@@ -1404,13 +1404,12 @@ mod tests {
         };
         // Set before the cache is enabled: applied when it is.
         let base = dead_server();
-        let tok =
-            std::env::temp_dir().join(format!("pharos-auto-lib-outside-{}", std::process::id()));
+        let root = test_root("outside-before");
+        let tok = root.join("token");
         let lib = Library::connect_with(&base, &tok, quick()).unwrap();
         lib.set_outside_used(hook(&calls));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no cache to tell yet");
-        lib.enable_cache(&cache_dir("outside-before"), 1 << 20)
-            .unwrap();
+        lib.enable_cache(&root.join("cache"), 1 << 20).unwrap();
         let after_enable = calls.load(Ordering::SeqCst);
         assert!(after_enable > 0, "the cache was told when it came up");
         // Set after: applied at once.
@@ -1428,16 +1427,14 @@ mod tests {
                 ..cache::OutsideBytes::default()
             })
         };
-        let tok = std::env::temp_dir().join(format!(
-            "pharos-auto-lib-outside-race-{}",
-            std::process::id()
-        ));
+        let root = test_root("outside-race");
+        let tok = root.join("token");
         let lib = Arc::new(Library::connect_with(&dead_server(), &tok, quick()).unwrap());
         lib.set_outside_used(hook(1));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handle = None;
         lib.enable_cache_with(
-            &cache_dir("outside-race"),
+            &root.join("cache"),
             1 << 20,
             || {},
             || {
@@ -1466,13 +1463,13 @@ mod tests {
     /// outside-bytes hook being applied.
     #[test]
     fn restored_pins_wait_for_the_outside_hook() {
-        let tok =
-            std::env::temp_dir().join(format!("pharos-auto-lib-pins-wait-{}", std::process::id()));
+        let root = test_root("pins-wait");
+        let tok = root.join("token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         lib.set_outside_used(Arc::new(cache::OutsideBytes::default));
         let mid = std::cell::Cell::new(None);
         lib.enable_cache_with(
-            &cache_dir("pins-wait"),
+            &root.join("cache"),
             1 << 20,
             || {},
             || {},
@@ -1500,10 +1497,8 @@ mod tests {
     /// hook and is refused.
     #[test]
     fn a_prefetch_as_the_cache_comes_up_sees_the_pending_outside_hook() {
-        let tok = std::env::temp_dir().join(format!(
-            "pharos-auto-lib-prefetch-gap-{}",
-            std::process::id()
-        ));
+        let root = test_root("prefetch-gap");
+        let tok = root.join("token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = calls.clone();
@@ -1516,7 +1511,7 @@ mod tests {
         }));
         let asked = std::cell::Cell::new(false);
         lib.enable_cache_with(
-            &cache_dir("prefetch-gap"),
+            &root.join("cache"),
             1 << 20,
             || {},
             || {},
@@ -1541,24 +1536,24 @@ mod tests {
 
     #[test]
     fn the_cache_is_enabled_only_once_it_is_up() {
-        let tok =
-            std::env::temp_dir().join(format!("pharos-auto-lib-enabled-{}", std::process::id()));
+        let root = test_root("enabled");
+        let tok = root.join("token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         assert!(!lib.cache_enabled());
         // A cache directory that cannot be made leaves it disabled.
-        let file =
-            std::env::temp_dir().join(format!("pharos-auto-lib-notadir-{}", std::process::id()));
+        let file = root.join("notadir");
         std::fs::write(&file, b"x").unwrap();
         assert!(lib.enable_cache(&file.join("sub"), 1 << 20).is_err());
         assert!(!lib.cache_enabled());
-        lib.enable_cache(&cache_dir("enabled"), 1 << 20).unwrap();
+        lib.enable_cache(&root.join("cache"), 1 << 20).unwrap();
         assert!(lib.cache_enabled());
     }
 
     #[test]
     fn enabling_the_cache_logs_where_its_cap_came_from() {
         crate::testlog::start();
-        let (lib, dir) = offline_lib("cap-source");
+        let root = test_root("cap-source");
+        let (lib, dir) = offline_lib(&root);
         let has = |want: &str| crate::testlog::lines().iter().any(|l| l == want);
         assert!(
             has("cache cap bytes=1048576 source=default"),
@@ -1579,7 +1574,8 @@ mod tests {
 
     #[test]
     fn reloading_with_no_token_file_signs_out_quietly() {
-        let tok = cache_dir("reload-none").join("device-token");
+        let root = test_root("reload-none");
+        let tok = root.join("device-token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         lib.reload_credentials().unwrap();
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
@@ -1587,7 +1583,8 @@ mod tests {
 
     #[test]
     fn reloading_a_new_token_file_resumes_from_it_and_keeps_it() {
-        let tok = cache_dir("reload-token").join("device-token");
+        let root = test_root("reload-token");
+        let tok = root.join("device-token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         token::store(&tok, "from-the-phone").unwrap();
         let e = lib.reload_credentials().unwrap_err();
@@ -1601,8 +1598,8 @@ mod tests {
 
     #[test]
     fn a_cap_needs_the_cache() {
-        let lib =
-            Library::connect_with(&dead_server(), &cache_dir("nocap").join("t"), quick()).unwrap();
+        let root = test_root("nocap");
+        let lib = Library::connect_with(&dead_server(), &root.join("t"), quick()).unwrap();
         assert!(lib.set_cache_cap(1).is_err());
         assert_eq!(lib.cache_cap(), None);
         assert_eq!(lib.offline_summary(), None);
@@ -1611,7 +1608,8 @@ mod tests {
 
     #[test]
     fn the_offline_summary_reports_cap_use_and_the_guard() {
-        let (lib, _dir) = offline_lib("summary");
+        let root = test_root("summary");
+        let (lib, _dir) = offline_lib(&root);
         lib.set_cache_cap(4096).unwrap();
         let s = lib.offline_summary().unwrap();
         assert_eq!((s.cap_bytes, s.used_bytes), (4096, 0));
@@ -1645,7 +1643,8 @@ mod tests {
 
     #[test]
     fn play_queue_is_the_rest_of_the_album_in_order() {
-        let (lib, _) = offline_lib("queue");
+        let root = test_root("queue");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
         assert_eq!(lib.play_queue("track/1"), ["track/2", "track/3"]);
@@ -1659,7 +1658,8 @@ mod tests {
 
     #[test]
     fn local_path_is_only_for_whole_cached_files() {
-        let (lib, _) = offline_lib("local");
+        let root = test_root("local");
+        let (lib, _) = offline_lib(&root);
         assert_eq!(lib.local_path("track/1"), None);
         keep(&lib, "track/1");
         let p = lib.local_path("track/1").unwrap();
@@ -1683,7 +1683,8 @@ mod tests {
     /// phone, and those rows carry no URL (and so no token).
     #[test]
     fn an_unreachable_server_still_lists_the_cached_tracks_of_an_album() {
-        let (lib, _) = offline_lib("browse");
+        let root = test_root("browse");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
         keep(&lib, "track/2");
@@ -1705,7 +1706,8 @@ mod tests {
 
     #[test]
     fn set_offline_answers_from_the_snapshot_without_waiting_for_the_network() {
-        let (lib, _) = offline_lib("flag");
+        let root = test_root("flag");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1)]);
         keep(&lib, "track/1");
@@ -1718,7 +1720,8 @@ mod tests {
 
     #[test]
     fn a_book_offline_plays_its_parts_on_the_phone_from_the_first() {
-        let (lib, _) = offline_lib("book");
+        let root = test_root("book");
+        let (lib, _) = offline_lib(&root);
         let book = NodeId::parse("album/7").unwrap();
         let mut resume = track(9);
         resume.id = "album/7".into();
@@ -1746,7 +1749,8 @@ mod tests {
 
     #[test]
     fn progress_offline_is_dropped_and_says_so() {
-        let (lib, _) = offline_lib("progress");
+        let root = test_root("progress");
+        let (lib, _) = offline_lib(&root);
         lib.set_online(false);
         crate::testlog::start();
         lib.progress("track/2", 61_000, tree::Progress::Paused)
@@ -1766,17 +1770,13 @@ mod tests {
 
     #[test]
     fn the_play_order_and_snapshots_survive_a_restart() {
-        let (lib, dir) = offline_lib("restart");
+        let root = test_root("restart");
+        let (lib, dir) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2)]);
         keep(&lib, "track/1");
         drop(lib);
-        let lib2 = Library::connect_with(
-            &dead_server(),
-            &std::env::temp_dir().join("pharos-auto-lib-restart2"),
-            quick(),
-        )
-        .unwrap();
+        let lib2 = Library::connect_with(&dead_server(), &root.join("token2"), quick()).unwrap();
         lib2.enable_cache(&dir, 1 << 20).unwrap();
         assert_eq!(lib2.play_queue("track/1"), ["track/2"]);
         assert!(lib2.local_path("track/1").is_some());
@@ -1784,7 +1784,8 @@ mod tests {
 
     #[test]
     fn only_albums_and_mixes_pin_and_a_pin_survives_for_the_tracks_it_names() {
-        let (lib, dir) = offline_lib("pin");
+        let root = test_root("pin");
+        let (lib, dir) = offline_lib(&root);
         assert!(lib.pin("music/albums").is_err());
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2)]);
@@ -1813,10 +1814,9 @@ mod tests {
         );
     }
 
-    fn worker(name: &str) -> (Worker, Arc<Shared>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("pharos-lib-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A worker whose token lives under `dir` (a test's `test_root`, bound
+    /// before the worker so it outlives it).
+    fn worker(dir: &Path) -> (Worker, Arc<Shared>, PathBuf) {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 auth: AuthState::SignedOut,
@@ -1850,7 +1850,8 @@ mod tests {
 
     #[test]
     fn a_sign_out_disowns_the_pending_quickconnect_poller() {
-        let (mut w, shared, _) = worker("signout-qc");
+        let root = test_root("signout-qc");
+        let (mut w, shared, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
@@ -1872,7 +1873,8 @@ mod tests {
     #[test]
     fn a_sign_out_that_is_not_durable_is_reported_and_still_signs_out() {
         use std::io::ErrorKind::Other;
-        let (mut w, shared, token_path) = worker("signout-not-durable");
+        let root = test_root("signout-not-durable");
+        let (mut w, shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         for at in ["sign_out", "revoked"] {
@@ -1901,7 +1903,8 @@ mod tests {
 
     #[test]
     fn a_reload_disowns_the_pending_quickconnect_poller() {
-        let (mut w, _, _) = worker("reload-qc");
+        let root = test_root("reload-qc");
+        let (mut w, _, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
@@ -1914,7 +1917,8 @@ mod tests {
 
     #[test]
     fn a_revoked_session_forgets_the_token_and_starts_quickconnect() {
-        let (mut w, shared, token_path) = worker("revoked");
+        let root = test_root("revoked");
+        let (mut w, shared, token_path) = worker(&root);
         token::store(&token_path, "stale-token").unwrap();
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
@@ -2175,7 +2179,8 @@ mod tests {
 
     #[test]
     fn a_poller_that_queued_its_approval_is_not_replaced_before_it_is_consumed() {
-        let (mut w, _, _) = worker("approved-pending");
+        let root = test_root("approved-pending");
+        let (mut w, _, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
