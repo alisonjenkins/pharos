@@ -665,42 +665,55 @@ pub async fn for_item(
     if item.kind != MediaKind::Audio {
         return Ok(None);
     }
-    let Some(mut lyrics) = state.lyrics.find(&item).await else {
+    let Some(lyrics) = state.lyrics.find(&item).await else {
         return Ok(None);
     };
-    let mut words_pending = None;
-    if want_words {
-        if let Some(aligner) = state.lyrics.aligner.clone() {
-            let mut lookup = words_for(&aligner, &item, &lyrics).await;
-            count_words_answer(&lookup);
-            if let align::Lookup::Mismatch(heard) = &lookup {
-                // Another record that was sung is aligned in its place, once.
-                if let Some(other) = state.lyrics.repick(&item, &lyrics, heard).await {
-                    lyrics = other;
-                    lookup = words_for(&aligner, &item, &lyrics).await;
+    Ok(Some(state.lyrics.served(&item, lyrics, want_words).await))
+}
+
+impl LyricsFinder {
+    /// `lyrics` of `item` as served: with the aligner's word times when
+    /// `want_words`, or another record in its place when it was not sung.
+    async fn served(
+        &self,
+        item: &MediaItem,
+        mut lyrics: Lyrics,
+        want_words: bool,
+    ) -> (Lyrics, Option<WordsPending>) {
+        let mut words_pending = None;
+        if want_words {
+            if let Some(aligner) = self.aligner.clone() {
+                let mut lookup = words_for(&aligner, item, &lyrics).await;
+                count_words_answer(&lookup);
+                if let align::Lookup::Mismatch(heard) = &lookup {
+                    // Another record that was sung is aligned in its place, once.
+                    if let Some(other) = self.repick(item, &lyrics, heard).await {
+                        lyrics = other;
+                        lookup = words_for(&aligner, item, &lyrics).await;
+                    }
                 }
+                match lookup {
+                    align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
+                    // The lines timed so far, the rest still guessed by the
+                    // client until the next answer (ADR-0121).
+                    align::Lookup::Partial(eta_ms, aligned) => {
+                        with_words(&mut lyrics, &aligned);
+                        words_pending = Some(WordsPending { eta_ms });
+                    }
+                    align::Lookup::Pending(eta_ms) => {
+                        words_pending = Some(WordsPending { eta_ms });
+                    }
+                    align::Lookup::Mismatch(_) => unsync_mismatch(&mut lyrics, item.id),
+                    align::Lookup::Unavailable => {}
+                }
+            } else {
+                // No aligner configured: the ask still goes unanswered, so it
+                // counts against the ready share like the aligner refusing it.
+                count_words_answer(&align::Lookup::Unavailable);
             }
-            match lookup {
-                align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
-                // The lines timed so far, the rest still guessed by the
-                // client until the next answer (ADR-0121).
-                align::Lookup::Partial(eta_ms, aligned) => {
-                    with_words(&mut lyrics, &aligned);
-                    words_pending = Some(WordsPending { eta_ms });
-                }
-                align::Lookup::Pending(eta_ms) => {
-                    words_pending = Some(WordsPending { eta_ms });
-                }
-                align::Lookup::Mismatch(_) => unsync_mismatch(&mut lyrics, item.id),
-                align::Lookup::Unavailable => {}
-            }
-        } else {
-            // No aligner configured: the ask still goes unanswered, so it
-            // counts against the ready share like the aligner refusing it.
-            count_words_answer(&align::Lookup::Unavailable);
         }
+        (lyrics, words_pending)
     }
-    Ok(Some((lyrics, words_pending)))
 }
 
 /// A lyric that was not what was sung, with no other record that was, is
