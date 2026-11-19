@@ -454,6 +454,62 @@ fn every_song_with_a_transcript_carries_its_text_check() {
     assert_eq!(before.check, None);
 }
 
+/// B1479/V1468: a song heard at length to other words falls back as a
+/// lyrics mismatch, keeps today's answer and says what was heard; a placed
+/// song's answer carries no check.
+#[test]
+fn a_song_sung_to_other_words_is_a_lyrics_mismatch() {
+    let other: Vec<Word> = (0..120)
+        .map(|k| Word {
+            text: format!(" lantern{}", k % 40),
+            start_s: 0.08 * k as f64,
+            end_s: 0.08 * k as f64 + 0.05,
+            prob: 0.9,
+            silent_lead: false,
+        })
+        .collect();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: transcript(other),
+        slow: Duration::ZERO,
+    };
+    let (got, events) =
+        run(&Engine::new(loader(Some(song().0)), silent(), None).with_stages(Box::new(stages)));
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::LyricsMismatch));
+    assert!(
+        got.fallback_reason
+            .starts_with("lyrics_mismatch: anchor share 0.000, text recall 0.000, heard 120 words"),
+        "{}",
+        got.fallback_reason
+    );
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
+    let answer = serde_json::to_value(&got.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "lyrics_mismatch");
+    assert_eq!(answer["check"]["text_recall"], 0.0);
+    assert_eq!(answer["check"]["heard_words"], 120);
+    assert!(answer["check"]["heard"]
+        .as_str()
+        .unwrap()
+        .starts_with(" lantern0 lantern1"));
+
+    let (placed, _) = with(Step::Works, Step::Works, Some(song().0));
+    assert_eq!(placed.placement.fallback, None);
+    assert!(serde_json::to_value(&placed.answer)
+        .unwrap()
+        .get("check")
+        .is_none());
+
+    // Too little heard is a low anchor share, with the check for the server.
+    let (barely, _) = with(Step::Works, Step::Works, None);
+    assert_eq!(barely.placement.fallback, Some(Fallback::EmissionFailed));
+    let answer = serde_json::to_value(&barely.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "emission_failed");
+}
+
 #[test]
 fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let (sung, _) = song();

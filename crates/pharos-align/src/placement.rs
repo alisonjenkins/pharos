@@ -63,10 +63,13 @@ pub enum Fallback {
     StageCrashed,
     /// The request asked for scores only (`"stages": false`, spec 040).
     NotAsked,
+    /// Too few lines were anchored, and the recogniser heard plenty but
+    /// little of the lyric's text: the lyric is another song's (B1479).
+    LyricsMismatch,
 }
 
 impl Fallback {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Off,
         Self::LowAnchorShare,
         Self::SeparateFailed,
@@ -77,6 +80,7 @@ impl Fallback {
         Self::StageTimeout,
         Self::StageCrashed,
         Self::NotAsked,
+        Self::LyricsMismatch,
     ];
 
     /// The `reason` label of `pharos_aligner_song_fallback_total`.
@@ -92,6 +96,7 @@ impl Fallback {
             Self::StageTimeout => "stage_timeout",
             Self::StageCrashed => "stage_crashed",
             Self::NotAsked => "not_asked",
+            Self::LyricsMismatch => "lyrics_mismatch",
         }
     }
 }
