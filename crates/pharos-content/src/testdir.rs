@@ -37,6 +37,12 @@ impl std::ops::Deref for TmpDir {
     }
 }
 
+impl AsRef<Path> for TmpDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

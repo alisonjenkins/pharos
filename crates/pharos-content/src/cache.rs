@@ -1263,14 +1263,10 @@ pub(crate) mod tests {
 
     use super::*;
 
-    pub(crate) fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "pharos-auto-cache-{name}-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    /// A test's own cache folder, removed when the guard drops: bind it
+    /// before the cache, so it outlives the cache and its workers.
+    pub(crate) fn tmp(name: &str) -> crate::testdir::TmpDir {
+        crate::testdir::TmpDir::new(&format!("cache-{name}"))
     }
 
     /// A finished track of `n` bytes, as the downloader would leave it.
@@ -1687,9 +1683,8 @@ pub(crate) mod tests {
                 ..OutsideBytes::default()
             })
         };
-        let c =
-            Cache::open_with_probe(&tmp("lowdisk-video"), 1000, fixed_free(MIN_FREE_BYTES + 50))
-                .unwrap();
+        let d = tmp("lowdisk-video");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 50)).unwrap();
         c.set_outside_used(hook(&outstanding));
         assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
         // The video still has 100 to write: 50 free beyond the guard is
@@ -1716,7 +1711,8 @@ pub(crate) mod tests {
             probe_order.lock().unwrap().push("probe");
             Ok(MIN_FREE_BYTES + 50)
         });
-        let c = Cache::open_with_probe(&tmp("lowdisk-order"), 1000, probe).unwrap();
+        let d = tmp("lowdisk-order");
+        let c = Cache::open_with_probe(&d, 1000, probe).unwrap();
         let hook_order = order.clone();
         c.set_outside_used(std::sync::Arc::new(move || {
             hook_order.lock().unwrap().push("outstanding");
@@ -1734,12 +1730,8 @@ pub(crate) mod tests {
     fn music_is_refused_while_a_videos_size_is_unknown() {
         let unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let u = unknown.clone();
-        let c = Cache::open_with_probe(
-            &tmp("lowdisk-unknown-video"),
-            1000,
-            fixed_free(MIN_FREE_BYTES + 1_000_000),
-        )
-        .unwrap();
+        let d = tmp("lowdisk-unknown-video");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 1_000_000)).unwrap();
         c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
             unknown: u.load(Ordering::SeqCst),
             ..OutsideBytes::default()
@@ -1769,12 +1761,8 @@ pub(crate) mod tests {
         let outstanding = std::sync::Arc::new(AtomicU64::new(MIN_FREE_BYTES));
         let o = outstanding.clone();
         // Room for a sparse 2 GiB "track" and the cap to match.
-        let c = Cache::open_with_probe(
-            &tmp("lowdisk-deficit"),
-            u64::MAX / 2,
-            fixed_free(MIN_FREE_BYTES / 2),
-        )
-        .unwrap();
+        let d = tmp("lowdisk-deficit");
+        let c = Cache::open_with_probe(&d, u64::MAX / 2, fixed_free(MIN_FREE_BYTES / 2)).unwrap();
         c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
             outstanding: o.load(Ordering::SeqCst),
             ..OutsideBytes::default()
@@ -1796,8 +1784,8 @@ pub(crate) mod tests {
 
     #[test]
     fn room_counts_the_bytes_still_to_write() {
-        let c = Cache::open_with_probe(&tmp("lowdisk-need"), 1000, fixed_free(MIN_FREE_BYTES + 10))
-            .unwrap();
+        let d = tmp("lowdisk-need");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 10)).unwrap();
         assert_eq!(c.ensure_free("track/x", 10), Ok(MIN_FREE_BYTES + 10));
         assert_eq!(
             c.ensure_free("track/x", 11),
@@ -1808,7 +1796,8 @@ pub(crate) mod tests {
     #[test]
     fn an_unreadable_free_space_figure_does_not_block() {
         let probe: FreeProbe = Box::new(|_| Err(std::io::Error::other("no statvfs")));
-        let c = Cache::open_with_probe(&tmp("lowdisk-unknown"), 1000, probe).unwrap();
+        let d = tmp("lowdisk-unknown");
+        let c = Cache::open_with_probe(&d, 1000, probe).unwrap();
         assert!(c.ensure_free("track/x", 1 << 40).is_ok());
     }
 
@@ -2139,7 +2128,8 @@ pub(crate) mod tests {
         assert_eq!(c.used_bytes(), 150);
         assert_eq!(c.free_bytes().unwrap(), 12_345);
         let failing: FreeProbe = Box::new(|_| Err(std::io::Error::other("statvfs")));
-        let c = Cache::open_with_probe(&tmp("summary-err"), 1000, failing).unwrap();
+        let d = tmp("summary-err");
+        let c = Cache::open_with_probe(&d, 1000, failing).unwrap();
         assert!(c.free_bytes().is_err());
     }
 }
