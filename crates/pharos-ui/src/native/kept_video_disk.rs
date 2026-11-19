@@ -2438,8 +2438,30 @@ enum Scanned {
     Removed,
 }
 
+/// Whether `item_dir` (a `root/user/item` folder) is the one `record`'s
+/// own ids name, as [`Inner::item_dir`] derives it.
+fn names_its_folder(item_dir: &Path, record: &KeptVideo) -> bool {
+    let name = |p: Option<&Path>| {
+        p.and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+    };
+    name(Some(item_dir)) == Some(safe_name(&record.item))
+        && name(item_dir.parent()) == Some(safe_name(&record.user))
+}
+
 fn scan_item(env: &Env, item_dir: &Path, sweep: Sweep) -> Scanned {
     match read_held(item_dir) {
+        // A record copied into another item's folder would be adopted at a
+        // path its own ids do not name, where removal never looks: it stays
+        // held (as `apply_held` keeps it) for the user to recover or discard.
+        HeldNow::Readable(record) if !names_its_folder(item_dir, &record) => Scanned::Held {
+            why: format!(
+                "record names another folder (record_user={} record_item={})",
+                safe_name(&record.user),
+                safe_name(&record.item)
+            ),
+            m: dir_size(item_dir),
+        },
         HeldNow::Readable(record) => Scanned::Record(Box::new(adopt(item_dir, *record, sweep))),
         // The host's check deletes nothing: the folder is measured and
         // counted as a tombstone, which the next ordinary sweep deletes.
@@ -8363,6 +8385,49 @@ mod tests {
                 .any(|l| l.contains("verdict=pending reason=run_parking")),
             "{pending:?}"
         );
+    }
+
+    /// A whole record copied into another item's folder is not adopted
+    /// there: removal looks only where the record's ids point, so the copy
+    /// would outlive it. The copy stays held, and the original is the one
+    /// download listed.
+    #[tokio::test]
+    async fn a_record_in_a_folder_it_does_not_name_stays_held() {
+        let rig = Rig::new("record-elsewhere");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let (from, to) = (rig.dir.join("u1").join("1"), rig.dir.join("u1").join("2"));
+        copy_tree(&from, &to);
+        let store = rig.open();
+        store.settled().await;
+        let listed = lock(&store.inner.state).list.len();
+        assert_eq!(listed, 1, "the copy was adopted as a second download");
+        assert!(
+            lock(&store.inner.state).held.iter().any(|(d, _)| *d == to),
+            "the copy is not held"
+        );
+        let held = lines("pharos: video folder held");
+        assert!(
+            held.iter()
+                .any(|l| l.contains("record names another folder")),
+            "{held:?}"
+        );
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &target);
+            } else {
+                std::fs::copy(e.path(), target).unwrap();
+            }
+        }
     }
 
     /// Waits, on the test's runtime, until `done` holds; at most 10 s.
