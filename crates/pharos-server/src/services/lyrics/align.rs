@@ -206,10 +206,13 @@ pub struct AlignCache {
 
 /// Word stamps per line, keyed by item id, with the key they were aligned for.
 type Remembered = HashMap<u64, (String, Aligned)>;
+/// Mismatch verdicts per item and key, kept apart from the word stamps so
+/// another lyric aligned for the item does not erase them (V1468).
+type Verdicts = HashMap<(u64, String), Heard>;
 
 enum CacheBackend {
     Disk(PathBuf),
-    Memory(Mutex<Remembered>),
+    Memory(Mutex<Remembered>, Mutex<Verdicts>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -235,15 +238,26 @@ impl AlignCache {
     pub fn new(dir: Option<PathBuf>) -> Self {
         let backend = match dir {
             Some(d) => CacheBackend::Disk(d),
-            None => CacheBackend::Memory(Mutex::new(HashMap::new())),
+            None => CacheBackend::Memory(Mutex::new(HashMap::new()), Mutex::new(HashMap::new())),
         };
         Self {
             backend: Arc::new(backend),
         }
     }
 
-    /// Retrieve cached word stamps for `id` matching `key`, if present.
+    /// Retrieve cached word stamps for `id` matching `key`, if present; a
+    /// lyric found not what was sung answers its verdict with no words, even
+    /// after another lyric was aligned for the item.
     pub fn get(&self, id: u64, key: &str) -> Option<Aligned> {
+        self.words(id, key).or_else(|| {
+            self.verdict(id, key).map(|heard| Aligned {
+                mismatch: Some(heard),
+                ..Aligned::default()
+            })
+        })
+    }
+
+    fn words(&self, id: u64, key: &str) -> Option<Aligned> {
         match &*self.backend {
             CacheBackend::Disk(dir) => {
                 let path = dir.join(format!("{id}.words.json"));
@@ -283,7 +297,7 @@ impl AlignCache {
                     mismatch: record.mismatch,
                 })
             }
-            CacheBackend::Memory(mem) => {
+            CacheBackend::Memory(mem, _) => {
                 let map = match mem.lock() {
                     Ok(m) => m,
                     Err(poisoned) => poisoned.into_inner(),
@@ -299,6 +313,9 @@ impl AlignCache {
 
     /// Persist word stamps for `id` under `key`.
     pub fn put(&self, id: u64, key: String, aligned: Aligned) {
+        if let Some(heard) = &aligned.mismatch {
+            self.keep_verdict(id, &key, heard);
+        }
         match &*self.backend {
             CacheBackend::Disk(dir) => {
                 let path = dir.join(format!("{id}.words.json"));
@@ -324,7 +341,7 @@ impl AlignCache {
                     tracing::warn!(media.id = id, dir = %dir.display(), error = %e, "lyrics: words cache write failed");
                 }
             }
-            CacheBackend::Memory(mem) => {
+            CacheBackend::Memory(mem, _) => {
                 let mut map = match mem.lock() {
                     Ok(m) => m,
                     Err(poisoned) => poisoned.into_inner(),
@@ -333,10 +350,63 @@ impl AlignCache {
             }
         }
     }
+
+    fn verdict(&self, id: u64, key: &str) -> Option<Heard> {
+        match &*self.backend {
+            CacheBackend::Disk(dir) => read_verdicts(&verdicts_path(dir, id)).remove(key),
+            CacheBackend::Memory(_, verdicts) => {
+                let map = match verdicts.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.get(&(id, key.to_string())).cloned()
+            }
+        }
+    }
+
+    fn keep_verdict(&self, id: u64, key: &str, heard: &Heard) {
+        match &*self.backend {
+            CacheBackend::Disk(dir) => {
+                let path = verdicts_path(dir, id);
+                let mut all = read_verdicts(&path);
+                all.insert(key.to_string(), heard.clone());
+                if let Err(e) = write_record(dir, &path, &all) {
+                    tracing::warn!(media.id = id, dir = %dir.display(), error = %e, "lyrics: mismatch verdict write failed");
+                }
+            }
+            CacheBackend::Memory(_, verdicts) => {
+                let mut map = match verdicts.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.insert((id, key.to_string()), heard.clone());
+            }
+        }
+    }
+}
+
+fn verdicts_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id}.mismatches.json"))
+}
+
+/// The verdicts kept for one item by key; none when the file is missing or unreadable.
+fn read_verdicts(path: &Path) -> HashMap<String, Heard> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "lyrics: mismatch verdicts read failed");
+            return HashMap::new();
+        }
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(path = %path.display(), error = %e, "lyrics: mismatch verdicts unreadable");
+        HashMap::new()
+    })
 }
 
 /// Written via a temporary file and atomically renamed over the destination.
-fn write_record(dir: &Path, path: &Path, record: &WordsRecord) -> std::io::Result<()> {
+fn write_record(dir: &Path, path: &Path, record: &impl Serialize) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -2617,6 +2687,32 @@ pub(super) mod tests {
         )
         .unwrap();
         assert_eq!(cache.get(5, "k").map(|a| a.mismatch), Some(None));
+    }
+
+    /// V1468: a lyric found not what was sung stays so after another lyric
+    /// is aligned for the same item, on disk and in memory.
+    #[test]
+    fn a_mismatch_outlives_another_lyric_aligned_for_the_item() {
+        let dir = tempfile::tempdir().unwrap();
+        for cache in [
+            AlignCache::new(Some(dir.path().to_path_buf())),
+            AlignCache::new(None),
+        ] {
+            let wrong = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+            let heard = wrong.mismatch.clone().unwrap();
+            cache.put(4, "wrong".into(), wrong);
+            let sung = Aligned {
+                lines: vec![vec![WordStamp {
+                    at: 0,
+                    start_ms: 10,
+                }]],
+                ..Aligned::default()
+            };
+            cache.put(4, "sung".into(), sung.clone());
+            assert_eq!(cache.get(4, "sung"), Some(sung));
+            assert_eq!(cache.get(4, "wrong").and_then(|a| a.mismatch), Some(heard));
+            assert_eq!(cache.get(5, "wrong"), None);
+        }
     }
 
     /// V1468: words aligned to lyrics that were not what was sung are never
