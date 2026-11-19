@@ -1455,7 +1455,7 @@ mod tests {
     #[test]
     fn a_response_of_unknown_length_reserves_one_check_window() {
         let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
-        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
         let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
         let (slot2, seen2) = (slot.clone(), seen.clone());
         let r = rig_with_free(
@@ -1469,12 +1469,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
                     .map_or(0, |c| c.reserved_bytes());
                 seen2.lock().unwrap().push(reserved);
                 Ok(u64::MAX)
             }),
         );
-        *slot.lock().unwrap() = Some(r.cache.clone());
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         // Reads: the job's check, the check before writing, then each check
@@ -1484,6 +1485,10 @@ mod tests {
         assert!(seen.len() >= 3, "{seen:?}");
         assert_eq!(seen[2], FREE_CHECK_BYTES, "window not reserved: {seen:?}");
         assert_eq!(r.cache.reserved_bytes(), 0, "kept after the job ended");
+        // The probe holds the cache weakly: the rig's end frees it.
+        let cache = Arc::downgrade(&r.cache);
+        drop(r);
+        assert!(cache.upgrade().is_none(), "the probe kept the cache alive");
     }
 
     /// A body of unknown length that ends exactly at a window boundary
@@ -1492,7 +1497,7 @@ mod tests {
     #[test]
     fn a_body_of_unknown_length_ending_at_a_window_completes_in_low_space() {
         let size = usize::try_from(FREE_CHECK_BYTES).unwrap();
-        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
         let slot2 = slot.clone();
         let r = rig_with_free(
             "unknown-length-low-space",
@@ -1502,13 +1507,18 @@ mod tests {
             fast(),
             Box::new(move |_| {
                 // Room is MIN_FREE plus 12 MiB, less what is on the disk.
-                let on_disk = slot2.lock().unwrap().as_ref().map_or(0, |c| {
+                let cache = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let on_disk = cache.as_ref().map_or(0, |c| {
                     std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len())
                 });
                 Ok((MIN_FREE_BYTES + 12 * 1024 * 1024).saturating_sub(on_disk))
             }),
         );
-        *slot.lock().unwrap() = Some(r.cache.clone());
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert!(
@@ -1524,7 +1534,7 @@ mod tests {
     fn a_chunk_crossing_the_window_is_reserved_before_it_is_written() {
         let chunk = 5_000_000usize;
         let size = chunk * 4;
-        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
         // (bytes on disk, reserved) at each check.
         let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
         let (slot2, seen2) = (slot.clone(), seen.clone());
@@ -1538,14 +1548,19 @@ mod tests {
             &["t"],
             fast(),
             Box::new(move |_| {
-                if let Some(c) = slot2.lock().unwrap().as_ref() {
+                let cache = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(c) = cache.as_ref() {
                     let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
                     seen2.lock().unwrap().push((on_disk, c.reserved_bytes()));
                 }
                 Ok(u64::MAX)
             }),
         );
-        *slot.lock().unwrap() = Some(r.cache.clone());
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         let seen = seen.lock().unwrap().clone();
@@ -1568,7 +1583,7 @@ mod tests {
     #[test]
     fn a_running_download_reports_what_it_has_written() {
         let size = usize::try_from(FREE_CHECK_BYTES * 3).unwrap();
-        let slot: Arc<Mutex<Option<Arc<Cache>>>> = Arc::default();
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
         // (bytes on disk, in-progress figure) at each check.
         let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
         let (slot2, seen2) = (slot.clone(), seen.clone());
@@ -1579,7 +1594,12 @@ mod tests {
             &["t"],
             fast(),
             Box::new(move |_| {
-                if let Some(c) = slot2.lock().unwrap().as_ref() {
+                let cache = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(c) = cache.as_ref() {
                     let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
                     seen2
                         .lock()
@@ -1589,7 +1609,7 @@ mod tests {
                 Ok(u64::MAX)
             }),
         );
-        *slot.lock().unwrap() = Some(r.cache.clone());
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         let seen = seen.lock().unwrap().clone();
