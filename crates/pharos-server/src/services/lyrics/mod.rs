@@ -483,10 +483,12 @@ impl LyricsFinder {
             searched += candidates.len();
             pick = choose(candidates);
         }
+        // Kept before the write is awaited: the write runs on whether or not
+        // this request is still waiting for it, and the search is done.
+        reserved.keep();
         let Some(pick) = pick else {
             self.write_repick(item.id, online.name(), song, current.clone(), None)
                 .await;
-            reserved.keep();
             repick_counted(repick::Outcome::None);
             tracing::warn!(
                 media.id = item.id,
@@ -513,7 +515,6 @@ impl LyricsFinder {
             Some(pick.candidate.id),
         )
         .await;
-        reserved.keep();
         repick_counted(repick::Outcome::Picked);
         tracing::warn!(
             media.id = item.id,
@@ -1379,6 +1380,33 @@ mod tests {
         assert_eq!(picked, Some(sung()));
         assert_eq!(searches(&online), 2);
         assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A request dropped while the search's answer is being written leaves
+    /// the song held: the write goes on, and a second search would race it.
+    #[tokio::test]
+    async fn a_repick_dropped_while_writing_its_answer_stays_held() {
+        use std::task::{Context, Waker};
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let before = finder.find(&item).await.unwrap();
+        let heard = heard();
+        let mut repick = Box::pin(finder.repick(&item, &before, &heard));
+        let mut cx = Context::from_waker(Waker::noop());
+        // The search answers at once, so the first wait after it is the
+        // write's.
+        while searches(&online) == 0 {
+            if repick.as_mut().poll(&mut cx).is_ready() {
+                panic!("answered before its write was awaited");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(repick);
+        let song = Song::of(&item).unwrap();
+        let key = (item.id, cache::key(online.name(), &song));
+        assert!(finder.repicked.lock().unwrap().contains(&key));
     }
 
     /// A `Searching` whose first lookup notifies `asked` and answers only
