@@ -490,6 +490,27 @@ pub fn url_path(url: &str) -> &str {
     from_path.split(['?', '#']).next().unwrap_or("")
 }
 
+/// Whether a download of `original` may follow a redirect to `next`
+/// without moving what its relative references resolve against. A
+/// playlist's references are planned and replayed against the key it was
+/// asked for, so one redirected into another folder would name files that
+/// are not there: it stops, Err naming both folders for the log. Any other
+/// file, and a playlist redirected within its folder, may follow (the
+/// same-origin rule is [`super::tv_page::redirect_verdict`]'s).
+pub fn playlist_base_verdict(original: &str, next: &str) -> Result<(), String> {
+    let from = url_path(original);
+    if !from.ends_with(".m3u8") {
+        return Ok(());
+    }
+    let folder = |path: &str| path.rsplit_once('/').map_or("/", |(dir, _)| dir).to_owned() + "/";
+    let (from_dir, to_dir) = (folder(from), folder(url_path(next)));
+    if from_dir == to_dir {
+        Ok(())
+    } else {
+        Err(format!("playlist folder moved from={from_dir} to={to_dir}"))
+    }
+}
+
 /// Whether a failed `cache.put` is the body transfer breaking (the browser
 /// rejects with a `TypeError`) rather than the store refusing it (quota and
 /// the like, which a retry cannot mend).
@@ -663,6 +684,28 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_playlist_redirected_into_another_folder_is_not_followed() {
+        let from = "http://s:8096/videos/1/main.m3u8?play=a";
+        assert_eq!(
+            playlist_base_verdict(from, "http://s:8096/elsewhere/main.m3u8?play=a"),
+            Err("playlist folder moved from=/videos/1/ to=/elsewhere/".to_owned())
+        );
+        // Within its folder, or with another query: references resolve the same.
+        assert_eq!(
+            playlist_base_verdict(from, "http://s:8096/videos/1/other.m3u8?play=b"),
+            Ok(())
+        );
+        // A segment's bytes do not depend on where they came from.
+        assert_eq!(
+            playlist_base_verdict(
+                "http://s:8096/videos/1/seg0.ts",
+                "http://s:8096/cdn/seg0.ts"
+            ),
+            Ok(())
+        );
+    }
 
     #[test]
     fn a_download_sends_the_token_only_for_the_user_it_belongs_to() {

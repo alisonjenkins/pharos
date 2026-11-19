@@ -30,7 +30,8 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::kept_video::{
-    loudness, request_class, request_key, request_line, url_path, Loudness, StoredFile, Verdict,
+    loudness, playlist_base_verdict, request_class, request_key, request_line, url_path, Loudness,
+    StoredFile, Verdict,
 };
 use super::kept_video_disk::{
     iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
@@ -3350,7 +3351,8 @@ fn token_for_run(owner: &str) -> Result<String, String> {
 /// The client the downloads use. Its redirect policy follows a redirect
 /// only to the same scheme, host and port as the request (the download
 /// sends the device token): a cross-host redirect or an https-to-http
-/// downgrade stops and is logged. Not `https_only`: a plain-http server on
+/// downgrade stops and is logged. A playlist is followed only within its
+/// folder ([`playlist_base_verdict`]). Not `https_only`: a plain-http server on
 /// the LAN must keep working. [`http`] is the proxy's and is unchanged.
 fn download_http() -> &'static Result<reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
@@ -3365,7 +3367,12 @@ fn download_http() -> &'static Result<reqwest::Client, String> {
             if attempt.previous().len() >= 10 {
                 return attempt.error("too many redirects");
             }
-            match tv_page::redirect_verdict(&first, attempt.url().as_str()) {
+            // Same origin, and a playlist stays in its folder: its relative
+            // references are planned against the key it was asked for.
+            let next = attempt.url().as_str();
+            match tv_page::redirect_verdict(&first, next)
+                .and_then(|()| playlist_base_verdict(&first, next))
+            {
                 Ok(()) => attempt.follow(),
                 Err(reason) => {
                     log::warn!(
