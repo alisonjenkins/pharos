@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::repick::Candidate;
 use super::{lrc, Lyrics, OnlineError, OnlineLyrics, Origin, Song};
 
 const BASE: &str = "https://lrclib.net/api";
@@ -77,6 +78,32 @@ impl LrcLib {
         let record: Record = reply.json().await.map_err(|e| fail(format!("body: {e}")))?;
         Ok(record.lyrics())
     }
+
+    async fn search(&self, song: &Song) -> Result<Vec<Candidate>, OnlineError> {
+        let fail = |detail: String| OnlineError {
+            provider: NAME,
+            detail,
+        };
+        let reply = self
+            .http
+            .get(format!("{}/search", self.base))
+            .query(&[
+                ("track_name", song.title.as_str()),
+                ("artist_name", song.artist.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| fail(format!("search request: {e}")))?;
+        let status = reply.status();
+        if !status.is_success() {
+            return Err(fail(format!("search status {status}")));
+        }
+        let found: Vec<Found> = reply
+            .json()
+            .await
+            .map_err(|e| fail(format!("search body: {e}")))?;
+        Ok(found.into_iter().filter_map(Found::candidate).collect())
+    }
 }
 
 impl Default for LrcLib {
@@ -103,6 +130,34 @@ impl Record {
     }
 }
 
+/// One `/search` result: a record with its id and length in seconds.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Found {
+    id: u64,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    synced_lyrics: Option<String>,
+}
+
+impl Found {
+    /// A record that can be aligned: synced lines and a length to match.
+    fn candidate(self) -> Option<Candidate> {
+        let duration_ms = self
+            .duration
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (d * 1000.0).round() as u64)?;
+        let lyrics = Lyrics::from_lines(lrc::parse(self.synced_lyrics.as_deref()?), Origin::Online)
+            .filter(Lyrics::synced)?;
+        Some(Candidate {
+            id: self.id,
+            duration_ms,
+            lyrics,
+        })
+    }
+}
+
 impl OnlineLyrics for LrcLib {
     fn name(&self) -> &'static str {
         NAME
@@ -113,6 +168,13 @@ impl OnlineLyrics for LrcLib {
         song: &'a Song,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>> {
         Box::pin(self.get(song))
+    }
+
+    fn search<'a>(
+        &'a self,
+        song: &'a Song,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Candidate>, OnlineError>> + Send + 'a>> {
+        Box::pin(LrcLib::search(self, song))
     }
 }
 
@@ -140,5 +202,23 @@ mod tests {
             serde_json::from_str(r#"{"syncedLyrics":null,"plainLyrics":null,"instrumental":true}"#)
                 .unwrap();
         assert_eq!(none.lyrics(), None);
+    }
+
+    #[test]
+    fn a_search_keeps_records_with_synced_lines_and_a_length() {
+        let found: Vec<Found> = serde_json::from_str(
+            r#"[
+                {"id": 11, "duration": 201.4, "syncedLyrics": "[00:01.00]grey gulls wheel", "plainLyrics": "grey gulls wheel"},
+                {"id": 12, "duration": 201.0, "syncedLyrics": null, "plainLyrics": "plain only"},
+                {"id": 13, "duration": null, "syncedLyrics": "[00:01.00]no length"},
+                {"id": 14, "duration": 199.0, "syncedLyrics": "", "instrumental": true}
+            ]"#,
+        )
+        .unwrap();
+        let got: Vec<Candidate> = found.into_iter().filter_map(Found::candidate).collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 11);
+        assert_eq!(got[0].duration_ms, 201_400);
+        assert!(got[0].lyrics.synced());
     }
 }
