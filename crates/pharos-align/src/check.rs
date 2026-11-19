@@ -61,8 +61,14 @@ impl TextCheck {
     /// (V1468): few lines anchored, little of the text heard, and enough
     /// heard for that to mean something.
     pub fn mismatch(&self, anchor_share: f64) -> bool {
-        anchor_share < MIN_ANCHOR_SHARE
-            && self.heard_words >= MIN_MISMATCH_HEARD_WORDS
+        anchor_share < MIN_ANCHOR_SHARE && self.text_mismatch()
+    }
+
+    /// Whether the text alone says another lyric was sung: little of it
+    /// heard, and enough heard for that to mean something. A song whose
+    /// later stages failed has no anchor share, and is judged by this.
+    pub fn text_mismatch(&self) -> bool {
+        self.heard_words >= MIN_MISMATCH_HEARD_WORDS
             && self.text_recall.is_some_and(|r| r < MAX_MISMATCH_RECALL)
     }
 

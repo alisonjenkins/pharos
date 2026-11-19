@@ -786,17 +786,35 @@ fn improve(
 ) -> Aligned {
     let mut times = StageTimes::default();
     // `clipped` is the recogniser's count once it has finished, so a later
-    // stage's failure still says what the recogniser did.
+    // stage's failure still says what the recogniser did. Once it has
+    // finished, its text check stands without the later stages: a lyric not
+    // sung is a mismatch whichever of them failed.
     let fail = |today: Today, times: StageTimes, clipped: usize, e: StageError| {
+        let mismatch = today.check.as_ref().filter(|c| c.text_mismatch());
+        let (fallback, reason) = match mismatch {
+            Some(check) => (
+                Fallback::LyricsMismatch,
+                format!(
+                    "{}: text recall {:.3}, heard {} words; {}: {}",
+                    Fallback::LyricsMismatch.label(),
+                    check.text_recall.unwrap_or(0.0),
+                    check.heard_words,
+                    e.fallback.label(),
+                    e.reason
+                ),
+            ),
+            None => (e.fallback, e.reason),
+        };
         tracing::warn!(
             path = %rel_path,
-            fallback = e.fallback.label(),
-            reason = %e.reason,
+            fallback = fallback.label(),
+            stage_fallback = e.fallback.label(),
+            reason = %reason,
             "recogniser stages fell back to today's answer"
         );
-        let mut placement = Placement::kept(today.with_words, e.fallback);
+        let mut placement = Placement::kept(today.with_words, fallback);
         placement.first_words_clipped = clipped;
-        today.into_aligned(placement, e.reason, times, 0)
+        today.into_aligned(placement, reason, times, 0)
     };
     let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
     let deadline = budget.deadline();

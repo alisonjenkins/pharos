@@ -511,6 +511,40 @@ fn a_song_sung_to_other_words_is_a_lyrics_mismatch() {
     assert_eq!(answer["check"]["fallback"], "emission_failed");
 }
 
+/// B1479/V1468: a song heard at length to other words is a lyrics mismatch
+/// even when the letter model then fails, so the server still drops the
+/// lyric's line times.
+#[test]
+fn a_song_sung_to_other_words_is_a_mismatch_though_its_emission_failed() {
+    let other: Vec<Word> = (0..120)
+        .map(|k| Word {
+            text: format!(" lantern{}", k % 40),
+            start_s: 0.08 * k as f64,
+            end_s: 0.08 * k as f64 + 0.05,
+            prob: 0.9,
+            silent_lead: false,
+        })
+        .collect();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: transcript(other),
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(&Engine::new(loader(None), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::LyricsMismatch));
+    assert!(
+        got.fallback_reason
+            .starts_with("lyrics_mismatch: text recall 0.000, heard 120 words; emission_failed: "),
+        "{}",
+        got.fallback_reason
+    );
+    assert!(kept(&got));
+    let answer = serde_json::to_value(&got.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "lyrics_mismatch");
+    assert_eq!(answer["check"]["heard_words"], 120);
+}
+
 #[test]
 fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let (sung, _) = song();
