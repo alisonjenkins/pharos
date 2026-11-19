@@ -140,21 +140,42 @@ pub fn use_test_video_slot(slot: Option<&'static Slot<dyn super::kept_video::Vid
 /// A claim that succeeds once. Opening the video store twice on one root
 /// is not harmless: the second open's recovery deletes the first's staging
 /// files. The phone has two callers (the media service's init hook and the
-/// first render), so each claims before it touches the folder; a failed
-/// first attempt is not retried by the second, which would open the store
-/// over whatever the first left.
+/// first render), so each claims before it touches the folder; a first
+/// attempt that reached the store is not retried by the second, which would
+/// open the store over whatever the first left. One that failed before it
+/// (the folder could not be made) gives the claim back, so a later caller
+/// tries again (see [`register_video_root`]).
 #[cfg(any(feature = "mobile", test))]
-pub struct OpenOnce(std::sync::atomic::AtomicBool);
+pub struct OpenOnce {
+    claimed: std::sync::atomic::AtomicBool,
+    /// The music hook is in; it goes in once, whoever claims.
+    hooked: std::sync::atomic::AtomicBool,
+}
 
 #[cfg(any(feature = "mobile", test))]
 impl OpenOnce {
     pub const fn new() -> Self {
-        Self(std::sync::atomic::AtomicBool::new(false))
+        Self {
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            hooked: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    /// True for the first caller only.
+    /// True for the first caller only, until the claim is given back.
     pub fn claim(&self) -> bool {
-        !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+        !self.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Gives the claim back: only for an attempt that never reached the
+    /// store, so no store can be opening or open on the root.
+    fn release(&self) {
+        self.claimed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True the first time only: whether to install the music hook.
+    fn first_hook(&self) -> bool {
+        !self.hooked.swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -245,7 +266,8 @@ pub enum Registration {
     /// Another caller had claimed the root; nothing was touched.
     AlreadyOpened,
     /// The folder could not be created: no store, and the music cache has
-    /// been told the video size is unknown.
+    /// been told the video size is unknown. The claim was given back, so a
+    /// later caller tries again.
     NoFolder(String),
     /// The store was opened and registered.
     Registered,
@@ -256,12 +278,14 @@ pub enum Registration {
 /// The phone's registration of its video store, as the Android crate runs
 /// it (the init hook and the first render both come here). `once` is
 /// claimed first, before the folder is touched: a second store on the same
-/// root would run recovery over the first's staging files, and a first
-/// attempt that failed is not retried over what it left. `install_hook`
-/// goes in before the folder is created and reports the size unknown while
-/// no store is registered, so a folder that cannot be created leaves the
-/// music refused, not counted as free of video. `register` opens and
-/// registers the store.
+/// root would run recovery over the first's staging files, so an attempt
+/// that reached `register` (the store may be opening or open) is never
+/// retried. One whose folder could not be created opened nothing and gives
+/// the claim back: a later caller tries the folder again. `install_hook`
+/// goes in once, before the folder is created, and reports the size unknown
+/// while no store is registered, so a folder that cannot be created leaves
+/// the music refused (fail closed), not counted as free of video.
+/// `register` opens and registers the store.
 #[cfg(any(feature = "mobile", test))]
 pub fn register_video_root(
     root: &std::path::Path,
@@ -272,8 +296,12 @@ pub fn register_video_root(
     if !once.claim() {
         return Registration::AlreadyOpened;
     }
-    install_hook();
+    if once.first_hook() {
+        install_hook();
+    }
     if let Err(e) = std::fs::create_dir_all(root) {
+        // Nothing was opened on the root: the next caller may try again.
+        once.release();
         return Registration::NoFolder(e.to_string());
     }
     match register() {
@@ -608,15 +636,16 @@ mod tests {
         assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// The registration run twice on one claim, as the init hook and the
-    /// first render do: the first (here, with no folder) installs the hook
-    /// once and opens nothing; the second does nothing at all.
+    /// A registration whose folder could not be created opened nothing, so
+    /// a later caller tries again (the hook goes in once); once one reaches
+    /// the store, every later call does nothing at all.
     #[test]
-    fn a_second_registration_on_one_claim_changes_nothing() {
+    fn a_registration_with_no_folder_is_retried_and_one_that_opened_is_not() {
         use std::cell::Cell;
         let root =
             std::env::temp_dir().join(format!("pharos-register-twice-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&root);
         assert!(std::fs::write(&root, b"a file where the folder should be").is_ok());
         let once = OpenOnce::new();
         let (hooks, registers) = (Cell::new(0), Cell::new(0));
@@ -637,13 +666,38 @@ mod tests {
             (1, 0),
             "hook once, no store"
         );
+        assert!(
+            matches!(run(), Registration::NoFolder(_)),
+            "a failed folder was not tried again"
+        );
+        assert_eq!((hooks.get(), registers.get()), (1, 0), "a second hook");
+        let _ = std::fs::remove_file(&root);
+        assert_eq!(run(), Registration::Registered, "the retry did not open");
+        assert_eq!((hooks.get(), registers.get()), (1, 1));
         assert_eq!(run(), Registration::AlreadyOpened);
         assert_eq!(
             (hooks.get(), registers.get()),
-            (1, 0),
-            "the second call touched the hook or the store"
+            (1, 1),
+            "a call after the store opened touched the hook or the store"
         );
-        let _ = std::fs::remove_file(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store that opened but was not registered keeps the claim: it may
+    /// still be open on the root.
+    #[test]
+    fn a_registration_that_reached_the_store_keeps_its_claim_on_failure() {
+        let root =
+            std::env::temp_dir().join(format!("pharos-register-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let once = OpenOnce::new();
+        let outcome = register_video_root(&root, &once, || {}, || Err("taken".to_owned()));
+        assert_eq!(outcome, Registration::NotRegistered("taken".to_owned()));
+        assert_eq!(
+            register_video_root(&root, &once, || {}, || Ok(())),
+            Registration::AlreadyOpened
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// On success the hook goes in before the folder is created, and the

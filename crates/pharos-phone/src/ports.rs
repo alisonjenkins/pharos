@@ -339,7 +339,7 @@ fn register_video_at(root: std::path::PathBuf) {
             root.display()
         ),
         Registration::NoFolder(e) => log::warn!(
-            "pharos: port video_store verdict=not_registered reason=no_folder dir={} error={e}",
+            "pharos: port video_store verdict=not_registered reason=no_folder retry=next_caller dir={} error={e}",
             root.display()
         ),
         Registration::Registered => log::info!(
