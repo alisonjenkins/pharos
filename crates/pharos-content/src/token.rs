@@ -69,9 +69,19 @@ fn encode(token: &str, user: Option<&str>) -> String {
 /// in this process or after a restart. A replacement is a rename, so a read
 /// sees one whole file.
 pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
+    // The token and the marker are read under the file's lock, as the
+    // writers change them: never one from before a change and the other
+    // from after it.
+    let _held = hold();
     let Some(stored) = read_raw(path)? else {
         return Ok(None);
     };
+    #[cfg(test)]
+    tests::AFTER_RAW_READ.with(|h| {
+        if let Some(f) = h.borrow_mut().take() {
+            f();
+        }
+    });
     match marker(path) {
         Marker::Present(r) if r.token == fingerprint(&stored.token) => {
             log::debug!("token read verdict=refused reason=revoked_marker");
@@ -562,6 +572,8 @@ pub(crate) mod tests {
         pub(super) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The next directory syncs fail with these, one each.
         pub(crate) static DIR_SYNC_ERRORS: RefCell<Vec<std::io::ErrorKind>> = const { RefCell::new(Vec::new()) };
+        /// Runs inside `read`, between the token's read and the marker's.
+        pub(super) static AFTER_RAW_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         /// Runs inside `store_user`, between its read and its write.
         static BETWEEN: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
     }
@@ -836,6 +848,35 @@ pub(crate) mod tests {
         store(&p, "tokC").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
         assert!(revoked(&p).is_none(), "the sign-in left the marker");
+    }
+
+    /// A read sees the token and its marker as one: a sign-in that replaces
+    /// a revoked token (and clears its marker) between the two reads waits
+    /// for the read, which refuses the revoked token rather than pairing it
+    /// with the cleared marker.
+    #[test]
+    fn a_read_never_pairs_an_old_token_with_a_new_marker_state() {
+        let d = dir("read-locked");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        assert!(matches!(end_session(&p, None, Some("A")), Ended::Marked(_)));
+        faults::REMOVE.with(|f| f.set(false));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let p2 = p.clone();
+        let reader = std::thread::spawn(move || {
+            AFTER_RAW_READ.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let _ = tx.send(());
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }));
+            });
+            load(&p2).unwrap()
+        });
+        rx.recv().unwrap();
+        store(&p, "tokB").unwrap();
+        assert_eq!(reader.join().unwrap(), None, "the revoked token was read");
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
     }
 
     /// (a) A marker that is there but cannot be read, or holds no
