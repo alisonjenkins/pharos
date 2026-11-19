@@ -51,13 +51,7 @@ impl LrcLib {
             provider: NAME,
             detail,
         };
-        let mut query: Vec<(&str, String)> = vec![
-            ("track_name", song.title.clone()),
-            ("artist_name", song.artist.clone()),
-        ];
-        if let Some(album) = &song.album {
-            query.push(("album_name", album.clone()));
-        }
+        let mut query = song_query(song);
         if let Some(ms) = song.duration_ms {
             query.push(("duration", (ms / 1000).to_string()));
         }
@@ -87,10 +81,7 @@ impl LrcLib {
         let reply = self
             .http
             .get(format!("{}/search", self.base))
-            .query(&[
-                ("track_name", song.title.as_str()),
-                ("artist_name", song.artist.as_str()),
-            ])
+            .query(&song_query(song))
             .send()
             .await
             .map_err(|e| fail(format!("search request: {e}")))?;
@@ -104,6 +95,19 @@ impl LrcLib {
             .map_err(|e| fail(format!("search body: {e}")))?;
         Ok(found.into_iter().filter_map(Found::candidate).collect())
     }
+}
+
+/// The song's title, artist and, when tagged, album, as LRCLIB's `get` and
+/// `search` both take them.
+fn song_query(song: &Song) -> Vec<(&'static str, String)> {
+    let mut query = vec![
+        ("track_name", song.title.clone()),
+        ("artist_name", song.artist.clone()),
+    ];
+    if let Some(album) = &song.album {
+        query.push(("album_name", album.clone()));
+    }
+    query
 }
 
 impl Default for LrcLib {
@@ -220,5 +224,51 @@ mod tests {
         assert_eq!(got[0].id, 11);
         assert_eq!(got[0].duration_ms, 201_400);
         assert!(got[0].lyrics.synced());
+    }
+
+    /// Answers one request with an empty search result and hands back its
+    /// request line.
+    async fn one_search() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            let head = String::from_utf8_lossy(&got);
+            let _ = tx.send(head.lines().next().unwrap_or_default().to_owned());
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                )
+                .await;
+        });
+        (base, rx)
+    }
+
+    #[tokio::test]
+    async fn a_search_names_the_album_when_the_song_has_one() {
+        let mut song = Song {
+            title: "Song".into(),
+            artist: "Band".into(),
+            album: Some("Record".into()),
+            duration_ms: Some(200_000),
+        };
+        let (base, asked) = one_search().await;
+        LrcLib::with_base(&base).search(&song).await.unwrap();
+        let line = asked.await.unwrap();
+        assert!(line.contains("album_name=Record"), "{line}");
+
+        song.album = None;
+        let (base, asked) = one_search().await;
+        LrcLib::with_base(&base).search(&song).await.unwrap();
+        let line = asked.await.unwrap();
+        assert!(!line.contains("album_name"), "{line}");
     }
 }
