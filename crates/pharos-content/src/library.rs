@@ -2318,12 +2318,18 @@ mod tests {
         let lib = &rig.lib;
         lib.prefetch(&["track/1".to_owned()]);
         wait_until("the server holding", || reached.load(Ordering::SeqCst));
-        // The refresh has lowered the reservation to what is left.
+        // The refresh has moved the reservation's baseline past the bytes
+        // written before it (the outstanding figure alone would also fall
+        // as bytes land against the first reservation).
         let total = u64::try_from(size).unwrap();
+        let cache = &lib.offline.get().unwrap().cache;
         wait_until("the reservation refreshed", || {
-            let r = lib.music_outstanding_bytes();
-            r > 0 && r <= total - FREE_CHECK_BYTES
+            cache
+                .reservation("track/1")
+                .is_some_and(|(_, at_len)| at_len >= FREE_CHECK_BYTES)
         });
+        let r = lib.music_outstanding_bytes();
+        assert!(r > 0 && r <= total - FREE_CHECK_BYTES, "outstanding {r}");
         let written = lib.music_in_progress_bytes().unwrap();
         assert!(
             written >= FREE_CHECK_BYTES,
