@@ -8637,6 +8637,48 @@ mod tests {
         until_within(|| only(&store).state == KeptState::Ready).await;
     }
 
+    /// The same for a refusal at promotion: a segment fetched whole under
+    /// its owner's token, then refused by `check_owner` because another
+    /// user's token went on file meanwhile, parks; a sign-in after that
+    /// refusal and before the run exits is kept, and the download resumes.
+    #[tokio::test]
+    async fn a_sign_in_after_a_promotion_refusal_resumes_the_download() {
+        let rig = Rig::new("sign-in-at-promotion-refusal");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.sign_in("u2");
+        let (s1, server, once) = (
+            store.clone(),
+            rig.server.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                server.sign_in("u1");
+                s1.resume_user("u1");
+            }
+        });
+        mid.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        let refused = lines("pharos: video keep promote verdict=refused item=1");
+        assert!(
+            !refused.is_empty(),
+            "the refusal did not come from promotion: {:?}",
+            lines("pharos: video keep fetch verdict=refused item=1")
+        );
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let pending = lines("pharos: video keep resume item=1");
+        assert!(
+            pending.iter().any(|l| l.contains("verdict=pending")),
+            "{pending:?}"
+        );
+    }
+
     /// A download removed and started again between a sign-in's pick and
     /// its start keeps its new run: the resume's claim was revoked by the
     /// removal, so the stale resume never overwrites the replacement's id.
