@@ -311,7 +311,8 @@ pub trait VideoStore: Send + Sync {
 pub struct StoredFile {
     pub path: std::path::PathBuf,
     pub len: u64,
-    /// The `Content-Type` the server sent for it.
+    /// The `Content-Type` to answer with: derived from the key's extension
+    /// by [`content_type_for`], never stored from the server's header.
     pub content_type: &'static str,
 }
 
