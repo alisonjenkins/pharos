@@ -1100,6 +1100,7 @@ mod tests {
                     lines: vec![Vec::new(); lines.len()],
                     offset_ms: self.offset_ms,
                     scores: vec![Some(s); lines.len()],
+                    mismatch: None,
                 });
             };
             // How far each sent line is from where its cue is really spoken.
@@ -1132,6 +1133,7 @@ mod tests {
                 lines: vec![Vec::new(); lines.len()],
                 offset_ms: if rest.abs() < 400 { 0 } else { rest },
                 scores,
+                mismatch: None,
             })
         }
     }

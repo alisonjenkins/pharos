@@ -115,7 +115,32 @@ pub struct Aligned {
     /// Per line, how well its words matched the singing in thousandths of
     /// the mean character probability (aligner 4); empty from an older one.
     pub scores: Vec<Option<u16>>,
+    /// Set when the aligner found the song sung to other words than these
+    /// lyrics (B1479): its words are then not the song's and are never shown.
+    pub mismatch: Option<Heard>,
 }
+
+/// What the aligner heard of a song whose lyrics did not match it (B1479),
+/// kept so another lyric can be scored against the same transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Heard {
+    /// The lyric's text recall in thousandths; `None` when not judged.
+    pub text_recall: Option<u16>,
+    pub heard_words: usize,
+    /// The transcript's text.
+    pub text: String,
+}
+
+impl Heard {
+    /// The text recall as the share from 0 to 1, for a log line.
+    pub fn recall(&self) -> Option<f64> {
+        self.text_recall.map(|r| f64::from(r) / 1000.0)
+    }
+}
+
+/// The aligner's `check.fallback` for a lyric that was not what was sung;
+/// pharos-align's `Fallback::LyricsMismatch` label.
+pub const LYRICS_MISMATCH: &str = "lyrics_mismatch";
 
 impl Aligned {
     /// Move a line start by the song's offset, keeping it at or after zero.
@@ -138,6 +163,9 @@ pub enum Lookup {
     Partial(Option<u32>, Aligned),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
+    /// The song was aligned and found sung to other words (B1479, V1468):
+    /// there are no word times to show for these lyrics.
+    Mismatch(Heard),
 }
 
 impl Lookup {
@@ -149,6 +177,7 @@ impl Lookup {
             Self::Pending(_) => "pending",
             Self::Partial(..) => "partial",
             Self::Unavailable => "unavailable",
+            Self::Mismatch(_) => "mismatch",
         }
     }
 }
@@ -175,6 +204,8 @@ struct WordsRecord {
     offset_ms: i64,
     #[serde(default)]
     scores: Vec<Option<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mismatch: Option<Heard>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -233,6 +264,7 @@ impl AlignCache {
                         .collect(),
                     offset_ms: record.offset_ms,
                     scores: record.scores,
+                    mismatch: record.mismatch,
                 })
             }
             CacheBackend::Memory(mem) => {
@@ -258,6 +290,7 @@ impl AlignCache {
                     key,
                     offset_ms: aligned.offset_ms,
                     scores: aligned.scores.clone(),
+                    mismatch: aligned.mismatch.clone(),
                     lines: aligned
                         .lines
                         .iter()
@@ -558,6 +591,7 @@ impl Aligner {
                 .collect(),
             offset_ms: p.offset_ms,
             scores: Vec::new(),
+            mismatch: None,
         })
     }
 
@@ -602,6 +636,7 @@ impl Aligner {
             )
             .await?;
         let offset_ms = answered.aligned.offset_ms;
+        let lyrics_mismatch = answered.aligned.mismatch.is_some();
         self.store(job.id, job.key.clone(), answered, Source::Song);
         // Measured once the answer is stored, the point the client can see
         // it and the estimator's own finish.
@@ -616,6 +651,7 @@ impl Aligner {
             eta.actual_ms = actual_ms,
             lines_streamed,
             first_line_ms,
+            lyrics_mismatch,
             "lyrics: aligned"
         );
         Ok(())
@@ -876,6 +912,9 @@ impl Aligner {
         let key = cache_key(&[], &rel_path, &item.path, &job_lines);
 
         if let Some(aligned) = self.cache.get(item.id, &key) {
+            if let Some(heard) = aligned.mismatch {
+                return Lookup::Mismatch(heard);
+            }
             if aligned.lines.len() == job_lines.len() {
                 return Lookup::Ready(aligned);
             }
@@ -989,6 +1028,18 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
         offset_ms: i64,
         /// Required for the same reason, from an aligner older than B1165.
         aligner_version: u32,
+        /// Sent only when the song fell back (B1479).
+        #[serde(default)]
+        check: Option<ReplyCheck>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReplyCheck {
+        fallback: String,
+        #[serde(default)]
+        text_recall: Option<f64>,
+        heard_words: usize,
+        heard: String,
     }
 
     #[derive(Deserialize)]
@@ -1031,6 +1082,17 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
             .map(|l| l.words.into_iter().map(WordStamp::from).collect())
             .collect(),
         offset_ms: reply.offset_ms,
+        mismatch: reply
+            .check
+            .filter(|c| c.fallback == LYRICS_MISMATCH)
+            .map(|c| Heard {
+                text_recall: c
+                    .text_recall
+                    .filter(|r| r.is_finite())
+                    .map(|r| (r.clamp(0.0, 1.0) * 1000.0).round() as u16),
+                heard_words: c.heard_words,
+                text: c.heard,
+            }),
     })
 }
 
@@ -1081,11 +1143,13 @@ mod tests {
             lines: vec![vec![stamp(0, 1000), stamp(3, 1400)]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let differing = Aligned {
             lines: vec![vec![stamp(0, 1000), stamp(3, 1600)]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (primary_base, primary_got) = fake(200, body(&primary, 2), None).await;
         let (release, hold) = oneshot::channel();
@@ -1209,6 +1273,7 @@ mod tests {
             lines: vec![vec![stamp(0, 1200), stamp(4, 1900)]],
             offset_ms: 0,
             scores: vec![Some(610)],
+            mismatch: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let media_root = dir.path().join("media");
@@ -1412,6 +1477,7 @@ mod tests {
             lines: stamps,
             offset_ms: 0,
             scores: Vec::new(),
+            mismatch: None,
         };
         aligner.cache.put(item.id, job.key.clone(), aligned.clone());
 
@@ -1583,6 +1649,7 @@ mod tests {
             }]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (base, _got) = fake(200, body(&answer, 2), None).await;
         let (tx, _rx) = mpsc::channel(1);
@@ -1629,6 +1696,7 @@ mod tests {
             }]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (base, _got) = fake(200, body(&answer, 2), None).await;
         let (tx, _rx) = mpsc::channel(1);
@@ -1786,6 +1854,7 @@ mod tests {
             lines: stamps,
             offset_ms: -3_700,
             scores: vec![Some(712), None],
+            mismatch: None,
         };
         assert_eq!(cache.get(10, "key_a"), None);
         cache.put(10, "key_a".into(), aligned.clone());
@@ -2040,6 +2109,7 @@ mod tests {
             lines: Vec::new(),
             offset_ms: -2_500,
             scores: Vec::new(),
+            mismatch: None,
         };
         assert_eq!(early.shift(10_000), 7_500);
         assert_eq!(early.shift(1_000), 0);
@@ -2435,13 +2505,99 @@ mod tests {
             lines: Vec::new(),
             offset_ms: 0,
             scores: Vec::new(),
+            mismatch: None,
         };
         let labels = [
             Lookup::Ready(aligned.clone()).label(),
             Lookup::Pending(None).label(),
             Lookup::Partial(None, aligned).label(),
             Lookup::Unavailable.label(),
+            Lookup::Mismatch(Heard::default()).label(),
         ];
-        assert_eq!(labels, ["ready", "pending", "partial", "unavailable"]);
+        assert_eq!(
+            labels,
+            ["ready", "pending", "partial", "unavailable", "mismatch"]
+        );
+    }
+
+    fn answer_with_check(fallback: &str) -> String {
+        format!(
+            r#"{{"offset_ms": 0, "aligner_version": 5, "lines": [{{"words": []}}],
+            "check": {{"fallback": "{fallback}", "text_recall": 0.0812,
+            "heard_words": 120, "heard": " the lanterns swing"}}}}"#
+        )
+    }
+
+    /// B1479: the server reads pharos-align's `Fallback::LyricsMismatch`
+    /// label by its string; renaming it there must fail here.
+    #[test]
+    fn a_lyrics_mismatch_answer_is_read_with_what_was_heard() {
+        assert_eq!(LYRICS_MISMATCH, "lyrics_mismatch");
+        let got = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        assert_eq!(
+            got.mismatch,
+            Some(Heard {
+                text_recall: Some(81),
+                heard_words: 120,
+                text: " the lanterns swing".into(),
+            })
+        );
+        assert_eq!(got.mismatch.unwrap().recall(), Some(0.081));
+    }
+
+    #[test]
+    fn another_fallback_or_no_check_is_no_mismatch() {
+        let other = parse_answer(&answer_with_check("low_anchor_share"), 1).unwrap();
+        assert_eq!(other.mismatch, None);
+        let plain = r#"{"offset_ms": 0, "aligner_version": 5, "lines": [{"words": []}]}"#;
+        assert_eq!(parse_answer(plain, 1).unwrap().mismatch, None);
+    }
+
+    #[test]
+    fn a_mismatch_outlives_the_process_in_the_words_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AlignCache::new(Some(dir.path().to_path_buf()));
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        cache.put(4, "k".into(), aligned.clone());
+        assert_eq!(cache.get(4, "k"), Some(aligned));
+        std::fs::write(
+            dir.path().join("5.words.json"),
+            r#"{"key":"k","lines":[[]]}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.get(5, "k").map(|a| a.mismatch), Some(None));
+    }
+
+    /// V1468: words aligned to lyrics that were not what was sung are never
+    /// served as the song's word times, and the song is not queued again.
+    #[test]
+    fn a_cached_mismatch_is_never_ready_and_never_queued_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let lyrics = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1000),
+                text: "grey gulls wheel".into(),
+                words: Vec::new(),
+            }],
+            Origin::Online,
+        )
+        .unwrap();
+
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
+        assert!(rx.try_recv().is_err());
     }
 }

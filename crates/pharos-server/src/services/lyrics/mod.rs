@@ -484,7 +484,8 @@ pub async fn for_item(
                 align::Lookup::Pending(eta_ms) => {
                     words_pending = Some(WordsPending { eta_ms });
                 }
-                align::Lookup::Unavailable => {}
+                // No words for lyrics that were not what was sung (B1479).
+                align::Lookup::Unavailable | align::Lookup::Mismatch(_) => {}
             }
         } else {
             // No aligner configured: the ask still goes unanswered, so it
