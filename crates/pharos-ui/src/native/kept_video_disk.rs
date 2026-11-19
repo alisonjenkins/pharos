@@ -11319,9 +11319,7 @@ pub(crate) mod tests {
                 FAIL_ENTRY_READ.with(|f| f.set(true));
                 s2.inner.settle_leftovers(Sweep::HostCheck);
                 FAIL_ENTRY_READ.with(|f| f.set(false));
-                k2.set(Some(
-                    lock(&s2.inner.state).leftover.contains(&d2),
-                ));
+                k2.set(Some(lock(&s2.inner.state).leftover.contains(&d2)));
             }
         });
         let _ = plan_decided(&store, "1").await;
