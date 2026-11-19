@@ -3,7 +3,7 @@
 //! against what the aligner heard by the measure the aligner judged the
 //! first one with.
 
-use pharos_core::lyrics_text::bigram_recall;
+use pharos_core::lyrics_text::{bigram_recall, words};
 
 use super::Lyrics;
 
@@ -17,6 +17,11 @@ pub const MAX_CANDIDATES: usize = 5;
 /// measured 0.917 against a transcript the wrong one scored 0.107 on, and a
 /// record that is only partly right is worse than none.
 pub const MIN_RECALL: f64 = 0.6;
+/// The fewest word pairs a record needs, as a share of the words heard: a
+/// few lines of the song are all heard and score full recall, while the
+/// whole lyric loses a little to each word the recogniser got wrong. A
+/// record that leaves out a repeated chorus still holds over half the song.
+pub const MIN_PAIRS_OF_HEARD: f64 = 0.5;
 
 /// Searches for another lyric by how they ended, as
 /// [`Outcome::label`] names it.
@@ -66,8 +71,10 @@ pub struct Pick {
 /// The best of `candidates` for a song `duration_ms` long, judged against
 /// `heard`: within [`DURATION_WINDOW_MS`], not the text of the lyric that
 /// failed (`current`), the [`MAX_CANDIDATES`] closest in length, and only
-/// one whose recall reaches [`MIN_RECALL`]. The higher recall wins, and
-/// on a tie the record closer in length.
+/// one with word pairs for [`MIN_PAIRS_OF_HEARD`] of the words heard and
+/// recall reaching [`MIN_RECALL`]. The higher recall wins, and on a tie the
+/// record closer in length. A record is scored as one text, pairs running
+/// across its line breaks, so every word it holds is in the measure.
 pub fn choose(
     candidates: Vec<Candidate>,
     current: &Lyrics,
@@ -81,12 +88,21 @@ pub fn choose(
         .collect();
     near.sort_by_key(|c| c.duration_ms.abs_diff(duration_ms));
     near.truncate(MAX_CANDIDATES);
+    let fewest_pairs = words(heard).len() as f64 * MIN_PAIRS_OF_HEARD;
     let mut best: Option<Pick> = None;
     for candidate in near {
-        let Some(recall) = bigram_recall(
-            candidate.lyrics.lines.iter().map(|l| l.text.as_str()),
-            heard,
-        ) else {
+        let text = candidate
+            .lyrics
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pairs = words(&text).len().saturating_sub(1);
+        if (pairs as f64) < fewest_pairs {
+            continue;
+        }
+        let Some(recall) = bigram_recall([text.as_str()], heard) else {
             continue;
         };
         if recall >= MIN_RECALL && best.as_ref().map_or(true, |b| recall > b.recall) {
@@ -276,5 +292,25 @@ mod tests {
             HEARD,
         );
         assert_eq!(got.map(|p| p.candidate.id), Some(6));
+    }
+
+    #[test]
+    fn a_few_lines_heard_whole_lose_to_the_lyric_heard_with_a_slip() {
+        // The recogniser wrote one word wrong; the full lyric loses the two
+        // pairs around it, the opening phrase loses none.
+        let heard = "grey gulls wheel above the key low tide hums along the stones";
+        let phrase = lyrics(&["grey gulls wheel", "above"]);
+        let got = choose(
+            vec![
+                candidate(7, SONG_MS, phrase),
+                candidate(8, SONG_MS + 500, sung()),
+            ],
+            &wrong(),
+            SONG_MS,
+            heard,
+        )
+        .unwrap();
+        assert_eq!(got.candidate.id, 8);
+        assert!(got.recall < 1.0, "{}", got.recall);
     }
 }
