@@ -266,19 +266,43 @@ fn use_user() -> Option<String> {
     me.or_else(offline_video::last_user)
 }
 
-/// The user's videos, re-read every [`POLL_MS`] while the component lives.
-fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
+/// What a screen of downloads shows from the store: the user's videos and
+/// how many folders could not be read. Polled as one value, so either one
+/// changing reaches the screen (a sweep can drop an unreadable folder while
+/// the list stays the same).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Listing {
+    videos: Vec<KeptVideo>,
+    unreadable: usize,
+}
+
+/// The listing to show for `user` now: nothing without a store or a user,
+/// except the unreadable count, which is the store's.
+fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
+    let Some(store) = store else {
+        return Listing::default();
+    };
+    Listing {
+        videos: user.map(|u| store.videos(u)).unwrap_or_default(),
+        unreadable: store.unreadable_count(),
+    }
+}
+
+/// The listing a poll sets, when it differs from the one shown.
+fn refreshed(shown: &Listing, now: Listing) -> Option<Listing> {
+    (*shown != now).then_some(now)
+}
+
+/// The user's listing, re-read every [`POLL_MS`] while the component lives.
+fn use_listing(user: Option<String>) -> Signal<Listing> {
     // Each render hands the poller the user as it is now.
     let current = use_hook(|| Rc::new(RefCell::new(user.clone())));
     *current.borrow_mut() = user;
     let read = {
         let current = Rc::clone(&current);
-        move || match (video_store(), current.borrow().as_deref()) {
-            (Some(store), Some(user)) => store.videos(user),
-            _ => Vec::new(),
-        }
+        move || listing(video_store().as_deref(), current.borrow().as_deref())
     };
-    let mut videos = use_signal(read.clone());
+    let mut shown = use_signal(read.clone());
     use_future(move || {
         let read = read.clone();
         async move {
@@ -286,9 +310,16 @@ fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
                 platform::SLEEP_IS_REAL,
                 || platform::sleep_ms(POLL_MS),
                 || {
-                    let now = read();
-                    if *videos.peek() != now {
-                        videos.set(now);
+                    let was = shown.peek().unreadable;
+                    let next = refreshed(&shown.peek(), read());
+                    if let Some(now) = next {
+                        if now.unreadable != was {
+                            platform::info(&format!(
+                                "pharos: video listing unreadable verdict=changed from={was} to={}",
+                                now.unreadable
+                            ));
+                        }
+                        shown.set(now);
                     }
                     true
                 },
@@ -296,7 +327,7 @@ fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
             .await;
         }
     });
-    videos
+    shown
 }
 
 /// The Download control of a film's or episode's title page. Nothing
@@ -308,13 +339,13 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     };
     let ctx = use_context::<Ctx>();
     let user = use_user();
-    let videos = use_videos(user.clone());
+    let listing = use_listing(user.clone());
     let id = detail.item.id;
     let item = id.to_string();
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
     let mut busy = use_signal(|| false);
     let mut message = use_signal(|| None::<String>);
-    let video = videos.read().iter().find(|v| v.item == item).cloned();
+    let video = listing.read().videos.iter().find(|v| v.item == item).cloned();
     let remove_user = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
@@ -418,14 +449,16 @@ pub fn VideoDownloads(
         return rsx! {};
     };
     let user = use_user();
-    let videos = use_videos(user.clone());
+    let listing = use_listing(user.clone());
     let nav = use_context::<Nav>();
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
     let problem = use_signal(|| None::<String>);
     let discarding = use_signal(|| false);
-    // Read at each render; a discard sets `problem`, which renders again.
+    // Read at each render. The listing polls it with the videos, so a change
+    // a sweep makes renders again even when the list is the same; a discard
+    // sets `problem`, which renders again too.
     let unreadable = store.unreadable_count();
     let discard_store = store.clone();
     let mut cap = use_signal(|| store.cap_bytes());
@@ -452,7 +485,7 @@ pub fn VideoDownloads(
                 }
             }
             VideoList {
-                videos: videos(),
+                videos: listing.read().videos.clone(),
                 used,
                 cap: store.cap_bytes(),
                 problem: problem(),
@@ -759,6 +792,59 @@ mod tests {
             !html.contains("disabled"),
             "the button stayed disabled: {html}"
         );
+    }
+
+    /// A poll refreshes the screen when only the unreadable count changed:
+    /// a sweep can drop an unreadable folder while the list stays empty.
+    #[test]
+    fn a_poll_refreshes_an_unreadable_count_that_changed_alone() {
+        let shown = Listing {
+            videos: vec![],
+            unreadable: 1,
+        };
+        let now = Listing {
+            videos: vec![],
+            unreadable: 0,
+        };
+        assert_eq!(
+            refreshed(&shown, now.clone()),
+            Some(now),
+            "the count changed and the screen kept the old one"
+        );
+        assert_eq!(refreshed(&shown, shown.clone()), None);
+    }
+
+    /// The listing carries the store's unreadable count with the videos,
+    /// and the count even with nobody signed in.
+    #[test]
+    fn a_listing_reads_the_unreadable_count_with_the_videos() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest};
+        struct Two;
+        impl VideoStore for Two {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                2
+            }
+        }
+        assert_eq!(listing(Some(&Two), Some("u")).unreadable, 2);
+        assert_eq!(listing(Some(&Two), None).unreadable, 2);
+        assert_eq!(listing(None, Some("u")), Listing::default());
     }
 
     fn video(item: &str, state: KeptState) -> KeptVideo {
