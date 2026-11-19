@@ -138,6 +138,9 @@ pub mod together_view;
 // the host so the sign-in sequences can be tested).
 #[cfg(any(target_os = "android", test))]
 pub mod token_file;
+// A scope-owned temporary folder for the native tests.
+#[cfg(test)]
+pub(crate) mod test_dir;
 pub mod track_follow;
 pub mod trail;
 pub mod turn;
