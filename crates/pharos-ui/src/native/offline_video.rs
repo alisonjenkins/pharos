@@ -235,6 +235,30 @@ fn identity() -> Identity {
     with_identity(|i| i.clone())
 }
 
+/// The device token of the session published last ([`session_replaced`]),
+/// once there is one. Written under the identity lock. A cold start read
+/// after it is bound to it: only that token's paired user may be installed.
+#[cfg(not(test))]
+static SESSION_TOKEN: std::sync::Mutex<Option<TokenSeen>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_TOKEN: std::cell::RefCell<Option<TokenSeen>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_session_token<R>(f: impl FnOnce(&mut Option<TokenSeen>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut SESSION_TOKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        SESSION_TOKEN.with(|t| f(&mut t.borrow_mut()))
+    }
+}
+
 /// Per-identity-state facts: whether a cold start has read and failed
 /// (so a proxied request does not read the preference and the token again),
 /// and whether the refusal for nobody signed in has been logged since the
@@ -319,6 +343,7 @@ pub fn session_replaced<A>(session: &Session<A>) {
     let paired = paired_user(&session.token);
     let (now, verdict, reason, user) = with_identity(|i| {
         bump_generation();
+        with_session_token(|t| *t = Some(session.token.clone()));
         let (verdict, reason, user) = match i.clone() {
             Identity::User(u) | Identity::Fenced(u) if paired.as_deref() == Some(u.as_str()) => {
                 *i = Identity::User(u.clone());
@@ -400,6 +425,7 @@ fn set_identity_if(expected: Option<u64>, next: Identity) -> Result<(), u64> {
         set_flag(REFUSAL_LOGGED, false);
         if next == Identity::Unknown {
             set_flag(COLD_TRIED, false);
+            with_session_token(|t| *t = None);
         }
         *i = next;
         bump_generation();
@@ -449,6 +475,21 @@ fn cold_start_identity() -> Identity {
             return Identity::Unknown;
         }
     };
+    // Once a session is published, its token decides: the remembered user
+    // is installed only if that token is still on file and paired with
+    // them, never because the file names them (a token stored since).
+    if let Some(seen) = with_session_token(|t| t.clone()).filter(|t| t.0.is_some()) {
+        let paired = paired_user(&seen);
+        return match (paired, pref) {
+            (Some(t), Some(p)) if t == p => Identity::User(p),
+            _ => {
+                super::platform::info(
+                    "pharos: video user verdict=none reason=session_token_not_paired_with_preference",
+                );
+                Identity::Unknown
+            }
+        };
+    }
     let Some(token) = token_user() else {
         return pref.map_or(Identity::SignedOut, Identity::User);
     };
@@ -495,25 +536,36 @@ pub fn last_user() -> Option<String> {
     if flag(COLD_TRIED) {
         return None;
     }
+    // The generation is taken before the reads, while the identity is
+    // Unknown: what they found is installed only through the one
+    // compare-and-set every install uses, so a sign-in, a sign-out or a
+    // session published during them (each advances the generation) wins.
+    let asked_at = identity_generation();
     let found = cold_start_identity();
+    #[cfg(test)]
+    tests::AFTER_COLD_READ.with(|h| {
+        if let Some(f) = h.borrow_mut().take() {
+            f();
+        }
+    });
     if found == Identity::Unknown {
         set_flag(COLD_TRIED, true);
-    }
-    let now = with_identity(|i| {
-        if *i == Identity::Unknown && found != Identity::Unknown {
-            *i = found.clone();
-            super::platform::info(&format!(
-                "pharos: video user verdict={} reason=cold_start",
-                if matches!(found, Identity::User(_)) {
-                    "known"
-                } else {
-                    "none"
-                }
-            ));
+    } else {
+        let verdict = if matches!(found, Identity::User(_)) {
+            "known"
+        } else {
+            "none"
+        };
+        match set_identity_if(Some(asked_at), found) {
+            Ok(()) => super::platform::info(&format!(
+                "pharos: video user verdict={verdict} reason=cold_start"
+            )),
+            Err(now) => super::platform::info(&format!(
+                "pharos: video user verdict=not_installed reason=identity_changed_during_cold_start asked_at={asked_at} now={now}"
+            )),
         }
-        i.clone()
-    });
-    match now {
+    }
+    match identity() {
         Identity::User(u) => Some(u),
         _ => None,
     }
@@ -1093,6 +1145,9 @@ mod tests {
     }
 
     thread_local! {
+        /// Runs once after a cold start's reads, before what they found is
+        /// installed.
+        pub(super) static AFTER_COLD_READ: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         /// The fence verdicts logged on this thread.
         pub(super) static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
@@ -2215,6 +2270,37 @@ mod tests {
         *p.on_read.borrow_mut() = Some(Box::new(|| remember_user("B")));
         assert_eq!(last_user().as_deref(), Some("B"), "B was overwritten");
         assert!(!serves(last_user()), "A's file served to B");
+    }
+
+    /// A cold start read overtaken by a new session installs nothing: the
+    /// read found A, B's session was published after it read, and the
+    /// install's compare-and-set on the generation refuses A. A cold start
+    /// read again after it is bound to B's token, which is not paired with
+    /// A, so A's files are never selected.
+    #[test]
+    fn a_cold_start_overtaken_by_a_new_session_installs_nobody() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        AFTER_COLD_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|| {
+                session_replaced(&Session::opened((), Some("tokB".to_owned())));
+            }));
+        });
+        assert_eq!(last_user(), None, "the overtaken cold start installed A");
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+        // Read again on B's session: bound to B's token, so still nobody.
+        set_flag(COLD_TRIED, false);
+        assert_eq!(last_user(), None, "a read on B's session installed A");
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_none());
+
+        // The control: a session with A's own paired token reads A.
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        session_replaced(&session(()));
+        assert_eq!(last_user().as_deref(), Some("A"));
+        assert!(stored_for(&Files, last_user().as_deref(), "/k").is_some());
     }
 
     pub(crate) fn video(item: &str, version: &str, state: KeptState) -> KeptVideo {
