@@ -273,6 +273,23 @@ pub enum Registration {
     Registered,
     /// The store was opened but not registered (one already is).
     NotRegistered(String),
+    /// The store's runtime or thread could not start, so no store was
+    /// opened on the root. The claim was given back, so a later caller
+    /// tries again.
+    NotOpened(String),
+}
+
+/// Why `register_video_root`'s `register` failed: before the store was
+/// opened on the root (nothing to protect, so the claim is given back) or
+/// after it may have been (the claim is kept: a second store would run
+/// recovery over the first's staging files).
+#[cfg(any(feature = "mobile", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterFailed {
+    /// Nothing was opened on the root.
+    BeforeOpen(String),
+    /// The store may be open on the root.
+    AfterOpen(String),
 }
 
 /// The phone's registration of its video store, as the Android crate runs
@@ -285,13 +302,15 @@ pub enum Registration {
 /// goes in once, before the folder is created, and reports the size unknown
 /// while no store is registered, so a folder that cannot be created leaves
 /// the music refused (fail closed), not counted as free of video.
-/// `register` opens and registers the store.
+/// `register` opens and registers the store. A `register` that failed
+/// before it opened anything ([`RegisterFailed::BeforeOpen`]) gives the
+/// claim back too.
 #[cfg(any(feature = "mobile", test))]
 pub fn register_video_root(
     root: &std::path::Path,
     once: &OpenOnce,
     install_hook: impl FnOnce(),
-    register: impl FnOnce() -> Result<(), String>,
+    register: impl FnOnce() -> Result<(), RegisterFailed>,
 ) -> Registration {
     if !once.claim() {
         return Registration::AlreadyOpened;
@@ -306,7 +325,12 @@ pub fn register_video_root(
     }
     match register() {
         Ok(()) => Registration::Registered,
-        Err(e) => Registration::NotRegistered(e),
+        Err(RegisterFailed::AfterOpen(e)) => Registration::NotRegistered(e),
+        Err(RegisterFailed::BeforeOpen(e)) => {
+            // No store was opened on the root: the next caller may try again.
+            once.release();
+            Registration::NotOpened(e)
+        }
     }
 }
 
@@ -690,12 +714,47 @@ mod tests {
             std::env::temp_dir().join(format!("pharos-register-kept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let once = OpenOnce::new();
-        let outcome = register_video_root(&root, &once, || {}, || Err("taken".to_owned()));
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || {},
+            || Err(RegisterFailed::AfterOpen("taken".to_owned())),
+        );
         assert_eq!(outcome, Registration::NotRegistered("taken".to_owned()));
         assert_eq!(
             register_video_root(&root, &once, || {}, || Ok(())),
             Registration::AlreadyOpened
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store whose runtime or thread could not start opened nothing on
+    /// the root: the claim is given back and the next caller opens it. The
+    /// hook still goes in only once.
+    #[test]
+    fn a_registration_that_failed_before_the_store_opened_is_retried() {
+        use std::cell::Cell;
+        let root =
+            std::env::temp_dir().join(format!("pharos-register-unopened-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let once = OpenOnce::new();
+        let hooks = Cell::new(0);
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || hooks.set(hooks.get() + 1),
+            || Err(RegisterFailed::BeforeOpen("video thread: no".to_owned())),
+        );
+        assert_eq!(
+            outcome,
+            Registration::NotOpened("video thread: no".to_owned())
+        );
+        assert_eq!(
+            register_video_root(&root, &once, || hooks.set(hooks.get() + 1), || Ok(())),
+            Registration::Registered,
+            "a store that never opened kept the claim"
+        );
+        assert_eq!(hooks.get(), 1, "a second hook");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -349,6 +349,10 @@ fn register_video_at(root: std::path::PathBuf) {
         Registration::NotRegistered(e) => {
             log::info!("pharos: port video_store verdict=already_registered reason={e}");
         }
+        Registration::NotOpened(e) => log::warn!(
+            "pharos: port video_store verdict=not_registered reason=not_opened retry=next_caller dir={} error={e}",
+            root.display()
+        ),
     }
 }
 

@@ -3447,16 +3447,17 @@ impl Fetcher for ServerFetcher {
 pub fn register_video_store(
     root: std::path::PathBuf,
     budget: Arc<dyn Budget>,
-) -> Result<(), String> {
+) -> Result<(), super::ports::RegisterFailed> {
+    use super::ports::RegisterFailed;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("video runtime: {e}"))?;
+        .map_err(|e| RegisterFailed::BeforeOpen(format!("video runtime: {e}")))?;
     let handle = runtime.handle().clone();
     std::thread::Builder::new()
         .name("pharos-video".into())
         .spawn(move || runtime.block_on(std::future::pending::<()>()))
-        .map_err(|e| format!("video thread: {e}"))?;
+        .map_err(|e| RegisterFailed::BeforeOpen(format!("video thread: {e}")))?;
     let store = DiskVideoStore::open(
         root,
         Env {
@@ -3470,7 +3471,7 @@ pub fn register_video_store(
             remove_dir: |dir| std::fs::remove_dir_all(dir),
         },
     );
-    super::ports::register_video_store(store).map_err(|e| e.to_string())
+    super::ports::register_video_store(store).map_err(|e| RegisterFailed::AfterOpen(e.to_string()))
 }
 
 /// Logs where a stream request was answered from: playlists at info,
