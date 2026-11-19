@@ -377,8 +377,9 @@ impl LyricsFinder {
             return known;
         }
         if let Some((known, age)) = self.read_disk(item.id, online.name(), &song).await {
-            self.remember_aged(item.id, key, known.clone(), age);
-            return known;
+            return self
+                .remember_unless_repicked(item.id, &key, &known, age)
+                .unwrap_or(known);
         }
         if self.cooling_down() {
             tracing::debug!(
@@ -390,7 +391,9 @@ impl LyricsFinder {
         }
         match online.find(&song).await {
             Ok(found) => {
-                if let Some(standing) = self.remember_unless_repicked(item.id, &key, &found) {
+                if let Some(standing) =
+                    self.remember_unless_repicked(item.id, &key, &found, Duration::ZERO)
+                {
                     return standing;
                 }
                 self.write_disk(item.id, online.name(), song, found.clone())
@@ -612,14 +615,16 @@ impl LyricsFinder {
             .then_some(r.found)
     }
 
-    /// Remember a lookup's answer unless a repick of the song was taken
-    /// while it was in flight; then the repick's answer stands and is
-    /// returned, or `found` when the repick has not answered yet.
+    /// Remember an answer from the provider or the disk, given `age` ago,
+    /// unless a repick of the song was taken while it was read; then the
+    /// repick's answer stands and is returned, or `found` when the repick
+    /// has not answered yet.
     fn remember_unless_repicked(
         &self,
         id: u64,
         key: &str,
         found: &Option<Lyrics>,
+        age: Duration,
     ) -> Option<Option<Lyrics>> {
         // Held across the insert so a repick cannot be taken between the
         // check and the commit.
@@ -641,7 +646,7 @@ impl LyricsFinder {
                     .unwrap_or_else(|| found.clone()),
             );
         }
-        self.remember(id, key.to_owned(), found.clone());
+        self.remember_aged(id, key.to_owned(), found.clone(), age);
         drop(held);
         None
     }
@@ -1420,6 +1425,24 @@ mod tests {
         assert_eq!(picked, Some(sung()));
         assert_eq!(searches(&online), 2);
         assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A disk read that lands while a repick of the song is searching is
+    /// served, but not remembered over what the repick will choose.
+    #[tokio::test]
+    async fn a_disk_read_during_a_repick_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let warm = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        assert_eq!(warm.find(&item).await, Some(wrong()));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let song = Song::of(&item).unwrap();
+        let key = cache::key(online.name(), &song);
+        let searching = Reserved::take(&finder.repicked, (item.id, key.clone())).unwrap();
+        assert_eq!(finder.find(&item).await, Some(wrong()));
+        assert!(finder.remembered(item.id, &key).is_none());
+        drop(searching);
     }
 
     /// Without a disk cache the record picked is held apart from the memo,
