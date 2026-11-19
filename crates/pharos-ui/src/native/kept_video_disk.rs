@@ -5305,9 +5305,22 @@ mod tests {
             }
         }
 
-        /// Waits until `key` has been asked for `times` times.
+        /// Waits until `key` has been asked for `times` times; fails after
+        /// 30 s of wall time, naming the requests that were made, so a
+        /// request that never comes is a failure, not a hang.
         async fn asked_times(&self, key: &str, times: usize) {
+            self.asked_times_within(key, times, std::time::Duration::from_secs(30))
+                .await;
+        }
+
+        async fn asked_times_within(&self, key: &str, times: usize, limit: std::time::Duration) {
+            let start = std::time::Instant::now();
             while self.asked().iter().filter(|k| *k == key).count() < times {
+                assert!(
+                    start.elapsed() < limit,
+                    "{key} was not asked {times} times; asked: {:?}",
+                    self.asked()
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
@@ -8889,6 +8902,17 @@ mod tests {
         }
     }
 
+    /// A request a test waits for that never comes fails the wait, naming
+    /// what was asked, instead of hanging the test.
+    #[tokio::test]
+    #[should_panic(expected = "was not asked 1 times; asked: []")]
+    async fn a_request_that_never_comes_fails_the_wait() {
+        let server = FakeServer::with_stream();
+        server
+            .asked_times_within(SEG0, 1, std::time::Duration::from_millis(50))
+            .await;
+    }
+
     /// Waits, on the test's runtime, until `done` holds; at most 10 s.
     async fn until_within(done: impl Fn() -> bool) {
         let start = std::time::Instant::now();
@@ -11279,9 +11303,7 @@ mod tests {
         store.start(request("1")).unwrap();
         rig.server.asked_times(SEG0, 2).await;
         // Let the new run finish, then the old run fail.
-        while only(&store).state != KeptState::Ready {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        until_within(|| only(&store).state == KeptState::Ready).await;
         release.store(true, Ordering::SeqCst);
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
