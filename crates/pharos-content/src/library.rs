@@ -124,6 +124,10 @@ enum Op {
     Search(String),
     SignOut,
     Reload,
+    /// Another part of the process signed out but could neither remove nor
+    /// mark the token with this fingerprint ([`token::fingerprint`]): stay
+    /// signed out, and refuse that token until a different one is stored.
+    StaySignedOut(String),
 }
 
 impl Op {
@@ -136,6 +140,7 @@ impl Op {
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
             Op::Reload => "reload credentials".into(),
+            Op::StaySignedOut(_) => "stay signed out".into(),
         }
     }
 }
@@ -327,6 +332,7 @@ impl Library {
                     qc: None,
                     qc_gen: 0,
                     qc_approved: Arc::default(),
+                    fenced: None,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -500,6 +506,15 @@ impl Library {
     /// the one given to [`Library::connect`].
     pub fn reload_credentials(&self) -> Result<(), ContentError> {
         self.call(Op::Reload).map(|_| ())
+    }
+
+    /// The app signed out but its token, fingerprinted `fingerprint`, could
+    /// be neither removed nor marked revoked: the service drops its link
+    /// and stays signed out, refusing that token in this process until a
+    /// sign-in stores a different one.
+    pub fn stay_signed_out(&self, fingerprint: &str) -> Result<(), ContentError> {
+        self.call(Op::StaySignedOut(fingerprint.to_owned()))
+            .map(|_| ())
     }
 
     /// Keep the listing for offline browse and remember the play order.
@@ -912,6 +927,10 @@ struct Worker {
     /// runs before the worker consumes it does not start a poller over it.
     qc_approved: Arc<AtomicBool>,
     limit: Duration,
+    /// The fingerprint of a token this process signed out of but could
+    /// neither remove nor mark revoked: refused on every read until a
+    /// different token is on file (the in-process fence).
+    fenced: Option<String>,
 }
 
 /// Reports what a sign-out (`at`: the user's, or the server's refusal)
@@ -1055,8 +1074,7 @@ impl Worker {
         if matches!(op, Op::SignOut) {
             self.link = None;
             self.stop_sign_in();
-            let ended =
-                note_forgotten("sign_out", token::end_session(&self.token_path, None, None));
+            let ended = self.end_session("sign_out");
             self.shared.set_auth(AuthState::SignedOut);
             return ended
                 .map(|()| Out::Done)
@@ -1067,6 +1085,16 @@ impl Worker {
         }
         if matches!(op, Op::Reload) {
             return self.reload(events).await;
+        }
+        if let Op::StaySignedOut(fingerprint) = op {
+            self.link = None;
+            let polling = self.stop_sign_in();
+            self.fenced = Some(fingerprint.clone());
+            self.shared.set_auth(AuthState::SignedOut);
+            log::warn!(
+                "credentials stay signed out: verdict=fenced reason=token_neither_removed_nor_marked quickconnect_stopped={polling}"
+            );
+            return Ok(Out::Done);
         }
         let mut last = None;
         for attempt in 0..2 {
@@ -1082,7 +1110,7 @@ impl Worker {
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
-                Op::SignOut | Op::Reload => Ok(Out::Done),
+                Op::SignOut | Op::Reload | Op::StaySignedOut(_) => Ok(Out::Done),
             };
             match r {
                 Err(e) if e.is_revoked() => {
@@ -1131,7 +1159,7 @@ impl Worker {
                 return Ok(l.clone());
             }
         }
-        let Some(device_token) = token::load(&self.token_path)? else {
+        let Some(device_token) = self.load_token()? else {
             self.start_sign_in(events);
             return Err(ContentError::NeedsSignIn);
         };
@@ -1176,7 +1204,7 @@ impl Worker {
     ) -> Result<Out, ContentError> {
         self.link = None;
         let polling = self.stop_sign_in();
-        let token = token::load(&self.token_path)?.is_some();
+        let token = self.load_token()?.is_some();
         let (verdict, result) = if token {
             match self.link(events).await {
                 Ok(_) => ("signed_in", Ok(Out::Done)),
@@ -1205,11 +1233,55 @@ impl Worker {
         self.qc.take().inspect(|h| h.abort()).is_some()
     }
 
+    /// The device token on file, behind the in-process fence: the fenced
+    /// token reads as none; a different one lifts the fence.
+    fn load_token(&mut self) -> Result<Option<String>, ContentError> {
+        let token = token::load(&self.token_path)?;
+        let Some(fenced) = self.fenced.as_deref() else {
+            return Ok(token);
+        };
+        match token {
+            Some(t) if token::fingerprint(&t) == fenced => {
+                log::info!("token read verdict=refused reason=service_fence");
+                Ok(None)
+            }
+            other => {
+                log::info!(
+                    "token fence verdict=lifted reason={}",
+                    if other.is_some() {
+                        "different_token"
+                    } else {
+                        "no_token"
+                    }
+                );
+                self.fenced = None;
+                Ok(other)
+            }
+        }
+    }
+
+    /// Ends the session's token on file (`at`: the user's sign-out or the
+    /// server's refusal). One that could be neither removed nor marked is
+    /// fenced in this process, so nothing here resumes from it.
+    fn end_session(&mut self, at: &str) -> Result<(), String> {
+        let held = token::load(&self.token_path).ok().flatten();
+        let ended = token::end_session(&self.token_path, None, None);
+        if matches!(ended, token::Ended::Unsafe { .. }) {
+            if let Some(t) = held.as_deref() {
+                self.fenced = Some(token::fingerprint(t));
+                log::warn!(
+                    "token fence verdict=fenced reason=token_neither_removed_nor_marked at={at}"
+                );
+            }
+        }
+        note_forgotten(at, ended)
+    }
+
     /// The server refused our credentials: forget them, drop the link and
     /// start QuickConnect.
     fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
         self.link = None;
-        let _ = note_forgotten("revoked", token::end_session(&self.token_path, None, None));
+        let _ = self.end_session("revoked");
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
         ContentError::NeedsSignIn
@@ -1852,6 +1924,7 @@ mod tests {
             qc: None,
             qc_gen: 0,
             qc_approved: Arc::default(),
+            fenced: None,
             limit: Duration::from_secs(5),
         };
         (w, shared, token_path)
@@ -1957,6 +2030,82 @@ mod tests {
                 |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
             ),
             "{lines:?}"
+        );
+    }
+
+    /// A sign-out whose token can be neither removed nor marked keeps the
+    /// service signed out all the same: the reload the credentials change
+    /// asks for refuses that token. A different token lifts the fence.
+    #[test]
+    fn a_sign_out_whose_token_neither_goes_nor_is_marked_leaves_the_service_signed_out() {
+        let root = test_root("signout-unsafe");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        token::faults::REMOVE.with(|f| f.set(true));
+        token::faults::MARKER.with(|f| f.set(true));
+        local.block_on(&rt, async {
+            let _ = w.execute(&Op::SignOut, &events).await;
+        });
+        token::faults::REMOVE.with(|f| f.set(false));
+        token::faults::MARKER.with(|f| f.set(false));
+        assert_eq!(token::load(&token_path).unwrap().as_deref(), Some("tok"));
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("token read verdict=refused reason=service_fence")),
+            "the reload read the signed-out token: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "{lines:?}"
+        );
+        // A new sign-in's token is not the fenced one.
+        token::store(&token_path, "tok2").unwrap();
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+        assert!(w.fenced.is_none());
+    }
+
+    /// The app's sign-out could neither remove nor mark the token: told to
+    /// stay signed out, the service refuses that token on its next reload.
+    #[test]
+    fn a_service_told_to_stay_signed_out_refuses_that_token() {
+        let root = test_root("stay-signed-out");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        local.block_on(&rt, async {
+            w.execute(&Op::StaySignedOut(token::fingerprint("tok")), &events)
+                .await
+                .unwrap();
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("credentials stay signed out: verdict=fenced")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "the reload resumed the fenced token: {lines:?}"
         );
     }
 

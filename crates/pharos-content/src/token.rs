@@ -122,7 +122,7 @@ pub fn revoked(path: &Path) -> Option<Revoked> {
 /// A fingerprint of a token (64-bit FNV-1a, spelled out here so no
 /// toolchain update changes it), so the marker can name it without holding
 /// it.
-fn fingerprint(token: &str) -> String {
+pub fn fingerprint(token: &str) -> String {
     let h = token
         .trim()
         .bytes()
