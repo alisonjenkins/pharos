@@ -72,12 +72,20 @@ pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
     let Some(stored) = read_raw(path)? else {
         return Ok(None);
     };
-    match revoked(path) {
-        Some(r) if r.token == fingerprint(&stored.token) => {
+    match marker(path) {
+        Marker::Present(r) if r.token == fingerprint(&stored.token) => {
             log::debug!("token read verdict=refused reason=revoked_marker");
             Ok(None)
         }
-        _ => Ok(Some(stored)),
+        // A marker that is there but cannot be read or understood may name
+        // this token: fail closed, until a new sign-in replaces both.
+        Marker::Unreadable(why) => {
+            log::warn!(
+                "token read verdict=refused reason=revocation_marker_unreadable error={why}"
+            );
+            Ok(None)
+        }
+        Marker::Present(_) | Marker::Absent => Ok(Some(stored)),
     }
 }
 
@@ -107,15 +115,46 @@ pub struct Revoked {
     token: String,
 }
 
+/// The revocation marker beside a token file, as a read finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Marker {
+    /// No marker: nothing is revoked.
+    Absent,
+    /// A marker naming a token.
+    Present(Revoked),
+    /// A marker that is there but could not be read or parsed (why): it
+    /// may name any token, so every read refuses (fail closed).
+    Unreadable(String),
+}
+
 /// The marker beside `path`, when there is a readable one.
 pub fn revoked(path: &Path) -> Option<Revoked> {
-    let raw = std::fs::read_to_string(revoked_path(path)).ok()?;
+    match marker(path) {
+        Marker::Present(r) => Some(r),
+        Marker::Absent | Marker::Unreadable(_) => None,
+    }
+}
+
+/// The marker beside `path`: absent, present, or there and unreadable.
+pub fn marker(path: &Path) -> Marker {
+    #[cfg(debug_assertions)]
+    if faults::MARKER_READ.with(std::cell::Cell::get) {
+        return Marker::Unreadable("marker read failed".to_owned());
+    }
+    let raw = match std::fs::read_to_string(revoked_path(path)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
+        Err(e) => return Marker::Unreadable(e.to_string()),
+    };
     let mut lines = raw.lines();
     let user = lines.next().map(str::trim).filter(|u| !u.is_empty());
-    let token = lines.next()?.trim().to_owned();
-    Some(Revoked {
+    let token = lines.next().map(str::trim).unwrap_or_default();
+    if token.len() != 16 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Marker::Unreadable("no token fingerprint in the marker".to_owned());
+    }
+    Marker::Present(Revoked {
         user: user.map(str::to_owned),
-        token,
+        token: token.to_owned(),
     })
 }
 
@@ -272,30 +311,56 @@ impl Ended {
 /// written either, says so.
 pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
     let _held = hold();
-    let stored = match read_raw(path) {
+    let read = {
+        #[cfg(debug_assertions)]
+        let failed = faults::TOKEN_READ.with(std::cell::Cell::get);
+        #[cfg(not(debug_assertions))]
+        let failed = false;
+        if failed {
+            Err(err(path, "token read failed"))
+        } else {
+            read_raw(path)
+        }
+    };
+    let stored = match read {
         Ok(Some(s)) if seen.is_some_and(|seen| s.token != seen.trim()) => return Ended::Changed,
         Ok(None) => return Ended::Forgotten(Forgotten::Durable),
-        Ok(Some(s)) => Some(s),
-        // Unreadable: try the removal all the same; with no token in hand
-        // there is nothing to fingerprint.
-        Err(_) => None,
+        Ok(Some(s)) => s,
+        // Unreadable: the compare cannot be made, so nothing is removed (it
+        // may be a replacement). The token the session ended with is still
+        // marked, for the user expected, when the caller names it.
+        Err(e) => {
+            let removal = format!("not attempted: the token could not be read to compare ({e})");
+            let Some(seen) = seen else {
+                log::warn!("token revocation marker verdict=not_written reason=token_unreadable_no_token_named error={e}");
+                return Ended::Unsafe {
+                    removal,
+                    marker: "no token named to fingerprint".to_owned(),
+                };
+            };
+            return mark(path, user, &fingerprint(seen), removal);
+        }
     };
     let removal = match remove(path) {
-        Ok(f) => return Ended::Forgotten(f),
+        Ok(Forgotten::Durable) => return Ended::Forgotten(Forgotten::Durable),
+        // Gone, but a crash may bring it back: marked too, so it never
+        // resumes; only when the marker fails as well is it unsafe.
+        Ok(Forgotten::NotDurable(why)) => format!("removal not durable: {why}"),
         Err(e) => e.to_string(),
     };
-    let Some(stored) = stored else {
-        return Ended::Unsafe {
-            removal,
-            marker: "the token could not be read to mark it".to_owned(),
-        };
-    };
     let named = user.map(str::to_owned).or(stored.user.clone());
-    match write_marker(path, named.as_deref(), &fingerprint(&stored.token)) {
+    mark(path, named.as_deref(), &fingerprint(&stored.token), removal)
+}
+
+/// Writes the marker for `user` and `token_fingerprint` after a removal
+/// that did not hold (`removal` says why): `Marked`, or `Unsafe` when the
+/// marker fails too.
+fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: String) -> Ended {
+    match write_marker(path, named, token_fingerprint) {
         Ok(()) => {
             log::warn!(
                 "token revocation marker verdict=written reason=token_not_removed user={} error={removal}",
-                named.as_deref().unwrap_or("")
+                named.unwrap_or("")
             );
             Ended::Marked(removal)
         }
@@ -345,13 +410,17 @@ fn write_marker(path: &Path, user: Option<&str>, token: &str) -> std::io::Result
 }
 
 /// Faults a test can set on its own thread, in debug builds only: the
-/// token file's removal, and the marker's write.
+/// token file's removal and read, and the marker's write and read.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod faults {
     thread_local! {
         pub static REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The marker cannot be read (it is there).
+        pub static MARKER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The token file cannot be read in `end_session`.
+        pub static TOKEN_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
@@ -767,6 +836,88 @@ pub(crate) mod tests {
         store(&p, "tokC").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
         assert!(revoked(&p).is_none(), "the sign-in left the marker");
+    }
+
+    /// (a) A marker that is there but cannot be read, or holds no
+    /// fingerprint, refuses every token (fail closed); a missing one
+    /// refuses nothing.
+    #[test]
+    fn an_unreadable_marker_fails_closed_and_a_missing_one_is_absent() {
+        let d = dir("marker-unreadable");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        assert_eq!(marker(&p), Marker::Absent);
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
+        faults::MARKER_READ.with(|f| f.set(true));
+        let read_failed = load(&p).unwrap();
+        faults::MARKER_READ.with(|f| f.set(false));
+        assert_eq!(
+            read_failed, None,
+            "an unreadable marker let the token through"
+        );
+        std::fs::write(revoked_path(&p), "A\n").unwrap();
+        assert!(
+            matches!(marker(&p), Marker::Unreadable(_)),
+            "{:?}",
+            marker(&p)
+        );
+        assert_eq!(
+            load(&p).unwrap(),
+            None,
+            "a marker with no fingerprint let it through"
+        );
+        // A new sign-in replaces both.
+        store(&p, "tokB").unwrap();
+        assert_eq!(marker(&p), Marker::Absent);
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+    }
+
+    /// (b) A token that cannot be read to compare is not removed (it may
+    /// be a replacement); the token the session ended with is marked for
+    /// its user, and with no token named the end is unsafe.
+    #[test]
+    fn an_unreadable_token_is_not_removed_and_the_ended_one_is_marked() {
+        let d = dir("token-unreadable");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        faults::TOKEN_READ.with(|f| f.set(true));
+        let ended = end_session(&p, Some("tokA"), Some("A"));
+        let unnamed = end_session(&p, None, Some("A"));
+        faults::TOKEN_READ.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+        assert!(
+            read_raw(&p).unwrap().is_some(),
+            "an uncompared token was removed"
+        );
+        let r = revoked(&p).expect("no marker");
+        assert_eq!(r.user.as_deref(), Some("A"));
+        assert_eq!(load(&p).unwrap(), None, "the ended token was read");
+        assert!(matches!(unnamed, Ended::Unsafe { .. }), "{unnamed:?}");
+    }
+
+    /// (c) A removal that is not durable is marked too; only when the
+    /// marker fails as well is it unsafe.
+    #[test]
+    fn a_removal_that_is_not_durable_is_marked_too() {
+        use std::io::ErrorKind::Other;
+        let d = dir("not-durable-marked");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+        let ended = end_session(&p, None, Some("A"));
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(
+            matches!(&ended, Ended::Marked(why) if why.contains("not durable")),
+            "{ended:?}"
+        );
+        assert_eq!(revoked(&p).and_then(|r| r.user).as_deref(), Some("A"));
+        store(&p, "tokA").unwrap();
+        DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+        faults::MARKER.with(|f| f.set(true));
+        let both = end_session(&p, None, Some("A"));
+        faults::MARKER.with(|f| f.set(false));
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(matches!(both, Ended::Unsafe { .. }), "{both:?}");
     }
 
     /// With neither the removal nor the marker written, the session's end

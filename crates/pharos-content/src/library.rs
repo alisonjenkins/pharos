@@ -1958,8 +1958,8 @@ mod tests {
     }
 
     /// A sign-out whose removal the folder could not make durable still
-    /// signs out in memory, and says it is not durable (both the user's
-    /// sign-out and the server's refusal).
+    /// signs out in memory, says it is not durable, and marks the token
+    /// revoked (both the user's sign-out and the server's refusal).
     #[test]
     fn a_sign_out_that_is_not_durable_is_reported_and_still_signs_out() {
         use std::io::ErrorKind::Other;
@@ -1985,9 +1985,17 @@ mod tests {
             assert_eq!(shared.lock().auth, AuthState::SignedOut, "{at}");
             assert!(token::load(&token_path).unwrap().is_none(), "{at}");
             let lines = crate::testlog::lines();
+            // Not durable is said, and the token is marked as well, so a
+            // crash that brings it back resumes nothing.
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("verdict=signed_out_not_durable")),
+                "{at}: {lines:?}"
+            );
             assert!(
                 lines.iter().any(|l| l.contains(&format!(
-                    "pharos: token forget verdict=signed_out_not_durable at={at} reason="
+                    "pharos: token forget verdict=marked_revoked at={at} reason=token_not_removed error=removal not durable"
                 ))),
                 "{at}: {lines:?}"
             );
