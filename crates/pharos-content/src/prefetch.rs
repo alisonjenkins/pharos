@@ -746,15 +746,13 @@ impl Gate {
                 st.total
                     .map_or(FREE_CHECK_BYTES, |t| t.saturating_sub(written))
             };
-            self.cache
-                .ensure_free(id, left(start))
-                .map_err(Fail::no_room)?;
-            let mut written = start;
-            let mut since_check = 0u64;
+            let unknown_len = st.total.is_none();
             // What the last check reserved, from where it was made: a chunk
             // that would pass it is reserved for before it is written, not
             // after, so the bytes a host admits against never lag the disk.
-            let mut reserved_ahead = left(start);
+            let mut reserved_ahead = self.reserve(id, left(start), 0, unknown_len)?;
+            let mut written = start;
+            let mut since_check = 0u64;
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -769,9 +767,7 @@ impl Gate {
             {
                 let len = chunk.len() as u64;
                 if since_check.saturating_add(len) > reserved_ahead {
-                    let need = len.max(left(written));
-                    self.cache.ensure_free(id, need).map_err(Fail::no_room)?;
-                    reserved_ahead = need;
+                    reserved_ahead = self.reserve(id, len.max(left(written)), len, unknown_len)?;
                     since_check = 0;
                 }
                 file.write_all(&chunk)
@@ -809,6 +805,27 @@ impl Gate {
                 }
                 _ => return self.finish(id, st.total),
             }
+        }
+    }
+
+    /// Reserves `want` bytes of room for the write. With no length to go by
+    /// `want` is a whole check window, which a small track may not need:
+    /// when the window does not fit, only `at_least` (the chunk about to be
+    /// written; none before the first) is reserved, and checked again at
+    /// the next chunk. Returns what was reserved.
+    fn reserve(&self, id: &str, want: u64, at_least: u64, unknown_len: bool) -> Result<u64, Fail> {
+        match self.cache.ensure_free(id, want) {
+            Ok(_) => Ok(want),
+            Err(NoRoom::LowDisk(room)) if unknown_len && at_least < want => {
+                log::info!(
+                    "cache download id={id} reserve verdict=chunk reason=window_does_not_fit window={want} chunk={at_least} room={room}"
+                );
+                self.cache
+                    .ensure_free(id, at_least)
+                    .map(|_| at_least)
+                    .map_err(Fail::no_room)
+            }
+            Err(no) => Err(Fail::no_room(no)),
         }
     }
 
@@ -1677,6 +1694,46 @@ mod tests {
             r.cache.is_complete("track/1"),
             "refused room for bytes that were not coming"
         );
+    }
+
+    /// A small track of unknown length fits where a whole check window
+    /// does not: it reserves the chunk it is about to write instead, and
+    /// completes as the same track with a length would.
+    #[test]
+    fn a_small_track_of_unknown_length_uses_the_room_it_needs() {
+        let size = 1024 * 1024;
+        let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
+        let slot2 = slot.clone();
+        let r = rig_with_free(
+            "unknown-length-small",
+            Script::default()
+                .file("/audio/1", body(size, 1))
+                .chunked()
+                .chunk_bytes(64 * 1024),
+            u64::MAX,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                // 4 MiB above the guard, less what is on the disk.
+                let cache = slot2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let on_disk = cache.as_ref().map_or(0, |c| {
+                    std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len())
+                });
+                Ok((MIN_FREE_BYTES + 4 * 1024 * 1024).saturating_sub(on_disk))
+            }),
+        );
+        *slot.lock().unwrap() = Some(Arc::downgrade(&r.cache));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        assert!(
+            r.cache.is_complete("track/1"),
+            "a 1 MiB track was refused for want of an 8 MiB window"
+        );
+        assert_eq!(read(&r.cache, "track/1"), body(size, 1));
     }
 
     /// A chunk that crosses the reserved window is reserved for before it is
