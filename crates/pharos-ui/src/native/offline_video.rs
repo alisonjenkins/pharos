@@ -1771,6 +1771,9 @@ mod tests {
     /// fetcher does, and what went out is captured.
     struct FileFetcher {
         file: std::path::PathBuf,
+        /// What the server answers a sent request with; a key with no
+        /// bytes here is answered 403.
+        files: std::collections::HashMap<String, Vec<u8>>,
         /// (owner, key, token) of each request sent.
         sent: std::sync::Mutex<Vec<(String, String, String)>>,
         /// (owner, reason) of each request not sent.
@@ -1779,8 +1782,16 @@ mod tests {
 
     impl FileFetcher {
         fn new(file: &std::path::Path) -> std::sync::Arc<Self> {
+            Self::serving(file, Vec::new())
+        }
+        /// A fetcher whose server answers `files`.
+        fn serving(
+            file: &std::path::Path,
+            files: Vec<(&'static str, Vec<u8>)>,
+        ) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
                 file: file.to_owned(),
+                files: files.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
                 sent: std::sync::Mutex::default(),
                 refused: std::sync::Mutex::default(),
             })
@@ -1822,14 +1833,33 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((owner.to_owned(), key.to_owned(), token));
-                Err(OpenFailed::Fetch(FetchError {
-                    status: Some(403),
-                    message: String::new(),
-                }))
+                match self.files.get(key) {
+                    Some(bytes) => Ok(Box::new(OneChunk(Some(bytes.clone())))
+                        as Box<dyn super::super::kept_video_disk::Body>),
+                    None => Err(OpenFailed::Fetch(FetchError {
+                        status: Some(403),
+                        message: String::new(),
+                    })),
+                }
             })
         }
         fn check_owner(&self, owner: &str) -> Result<(), String> {
             self.decide(owner).map(|_| ())
+        }
+    }
+
+    /// A body sent whole in one chunk.
+    struct OneChunk(Option<Vec<u8>>);
+
+    impl super::super::kept_video_disk::Body for OneChunk {
+        fn next_chunk(
+            &mut self,
+        ) -> super::super::kept_video_disk::BoxFut<
+            '_,
+            Result<Option<Vec<u8>>, super::super::kept_video_disk::FetchError>,
+        > {
+            let next = self.0.take();
+            Box::pin(async move { Ok(next) })
         }
     }
 
@@ -1899,6 +1929,66 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("{user}'s download never asked for its first file");
+    }
+
+    /// The late store, end to end on the host, through the code the phone
+    /// runs: A's download was interrupted, and the restart's recovery parks
+    /// it again (the token is not paired yet). A's session opens and its
+    /// `me` pairs the token before the store is published. Publishing the
+    /// store replays that sign-in: the download's requests go out with A's
+    /// token and its files land on disk.
+    #[test]
+    fn a_download_parked_by_recovery_resumes_when_the_store_is_published_after_me() {
+        use super::super::kept_video_disk::tests::stream_files;
+        use super::super::token_file;
+        let d = TmpDir::new("late-store");
+        let path = d.path().join("device-token");
+        let videos = d.path().join("videos");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let fetcher = FileFetcher::serving(&path, stream_files());
+            // A's download, interrupted: its first request is refused (the
+            // token names nobody yet) and the run parks.
+            {
+                let before = disk_store(&videos, fetcher.clone());
+                first_request_decided(&before, &fetcher, "A", "1").await;
+                before.settled().await;
+            }
+            assert_eq!(fetcher.sent(), [], "a request went out unpaired");
+            // The restart: recovery's run is refused and parks again.
+            let refused = fetcher.refused().len();
+            late_slot();
+            let store = disk_store(&videos, fetcher.clone());
+            store.settled().await;
+            assert!(fetcher.refused().len() > refused, "recovery did not run");
+            assert_eq!(store.used_bytes("A"), 0);
+            // A's session and `me`, before the store is published.
+            let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
+                panic!("A's token did not open A's session");
+            };
+            session_replaced(&session_a);
+            let ask = me_request(true, Some(session_a)).unwrap();
+            assert!(ask.answered("A"));
+            assert_eq!(fetcher.sent(), [], "a request went out before publication");
+            // Publication replays the sign-in.
+            super::super::ports::register_video_store(store.clone()).unwrap();
+            store.settled().await;
+            super::super::ports::use_test_video_slot(None);
+            let sent = fetcher.sent();
+            assert!(
+                !sent.is_empty() && sent.iter().all(|(o, _, t)| o == "A" && t == "tokA"),
+                "the download did not resume with A's token: {sent:?} refused={:?}",
+                fetcher.refused()
+            );
+            assert!(store.used_bytes("A") > 0, "no bytes landed");
+            assert!(
+                matches!(store.videos("A")[0].state, KeptState::Ready),
+                "{:?}",
+                store.videos("A")
+            );
+        });
     }
 
     /// The whole chain on the host, through the code the phone runs: open

@@ -4352,7 +4352,7 @@ impl DiskVideoStore {
 
     /// Waits for every download started so far to stop (tests).
     #[cfg(test)]
-    async fn settled(&self) {
+    pub(crate) async fn settled(&self) {
         loop {
             let next = self
                 .inner
@@ -4876,7 +4876,7 @@ impl VideoStore for DiskVideoStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     /// What a folder holds, for a test that needs it whole: a short walk
@@ -5269,6 +5269,18 @@ mod tests {
     const SEG0: &str = "/videos/1/h264cmaf/0.m4s?PlaySessionId=p";
     const SEG1: &str = "/videos/1/h264cmaf/1.m4s?PlaySessionId=p";
     const INIT: &str = "/videos/1/h264cmaf/init.mp4?PlaySessionId=p";
+
+    /// The keys and bytes of the one-title stream the tests download, for
+    /// another module's fake server.
+    pub(crate) fn stream_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (MASTER_KEY, MASTER.as_bytes().to_vec()),
+            (MEDIA_KEY, MEDIA.as_bytes().to_vec()),
+            (INIT, vec![1; 10]),
+            (SEG0, vec![2; 100]),
+            (SEG1, vec![3; 100]),
+        ]
+    }
 
     /// A server in memory: a key answers its bytes, or fails as scripted.
     #[derive(Default)]
