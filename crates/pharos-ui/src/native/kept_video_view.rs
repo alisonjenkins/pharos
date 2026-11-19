@@ -345,7 +345,12 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
     let mut busy = use_signal(|| false);
     let mut message = use_signal(|| None::<String>);
-    let video = listing.read().videos.iter().find(|v| v.item == item).cloned();
+    let video = listing
+        .read()
+        .videos
+        .iter()
+        .find(|v| v.item == item)
+        .cloned();
     let remove_user = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
@@ -527,20 +532,38 @@ fn start_discard(
             "pharos: video discard unreadable result={outcome:?}"
         ));
         problem.set(match outcome {
-            Some(Ok(_)) => None,
-            Some(Err(e)) => Some(format!("Some downloads could not be removed: {e}")),
-            None => Some("Some downloads could not be removed: the removal stopped".to_owned()),
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some(format!("Some downloads could not be removed: {e}")),
+            Err(OffUi::Stopped) => {
+                Some("Some downloads could not be removed: the removal stopped".to_owned())
+            }
+            Err(OffUi::NotStarted(e)) => Some(format!(
+                "Some downloads could not be removed: the removal could not start ({e}). Try again."
+            )),
         });
         discarding.set(false);
     });
 }
 
+/// Why work sent off the UI gave no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OffUi {
+    /// Its thread could not be made (the system refused one).
+    NotStarted(String),
+    /// Its thread ended without a result (it panicked).
+    Stopped,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next `off_ui` on this thread fail to start its thread.
+    static OFF_UI_SPAWN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Runs `work` on a thread of its own and resolves with its result, so a
-/// blocking job (deleting folders) never holds the UI executor. `None` when
-/// the thread ended without a result (it panicked).
-fn off_ui<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> impl std::future::Future<Output = Option<T>> {
+/// blocking job (deleting folders) never holds the UI executor. Err when
+/// the thread could not be made, or ended without a result.
+async fn off_ui<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, OffUi> {
     use futures_util::task::AtomicWaker;
     use std::sync::{Arc, Mutex};
 
@@ -565,10 +588,27 @@ fn off_ui<T: Send + 'static>(
         waker: AtomicWaker::new(),
     });
     let sender = Arc::clone(&slot);
-    std::thread::spawn(move || {
+    let job = move || {
         let mut deliver = Deliver(sender, None);
         deliver.1 = Some(work());
-    });
+    };
+    #[cfg(test)]
+    let job = (!OFF_UI_SPAWN_FAULT.with(|f| f.replace(false))).then_some(job);
+    #[cfg(not(test))]
+    let job = Some(job);
+    let spawned = match job {
+        Some(job) => std::thread::Builder::new()
+            .name("pharos-off-ui".to_owned())
+            .spawn(job)
+            .map(drop),
+        None => Err(std::io::Error::other("no thread for the test")),
+    };
+    if let Err(e) = spawned {
+        platform::warn(&format!(
+            "pharos: video off_ui verdict=not_started reason=thread_refused error={e}"
+        ));
+        return Err(OffUi::NotStarted(e.to_string()));
+    }
     std::future::poll_fn(move |cx| {
         slot.waker.register(cx.waker());
         match slot.value.lock() {
@@ -579,6 +619,8 @@ fn off_ui<T: Send + 'static>(
             Err(_) => std::task::Poll::Ready(None),
         }
     })
+    .await
+    .ok_or(OffUi::Stopped)
 }
 
 /// Applies a cap option to the store: the bytes set, or why not.
@@ -845,6 +887,88 @@ mod tests {
         assert_eq!(listing(Some(&Two), Some("u")).unreadable, 2);
         assert_eq!(listing(Some(&Two), None).unreadable, 2);
         assert_eq!(listing(None, Some("u")), Listing::default());
+    }
+
+    /// A discard whose thread the system refuses says so and enables the
+    /// button again, so the user can retry; it never stays "removing".
+    #[test]
+    fn a_discard_whose_thread_is_refused_reports_it_and_can_be_retried() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest};
+        use std::sync::Arc;
+        struct Never;
+        impl VideoStore for Never {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+        }
+        fn root() -> Element {
+            let discarding = use_signal(|| false);
+            let problem = use_signal(|| None::<String>);
+            use_hook(|| {
+                OFF_UI_SPAWN_FAULT.with(|f| f.set(true));
+                start_discard(Arc::new(Never), discarding, problem);
+            });
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: problem(),
+                    unreadable: 1,
+                    discarding: discarding(),
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let html = rt.block_on(async {
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("could not start")
+                    || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break html;
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            html.contains("the removal could not start (no thread for the test). Try again."),
+            "{html}"
+        );
+        assert!(
+            !html.contains("disabled"),
+            "the button stayed disabled: {html}"
+        );
     }
 
     fn video(item: &str, state: KeptState) -> KeptVideo {
