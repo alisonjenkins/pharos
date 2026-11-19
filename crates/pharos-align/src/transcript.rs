@@ -18,6 +18,10 @@ pub struct Word {
     /// The recogniser's confidence, 0 to 1.
     #[serde(rename = "p", default)]
     pub prob: f64,
+    /// The vocals were mostly silent from `start_s` up to the word's own
+    /// sung length before `end_s`: the start was put back over a gap.
+    #[serde(rename = "q", default)]
+    pub silent_lead: bool,
 }
 
 /// serde_json's own float parse can land one ulp off the nearest double,
@@ -31,6 +35,10 @@ fn exact_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
 #[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 pub struct Transcript {
     pub words: Vec<Word>,
+    /// Segments whose first word the recogniser started from its letters
+    /// rather than whisper's start, which was seconds early.
+    #[serde(default)]
+    pub first_words_clipped: usize,
 }
 
 #[derive(Debug, thiserror::Error)]

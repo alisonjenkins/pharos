@@ -11,6 +11,7 @@ use whisper_rs::{
 
 use super::{retry_windows, segment_words, Decode, Retry, Segment, Token};
 use crate::audio::RATE;
+use crate::loudness::Loudness;
 use crate::transcript::Transcript;
 
 #[derive(Debug, thiserror::Error)]
@@ -90,9 +91,7 @@ impl Recogniser {
             r.record();
         }
         Ok(Heard {
-            transcript: Transcript {
-                words: segment_words(&segments),
-            },
+            transcript: segment_words(&segments, &Loudness::of(audio, RATE)),
             segments,
             retries,
         })

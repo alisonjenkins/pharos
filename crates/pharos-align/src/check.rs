@@ -104,6 +104,7 @@ mod tests {
                 start_s: 0.0,
                 end_s: 0.1,
                 prob: 0.9,
+                silent_lead: false,
             })
             .collect()
     }
@@ -132,6 +133,7 @@ mod tests {
             start_s: 0.0,
             end_s: 0.1,
             prob: 0.9,
+            silent_lead: false,
         });
         let got = TextCheck::new(&[line("grey gullswheel")], &h);
         assert_eq!(got.text_recall, Some(1.0));

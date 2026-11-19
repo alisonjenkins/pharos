@@ -188,7 +188,7 @@ pub trait Stages: Send + Sync {
         &self,
         vocals: &[f32],
         deadline: Instant,
-    ) -> Result<Vec<transcript::Word>, StageError>;
+    ) -> Result<transcript::Transcript, StageError>;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -785,14 +785,17 @@ fn improve(
     on: &mut dyn FnMut(Progress<'_>),
 ) -> Aligned {
     let mut times = StageTimes::default();
-    let fail = |today: Today, times: StageTimes, e: StageError| {
+    // `clipped` is the recogniser's count once it has finished, so a later
+    // stage's failure still says what the recogniser did.
+    let fail = |today: Today, times: StageTimes, clipped: usize, e: StageError| {
         tracing::warn!(
             path = %rel_path,
             fallback = e.fallback.label(),
             reason = %e.reason,
             "recogniser stages fell back to today's answer"
         );
-        let placement = Placement::kept(today.with_words, e.fallback);
+        let mut placement = Placement::kept(today.with_words, e.fallback);
+        placement.first_words_clipped = clipped;
         today.into_aligned(placement, e.reason, times, 0)
     };
     let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
@@ -808,7 +811,7 @@ fn improve(
     times.vocals_ms = ms_since(t);
     let vocals = match vocals {
         Ok(v) => v,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, 0, e),
     };
 
     let t = Instant::now();
@@ -826,10 +829,10 @@ fn improve(
     times.recognise_ms = ms_since(t);
     let heard = match heard {
         Ok(h) => h,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, 0, e),
     };
     let today = Today {
-        check: Some(TextCheck::new(&today.request, &heard)),
+        check: Some(TextCheck::new(&today.request, &heard.words)),
         ..today
     };
 
@@ -862,7 +865,7 @@ fn improve(
     times.emission_ms = ms_since(t);
     let data = match emission {
         Ok(d) => d,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, heard.first_words_clipped, e),
     };
 
     let t = Instant::now();
@@ -873,7 +876,7 @@ fn improve(
         let frames = data.len() / CLASSES;
         let emission = Emission::new(&data, frames, CLASSES)
             .map_err(|e| stage(Fallback::EmissionFailed)(e.to_string()))?;
-        let matched = match_lines(&today.request, &heard, Options { slot_cap: true });
+        let matched = match_lines(&today.request, &heard.words, Options { slot_cap: true });
         let song = Song {
             emission,
             n_samples: vocals.len(),
@@ -884,8 +887,9 @@ fn improve(
     times.place_ms = ms_since(t);
     let mut refined = match placed {
         Ok(r) => r,
-        Err(e) => return fail(today, times, e),
+        Err(e) => return fail(today, times, heard.first_words_clipped, e),
     };
+    refined.placement.first_words_clipped = heard.first_words_clipped;
     let share = refined.placement.anchor_share.unwrap_or(0.0);
     if let Some(check) = today.check.as_ref().filter(|c| c.mismatch(share)) {
         refined.placement.fallback = Some(Fallback::LyricsMismatch);

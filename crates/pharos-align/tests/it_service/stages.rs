@@ -15,7 +15,7 @@ use pharos_align::service::{
     SongError, StageError, Stages, StreamDecoder, ALIGNER_VERSION,
 };
 use pharos_align::tokens::{label, CLASSES, STAR};
-use pharos_align::transcript::Word;
+use pharos_align::transcript::{Transcript, Word};
 
 const RATE: usize = 16_000;
 /// 20 ms frames, as MMS_FA gives at 16 kHz.
@@ -95,6 +95,7 @@ fn heard(text: &str, start_s: f64) -> Vec<Word> {
             start_s: start_s + 0.5 * k as f64,
             end_s: start_s + 0.5 * k as f64 + 0.4,
             prob: 0.9,
+            silent_lead: false,
         })
         .collect()
 }
@@ -109,7 +110,7 @@ enum Step {
 struct Scripted {
     vocals: Step,
     recognise: Step,
-    heard: Vec<Word>,
+    heard: Transcript,
     /// How long separating takes.
     slow: Duration,
 }
@@ -127,7 +128,7 @@ impl Stages for Scripted {
         }
     }
 
-    fn recognise(&self, vocals: &[f32], _: Instant) -> Result<Vec<Word>, StageError> {
+    fn recognise(&self, vocals: &[f32], _: Instant) -> Result<Transcript, StageError> {
         assert_eq!(vocals.len(), SONG_S * RATE);
         match self.recognise {
             Step::Works => Ok(self.heard.clone()),
@@ -162,6 +163,13 @@ fn song() -> (Vec<(char, i64)>, Vec<Word>) {
     let mut h = heard("grey gulls wheel", 1.7);
     h.extend(heard("low tide hums", 5.9));
     (sung, h)
+}
+
+fn transcript(words: Vec<Word>) -> Transcript {
+    Transcript {
+        words,
+        first_words_clipped: 0,
+    }
 }
 
 fn silent() -> Decoder {
@@ -210,7 +218,7 @@ fn with(
     let stages = Scripted {
         vocals,
         recognise,
-        heard,
+        heard: transcript(heard),
         slow: Duration::ZERO,
     };
     run(&Engine::new(loader(sung), silent(), None).with_stages(Box::new(stages)))
@@ -229,6 +237,62 @@ fn kept(a: &Aligned) -> bool {
         .lines
         .iter()
         .all(|l: &LineWords| l.placement == Some(Method::Kept))
+}
+
+#[test]
+fn the_song_says_how_many_first_words_were_clipped_and_anchors_started_late() {
+    let (sung, mut heard) = song();
+    // "low" heard from just after the line before it to where it was sung.
+    heard[3].start_s = 3.2;
+    heard[3].silent_lead = true;
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: Transcript {
+            words: heard,
+            first_words_clipped: 1,
+        },
+        slow: Duration::ZERO,
+    };
+    let (got, _) =
+        run(&Engine::new(loader(Some(sung)), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, None);
+    assert_eq!(got.placement.first_words_clipped, 1);
+    assert_eq!(got.placement.anchors_from_second_word, 1);
+}
+
+#[test]
+fn a_stage_failing_after_the_recogniser_still_says_how_many_first_words_it_clipped() {
+    let (sung, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: Transcript {
+            words: heard,
+            first_words_clipped: 2,
+        },
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(
+        &Engine::new(singers(Some(sung), "vulkan", true), silent(), None)
+            .with_stages(Box::new(stages)),
+    );
+    assert_eq!(got.placement.fallback, Some(Fallback::EmissionFailed));
+    assert_eq!(got.placement.first_words_clipped, 2);
+
+    let (_, heard) = song();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Fails,
+        heard: Transcript {
+            words: heard,
+            first_words_clipped: 2,
+        },
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(&Engine::new(loader(None), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::RecogniseFailed));
+    assert_eq!(got.placement.first_words_clipped, 0);
 }
 
 #[test]
@@ -340,7 +404,7 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
-        heard: Vec::new(),
+        heard: Transcript::default(),
         slow: Duration::ZERO,
     };
     let (got, events) =
@@ -374,7 +438,7 @@ fn every_song_with_a_transcript_carries_its_text_check() {
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
-        heard: heard("the lanterns swing in the orchard", 1.0),
+        heard: transcript(heard("the lanterns swing in the orchard", 1.0)),
         slow: Duration::ZERO,
     };
     let (got, _) =
@@ -401,12 +465,13 @@ fn a_song_sung_to_other_words_is_a_lyrics_mismatch() {
             start_s: 0.08 * k as f64,
             end_s: 0.08 * k as f64 + 0.05,
             prob: 0.9,
+            silent_lead: false,
         })
         .collect();
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
-        heard: other,
+        heard: transcript(other),
         slow: Duration::ZERO,
     };
     let (got, events) =
@@ -452,7 +517,7 @@ fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let stages = Scripted {
         vocals: Step::Panics,
         recognise: Step::Panics,
-        heard: Vec::new(),
+        heard: Transcript::default(),
         slow: Duration::ZERO,
     };
     let (got, events) =
@@ -472,7 +537,7 @@ fn panicking() -> Scripted {
     Scripted {
         vocals: Step::Panics,
         recognise: Step::Panics,
-        heard: Vec::new(),
+        heard: Transcript::default(),
         slow: Duration::ZERO,
     }
 }
@@ -553,7 +618,7 @@ fn an_emission_that_falls_back_to_the_cpu_fails_the_stage() {
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
-        heard,
+        heard: transcript(heard),
         slow: Duration::ZERO,
     };
     let (got, events) = run(
@@ -603,7 +668,7 @@ fn a_gpu_emission_that_fails_fails_the_stage_without_the_cpu_pass() {
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Works,
-        heard,
+        heard: transcript(heard),
         slow: Duration::ZERO,
     };
     let cpu_loads = Arc::new(AtomicUsize::new(0));
@@ -650,7 +715,7 @@ fn a_song_past_its_stage_budget_keeps_todays_answer_and_says_where_it_stopped() 
     let stages = Scripted {
         vocals: Step::Works,
         recognise: Step::Panics,
-        heard,
+        heard: transcript(heard),
         slow: Duration::from_millis(50),
     };
     let engine = Engine::new(loader(Some(sung)), silent(), None)
@@ -681,7 +746,7 @@ fn a_stage_that_fails_past_the_budget_is_a_timeout_naming_its_error() {
     let stages = Scripted {
         vocals: Step::Fails,
         recognise: Step::Works,
-        heard,
+        heard: transcript(heard),
         slow: Duration::from_millis(50),
     };
     let engine = Engine::new(loader(Some(sung)), silent(), None)
@@ -715,8 +780,8 @@ impl Stages for Watched {
         Ok(vec![0.0; SONG_S * RATE])
     }
 
-    fn recognise(&self, _: &[f32], _: Instant) -> Result<Vec<Word>, StageError> {
-        Ok(song().1)
+    fn recognise(&self, _: &[f32], _: Instant) -> Result<Transcript, StageError> {
+        Ok(transcript(song().1))
     }
 }
 
@@ -748,7 +813,7 @@ fn a_song_whose_stages_ended_the_last_process_skips_them() {
     let stages = Scripted {
         vocals: Step::Panics,
         recognise: Step::Panics,
-        heard: Vec::new(),
+        heard: Transcript::default(),
         slow: Duration::ZERO,
     };
     let engine = Engine::new(loader(Some(sung)), silent(), None)

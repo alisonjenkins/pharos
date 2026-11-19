@@ -348,6 +348,8 @@ fn run_song(
                 lines_held = p.held_lines,
                 text_recall,
                 heard_words,
+                first_words_clipped = p.first_words_clipped,
+                anchors_from_second_word = p.anchors_from_second_word,
                 fallback = p.fallback_label(),
                 fallback_reason = %a.fallback_reason,
                 lines_corrected = a.corrected,

@@ -487,6 +487,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
         let mut placement = Placement::kept(with_words, Fallback::LowAnchorShare);
         placement.anchor_share = Some(share);
         placement.dropped_anchors = n_dropped;
+        placement.anchors_from_second_word = matched.from_second_word;
         return Refined {
             lines: out,
             methods,
@@ -677,6 +678,7 @@ pub fn place(lines: &[Line], today: &[LineWords], matched: &Matched, song: &Song
     let mut placement = Placement::from_methods(methods.iter().flatten().copied(), share);
     placement.dropped_anchors = n_dropped;
     placement.held_lines = held;
+    placement.anchors_from_second_word = matched.from_second_word;
     Refined {
         lines: out,
         methods,
@@ -745,6 +747,7 @@ mod tests {
                 start_s: start_s + 0.5 * k as f64,
                 end_s: start_s + 0.5 * k as f64 + 0.4,
                 prob: 0.9,
+                silent_lead: false,
             })
             .collect()
     }
@@ -1242,6 +1245,7 @@ mod tests {
             start_s: 3.5 + 0.02 * k as f64,
             end_s: 3.5 + 0.02 * k as f64 + 0.015,
             prob: 0.9,
+            silent_lead: false,
         }));
         h.extend(heard("low tide hums", 5.0));
         let m = match_lines(&lines, &h, Options::default());
@@ -1279,6 +1283,7 @@ mod tests {
             start_s: 3.5 + 0.02 * k as f64,
             end_s: 3.5 + 0.02 * k as f64 + 0.015,
             prob: 0.9,
+            silent_lead: false,
         }));
         h.extend(heard("low tide hums", 5.6));
         let m = match_lines(&lines, &h, Options::default());
