@@ -279,6 +279,16 @@ pub enum Registration {
     NotOpened(String),
 }
 
+/// Whether a registration attempt is done with, for a caller that retries
+/// until it is (the service's init hook): only once a store is published.
+/// `AlreadyOpened` with nothing published is another caller still opening
+/// the store, which may yet fail before it opens and give the claim back:
+/// not done, so the retry goes on.
+#[cfg(any(feature = "mobile", test))]
+pub fn registration_done(_outcome: &Registration, published: bool) -> bool {
+    published
+}
+
 /// Why `register_video_root`'s `register` failed: before the store was
 /// opened on the root (nothing to protect, so the claim is given back) or
 /// after it may have been (the claim is kept: a second store would run
@@ -755,6 +765,52 @@ mod tests {
             "a store that never opened kept the claim"
         );
         assert_eq!(hooks.get(), 1, "a second hook");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two attempts overlap: the second finds the root claimed while the
+    /// first is opening, and is not done, since nothing is published. The
+    /// first then fails before it opens and gives the claim back; a later
+    /// retry opens and registers the store, and only then is it done.
+    #[test]
+    fn an_attempt_that_found_the_store_opening_is_not_done_until_one_is_published() {
+        use std::cell::{Cell, RefCell};
+        let root =
+            std::env::temp_dir().join(format!("pharos-register-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let once = OpenOnce::new();
+        let published = Cell::new(false);
+        let second = RefCell::new(None);
+        let first = register_video_root(
+            &root,
+            &once,
+            || {},
+            || {
+                // The service's retry, while this caller is opening.
+                let outcome = register_video_root(&root, &once, || {}, || Ok(()));
+                let done = registration_done(&outcome, published.get());
+                *second.borrow_mut() = Some((outcome, done));
+                Err(RegisterFailed::BeforeOpen("video thread: no".to_owned()))
+            },
+        );
+        assert!(matches!(first, Registration::NotOpened(_)), "{first:?}");
+        assert!(!registration_done(&first, published.get()));
+        assert_eq!(
+            second.take(),
+            Some((Registration::AlreadyOpened, false)),
+            "an attempt that found the store opening said it was done"
+        );
+        let retry = register_video_root(
+            &root,
+            &once,
+            || {},
+            || {
+                published.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(retry, Registration::Registered);
+        assert!(registration_done(&retry, published.get()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

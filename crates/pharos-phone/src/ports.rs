@@ -323,8 +323,8 @@ static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
 /// Claimed by the first `register_video_at`, before it touches the folder.
 static OPENED: pharos_ui::native::ports::OpenOnce = pharos_ui::native::ports::OpenOnce::new();
 
-/// Whether a store is, or is being, registered on `root`: `false` only when
-/// none was opened and a later caller may try again.
+/// Whether a store is published, so the service's init is done; `false`
+/// while none is (a later caller tries again).
 fn register_video_at(root: std::path::PathBuf) -> bool {
     use pharos_ui::native::ports::{register_video_root, Registration};
     let outcome = register_video_root(
@@ -336,9 +336,11 @@ fn register_video_at(root: std::path::PathBuf) -> bool {
             pharos_ui::native::register_phone_video_store(root.clone(), budget)
         },
     );
-    let settled = !matches!(
-        outcome,
-        Registration::NoFolder(_) | Registration::NotOpened(_)
+    // Done only once a store is published: one still being opened by
+    // another caller may fail before it opens and give the claim back.
+    let settled = pharos_ui::native::ports::registration_done(
+        &outcome,
+        pharos_ui::native::ports::video_store().is_some(),
     );
     match outcome {
         // The first caller may still be opening the store: the UI's readers
