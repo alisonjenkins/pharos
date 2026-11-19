@@ -275,8 +275,18 @@ pub struct Cache {
     /// (or failed) yet, by track id: free space does not lack them yet, but
     /// it will. A host admitting its own downloads against the same free
     /// space takes them off it (`reserved_bytes`). Written only under the
-    /// shared admission lock.
-    reserved: Mutex<std::collections::HashMap<String, u64>>,
+    /// shared admission lock. Each reservation keeps what its `.part` held
+    /// when it was made: the bytes written since come off what is still
+    /// owed, so a host never counts them both on disk and as owed.
+    reserved: Mutex<std::collections::HashMap<String, Reservation>>,
+}
+
+/// What one approved music write still had to add, and from where.
+#[derive(Debug, Clone, Copy)]
+struct Reservation {
+    bytes: u64,
+    /// The `.part`'s length when the reservation was made.
+    at_len: u64,
 }
 
 /// Space available to an unprivileged writer, as `df` reports it.
@@ -956,12 +966,29 @@ impl Cache {
     }
 
     fn reserve(&self, id: &str, bytes: u64) {
+        let at_len = self.part_len(id);
         let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes == 0 {
             r.remove(id);
         } else {
-            r.insert(id.to_owned(), bytes);
+            r.insert(id.to_owned(), Reservation { bytes, at_len });
         }
+    }
+
+    /// `id`'s reservation and the `.part` length it was made at (tests).
+    #[cfg(test)]
+    pub(crate) fn reservation(&self, id: &str) -> Option<(u64, u64)> {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|r| (r.bytes, r.at_len))
+    }
+
+    /// The length of `id`'s `.part`; 0 when there is none (or it cannot
+    /// be read: what is owed is then the whole reservation, never less).
+    fn part_len(&self, id: &str) -> u64 {
+        std::fs::metadata(self.part_path(id)).map_or(0, |m| m.len())
     }
 
     /// Drops what was reserved for `id`: its write landed, failed or was
@@ -980,12 +1007,18 @@ impl Cache {
 
     /// What approved music writes have yet to add to the disk. Read under
     /// the shared admission lock by a host that admits against free space.
+    ///
+    /// Each reservation counts only what its write has yet to add: the bytes
+    /// its `.part` has gained since the reservation are on disk, where
+    /// [`Cache::in_progress_bytes`] counts them (and free space lacks them),
+    /// so they come off here. Written and owed are then read from the same
+    /// point, and their sum is the reservation's whole claim, once.
     pub fn reserved_bytes(&self) -> u64 {
-        self.reserved
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .fold(0, |a, b| a.saturating_add(*b))
+        let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        r.iter().fold(0u64, |sum, (id, v)| {
+            let written = self.part_len(id).saturating_sub(v.at_len);
+            sum.saturating_add(v.bytes.saturating_sub(written))
+        })
     }
 
     /// Bytes in every `.part` file in the cache folder, reserved or not. A
@@ -1481,6 +1514,30 @@ mod tests {
         );
         assert!(c.is_complete("track/b"));
         assert_eq!(c.in_progress_bytes(), Some(500));
+    }
+
+    /// Bytes a reserved write has put on disk since its reservation are not
+    /// owed any more: the reservation and the `.part` together claim what
+    /// was approved, once, before the next refresh as after it.
+    #[test]
+    fn bytes_written_since_a_reservation_are_not_also_owed() {
+        let d = tmp("reserve-written");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(c.part_path("track/x"), vec![0u8; 6]).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            94,
+            "the written bytes are still counted as owed"
+        );
+        assert_eq!(
+            c.reserved_bytes() + c.in_progress_bytes().unwrap(),
+            100,
+            "the written bytes were counted twice"
+        );
+        // More than reserved landed: nothing is owed, never less than 0.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 150]).unwrap();
+        assert_eq!(c.reserved_bytes(), 0);
     }
 
     /// What `ensure_free` approves is reserved until the write lands or the

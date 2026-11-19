@@ -1931,16 +1931,22 @@ mod tests {
             assert!(waited < 10_000, "the server never reached the hold");
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The window is claimed whole: what is still owed of it, and what
+        // has landed of it in the `.part` (never counted as owed too).
+        let claim = || {
+            lib.music_outstanding_bytes()
+                .saturating_add(lib.music_in_progress_bytes().unwrap_or(0))
+        };
         let mut waited = 0;
-        while lib.music_outstanding_bytes() < FREE_CHECK_BYTES {
+        while claim() < FREE_CHECK_BYTES {
             waited += 1;
-            assert!(
-                waited < 10_000,
-                "never outstanding: {}",
-                lib.music_outstanding_bytes()
-            );
+            assert!(waited < 10_000, "never outstanding: {}", claim());
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            lib.music_outstanding_bytes() < FREE_CHECK_BYTES,
+            "the bytes already written are still counted as owed"
+        );
         release.store(true, Ordering::SeqCst);
         let o = lib.offline.get().unwrap();
         assert!(o.downloader.wait_idle(Duration::from_secs(20)));

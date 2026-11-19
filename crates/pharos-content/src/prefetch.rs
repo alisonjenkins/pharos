@@ -1794,7 +1794,9 @@ mod tests {
                     .unwrap()
                     .as_ref()
                     .and_then(std::sync::Weak::upgrade)
-                    .map_or(0, |c| c.reserved_bytes());
+                    .map_or(0, |c| {
+                        c.reserved_bytes() + c.in_progress_bytes().unwrap_or(0)
+                    });
                 seen2.lock().unwrap().push(reserved);
                 Ok(u64::MAX)
             }),
@@ -1803,8 +1805,8 @@ mod tests {
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         // Reads: the job's check, the check before writing, then each check
-        // while writing; the last two see the window reserved by the one
-        // before.
+        // while writing; the last two see the window claimed by the one
+        // before (what is still owed of it and what has landed of it).
         let seen = seen.lock().unwrap().clone();
         assert!(seen.len() >= 3, "{seen:?}");
         assert_eq!(seen[2], FREE_CHECK_BYTES, "window not reserved: {seen:?}");
@@ -1899,8 +1901,10 @@ mod tests {
         let chunk = 5_000_000usize;
         let size = chunk * 4;
         let slot: Arc<Mutex<Option<std::sync::Weak<Cache>>>> = Arc::default();
-        // (bytes on disk, reserved) at each check.
-        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+        // (bytes on disk, the reservation and where it was made) at each
+        // check.
+        type Seen = Arc<Mutex<Vec<(u64, (u64, u64))>>>;
+        let seen: Seen = Arc::default();
         let (slot2, seen2) = (slot.clone(), seen.clone());
         let r = rig_with_free(
             "crossing",
@@ -1919,7 +1923,8 @@ mod tests {
                     .and_then(std::sync::Weak::upgrade);
                 if let Some(c) = cache.as_ref() {
                     let on_disk = std::fs::metadata(c.part_path("track/1")).map_or(0, |m| m.len());
-                    seen2.lock().unwrap().push((on_disk, c.reserved_bytes()));
+                    let held = c.reservation("track/1").unwrap_or((0, on_disk));
+                    seen2.lock().unwrap().push((on_disk, held));
                 }
                 Ok(u64::MAX)
             }),
@@ -1929,14 +1934,14 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         let seen = seen.lock().unwrap().clone();
         assert!(seen.len() >= 3, "{seen:?}");
-        // A check sees the reservation the one before it made: what reached
-        // the disk since then must be within it.
-        for pair in seen.windows(2) {
-            let ((was, _), (now, reserved)) = (pair[0], pair[1]);
+        // A check sees the reservation still in force, made by the check
+        // before it: what reached the disk since the length it recorded
+        // must be within it.
+        for &(now, (reserved, from)) in &seen {
             assert!(
-                now - was <= reserved,
+                now.saturating_sub(from) <= reserved,
                 "{} bytes written past a reservation of {reserved}: {seen:?}",
-                now - was
+                now.saturating_sub(from)
             );
         }
     }
