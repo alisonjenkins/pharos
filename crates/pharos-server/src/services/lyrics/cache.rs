@@ -164,14 +164,17 @@ impl DiskCache {
         }
     }
 
-    /// Keep the provider's answer, unless the song as tagged now was
-    /// repicked: a lookup that was in flight then answered with the record
-    /// the repick replaced. Blocking; a failure is logged and the answer is
-    /// only lost, never wrong.
+    /// Keep the provider's answer, unless the song was repicked: a lookup
+    /// that was in flight then answered with the record the repick
+    /// replaced. Blocking; a failure is logged and the answer is only lost,
+    /// never wrong.
     pub fn put(&self, id: u64, provider: &str, song: &Song, found: Option<&Lyrics>) {
         self.put_at(id, provider, song, found, now_secs());
     }
 
+    /// [`Self::put`] for an answer asked for at `at`, Unix seconds. A repick
+    /// written since then stands whatever song it was for, as the item may
+    /// have been retagged while the lookup ran.
     pub(super) fn put_at(
         &self,
         id: u64,
@@ -196,7 +199,11 @@ impl DiskCache {
             .writing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if repick.is_none() && self.repicked(id, provider, song) {
+        let standing_repick = repick.is_none()
+            && self.read(id).is_some_and(|r| {
+                r.repick.is_some() && (r.key == key(provider, song) || r.fetched_at >= at)
+            });
+        if standing_repick {
             tracing::debug!(
                 media.id = id,
                 provider,
@@ -257,7 +264,7 @@ pub(super) fn key(provider: &str, song: &Song) -> String {
     .to_string()
 }
 
-fn now_secs() -> u64 {
+pub(super) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -434,10 +441,25 @@ mod tests {
         );
         let mut retagged = song();
         retagged.title = "Song (Live)".into();
-        cache.put(7, "lrclib", &retagged, None);
+        cache.put_at(7, "lrclib", &retagged, None, now_secs() + 1);
         assert!(matches!(
             cache.get(7, "lrclib", &retagged),
             Some(Cached::Missing { .. })
         ));
+    }
+
+    /// A lookup asked before the item was retagged and repicked does not
+    /// replace the repick when it answers.
+    #[test]
+    fn a_lookup_asked_before_a_retag_does_not_replace_its_repick() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        let asked = now_secs() - 5;
+        let mut retagged = song();
+        retagged.title = "Song (Live)".into();
+        cache.put_repicked(7, "lrclib", &retagged, &words(), Some(42));
+        cache.put_at(7, "lrclib", &song(), None, asked);
+        assert!(cache.repicked(7, "lrclib", &retagged));
+        assert_eq!(cache.get(7, "lrclib", &song()), None);
     }
 }
