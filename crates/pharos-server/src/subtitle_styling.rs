@@ -1529,6 +1529,7 @@ mod tests {
             ],
             offset_ms: 0,
             scores: vec![Some(640), None],
+            mismatch: None,
         };
         let sung = sung_lines(4, &[1, 3], &answer);
         assert_eq!(sung.len(), 4);
