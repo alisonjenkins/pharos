@@ -1889,20 +1889,23 @@ mod tests {
         });
         // Version B now, served whole whatever the range.
         r.srv.edit(|s| s.etag("vB").ignore_range());
-        // The outside figure is unknown for one ask only: the third, which
-        // is the room check for version B's body (the first is installing
-        // the figure, the second the retry's preflight).
+        // The outside figure is unknown for one ask only: the second once
+        // the figure is installed (installing it trims, which asks too),
+        // which is the room check for version B's body (the first is the
+        // retry's preflight).
         let asked = Arc::new(AtomicUsize::new(0));
-        let a = asked.clone();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (a, on) = (asked.clone(), armed.clone());
         r.cache
             .set_outside_used(Arc::new(move || crate::cache::OutsideBytes {
                 held: 0,
                 outstanding: 0,
-                unknown: a.fetch_add(1, Ordering::SeqCst) + 1 == 3,
+                unknown: on.load(Ordering::SeqCst) && a.fetch_add(1, Ordering::SeqCst) + 1 == 2,
             }));
+        armed.store(true, Ordering::SeqCst);
         r.dl.set_online(false);
         r.dl.set_online(true);
-        wait("the refusal", &|| asked.load(Ordering::SeqCst) >= 3);
+        wait("the refusal", &|| asked.load(Ordering::SeqCst) >= 2);
         assert_eq!(r.srv.seen().len(), 2, "{:?}", r.srv.seen());
         assert_eq!(
             std::fs::metadata(&part).map(|m| m.len()).ok(),

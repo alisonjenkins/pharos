@@ -900,7 +900,8 @@ impl Cache {
         // active download's file is safe, and an eviction does not change
         // the figure. They are read once, not per victim (this runs under
         // the shared admission lock), and once more before the cache is
-        // declared within the cap, since a download may have written since.
+        // declared within the cap, since a download may have written since:
+        // that recheck runs on the first fit too, not only after an evict.
         // An incomplete scan counts what it did read, a lower bound: the
         // cache trims for at least that much and never deletes on a guess.
         let parts_now = || {
@@ -919,7 +920,7 @@ impl Cache {
                 f();
             }
         });
-        let mut fresh = true;
+        let mut fresh = false;
         let mut evicted = Vec::new();
         loop {
             let (_, music) = Self::totals(s);
@@ -1601,6 +1602,34 @@ pub(crate) mod tests {
             "a discard took the counted part off mid-trim"
         );
         assert!(!part.exists(), "the discard ran once the trim was done");
+    }
+
+    /// A trim that fits on its first part scan reads the parts once more
+    /// before it declares the cache within the cap: a download that wrote
+    /// after the scan is counted, and a track goes for it.
+    #[test]
+    fn a_part_that_grows_after_the_first_scan_is_counted_before_a_fit() {
+        let d = tmp("trim-grow");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        let part = c.part_path("track/p");
+        std::fs::write(&part, vec![0u8; 20]).unwrap();
+        let grown = part.clone();
+        AFTER_TRIM_SCAN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = std::fs::write(&grown, vec![0u8; 100]);
+            }));
+        });
+        // 100 finished + 20 part fits 150 on the first scan; the part is
+        // 100 by the time the trim decides, so the track must go.
+        c.set_cap(150).unwrap();
+        AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            c.used_bytes(),
+            0,
+            "the trim declared a fit on a stale part scan"
+        );
     }
 
     /// A reservation made while its `.part`'s length could not be read
