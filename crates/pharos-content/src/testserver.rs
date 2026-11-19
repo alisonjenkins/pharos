@@ -244,6 +244,11 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     let send = drop_after.map_or(reply.body.len(), |n| n.min(reply.body.len()));
     let part = reply.body.get(..send).unwrap_or_default();
     let at = hold.as_ref().map(|h| h.at);
+    // A hold at 0 stops after the headers, before any body byte: no piece
+    // ends there, so the loops below never reach it.
+    if at == Some(0) {
+        wait_at(hold.as_ref()).await;
+    }
     if reply.chunked {
         for (start, end) in pieces(part.len(), piece, at) {
             let piece = part.get(start..end).unwrap_or_default();
@@ -398,6 +403,10 @@ mod tests {
                 Err(_) => waited += 1,
             }
         }
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the hold was never reached"
+        );
         let head = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         got.split_off(head)
     }
@@ -433,6 +442,17 @@ mod tests {
             .map(|c| c[1].len())
             .sum();
         assert_eq!(data, 5_000, "the chunked body went past its hold");
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // A hold at 0: the headers, and no body byte.
+        let (script, release, reached) =
+            Script::default().file("/z", vec![7; 10_000]).hold_after(0);
+        let body = body_at_hold(script, "/z", &reached);
+        assert!(
+            body.is_empty(),
+            "{} body bytes went past a hold at 0",
+            body.len()
+        );
         release.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
