@@ -235,17 +235,14 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         .find_map(|kv| kv.strip_prefix("api_key="))
         .map(str::to_owned);
 
-    let (piece, hold, etag) = {
-        let s = state.lock().unwrap_or_else(PoisonError::into_inner);
-        (
-            s.piece,
-            s.hold.clone(),
-            s.etag.clone().unwrap_or_else(|| "v1".to_owned()),
-        )
-    };
-    let piece = if piece == 0 { 8192 } else { piece };
-    let (reply, drop_after) = {
+    // One snapshot of the script per request: the body, its etag and how
+    // it is paced all come from the same lock, so a test changing the
+    // script mid-request never pairs one version's body with another's.
+    let (piece, hold, etag, (reply, drop_after)) = {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let piece = s.piece;
+        let hold = s.hold.clone();
+        let etag = s.etag.clone().unwrap_or_else(|| "v1".to_owned());
         let r = plan(&mut s, path, token.as_deref(), range.as_deref());
         s.log.push(Seen {
             path: path.to_owned(),
@@ -253,8 +250,9 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
             if_range,
             status: r.0.status,
         });
-        r
+        (piece, hold, etag, r)
     };
+    let piece = if piece == 0 { 8192 } else { piece };
     let mut out = format!("HTTP/1.1 {} X\r\nConnection: close\r\n", reply.status).into_bytes();
     if let Some(cr) = &reply.content_range {
         out.extend_from_slice(format!("Content-Range: {cr}\r\n").as_bytes());
