@@ -1895,6 +1895,9 @@ mod tests {
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         for at in ["sign_out", "revoked"] {
+            // Each case starts signed in, so the sign-out is what moves it.
+            shared.set_auth(AuthState::SignedIn);
+            assert_eq!(shared.lock().auth, AuthState::SignedIn, "{at}");
             token::store(&token_path, "tok").unwrap();
             crate::testlog::start();
             crate::token::tests::DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
