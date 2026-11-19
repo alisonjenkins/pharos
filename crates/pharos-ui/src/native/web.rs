@@ -4154,8 +4154,8 @@ pub fn token_user_if(_seen: &str) -> Result<Option<String>, String> {
 }
 
 /// Drops an ended session's device token; there is none here.
-pub fn forget_token_if(_seen: &str) -> bool {
-    true
+pub fn forget_token_if(_seen: &str, _user: Option<&str>) -> super::offline_video::TokenEnd {
+    super::offline_video::TokenEnd::Forgotten
 }
 
 /// Keeps `user` with the device token; nothing to do where there is none.

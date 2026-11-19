@@ -233,7 +233,10 @@ pub fn forget_token() -> token_file::SignedOut {
     drop_legacy_user(&path);
     let verdict = token_file::sign_out(&path);
     KEPT_AFTER_SIGN_OUT.store(
-        matches!(verdict, token_file::SignedOut::NotSaved(_)),
+        matches!(
+            verdict,
+            token_file::SignedOut::NotSaved(_) | token_file::SignedOut::Marked(_)
+        ),
         std::sync::atomic::Ordering::SeqCst,
     );
     note_credentials_changed("forgotten");
@@ -246,33 +249,31 @@ pub fn forget_token() -> token_file::SignedOut {
 static KEPT_AFTER_SIGN_OUT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Drops the token a resume was refused with, only while it is still the
-/// one on file. False when a sign-in replaced it since: the replacement is
-/// kept, for the caller to resume with.
-pub fn forget_refused_token(refused: &str) -> bool {
-    let Ok(path) = token_path() else {
-        set_cached(None);
-        return true;
-    };
-    let forgot = match token_file::forget_if(&path, refused) {
-        Ok(token_file::ForgetIf::Changed) => {
-            log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
-            return false;
-        }
-        Ok(token_file::ForgetIf::Forgotten(token_file::Forgotten::Durable)) => true,
-        Ok(token_file::ForgetIf::Forgotten(token_file::Forgotten::NotDurable(why))) => {
-            log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
-            true
-        }
+/// Drops the token a session ended (or a resume was refused) with, only
+/// while it is still the one on file, and says what happened
+/// (`token_file::end_session`): `Changed` when a sign-in replaced it since
+/// (kept, for the caller to resume with), `Marked` when it would not go but
+/// is marked revoked for `user`, `Unsafe` when neither could be written.
+pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::Ended {
+    let path = match token_path() {
+        Ok(path) => path,
         Err(e) => {
-            log::warn!("forget token: {e}");
-            true
+            set_cached(None);
+            return token_file::Ended::Unsafe {
+                removal: e,
+                marker: "no token path".to_owned(),
+            };
         }
     };
+    let ended = token_file::end_session(&path, Some(refused), user);
+    if ended == token_file::Ended::Changed {
+        log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
+        return ended;
+    }
     set_cached(None);
     drop_legacy_user(&path);
     note_credentials_changed("forgotten");
-    forgot
+    ended
 }
 
 /// Tells the host app the token file changed, so the car's media service in

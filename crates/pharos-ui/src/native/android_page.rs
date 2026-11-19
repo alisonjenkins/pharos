@@ -218,7 +218,7 @@ impl offline_video::Resumer for PhoneResumer<'_> {
     }
 
     fn forget_token(&self, refused: &str) -> bool {
-        android::forget_refused_token(refused)
+        android::forget_refused_token(refused, None) != super::token_file::Ended::Changed
     }
 }
 
@@ -2038,8 +2038,8 @@ pub fn token_user_if(seen: &str) -> Result<Option<String>, String> {
 /// Drops the device token an ended session was opened with, only while it
 /// is still the one on file (`token_file::forget_if`): a replacement a new
 /// sign-in stored is kept. False when it was kept.
-pub fn forget_token_if(seen: &str) -> bool {
-    android::forget_refused_token(seen)
+pub fn forget_token_if(seen: &str, user: Option<&str>) -> super::offline_video::TokenEnd {
+    android::forget_refused_token(seen, user).into()
 }
 
 /// Keeps `user` with the device token, at sign-in, only while the token on

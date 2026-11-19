@@ -867,34 +867,106 @@ fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
 /// them, and an offline restart would show their downloads again. An
 /// outage never comes here (the machine keeps the session).
 pub fn session_ended() {
-    let ended = with_id(|s| s.session_token.take());
+    let (ended, user) = with_id(|s| {
+        let user = match &s.identity {
+            Identity::User(u) | Identity::Fenced(u) => Some(u.clone()),
+            _ => None,
+        };
+        (s.session_token.take(), user)
+    });
     forget_user();
     let Some(token) = ended.and_then(|t| t.0) else {
         super::platform::info("pharos: token forget verdict=none reason=no_session_token");
         return;
     };
-    let forgot = forget_session_token(&token);
-    super::platform::info(&format!(
-        "pharos: token forget verdict={} reason=session_ended",
-        if forgot {
-            "forgotten"
-        } else {
-            "kept_replacement"
-        }
-    ));
+    let outcome = forget_session_token(&token, user.as_deref());
+    note_session_token(&outcome, user.as_deref());
 }
 
-/// Drops `token` only while it is the one on file. False when a new
-/// sign-in replaced it.
-fn forget_session_token(token: &str) -> bool {
+/// What a session's end did to its device token, on every platform (the
+/// phone's `token_file::Ended`; nothing to do where there is no token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenEnd {
+    /// Gone, or there was none.
+    Forgotten,
+    /// Gone, but its folder could not be synced (why).
+    ForgottenNotDurable(String),
+    /// A sign-in replaced it since: the replacement is kept.
+    KeptReplacement,
+    /// It would not go (why), but a synced marker names it revoked.
+    Marked(String),
+    /// Neither removed nor marked: a restart may resume its account.
+    Unsafe { removal: String, marker: String },
+}
+
+impl TokenEnd {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Forgotten => "forgotten",
+            Self::ForgottenNotDurable(_) => "forgotten_not_durable",
+            Self::KeptReplacement => "kept_replacement",
+            Self::Marked(_) => "marked_revoked",
+            Self::Unsafe { .. } => "restart_unsafe",
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+impl From<super::token_file::Ended> for TokenEnd {
+    fn from(e: super::token_file::Ended) -> Self {
+        use super::token_file::{Ended, Forgotten};
+        match e {
+            Ended::Forgotten(Forgotten::Durable) => Self::Forgotten,
+            Ended::Forgotten(Forgotten::NotDurable(why)) => Self::ForgottenNotDurable(why),
+            Ended::Changed => Self::KeptReplacement,
+            Ended::Marked(why) => Self::Marked(why),
+            Ended::Unsafe { removal, marker } => Self::Unsafe { removal, marker },
+        }
+    }
+}
+
+/// Logs what a session's end did to its token, at warn when the token stayed.
+fn note_session_token(outcome: &TokenEnd, user: Option<&str>) {
+    let user = user.unwrap_or("");
+    let line = match outcome {
+        TokenEnd::Forgotten | TokenEnd::KeptReplacement => {
+            let line = format!(
+                "pharos: token forget verdict={} reason=session_ended user={user}",
+                outcome.label()
+            );
+            super::platform::info(&line);
+            line
+        }
+        TokenEnd::ForgottenNotDurable(why) | TokenEnd::Marked(why) => {
+            let line = format!(
+                "pharos: token forget verdict={} reason=session_ended user={user} error={why}",
+                outcome.label()
+            );
+            super::platform::warn(&line);
+            line
+        }
+        TokenEnd::Unsafe { removal, marker } => {
+            let line = format!(
+                "pharos: token forget verdict=restart_unsafe reason=session_ended user={user} removal_error={removal} marker_error={marker} restart_safety=not_guaranteed"
+            );
+            super::platform::warn(&line);
+            line
+        }
+    };
+    #[cfg(test)]
+    tests::LOGGED.with(|l| l.borrow_mut().push(line));
+    #[cfg(not(test))]
+    let _ = line;
+}
+
+/// Drops `token` only while it is the one on file, marking it revoked for
+/// `user` when it will not go.
+fn forget_session_token(token: &str, user: Option<&str>) -> TokenEnd {
     #[cfg(test)]
     if let Some(path) = tests::PREF.with(|p| p.borrow().as_ref().and_then(tests::Pref::file)) {
-        return !matches!(
-            super::token_file::forget_if(&path, token),
-            Ok(super::token_file::ForgetIf::Changed)
-        );
+        return super::token_file::end_session(&path, Some(token), user).into();
     }
-    super::platform::forget_token_if(token)
+    super::platform::forget_token_if(token, user)
 }
 
 /// Notes a sign-out. Nobody is signed in from this call on, whatever the
@@ -1981,6 +2053,63 @@ pub(crate) mod tests {
                 "the replacement token was dropped"
             );
         });
+    }
+
+    /// A's session ends and A's token will not go: it is marked revoked, so
+    /// an offline restart (with the preference still naming A) restores
+    /// nobody. With the marker unwritable too, the end says a restart is not
+    /// safe.
+    #[test]
+    fn a_session_end_whose_token_will_not_go_marks_it_and_restores_nobody() {
+        use super::super::token_file;
+        use pharos_content::token::faults;
+        let d = TmpDir::new("session-end-marked");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        for both_fail in [false, true] {
+            token_file::store(&path, "tokA").unwrap();
+            run(async {
+                let resumer = FakeResumer::new(&path);
+                let Resumed::Opened(session_a) = resume_session(&resumer).await else {
+                    panic!("A's token did not open A's session");
+                };
+                session_replaced(&session_a);
+                assert!(me_request(true, Some(session_a)).unwrap().answered("A"));
+            });
+            p.fail_write.set(true);
+            LOGGED.with(|l| l.borrow_mut().clear());
+            faults::REMOVE.with(|f| f.set(true));
+            faults::MARKER.with(|f| f.set(both_fail));
+            session_ended();
+            faults::REMOVE.with(|f| f.set(false));
+            faults::MARKER.with(|f| f.set(false));
+            assert!(path.exists(), "the fault removed the token");
+            let lines = logged("pharos: token forget");
+            if both_fail {
+                assert!(
+                    lines.iter().any(|l| l.contains("verdict=restart_unsafe")
+                        && l.contains("restart_safety=not_guaranteed")
+                        && l.contains("user=A")),
+                    "{lines:?}"
+                );
+            } else {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("verdict=marked_revoked") && l.contains("user=A")),
+                    "{lines:?}"
+                );
+                // An offline restart: the preference and the token both
+                // still name A.
+                set_identity(Identity::Unknown);
+                assert_eq!(last_user(), None, "the revoked user came back offline");
+            }
+            p.fail_write.set(false);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(pharos_content::token::revoked_path(&path));
+            set_identity(Identity::Unknown);
+        }
     }
 
     /// The late store, end to end on the host, through the code the phone

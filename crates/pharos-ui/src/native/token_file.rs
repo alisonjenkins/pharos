@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use pharos_content::token::{ForgetIf, Forgotten, Pairing, Stored};
+pub use pharos_content::token::{Ended, ForgetIf, Forgotten, Pairing, Stored};
 
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.
@@ -73,8 +73,11 @@ pub enum SignedOut {
     /// Gone for every reader, but the folder could not be synced: a crash
     /// may bring it back.
     SavedNotDurable(String),
-    /// The file could not be removed: the token is still on file, and a
-    /// restart would resume the account with it.
+    /// The file could not be removed (why), but a synced revocation marker
+    /// names it: nothing resumes from it, here or after a restart.
+    Marked(String),
+    /// The file could not be removed nor marked revoked: the token is still
+    /// on file, and a restart would resume the account with it.
     NotSaved(String),
 }
 
@@ -82,17 +85,32 @@ pub enum SignedOut {
 /// reports: an unlink that failed is kept apart from an unlink whose
 /// folder sync failed.
 pub fn sign_out(path: &Path) -> SignedOut {
-    match forget(path) {
-        Ok(Forgotten::Durable) => SignedOut::Saved,
-        Ok(Forgotten::NotDurable(why)) => {
+    match end_session(path, None, None) {
+        Ended::Forgotten(Forgotten::Durable) | Ended::Changed => SignedOut::Saved,
+        Ended::Forgotten(Forgotten::NotDurable(why)) => {
             log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
             SignedOut::SavedNotDurable(why)
         }
-        Err(why) => {
-            log::warn!("pharos: token forget verdict=not_removed reason={why}");
-            SignedOut::NotSaved(why)
+        Ended::Marked(why) => {
+            log::warn!(
+                "pharos: token forget verdict=marked_revoked reason=token_not_removed error={why}"
+            );
+            SignedOut::Marked(why)
+        }
+        Ended::Unsafe { removal, marker } => {
+            log::warn!(
+                "pharos: token forget verdict=not_removed reason={removal} marker_error={marker}"
+            );
+            SignedOut::NotSaved(removal)
         }
     }
+}
+
+/// Ends a session's hold on the token (`pharos_content::token::end_session`):
+/// the token goes while it is `seen` (any with `None`), a replacement is
+/// kept, and one that will not go is marked revoked for `user`.
+pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
+    pharos_content::token::end_session(path, seen, user)
 }
 
 /// Removes the token and its user only while the token on file is `seen`
