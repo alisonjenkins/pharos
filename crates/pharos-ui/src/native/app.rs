@@ -2812,7 +2812,8 @@ fn offline_start(route: &Route) -> Option<Element> {
             });
         }
     }
-    let others = offline_start_books(route);
+    // The same read decides the screen and the logged verdict.
+    let others = offline_start_books(route, videos.len());
     platform::info(&format!(
         "pharos: offline start verdict={} videos={} books_or_music={}",
         if others.is_some() || !videos.is_empty() {
@@ -2837,7 +2838,7 @@ fn offline_start(route: &Route) -> Option<Element> {
 /// the reader when a kept book was asked for. `None` when nothing is kept,
 /// so the usual waiting page shows. Two builds have one: the browser (kept books) and the phone (downloads).
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-fn offline_start_books(route: &Route) -> Option<Element> {
+fn offline_start_books(route: &Route, _videos: usize) -> Option<Element> {
     let store = super::kept_web::read()?;
     Some(match route {
         Route::Read(id) if store.find(&id.to_string()).is_some() => {
@@ -2850,8 +2851,8 @@ fn offline_start_books(route: &Route) -> Option<Element> {
 /// The phone: the music and books downloaded on it, which play without the
 /// server. `None` where no store is registered or nothing is downloaded.
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-fn offline_start_books(_route: &Route) -> Option<Element> {
-    super::offline_start::start()
+fn offline_start_books(_route: &Route, videos: usize) -> Option<Element> {
+    super::offline_start::start(videos)
 }
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]

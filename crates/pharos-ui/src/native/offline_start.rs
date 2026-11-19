@@ -243,17 +243,25 @@ pub fn any_downloaded() -> bool {
 }
 
 /// The offline home, or `None` for the waiting page. Logs the decision.
-pub fn start() -> Option<Element> {
+/// `videos` is the ready-video count the caller's render shows (V1465), so
+/// the logged verdict describes that render, not a later read of a store
+/// published in between.
+pub fn start(videos: usize) -> Option<Element> {
+    let decision = start_decision(videos);
+    log_decision(&decision);
+    (decision.verdict == Verdict::OfflineHome).then(|| rsx! { OfflineStart {} })
+}
+
+/// The cut-off decision over the registered ports and the caller's
+/// `videos` count.
+fn start_decision(videos: usize) -> Decision {
     let store = offline_store();
     let can_play = store.is_some() && native_audio().is_some();
     let items = match (&store, can_play) {
         (Some(store), true) => current_items(&**store).1.len(),
         _ => 0,
     };
-    let videos = super::offline_video::ready_for_last_user().len();
-    let decision = decide(true, can_play, items, videos);
-    log_decision(&decision);
-    (decision.verdict == Verdict::OfflineHome).then(|| rsx! { OfflineStart {} })
+    decide(true, can_play, items, videos)
 }
 
 #[derive(Clone)]
@@ -750,9 +758,19 @@ mod tests {
         assert!(html.contains("pharos-download-head"), "{html}");
     }
 
+    /// The decision counts the videos the caller's render read, not a read
+    /// of its own: with no store published here, a second read finds none.
+    #[test]
+    fn the_start_decision_counts_the_videos_its_caller_shows() {
+        assert!(super::super::offline_video::ready_for_last_user().is_empty());
+        let d = start_decision(2);
+        assert_eq!((d.verdict, d.videos), (Verdict::VideosOnly, 2));
+        assert_eq!(start_decision(0).verdict, Verdict::Waiting);
+    }
+
     #[test]
     fn without_registered_ports_the_start_falls_back_to_the_waiting_page() {
-        assert!(start().is_none());
+        assert!(start(0).is_none());
         let mut dom = VirtualDom::new(|| rsx! { OfflineStart {} });
         dom.rebuild_in_place();
         assert_eq!(dioxus_ssr::render(&dom), "");
