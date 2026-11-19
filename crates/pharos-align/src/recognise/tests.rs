@@ -136,7 +136,7 @@ fn a_clipped_word_is_sung_for_at_least_and_at_most_a_bound() {
 fn a_first_word_within_the_bound_keeps_whispers_start() {
     let t = segment_words(
         &[seg(1.0, 5.0, vec![tok(" Long", 1.0, 3.4)])],
-        &loud(&[(1.0, false), (4.0, true)]),
+        &loud(&[(3.0, false), (2.0, true)]),
     );
     assert_eq!((t.words[0].start_s, t.words[0].end_s), (1.0, 3.4));
     assert_eq!(t.first_words_clipped, 0);
