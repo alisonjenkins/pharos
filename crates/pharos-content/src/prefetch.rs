@@ -736,14 +736,19 @@ impl Gate {
             )
             .await
             .map_err(|e| Fail::Transient(e.redacted()))?;
-            let append = match resp.status {
+            // The response's length and validator are taken into `st` only
+            // once the part is open in the mode they belong to: a refusal
+            // before then (no room, accounting unknown) leaves the bytes on
+            // disk paired with the validator they were fetched under, so a
+            // retry never resumes them with another version's tag.
+            let mut validator = st.etag.clone();
+            let total = match resp.status {
                 200 => {
                     if pos > 0 {
                         log::info!("cache download id={id} server sent the whole file for a range request; restarting at 0");
                     }
-                    st.total = resp.content_length;
-                    st.etag = resp.etag.clone();
-                    false
+                    validator = resp.etag.clone();
+                    resp.content_length
                 }
                 206 => {
                     let Some(cr) = resp.content_range else {
@@ -756,8 +761,7 @@ impl Gate {
                             cr.first
                         )));
                     }
-                    st.total = cr.total;
-                    true
+                    cr.total
                 }
                 401 | 403 => return Err(Fail::Unauthorized),
                 416 => {
@@ -775,16 +779,14 @@ impl Gate {
                 }
                 s => return Err(Fail::Permanent(format!("http {s}"))),
             };
+            let append = resp.status == 206;
             st.got_ok = true;
             let start = if append { pos } else { 0 };
             // With no length to go by, the next free-space check's window is
             // what the write may still add before it is looked at again: it
             // is reserved, and rolled forward at each check.
-            let left = |written: u64| {
-                st.total
-                    .map_or(FREE_CHECK_BYTES, |t| t.saturating_sub(written))
-            };
-            let unknown_len = st.total.is_none();
+            let left = |written: u64| total.map_or(FREE_CHECK_BYTES, |t| t.saturating_sub(written));
+            let unknown_len = total.is_none();
             // What the last check reserved, from where it was made: a chunk
             // that would pass it is reserved for before it is written, not
             // after, so the bytes a host admits against never lag the disk.
@@ -798,6 +800,13 @@ impl Gate {
                 .truncate(!append)
                 .open(&part)
                 .map_err(|e| Fail::Permanent(format!("open part: {e}")))?;
+            if validator != st.etag {
+                log::info!(
+                    "cache download id={id} validator verdict=replaced reason=whole_body_opened"
+                );
+            }
+            st.total = total;
+            st.etag = validator;
             while let Some(chunk) = resp
                 .next_chunk()
                 .await
@@ -1771,6 +1780,78 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert!(r.cache.is_complete("track/1"));
         assert_eq!(read(&r.cache, "track/1"), body(size, 1));
+    }
+
+    /// A whole new version arriving for a resume, refused room before the
+    /// part is truncated (accounting unknown), leaves the old bytes paired
+    /// with their own validator: the retry resumes them with the old tag,
+    /// never the new version's, so the two are never stitched together.
+    #[test]
+    fn a_new_version_refused_before_truncation_keeps_the_old_validator() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(300);
+        let r = rig(
+            "validator-refused",
+            script,
+            1 << 20,
+            &["t"],
+            Tuning {
+                // Only a network change ends a wait in this test.
+                backoff_min: Duration::from_secs(30),
+                backoff_max: Duration::from_secs(30),
+                ..fast()
+            },
+        );
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        r.dl.prefetch(&ids(&["track/1"]));
+        let part = r.cache.part_path("track/1");
+        wait("the partial file", &|| {
+            std::fs::metadata(&part).is_ok_and(|m| m.len() == 300)
+        });
+        // Version B now, served whole whatever the range.
+        r.srv.edit(|s| s.etag("vB").ignore_range());
+        // The outside figure is unknown for one ask only: the third, which
+        // is the room check for version B's body (the first is installing
+        // the figure, the second the retry's preflight).
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        r.cache
+            .set_outside_used(Arc::new(move || crate::cache::OutsideBytes {
+                held: 0,
+                outstanding: 0,
+                unknown: a.fetch_add(1, Ordering::SeqCst) + 1 == 3,
+            }));
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        wait("the refusal", &|| asked.load(Ordering::SeqCst) >= 3);
+        assert_eq!(r.srv.seen().len(), 2, "{:?}", r.srv.seen());
+        assert_eq!(
+            std::fs::metadata(&part).map(|m| m.len()).ok(),
+            Some(300),
+            "the old bytes were truncated before the room was approved"
+        );
+        // The wait ends on a network change.
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        let seen = r.srv.seen();
+        let third = seen
+            .get(2)
+            .unwrap_or_else(|| panic!("no retry after the refusal: {seen:?}"));
+        assert_eq!(
+            third.if_range.as_deref(),
+            Some("\"vA\""),
+            "the retry resumed the old bytes with the new version's tag: {seen:?}"
+        );
+        assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
     }
 
     /// A response with no length reserves the next check's window of free
