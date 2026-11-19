@@ -311,7 +311,7 @@ fn pieces(len: usize, piece: usize, at: Option<usize>) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0;
     while start < len {
-        let mut end = (start + piece).min(len);
+        let mut end = start.saturating_add(piece).min(len);
         if let Some(at) = at.filter(|&a| a > start && a < end) {
             end = at;
         }
@@ -401,6 +401,14 @@ fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A piece size past the address space ends at the body, without
+    /// overflowing; ordinary sizes split as before.
+    #[test]
+    fn an_oversized_piece_ends_at_the_body() {
+        assert_eq!(pieces(10, usize::MAX, None), [(0, 10)]);
+        assert_eq!(pieces(10, 4, Some(6)), [(0, 4), (4, 6), (6, 10)]);
+    }
     use std::io::{Read, Write};
 
     /// Reads what the server sends until the hold is reached, then a moment
