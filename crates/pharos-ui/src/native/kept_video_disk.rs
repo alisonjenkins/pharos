@@ -4116,12 +4116,23 @@ impl Inner {
         let mut freed = 0u64;
         let mut failed = Vec::new();
         for dir in self.claim_held() {
-            match read_held(&dir) {
+            let now = read_held(&dir);
+            // A record that reads but names another folder (or ids already
+            // listed from their own folder) is never released: discarding
+            // it removes the folder, as an unreadable one is.
+            let recoverable = match &now {
                 HeldNow::Readable(record) => {
+                    self.item_dir(&record.user, &record.item) == dir
+                        && find(&lock(&self.state).list, &record.user, &record.item).is_none()
+                }
+                _ => true,
+            };
+            match now {
+                HeldNow::Readable(record) if recoverable => {
                     self.apply_held(&dir, HeldNow::Readable(record), Sweep::Ordinary);
                 }
                 HeldNow::Gone => self.apply_held(&dir, HeldNow::Gone, Sweep::Ordinary),
-                HeldNow::NoRecord | HeldNow::Still(_) => {
+                HeldNow::Readable(_) | HeldNow::NoRecord | HeldNow::Still(_) => {
                     let bytes = lock(&self.state)
                         .held
                         .iter()
@@ -4163,7 +4174,20 @@ impl Inner {
                     }
                 }
             }
-            lock(&self.state).deleting.retain(|d| *d != dir);
+            let mut st = lock(&self.state);
+            st.deleting.retain(|d| *d != dir);
+            // Never reported as done while the folder is still held.
+            if st.held.iter().any(|(d, _)| *d == dir) {
+                drop(st);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video held folder verdict=still_held dir={} reason=discard_did_not_remove",
+                        dir.display()
+                    ),
+                );
+                failed.push(dir.display().to_string());
+            }
         }
         if failed.is_empty() {
             Ok(freed)
@@ -8615,6 +8639,33 @@ mod tests {
         store.inner.sweep_remeasure();
         assert_eq!(ours("pharos: video folder remeasured"), 1);
         assert!(lock(&store.inner.state).unknown_folder().is_none());
+    }
+
+    /// Discarding the held folders removes one whose record reads but names
+    /// another folder: the folder is gone, and admission is open again.
+    #[tokio::test]
+    async fn a_discard_removes_a_folder_whose_record_names_another() {
+        let rig = Rig::new("discard-elsewhere");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let (from, to) = (rig.dir.join("u1").join("1"), rig.dir.join("u1").join("2"));
+        copy_tree(&from, &to);
+        let store = rig.open();
+        store.settled().await;
+        assert!(lock(&store.inner.state).unknown_folder().is_some());
+        let freed = store.discard_unreadable();
+        assert!(freed.is_ok(), "{freed:?}");
+        assert!(!to.exists(), "the discard left the folder on disk");
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_none(),
+            "admission is still blocked"
+        );
+        assert!(freed.unwrap() > 0, "the freed bytes were not counted");
+        assert_eq!(only(&store).item, "1");
     }
 
     /// A whole record copied into another item's folder is not adopted
