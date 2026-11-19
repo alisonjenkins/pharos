@@ -100,7 +100,10 @@ pub fn offline_store() -> Option<Arc<dyn OfflineStore>> {
 pub fn register_video_store(
     port: Arc<dyn super::kept_video::VideoStore>,
 ) -> Result<(), AlreadyRegistered> {
-    VIDEO_STORE.set(port)
+    video_slot().set(port)?;
+    // A sign-in that landed before the store resumes its downloads now.
+    super::offline_video::store_published();
+    Ok(())
 }
 
 /// The registered store of downloaded videos, if any. A component reads it

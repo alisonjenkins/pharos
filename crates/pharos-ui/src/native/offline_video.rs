@@ -708,15 +708,97 @@ fn remember_user_seen(asked_at: u64, user: &str, seen: &TokenSeen) -> bool {
     }
 }
 
-/// Runs `f` on the store of downloaded videos, when there is one.
-fn with_store(f: impl FnOnce(&dyn super::kept_video::VideoStore)) {
+/// The store of downloaded videos, when there is one.
+fn store() -> Option<std::sync::Arc<dyn super::kept_video::VideoStore>> {
     #[cfg(test)]
     if let Some(store) = tests::STORE.with(|s| s.borrow().clone()) {
-        f(&*store);
-        return;
+        return Some(store);
     }
-    if let Some(store) = super::ports::video_store() {
+    super::ports::video_store()
+}
+
+/// Runs `f` on the store of downloaded videos, when there is one.
+fn with_store(f: impl FnOnce(&dyn super::kept_video::VideoStore)) {
+    if let Some(store) = store() {
         f(&*store);
+    }
+}
+
+/// A sign-in whose resume found no store yet: the user and the token they
+/// were paired with, replayed when the store is published
+/// ([`store_published`]). Decided and taken under this one lock, and the
+/// store is published before its replay takes it, so a sign-in either sees
+/// the store or leaves its resume here for the replay: never neither.
+#[cfg(not(test))]
+static RESUME_OWED: std::sync::Mutex<Option<(String, TokenSeen)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static RESUME_OWED: std::cell::RefCell<Option<(String, TokenSeen)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_owed<R>(f: impl FnOnce(&mut Option<(String, TokenSeen)>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut RESUME_OWED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        RESUME_OWED.with(|o| f(&mut o.borrow_mut()))
+    }
+}
+
+/// Resumes `user`'s downloads on the store now, or, with no store published
+/// yet, owes the resume to its publication.
+fn resume_or_owe(user: &str, seen: &TokenSeen) {
+    let now = with_owed(|owed| {
+        let store = store();
+        if store.is_none() {
+            *owed = Some((user.to_owned(), seen.clone()));
+        }
+        store
+    });
+    match now {
+        Some(store) => {
+            super::platform::info(&format!(
+                "pharos: video keep resume verdict=resumed reason=token_paired user={user}"
+            ));
+            store.resume_user(user);
+        }
+        None => super::platform::info(&format!(
+            "pharos: video keep resume verdict=owed reason=store_not_published user={user}"
+        )),
+    }
+}
+
+/// Called once the store of downloaded videos is published: replays a
+/// sign-in that landed before it, so a download recovery parked is resumed,
+/// only while that user is still the one signed in and the token on file is
+/// still the one paired with them (fail closed otherwise).
+pub fn store_published() {
+    let Some((user, seen)) = with_owed(Option::take) else {
+        return;
+    };
+    let reason = if identity() != Identity::User(user.clone()) {
+        Some("identity_changed")
+    } else if paired_user(&seen).as_deref() != Some(user.as_str()) {
+        Some("token_not_paired")
+    } else {
+        None
+    };
+    match (reason, store()) {
+        (None, Some(store)) => {
+            super::platform::info(&format!(
+                "pharos: video keep resume verdict=resumed reason=store_published_after_sign_in user={user}"
+            ));
+            store.resume_user(&user);
+        }
+        (why, _) => super::platform::info(&format!(
+            "pharos: video keep resume verdict=not_resumed reason={} user={user}",
+            why.unwrap_or("store_not_published")
+        )),
     }
 }
 
@@ -729,12 +811,7 @@ fn note_signed_in(user: &str, seen: &TokenSeen) {
     // before would read an unpaired token, send nothing and park until the
     // next sign-in. A pairing that fails resumes nothing (fail closed).
     match note_token_user(user, seen) {
-        Ok(()) => {
-            super::platform::info(&format!(
-                "pharos: video keep resume verdict=resumed reason=token_paired user={user}"
-            ));
-            with_store(|store| store.resume_user(user));
-        }
+        Ok(()) => resume_or_owe(user, seen),
         Err(e) => super::platform::warn(&format!(
             "pharos: video keep resume verdict=not_resumed reason=token_not_paired user={user} error={e}"
         )),
@@ -1171,6 +1248,57 @@ mod tests {
             *runs.0.lock().unwrap(),
             ["resume A sent"],
             "resumed with an unpaired token"
+        );
+    }
+
+    /// A fresh video slot for this thread, as a store published late finds.
+    fn late_slot() -> &'static super::super::ports::Slot<dyn VideoStore> {
+        let slot = Box::leak(Box::new(super::super::ports::Slot::new()));
+        super::super::ports::use_test_video_slot(Some(slot));
+        slot
+    }
+
+    /// A sign-in that lands before the store is published (recovery parked
+    /// the download first) resumes it once the store is: the publication
+    /// replays the accepted sign-in, with the token still paired.
+    #[test]
+    fn a_sign_in_before_the_store_is_published_resumes_on_publication() {
+        let _p = pref();
+        late_slot();
+        remember_user("A");
+        let runs = std::sync::Arc::new(TokenRuns::default());
+        super::super::ports::register_video_store(runs.clone()).unwrap();
+        super::super::ports::use_test_video_slot(None);
+        assert_eq!(
+            *runs.0.lock().unwrap(),
+            ["resume A sent"],
+            "the sign-in before publication resumed nothing"
+        );
+    }
+
+    /// The replay keeps the sign-in's checks: a user who signed out, or a
+    /// token replaced, before the store is published resumes nothing.
+    #[test]
+    fn a_replayed_sign_in_resumes_nothing_once_its_user_or_token_changed() {
+        let p = pref();
+        late_slot();
+        remember_user("A");
+        forget_user();
+        let runs = std::sync::Arc::new(Runs::default());
+        super::super::ports::register_video_store(runs.clone()).unwrap();
+        assert_eq!(*runs.0.lock().unwrap(), Vec::<String>::new());
+
+        late_slot();
+        remember_user("A");
+        p.clear_token();
+        p.token_present.set(true);
+        let runs = std::sync::Arc::new(Runs::default());
+        super::super::ports::register_video_store(runs.clone()).unwrap();
+        super::super::ports::use_test_video_slot(None);
+        assert_eq!(
+            *runs.0.lock().unwrap(),
+            Vec::<String>::new(),
+            "resumed with the token replaced since the sign-in"
         );
     }
 
