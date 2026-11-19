@@ -40,7 +40,7 @@ pub use cache::{
 pub use error::ContentError;
 pub use fault::unreachable as server_unreachable;
 pub use id::NodeId;
-pub use library::{AuthState, Library, Timeouts};
+pub use library::{fence_token, AuthState, Library, Timeouts};
 pub use node::{Node, ART_WIDTH};
 pub use resume::{
     Resume, Verdict as ResumeVerdict, MIN_TRACK_MS as RESUME_MIN_TRACK_MS,

@@ -332,7 +332,7 @@ impl Library {
                     qc: None,
                     qc_gen: 0,
                     qc_approved: Arc::default(),
-                    fenced: None,
+                    session_token: None,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -927,10 +927,54 @@ struct Worker {
     /// runs before the worker consumes it does not start a poller over it.
     qc_approved: Arc<AtomicBool>,
     limit: Duration,
-    /// The fingerprint of a token this process signed out of but could
-    /// neither remove nor mark revoked: refused on every read until a
-    /// different token is on file (the in-process fence).
-    fenced: Option<String>,
+    /// The device token the open link was resumed with: a refusal ends
+    /// that token, never whichever one is on file by then.
+    session_token: Option<String>,
+}
+
+/// The fingerprint of a token this process signed out of but could neither
+/// remove nor mark revoked: refused on every read until a different token
+/// is on file (the in-process fence). Process-wide, so a fence set before
+/// any library is connected holds for the worker that connects later.
+#[cfg(not(test))]
+static FENCED: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static FENCED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn fenced() -> Option<String> {
+    #[cfg(not(test))]
+    {
+        FENCED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(test)]
+    {
+        FENCED.with(|f| f.borrow().clone())
+    }
+}
+
+fn set_fenced(fingerprint: Option<String>) {
+    #[cfg(not(test))]
+    {
+        *FENCED.lock().unwrap_or_else(PoisonError::into_inner) = fingerprint;
+    }
+    #[cfg(test)]
+    {
+        FENCED.with(|f| *f.borrow_mut() = fingerprint);
+    }
+}
+
+/// Fences the token with `fingerprint` in this process, library or not:
+/// the app signed out and could neither remove nor mark it. A worker that
+/// connects later reads through the fence too.
+pub fn fence_token(fingerprint: &str) {
+    set_fenced(Some(fingerprint.to_owned()));
+    log::warn!("token fence verdict=fenced reason=token_neither_removed_nor_marked at=process");
 }
 
 /// Reports what a sign-out (`at`: the user's, or the server's refusal)
@@ -1074,7 +1118,7 @@ impl Worker {
         if matches!(op, Op::SignOut) {
             self.link = None;
             self.stop_sign_in();
-            let ended = self.end_session("sign_out");
+            let ended = self.end_session("sign_out", None);
             self.shared.set_auth(AuthState::SignedOut);
             return ended
                 .map(|()| Out::Done)
@@ -1089,7 +1133,7 @@ impl Worker {
         if let Op::StaySignedOut(fingerprint) = op {
             self.link = None;
             let polling = self.stop_sign_in();
-            self.fenced = Some(fingerprint.clone());
+            set_fenced(Some(fingerprint.clone()));
             self.shared.set_auth(AuthState::SignedOut);
             log::warn!(
                 "credentials stay signed out: verdict=fenced reason=token_neither_removed_nor_marked quickconnect_stopped={polling}"
@@ -1115,7 +1159,8 @@ impl Worker {
             match r {
                 Err(e) if e.is_revoked() => {
                     log::warn!("{}: device token revoked; starting QuickConnect", op.name());
-                    return Err(self.revoked(events));
+                    let seen = self.session_token.clone();
+                    return Err(self.revoked(events, seen));
                 }
                 Err(e @ ContentError::Closed { .. }) => {
                     log::warn!("{} (attempt {}): {e}; reconnecting", op.name(), attempt + 1);
@@ -1151,7 +1196,8 @@ impl Worker {
                                 "media token refresh refused ({}); starting QuickConnect",
                                 e.redacted()
                             );
-                            return Err(self.revoked(events));
+                            let seen = self.session_token.clone();
+                            return Err(self.revoked(events, seen));
                         }
                         Err(e) => return Err(e),
                     }
@@ -1171,7 +1217,7 @@ impl Worker {
                     "stored device token refused ({}); starting QuickConnect",
                     e.redacted()
                 );
-                return Err(self.revoked(events));
+                return Err(self.revoked(events, Some(device_token)));
             }
             Err(e) => {
                 self.shared.set_error(e.redacted());
@@ -1186,12 +1232,13 @@ impl Worker {
                     "media token refused ({}); starting QuickConnect",
                     e.redacted()
                 );
-                return Err(self.revoked(events));
+                return Err(self.revoked(events, Some(device_token)));
             }
             Err(e) => return Err(e),
         };
         let link = Link { cat, media };
         self.link = Some(link.clone());
+        self.session_token = Some(device_token);
         self.shared.set_auth(AuthState::SignedIn);
         Ok(link)
     }
@@ -1237,7 +1284,7 @@ impl Worker {
     /// token reads as none; a different one lifts the fence.
     fn load_token(&mut self) -> Result<Option<String>, ContentError> {
         let token = token::load(&self.token_path)?;
-        let Some(fenced) = self.fenced.as_deref() else {
+        let Some(fenced) = fenced() else {
             return Ok(token);
         };
         match token {
@@ -1254,21 +1301,25 @@ impl Worker {
                         "no_token"
                     }
                 );
-                self.fenced = None;
+                set_fenced(None);
                 Ok(other)
             }
         }
     }
 
     /// Ends the session's token on file (`at`: the user's sign-out or the
-    /// server's refusal). One that could be neither removed nor marked is
-    /// fenced in this process, so nothing here resumes from it.
-    fn end_session(&mut self, at: &str) -> Result<(), String> {
+    /// server's refusal): only while it is still `seen` when one is named
+    /// (a refusal ends the token it was sent with; a replacement stays),
+    /// any token with `None` (a sign-out). One that could be neither
+    /// removed nor marked is fenced in this process, so nothing here
+    /// resumes from it.
+    fn end_session(&mut self, at: &str, seen: Option<&str>) -> Result<(), String> {
+        self.session_token = None;
         let held = token::load(&self.token_path).ok().flatten();
-        let ended = token::end_session(&self.token_path, None, None);
+        let ended = token::end_session(&self.token_path, seen, None);
         if matches!(ended, token::Ended::Unsafe { .. }) {
-            if let Some(t) = held.as_deref() {
-                self.fenced = Some(token::fingerprint(t));
+            if let Some(t) = seen.or(held.as_deref()) {
+                set_fenced(Some(token::fingerprint(t)));
                 log::warn!(
                     "token fence verdict=fenced reason=token_neither_removed_nor_marked at={at}"
                 );
@@ -1279,9 +1330,13 @@ impl Worker {
 
     /// The server refused our credentials: forget them, drop the link and
     /// start QuickConnect.
-    fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
+    fn revoked(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+        seen: Option<String>,
+    ) -> ContentError {
         self.link = None;
-        let _ = self.end_session("revoked");
+        let _ = self.end_session("revoked", seen.as_deref());
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
         ContentError::NeedsSignIn
@@ -1924,7 +1979,7 @@ mod tests {
             qc: None,
             qc_gen: 0,
             qc_approved: Arc::default(),
-            fenced: None,
+            session_token: None,
             limit: Duration::from_secs(5),
         };
         (w, shared, token_path)
@@ -1978,7 +2033,7 @@ mod tests {
                 if at == "sign_out" {
                     w.execute(&Op::SignOut, &events).await.unwrap();
                 } else {
-                    let _ = w.revoked(&events);
+                    let _ = w.revoked(&events, None);
                 }
             });
             crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
@@ -2081,7 +2136,7 @@ mod tests {
         // A new sign-in's token is not the fenced one.
         token::store(&token_path, "tok2").unwrap();
         assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
-        assert!(w.fenced.is_none());
+        assert!(fenced().is_none());
     }
 
     /// The app's sign-out could neither remove nor mark the token: told to
@@ -2117,6 +2172,55 @@ mod tests {
         );
     }
 
+    /// A refusal ends the token its request was sent with: a replacement a
+    /// sign-in stored since is kept, and the refused token, still on file,
+    /// goes.
+    #[test]
+    fn a_revoked_session_ends_its_own_token_not_a_replacement() {
+        let root = test_root("revoked-own");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tokB").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, Some("tokA".to_owned()));
+        });
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "the refusal of A's session removed B's token"
+        );
+        token::store(&token_path, "tokA").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, Some("tokA".to_owned()));
+        });
+        assert_eq!(token::load(&token_path).unwrap(), None);
+    }
+
+    /// A fence set before any library is connected (the app signed out and
+    /// could neither remove nor mark its token) holds for a worker that
+    /// connects afterwards; a different token is not fenced.
+    #[test]
+    fn a_fence_set_before_the_service_connects_holds_for_its_worker() {
+        let root = test_root("fence-before-connect");
+        fence_token(&token::fingerprint("tok"));
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        assert_eq!(
+            w.load_token().unwrap(),
+            None,
+            "the new worker read the fenced token"
+        );
+        token::store(&token_path, "tok2").unwrap();
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+    }
+
     #[test]
     fn a_reload_disowns_the_pending_quickconnect_poller() {
         let root = test_root("reload-qc");
@@ -2139,7 +2243,7 @@ mod tests {
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
-            let e = w.revoked(&events);
+            let e = w.revoked(&events, None);
             assert!(matches!(e, ContentError::NeedsSignIn), "{e}");
             assert!(w.qc.is_some(), "QuickConnect started");
         });
