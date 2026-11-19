@@ -177,11 +177,55 @@ enum Stop {
     Parked(String),
 }
 
+/// A user's request key to the whole files on disk that answer it, one per
+/// item folder: two of a user's downloads may store the same key, and
+/// removing one keeps the other's copy answering. A lookup answers with the
+/// copy indexed last.
+#[derive(Default)]
+struct Index(HashMap<(String, String), Vec<(PathBuf, u64)>>);
+
+impl Index {
+    /// Indexes `path` for `at`, replacing an earlier entry for that path.
+    fn insert(&mut self, at: (String, String), (path, len): (PathBuf, u64)) {
+        let copies = self.0.entry(at).or_default();
+        copies.retain(|(p, _)| *p != path);
+        copies.push((path, len));
+    }
+
+    fn get(&self, at: &(String, String)) -> Option<&(PathBuf, u64)> {
+        self.0.get(at)?.last()
+    }
+
+    /// Keeps only the copies whose path `keep` accepts.
+    fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) {
+        self.0.retain(|_, copies| {
+            copies.retain(|(p, _)| keep(p));
+            !copies.is_empty()
+        });
+    }
+
+    /// Forgets the copy at `path` for `at`; any other copy stays.
+    fn remove(&mut self, at: &(String, String), path: &Path) {
+        if let Some(copies) = self.0.get_mut(at) {
+            copies.retain(|(p, _)| p != path);
+            if copies.is_empty() {
+                self.0.remove(at);
+            }
+        }
+    }
+
+    fn extend(&mut self, entries: impl IntoIterator<Item = ((String, String), (PathBuf, u64))>) {
+        for (at, copy) in entries {
+            self.insert(at, copy);
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     list: Vec<KeptVideo>,
-    /// Request key to its whole file on disk.
-    index: HashMap<(String, String), (PathBuf, u64)>,
+    /// Request key to the whole files on disk that answer it.
+    index: Index,
     /// The run that owns each (user, item) download; a removed or restarted
     /// download is told apart from the one still running by this number.
     runs: HashMap<(String, String), u64>,
@@ -2698,7 +2742,7 @@ fn prune_unplanned(
             st.leftover.push(dir.clone());
         }
     }
-    st.index.retain(|_, (path, _)| {
+    st.index.retain(|path| {
         path.parent() != Some(files.as_path()) || {
             path.file_name()
                 .is_some_and(|n| keep.contains(n.to_string_lossy().as_ref()))
@@ -3365,8 +3409,9 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return;
         }
-        let _ = std::fs::remove_file(inner.file_path(user, item, key));
-        st.index.remove(&(user.to_owned(), key.clone()));
+        let path = inner.file_path(user, item, key);
+        let _ = std::fs::remove_file(&path);
+        st.index.remove(&(user.to_owned(), key.clone()), &path);
     }
 }
 
@@ -4342,7 +4387,7 @@ impl VideoStore for DiskVideoStore {
             // that will not delete must not go on answering requests.
             let files = self.inner.item_dir(user, item).join("files");
             st.index
-                .retain(|_, (path, _)| path.parent() != Some(files.as_path()));
+                .retain(|path| path.parent() != Some(files.as_path()));
             // What the record reserved keeps counting, as a tombstone, from
             // the moment the record leaves the list: there is no instant
             // when the folder counts for nothing while it is deleted.
@@ -5341,6 +5386,34 @@ mod tests {
             "{ready:?}"
         );
         assert!(lines("pharos: video keep failed").is_empty());
+    }
+
+    /// Two of a user's downloads that store the same request key each keep
+    /// their own copy: removing the one indexed last leaves the other's
+    /// copy answering, before a restart and after it.
+    #[tokio::test]
+    async fn removing_one_of_two_downloads_sharing_a_key_keeps_the_others_copy() {
+        let rig = Rig::new("shared-key");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        let one = store.inner.item_dir("u1", "1").join("files");
+        store.remove("u1", "2");
+        store.settled().await;
+        for key in [SEG0, SEG1, INIT, MEDIA_KEY] {
+            let f = store
+                .stored_file("u1", key)
+                .unwrap_or_else(|| panic!("{key} stopped answering after the other copy went"));
+            assert_eq!(f.path.parent(), Some(one.as_path()), "{key}");
+            assert!(f.path.exists(), "{key}");
+        }
+        drop(store);
+        let store = rig.open();
+        store.remove("u1", "2");
+        store.settled().await;
+        assert!(store.stored_file("u1", SEG0).is_some());
     }
 
     #[tokio::test]
