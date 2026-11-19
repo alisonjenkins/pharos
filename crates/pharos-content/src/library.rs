@@ -1984,20 +1984,34 @@ mod tests {
             assert!(waited < 10_000, "the server never reached the hold");
             std::thread::sleep(Duration::from_millis(1));
         }
-        // The window is claimed whole: what is still owed of it, and what
-        // has landed of it in the `.part` (never counted as owed too).
-        let claim = || {
-            lib.music_outstanding_bytes()
-                .saturating_add(lib.music_in_progress_bytes().unwrap_or(0))
-        };
+        // The server's hold is set once its bytes reach the socket, not the
+        // disk: wait for the downloader to land them all in the `.part`.
+        let hold = 64 * 1024;
+        let part = cache.part_path("track/1");
+        let landed = || std::fs::metadata(&part).map_or(0, |m| m.len());
         let mut waited = 0;
-        while claim() < FREE_CHECK_BYTES {
+        while landed() < hold || lib.music_in_progress_bytes().unwrap_or(0) < hold {
             waited += 1;
-            assert!(waited < 10_000, "never outstanding: {}", claim());
+            assert!(
+                waited < 10_000,
+                "the .part never reached the hold: {} on disk, {:?} in progress",
+                landed(),
+                lib.music_in_progress_bytes()
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(
-            lib.music_outstanding_bytes() < FREE_CHECK_BYTES,
+        // The window is claimed whole: what has landed of it in the `.part`,
+        // and what is still owed of it (never the landed bytes again).
+        let written = lib.music_in_progress_bytes().unwrap_or(0);
+        let outstanding = lib.music_outstanding_bytes();
+        assert_eq!(
+            written + outstanding,
+            FREE_CHECK_BYTES,
+            "the window is not claimed whole: {written} written, {outstanding} owed"
+        );
+        assert_eq!(
+            outstanding,
+            FREE_CHECK_BYTES - written,
             "the bytes already written are still counted as owed"
         );
         release.store(true, Ordering::SeqCst);
