@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use super::cache::Cache;
+use super::cache::{Cache, NoRoom};
 use super::error::ContentError;
 use super::http::{self, Request, Url};
 
@@ -124,6 +124,20 @@ enum Fail {
     Unauthorized,
     Transient(String),
     Permanent(String),
+}
+
+impl Fail {
+    fn no_room(no: NoRoom) -> Self {
+        Self::LowDisk(room_of(no))
+    }
+}
+
+/// The room a refusal reports: none when the cap could not be checked.
+fn room_of(no: NoRoom) -> u64 {
+    match no {
+        NoRoom::LowDisk(room) => room,
+        NoRoom::AccountingUnknown => 0,
+    }
 }
 
 #[derive(Default, Clone)]
@@ -509,8 +523,8 @@ impl Gate {
             id,
         };
         let outcome = loop {
-            if let Err(free) = self.cache.ensure_free(id, 0) {
-                break Outcome::LowDisk(free);
+            if let Err(no) = self.cache.ensure_free(id, 0) {
+                break Outcome::LowDisk(room_of(no));
             }
             if !self.pause_until_online(id, &mut generation).await {
                 break Outcome::Cancelled;
@@ -692,7 +706,7 @@ impl Gate {
             };
             self.cache
                 .ensure_free(id, left(start))
-                .map_err(Fail::LowDisk)?;
+                .map_err(Fail::no_room)?;
             let mut written = start;
             let mut since_check = 0u64;
             // What the last check reserved, from where it was made: a chunk
@@ -714,7 +728,7 @@ impl Gate {
                 let len = chunk.len() as u64;
                 if since_check.saturating_add(len) > reserved_ahead {
                     let need = len.max(left(written));
-                    self.cache.ensure_free(id, need).map_err(Fail::LowDisk)?;
+                    self.cache.ensure_free(id, need).map_err(Fail::no_room)?;
                     reserved_ahead = need;
                     since_check = 0;
                 }
@@ -731,7 +745,7 @@ impl Gate {
                     reserved_ahead = left(written);
                     self.cache
                         .ensure_free(id, reserved_ahead)
-                        .map_err(Fail::LowDisk)?;
+                        .map_err(Fail::no_room)?;
                 }
                 if !self.is_pin_work(id) {
                     let mut q = self.lock();

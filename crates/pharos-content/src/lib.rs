@@ -34,7 +34,7 @@ pub mod token;
 mod tree;
 
 pub use cache::{
-    admission_guard, statvfs_free, Download, DownloadTrack, OfflineSummary, OutsideBytes,
+    admission_guard, statvfs_free, Download, DownloadTrack, NoRoom, OfflineSummary, OutsideBytes,
     OutsideUsed, DEFAULT_CAP_BYTES, MIN_FREE_BYTES,
 };
 pub use error::ContentError;

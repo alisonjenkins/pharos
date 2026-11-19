@@ -252,6 +252,17 @@ pub struct OutsideBytes {
     pub unknown: bool,
 }
 
+/// Why [`Cache::ensure_free`] refused a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRoom {
+    /// Even eviction cannot leave the guard free; carries the room there is.
+    LowDisk(u64),
+    /// Other downloads on the same cap could not say what they hold (a
+    /// folder that could not be read), so the cap cannot be checked yet.
+    /// Retryable: it clears once their size can be read again.
+    AccountingUnknown,
+}
+
 pub struct Cache {
     dir: PathBuf,
     cap: AtomicU64,
@@ -934,7 +945,7 @@ impl Cache {
     /// What it approves is reserved for `downloading` (the bytes the write
     /// has yet to add) until `commit` or `release_reservation` clears it, so a host
     /// admitting against the same free figure sees them as spoken for.
-    pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
+    pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
         let _admission = admission_guard();
         let verdict = self.check_free(downloading, need);
         match verdict {
@@ -1051,7 +1062,7 @@ impl Cache {
         (total, whole)
     }
 
-    fn check_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
+    fn check_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
         // Outstanding first, then the probe: a write that lands between the
         // two lowers free and the stale (higher) outstanding keeps the figure
         // conservative. The other order counts those bytes twice as spent
@@ -1065,7 +1076,7 @@ impl Cache {
                 outside.held,
                 outside.outstanding
             );
-            return Err(0);
+            return Err(NoRoom::AccountingUnknown);
         }
         let outstanding = outside.outstanding;
         let raw = match (self.free)(&self.dir) {
@@ -1106,7 +1117,7 @@ impl Cache {
         if now >= want {
             Ok(room)
         } else {
-            Err(room)
+            Err(NoRoom::LowDisk(room))
         }
     }
 
@@ -1533,7 +1544,10 @@ mod tests {
         put(&c, "track/a", 100);
         put(&c, "track/x", 100);
         c.protect(&[]);
-        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 1));
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES - 1))
+        );
         assert!(c.is_complete("track/a") && c.is_complete("track/x"));
     }
 
@@ -1558,7 +1572,10 @@ mod tests {
         // The video still has 100 to write: 50 free beyond the guard is
         // really 50 short of it, and nothing is there to evict.
         outstanding.store(100, Ordering::SeqCst);
-        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 50));
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES - 50))
+        );
         // Evicting music makes up the difference.
         put(&c, "track/a", 100);
         c.protect(&[]);
@@ -1605,7 +1622,11 @@ mod tests {
             ..OutsideBytes::default()
         }));
         crate::testlog::start();
-        assert_eq!(c.ensure_free("track/x", 10), Err(0), "admitted");
+        assert_eq!(
+            c.ensure_free("track/x", 10),
+            Err(NoRoom::AccountingUnknown),
+            "admitted"
+        );
         let lines = crate::testlog::lines();
         assert!(
             lines
@@ -1644,7 +1665,10 @@ mod tests {
         c.protect(&[]);
         // 1 GiB free, 2 GiB owed, 2 GiB of music: evicting it leaves 3 GiB
         // against the 4 GiB the guard and the owed bytes need.
-        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES / 2));
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES / 2))
+        );
     }
 
     #[test]
@@ -1652,7 +1676,10 @@ mod tests {
         let c = Cache::open_with_probe(&tmp("lowdisk-need"), 1000, fixed_free(MIN_FREE_BYTES + 10))
             .unwrap();
         assert_eq!(c.ensure_free("track/x", 10), Ok(MIN_FREE_BYTES + 10));
-        assert_eq!(c.ensure_free("track/x", 11), Err(MIN_FREE_BYTES + 10));
+        assert_eq!(
+            c.ensure_free("track/x", 11),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES + 10))
+        );
     }
 
     #[test]
