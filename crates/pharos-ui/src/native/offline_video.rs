@@ -2086,7 +2086,9 @@ pub(crate) mod tests {
     }
 
     /// Starts a download of `user`'s and waits, bounded, until its first
-    /// request has been decided: sent, or refused before it went out.
+    /// request has been decided: sent, or refused before it went out. A
+    /// start the store refuses fails the test: a race test whose download
+    /// never started would pass on nothing.
     async fn first_request_decided(
         store: &super::super::kept_video_disk::DiskVideoStore,
         fetcher: &FileFetcher,
@@ -2094,8 +2096,8 @@ pub(crate) mod tests {
         item: &str,
     ) {
         let before = fetcher.sent().len() + fetcher.refused().len();
-        if store.start(keep(user, item)).is_err() {
-            return;
+        if let Err(e) = store.start(keep(user, item)) {
+            panic!("{user}'s download of {item} did not start: {e:?}");
         }
         for _ in 0..3000 {
             if fetcher.sent().len() + fetcher.refused().len() > before {
@@ -2299,9 +2301,17 @@ pub(crate) mod tests {
                 first_request_decided(&before, &fetcher, "A", "1").await;
                 before.settled().await;
             }
+            assert!(
+                !fetcher.refused().is_empty(),
+                "A's first request was not refused, so no run parked"
+            );
+            // The restart: recovery's run is refused and parks again, so
+            // there is a parked run for the race below.
+            let refused = fetcher.refused().len();
             late_slot();
             let store = disk_store(&videos, fetcher.clone());
             store.settled().await;
+            assert!(fetcher.refused().len() > refused, "recovery did not run");
             let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
                 panic!("A's token did not open A's session");
             };
