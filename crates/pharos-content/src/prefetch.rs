@@ -675,6 +675,12 @@ impl Gate {
             id,
         };
         let outcome = loop {
+            // Online and still wanted first: the preflight below may evict
+            // other retained parts, which a job that cannot run yet (or is
+            // no longer wanted) must not do.
+            if !self.pause_until_online(id, &mut generation).await {
+                break Outcome::Cancelled;
+            }
             // A retained part always gets its response inspected: the
             // preflight counts its bytes as room (a whole body's admission
             // reclaims them) and authorizes no write. The headers decide:
@@ -710,14 +716,8 @@ impl Gate {
                     {
                         break Outcome::Yielded;
                     }
-                    if !self.pause_until_online(id, &mut generation).await {
-                        break Outcome::Cancelled;
-                    }
                     continue;
                 }
-            }
-            if !self.pause_until_online(id, &mut generation).await {
-                break Outcome::Cancelled;
             }
             attempt = attempt.saturating_add(1);
             let u = match url.clone() {
@@ -1541,6 +1541,47 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(10)));
         let order: Vec<String> = r.srv.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(order, ["/audio/1", "/audio/2", "/audio/3"]);
+    }
+
+    /// CR outside-diff prefetch.rs:685-689: a job waiting for the network
+    /// evicts nothing. Its preflight, which may evict retained parts, runs
+    /// only once it is online; then the other part goes and the job runs.
+    #[test]
+    fn a_job_waiting_for_the_network_evicts_no_retained_part() {
+        let script = Script::default().file("/audio/1", body(100, 1));
+        let r = rig_with_free(
+            "offline-no-evict",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(|dir: &std::path::Path| {
+                let parts: u64 = std::fs::read_dir(dir)
+                    .map(|d| {
+                        d.filter_map(Result::ok)
+                            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+                            .map(|e| e.metadata().map_or(0, |m| m.len()))
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                Ok((MIN_FREE_BYTES + 500).saturating_sub(parts))
+            }),
+        );
+        let other = r.cache.part_path("track/9");
+        std::fs::write(&other, vec![7u8; 1000]).unwrap();
+        r.dl.set_online(false);
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        wait_in_flight(&r, "track/1");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(other.exists(), "an offline job evicted a retained part");
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)));
+        assert!(r.cache.is_complete("track/1"));
+        assert!(
+            !other.exists(),
+            "the online job's preflight evicted nothing"
+        );
     }
 
     /// Waits until the downloader has taken a job off the queue.
