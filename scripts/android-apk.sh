@@ -48,6 +48,8 @@ out=${PHAROS_ANDROID_APK_OUT:-$target_dir/pharos-tv-$profile.apk}
 
 echo "android-apk: building the page visualiser" >&2
 nix develop -c sh scripts/tv-visualiser.sh
+echo "android-apk: building the page HLS engine" >&2
+nix develop -c sh scripts/tv-hls.sh
 
 gradle_root=$target_dir/dx/pharos-tv/$profile/android/app
 main_dir=$gradle_root/app/src/main

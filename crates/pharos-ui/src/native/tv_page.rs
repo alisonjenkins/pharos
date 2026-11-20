@@ -450,7 +450,7 @@ pub fn engine_start_js(start: &EngineStart<'_>) -> String {
         r#"const id = {id};
 const all = window.__pharosEngines = window.__pharosEngines || {{}};
 const stopped = window.__pharosEngineStopped = window.__pharosEngineStopped || {{}};
-const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "engine", id }}, m));
+const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "engine", id, gen: {generation} }}, m));
 (async () => {{
   try {{
     if (!window.__pharosEngine && window.__pharosEngineLoad) await window.__pharosEngineLoad;
@@ -979,9 +979,12 @@ pub enum Bridge {
         #[serde(flatten)]
         event: HlsEvent,
     },
-    /// What the page's Rust HLS engine reports for the player on `id`.
+    /// What the page's Rust HLS engine reports for the player on `id`, from
+    /// the play attach `gen` started: a late event of an earlier play on the
+    /// same element must not reach the play after it.
     Engine {
         id: String,
+        gen: u64,
         #[serde(flatten)]
         event: EngineEvent,
     },
@@ -1223,6 +1226,18 @@ pub enum EngineEvent {
 }
 
 impl EngineEvent {
+    /// Stable log token for the event's kind, its `ev` tag on the wire.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Started { .. } => "started",
+            Self::Fatal { .. } => "fatal",
+            Self::Frag { .. } => "frag",
+            Self::FragFailed { .. } => "fragfailed",
+            Self::Line { .. } => "line",
+            Self::Event { .. } => "event",
+        }
+    }
+
     /// The JSON the page hands to the bridge.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
@@ -2800,13 +2815,51 @@ process.stdout.write(JSON.stringify(out));
             };
             sent["t"] = "engine".into();
             sent["id"] = "v".into();
+            sent["gen"] = 3.into();
             assert_eq!(
                 parse_bridge(&sent),
                 Some(Bridge::Engine {
                     id: "v".into(),
+                    gen: 3,
                     event
                 })
             );
+        }
+    }
+
+    #[test]
+    fn an_engine_event_label_is_its_wire_tag() {
+        let events = [
+            EngineEvent::Started {
+                error: String::new(),
+            },
+            EngineEvent::Fatal {
+                kind: "network".into(),
+                reason: "r".into(),
+            },
+            EngineEvent::Frag {
+                bytes: 1,
+                load_ms: 1,
+                media_ms: 1,
+            },
+            EngineEvent::FragFailed { timed_out: false },
+            EngineEvent::Line {
+                warn: false,
+                text: "t".into(),
+            },
+            EngineEvent::Event {
+                kind: 1,
+                level: 1,
+                fields: Vec::new(),
+            },
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for event in &events {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&event.to_json()) else {
+                panic!("the engine writes JSON: {event:?}");
+            };
+            assert_eq!(json["ev"], event.label(), "{event:?}");
+            assert!(seen.insert(event.label()), "{} twice", event.label());
         }
     }
 
@@ -2892,6 +2945,11 @@ process.stdout.write(JSON.stringify(out));
         );
         assert!(script.contains("(stopped[id] || 0) >= 7"), "{script}");
         assert!(script.contains("all[id] = { gen: 7, run };"), "{script}");
+        // Every event it sends names its attach, `started` included.
+        assert!(
+            script.contains(r#"{ t: "engine", id, gen: 7 }"#),
+            "{script}"
+        );
         let with_token = engine_start_js(&EngineStart {
             video_id: "v",
             generation: 1,

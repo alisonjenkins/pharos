@@ -79,14 +79,14 @@ lint:
 # B1333/V1304: type-check and lint the TV app (`--features mobile`) for the
 # TV's own target. The Android-only modules (android.rs, android_page.rs)
 # compile under no other build, so a change to a shared signature broke the
-# TV line with every other check green. The visualiser bundle is built only
-# for an APK; an empty one stands in for the check.
+# TV line with every other check green. The page's wasm bundles (visualiser,
+# HLS engine) are built only for an APK; empty ones stand in for the check.
 tv-check:
     #!/usr/bin/env bash
     set -euo pipefail
     gen=crates/pharos-ui/assets/generated
     mkdir -p "$gen"
-    for f in tv-visualiser.js tv-visualiser.wasm.b64; do
+    for f in tv-visualiser.js tv-visualiser.wasm.b64 tv-hls.js tv-hls.wasm.b64; do
       [ -e "$gen/$f" ] || : > "$gen/$f"
     done
     nix develop .#android --command cargo clippy -p pharos-ui --bin pharos-tv \
@@ -94,14 +94,14 @@ tv-check:
 
 # Spec 044 (T18): type-check and lint the phone app and the car's media
 # service for the phone's own target. Both are Android-only, so no host
-# build compiles them. The visualiser stand-ins are as in tv-check, since
+# build compiles them. The page bundle stand-ins are as in tv-check, since
 # the phone links pharos-ui too.
 phone-check:
     #!/usr/bin/env bash
     set -euo pipefail
     gen=crates/pharos-ui/assets/generated
     mkdir -p "$gen"
-    for f in tv-visualiser.js tv-visualiser.wasm.b64; do
+    for f in tv-visualiser.js tv-visualiser.wasm.b64 tv-hls.js tv-hls.wasm.b64; do
       [ -e "$gen/$f" ] || : > "$gen/$f"
     done
     nix develop .#android --command cargo clippy -p pharos-phone -p pharos-android \
