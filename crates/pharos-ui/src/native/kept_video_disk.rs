@@ -4715,8 +4715,15 @@ impl DiskVideoStore {
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop();
             match next {
+                // A download that panicked fails the test that waits on
+                // it; one that ended (`Stop::Failed` included) or was
+                // aborted is a normal end.
                 Some(task) => {
-                    let _ = task.await;
+                    if let Err(e) = task.await {
+                        if e.is_panic() {
+                            std::panic::resume_unwind(e.into_panic());
+                        }
+                    }
                 }
                 None => break,
             }
