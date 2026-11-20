@@ -205,6 +205,9 @@ enum Outcome {
     /// A pin refused for low disk with its part kept: parked with its
     /// state for this long, then tried again; the worker moves on.
     Parked(Duration),
+    /// Read-ahead that cannot go on over its part (`why`): it ends with
+    /// the part and its validator kept, and the next request resumes it.
+    KeptPart(&'static str),
 }
 
 impl Downloader {
@@ -835,18 +838,10 @@ impl Gate {
                     );
                     break Outcome::Parked(backoff);
                 }
-                Err(Fail::PartNotTruncated) => {
-                    log::info!(
-                        "cache download id={id} bytes={} ms={} outcome=retry reason=part_not_truncated attempt={attempt} wait_ms={}",
-                        part_len(),
-                        started.elapsed().as_millis(),
-                        backoff.as_millis()
-                    );
-                    self.sleep_backoff(&mut backoff, &mut epoch).await;
-                    if self.yield_to_playback(id, &st) {
-                        break Outcome::Yielded;
-                    }
-                }
+                // Read-ahead does not hold the worker over a part it cannot
+                // empty: it ends with the part and validator kept, as for a
+                // replacement that does not fit, and the next track goes.
+                Err(Fail::PartNotTruncated) => break Outcome::KeptPart("part_not_truncated"),
                 Err(Fail::Unauthorized) if !refreshed => {
                     refreshed = true;
                     url = None;
@@ -936,6 +931,13 @@ impl Gate {
                     "cache download id={id} bytes={kept} ms={ms} outcome=failed reason=cancelled (no longer wanted; partial kept) validator={}",
                     if kept > 0 { "kept" } else { "none" }
                 );
+            }
+            Outcome::KeptPart(why) => {
+                log::info!(
+                    "cache download id={id} bytes={} ms={ms} outcome=skipped reason={why} part=kept attempts={attempt}",
+                    part_len()
+                );
+                self.give_up(id, PartFate::Keep(st));
             }
             Outcome::LowDisk(free) => {
                 // A refusal for space, from the preflight, the admission or
@@ -2708,6 +2710,37 @@ mod tests {
             "track 1 never retried"
         );
         assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// CR review 5995575621 (prefetch.rs:814-824): read-ahead over a part
+    /// that will not truncate ends with the part kept, so the next track
+    /// goes; it does not hold the worker retrying in place.
+    #[test]
+    fn read_ahead_whose_part_will_not_truncate_lets_the_next_track_go() {
+        let script = replacing_origin().file("/audio/2", body(100, 2));
+        let r = rig("read-ahead-not-truncated", script, 1 << 20, &["t"], fast());
+        let part = r.cache.part_path("track/1");
+        crate::cache::TRUNCATE_REFUSED
+            .lock()
+            .unwrap()
+            .push(part.clone());
+        r.dl.prefetch(&ids(&["track/1", "track/2"]));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !r.cache.is_complete("track/2") {
+            assert!(
+                Instant::now() < until,
+                "the untruncatable part held the worker: {:?}",
+                r.srv.seen()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        crate::cache::TRUNCATE_REFUSED
+            .lock()
+            .unwrap()
+            .retain(|p| *p != part);
+        assert!(!r.cache.is_complete("track/1"));
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        assert!(r.dl.has_deferred("track/1"), "the part's validator went");
     }
 
     /// A whole new body refused for low disk keeps the old part and its
