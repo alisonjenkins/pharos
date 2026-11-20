@@ -377,11 +377,56 @@ pub fn request_key(url: &str) -> String {
         None => url,
     };
     let key = path_and_query.split('#').next().unwrap_or_default();
-    if key.starts_with('/') {
+    let key = if key.starts_with('/') {
         key.to_owned()
     } else {
         format!("/{key}")
+    };
+    without_encoded_dots(key)
+}
+
+/// `key` with its dot segments removed when one is percent-encoded
+/// (`%2e`, `.%2E`, ...): the WebView's URL parser reads those as `.` and
+/// `..` and asks for the path without them, so the key must name that
+/// path too. The query is kept as it is; a key with no encoded dot
+/// segment is returned unchanged.
+fn without_encoded_dots(key: String) -> String {
+    let (path, query) = key.split_at(key.find('?').unwrap_or(key.len()));
+    let dot = |s: &str| s == "." || s.eq_ignore_ascii_case("%2e");
+    let encoded = |s: &str| s.contains('%') && s.len() <= 6;
+    let mut changed = false;
+    let segments: Vec<String> = path
+        .split('/')
+        .map(|s| {
+            let decoded = if encoded(s) {
+                if dot(s) {
+                    Some(".")
+                } else if s.len() >= 2 {
+                    // `..` spelled with either dot encoded, or both.
+                    let lower = s.to_ascii_lowercase();
+                    ["%2e%2e", ".%2e", "%2e."]
+                        .contains(&lower.as_str())
+                        .then_some("..")
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match decoded {
+                Some(d) => {
+                    changed = true;
+                    d.to_owned()
+                }
+                None => s.to_owned(),
+            }
+        })
+        .collect();
+    if !changed {
+        return key;
     }
+    let path = without_dot_segments(&segments.join("/"));
+    format!("{path}{query}")
 }
 
 /// The `Content-Type` the server sends for a stored file, by its extension.
@@ -1043,6 +1088,32 @@ mod tests {
                 usize::MAX
             ),
             Localized::Unchanged
+        );
+    }
+
+    /// CR 4644634646: an encoded dot segment is a dot segment, as the
+    /// WebView reads it: the key names the path it asks for. The query is
+    /// kept, and a path with no dot segment is unchanged.
+    #[test]
+    fn an_encoded_dot_segment_is_removed_from_the_key() {
+        assert_eq!(
+            request_key("https://s.example/jf/videos/%2e/0.m4s?p=%2e"),
+            "/jf/videos/0.m4s?p=%2e"
+        );
+        assert_eq!(
+            request_key("https://s.example/jf/videos/x/%2E%2e/0.m4s"),
+            "/jf/videos/0.m4s"
+        );
+        assert_eq!(
+            key_under_base(
+                "https://s.example/jf",
+                "https://s.example/jf/videos/.%2e/v/0.m4s"
+            ),
+            Some("/v/0.m4s".to_owned())
+        );
+        assert_eq!(
+            request_key("https://s.example/jf/videos/a%20b/0.m4s?q=1"),
+            "/jf/videos/a%20b/0.m4s?q=1"
         );
     }
 
