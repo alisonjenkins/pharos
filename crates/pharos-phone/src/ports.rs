@@ -252,6 +252,10 @@ impl Budget for PhoneBudget {
         pharos_ui::native::ports::music_used(music())
     }
 
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        pharos_ui::native::ports::set_music_cap(music(), bytes)
+    }
+
     fn accounting_ready(&self) -> bool {
         pharos_ui::native::ports::music_ready(music())
     }

@@ -131,6 +131,13 @@ pub trait Budget: Send + Sync {
     fn other_used_bytes(&self) -> u64;
     /// Free space on the device, measured now.
     fn free_bytes(&self) -> u64;
+    /// Sets the one cap every kind shares. A host that cannot keeps it and
+    /// says why.
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        Err(format!(
+            "this device cannot change the cap to {bytes} bytes"
+        ))
+    }
     /// Whether the other kinds' figures can be had yet. A host whose music
     /// cache is not up reports the default cap and no music, so a new
     /// download is refused until it is. Ready by default.
@@ -5367,6 +5374,24 @@ impl VideoStore for DiskVideoStore {
         self.inner.env.budget.cap_bytes()
     }
 
+    /// The one cap music and video share, set through the budget (the
+    /// phone's music cache): `cap_bytes` reads the same cap back. The free
+    /// floor is the budget's own and stays.
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        let set = self.inner.env.budget.set_cap_bytes(bytes);
+        match &set {
+            Ok(()) => emit(
+                false,
+                format!("pharos: video cap verdict=set bytes={bytes}"),
+            ),
+            Err(e) => emit(
+                true,
+                format!("pharos: video cap verdict=refused bytes={bytes} error={e}"),
+            ),
+        }
+        set
+    }
+
     fn size_unknown(&self) -> bool {
         if lock(&self.inner.state).unknown_folder().is_none() {
             return false;
@@ -6268,6 +6293,13 @@ pub(crate) mod tests {
             self.read();
             self.cap.load(Ordering::SeqCst)
         }
+        fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+            if bytes == 0 {
+                return Err("the music cache refused 0".to_owned());
+            }
+            self.cap.store(bytes, Ordering::SeqCst);
+            Ok(())
+        }
         fn other_used_bytes(&self) -> u64 {
             self.read();
             self.other.load(Ordering::SeqCst)
@@ -6741,6 +6773,9 @@ pub(crate) mod tests {
         }
         fn cache_enabled(&self) -> bool {
             true
+        }
+        fn set_cache_cap(&self, _: u64) -> Result<(), String> {
+            Err("the fake music keeps its cap".to_owned())
         }
         fn pending(&self) -> (u64, Option<u64>) {
             (
@@ -11080,6 +11115,26 @@ pub(crate) mod tests {
         store.remove("u1", "1");
         assert!(only(&store).ready());
         assert!(store.stored_file("u1", SEG0).is_some());
+    }
+
+    /// The phone's allowance picker sets the one cap music and video share:
+    /// the store hands it to its budget, and reads the same cap back. A
+    /// refusal leaves the cap as it was and says why.
+    #[tokio::test]
+    async fn setting_the_cap_sets_the_shared_cap_and_reads_it_back() {
+        let rig = Rig::new("set-cap");
+        let store = rig.open();
+        assert_eq!(store.cap_bytes(), 4 * GIB);
+        assert_eq!(store.set_cap_bytes(8 * GIB), Ok(()));
+        assert_eq!(store.cap_bytes(), 8 * GIB, "the cap did not change");
+        assert!(!lines("pharos: video cap verdict=set bytes=8589934592").is_empty());
+        let refused = store.set_cap_bytes(0);
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(store.cap_bytes(), 8 * GIB);
+        assert!(!lines(
+            "pharos: video cap verdict=refused bytes=0 error=the music cache refused 0"
+        )
+        .is_empty());
     }
 
     /// A whole inventory that lacks one of a Ready download's files does not

@@ -203,6 +203,9 @@ pub trait MusicSide {
     /// free-space figure; None when they could not all be read), from one
     /// read of each part.
     fn pending(&self) -> (u64, Option<u64>);
+    /// Sets the cache's cap, the one music and video share. Its free-space
+    /// floor is its own and stays.
+    fn set_cache_cap(&self, bytes: u64) -> Result<(), String>;
 }
 
 #[cfg(any(feature = "mobile", test))]
@@ -216,6 +219,9 @@ impl MusicSide for pharos_content::Library {
     fn cache_enabled(&self) -> bool {
         pharos_content::Library::cache_enabled(self)
     }
+    fn set_cache_cap(&self, bytes: u64) -> Result<(), String> {
+        pharos_content::Library::set_cache_cap(self, bytes).map_err(|e| e.redacted())
+    }
     fn pending(&self) -> (u64, Option<u64>) {
         let p = self.music_pending();
         (p.owed, p.written)
@@ -228,6 +234,16 @@ pub fn music_cap(music: Option<&dyn MusicSide>) -> u64 {
     music
         .and_then(MusicSide::cache_cap)
         .unwrap_or(pharos_content::DEFAULT_CAP_BYTES)
+}
+
+/// Sets the cap music and video share, through the music cache; refused
+/// while there is none, as nothing would keep it.
+#[cfg(any(feature = "mobile", test))]
+pub fn set_music_cap(music: Option<&dyn MusicSide>, bytes: u64) -> Result<(), String> {
+    match music {
+        Some(m) if m.cache_enabled() => m.set_cache_cap(bytes),
+        _ => Err("the music cache is not up yet, so the allowance cannot change".to_owned()),
+    }
 }
 
 /// What the music holds of the cap; nothing while there is no cache.
@@ -689,6 +705,38 @@ pub trait OfflineStore: Send + Sync {
 mod tests {
     use super::super::test_dir::TmpDir;
     use super::*;
+
+    /// The phone's allowance goes to the music cache's cap, the one music
+    /// and video share, and is refused while there is no cache to keep it.
+    #[test]
+    fn the_shared_cap_is_set_through_the_music_cache() {
+        struct Music(std::cell::Cell<u64>, bool);
+        impl MusicSide for Music {
+            fn cache_cap(&self) -> Option<u64> {
+                Some(self.0.get())
+            }
+            fn used_bytes(&self) -> Option<u64> {
+                Some(0)
+            }
+            fn cache_enabled(&self) -> bool {
+                self.1
+            }
+            fn pending(&self) -> (u64, Option<u64>) {
+                (0, Some(0))
+            }
+            fn set_cache_cap(&self, bytes: u64) -> Result<(), String> {
+                self.0.set(bytes);
+                Ok(())
+            }
+        }
+        let on = Music(std::cell::Cell::new(4), true);
+        assert_eq!(set_music_cap(Some(&on), 8), Ok(()));
+        assert_eq!(music_cap(Some(&on)), 8, "the shared cap did not change");
+        let off = Music(std::cell::Cell::new(4), false);
+        assert!(set_music_cap(Some(&off), 8).is_err());
+        assert_eq!(off.0.get(), 4);
+        assert!(set_music_cap(None, 8).is_err());
+    }
 
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn count() {
