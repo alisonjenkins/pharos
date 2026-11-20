@@ -1890,7 +1890,12 @@ fn mark_handler(
             };
             match settle_session(machine, session, result) {
                 Ok(now) => {
-                    if matches!(mark, Mark::Played) {
+                    // Kept only for the session that sent it: a mark that
+                    // lands after a sign-out or another sign-in is not this
+                    // session's to show.
+                    if matches!(mark, Mark::Played)
+                        && mark_is_current(machine.peek().session(), session, id)
+                    {
                         stored.set(Some((id, now)));
                     }
                 }
@@ -2622,6 +2627,18 @@ fn settle_start<T>(
         }
         StartFailure::from_client(&e)
     })
+}
+
+/// Whether a mark sent in session `sent_in` still belongs to the session
+/// signed in now (`current`); logs the skip when it does not.
+fn mark_is_current(current: u32, sent_in: u32, id: ItemRef) -> bool {
+    if current == sent_in {
+        return true;
+    }
+    platform::info(&format!(
+        "pharos: mark {id} stored verdict=skipped reason=stale_session sent_in={sent_in} current={current}"
+    ));
+    false
 }
 
 /// As [`settle`], for a call sent in `session`: a refusal ends only that
@@ -9567,6 +9584,15 @@ mod tests {
         let mut m = machine();
         m.apply(Event::NeedsSignIn);
         assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+    }
+
+    /// CR 4638660937: a played mark that lands after the session it was
+    /// sent in ended is not stored for the session signed in now.
+    #[test]
+    fn a_mark_from_an_ended_session_is_not_stored() {
+        let id: ItemRef = "1".parse().unwrap();
+        assert!(mark_is_current(3, 3, id));
+        assert!(!mark_is_current(4, 3, id), "a stale mark was stored");
     }
 
     /// CR 4638660942: only an accepted resume notes a newer server's
