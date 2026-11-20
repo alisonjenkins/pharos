@@ -213,7 +213,9 @@ type Remembered = HashMap<u64, (String, Aligned)>;
 type Verdicts = HashMap<(u64, String), Heard>;
 
 enum CacheBackend {
-    Disk(PathBuf),
+    /// The directory, and the verdicts its file could not take yet: held
+    /// here, answered from here and written with the item's next write.
+    Disk(PathBuf, Mutex<Verdicts>),
     Memory(Mutex<Remembered>, Mutex<Verdicts>),
 }
 
@@ -239,7 +241,7 @@ impl AlignCache {
     /// Create a cache rooted at `dir`, or an in-memory cache when `None`.
     pub fn new(dir: Option<PathBuf>) -> Self {
         let backend = match dir {
-            Some(d) => CacheBackend::Disk(d),
+            Some(d) => CacheBackend::Disk(d, Mutex::default()),
             None => CacheBackend::Memory(Mutex::new(HashMap::new()), Mutex::new(HashMap::new())),
         };
         Self {
@@ -261,7 +263,7 @@ impl AlignCache {
 
     fn words(&self, id: u64, key: &str) -> Option<Aligned> {
         match &*self.backend {
-            CacheBackend::Disk(dir) => {
+            CacheBackend::Disk(dir, _) => {
                 let path = dir.join(format!("{id}.words.json"));
                 let bytes = match std::fs::read(&path) {
                     Ok(b) => b,
@@ -315,11 +317,12 @@ impl AlignCache {
 
     /// Persist word stamps for `id` under `key`.
     pub fn put(&self, id: u64, key: String, aligned: Aligned) {
-        if let Some(heard) = &aligned.mismatch {
-            self.keep_verdict(id, &key, heard);
+        match &aligned.mismatch {
+            Some(heard) => self.keep_verdict(id, &key, heard),
+            None => self.write_unsaved_verdicts(id),
         }
         match &*self.backend {
-            CacheBackend::Disk(dir) => {
+            CacheBackend::Disk(dir, _) => {
                 let path = dir.join(format!("{id}.words.json"));
                 let record = WordsRecord {
                     key,
@@ -355,7 +358,9 @@ impl AlignCache {
 
     fn verdict(&self, id: u64, key: &str) -> Option<Heard> {
         match &*self.backend {
-            CacheBackend::Disk(dir) => read_verdicts(&verdicts_path(dir, id)).remove(key),
+            CacheBackend::Disk(dir, unsaved) => read_verdicts(&verdicts_path(dir, id))
+                .remove(key)
+                .or_else(|| lock(unsaved).get(&(id, key.to_string())).cloned()),
             CacheBackend::Memory(_, verdicts) => {
                 let map = match verdicts.lock() {
                     Ok(m) => m,
@@ -368,13 +373,9 @@ impl AlignCache {
 
     fn keep_verdict(&self, id: u64, key: &str, heard: &Heard) {
         match &*self.backend {
-            CacheBackend::Disk(dir) => {
-                let path = verdicts_path(dir, id);
-                let mut all = read_verdicts(&path);
-                all.insert(key.to_string(), heard.clone());
-                if let Err(e) = write_record(dir, &path, &all) {
-                    tracing::warn!(media.id = id, dir = %dir.display(), error = %e, "lyrics: mismatch verdict write failed");
-                }
+            CacheBackend::Disk(_, unsaved) => {
+                lock(unsaved).insert((id, key.to_string()), heard.clone());
+                self.write_unsaved_verdicts(id);
             }
             CacheBackend::Memory(_, verdicts) => {
                 let mut map = match verdicts.lock() {
@@ -385,6 +386,50 @@ impl AlignCache {
             }
         }
     }
+}
+
+impl AlignCache {
+    /// Writes the verdicts for `id` its file has not taken yet, keeping
+    /// them in memory while the write fails.
+    fn write_unsaved_verdicts(&self, id: u64) {
+        let CacheBackend::Disk(dir, unsaved) = &*self.backend else {
+            return;
+        };
+        let mut unsaved = lock(unsaved);
+        let keys: Vec<String> = unsaved
+            .keys()
+            .filter(|(i, _)| *i == id)
+            .map(|(_, k)| k.clone())
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let path = verdicts_path(dir, id);
+        let mut all = read_verdicts(&path);
+        for key in &keys {
+            if let Some(heard) = unsaved.get(&(id, key.clone())) {
+                all.insert(key.clone(), heard.clone());
+            }
+        }
+        match write_record(dir, &path, &all) {
+            Ok(()) => {
+                for key in keys {
+                    unsaved.remove(&(id, key));
+                }
+            }
+            Err(e) => tracing::warn!(
+                media.id = id,
+                dir = %dir.display(),
+                held = keys.len(),
+                error = %e,
+                "lyrics: mismatch verdict write failed; held in memory until the next write"
+            ),
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn verdicts_path(dir: &Path, id: u64) -> PathBuf {
@@ -2791,6 +2836,43 @@ pub(super) mod tests {
         )
         .unwrap();
         assert_eq!(cache.get(5, "k").map(|a| a.mismatch), Some(None));
+    }
+
+    /// A verdict its file would not take is still answered after another
+    /// lyric's words are written for the item, and is written once the
+    /// file takes it.
+    #[test]
+    fn a_verdict_the_disk_refused_is_held_and_written_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("4.mismatches.json");
+        std::fs::create_dir(&blocker).unwrap();
+        let cache = AlignCache::new(Some(dir.path().to_path_buf()));
+        let wrong = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = wrong.mismatch.clone().unwrap();
+        cache.put(4, "wrong".into(), wrong);
+        let sung = Aligned {
+            lines: vec![vec![WordStamp {
+                at: 0,
+                start_ms: 10,
+            }]],
+            ..Aligned::default()
+        };
+        cache.put(4, "sung".into(), sung.clone());
+        assert_eq!(cache.get(4, "sung"), Some(sung.clone()));
+        assert_eq!(
+            cache.get(4, "wrong").and_then(|a| a.mismatch),
+            Some(heard.clone())
+        );
+        let reopened = AlignCache::new(Some(dir.path().to_path_buf()));
+        assert_eq!(reopened.get(4, "wrong"), None);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        cache.put(4, "sung".into(), sung);
+        let reopened = AlignCache::new(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            reopened.get(4, "wrong").and_then(|a| a.mismatch),
+            Some(heard)
+        );
     }
 
     /// V1468: a lyric found not what was sung stays so after another lyric
