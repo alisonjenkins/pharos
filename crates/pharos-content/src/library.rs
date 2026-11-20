@@ -959,29 +959,27 @@ thread_local! {
     static FENCED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The fence as it stands (tests read it).
+#[cfg(test)]
 fn fenced() -> Option<String> {
+    with_fence(|f| f.clone())
+}
+
+/// Runs `f` on the fence in one hold of its lock, so a decision read from
+/// it and a change made to it cannot straddle another thread's fence.
+fn with_fence<R>(f: impl FnOnce(&mut Option<String>) -> R) -> R {
     #[cfg(not(test))]
     {
-        FENCED
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        f(&mut FENCED.lock().unwrap_or_else(PoisonError::into_inner))
     }
     #[cfg(test)]
     {
-        FENCED.with(|f| f.borrow().clone())
+        FENCED.with(|slot| f(&mut slot.borrow_mut()))
     }
 }
 
 fn set_fenced(fingerprint: Option<String>) {
-    #[cfg(not(test))]
-    {
-        *FENCED.lock().unwrap_or_else(PoisonError::into_inner) = fingerprint;
-    }
-    #[cfg(test)]
-    {
-        FENCED.with(|f| *f.borrow_mut() = fingerprint);
-    }
+    with_fence(|f| *f = fingerprint);
 }
 
 /// Fences the token with `fingerprint` in this process, library or not:
@@ -1299,25 +1297,37 @@ impl Worker {
     /// token reads as none; a different one lifts the fence.
     fn load_token(&mut self) -> Result<Option<String>, ContentError> {
         let token = token::load(&self.token_path)?;
-        let Some(fenced) = fenced() else {
-            return Ok(token);
-        };
-        match token {
-            Some(t) if token::fingerprint(&t) == fenced => {
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_FENCE_CHECK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        let read = token.as_deref().map(token::fingerprint);
+        // Compared and lifted in one hold: a fence for this very token that
+        // lands meanwhile is either seen here or lands after the lift.
+        let verdict = with_fence(|fence| match fence.as_deref() {
+            None => None,
+            Some(f) if read.as_deref() == Some(f) => Some("refused"),
+            Some(_) => {
+                *fence = None;
+                Some("lifted")
+            }
+        });
+        match verdict {
+            None => Ok(token),
+            Some("refused") => {
                 log::info!("token read verdict=refused reason=service_fence");
                 Ok(None)
             }
-            other => {
+            Some(_) => {
                 log::info!(
                     "token fence verdict=lifted reason={}",
-                    if other.is_some() {
+                    if token.is_some() {
                         "different_token"
                     } else {
                         "no_token"
                     }
                 );
-                set_fenced(None);
-                Ok(other)
+                Ok(token)
             }
         }
     }
@@ -1486,6 +1496,10 @@ mod tests {
     use crate::testdir::TmpDir;
 
     thread_local! {
+        /// Runs once in `load_token` after the token file is read, before
+        /// the fence is consulted.
+        pub(super) static BEFORE_FENCE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
         /// Runs once in `end_session` before the token file is ended.
         pub(super) static BEFORE_END_SESSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             std::cell::RefCell::new(None);
@@ -2305,6 +2319,30 @@ mod tests {
             Some("tokB"),
             "the refusal of A's QuickConnect session removed B's token"
         );
+    }
+
+    /// CR 4637783544: a read that finds B on file while A is fenced lifts
+    /// the fence only if it still names A when it is lifted. B's own fence,
+    /// landing after B was read, refuses B instead of being cleared.
+    #[test]
+    fn a_fence_for_the_token_just_read_is_not_lifted() {
+        let root = test_root("fence-lift-race");
+        let (mut w, _shared, token_path) = worker(&root);
+        token::store(&token_path, "tokB").unwrap();
+        set_fenced(Some(token::fingerprint("tokA")));
+        BEFORE_FENCE_CHECK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|| fence_token(&token::fingerprint("tokB"))));
+        });
+        assert_eq!(
+            w.load_token().unwrap(),
+            None,
+            "B was read through its own fence"
+        );
+        assert_eq!(fenced(), Some(token::fingerprint("tokB")));
+        // While A's fence stands, B is good.
+        set_fenced(Some(token::fingerprint("tokA")));
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
+        assert_eq!(fenced(), None);
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
