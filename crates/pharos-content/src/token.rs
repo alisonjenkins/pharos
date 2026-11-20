@@ -303,6 +303,41 @@ pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
     }
 }
 
+/// What a download run's read of the token file found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunRead {
+    /// The token, with the user it is paired with.
+    Token(Stored),
+    /// The sign-out fence refuses it (or every token): nothing is sent.
+    Fenced,
+    /// No token to send: none on file, or one a marker revokes.
+    NoToken,
+}
+
+/// The token for a download run and the fence decision on it, from one
+/// hold of the file's lock: the fence is the one in force when the token
+/// is read, never a snapshot from before it. A token stored after an older
+/// fence was set is allowed; one the fence names when it is read is not.
+pub fn read_for_run(path: &Path) -> Result<RunRead, ContentError> {
+    let _held = hold();
+    let fence = fence_held(path);
+    if fence == Fence::Every {
+        return Ok(RunRead::Fenced);
+    }
+    #[cfg(test)]
+    tests::between_read_and_write();
+    let Some(stored) = read_raw(path)? else {
+        return Ok(RunRead::NoToken);
+    };
+    if !matches!(marker(path, &fingerprint(&stored.token)), Marker::Absent) {
+        return Ok(RunRead::NoToken);
+    }
+    if fence.refuses(&stored.token) {
+        return Ok(RunRead::Fenced);
+    }
+    Ok(RunRead::Token(stored))
+}
+
 /// The file as it is, marker or not, with the user its pairing file names
 /// for it. The writers compare against this. Called with the lock held.
 ///
@@ -1225,6 +1260,48 @@ pub(crate) mod tests {
     /// A folder of the test's own, removed when the test ends.
     fn dir(tag: &str) -> crate::testdir::TmpDir {
         crate::testdir::TmpDir::new(&format!("token-{tag}"))
+    }
+
+    /// Body item android.rs:221: a run's fence and token come from one
+    /// hold of the lock. A sign-in that stores B and a sign-out that fences
+    /// B, both landing while the run reads, wait for it: the run sends A,
+    /// the token on file when it read, never B under the fence it read
+    /// before B was stored.
+    #[test]
+    fn a_runs_fence_and_token_are_read_together() {
+        let d = dir("run-read");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        store_user(&p, "A").unwrap();
+        let other: std::sync::Arc<Mutex<Option<std::thread::JoinHandle<()>>>> =
+            std::sync::Arc::default();
+        {
+            let (p, other) = (p.clone(), other.clone());
+            BETWEEN.with(|b| {
+                *b.borrow_mut() = Some(Box::new(move || {
+                    let p = p.clone();
+                    let t = std::thread::spawn(move || {
+                        store(&p, "tokB").unwrap();
+                        add_fence(&p, &Fence::token(&fingerprint("tokB")), "test");
+                    });
+                    // Long enough for an unlocked sign-in and sign-out.
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    *other.lock().unwrap() = Some(t);
+                }));
+            });
+        }
+        let read = read_for_run(&p).unwrap();
+        BETWEEN.with(|b| *b.borrow_mut() = None);
+        other.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(
+            read,
+            RunRead::Token(Stored {
+                token: "tokA".into(),
+                user: Some("A".into())
+            }),
+            "the run mixed a fence read before a store with the token after it"
+        );
+        assert_eq!(read_for_run(&p).unwrap(), RunRead::Fenced);
     }
 
     /// A sign-in that lands while a user id is being paired with the old
