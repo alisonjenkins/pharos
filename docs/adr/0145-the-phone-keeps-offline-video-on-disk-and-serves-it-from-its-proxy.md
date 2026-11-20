@@ -46,6 +46,11 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   sign-out or session end could not remove is marked revoked on disk, and
   one that could be neither removed nor marked is refused for the rest of
   the process, in the media service's library too.
+- Revocation markers are keyed by token fingerprint, one file per token,
+  and a store never removes or rewrites a marker naming another token; it
+  removes the new token's own marker only after that token is written,
+  fsynced, renamed and its folder synced, and fails the sign-in closed
+  when that removal fails.
 - Who may reach the downloads is one offline-owner state. A session end
   (the server refused the session, or it ended) fences that state first
   and tears down after: it parks the user's runs, then clears the token.
