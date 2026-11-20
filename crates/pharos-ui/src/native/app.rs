@@ -5375,6 +5375,8 @@ fn offline_playing(
         from_start: start_ms == 0 && from_start,
         engine,
         session,
+        // Try again keys a downloaded copy by its session.
+        renegotiation: 0,
         grant: RefCell::new(None),
         grant_gen: Cell::new(grant_gen),
         session_suspect: Cell::new(false),
@@ -5403,6 +5405,10 @@ struct Playing {
     engine: Engine,
     /// The server's play session; a new one remounts the player.
     session: String,
+    /// The player's renegotiations before this one. A recovery the server
+    /// answers with the same session is still a new stream, so it
+    /// remounts the player too.
+    renegotiation: u32,
     /// Reports and the stop go through this. It dies with the connection,
     /// so a reconnect swaps in a fresh one under the same player.
     /// `None` for a downloaded copy, which has no session on the server.
@@ -5452,6 +5458,11 @@ impl Playing {
         true
     }
 
+    /// Mounts the player afresh: a new session, or a renegotiation.
+    fn mount_key(&self) -> String {
+        player_key(&self.session, self.renegotiation)
+    }
+
     /// The tracks this playback was negotiated with, for negotiating it again.
     fn asked(&self) -> TrackPicks {
         TrackPicks {
@@ -5471,6 +5482,12 @@ impl Playing {
                 .any(|t| t.index == i && t.vtt_url.is_none() && t.images_url.is_none())
         })
     }
+}
+
+/// The player's mount key: its play session, and the renegotiations
+/// before it.
+fn player_key(session: &str, renegotiation: u32) -> String {
+    format!("{session}#{renegotiation}")
 }
 
 /// The playback props, compared by identity: a new negotiation is a new
@@ -5665,6 +5682,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let account = try_use_context::<AccountMe>();
     let offline_key = use_hook(|| Rc::new(Cell::new((0u32, false))));
     let retry_key = Rc::clone(&offline_key);
+    let renegotiations = use_hook(|| Rc::new(Cell::new(0u32)));
+    let renegotiated = Rc::clone(&renegotiations);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -5678,6 +5697,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let asked = picks();
         let picked_here = version_pick();
         let auto = auto_cap();
+        let renegotiation = renegotiated.get();
         // A song Previous went back to starts over (B464/V406), as does an
         // item Play from start was pressed on (B500). The press is spent only
         // by a negotiation that runs, so a load before sign-in keeps it; this
@@ -5864,6 +5884,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         from_start: start_ms == 0 && from_start,
                         engine,
                         session: decision.play_session,
+                        renegotiation,
                         grant: RefCell::new(Some(grant)),
                         offline: None,
                         grant_gen: Cell::new(grant_gen),
@@ -6099,7 +6120,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         },
         None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
             remount_on(
-                &p.0.session,
+                &p.0.mount_key(),
                 rsx! {
                     Player {
                         playing: p.clone(),
@@ -6113,7 +6134,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         upcoming: upcoming.read().clone().flatten(),
                         on_renegotiate: {
                             let offline_key = Rc::clone(&retry_key);
+                            let renegotiations = Rc::clone(&renegotiations);
                             move |next| {
+                                renegotiations.set(renegotiations.get().wrapping_add(1));
                                 // Try again on a downloaded copy mounts a new
                                 // player: the failed one keeps its error.
                                 let offline = matches!(
@@ -9353,6 +9376,19 @@ mod tests {
     #[test]
     fn the_same_play_session_keeps_its_player() {
         assert_eq!(mounts_across(&["a", "a"]), 1);
+    }
+
+    /// A recovery the server adopts hands back the session the failed
+    /// player had; the player still mounts afresh. A grant-only renewal
+    /// keeps it (V392).
+    #[test]
+    fn a_recovery_that_keeps_its_session_mounts_a_new_player() {
+        let renewed = [player_key("a", 0), player_key("a", 0)];
+        let renewed: Vec<_> = renewed.iter().map(String::as_str).collect();
+        assert_eq!(mounts_across(&renewed), 1);
+        let recovered = [player_key("a", 0), player_key("a", 1)];
+        let recovered: Vec<_> = recovered.iter().map(String::as_str).collect();
+        assert_eq!(mounts_across(&recovered), 2);
     }
 
     /// Spec 020 FR-001 (V400): the stage beside the screen draws the player,
