@@ -666,6 +666,61 @@ impl State {
     /// it too, whether a start, a resume or a handoff claimed it: a run
     /// that took allowances before then is stale on that record, and its
     /// late exit gives nothing back from the new run's reservation.
+    /// Gives back what earlier runs of `user`'s `item` took as
+    /// playlist allowances before a plan, down to the record's reservation
+    /// before them plus the playlists that landed (on disk), and forgets
+    /// them, so their exit has nothing left to release. Only on the record
+    /// they were taken from (its generation); a replaced record's are
+    /// dropped with no change. Called under the state lock before a claim
+    /// with no run in `runs`: a parked run's allowances are settled while
+    /// the record is still its own, and its late exit cannot touch the
+    /// replacement's reservation.
+    fn release_preplan_allowances(&mut self, user: &str, item: &str) {
+        let stale: Vec<u64> = self
+            .playlists_taken
+            .keys()
+            .filter(|(u, i, _)| u == user && i == item)
+            .map(|(_, _, run)| *run)
+            .collect();
+        let gen = self
+            .record_gen
+            .get(&(user.to_owned(), item.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        for run in stale {
+            let who = (user.to_owned(), item.to_owned(), run);
+            self.playlists_taken.remove(&who);
+            let landed = self.playlists_landed.remove(&who).unwrap_or(0);
+            let base = self.playlists_base.remove(&who);
+            let Some((base, _)) = base.filter(|(_, g)| *g == gen) else {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance kept item={item} run={run} reason=record_replaced"
+                    ),
+                );
+                continue;
+            };
+            if let Some(v) = self
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            {
+                let to = base.saturating_add(landed).min(v.estimated_bytes);
+                if to < v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed} reason=reclaimed_before_claim",
+                            v.estimated_bytes
+                        ),
+                    );
+                    v.estimated_bytes = to;
+                }
+            }
+        }
+    }
+
     fn claim_run(&mut self, user: &str, item: &str) -> u64 {
         self.next_run = self.next_run.wrapping_add(1);
         let id = self.next_run;
@@ -4720,6 +4775,10 @@ impl VideoStore for DiskVideoStore {
                     continue;
                 }
                 let Some(&run) = st.runs.get(&key) else {
+                    // A run parked by a session end may still hold playlist
+                    // allowances on this record: settled here, in this hold,
+                    // before the claim moves the record to the new run.
+                    st.release_preplan_allowances(&v.user, &v.item);
                     let id = st.claim_run(&v.user, &v.item);
                     resume.push((v.item, id));
                     continue;
@@ -9336,6 +9395,60 @@ pub(crate) mod tests {
             "the stale run changed the resumed record's reservation: {:?}",
             captured()
         );
+    }
+
+    /// A sign-in that resumes a record whose parked run still holds playlist
+    /// allowances settles them before it claims the record: the record is
+    /// back to its reservation before them plus the playlists that landed,
+    /// and the parked run's late exit has nothing left to release.
+    #[tokio::test]
+    async fn a_resume_settles_a_parked_runs_playlist_allowances_before_its_claim() {
+        let rig = Rig::new("resume-settles-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let old = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied()
+            .unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        let (base, landed) = {
+            let st = lock(&store.inner.state);
+            (
+                st.playlists_base
+                    .get(&who)
+                    .map(|b| b.0)
+                    .expect("no allowance taken"),
+                st.playlists_landed.get(&who).copied().unwrap_or(0),
+            )
+        };
+        let inflated = only(&store).estimated_bytes;
+        assert!(
+            inflated > base.saturating_add(landed),
+            "no allowance outstanding"
+        );
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        {
+            let st = lock(&store.inner.state);
+            assert!(
+                !st.playlists_taken.contains_key(&who),
+                "the parked run kept its allowance"
+            );
+            assert!(!st.playlists_base.contains_key(&who));
+        }
+        assert_eq!(
+            only(&store).estimated_bytes,
+            base.saturating_add(landed).min(inflated),
+            "the parked run's allowance still counts after the claim"
+        );
+        assert!(!lines("pharos: video playlist allowance released item=1").is_empty());
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
     }
 
     /// A download removed and started again between a sign-in's pick and
