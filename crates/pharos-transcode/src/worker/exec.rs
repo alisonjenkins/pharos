@@ -283,12 +283,27 @@ fn ffprobe_bin() -> String {
     }
 }
 
-/// B550/V460: a hardware failure on a window that holds no source video is
-/// [`WorkerError::NoFrames`], not a device fault, so the device is not cooled.
-/// Anything else keeps its classification.
+/// Whether a failure may only be a window with no picture in it, so the
+/// source should be asked ([`window_has_video`]) before the error stands: the
+/// encoder never opened, and the failure reads as a device fault or as a
+/// decode failure. A window shorter than a frame fails either way, depending
+/// on which line the decoder printed first (B1506).
+pub fn may_be_empty_window(err: &WorkerError, stderr: &str) -> bool {
+    matches!(
+        err,
+        WorkerError::DeviceBusy(_) | WorkerError::DecodeFailed(_)
+    ) && encoder_never_opened(stderr)
+}
+
+/// B550/V460: a hardware or decode failure on a window that holds no source
+/// video is [`WorkerError::NoFrames`], not a device or source fault, so the
+/// device is not cooled and the segment gets a filler. Anything else keeps its
+/// classification.
 pub fn settle_no_frames(err: WorkerError, has_video: Option<bool>) -> WorkerError {
     match (err, has_video) {
-        (WorkerError::DeviceBusy(why), Some(false)) => WorkerError::NoFrames(why),
+        (WorkerError::DeviceBusy(why) | WorkerError::DecodeFailed(why), Some(false)) => {
+            WorkerError::NoFrames(why)
+        }
         (err, _) => err,
     }
 }
@@ -584,6 +599,44 @@ mod tests {
         // Only a device fault is ever re-read.
         let e = settle_no_frames(WorkerError::BadInput("x".into()), Some(false));
         assert!(matches!(e, WorkerError::BadInput(_)), "{e:?}");
+    }
+
+    /// A window shorter than a frame where the decoder's own complaint comes
+    /// first: classified as a decode failure, with the same EOF line.
+    const EMPTY_WINDOW_DECODE_STDERR: &str = "[h264 @ 0x5555556f1a00] hwaccel initialisation returned error.\n\
+[vost#0:0/h264_vaapi @ 0x55555573a180] [enc:h264_vaapi @ 0x5555557a2f80] Could not open encoder before EOF\n\
+[out#0/mp4 @ 0x5555556eb000] Nothing was written into output file, because at least one of its streams received no packets.\n";
+
+    #[test]
+    fn a_decode_failure_with_an_unopened_encoder_is_no_frames_once_the_window_is_shown_empty() {
+        let classified = || classify_failure(EMPTY_WINDOW_DECODE_STDERR, true);
+        assert!(matches!(classified(), WorkerError::DecodeFailed(_)));
+        assert!(may_be_empty_window(
+            &classified(),
+            EMPTY_WINDOW_DECODE_STDERR
+        ));
+        let e = settle_no_frames(classified(), Some(false));
+        assert!(matches!(e, WorkerError::NoFrames(_)), "{e:?}");
+        // Video in the window, or no answer: the decode failure stands.
+        for has_video in [Some(true), None] {
+            let e = settle_no_frames(classified(), has_video);
+            assert!(matches!(e, WorkerError::DecodeFailed(_)), "{e:?}");
+        }
+        // A decode failure whose encoder did open is never re-read.
+        let opened = "Decode error rate 1 exceeds maximum 0.666667";
+        assert!(!may_be_empty_window(
+            &classify_failure(opened, true),
+            opened
+        ));
+        // Nor is any other class, whatever the EOF line says.
+        assert!(!may_be_empty_window(
+            &WorkerError::BadInput("x".into()),
+            EMPTY_WINDOW_DECODE_STDERR
+        ));
+        assert!(may_be_empty_window(
+            &classify_failure(NO_FRAMES_STDERR, true),
+            NO_FRAMES_STDERR
+        ));
     }
 
     #[test]
