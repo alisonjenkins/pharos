@@ -594,12 +594,26 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             format!("the revocation marker refuses the new token and cannot be removed: {e}"),
         ));
     }
+    // A pairing that survived from an earlier install of this very token
+    // (A, then B, then A again, its unlink failing each time) would name
+    // a user this sign-in has not confirmed once the file holds A again:
+    // cleared durably first, or the sign-in is refused before the rename.
+    if !matches!(&previous, Some(s) if s.token == token) && paired_user(path, token).is_some() {
+        if let Err(e) = remove_pairing(path) {
+            log::warn!("token store verdict=refused reason=earlier_pairing_not_cleared error={e}");
+            return Err(err(
+                path,
+                format!("a pairing from an earlier install of this token cannot be cleared: {e}"),
+            ));
+        }
+        log::info!("token pairing verdict=cleared reason=earlier_install_of_this_token");
+    }
     write(path, token).map_err(|e| err(path, e))?;
     // Installed: a token that replaces another starts unpaired. A pairing
     // left from an earlier install of this same token (A, then B, then A
     // again) would name a user this sign-in has not confirmed.
     if !matches!(&previous, Some(s) if s.token == token) {
-        match std::fs::remove_file(user_path(path)) {
+        match unlink_pairing(path) {
             Ok(()) => log::info!("token pairing verdict=cleared reason=token_replaced"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -1257,6 +1271,27 @@ fn write(path: &Path, token: &str) -> std::io::Result<()> {
 
 /// Pairs `user` with `token` in the pairing file, written whole as the
 /// token file is. Called with the lock held, after the token is on file.
+/// Unlinks the pairing file. Called with the lock held.
+fn unlink_pairing(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_PAIR_REMOVE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("pairing removal failed"));
+    }
+    std::fs::remove_file(user_path(path))
+}
+
+/// Unlinks the pairing file and syncs its folder, so a crash cannot bring
+/// it back. Called with the lock held.
+fn remove_pairing(path: &Path) -> Result<(), String> {
+    match unlink_pairing(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let dir = path.parent().ok_or("no directory")?;
+    durable_dir(dir)
+}
+
 fn write_pair(path: &Path, user: &str, token: &str) -> std::io::Result<()> {
     #[cfg(test)]
     if tests::FAIL_WRITE.with(std::cell::Cell::get) {
@@ -1349,6 +1384,8 @@ pub(crate) mod tests {
         /// While set, writing the token file fails before anything changes.
         pub(super) static FAIL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, syncing the directory after a rename fails.
+        /// Unlinking the pairing file fails.
+        pub(super) static FAIL_PAIR_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The next directory syncs fail with these, one each.
         pub(crate) static DIR_SYNC_ERRORS: RefCell<Vec<std::io::ErrorKind>> = const { RefCell::new(Vec::new()) };
@@ -1866,6 +1903,37 @@ pub(crate) mod tests {
         assert!(crate::testlog::lines()
             .iter()
             .any(|l| l.contains("token revocation marker verdict=kept reason=folder_not_synced")));
+    }
+
+    /// Outside diff token.rs:600-602 (review 5997638687): A's pairing
+    /// survives A to B, its unlink failing. Storing A again does not take
+    /// it back up: the stale pairing is cleared before the rename, or the
+    /// store is refused with B left on file. The control: with the unlink
+    /// working, A installs unpaired.
+    #[test]
+    fn an_earlier_installs_pairing_is_not_taken_back_up() {
+        let d = dir("pairing-earlier-install");
+        let path = d.join("device-token");
+        store(&path, "tokA").unwrap();
+        store_user(&path, "u1").unwrap();
+        FAIL_PAIR_REMOVE.with(|f| f.set(true));
+        store(&path, "tokB").unwrap();
+        assert!(
+            user_path(&path).exists(),
+            "the failed unlink left no pairing"
+        );
+        crate::testlog::start();
+        let again = store(&path, "tokA");
+        FAIL_PAIR_REMOVE.with(|f| f.set(false));
+        assert!(again.is_err(), "{again:?}");
+        assert_eq!(load(&path).unwrap().as_deref(), Some("tokB"));
+        assert!(crate::testlog::lines()
+            .iter()
+            .any(|l| l.contains("token store verdict=refused reason=earlier_pairing_not_cleared")));
+        store(&path, "tokA").unwrap();
+        let back = read(&path).unwrap().unwrap();
+        assert_eq!(back.token, "tokA");
+        assert_eq!(back.user, None, "an earlier install's user came back");
     }
 
     /// CR 4646025360: a marker is never unlinked, so no failure while it is
