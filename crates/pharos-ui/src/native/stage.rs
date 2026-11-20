@@ -27,6 +27,9 @@ const STRIP_CLASS: &str = "pharos-stage-strip";
 /// The stage bar's Expand button, where a TV's focus lands as the player
 /// goes compact (B1031).
 pub const STAGE_EXPAND_ID: &str = "pharos-stage-expand";
+/// The stage bar's queue button, where Escape in the docked queue puts the
+/// focus back.
+pub const STAGE_QUEUE_ID: &str = "pharos-stage-queue";
 /// Whether the D-pad's spatial focus is the only way round the page (a TV):
 /// the floating window's strip is then no focus stop, as its arrows would
 /// move the window rather than the focus (B1031).
@@ -753,6 +756,7 @@ pub fn StageBar(
                 if let Some(q) = queue {
                     div { class: "pharos-stage-extra",
                         button {
+                            id: STAGE_QUEUE_ID,
                             class: "pharos-stage-button pharos-stage-queue",
                             r#type: "button",
                             "data-key-action": "queue",
