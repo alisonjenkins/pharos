@@ -952,14 +952,25 @@ impl PlannerNoteReport {
                 "track={} index={index} from_ms={from_ms} to_ms={to_ms}",
                 track.label()
             ),
+            Note::Refill {
+                track,
+                index,
+                start_ms,
+                end_ms,
+            } => format!(
+                "track={} index={index} start_ms={start_ms} end_ms={end_ms}",
+                track.label()
+            ),
         }
     }
 
-    /// A giving up is the one note that means the stream is off nominal.
+    /// The notes that mean the stream is off nominal.
     pub fn is_warn(&self) -> bool {
         matches!(
             self.0,
-            pharos_hls::planner::Note::GaveUp { .. } | pharos_hls::planner::Note::Skipped { .. }
+            pharos_hls::planner::Note::GaveUp { .. }
+                | pharos_hls::planner::Note::Refill { .. }
+                | pharos_hls::planner::Note::Skipped { .. }
         )
     }
 
@@ -1009,6 +1020,17 @@ impl PlannerNoteReport {
                 ("index", index.to_string()),
                 ("from_ms", from_ms.to_string()),
                 ("to_ms", to_ms.to_string()),
+            ],
+            Note::Refill {
+                track,
+                index,
+                start_ms,
+                end_ms,
+            } => vec![
+                ("track", track.label().to_owned()),
+                ("index", index.to_string()),
+                ("start_ms", start_ms.to_string()),
+                ("end_ms", end_ms.to_string()),
             ],
         };
         let mut all = vec![
@@ -4962,6 +4984,21 @@ mod tests {
             gave_up.line(),
             "pharos: playback engine=rust planner=gave_up track=audio index=4 appends=2"
         );
+        let refill = PlannerNoteReport(Note::Refill {
+            track: Track::Video,
+            index: 120,
+            start_ms: 720_070,
+            end_ms: 722_000,
+        });
+        assert_eq!(
+            refill.line(),
+            "pharos: playback engine=rust planner=refill track=video index=120 start_ms=720070 end_ms=722000"
+        );
+        assert!(refill.is_warn());
+        assert!(refill
+            .event(String::new())
+            .fields
+            .contains(&("start_ms", "720070".to_owned())));
         let e = gave_up.event("/ui/watch/9".to_owned());
         assert_eq!(e.level, ClientLevel::Warn);
         assert!(e.fields.contains(&("planner", "gave_up".to_owned())));

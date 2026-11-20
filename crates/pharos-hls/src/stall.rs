@@ -25,7 +25,7 @@ const HOLE_MS: u64 = 100;
 
 /// Widest gap the watchdog jumps. Wider gaps are missing segments, which the
 /// planner fetches; jumping them would skip content. Provisional.
-const MAX_JUMP_MS: u64 = 1_000;
+pub(crate) const MAX_JUMP_MS: u64 = 1_000;
 
 /// Lands this far past a gap's end (hls.js `skipBufferHolePadding`).
 const JUMP_PADDING_MS: u64 = 100;
