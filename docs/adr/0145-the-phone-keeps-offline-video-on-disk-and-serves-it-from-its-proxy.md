@@ -56,10 +56,13 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   pairing is missing or stale is unpaired and fails closed. A token file
   in this build's earlier two-line layout is split on read.
 - Revocation markers are keyed by token fingerprint, one file per token,
-  and a store never removes or rewrites a marker naming another token; it
-  removes the new token's own marker durably (removed, then its folder
-  synced) before writing anything, and refuses the sign-in with nothing
-  written when that removal fails. A folder that can never be synced
+  and a store never touches a marker naming another token. It clears
+  the new token's own marker durably before writing anything, and
+  refuses the sign-in with nothing written when that fails. A marker is
+  never unlinked: it is cleared by renaming a fsynced temp file holding
+  `cleared` over it, between two folder syncs, and a reader takes a
+  cleared marker as none. The file on disk is then always the old marker
+  or the cleared one, so no failure leaves the token unguarded. A folder that can never be synced
   (EINVAL or ENOTSUP on both attempts) is accepted and logged as not
   durable, since refusing would make sign-in impossible there.
 - Who may reach the downloads is one offline-owner state. A session end
