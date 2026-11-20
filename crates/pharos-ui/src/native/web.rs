@@ -707,11 +707,11 @@ thread_local! {
         });
     /// The non-native player's `change` handler on its `TextTrackList`.
     static ON_TRACKS_CHANGE: std::cell::RefCell<Option<Closure<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
+        const { RefCell::new(None) };
     /// The `ResizeObserver` on the `<video>` in `CUE_VIDEO` and its callback,
     /// which lift the shown cues again for the player's new size.
     static CUE_RESIZE: std::cell::RefCell<Option<CueResize>> =
-        const { std::cell::RefCell::new(None) };
+        const { RefCell::new(None) };
 }
 
 /// The `<video>` a `ResizeObserver` watches, the observer and the callback
@@ -4067,7 +4067,39 @@ impl Drop for HlsJs {
 /// Console lines carry URLs; their credentials stay out of the console, which
 /// ends up in screenshots and pasted logs.
 pub fn warn(message: &str) {
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Line {
+            warn: true,
+            text: message,
+        });
+        return;
+    }
     web_sys::console::warn_1(&super::report::redact(message).into());
+}
+
+/// A log line or a client event of this page.
+pub enum PageOutput<'a> {
+    Line { warn: bool, text: &'a str },
+    Event(&'a ClientEvent),
+}
+
+/// Where this page's log lines and client events go when the app that owns
+/// the log and the telemetry runs outside the page: the Android app, whose
+/// page runs only the HLS engine (`hls_page`).
+pub type PageSink = Box<dyn Fn(PageOutput<'_>)>;
+
+thread_local! {
+    static PAGE_SINK: RefCell<Option<Rc<PageSink>>> =
+        const { RefCell::new(None) };
+}
+
+/// From now on [`info`], [`warn`] and [`report_event`] hand everything to `sink`.
+pub fn set_page_sink(sink: PageSink) {
+    PAGE_SINK.with(|slot| *slot.borrow_mut() = Some(Rc::new(sink)));
+}
+
+fn page_sink() -> Option<Rc<PageSink>> {
+    PAGE_SINK.with(|slot| slot.borrow().clone())
 }
 
 pub use super::diagnostics::{forget_opt_in, load_opted_in, opted_in, set_opted_in};
@@ -4105,6 +4137,10 @@ pub fn install_telemetry(api: &NativeApi) {
 /// Submits one client event without waiting for it, if opted in. Opted out,
 /// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Event(&event));
+        return;
+    }
     // Kept locally whatever the opt-in: it leaves only inside a pressed report.
     super::report::record_event(&event);
     if let Some((api, event)) = diagnostics::report(event) {
@@ -4142,6 +4178,13 @@ fn hls_event(
 }
 
 pub fn info(message: &str) {
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Line {
+            warn: false,
+            text: message,
+        });
+        return;
+    }
     web_sys::console::info_1(&super::report::redact(message).into());
 }
 
