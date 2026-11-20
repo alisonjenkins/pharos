@@ -685,15 +685,25 @@ mod tests {
         static RUNNING: AtomicBool = AtomicBool::new(false);
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (done, ended) = std::sync::mpsc::channel::<()>();
-        let started = std::time::Instant::now();
-        let first = spawn_once(&RUNNING, move || {
-            wait.recv().unwrap();
-            done.send(()).unwrap();
+        // The caller runs on a thread of its own: the open it starts waits
+        // for `release`, sent only after the caller returned, so a caller
+        // that waited for the open would never return. The bounded wait is
+        // a deadlock guard, not a latency bound (CR 4644634426).
+        let (returned, caller) = std::sync::mpsc::channel::<Background>();
+        std::thread::spawn(move || {
+            let verdict = spawn_once(&RUNNING, move || {
+                wait.recv().unwrap();
+                done.send(()).unwrap();
+            });
+            returned.send(verdict).unwrap();
         });
+        let first = caller
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("the caller waited for the open: {e}"));
         assert_eq!(first, Background::Started);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "the caller waited for the open"
+            ended.try_recv().is_err(),
+            "the open ended before it was released"
         );
         assert_eq!(
             spawn_once(&RUNNING, || unreachable!("a second open ran")),
