@@ -658,16 +658,29 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
     }
 }
 
-/// Removes the revocation marker beside `path` (absent is fine).
+/// Removes the revocation marker beside `path` (absent is fine), and
+/// syncs the folder once it went, so the removal is on disk before the
+/// store reports success. A sync that fails is logged apart from a removal
+/// that failed: the marker is gone for every reader, and a crash that brings
+/// it back only refuses again (fail closed), so the store still holds.
 fn remove_marker(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(revoked_path(path)) {
-        Ok(()) => {
-            log::info!("token revocation marker verdict=cleared reason=signed_in");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     }
+    match path.parent().map(durable_dir) {
+        Some(Ok(())) => {
+            log::info!("token revocation marker verdict=cleared reason=signed_in");
+        }
+        Some(Err(why)) => log::warn!(
+            "token revocation marker verdict=cleared_not_durable reason=signed_in error={why}"
+        ),
+        None => log::warn!(
+            "token revocation marker verdict=cleared_not_durable reason=signed_in error=no_directory"
+        ),
+    }
+    Ok(())
 }
 
 /// Writes the marker whole (temp file, fsync, rename, folder sync). The
@@ -1404,6 +1417,32 @@ pub(crate) mod tests {
         );
         assert!(marker.is_dir(), "the marker was changed");
         assert_eq!(load(&p).unwrap(), None);
+    }
+
+    /// CR 4638660923: the removal of a marker that would refuse the new
+    /// token is synced before the store reports success; a sync that fails
+    /// is logged apart, as not durable, and the store still holds.
+    #[test]
+    fn a_cleared_marker_is_synced_and_a_failed_sync_is_named() {
+        let d = dir("token-marker-sync");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        write_marker(&p, Some("A"), &fingerprint("tokN")).unwrap();
+        crate::testlog::start();
+        DIR_SYNC_ERRORS.with(|q| {
+            q.borrow_mut()
+                .extend([std::io::ErrorKind::Other, std::io::ErrorKind::Other]);
+        });
+        store(&p, "tokN").unwrap();
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("token revocation marker verdict=cleared_not_durable")),
+            "{lines:?}"
+        );
     }
 
     /// (c) A removal that is not durable is marked too; only when the
