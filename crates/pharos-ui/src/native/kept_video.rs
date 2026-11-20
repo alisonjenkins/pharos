@@ -633,7 +633,9 @@ pub fn localize_playlist(
             let body = line.trim_end_matches(['\r', '\n']);
             let ending = &line[body.len()..];
             let trimmed = body.trim();
-            if trimmed.is_empty() {
+            // Blank lines and comments (a `#` line that is not an `#EXT`
+            // tag) are kept as they are; only tags carry URI attributes.
+            if trimmed.is_empty() || (trimmed.starts_with('#') && !trimmed.starts_with("#EXT")) {
                 push(&mut out, line)?;
             } else if trimmed.starts_with('#') {
                 let mut rest = body;
@@ -923,6 +925,22 @@ mod tests {
             localize_playlist("#EXTINF:6.0,\n../../x/0.m4s\n", from, server, usize::MAX),
             Localized::NotLocal("../../x/0.m4s".to_owned()),
             "a reference outside the base path was kept"
+        );
+    }
+
+    /// CR 4638660961: a comment line is kept verbatim, even one that holds
+    /// `URI="..."`; tags still have theirs localized.
+    #[test]
+    fn a_playlist_comment_is_kept_verbatim() {
+        let server = "https://s.example/jf";
+        let text =
+            "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/jf/videos/1/init.mp4\"\n";
+        assert_eq!(
+            localize_playlist(text, None, server, usize::MAX),
+            Localized::Rewritten(
+                "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
+                    .to_owned()
+            )
         );
     }
 
