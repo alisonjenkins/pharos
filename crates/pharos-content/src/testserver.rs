@@ -407,6 +407,8 @@ mod tests {
     #[test]
     fn an_oversized_piece_ends_at_the_body() {
         assert_eq!(pieces(10, usize::MAX, None), [(0, 10)]);
+        // From a hold past 0, an unclamped end would overflow.
+        assert_eq!(pieces(2, usize::MAX, Some(1)), [(0, 1), (1, 2)]);
         assert_eq!(pieces(10, 4, Some(6)), [(0, 4), (4, 6), (6, 10)]);
     }
     use std::io::{Read, Write};
