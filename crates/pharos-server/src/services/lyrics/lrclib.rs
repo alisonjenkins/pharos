@@ -239,6 +239,7 @@ mod tests {
             let mut buf = [0u8; 4096];
             while !got.windows(4).any(|w| w == b"\r\n\r\n") {
                 let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before the end of the request head");
                 got.extend_from_slice(&buf[..n]);
             }
             let head = String::from_utf8_lossy(&got);
