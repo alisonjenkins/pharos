@@ -1189,18 +1189,39 @@ impl Worker {
                     }
                 }
                 // A sign-out may have fenced the token while a refresh was
-                // out: the link is not handed on.
+                // out: the link is not handed on. As at the entry check, the
+                // stored token is looked up instead: a usable replacement
+                // resumes, and none starts QuickConnect.
                 let link = l.clone();
-                if self.fenced_after(&link.token, "refresh") {
-                    return Err(ContentError::NeedsSignIn);
+                if !self.fenced_after(&link.token, "refresh") {
+                    return Ok(link);
                 }
+            }
+        }
+        // At most twice: a fence that lands while the resume is out sends
+        // it back to the token file once, where the fenced token reads as
+        // none.
+        for _ in 0..2 {
+            let Some(device_token) = self.load_token()? else {
+                self.start_sign_in(events);
+                return Err(ContentError::NeedsSignIn);
+            };
+            if let Some(link) = self.resume_link(events, device_token).await? {
                 return Ok(link);
             }
         }
-        let Some(device_token) = self.load_token()? else {
-            self.start_sign_in(events);
-            return Err(ContentError::NeedsSignIn);
-        };
+        log::warn!("token link verdict=needs_sign_in reason=fenced_twice");
+        self.start_sign_in(events);
+        Err(ContentError::NeedsSignIn)
+    }
+
+    /// Resumes a session from `device_token` and opens a link on it.
+    /// `None` when a sign-out fenced the token while the resume was out.
+    async fn resume_link(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+        device_token: String,
+    ) -> Result<Option<Link>, ContentError> {
         let (bootstrap, closed) = net::open(&self.base).await?;
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
@@ -1231,12 +1252,12 @@ impl Worker {
         // A sign-out may have fenced the token while the resume was out:
         // no link opens with it.
         if self.fenced_after(&device_token, "resume") {
-            return Err(ContentError::NeedsSignIn);
+            return Ok(None);
         }
         let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
         self.shared.set_auth(AuthState::SignedIn);
-        Ok(link)
+        Ok(Some(link))
     }
 
     /// Drop the connection and any QuickConnect, then resume from the token
@@ -2402,6 +2423,9 @@ mod tests {
             out.err()
         );
         assert!(w.link.is_none(), "the fenced link was kept");
+        // CR 4642574342: as at the entry check, the token file is looked
+        // up: the fenced token reads as none, so QuickConnect starts.
+        assert!(w.qc.is_some(), "no sign-in started after the fence");
         let lines = crate::testlog::lines();
         assert!(
             lines
