@@ -2140,85 +2140,99 @@ mod tests {
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
     }
 
+    /// Free space that has room until `part` holds 600 bytes, then only
+    /// `after` above the floor: the drop that leaves the part and the low
+    /// reading are in place together, before any retry can run.
+    fn room_once_part_is_600(
+        part: Arc<Mutex<Option<std::path::PathBuf>>>,
+        after: u64,
+    ) -> FreeProbe {
+        Box::new(move |_| {
+            let len = part
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len());
+            Ok(if len >= 600 {
+                MIN_FREE_BYTES + after
+            } else {
+                MIN_FREE_BYTES + 5000
+            })
+        })
+    }
+
+    /// An origin whose every answer is a whole new body (it ignores
+    /// ranges) under validator vB, the first cut after 600 bytes: the
+    /// retry is a replacement from the start, with no script change to
+    /// race.
+    fn replacing_origin() -> Script {
+        Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vB")
+            .ignore_range()
+            .drop_first_after(600)
+    }
+
     /// A whole new body refused for low disk keeps the old part and its
-    /// validator: the bytes are on disk and counted already, so the job
-    /// backs off and tries again, resuming them once there is room.
+    /// validator: the bytes are on disk and counted already, so a pin's
+    /// job backs off and tries again, resuming them once there is room.
     #[test]
     fn a_replacement_refused_for_low_disk_keeps_the_part_and_its_validator() {
-        let script = Script::default()
-            .file("/audio/1", body(1000, 1))
-            .etag("vA")
-            .drop_first_after(600);
-        let room = Arc::new(AtomicU64::new(MIN_FREE_BYTES + 100));
-        let r2 = room.clone();
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
         let r = rig_with_free(
             "replacement-low-disk",
-            script,
+            replacing_origin(),
             1 << 20,
             &["t"],
             fast(),
-            Box::new(move |_| Ok(r2.load(Ordering::SeqCst))),
+            room_once_part_is_600(slot.clone(), 100),
         );
+        *slot.lock().unwrap() = Some(r.cache.part_path("track/1"));
         let part = r.cache.part_path("track/1");
-        // The first attempt has room; the drop leaves 600 bytes.
-        room.store(MIN_FREE_BYTES + 5000, Ordering::SeqCst);
+        r.cache.pin("album/a", &ids(&["track/1"]));
         r.dl.prefetch(&ids(&["track/1"]));
-        let until = Instant::now() + Duration::from_secs(10);
-        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 600) {
-            assert!(Instant::now() < until, "no partial file");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        // Too little for the new version even with the old part as room.
-        room.store(MIN_FREE_BYTES + 100, Ordering::SeqCst);
-        r.srv.edit(|s| s.etag("vB").ignore_range());
         let until = Instant::now() + Duration::from_secs(10);
         while r.srv.seen().len() < 4 {
             assert!(Instant::now() < until, "no retries: {:?}", r.srv.seen());
             std::thread::sleep(Duration::from_millis(2));
         }
+        let seen = r.srv.seen();
+        assert!(
+            seen[1..].iter().all(|s| s.status == 200),
+            "a retry was not a refused replacement: {seen:?}"
+        );
         assert_eq!(
             std::fs::metadata(&part).map(|m| m.len()).ok(),
             Some(600),
             "the refused replacement deleted the part"
         );
-        let seen = r.srv.seen();
         assert!(
             seen[1..]
                 .iter()
-                .all(|s| s.if_range.as_deref() == Some("\"vA\"")),
+                .all(|s| s.if_range.as_deref() == Some("\"vB\"")),
             "a retry lost the part's validator: {seen:?}"
         );
         assert!(!r.cache.is_complete("track/1"));
     }
 
     /// CR 4637783558: a 200 that is then refused for space is no progress:
-    /// consecutive refusals back off further, up to the maximum, instead
-    /// of starting again at the minimum on every 200.
+    /// a pin's consecutive refusals back off further, up to the maximum,
+    /// instead of starting again at the minimum on every 200.
     #[test]
     fn storage_refusals_back_off_despite_each_200() {
-        let script = Script::default()
-            .file("/audio/1", body(1000, 1))
-            .etag("vA")
-            .drop_first_after(600);
-        let room = Arc::new(AtomicU64::new(MIN_FREE_BYTES + 5000));
-        let r2 = room.clone();
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
         let r = rig_with_free(
             "replacement-backoff",
-            script,
+            replacing_origin(),
             1 << 20,
             &["t"],
             fast(),
-            Box::new(move |_| Ok(r2.load(Ordering::SeqCst))),
+            room_once_part_is_600(slot.clone(), 100),
         );
-        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(r.cache.part_path("track/1"));
+        r.cache.pin("album/a", &ids(&["track/1"]));
         r.dl.prefetch(&ids(&["track/1"]));
-        let until = Instant::now() + Duration::from_secs(10);
-        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 600) {
-            assert!(Instant::now() < until, "no partial file");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        room.store(MIN_FREE_BYTES + 100, Ordering::SeqCst);
-        r.srv.edit(|s| s.etag("vB").ignore_range());
         let until = Instant::now() + Duration::from_secs(10);
         while r.srv.seen().len() < 6 {
             assert!(Instant::now() < until, "no retries: {:?}", r.srv.seen());
