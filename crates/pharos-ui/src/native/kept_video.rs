@@ -302,6 +302,14 @@ pub trait VideoStore: Send + Sync {
     fn video_bytes(&self, user: &str) -> u64 {
         self.used_bytes(user)
     }
+    /// `user`'s video subtotal and the shared usage, from one read of the
+    /// subtotal, so a download writing between two calls cannot show more
+    /// video than the shared figure holds. By default both are
+    /// `used_bytes`; a store that overrides `video_bytes` overrides this.
+    fn usage(&self, user: &str) -> Usage {
+        let used = self.used_bytes(user);
+        Usage { video: used, used }
+    }
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
     /// The stored file for a request's [`request_key`] among `user`'s own
@@ -377,6 +385,14 @@ pub fn content_type_for(key: &str) -> &'static str {
         Some("vtt") => "text/vtt",
         _ => "application/octet-stream",
     }
+}
+
+/// What a user's downloads hold ([`VideoStore::usage`]): the videos'
+/// own bytes, and the figure the shared cap counts, read together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub video: u64,
+    pub used: u64,
 }
 
 /// What a request for a stream is, for the log line a host writes about it.

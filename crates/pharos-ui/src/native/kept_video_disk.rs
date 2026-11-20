@@ -5544,8 +5544,16 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
-        self.video_bytes(user)
-            .saturating_add(self.inner.env.budget.other_used_bytes())
+        self.usage(user).used
+    }
+
+    fn usage(&self, user: &str) -> super::kept_video::Usage {
+        // One read of the subtotal serves both figures.
+        let video = self.video_bytes(user);
+        super::kept_video::Usage {
+            video,
+            used: video.saturating_add(self.inner.env.budget.other_used_bytes()),
+        }
     }
 
     fn video_bytes(&self, user: &str) -> u64 {

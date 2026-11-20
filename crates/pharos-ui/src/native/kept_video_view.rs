@@ -328,6 +328,9 @@ struct Listing {
     unreadable: usize,
     /// Folders a removal left: see [`VideoStore::leftover_count`].
     leftover: usize,
+    /// The user's usage, polled with the rows: music finishing a download
+    /// changes it with no video row changing, and the page must show it.
+    usage: Option<super::kept_video::Usage>,
 }
 
 /// The listing to show for `user` now: nothing without a store or a user,
@@ -341,6 +344,7 @@ fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
         videos: user.map(|u| store.videos(u)).unwrap_or_default(),
         unreadable: store.unreadable_count(),
         leftover: store.leftover_count(),
+        usage: user.map(|u| store.usage(u)),
     }
 }
 
@@ -572,8 +576,18 @@ pub fn VideoDownloads(
     let user = use_user();
     let listing = use_listing(user.clone());
     let nav = use_context::<Nav>();
-    let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
-    let videos_used = user.as_deref().map(|u| store.video_bytes(u));
+    // Both figures from one read: the polled one while it was read for this
+    // user, else a fresh one.
+    let usage = {
+        let shown = listing.read();
+        if shown.owner == user {
+            shown.usage
+        } else {
+            user.as_deref().map(|u| store.usage(u))
+        }
+    };
+    let used = usage.map_or(0, |u| u.used);
+    let videos_used = usage.map(|u| u.video);
     let remove_user = user.clone();
     let remove_store = store.clone();
     // App-wide, not this view's: a discard outlives the page that started
@@ -1272,12 +1286,14 @@ mod tests {
             videos: vec![],
             unreadable: 1,
             leftover: 0,
+            usage: None,
         };
         let now = Listing {
             owner: None,
             videos: vec![],
             unreadable: 0,
             leftover: 0,
+            usage: None,
         };
         assert_eq!(
             refreshed(&shown, now.clone()),
@@ -1285,6 +1301,67 @@ mod tests {
             "the count changed and the screen kept the old one"
         );
         assert_eq!(refreshed(&shown, shown.clone()), None);
+    }
+
+    /// A store whose usage is given, and whose separate figures must not
+    /// be read: the screen takes both from one `usage` call.
+    struct Shared(std::sync::atomic::AtomicU64);
+    impl VideoStore for Shared {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(
+            &self,
+            _: super::super::kept_video::KeepVideoRequest,
+        ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            unreachable!("used_bytes read apart from the video subtotal")
+        }
+        fn video_bytes(&self, _: &str) -> u64 {
+            unreachable!("video_bytes read apart from the shared usage")
+        }
+        fn usage(&self, _: &str) -> super::super::kept_video::Usage {
+            super::super::kept_video::Usage {
+                video: 100,
+                used: 100 + self.0.load(std::sync::atomic::Ordering::SeqCst),
+            }
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    /// CR 4640611377: music finishing a download changes the shared usage
+    /// with no video row or folder count changing; the poll still renders
+    /// it again. CR 4640611383: both figures come from one `usage` read.
+    #[test]
+    fn a_poll_refreshes_a_usage_that_changed_alone() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let store = Shared(AtomicU64::new(0));
+        let shown = listing(Some(&store), Some("A"));
+        assert_eq!(
+            shown.usage,
+            Some(super::super::kept_video::Usage {
+                video: 100,
+                used: 100
+            })
+        );
+        assert_eq!(refreshed(&shown, listing(Some(&store), Some("A"))), None);
+        store.0.store(20, Ordering::SeqCst);
+        let now = listing(Some(&store), Some("A"));
+        assert_eq!(
+            refreshed(&shown, now.clone()),
+            Some(now),
+            "music's change left the old usage on screen"
+        );
+        assert_eq!(listing(Some(&store), None).usage, None);
     }
 
     /// A listing read for A is never shown once the screen is B's: B's
@@ -1298,6 +1375,7 @@ mod tests {
             videos: a_rows.clone(),
             unreadable: 0,
             leftover: 0,
+            usage: None,
         };
         let rows = rows_for(&shown, Some("B"), || Listing {
             owner: Some("B".into()),
