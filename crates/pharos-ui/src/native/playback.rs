@@ -515,6 +515,18 @@ pub fn plan_hls(
     })
 }
 
+/// The `SourceBuffer.remove` range, in seconds, for the planner's evict up to
+/// `end_ms`. It starts at zero, not at the evict's own start: that start is
+/// the first buffered range's, rounded to a millisecond ([`ranges_to_ms`]),
+/// and a start rounded up leaves the first frame in, so the range reads the
+/// same afterwards and the planner asks again without end (B1505). Nothing is
+/// buffered before the first range, so zero removes the same media.
+pub fn evict_range_s(end_ms: u64) -> (f64, f64) {
+    #[allow(clippy::cast_precision_loss)]
+    let end_s = end_ms as f64 / 1000.0;
+    (0.0, end_s)
+}
+
 /// Converts `(start_s, end_s)` `TimeRanges` pairs into sorted millisecond ranges.
 pub fn ranges_to_ms(ranges_s: &[(f64, f64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::with_capacity(ranges_s.len());
@@ -5431,6 +5443,17 @@ mod tests {
             plan_hls(&empty_master, &fmp4_media, None, |_| true),
             Err((HlsFallbackCause::NoVariant, "none".to_owned()))
         );
+    }
+
+    #[test]
+    fn an_evict_removes_from_before_a_start_that_rounded_up() {
+        // A first frame at 66.7 ms reads as 67 ms.
+        let true_start_s = 0.0667;
+        let buffered = ranges_to_ms(&[(true_start_s, 60.0)]);
+        assert_eq!(buffered, vec![(67, 60_000)]);
+        let (start_s, end_s) = evict_range_s(30_000);
+        assert!(start_s <= true_start_s);
+        assert!((end_s - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]

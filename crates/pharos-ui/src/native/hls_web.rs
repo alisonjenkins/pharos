@@ -22,11 +22,11 @@ use super::platform::{
     video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    abr_ladder, check_master, engine_buffer_config, forward_buffer_ms, pick_audio_uri, plan_hls,
-    playlist_retry_policy, ranges_to_ms, rung_label, segment_deadlines, with_abr, AbrSwitchReport,
-    FailureKind, Fatal, FragmentLoad, HlsFallbackCause, MediaRecovery, MediaRecoveryReport,
-    MediaVerdict, OnFatal, OnFragment, PlannerNoteReport, PlaybackEngine, SegmentFailureReport,
-    SegmentRecovery, StallReport,
+    abr_ladder, check_master, engine_buffer_config, evict_range_s, forward_buffer_ms,
+    pick_audio_uri, plan_hls, playlist_retry_policy, ranges_to_ms, rung_label, segment_deadlines,
+    with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad, HlsFallbackCause, MediaRecovery,
+    MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment, PlannerNoteReport, PlaybackEngine,
+    SegmentFailureReport, SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -1300,16 +1300,9 @@ fn execute_actions(session: &Rc<RefCell<Session>>, actions: Vec<Action>) {
             Action::FetchInit { track } => start_fetch(session, track, SegRequest::Init),
             Action::Fetch { track, index } => start_fetch(session, track, SegRequest::Media(index)),
             Action::Abort { track } => abort_track(session, track),
-            Action::Evict {
-                track,
-                start_ms,
-                end_ms,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let op = Op::Remove {
-                    start_s: start_ms as f64 / 1000.0,
-                    end_s: end_ms as f64 / 1000.0,
-                };
+            Action::Evict { track, end_ms, .. } => {
+                let (start_s, end_s) = evict_range_s(end_ms);
+                let op = Op::Remove { start_s, end_s };
                 {
                     let mut s = session.borrow_mut();
                     if let Some(t) = s.track_mut(track) {
