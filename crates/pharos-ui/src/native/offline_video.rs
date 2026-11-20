@@ -2392,8 +2392,10 @@ pub(crate) mod tests {
                 panic!("B's token did not open B's session");
             };
             assert_eq!(*resumer.sent.borrow(), ["tokA", "tokB"]);
-            // A's answer lands after the re-open.
-            let _ = ask_a.answered("A");
+            // The app publishes B's session, as `connect` does.
+            session_replaced(&session_b);
+            // A's answer lands after the re-open, and is refused.
+            assert!(!ask_a.answered("A"), "A's late answer was taken");
             assert_eq!(
                 token_file::read(&path).unwrap().unwrap().user,
                 None,
