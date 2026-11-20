@@ -2525,27 +2525,7 @@ addEventListener("scroll", gridPlace, { passive: true });
 addEventListener("focusin", gridPlace);
 __GRID_VIEW__
 __MEASURE__
-// Back closes an open dialog or menu before it goes back a page (FR-607),
-// with the Escape each of them already closes on. One that is still open
-// at the next Back, with no key pressed between, does not close on Escape:
-// that Back goes on as usual.
-let backClosed = null;
-addEventListener("keydown", () => { backClosed = null; }, true);
-const closeOverlay = () => {
-  let el = null;
-  for (const o of document.querySelectorAll('__OVERLAYS__')) {
-    if (o.getClientRects().length === 0) continue;
-    // The innermost of nested ones (B1508): the queue's Clear confirm, then
-    // the queue.
-    if (!el || el.contains(o)) el = o;
-  }
-  if (!el || el === backClosed) return null;
-  const at = document.activeElement;
-  const target = at && el.contains(at) ? at : el;
-  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-  backClosed = el;
-  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
-};
+__BACK_CLOSE__
 addEventListener("popstate", (e) => {
   const closed = closeOverlay();
   if (e.state === "pharos-guard") {

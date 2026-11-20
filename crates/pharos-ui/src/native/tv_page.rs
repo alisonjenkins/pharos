@@ -734,8 +734,38 @@ pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .
 /// confirm, which Back closes first.
 pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue, .pharos-queue:focus-within"#;
 
+/// The remote's Back, before it goes back a page: `closeOverlay()` sends an
+/// Escape to the innermost open [`OVERLAYS`] entry and names it, or returns
+/// `null` when there is none, or when that one ignored the Escape of the
+/// last Back (no key pressed since), so this Back navigates. The Android
+/// bridge's `popstate` handler calls it; the B1508 test drives it in node.
+pub const BACK_CLOSE_JS: &str = r#"
+// Back closes an open dialog or menu before it goes back a page (FR-607),
+// with the Escape each of them already closes on. One that is still open
+// at the next Back, with no key pressed between, does not close on Escape:
+// that Back goes on as usual.
+let backClosed = null;
+addEventListener("keydown", () => { backClosed = null; }, true);
+const closeOverlay = () => {
+  let el = null;
+  for (const o of document.querySelectorAll('__OVERLAYS__')) {
+    if (o.getClientRects().length === 0) continue;
+    // The innermost of nested ones (B1508): the queue's Clear confirm, then
+    // the queue.
+    if (!el || el.contains(o)) el = o;
+  }
+  if (!el || el === backClosed) return null;
+  const at = document.activeElement;
+  const target = at && el.contains(at) ? at : el;
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  backClosed = el;
+  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
+};
+"#;
+
 pub fn bridge_script(template: &str) -> String {
     template
+        .replace("__BACK_CLOSE__", BACK_CLOSE_JS)
         .replace("__BAR_KEYS__", BAR_KEY_JS)
         .replace("__TILE_HOLD__", TILE_HOLD_JS)
         .replace("__ARROWS_SKIP_VDOM__", ARROWS_SKIP_VDOM_JS)
