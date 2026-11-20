@@ -61,6 +61,9 @@ pub fn karaoke_on() -> bool {
 const QUEUE_KEY: &str = "pharos.listen.queue";
 const QUEUE_SHOWN: &str = "shown";
 pub const QUEUE_PANEL_ID: &str = "pharos-queue";
+/// The now-playing screen's Queue button, where Escape in the queue puts the
+/// focus back.
+const QUEUE_TOGGLE_ID: &str = "pharos-listen-queue-toggle";
 
 /// Device-local: whether the listener docked the queue beside the mini bar
 /// or floating window (B900/V852). It starts closed, so the page keeps the
@@ -415,6 +418,7 @@ pub fn ListenView(
                         }
                     }
                     button {
+                        id: QUEUE_TOGGLE_ID,
                         class: "pharos-chip pharos-queue-toggle",
                         "data-key-action": "queue",
                         r#type: "button",
@@ -458,6 +462,12 @@ pub fn ListenView(
                     on_queue,
                     playing,
                     audiobook: audiobook.is_some(),
+                    // The panel's arrows stay inside it, so Escape (the TV's
+                    // Back) is the way out (B1508).
+                    on_escape: move |()| {
+                        toggle_queue();
+                        platform::focus_by_id(QUEUE_TOGGLE_ID);
+                    },
                 }
             }
             div { class: "pharos-listen-body",
