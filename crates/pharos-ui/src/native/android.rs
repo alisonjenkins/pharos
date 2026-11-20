@@ -181,16 +181,12 @@ fn token_lock() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The sign-out fence is this process's [`token_file::fence`]: set when a
-/// sign-out left its token on file, so that token is not loaded again here.
-/// Every token store replaces it ([`token_file::SignOutFence::after_store`]),
-/// the car's QuickConnect included.
-fn fence() -> token_file::SignOutFence {
-    token_file::fence()
-}
-
-fn set_fence(fence: token_file::SignOutFence) {
-    token_file::set_fence(fence);
+/// The sign-out fence is the token file's own ([`token_file::fence`]): set
+/// by the sign-out operation that left its token on file, under the file's
+/// lock, so that token is not loaded again here. Every token store replaces
+/// it in the same lock, the car's QuickConnect included.
+fn fence(path: &std::path::Path) -> token_file::SignOutFence {
+    token_file::fence(path)
 }
 
 /// `load_token`, read from disk only the first time. Never log the value.
@@ -213,19 +209,12 @@ pub fn load_token() -> Option<String> {
 
 /// Reads the token behind the fence and caches it, under the cache's lock.
 fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
-    let fence = fence();
-    let token = if fence == token_file::SignOutFence::Every {
-        None
-    } else {
-        token_path()
-            .ok()
-            .and_then(|path| token_file::read(&path).ok().flatten())
-            .map(|s| s.token)
-    };
-    let token = match token {
-        Some(t) if fence.refuses(&t) => None,
-        other => other,
-    };
+    let path = token_path().ok();
+    let fence = path.as_deref().map(fence).unwrap_or_default();
+    // The read goes through the fence itself (`token_file::read`).
+    let token = path
+        .and_then(|path| token_file::read(&path).ok().flatten())
+        .map(|s| s.token);
     if token.is_none() && fence != token_file::SignOutFence::Open {
         log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
     }
@@ -238,7 +227,7 @@ fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
 /// sign-out fence as `load_token`. Never log the token.
 pub fn run_token(owner: &str) -> Result<String, String> {
     let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    let decided = token_file::run_token(&path, owner, &fence());
+    let decided = token_file::run_token(&path, owner, &fence(&path));
     if decided
         .as_ref()
         .is_err_and(|e| e.starts_with("signed_out_token_not_removed"))
@@ -269,8 +258,14 @@ pub fn store_token(token: &str) -> Result<(), String> {
 /// the removal left is the verdict; a file that would not go is
 /// `NotSaved`, and this process stays signed out all the same: the token
 /// is not read again until a new sign-in stores one.
+///
+/// The sign-out operation fences the token it left on file itself, under
+/// the file's lock and from the token it targeted (every token when it
+/// could not name one): no store lands between it and its fence, and no
+/// earlier read names the wrong token. A `NotSaved` is never reported as
+/// forgotten: the media service stays signed out instead.
 pub fn forget_token() -> token_file::SignedOut {
-    let (verdict, held) = {
+    let verdict = {
         let mut cached = token_lock();
         *cached = Some(None);
         let path = match token_path() {
@@ -278,22 +273,10 @@ pub fn forget_token() -> token_file::SignedOut {
             Err(e) => return token_file::SignedOut::NotSaved(e),
         };
         drop_legacy_user(&path);
-        // The token as it stood, so a sign-out that can neither remove nor
-        // mark it can still name it to the fences.
-        let held = token_file::read(&path).ok().flatten().map(|s| s.token);
-        let verdict = token_file::sign_out(&path);
-        if matches!(
-            verdict,
-            token_file::SignedOut::NotSaved(_) | token_file::SignedOut::Marked(_)
-        ) {
-            set_fence(token_file::SignOutFence::for_token(held.as_deref()));
-        } else {
-            set_fence(token_file::SignOutFence::Open);
-        }
-        (verdict, held)
+        token_file::sign_out(&path)
     };
-    match (&verdict, held) {
-        (token_file::SignedOut::NotSaved(_), Some(token)) => note_credentials_kept(&token),
+    match &verdict {
+        token_file::SignedOut::NotSaved(_) => note_credentials_kept(),
         _ => note_credentials_changed("forgotten"),
     }
     verdict
@@ -325,19 +308,14 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
         }
         *cached = Some(None);
         drop_legacy_user(&path);
-        if let token_file::Ended::Unsafe { target, .. } = &ended {
-            // Still on file and readable: fence it in this process, the
-            // media service's reads included, rather than ask it to reload.
-            set_fence(target.clone().map_or(
-                token_file::SignOutFence::Every,
-                token_file::SignOutFence::Token,
-            ));
-        }
+        // An `Unsafe` end fenced its target in the operation, the media
+        // service's reads included: it is asked to stay signed out below,
+        // not to reload.
         ended
     };
     if matches!(ended, token_file::Ended::Unsafe { .. }) {
         log::warn!("pharos: token forget verdict=fenced reason=token_neither_removed_nor_marked");
-        note_credentials_kept(refused);
+        note_credentials_kept();
     } else {
         note_credentials_changed("forgotten");
     }
@@ -347,8 +325,8 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
 /// Tells the host app a sign-out left `token` on file, neither removed nor
 /// marked: the car's media service, in this same process, stays signed out
 /// and refuses that token (by fingerprint) instead of reloading it.
-fn note_credentials_kept(token: &str) {
-    let hook = super::ports::credentials_kept(&token_file::fingerprint(token));
+fn note_credentials_kept() {
+    let hook = super::ports::credentials_kept();
     log::warn!("pharos: credentials change=kept_unsafe action=stay_signed_out host_hook={hook}");
 }
 

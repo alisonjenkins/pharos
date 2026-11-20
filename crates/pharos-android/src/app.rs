@@ -111,19 +111,16 @@ pub fn credentials_changed() {
 }
 
 /// The phone signed out but its token could be neither removed nor marked
-/// revoked: the car stays signed out and refuses that token (by
-/// `fingerprint`) in this process until a different one is stored, rather
-/// than reloading it. The service runs in the app's own process, so this is
-/// the fence its reads go through.
-pub fn credentials_kept(fingerprint: &str) {
-    // Fenced for the whole process first, so a service that connects
-    // after this reads through it too.
-    content::fence_token(fingerprint);
+/// revoked: the car stays signed out rather than reloading it. The
+/// sign-out fenced the token in the token file's own fence, under the
+/// file's lock, before this runs; the service runs in the app's own
+/// process and reads through that fence, connected now or later.
+pub fn credentials_kept() {
     let Some(lib) = LIBRARY.get() else {
         log("app credentials_kept verdict=fenced reason=library_not_connected");
         return;
     };
-    match lib.stay_signed_out(fingerprint) {
+    match lib.stay_signed_out() {
         Ok(()) => {
             log("app credentials_kept verdict=fenced");
             notify_changed();

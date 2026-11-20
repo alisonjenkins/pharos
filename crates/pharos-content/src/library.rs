@@ -127,7 +127,7 @@ enum Op {
     /// Another part of the process signed out but could neither remove nor
     /// mark the token with this fingerprint ([`token::fingerprint`]): stay
     /// signed out, and refuse that token until a different one is stored.
-    StaySignedOut(String),
+    StaySignedOut,
 }
 
 impl Op {
@@ -140,7 +140,7 @@ impl Op {
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
             Op::Reload => "reload credentials".into(),
-            Op::StaySignedOut(_) => "stay signed out".into(),
+            Op::StaySignedOut => "stay signed out".into(),
         }
     }
 }
@@ -507,13 +507,13 @@ impl Library {
         self.call(Op::Reload).map(|_| ())
     }
 
-    /// The app signed out but its token, fingerprinted `fingerprint`, could
-    /// be neither removed nor marked revoked: the service drops its link
-    /// and stays signed out, refusing that token in this process until a
-    /// sign-in stores a different one.
-    pub fn stay_signed_out(&self, fingerprint: &str) -> Result<(), ContentError> {
-        self.call(Op::StaySignedOut(fingerprint.to_owned()))
-            .map(|_| ())
+    /// The app signed out but its token could be neither removed nor
+    /// marked revoked: the service drops its link and stays signed out. The
+    /// sign-out fenced that token already, in the operation that left it
+    /// ([`token::end_session`]), so every read here refuses it until a
+    /// sign-in stores another.
+    pub fn stay_signed_out(&self) -> Result<(), ContentError> {
+        self.call(Op::StaySignedOut).map(|_| ())
     }
 
     /// Keep the listing for offline browse and remember the play order.
@@ -947,49 +947,6 @@ struct Worker {
     limit: Duration,
 }
 
-/// The fingerprint of a token this process signed out of but could neither
-/// remove nor mark revoked: refused on every read until a different token
-/// is on file (the in-process fence). Process-wide, so a fence set before
-/// any library is connected holds for the worker that connects later.
-#[cfg(not(test))]
-static FENCED: Mutex<Option<String>> = Mutex::new(None);
-
-#[cfg(test)]
-thread_local! {
-    static FENCED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The fence as it stands (tests read it).
-#[cfg(test)]
-fn fenced() -> Option<String> {
-    with_fence(|f| f.clone())
-}
-
-/// Runs `f` on the fence in one hold of its lock, so a decision read from
-/// it and a change made to it cannot straddle another thread's fence.
-fn with_fence<R>(f: impl FnOnce(&mut Option<String>) -> R) -> R {
-    #[cfg(not(test))]
-    {
-        f(&mut FENCED.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    {
-        FENCED.with(|slot| f(&mut slot.borrow_mut()))
-    }
-}
-
-fn set_fenced(fingerprint: Option<String>) {
-    with_fence(|f| *f = fingerprint);
-}
-
-/// Fences the token with `fingerprint` in this process, library or not:
-/// the app signed out and could neither remove nor mark it. A worker that
-/// connects later reads through the fence too.
-pub fn fence_token(fingerprint: &str) {
-    set_fenced(Some(fingerprint.to_owned()));
-    log::warn!("token fence verdict=fenced reason=token_neither_removed_nor_marked at=process");
-}
-
 /// Reports what a sign-out (`at`: the user's, or the server's refusal)
 /// left on disk. The worker has signed out in memory either way; a removal
 /// the folder could not make durable may come back after a crash, so it is
@@ -1145,10 +1102,9 @@ impl Worker {
         if matches!(op, Op::Reload) {
             return self.reload(events).await;
         }
-        if let Op::StaySignedOut(fingerprint) = op {
+        if matches!(op, Op::StaySignedOut) {
             self.link = None;
             let polling = self.stop_sign_in();
-            set_fenced(Some(fingerprint.clone()));
             self.shared.set_auth(AuthState::SignedOut);
             log::warn!(
                 "credentials stay signed out: verdict=fenced reason=token_neither_removed_nor_marked quickconnect_stopped={polling}"
@@ -1169,7 +1125,7 @@ impl Worker {
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
-                Op::SignOut | Op::Reload | Op::StaySignedOut(_) => Ok(Out::Done),
+                Op::SignOut | Op::Reload | Op::StaySignedOut => Ok(Out::Done),
             };
             match r {
                 Err(e) if e.is_revoked() => {
@@ -1199,14 +1155,8 @@ impl Worker {
         }
         // An open link whose token has been fenced since is not reused: the
         // fence holds for every call, not just for the next token read.
-        let fenced_link = self.link.as_ref().is_some_and(|l| {
-            let fp = token::fingerprint(&l.token);
-            with_fence(|f| f.as_deref() == Some(fp.as_str()))
-        });
-        if fenced_link {
-            log::warn!("token read verdict=refused reason=service_fence at=open_link");
-            self.link = None;
-            self.shared.set_auth(AuthState::SignedOut);
+        let open = self.link.as_ref().map(|l| l.token.clone());
+        if open.is_some_and(|t| self.fenced_after(&t, "open_link")) {
             return Err(ContentError::NeedsSignIn);
         }
         if let Some(l) = self.link.as_mut() {
@@ -1305,43 +1255,28 @@ impl Worker {
         self.qc.take().inspect(|h| h.abort()).is_some()
     }
 
-    /// The device token on file, behind the in-process fence: the fenced
-    /// token reads as none; a different one lifts the fence.
+    /// The device token on file, behind the in-process fence
+    /// ([`token::Fence`]): the fenced token reads as none. A read never
+    /// lifts the fence; only a store of another token replaces it, in the
+    /// same hold of the file's lock ([`token::store`]).
     fn load_token(&mut self) -> Result<Option<String>, ContentError> {
-        let token = token::load(&self.token_path)?;
-        #[cfg(test)]
-        if let Some(hook) = tests::BEFORE_FENCE_CHECK.with(|h| h.borrow_mut().take()) {
-            hook();
+        token::load(&self.token_path)
+    }
+
+    /// Whether `token` is fenced now (`at`: where it was checked): a fenced
+    /// one drops the link and signs the service out.
+    fn fenced_after(&mut self, token: &str, at: &str) -> bool {
+        let fence = token::fence(&self.token_path);
+        if !fence.refuses(token) {
+            return false;
         }
-        let read = token.as_deref().map(token::fingerprint);
-        // Compared and lifted in one hold: a fence for this very token that
-        // lands meanwhile is either seen here or lands after the lift.
-        let verdict = with_fence(|fence| match fence.as_deref() {
-            None => None,
-            Some(f) if read.as_deref() == Some(f) => Some("refused"),
-            Some(_) => {
-                *fence = None;
-                Some("lifted")
-            }
-        });
-        match verdict {
-            None => Ok(token),
-            Some("refused") => {
-                log::info!("token read verdict=refused reason=service_fence");
-                Ok(None)
-            }
-            Some(_) => {
-                log::info!(
-                    "token fence verdict=lifted reason={}",
-                    if token.is_some() {
-                        "different_token"
-                    } else {
-                        "no_token"
-                    }
-                );
-                Ok(token)
-            }
-        }
+        log::warn!(
+            "token read verdict=refused reason=service_fence at={at} fence={}",
+            fence.label()
+        );
+        self.link = None;
+        self.shared.set_auth(AuthState::SignedOut);
+        true
     }
 
     /// Ends the session's token on file (`at`: the user's sign-out or the
@@ -1355,21 +1290,15 @@ impl Worker {
         if let Some(hook) = tests::BEFORE_END_SESSION.with(|h| h.borrow_mut().take()) {
             hook();
         }
+        // An `Unsafe` end fences the token it targeted (every token, when
+        // it could not name one) inside `end_session`, under the file's
+        // lock: no store lands between the operation and its fence.
         let ended = token::end_session(&self.token_path, seen, None);
-        // The fence names the token `end_session` targeted under the file's
-        // lock: a replacement stored after an earlier read is the one left.
         if let token::Ended::Unsafe { target, .. } = &ended {
-            match target {
-                Some(fp) => {
-                    set_fenced(Some(fp.clone()));
-                    log::warn!(
-                        "token fence verdict=fenced reason=token_neither_removed_nor_marked at={at}"
-                    );
-                }
-                None => {
-                    log::warn!("token fence verdict=not_fenced reason=no_token_targeted at={at}")
-                }
-            }
+            log::warn!(
+                "token fence verdict={} reason=token_neither_removed_nor_marked at={at}",
+                token::Fence::for_target(target.as_deref()).label()
+            );
         }
         note_forgotten(at, ended)
     }
@@ -1508,10 +1437,6 @@ mod tests {
     use crate::testdir::TmpDir;
 
     thread_local! {
-        /// Runs once in `load_token` after the token file is read, before
-        /// the fence is consulted.
-        pub(super) static BEFORE_FENCE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            std::cell::RefCell::new(None);
         /// Runs once in `end_session` before the token file is ended.
         pub(super) static BEFORE_END_SESSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             std::cell::RefCell::new(None);
@@ -2181,7 +2106,11 @@ mod tests {
         });
         token::faults::REMOVE.with(|f| f.set(false));
         token::faults::MARKER.with(|f| f.set(false));
-        assert_eq!(token::load(&token_path).unwrap().as_deref(), Some("tok"));
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tok")),
+            "the sign-out did not fence the token it left"
+        );
         local.block_on(&rt, async {
             w.execute(&Op::Reload, &events).await.unwrap();
         });
@@ -2190,7 +2119,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("token read verdict=refused reason=service_fence")),
+                .any(|l| l.contains("token read verdict=refused reason=sign_out_fence")),
             "the reload read the signed-out token: {lines:?}"
         );
         assert!(
@@ -2202,7 +2131,7 @@ mod tests {
         // A new sign-in's token is not the fenced one.
         token::store(&token_path, "tok2").unwrap();
         assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
-        assert!(fenced().is_none());
+        assert!(!token::fence(&token_path).refuses("tok2"));
     }
 
     /// The app's sign-out could neither remove nor mark the token: told to
@@ -2216,10 +2145,10 @@ mod tests {
         token::store(&token_path, "tok").unwrap();
         shared.set_auth(AuthState::SignedIn);
         crate::testlog::start();
+        // The app's sign-out fenced the token it could not end.
+        token::set_fence(&token_path, token::Fence::for_token(Some("tok")), "test");
         local.block_on(&rt, async {
-            w.execute(&Op::StaySignedOut(token::fingerprint("tok")), &events)
-                .await
-                .unwrap();
+            w.execute(&Op::StaySignedOut, &events).await.unwrap();
             w.execute(&Op::Reload, &events).await.unwrap();
         });
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
@@ -2337,28 +2266,27 @@ mod tests {
         );
     }
 
-    /// CR 4637783544: a read that finds B on file while A is fenced lifts
-    /// the fence only if it still names A when it is lifted. B's own fence,
-    /// landing after B was read, refuses B instead of being cleared.
+    /// CR 4638660894: a read that finds B on file while A is fenced
+    /// returns B and leaves A's fence standing. Only a store replaces a
+    /// fence; a read from before a sign-out's fence never clears it.
     #[test]
-    fn a_fence_for_the_token_just_read_is_not_lifted() {
-        let root = test_root("fence-lift-race");
+    fn a_read_of_another_token_does_not_lift_the_fence() {
+        let root = test_root("fence-not-lifted");
         let (mut w, _shared, token_path) = worker(&root);
         token::store(&token_path, "tokB").unwrap();
-        set_fenced(Some(token::fingerprint("tokA")));
-        BEFORE_FENCE_CHECK.with(|h| {
-            *h.borrow_mut() = Some(Box::new(|| fence_token(&token::fingerprint("tokB"))));
-        });
+        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tokA")),
+            "a read lifted the fence"
+        );
+        token::set_fence(&token_path, token::Fence::for_token(Some("tokB")), "test");
         assert_eq!(
             w.load_token().unwrap(),
             None,
-            "B was read through its own fence"
+            "B was read through its fence"
         );
-        assert_eq!(fenced(), Some(token::fingerprint("tokB")));
-        // While A's fence stands, B is good.
-        set_fenced(Some(token::fingerprint("tokA")));
-        assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
-        assert_eq!(fenced(), None);
     }
 
     /// CR 4637783594: a link opened with a token fenced since is not
@@ -2382,7 +2310,7 @@ mod tests {
         struct Boot;
         impl bootstrap::Server for Boot {}
         let root = test_root("fence-open-link");
-        let (mut w, _shared, _token_path) = worker(&root);
+        let (mut w, _shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
@@ -2395,9 +2323,8 @@ mod tests {
             .await;
         });
         assert!(w.link.is_some(), "the approval opened no link");
-        fence_token(&token::fingerprint("tokA"));
+        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
         let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
-        set_fenced(None);
         assert!(
             matches!(&out, Err(ContentError::NeedsSignIn)),
             "{:?}",
@@ -2428,8 +2355,10 @@ mod tests {
         token::faults::REMOVE.with(|f| f.set(false));
         token::faults::MARKER.with(|f| f.set(false));
         assert!(out.is_err(), "{out:?}");
-        assert_eq!(fenced(), Some(token::fingerprint("tokB")));
-        set_fenced(None);
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tokB"))
+        );
     }
 
     /// A fence set before any library is connected (the app signed out and
@@ -2438,11 +2367,11 @@ mod tests {
     #[test]
     fn a_fence_set_before_the_service_connects_holds_for_its_worker() {
         let root = test_root("fence-before-connect");
-        fence_token(&token::fingerprint("tok"));
         let (mut w, shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         token::store(&token_path, "tok").unwrap();
+        token::set_fence(&token_path, token::Fence::for_token(Some("tok")), "test");
         local.block_on(&rt, async {
             w.execute(&Op::Reload, &events).await.unwrap();
         });

@@ -2,17 +2,16 @@
 //! sign-out fences the token on the app's thread, and the service's worker
 //! (its own `pharos-content` thread) reads through the fence on a reload.
 //!
-//! Standalone, not in an `it_<area>` group: the fence is process-wide
-//! state, and this binary links the library without `cfg(test)`, so it runs
-//! the production fence. Another test reading a token in the same process
-//! could lift or set the fence under it.
+//! This binary links the library without `cfg(test)`, so it runs the
+//! production fence. The fence is kept per token file, so the other tests
+//! of the group, each with a file of its own, cannot set or lift it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pharos_content::{fence_token, token, AuthState, Library, Timeouts};
+use pharos_content::{token, AuthState, Library, Timeouts};
 
 /// A folder of this test's own, removed when it drops (a failed assertion
 /// included).
@@ -64,11 +63,12 @@ fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
     )
     .unwrap();
 
-    // The sign-out could neither remove nor mark the token: the app fences
-    // it from its own thread.
+    // The sign-out could neither remove nor mark the token: the fence goes
+    // in from the app's own thread.
+    let at = token_path.clone();
     std::thread::Builder::new()
         .name("app-sign-out".into())
-        .spawn(|| fence_token(&token::fingerprint("fenced-token")))
+        .spawn(move || token::set_fence(&at, token::Fence::for_token(Some("fenced-token")), "test"))
         .unwrap()
         .join()
         .unwrap();

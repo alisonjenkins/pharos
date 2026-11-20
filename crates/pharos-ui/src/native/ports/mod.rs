@@ -410,12 +410,12 @@ pub fn register_on_credentials_changed(hook: fn()) -> Result<(), AlreadyRegister
 
 /// What the host app runs instead of a reload when a sign-out could neither
 /// remove nor mark its token: the second client (the car's media service,
-/// in this same process) stays signed out and refuses the token with this
-/// fingerprint until a different one is stored.
-static ON_CREDENTIALS_KEPT: OnceLock<fn(&str)> = OnceLock::new();
+/// in this same process) stays signed out. The sign-out fenced the token in
+/// the token file's own fence already, which the service reads through.
+static ON_CREDENTIALS_KEPT: OnceLock<fn()> = OnceLock::new();
 
 /// Called once by the host app before the UI launches.
-pub fn register_on_credentials_kept(hook: fn(&str)) -> Result<(), AlreadyRegistered> {
+pub fn register_on_credentials_kept(hook: fn()) -> Result<(), AlreadyRegistered> {
     ON_CREDENTIALS_KEPT.set(hook).map_err(|_| AlreadyRegistered)
 }
 
@@ -453,44 +453,16 @@ pub fn credentials_changed() -> bool {
     true
 }
 
-/// Queues the host's stay-signed-out hook for the token fingerprinted
-/// `fingerprint`, in order with every other credentials change; returns
-/// whether one was registered.
-pub fn credentials_kept(fingerprint: &str) -> bool {
-    credentials_kept_via(
-        PROCESS_FENCE,
-        ON_CREDENTIALS_KEPT.get().copied(),
-        notifier,
-        fingerprint,
-    )
-}
-
-/// The media service's process-wide fence. Only the phone build hosts
-/// that service in this process; elsewhere there is nothing to fence.
-#[cfg(any(feature = "mobile", test))]
-const PROCESS_FENCE: fn(&str) = pharos_content::fence_token;
-#[cfg(not(any(feature = "mobile", test)))]
-const PROCESS_FENCE: fn(&str) = |_| {};
-
-/// `credentials_kept` with its parts named. The process-wide fence (`fence`,
-/// a mutex set) goes in on the caller's thread first, whatever becomes of
-/// the hook: no hook registered, no notifier thread, or a closed channel
-/// still leave the token refused. Only the hook, which can block on the
-/// content worker, goes to the notifier thread.
-fn credentials_kept_via(
-    fence: fn(&str),
-    hook: Option<fn(&str)>,
-    notifier: fn() -> Option<&'static std::sync::mpsc::Sender<HostCall>>,
-    fingerprint: &str,
-) -> bool {
-    fence(fingerprint);
-    let Some(hook) = hook else {
+/// Queues the host's stay-signed-out hook, in order with every other
+/// credentials change; returns whether one was registered. The token is
+/// fenced already: the sign-out operation set the fence under the token
+/// file's lock, so nothing here has to land first.
+pub fn credentials_kept() -> bool {
+    let Some(hook) = ON_CREDENTIALS_KEPT.get() else {
         eprintln!("warn: credentials kept verdict=fenced reason=no_host_hook");
         return false;
     };
-    let fingerprint = fingerprint.to_owned();
-    let queued = queue_hook(notifier(), Box::new(move || hook(&fingerprint)));
-    if !queued {
+    if !queue_hook(notifier(), Box::new(*hook)) {
         eprintln!("warn: credentials kept verdict=fenced reason=hook_not_queued");
     }
     true
@@ -741,32 +713,6 @@ mod tests {
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn count() {
         RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    static FENCED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    fn record_fence(fp: &str) {
-        FENCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(fp.to_owned());
-    }
-    fn no_notifier() -> Option<&'static std::sync::mpsc::Sender<HostCall>> {
-        None
-    }
-    fn hook(_: &str) {}
-
-    /// CR 4637783594: the fence goes in on the caller's thread even when
-    /// the hook cannot be queued (no notifier thread) or none is set.
-    #[test]
-    fn a_kept_token_is_fenced_without_a_notifier() {
-        credentials_kept_via(record_fence, Some(hook), no_notifier, "fp-no-thread");
-        credentials_kept_via(record_fence, None, no_notifier, "fp-no-hook");
-        let fenced = FENCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        assert!(fenced.contains(&"fp-no-thread".to_owned()), "{fenced:?}");
-        assert!(fenced.contains(&"fp-no-hook".to_owned()), "{fenced:?}");
     }
 
     /// A store that failed to register (its folder could not be created)
@@ -1074,19 +1020,19 @@ mod tests {
         assert_eq!(d.cached_bytes(), 15);
     }
 
-    /// A sign-out that kept its token hands the host the token's
-    /// fingerprint, on the notifier thread, in place of a reload.
+    /// A sign-out that kept its token runs the host's hook on the
+    /// notifier thread, in place of a reload.
     #[test]
-    fn a_kept_token_reaches_the_host_hook_by_fingerprint() {
+    fn a_kept_token_reaches_the_host_hook() {
         static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        fn hook(fingerprint: &str) {
+        fn hook() {
             SEEN.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(fingerprint.to_owned());
+                .push("kept".to_owned());
         }
-        assert!(!credentials_kept("f1"), "a hook ran with none registered");
+        assert!(!credentials_kept(), "a hook ran with none registered");
         assert_eq!(register_on_credentials_kept(hook), Ok(()));
-        assert!(credentials_kept("f1"));
+        assert!(credentials_kept());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while SEEN
             .lock()
@@ -1100,7 +1046,7 @@ mod tests {
             *SEEN
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ["f1"]
+            ["kept"]
         );
     }
 
