@@ -8120,6 +8120,8 @@ pub(crate) mod tests {
 
     /// An entry that listed but whose lookup then fails is not "not a
     /// folder": its size is unknown and admission is blocked.
+    // `std::os::unix::fs::symlink` makes the dangling link.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_folder_whose_metadata_fails_after_listing_blocks_admission() {
         let rig = Rig::new("entry-metadata");
