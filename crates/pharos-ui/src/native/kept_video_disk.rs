@@ -2089,6 +2089,18 @@ impl Inner {
     }
 }
 
+/// Whether the offline proxy has a handler for `key`: its first path
+/// segment is one the page's requests are answered for
+/// ([`crate::native::tv_page::proxied_segments`]).
+fn servable(key: &str) -> bool {
+    let first = url_path(key)
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    crate::native::tv_page::proxied(first)
+}
+
 /// Fetches `key` to its file, retrying with backoff while a retry can
 /// mend the failure, and stops once the download has been removed.
 async fn fetch_file(
@@ -2099,6 +2111,24 @@ async fn fetch_file(
     key: &str,
     limit: Option<u64>,
 ) -> Result<u64, Stop> {
+    // Every key a download stores is one the offline proxy answers: one it
+    // has no handler for (a playlist the server moved under `/delivery/`)
+    // would be Ready and play nothing. Refused, not served by widening the
+    // proxy, which sends what it answers to the server with the token.
+    if !servable(key) {
+        let reason = format!(
+            "{} is under a path the phone's player cannot load offline (reason=key_not_servable)",
+            url_path(key)
+        );
+        emit(
+            true,
+            format!(
+                "pharos: video keep refused item={item} reason=key_not_servable url_path={}",
+                url_path(key)
+            ),
+        );
+        return Err(Stop::Refused(reason));
+    }
     let path = inner.file_path(user, item, key);
     let mut attempt = 0u32;
     loop {
@@ -13216,6 +13246,48 @@ pub(crate) mod tests {
     /// absolute path: the copy is Ready, and with the server gone the
     /// master, its playlist and its first segment are answered from disk
     /// by exactly the keys the playlists name.
+    /// Review 5987746170 (offline_video.rs:1149): a master the server moves
+    /// under a path the offline proxy has no handler for (`/delivery/`)
+    /// would store keys nothing serves. The download is refused before it
+    /// reaches Ready, naming the key and the reason.
+    #[tokio::test]
+    async fn a_key_the_proxy_does_not_serve_is_refused_before_ready() {
+        let rig = Rig::new("unservable-key");
+        {
+            let moved_master = "/delivery/1/master.m3u8?PlaySessionId=p";
+            let mut f = rig.server.files.lock().unwrap();
+            f.clear();
+            f.insert(
+                moved_master.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\nmain.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                "/delivery/1/main.m3u8?PlaySessionId=p".into(),
+                MEDIA.as_bytes().to_vec(),
+            );
+            f.insert("/delivery/1/init.mp4?PlaySessionId=p".into(), vec![1; 10]);
+            f.insert("/delivery/1/0.m4s?PlaySessionId=p".into(), vec![2; 100]);
+            f.insert("/delivery/1/1.m4s?PlaySessionId=p".into(), vec![3; 100]);
+            drop(f);
+            rig.server
+                .redirects
+                .lock()
+                .unwrap()
+                .insert(MASTER_KEY.into(), moved_master.into());
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("reached {:?} with keys nothing serves", kept.state);
+        };
+        assert!(reason.contains("key_not_servable"), "{reason}");
+        assert!(
+            !lines("pharos: video keep refused item=1 reason=key_not_servable url_path=/delivery/1/main.m3u8").is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_master_redirected_into_another_folder_downloads_and_plays_offline() {
         let rig = Rig::new("redirected-master");
