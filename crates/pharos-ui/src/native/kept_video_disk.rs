@@ -2897,10 +2897,12 @@ fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
         Measure::Whole(e) | Measure::Short(e) => regular_files(&e),
     };
     let mut whole = 0usize;
+    let mut on_disk = 0u64;
     let mut index = Vec::new();
     for key in &record.files {
         if let Some(len) = names.get(&file_name(key)) {
             whole += 1;
+            on_disk = on_disk.saturating_add(*len);
             index.push((
                 (record.user.clone(), key.clone()),
                 (item_dir.join("files").join(file_name(key)), *len),
@@ -2921,8 +2923,30 @@ fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
         record.state = KeptState::Downloading {
             done: u32::try_from(whole).unwrap_or(u32::MAX),
             total,
-            bytes: 0,
+            bytes: on_disk,
         };
+    } else if let KeptState::Downloading { done, total, bytes } = record.state {
+        // The progress a manifest kept is from its last save: the planned
+        // files on disk now say what is done. The reservation stays as
+        // admitted, and the folder's measure below says whether it is known.
+        if !record.files.is_empty() {
+            let now_done = u32::try_from(whole).unwrap_or(u32::MAX);
+            let now_total = u32::try_from(record.files.len()).unwrap_or(u32::MAX);
+            if (done, total, bytes) != (now_done, now_total, on_disk) {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video record progress item={} verdict=rebuilt done={done}->{now_done} total={total}->{now_total} bytes={bytes}->{on_disk} reason=planned_files_on_disk",
+                        record.item
+                    ),
+                );
+            }
+            record.state = KeptState::Downloading {
+                done: now_done,
+                total: now_total,
+                bytes: on_disk,
+            };
+        }
     }
     // A record never counts for less than the folder holds: a field a
     // manifest lacks (an estimate that defaulted to 0) cannot make its
@@ -11374,6 +11398,48 @@ pub(crate) mod tests {
         UNREADABLE.with(|u| u.borrow_mut().clear());
         store.inner.sweep_remeasure();
         assert!(!store.size_unknown(), "a whole remeasure kept the block");
+    }
+
+    /// Outside-diff item on kept_video_disk.rs:2887: a Downloading record
+    /// found at reopen takes its progress from the planned files on disk,
+    /// not the counts its last save kept; its admitted reservation stays.
+    #[tokio::test]
+    async fn a_reopened_download_rebuilds_its_progress_from_the_files_on_disk() {
+        let rig = Rig::new("reopen-progress");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let mut record = only(&store);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(store.inner.file_path("u1", "1", SEG0)).unwrap();
+        let planned = record.files.len();
+        let on_disk: u64 = record
+            .files
+            .iter()
+            .filter_map(|k| std::fs::metadata(store.inner.file_path("u1", "1", k)).ok())
+            .map(|m| m.len())
+            .sum();
+        record.state = KeptState::Downloading {
+            done: 0,
+            total: 99,
+            bytes: 1,
+        };
+        let reserved = record.estimated_bytes;
+        let adopted = adopt(&dir, record, Sweep::HostCheck);
+        assert_eq!(
+            adopted.record.state,
+            KeptState::Downloading {
+                done: u32::try_from(planned - 1).unwrap(),
+                total: u32::try_from(planned).unwrap(),
+                bytes: on_disk,
+            }
+        );
+        assert!(
+            adopted.record.estimated_bytes >= reserved,
+            "the reservation dropped"
+        );
+        assert!(adopted.exact);
+        assert!(!lines("pharos: video record progress item=1 verdict=rebuilt").is_empty());
     }
 
     /// The control: a whole inventory keeps a restored Ready download Ready.
