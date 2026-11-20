@@ -801,20 +801,23 @@ fn durable_dir(dir: &Path) -> Result<(), String> {
     let Err(first) = sync_dir(dir) else {
         return Ok(());
     };
+    let unsupported = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        )
+    };
     match sync_dir(dir) {
         Ok(()) => {
             log::info!("token file dir sync verdict=retried first_error={first}");
             Ok(())
         }
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
-            ) =>
-        {
+        // Unsupported only when both attempts say so: any other first error
+        // is a real failure, whatever the retry reports.
+        Err(e) if unsupported(&first) && unsupported(&e) => {
             Err(format!("{DIR_SYNC_UNSUPPORTED}: {e}"))
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(format!("{e} (first attempt: {first})")),
     }
 }
 
@@ -1028,6 +1031,20 @@ pub(crate) mod tests {
         DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
         assert!(stored.is_ok(), "{stored:?}");
         assert_eq!(load(&unsupported).unwrap().as_deref(), Some("new"));
+        // A real first failure is not unsupported, whatever the retry says
+        // (the write's own sync takes the first error).
+        let mixed = d.join("mixed-token");
+        DIR_SYNC_ERRORS.with(|q| {
+            q.borrow_mut().extend([
+                std::io::ErrorKind::Other,
+                std::io::ErrorKind::Other,
+                std::io::ErrorKind::Unsupported,
+            ]);
+        });
+        let stored = store(&mixed, "new");
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(stored.is_err(), "{stored:?}");
+        assert_eq!(load(&mixed).unwrap(), None);
     }
 
     /// A sign-out's removal is synced to the folder: a failed sync is tried
@@ -1075,7 +1092,9 @@ pub(crate) mod tests {
                 vec![InvalidInput, InvalidInput],
                 Some("directory sync unsupported"),
             ),
-            (vec![Other, Unsupported], Some("directory sync unsupported")),
+            // CR 4640059241: unsupported only when both attempts say so.
+            (vec![Other, Unsupported], Some("directory sync failed")),
+            (vec![Unsupported, Other], Some("directory sync failed")),
             (vec![Other, Other], Some("directory sync failed")),
         ] {
             store(&p, "tok").unwrap();
@@ -1091,6 +1110,15 @@ pub(crate) mod tests {
                 Some(reason) => {
                     assert!(
                         matches!(&forgot, Forgotten::NotDurable(why) if why.contains(reason)),
+                        "{errors:?}: {forgot:?}"
+                    );
+                    let named_unsupported = matches!(
+                        &forgot,
+                        Forgotten::NotDurable(why) if why.contains(DIR_SYNC_UNSUPPORTED)
+                    );
+                    assert_eq!(
+                        named_unsupported,
+                        reason == DIR_SYNC_UNSUPPORTED,
                         "{errors:?}: {forgot:?}"
                     );
                     let lines = crate::testlog::lines();
