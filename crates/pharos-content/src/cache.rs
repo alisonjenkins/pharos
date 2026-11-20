@@ -57,6 +57,8 @@ thread_local! {
     static BEFORE_PART_EVICT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Makes `truncate_part` fail.
     static TRUNCATE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the emptying of an opened part (`set_len`) fail.
+    static SET_LEN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Parts whose `truncate_part` fails, from any thread (the downloader's).
@@ -1314,7 +1316,7 @@ impl Cache {
     /// [`Cache::truncate_part`] with the cache's lock already held.
     fn truncate_part_locked(&self, id: &str) -> std::io::Result<()> {
         match self.open_for_truncate(id)? {
-            Some(f) => f.set_len(0),
+            Some(f) => empty_opened(&f),
             None => Ok(()),
         }
     }
@@ -1693,7 +1695,7 @@ impl Cache {
             }
             part_file = match self.open_for_truncate(downloading) {
                 Ok(f) => f,
-                Err(e) => return Err(truncate_refused(downloading, &e, 0)),
+                Err(e) => return Err(truncate_refused(downloading, &e, 0, "open")),
             };
             parts = Some(listed);
         }
@@ -1752,8 +1754,10 @@ impl Cache {
         }
         let emptied = part_file.is_some();
         if let Some(f) = part_file {
-            if let Err(e) = f.set_len(0) {
-                return Err(truncate_refused(downloading, &e, evicted_n));
+            if let Err(e) = empty_opened(&f) {
+                // The evictions made for it cannot be undone; the part is
+                // as it was, and the refusal says how many went.
+                return Err(truncate_refused(downloading, &e, evicted_n, "set_len"));
             }
         }
         // A part's length is no measure of what it frees (it may be
@@ -1828,17 +1832,26 @@ impl Cache {
             Some(_) => self.truncate_part_locked(downloading),
             None => self.truncate_part(downloading),
         };
-        emptied.map_err(|e| truncate_refused(downloading, &e, 0))
+        emptied.map_err(|e| truncate_refused(downloading, &e, 0, "truncate"))
     }
 }
 
 /// The refusal of a replacement whose part would not empty, after
 /// `evicted` evictions made for it.
-fn truncate_refused(downloading: &str, e: &std::io::Error, evicted: usize) -> NoRoom {
+fn truncate_refused(downloading: &str, e: &std::io::Error, evicted: usize, step: &str) -> NoRoom {
     log::warn!(
-        "cache admission id={downloading} verdict=refused reason=truncate_failed error={e} evicted={evicted}"
+        "cache admission id={downloading} verdict=refused reason=truncate_failed step={step} error={e} evicted={evicted} part=kept"
     );
     NoRoom::PartNotTruncated
+}
+
+/// Empties an opened part.
+fn empty_opened(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if SET_LEN_FAULT.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("set_len refused for the test"));
+    }
+    f.set_len(0)
 }
 
 impl Cache {
@@ -2218,7 +2231,7 @@ pub(crate) mod tests {
         );
         assert!(
             crate::testlog::lines().iter().any(|l| l.contains(
-                "cache admission id=track/x verdict=refused reason=truncate_failed error=truncate refused for the test evicted=0"
+                "cache admission id=track/x verdict=refused reason=truncate_failed step=open error=truncate refused for the test evicted=0"
             )),
             "the refusal did not say nothing was evicted"
         );
@@ -2228,6 +2241,38 @@ pub(crate) mod tests {
         assert_eq!(
             (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
             (0, Some(0), 1300)
+        );
+    }
+
+    /// CR 4647361477: a replacement whose part opens, but whose emptying
+    /// (`set_len`) fails after a track was evicted for it, is refused with
+    /// the part as it was. The eviction cannot be undone: the refusal names
+    /// the step and how many went.
+    #[test]
+    fn a_replacement_whose_emptying_fails_after_an_eviction_keeps_its_part() {
+        let d = tmp("replace-set-len-fails");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free and 600 reclaimed: 1300 fits only with track/a gone.
+        SET_LEN_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        SET_LEN_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            std::fs::read(c.part_path("track/x")).unwrap(),
+            vec![1u8; 600],
+            "the part was touched"
+        );
+        assert_eq!((c.used_bytes(), c.reserved_bytes()), (0, 0));
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "verdict=refused reason=truncate_failed step=set_len error=set_len refused for the test evicted=1 part=kept"
+            )),
+            "{:?}",
+            crate::testlog::lines()
         );
     }
 
@@ -2367,7 +2412,7 @@ pub(crate) mod tests {
         );
         assert!(
             crate::testlog::lines().iter().any(|l| l.contains(
-                "cache admission id=track/x verdict=refused reason=truncate_failed error=truncate refused for the test"
+                "cache admission id=track/x verdict=refused reason=truncate_failed step=truncate error=truncate refused for the test"
             )),
             "{:?}",
             crate::testlog::lines()
