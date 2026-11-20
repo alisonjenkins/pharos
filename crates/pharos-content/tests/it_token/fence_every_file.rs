@@ -14,8 +14,9 @@ fn a_sign_out_that_cannot_find_its_token_file_keeps_the_service_signed_out() {
     let scratch = super::Scratch::new("fence-every-file");
     let token_path = scratch.0.join("token");
     token::store(&token_path, "kept-token").unwrap();
+    let probe = super::Probe::start();
     let lib = Library::connect_with(
-        &super::dead_server(),
+        &probe.url,
         &token_path,
         Timeouts {
             command: Duration::from_secs(3),
@@ -27,10 +28,14 @@ fn a_sign_out_that_cannot_find_its_token_file_keeps_the_service_signed_out() {
     lib.reload_credentials()
         .expect("the reload tried the fenced token against the server");
     assert_eq!(lib.auth_state(), AuthState::SignedOut);
+    // CR 4644634535: the fenced reload dialed nothing.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(probe.accepted(), 0, "the fenced reload connected");
     // A sign-in's store lifts it: the replacement is read and tried.
     token::store(&token_path, "replacement-token").unwrap();
     assert!(
         lib.reload_credentials().is_err(),
         "the reload did not read the replacement token"
     );
+    assert!(probe.saw(1), "the replacement reload made no connection");
 }

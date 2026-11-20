@@ -68,8 +68,67 @@ impl Drop for Scratch {
     }
 }
 
-/// An address nothing listens on: a link attempt fails at once.
-pub fn dead_server() -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    format!("http://{}", l.local_addr().unwrap())
+/// A loopback listener held for the test's whole run, so no other process
+/// can take its port: it counts each connection and closes it without a
+/// word, so a link attempt fails at once and is seen to have been made.
+pub struct Probe {
+    pub url: String,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Probe {
+    pub fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, s) = (accepted.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        drop(conn);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            }
+        });
+        Self {
+            url,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits up to 5 s for at least `n` connections; whether they came.
+    pub fn saw(&self, n: usize) -> bool {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.accepted() < n {
+            if std::time::Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        true
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }

@@ -20,8 +20,9 @@ fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
     let scratch = super::Scratch::new("fence-cross-thread");
     let token_path = scratch.0.join("token");
     token::store(&token_path, "fenced-token").unwrap();
+    let probe = super::Probe::start();
     let lib = Library::connect_with(
-        &super::dead_server(),
+        &probe.url,
         &token_path,
         Timeouts {
             command: Duration::from_secs(3),
@@ -46,6 +47,9 @@ fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
     lib.reload_credentials()
         .expect("the reload tried the fenced token against the server");
     assert_eq!(lib.auth_state(), AuthState::SignedOut);
+    // CR 4644634535: the fenced reload dialed nothing.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(probe.accepted(), 0, "the fenced reload connected");
 
     // The control: a different token is read, so the reload tries it (and
     // fails, with nothing listening).
@@ -54,4 +58,5 @@ fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
         lib.reload_credentials().is_err(),
         "the reload did not read the replacement token"
     );
+    assert!(probe.saw(1), "the replacement reload made no connection");
 }
