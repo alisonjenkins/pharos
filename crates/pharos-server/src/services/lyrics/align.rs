@@ -57,8 +57,24 @@ const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// The most lines one request may carry; the aligner refuses more.
 const MAX_LINES: usize = 500;
 
+/// Whether the aligner takes `lyrics`: synced, not already timed word by
+/// word, and at most [`MAX_LINES`] lines.
+pub fn alignable(lyrics: &Lyrics) -> bool {
+    lyrics.synced()
+        && !lyrics.lines.iter().all(|l| !l.words.is_empty())
+        && lyrics.lines.len() <= MAX_LINES
+}
+
 /// One alignment job sent to the background task.
 #[derive(Debug)]
+/// The song's path under the media root, its lines as a job asks for
+/// them, and the cache key both are kept under.
+struct Keyed {
+    rel_path: String,
+    job_lines: Vec<(u64, u64, String)>,
+    key: String,
+}
+
 struct Job {
     id: u64,
     path: String,
@@ -115,7 +131,32 @@ pub struct Aligned {
     /// Per line, how well its words matched the singing in thousandths of
     /// the mean character probability (aligner 4); empty from an older one.
     pub scores: Vec<Option<u16>>,
+    /// Set when the aligner found the song sung to other words than these
+    /// lyrics (B1479): its words are then not the song's and are never shown.
+    pub mismatch: Option<Heard>,
 }
+
+/// What the aligner heard of a song whose lyrics did not match it (B1479),
+/// kept so another lyric can be scored against the same transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Heard {
+    /// The lyric's text recall in thousandths; `None` when not judged.
+    pub text_recall: Option<u16>,
+    pub heard_words: usize,
+    /// The transcript's text.
+    pub text: String,
+}
+
+impl Heard {
+    /// The text recall as the share from 0 to 1, for a log line.
+    pub fn recall(&self) -> Option<f64> {
+        self.text_recall.map(|r| f64::from(r) / 1000.0)
+    }
+}
+
+/// The aligner's `check.fallback` for a lyric that was not what was sung;
+/// pharos-align's `Fallback::LyricsMismatch` label.
+pub const LYRICS_MISMATCH: &str = "lyrics_mismatch";
 
 impl Aligned {
     /// Move a line start by the song's offset, keeping it at or after zero.
@@ -138,6 +179,9 @@ pub enum Lookup {
     Partial(Option<u32>, Aligned),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
+    /// The song was aligned and found sung to other words (B1479, V1468):
+    /// there are no word times to show for these lyrics.
+    Mismatch(Heard),
 }
 
 impl Lookup {
@@ -149,6 +193,7 @@ impl Lookup {
             Self::Pending(_) => "pending",
             Self::Partial(..) => "partial",
             Self::Unavailable => "unavailable",
+            Self::Mismatch(_) => "mismatch",
         }
     }
 }
@@ -161,10 +206,15 @@ pub struct AlignCache {
 
 /// Word stamps per line, keyed by item id, with the key they were aligned for.
 type Remembered = HashMap<u64, (String, Aligned)>;
+/// Mismatch verdicts per item and key, kept apart from the word stamps so
+/// another lyric aligned for the item does not erase them (V1468).
+type Verdicts = HashMap<(u64, String), Heard>;
 
 enum CacheBackend {
-    Disk(PathBuf),
-    Memory(Mutex<Remembered>),
+    /// The directory, and the verdicts its file could not take yet: held
+    /// here, answered from here and written with the item's next write.
+    Disk(PathBuf, Mutex<Verdicts>),
+    Memory(Mutex<Remembered>, Mutex<Verdicts>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,6 +225,8 @@ struct WordsRecord {
     offset_ms: i64,
     #[serde(default)]
     scores: Vec<Option<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mismatch: Option<Heard>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,18 +239,29 @@ impl AlignCache {
     /// Create a cache rooted at `dir`, or an in-memory cache when `None`.
     pub fn new(dir: Option<PathBuf>) -> Self {
         let backend = match dir {
-            Some(d) => CacheBackend::Disk(d),
-            None => CacheBackend::Memory(Mutex::new(HashMap::new())),
+            Some(d) => CacheBackend::Disk(d, Mutex::default()),
+            None => CacheBackend::Memory(Mutex::new(HashMap::new()), Mutex::new(HashMap::new())),
         };
         Self {
             backend: Arc::new(backend),
         }
     }
 
-    /// Retrieve cached word stamps for `id` matching `key`, if present.
+    /// Retrieve cached word stamps for `id` matching `key`, if present; a
+    /// lyric found not what was sung answers its verdict with no words, even
+    /// after another lyric was aligned for the item.
     pub fn get(&self, id: u64, key: &str) -> Option<Aligned> {
+        self.words(id, key).or_else(|| {
+            self.verdict(id, key).map(|heard| Aligned {
+                mismatch: Some(heard),
+                ..Aligned::default()
+            })
+        })
+    }
+
+    fn words(&self, id: u64, key: &str) -> Option<Aligned> {
         match &*self.backend {
-            CacheBackend::Disk(dir) => {
+            CacheBackend::Disk(dir, _) => {
                 let path = dir.join(format!("{id}.words.json"));
                 let bytes = match std::fs::read(&path) {
                     Ok(b) => b,
@@ -233,9 +296,10 @@ impl AlignCache {
                         .collect(),
                     offset_ms: record.offset_ms,
                     scores: record.scores,
+                    mismatch: record.mismatch,
                 })
             }
-            CacheBackend::Memory(mem) => {
+            CacheBackend::Memory(mem, _) => {
                 let map = match mem.lock() {
                     Ok(m) => m,
                     Err(poisoned) => poisoned.into_inner(),
@@ -251,13 +315,18 @@ impl AlignCache {
 
     /// Persist word stamps for `id` under `key`.
     pub fn put(&self, id: u64, key: String, aligned: Aligned) {
+        match &aligned.mismatch {
+            Some(heard) => self.keep_verdict(id, &key, heard),
+            None => self.write_unsaved_verdicts(id),
+        }
         match &*self.backend {
-            CacheBackend::Disk(dir) => {
+            CacheBackend::Disk(dir, _) => {
                 let path = dir.join(format!("{id}.words.json"));
                 let record = WordsRecord {
                     key,
                     offset_ms: aligned.offset_ms,
                     scores: aligned.scores.clone(),
+                    mismatch: aligned.mismatch.clone(),
                     lines: aligned
                         .lines
                         .iter()
@@ -275,7 +344,7 @@ impl AlignCache {
                     tracing::warn!(media.id = id, dir = %dir.display(), error = %e, "lyrics: words cache write failed");
                 }
             }
-            CacheBackend::Memory(mem) => {
+            CacheBackend::Memory(mem, _) => {
                 let mut map = match mem.lock() {
                     Ok(m) => m,
                     Err(poisoned) => poisoned.into_inner(),
@@ -284,10 +353,105 @@ impl AlignCache {
             }
         }
     }
+
+    fn verdict(&self, id: u64, key: &str) -> Option<Heard> {
+        match &*self.backend {
+            CacheBackend::Disk(dir, unsaved) => read_verdicts(&verdicts_path(dir, id))
+                .remove(key)
+                .or_else(|| lock(unsaved).get(&(id, key.to_string())).cloned()),
+            CacheBackend::Memory(_, verdicts) => {
+                let map = match verdicts.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.get(&(id, key.to_string())).cloned()
+            }
+        }
+    }
+
+    fn keep_verdict(&self, id: u64, key: &str, heard: &Heard) {
+        match &*self.backend {
+            CacheBackend::Disk(_, unsaved) => {
+                lock(unsaved).insert((id, key.to_string()), heard.clone());
+                self.write_unsaved_verdicts(id);
+            }
+            CacheBackend::Memory(_, verdicts) => {
+                let mut map = match verdicts.lock() {
+                    Ok(m) => m,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                map.insert((id, key.to_string()), heard.clone());
+            }
+        }
+    }
+}
+
+impl AlignCache {
+    /// Writes the verdicts for `id` its file has not taken yet, keeping
+    /// them in memory while the write fails.
+    fn write_unsaved_verdicts(&self, id: u64) {
+        let CacheBackend::Disk(dir, unsaved) = &*self.backend else {
+            return;
+        };
+        let mut unsaved = lock(unsaved);
+        let keys: Vec<String> = unsaved
+            .keys()
+            .filter(|(i, _)| *i == id)
+            .map(|(_, k)| k.clone())
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let path = verdicts_path(dir, id);
+        let mut all = read_verdicts(&path);
+        for key in &keys {
+            if let Some(heard) = unsaved.get(&(id, key.clone())) {
+                all.insert(key.clone(), heard.clone());
+            }
+        }
+        match write_record(dir, &path, &all) {
+            Ok(()) => {
+                for key in keys {
+                    unsaved.remove(&(id, key));
+                }
+            }
+            Err(e) => tracing::warn!(
+                media.id = id,
+                dir = %dir.display(),
+                held = keys.len(),
+                error = %e,
+                "lyrics: mismatch verdict write failed; held in memory until the next write"
+            ),
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn verdicts_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id}.mismatches.json"))
+}
+
+/// The verdicts kept for one item by key; none when the file is missing or unreadable.
+fn read_verdicts(path: &Path) -> HashMap<String, Heard> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "lyrics: mismatch verdicts read failed");
+            return HashMap::new();
+        }
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(path = %path.display(), error = %e, "lyrics: mismatch verdicts unreadable");
+        HashMap::new()
+    })
 }
 
 /// Written via a temporary file and atomically renamed over the destination.
-fn write_record(dir: &Path, path: &Path, record: &WordsRecord) -> std::io::Result<()> {
+fn write_record(dir: &Path, path: &Path, record: &impl Serialize) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
@@ -371,6 +535,9 @@ struct Ask {
     audio_stream: Option<u32>,
 }
 
+#[cfg(test)]
+type BeforeQueue = Box<dyn FnOnce(&Aligner) + Send>;
+
 /// Client and background worker for lyric forced alignment.
 pub struct Aligner {
     http: Client,
@@ -389,6 +556,9 @@ pub struct Aligner {
     tx: mpsc::Sender<Job>,
     /// Spec 039, R21: sent each stored song for a comparison, when set.
     shadow: Option<Shadow>,
+    /// Run by `words_for` between its cache miss and the `pending` lock.
+    #[cfg(test)]
+    before_queue: Mutex<Option<BeforeQueue>>,
 }
 
 impl Aligner {
@@ -408,6 +578,7 @@ impl Aligner {
             partial: Mutex::default(),
             tx: mpsc::channel(1).0,
             shadow: None,
+            before_queue: Mutex::default(),
         }
     }
 
@@ -439,6 +610,8 @@ impl Aligner {
         });
         let aligner = Arc::new(Self {
             shadow,
+            #[cfg(test)]
+            before_queue: Mutex::default(),
             http,
             base,
             media_root,
@@ -546,7 +719,8 @@ impl Aligner {
 
     /// The lines timed so far for item `id` under cache `key`, as an answer
     /// with an empty line for each still to come; `None` before a line is
-    /// timed, or when the job in flight was for other lyrics.
+    /// timed, or when the job in flight was for other lyrics. Words stream
+    /// as they are timed, before the text check has run.
     fn partial_for(&self, id: u64, key: &str) -> Option<Aligned> {
         let partial = self.partial_lock();
         let p = partial.get(&id).filter(|p| p.key == key)?;
@@ -558,6 +732,7 @@ impl Aligner {
                 .collect(),
             offset_ms: p.offset_ms,
             scores: Vec::new(),
+            mismatch: None,
         })
     }
 
@@ -602,6 +777,7 @@ impl Aligner {
             )
             .await?;
         let offset_ms = answered.aligned.offset_ms;
+        let lyrics_mismatch = answered.aligned.mismatch.is_some();
         self.store(job.id, job.key.clone(), answered, Source::Song);
         // Measured once the answer is stored, the point the client can see
         // it and the estimator's own finish.
@@ -616,6 +792,7 @@ impl Aligner {
             eta.actual_ms = actual_ms,
             lines_streamed,
             first_line_ms,
+            lyrics_mismatch,
             "lyrics: aligned"
         );
         Ok(())
@@ -844,20 +1021,24 @@ impl Aligner {
             .is_ok_and(|r| r.status().is_success())
     }
 
-    /// Check if word timestamps are ready for `lyrics`, or queue a background job.
-    pub fn words_for(&self, item: &MediaItem, lyrics: &Lyrics) -> Lookup {
+    /// The aligner's answer for `lyrics` of `item` when it found them not
+    /// what was sung, read from the cache alone: nothing is queued.
+    pub fn mismatched(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Heard> {
+        let keyed = self.keyed(item, lyrics)?;
+        self.cache.get(item.id, &keyed.key)?.mismatch
+    }
+
+    /// What a job for `lyrics` of `item` asks and is cached under; `None`
+    /// when the lyrics have no line times. Lyrics that are not
+    /// [`alignable`] still have a key: their verdict from before they were
+    /// word-timed holds, as the key does not count the words.
+    fn keyed(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Keyed> {
         if !lyrics.synced() {
-            return Lookup::Unavailable;
+            return None;
         }
-        if lyrics.lines.iter().all(|l| !l.words.is_empty()) || lyrics.lines.len() > MAX_LINES {
-            return Lookup::Unavailable;
-        }
-        let rel_path = match item.path.strip_prefix(&self.media_root) {
-            Ok(p) => match p.to_str() {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => return Lookup::Unavailable,
-            },
-            Err(_) => return Lookup::Unavailable,
+        let rel_path = match item.path.strip_prefix(&self.media_root).ok()?.to_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return None,
         };
 
         let mut job_lines = Vec::with_capacity(lyrics.lines.len());
@@ -872,19 +1053,57 @@ impl Aligner {
             let end_ms = end_ms.max(start_ms);
             job_lines.push((start_ms, end_ms, line.text.clone()));
         }
-
         let key = cache_key(&[], &rel_path, &item.path, &job_lines);
+        Some(Keyed {
+            rel_path,
+            job_lines,
+            key,
+        })
+    }
 
-        if let Some(aligned) = self.cache.get(item.id, &key) {
-            if aligned.lines.len() == job_lines.len() {
-                return Lookup::Ready(aligned);
-            }
+    /// What the cache already says of `lyrics` under `key`: its mismatch
+    /// verdict, or its words when they fit the `lines` it would be sent.
+    fn cached(&self, id: u64, key: &str, lyrics: &Lyrics, lines: usize) -> Option<Lookup> {
+        let aligned = self.cache.get(id, key)?;
+        if let Some(heard) = aligned.mismatch {
+            return Some(Lookup::Mismatch(heard));
+        }
+        (alignable(lyrics) && aligned.lines.len() == lines).then_some(Lookup::Ready(aligned))
+    }
+
+    /// Check if word timestamps are ready for `lyrics`, or queue a background job.
+    pub fn words_for(&self, item: &MediaItem, lyrics: &Lyrics) -> Lookup {
+        let Some(Keyed {
+            rel_path,
+            job_lines,
+            key,
+        }) = self.keyed(item, lyrics)
+        else {
+            return Lookup::Unavailable;
+        };
+
+        if let Some(found) = self.cached(item.id, &key, lyrics, job_lines.len()) {
+            return found;
+        }
+        if !alignable(lyrics) {
+            return Lookup::Unavailable;
+        }
+        #[cfg(test)]
+        if let Some(run) = self.before_queue.lock().ok().and_then(|mut f| f.take()) {
+            run(self);
         }
 
         let mut pending = match self.pending.lock() {
             Ok(p) => p,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // The worker stores its answer before it leaves `pending`, so one
+        // stored since the miss above is seen here.
+        if !pending.contains(&item.id) {
+            if let Some(found) = self.cached(item.id, &key, lyrics, job_lines.len()) {
+                return found;
+            }
+        }
 
         if pending.contains(&item.id) {
             let left = self
@@ -989,6 +1208,18 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
         offset_ms: i64,
         /// Required for the same reason, from an aligner older than B1165.
         aligner_version: u32,
+        /// Sent only when the song fell back (B1479).
+        #[serde(default)]
+        check: Option<ReplyCheck>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReplyCheck {
+        fallback: String,
+        #[serde(default)]
+        text_recall: Option<f64>,
+        heard_words: usize,
+        heard: String,
     }
 
     #[derive(Deserialize)]
@@ -1031,11 +1262,22 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
             .map(|l| l.words.into_iter().map(WordStamp::from).collect())
             .collect(),
         offset_ms: reply.offset_ms,
+        mismatch: reply
+            .check
+            .filter(|c| c.fallback == LYRICS_MISMATCH)
+            .map(|c| Heard {
+                text_recall: c
+                    .text_recall
+                    .filter(|r| r.is_finite())
+                    .map(|r| (r.clamp(0.0, 1.0) * 1000.0).round() as u16),
+                heard_words: c.heard_words,
+                text: c.heard,
+            }),
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
@@ -1054,7 +1296,52 @@ mod tests {
             partial: Mutex::default(),
             tx,
             shadow: None,
+            before_queue: Mutex::default(),
         }
+    }
+
+    /// An aligner whose cache holds a verdict that `lyrics` of `item`, a
+    /// file under `media_root`, were not what was sung.
+    pub(in crate::services::lyrics) fn found_not_sung(
+        media_root: &Path,
+        item: &MediaItem,
+        lyrics: &Lyrics,
+    ) -> Arc<Aligner> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root.to_path_buf(), AlignCache::new(None), tx);
+        assert_eq!(aligner.words_for(item, lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check(LYRICS_MISMATCH), 1).unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+        Arc::new(aligner)
+    }
+
+    /// An aligner with `lyrics` of `item` in flight, and the key its
+    /// events are sent under.
+    pub(in crate::services::lyrics) fn in_flight(
+        media_root: &Path,
+        item: &MediaItem,
+        lyrics: &Lyrics,
+    ) -> (Arc<Aligner>, String) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root.to_path_buf(), AlignCache::new(None), tx);
+        assert_eq!(aligner.words_for(item, lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        (Arc::new(aligner), job.key)
+    }
+
+    /// Sends `event` for `item` under `key` to an aligner from [`in_flight`].
+    pub(in crate::services::lyrics) fn send(
+        aligner: &Aligner,
+        item: &MediaItem,
+        key: &str,
+        event: &str,
+        n_lines: usize,
+    ) {
+        aligner
+            .event((item.id, key), event.as_bytes(), n_lines)
+            .unwrap();
     }
 
     fn sample_item(path: PathBuf) -> MediaItem {
@@ -1081,11 +1368,13 @@ mod tests {
             lines: vec![vec![stamp(0, 1000), stamp(3, 1400)]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let differing = Aligned {
             lines: vec![vec![stamp(0, 1000), stamp(3, 1600)]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (primary_base, primary_got) = fake(200, body(&primary, 2), None).await;
         let (release, hold) = oneshot::channel();
@@ -1209,6 +1498,7 @@ mod tests {
             lines: vec![vec![stamp(0, 1200), stamp(4, 1900)]],
             offset_ms: 0,
             scores: vec![Some(610)],
+            mismatch: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let media_root = dir.path().join("media");
@@ -1412,6 +1702,7 @@ mod tests {
             lines: stamps,
             offset_ms: 0,
             scores: Vec::new(),
+            mismatch: None,
         };
         aligner.cache.put(item.id, job.key.clone(), aligned.clone());
 
@@ -1583,6 +1874,7 @@ mod tests {
             }]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (base, _got) = fake(200, body(&answer, 2), None).await;
         let (tx, _rx) = mpsc::channel(1);
@@ -1629,6 +1921,7 @@ mod tests {
             }]],
             offset_ms: 0,
             scores: vec![None],
+            mismatch: None,
         };
         let (base, _got) = fake(200, body(&answer, 2), None).await;
         let (tx, _rx) = mpsc::channel(1);
@@ -1786,6 +2079,7 @@ mod tests {
             lines: stamps,
             offset_ms: -3_700,
             scores: vec![Some(712), None],
+            mismatch: None,
         };
         assert_eq!(cache.get(10, "key_a"), None);
         cache.put(10, "key_a".into(), aligned.clone());
@@ -2040,6 +2334,7 @@ mod tests {
             lines: Vec::new(),
             offset_ms: -2_500,
             scores: Vec::new(),
+            mismatch: None,
         };
         assert_eq!(early.shift(10_000), 7_500);
         assert_eq!(early.shift(1_000), 0);
@@ -2327,7 +2622,8 @@ mod tests {
 
     /// V1297: a song in flight with lines timed for its current lyrics is
     /// looked up as `Partial`, and with none yet, or only lines timed for
-    /// other lyrics, as `Pending`.
+    /// other lyrics, as `Pending`. Its words stream as they are timed,
+    /// before the text check, and a mismatch found then unsyncs it (V1468).
     #[test]
     fn a_song_in_flight_is_partial_once_a_line_is_timed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2435,13 +2731,255 @@ mod tests {
             lines: Vec::new(),
             offset_ms: 0,
             scores: Vec::new(),
+            mismatch: None,
         };
         let labels = [
             Lookup::Ready(aligned.clone()).label(),
             Lookup::Pending(None).label(),
             Lookup::Partial(None, aligned).label(),
             Lookup::Unavailable.label(),
+            Lookup::Mismatch(Heard::default()).label(),
         ];
-        assert_eq!(labels, ["ready", "pending", "partial", "unavailable"]);
+        assert_eq!(
+            labels,
+            ["ready", "pending", "partial", "unavailable", "mismatch"]
+        );
+    }
+
+    fn answer_with_check(fallback: &str) -> String {
+        format!(
+            r#"{{"offset_ms": 0, "aligner_version": 5, "lines": [{{"words": []}}],
+            "check": {{"fallback": "{fallback}", "text_recall": 0.0812,
+            "heard_words": 120, "heard": " the lanterns swing"}}}}"#
+        )
+    }
+
+    /// B1479: the server reads pharos-align's `Fallback::LyricsMismatch`
+    /// label by its string; renaming it there must fail here.
+    #[test]
+    fn a_lyrics_mismatch_answer_is_read_with_what_was_heard() {
+        assert_eq!(LYRICS_MISMATCH, "lyrics_mismatch");
+        let got = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        assert_eq!(
+            got.mismatch,
+            Some(Heard {
+                text_recall: Some(81),
+                heard_words: 120,
+                text: " the lanterns swing".into(),
+            })
+        );
+        assert_eq!(got.mismatch.unwrap().recall(), Some(0.081));
+    }
+
+    #[test]
+    fn another_fallback_or_no_check_is_no_mismatch() {
+        let other = parse_answer(&answer_with_check("low_anchor_share"), 1).unwrap();
+        assert_eq!(other.mismatch, None);
+        let plain = r#"{"offset_ms": 0, "aligner_version": 5, "lines": [{"words": []}]}"#;
+        assert_eq!(parse_answer(plain, 1).unwrap().mismatch, None);
+    }
+
+    #[test]
+    fn a_mismatch_outlives_the_process_in_the_words_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AlignCache::new(Some(dir.path().to_path_buf()));
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        cache.put(4, "k".into(), aligned.clone());
+        assert_eq!(cache.get(4, "k"), Some(aligned));
+        std::fs::write(
+            dir.path().join("5.words.json"),
+            r#"{"key":"k","lines":[[]]}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.get(5, "k").map(|a| a.mismatch), Some(None));
+    }
+
+    /// A verdict its file would not take is still answered after another
+    /// lyric's words are written for the item, and is written once the
+    /// file takes it.
+    #[test]
+    fn a_verdict_the_disk_refused_is_held_and_written_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("4.mismatches.json");
+        std::fs::create_dir(&blocker).unwrap();
+        let cache = AlignCache::new(Some(dir.path().to_path_buf()));
+        let wrong = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = wrong.mismatch.clone().unwrap();
+        cache.put(4, "wrong".into(), wrong);
+        let sung = Aligned {
+            lines: vec![vec![WordStamp {
+                at: 0,
+                start_ms: 10,
+            }]],
+            ..Aligned::default()
+        };
+        cache.put(4, "sung".into(), sung.clone());
+        assert_eq!(cache.get(4, "sung"), Some(sung.clone()));
+        assert_eq!(
+            cache.get(4, "wrong").and_then(|a| a.mismatch),
+            Some(heard.clone())
+        );
+        let reopened = AlignCache::new(Some(dir.path().to_path_buf()));
+        assert_eq!(reopened.get(4, "wrong"), None);
+
+        std::fs::remove_dir(&blocker).unwrap();
+        cache.put(4, "sung".into(), sung);
+        let reopened = AlignCache::new(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            reopened.get(4, "wrong").and_then(|a| a.mismatch),
+            Some(heard)
+        );
+    }
+
+    /// V1468: a lyric found not what was sung stays so after another lyric
+    /// is aligned for the same item, on disk and in memory.
+    #[test]
+    fn a_mismatch_outlives_another_lyric_aligned_for_the_item() {
+        let dir = tempfile::tempdir().unwrap();
+        for cache in [
+            AlignCache::new(Some(dir.path().to_path_buf())),
+            AlignCache::new(None),
+        ] {
+            let wrong = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+            let heard = wrong.mismatch.clone().unwrap();
+            cache.put(4, "wrong".into(), wrong);
+            let sung = Aligned {
+                lines: vec![vec![WordStamp {
+                    at: 0,
+                    start_ms: 10,
+                }]],
+                ..Aligned::default()
+            };
+            cache.put(4, "sung".into(), sung.clone());
+            assert_eq!(cache.get(4, "sung"), Some(sung));
+            assert_eq!(cache.get(4, "wrong").and_then(|a| a.mismatch), Some(heard));
+            assert_eq!(cache.get(5, "wrong"), None);
+        }
+    }
+
+    /// V1468: a lyric found not to be what was sung is still a mismatch
+    /// once every line is word-timed (a sidecar given its own words), as
+    /// its text and line times are unchanged; a fully word-timed lyric with
+    /// no verdict is still never queued. Disarm check: with `keyed`
+    /// refusing lyrics that are not `alignable`, this fails.
+    #[test]
+    fn a_mismatch_holds_once_the_lyric_is_word_timed_and_none_is_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let line = |text: &str, start_ms| LyricLine {
+            start_ms: Some(start_ms),
+            text: text.into(),
+            words: Vec::new(),
+        };
+        let lyrics =
+            Lyrics::from_lines(vec![line("grey gulls wheel", 1000)], Origin::SidecarLrc).unwrap();
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+
+        let mut word_timed = lyrics.clone();
+        for l in &mut word_timed.lines {
+            l.words = vec![WordStamp {
+                at: 0,
+                start_ms: l.start_ms.unwrap(),
+            }];
+        }
+        assert!(!alignable(&word_timed));
+        assert_eq!(
+            aligner.words_for(&item, &word_timed),
+            Lookup::Mismatch(heard.clone())
+        );
+        assert_eq!(aligner.mismatched(&item, &word_timed), Some(heard));
+
+        let mut other = word_timed.clone();
+        other.lines[0].text = "the lanterns swing".into();
+        assert_eq!(aligner.words_for(&item, &other), Lookup::Unavailable);
+        assert_eq!(aligner.mismatched(&item, &other), None);
+        assert!(rx.try_recv().is_err(), "nothing queued");
+    }
+
+    /// A verdict the worker stores after `words_for` missed the cache, but
+    /// before it took the `pending` lock, is still honoured: the song is
+    /// not queued again. Disarm check: without the recheck under the lock,
+    /// this queues a second job.
+    #[test]
+    fn a_verdict_stored_between_the_miss_and_the_queue_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let lyrics = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1000),
+                text: "grey gulls wheel".into(),
+                words: Vec::new(),
+            }],
+            Origin::Online,
+        )
+        .unwrap();
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+
+        // The worker stores its verdict and leaves `pending` while this
+        // lookup sits between its cache miss and the `pending` lock.
+        let (id, key) = (item.id, job.key);
+        *aligner.before_queue.lock().unwrap() = Some(Box::new(move |a: &Aligner| {
+            a.cache.put(id, key, aligned);
+            a.pending.lock().unwrap().remove(&id);
+        }));
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Mismatch(heard.clone())
+        );
+        assert!(rx.try_recv().is_err(), "nothing queued again");
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
+    }
+
+    /// V1468: words aligned to lyrics that were not what was sung are never
+    /// served as the song's word times, and the song is not queued again.
+    #[test]
+    fn a_cached_mismatch_is_never_ready_and_never_queued_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let lyrics = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1000),
+                text: "grey gulls wheel".into(),
+                words: Vec::new(),
+            }],
+            Origin::Online,
+        )
+        .unwrap();
+
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
+        assert!(rx.try_recv().is_err());
     }
 }

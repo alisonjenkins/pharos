@@ -20,6 +20,7 @@ pub mod embedded;
 pub mod eta;
 pub mod lrc;
 pub mod lrclib;
+pub mod repick;
 pub mod shadow;
 pub mod sidecar;
 
@@ -108,12 +109,17 @@ impl Lyrics {
         };
         let last = self.lines.iter().filter_map(|l| l.start_ms).max();
         if last.is_some_and(|ms| ms > duration_ms.saturating_add(OVERRUN_SLACK_MS)) {
-            for line in &mut self.lines {
-                line.start_ms = None;
-                line.words.clear();
-            }
+            self.unsync();
         }
         self
+    }
+
+    /// Keep the words as plain lyrics, without line or word times.
+    pub fn unsync(&mut self) {
+        for line in &mut self.lines {
+            line.start_ms = None;
+            line.words.clear();
+        }
     }
 }
 
@@ -176,6 +182,19 @@ pub trait OnlineLyrics: Send + Sync {
         &'a self,
         song: &'a Song,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>;
+
+    /// The synced records the service returns for the song's title and
+    /// artist, in its own order, for picking another when the one found was
+    /// not what was sung (B1479). A service may return only some of what it
+    /// holds (LRCLIB returns at most 20), so finding none usable is a verdict
+    /// on these records only. A service that cannot search has none.
+    fn search<'a>(
+        &'a self,
+        _song: &'a Song,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
+    {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
 }
 
 /// Online answers kept before the memo is emptied and starts again; bounds
@@ -194,6 +213,76 @@ pub struct LyricsFinder {
     down_until: Mutex<Option<Instant>>,
     disk: Option<Arc<cache::DiskCache>>,
     aligner: Option<Arc<align::Aligner>>,
+    /// Songs searched for another lyric since the process started, so a
+    /// second ask while one runs, or after one without a disk cache, does
+    /// not search again (B1479). Keyed by the song's tags as well, so a
+    /// retagged song is searched again. Holds the record picked, apart from
+    /// the memo so the memo's emptying cannot lose it: without a disk cache,
+    /// or when its write failed, nothing else does.
+    repicked: Mutex<HashMap<(u64, String), Option<Lyrics>>>,
+    /// Holds the next read at a named point (`"local"`, `"disk"`): says it
+    /// began, then waits to be let go.
+    #[cfg(test)]
+    paused: Mutex<HashMap<&'static str, Pause>>,
+}
+
+#[cfg(test)]
+type Pause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+type Repicked = Mutex<HashMap<(u64, String), Option<Lyrics>>>;
+
+/// A song's place in [`LyricsFinder::repick`]'s guard, given back when
+/// dropped, so a search that fails, waits out a cooldown or is cancelled
+/// can be made again; kept once the search's answer is written.
+struct Reserved<'a> {
+    set: &'a Repicked,
+    key: Option<(u64, String)>,
+}
+
+impl<'a> Reserved<'a> {
+    /// `None` when the song is held already.
+    fn take(set: &'a Repicked, key: (u64, String)) -> Option<Self> {
+        let first = set
+            .lock()
+            .map(|mut held| match held.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(None);
+                    true
+                }
+            })
+            .unwrap_or(false);
+        // Lazily: a guard built for a refused take would give back the
+        // holder's reservation when dropped.
+        first.then(|| Self {
+            set,
+            key: Some(key),
+        })
+    }
+
+    fn keep(mut self) {
+        self.key = None;
+    }
+
+    /// Hold `found` as the song's lyric from now on.
+    fn pick(&self, found: &Lyrics) {
+        let Some(key) = &self.key else { return };
+        if let Ok(mut held) = self.set.lock() {
+            held.insert(key.clone(), Some(found.clone()));
+        }
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        if let Ok(mut held) = self.set.lock() {
+            held.remove(&key);
+        }
+    }
 }
 
 /// An online answer held in memory: what was asked, so a retagged song is
@@ -214,6 +303,9 @@ impl LyricsFinder {
             down_until: Mutex::default(),
             disk: None,
             aligner: None,
+            repicked: Mutex::default(),
+            #[cfg(test)]
+            paused: Mutex::default(),
         }
     }
 
@@ -234,8 +326,34 @@ impl LyricsFinder {
         self
     }
 
+    /// The lyrics of the song `read` gives, `None` when it is not a song or
+    /// has none. The lookup is asked as of before the read: a repick for a
+    /// retag made while the item is read, or while this lookup waits, must
+    /// count as after it, so an answer for the tags read cannot replace it.
+    pub async fn find_read<E>(
+        &self,
+        read: impl Future<Output = Result<MediaItem, E>>,
+    ) -> Result<Option<(MediaItem, Lyrics)>, E> {
+        let asked_at = cache::now_secs();
+        let item = read.await?;
+        if item.kind != MediaKind::Audio {
+            return Ok(None);
+        }
+        Ok(self
+            .find_asked(&item, asked_at)
+            .await
+            .map(|lyrics| (item, lyrics)))
+    }
+
+    #[cfg(test)]
     pub async fn find(&self, item: &MediaItem) -> Option<Lyrics> {
+        self.find_asked(item, cache::now_secs()).await
+    }
+
+    async fn find_asked(&self, item: &MediaItem, asked_at: u64) -> Option<Lyrics> {
         let started = Instant::now();
+        #[cfg(test)]
+        self.pause("local").await;
         let path = item.path.clone();
         let local = tokio::task::spawn_blocking(move || local(&path))
             .await
@@ -245,7 +363,7 @@ impl LyricsFinder {
             });
         let found = match local {
             Some(found) => Some(found),
-            None => self.online(item).await,
+            None => self.online(item, asked_at).await,
         }
         .map(|l| {
             let last_line_ms = l.lines.iter().filter_map(|line| line.start_ms).max();
@@ -281,7 +399,8 @@ impl LyricsFinder {
         found
     }
 
-    async fn online(&self, item: &MediaItem) -> Option<Lyrics> {
+    /// The online answer for `item`, as snapshotted at `asked_at`.
+    async fn online(&self, item: &MediaItem, asked_at: u64) -> Option<Lyrics> {
         let online = self.online.as_ref()?;
         let Some(song) = Song::of(item) else {
             tracing::debug!(
@@ -292,12 +411,16 @@ impl LyricsFinder {
             return None;
         };
         let key = cache::key(online.name(), &song);
+        if let Some(picked) = self.picked(item.id, &key) {
+            return Some(picked);
+        }
         if let Some(known) = self.remembered(item.id, &key) {
             return known;
         }
         if let Some((known, age)) = self.read_disk(item.id, online.name(), &song).await {
-            self.remember_aged(item.id, key, known.clone(), age);
-            return known;
+            return self
+                .remember_unless_repicked(item.id, &key, &known, age)
+                .unwrap_or(known);
         }
         if self.cooling_down() {
             tracing::debug!(
@@ -309,8 +432,12 @@ impl LyricsFinder {
         }
         match online.find(&song).await {
             Ok(found) => {
-                self.remember(item.id, key, found.clone());
-                self.write_disk(item.id, online.name(), song, found.clone())
+                if let Some(standing) =
+                    self.remember_unless_repicked(item.id, &key, &found, Duration::ZERO)
+                {
+                    return standing;
+                }
+                self.write_disk(item.id, online.name(), song, found.clone(), asked_at)
                     .await;
                 found
             }
@@ -334,12 +461,195 @@ impl LyricsFinder {
         }
     }
 
+    /// Another online lyric for `item`, whose lyric `current` the aligner
+    /// found was not what was sung (B1479, V1468), scored against what it
+    /// `heard`. Searched once per song: the answer, a pick or none, is kept
+    /// in place of `current` with the search marked done. `None` when there
+    /// is no other, the search was made already, or `current` is local.
+    pub async fn repick(
+        &self,
+        item: &MediaItem,
+        current: &Lyrics,
+        heard: &align::Heard,
+    ) -> Option<Lyrics> {
+        let text_recall = heard.recall();
+        if current.origin != Origin::Online {
+            repick_counted(repick::Outcome::SkippedLocal);
+            tracing::warn!(
+                media.id = item.id,
+                origin = current.origin.label(),
+                text_recall,
+                heard_words = heard.heard_words,
+                "lyrics: not what was sung, and local, so not searched for another"
+            );
+            return None;
+        }
+        let online = self.online.as_ref()?;
+        let song = Song::of(item)?;
+        // Records are judged by their length against the song's; without
+        // one no search could be judged, so none is made or marked done.
+        let Some(duration_ms) = item.probe.duration_ms.filter(|&ms| ms > 0) else {
+            tracing::warn!(
+                media.id = item.id,
+                duration_ms = ?item.probe.duration_ms,
+                text_recall,
+                "lyrics: not what was sung, but the song has no length, so not searched for another"
+            );
+            return None;
+        };
+        let Some(reserved) =
+            Reserved::take(&self.repicked, (item.id, cache::key(online.name(), &song)))
+        else {
+            tracing::debug!(
+                media.id = item.id,
+                "lyrics: another lyric is being searched for already"
+            );
+            return None;
+        };
+        if self.repicked_on_disk(item.id, online.name(), &song).await {
+            reserved.keep();
+            tracing::debug!(
+                media.id = item.id,
+                "lyrics: another lyric was searched for already"
+            );
+            return None;
+        }
+        if self.cooling_down() {
+            return None;
+        }
+        let search = |song: Song| async move {
+            match online.search(&song).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    if let Ok(mut until) = self.down_until.lock() {
+                        *until = Some(Instant::now() + ONLINE_COOLDOWN);
+                    }
+                    metrics::counter!("pharos_lyrics_online_error_total", "provider" => e.provider)
+                        .increment(1);
+                    repick_counted(repick::Outcome::Error);
+                    tracing::warn!(
+                        media.id = item.id,
+                        origin = current.origin.label(),
+                        text_recall,
+                        album = song.album.is_some(),
+                        error = %e,
+                        "lyrics: not what was sung, and the search for another failed"
+                    );
+                    None
+                }
+            }
+        };
+        let choose = |candidates| repick::choose(candidates, current, duration_ms, &heard.text);
+        let candidates = search(song.clone()).await?;
+        let mut searched = candidates.len();
+        let mut pick = choose(candidates);
+        // An album tag the provider files differently hides every record;
+        // the search is made once more without it.
+        let without_album = pick.is_none() && song.album.is_some();
+        if without_album {
+            let candidates = search(Song {
+                album: None,
+                ..song.clone()
+            })
+            .await?;
+            searched += candidates.len();
+            pick = choose(candidates);
+        }
+        if let Some(pick) = &pick {
+            reserved.pick(&pick.candidate.lyrics);
+        }
+        // Kept before the write is awaited: the write runs on whether or not
+        // this request is still waiting for it, and the search is done.
+        reserved.keep();
+        let Some(pick) = pick else {
+            self.write_repick(item.id, online.name(), song, current.clone(), None)
+                .await;
+            repick_counted(repick::Outcome::None);
+            tracing::warn!(
+                media.id = item.id,
+                origin = current.origin.label(),
+                text_recall,
+                searched,
+                without_album,
+                duration_ms = item.probe.duration_ms,
+                "lyrics: not what was sung, and no other record was"
+            );
+            return None;
+        };
+        let found = pick.candidate.lyrics;
+        self.remember(
+            item.id,
+            cache::key(online.name(), &song),
+            Some(found.clone()),
+        );
+        self.write_repick(
+            item.id,
+            online.name(),
+            song,
+            found.clone(),
+            Some(pick.candidate.id),
+        )
+        .await;
+        repick_counted(repick::Outcome::Picked);
+        tracing::warn!(
+            media.id = item.id,
+            origin = current.origin.label(),
+            text_recall,
+            searched,
+            without_album,
+            candidate.id = pick.candidate.id,
+            candidate.recall = pick.recall,
+            "lyrics: not what was sung, another record was and is served instead"
+        );
+        Some(found.fit_to(item.probe.duration_ms))
+    }
+
+    async fn repicked_on_disk(&self, id: u64, provider: &'static str, song: &Song) -> bool {
+        let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        let song = song.clone();
+        tokio::task::spawn_blocking(move || disk.repicked(id, provider, &song))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn write_repick(
+        &self,
+        id: u64,
+        provider: &'static str,
+        song: Song,
+        lyrics: Lyrics,
+        picked: Option<u64>,
+    ) {
+        let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let written = tokio::task::spawn_blocking(move || {
+            disk.put_repicked(id, provider, &song, &lyrics, picked);
+        })
+        .await;
+        if let Err(e) = written {
+            tracing::warn!(media.id = id, error = %e, "lyrics: cache write task failed");
+        }
+    }
+
     fn cooling_down(&self) -> bool {
         self.down_until
             .lock()
             .ok()
             .and_then(|until| *until)
             .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// The record a repick of the song as tagged now chose, if one did.
+    fn picked(&self, id: u64, key: &str) -> Option<Lyrics> {
+        self.repicked
+            .lock()
+            .ok()?
+            .get(&(id, key.to_owned()))
+            .cloned()
+            .flatten()
     }
 
     fn remembered(&self, id: u64, key: &str) -> Option<Option<Lyrics>> {
@@ -351,6 +661,42 @@ impl LyricsFinder {
         r.lapses_at
             .map_or(true, |at| Instant::now() < at)
             .then_some(r.found)
+    }
+
+    /// Remember an answer from the provider or the disk, given `age` ago,
+    /// unless a repick of the song was taken while it was read; then the
+    /// repick's answer stands and is returned, or `found` when the repick
+    /// has not answered yet.
+    fn remember_unless_repicked(
+        &self,
+        id: u64,
+        key: &str,
+        found: &Option<Lyrics>,
+        age: Duration,
+    ) -> Option<Option<Lyrics>> {
+        // Held across the insert so a repick cannot be taken between the
+        // check and the commit.
+        let held = self
+            .repicked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(picked) = held.get(&(id, key.to_owned())) {
+            let picked = picked.clone();
+            drop(held);
+            tracing::debug!(
+                media.id = id,
+                "lyrics: lookup answer dropped, the song was repicked meanwhile"
+            );
+            return Some(
+                picked
+                    .map(Some)
+                    .or_else(|| self.remembered(id, key))
+                    .unwrap_or_else(|| found.clone()),
+            );
+        }
+        self.remember_aged(id, key.to_owned(), found.clone(), age);
+        drop(held);
+        None
     }
 
     fn remember(&self, id: u64, key: String, found: Option<Lyrics>) {
@@ -380,6 +726,15 @@ impl LyricsFinder {
         }
     }
 
+    #[cfg(test)]
+    async fn pause(&self, at: &'static str) {
+        let held = self.paused.lock().ok().and_then(|mut p| p.remove(at));
+        if let Some((began, go)) = held {
+            let _ = began.send(());
+            let _ = go.await;
+        }
+    }
+
     /// A standing answer from the disk cache and how old it is, `None` when
     /// there is none.
     async fn read_disk(
@@ -388,6 +743,8 @@ impl LyricsFinder {
         provider: &'static str,
         song: &Song,
     ) -> Option<(Option<Lyrics>, Duration)> {
+        #[cfg(test)]
+        self.pause("disk").await;
         let disk = Arc::clone(self.disk.as_ref()?);
         let song = song.clone();
         let cached = tokio::task::spawn_blocking(move || disk.get(id, provider, &song))
@@ -405,13 +762,21 @@ impl LyricsFinder {
         })
     }
 
-    async fn write_disk(&self, id: u64, provider: &'static str, song: Song, found: Option<Lyrics>) {
+    async fn write_disk(
+        &self,
+        id: u64,
+        provider: &'static str,
+        song: Song,
+        found: Option<Lyrics>,
+        asked_at: u64,
+    ) {
         let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
             return;
         };
-        let written =
-            tokio::task::spawn_blocking(move || disk.put(id, provider, &song, found.as_ref()))
-                .await;
+        let written = tokio::task::spawn_blocking(move || {
+            disk.put_at(id, provider, &song, found.as_ref(), asked_at)
+        })
+        .await;
         if let Err(e) = written {
             tracing::warn!(media.id = id, error = %e, "lyrics: cache write task failed");
         }
@@ -423,6 +788,10 @@ fn local(path: &std::path::Path) -> Option<Lyrics> {
     sidecar::lrc(path)
         .or_else(|| embedded::read(path))
         .or_else(|| sidecar::text(path))
+}
+
+fn repick_counted(outcome: repick::Outcome) {
+    metrics::counter!(repick::REPICK_TOTAL, "outcome" => outcome.label()).increment(1);
 }
 
 /// Word times are still being worked out.
@@ -454,45 +823,109 @@ pub async fn for_item(
     crate::services::access::check_item(state, user, id, "item")
         .await
         .map_err(DetailError::Hidden)?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        DomainError::NotFound(_) => DetailError::NotFound,
-        other => DetailError::Store(other),
-    })?;
-    if item.kind != MediaKind::Audio {
-        return Ok(None);
-    }
-    let Some(mut lyrics) = state.lyrics.find(&item).await else {
+    let found = state
+        .lyrics
+        .find_read(state.stores.get(id))
+        .await
+        .map_err(|e| match e {
+            DomainError::NotFound(_) => DetailError::NotFound,
+            other => DetailError::Store(other),
+        })?;
+    let Some((item, lyrics)) = found else {
         return Ok(None);
     };
-    let mut words_pending = None;
-    if want_words {
-        if let Some(aligner) = state.lyrics.aligner.clone() {
-            // words_for stats the file and reads the disk cache.
-            let asked = lyrics.clone();
-            let lookup = tokio::task::spawn_blocking(move || aligner.words_for(&item, &asked))
-                .await
-                .unwrap_or(align::Lookup::Unavailable);
-            count_words_answer(&lookup);
-            match lookup {
-                align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
-                // The lines timed so far, the rest still guessed by the
-                // client until the next answer (ADR-0121).
-                align::Lookup::Partial(eta_ms, aligned) => {
-                    with_words(&mut lyrics, &aligned);
-                    words_pending = Some(WordsPending { eta_ms });
+    Ok(Some(state.lyrics.served(&item, lyrics, want_words).await))
+}
+
+impl LyricsFinder {
+    /// `lyrics` of `item` as served: with the aligner's word times when
+    /// `want_words`, or another record in its place when it was not sung.
+    async fn served(
+        &self,
+        item: &MediaItem,
+        mut lyrics: Lyrics,
+        want_words: bool,
+    ) -> (Lyrics, Option<WordsPending>) {
+        let mut words_pending = None;
+        if want_words {
+            if let Some(aligner) = self.aligner.clone() {
+                let mut lookup = words_for(&aligner, item, &lyrics).await;
+                count_words_answer(&lookup);
+                if let align::Lookup::Mismatch(heard) = &lookup {
+                    // Another record that was sung is aligned in its place, once.
+                    if let Some(other) = self.repick(item, &lyrics, heard).await {
+                        lyrics = other;
+                        lookup = words_for(&aligner, item, &lyrics).await;
+                    }
                 }
-                align::Lookup::Pending(eta_ms) => {
-                    words_pending = Some(WordsPending { eta_ms });
+                match lookup {
+                    align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
+                    // The lines timed so far, the rest still guessed by the
+                    // client until the next answer (ADR-0121).
+                    align::Lookup::Partial(eta_ms, aligned) => {
+                        with_words(&mut lyrics, &aligned);
+                        words_pending = Some(WordsPending { eta_ms });
+                    }
+                    align::Lookup::Pending(eta_ms) => {
+                        words_pending = Some(WordsPending { eta_ms });
+                    }
+                    align::Lookup::Mismatch(_) => unsync_mismatch(&mut lyrics, item.id),
+                    align::Lookup::Unavailable => {}
                 }
-                align::Lookup::Unavailable => {}
+            } else {
+                // No aligner configured: the ask still goes unanswered, so it
+                // counts against the ready share like the aligner refusing it.
+                count_words_answer(&align::Lookup::Unavailable);
             }
-        } else {
-            // No aligner configured: the ask still goes unanswered, so it
-            // counts against the ready share like the aligner refusing it.
-            count_words_answer(&align::Lookup::Unavailable);
+        } else if let Some(aligner) = &self.aligner {
+            // Lines alone still follow another song, so they go too.
+            if mismatched(aligner, item, &lyrics).await {
+                unsync_mismatch(&mut lyrics, item.id);
+            }
         }
+        (lyrics, words_pending)
     }
-    Ok(Some((lyrics, words_pending)))
+}
+
+/// A lyric that was not what was sung, with no other record that was, is
+/// shown as plain text (B1479, V1468): its times follow another song.
+fn unsync_mismatch(lyrics: &mut Lyrics, id: u64) {
+    lyrics.unsync();
+    metrics::counter!(
+        "pharos_lyrics_unsynced_total",
+        "reason" => align::LYRICS_MISMATCH,
+        "origin" => lyrics.origin.label()
+    )
+    .increment(1);
+    tracing::info!(
+        media.id = id,
+        origin = lyrics.origin.label(),
+        "lyrics: not what was sung, shown unsynced"
+    );
+}
+
+/// The aligner's answer for `lyrics` of `item`, which stats the file and
+/// reads the disk cache, so off the async threads.
+async fn words_for(
+    aligner: &Arc<align::Aligner>,
+    item: &MediaItem,
+    lyrics: &Lyrics,
+) -> align::Lookup {
+    let aligner = Arc::clone(aligner);
+    let (item, lyrics) = (item.clone(), lyrics.clone());
+    tokio::task::spawn_blocking(move || aligner.words_for(&item, &lyrics))
+        .await
+        .unwrap_or(align::Lookup::Unavailable)
+}
+
+/// Whether the aligner found `lyrics` of `item` not what was sung, read
+/// from its cache alone, which stats the file, so off the async threads.
+async fn mismatched(aligner: &Arc<align::Aligner>, item: &MediaItem, lyrics: &Lyrics) -> bool {
+    let aligner = Arc::clone(aligner);
+    let (item, lyrics) = (item.clone(), lyrics.clone());
+    tokio::task::spawn_blocking(move || aligner.mismatched(&item, &lyrics).is_some())
+        .await
+        .unwrap_or(false)
 }
 
 /// The aligner's words onto `lyrics`. The aligner moved the song's lines onto
@@ -867,6 +1300,788 @@ mod tests {
         assert_eq!(
             got,
             [("pending".to_owned(), 2), ("unavailable".to_owned(), 1)]
+        );
+    }
+
+    /// A provider whose song search answers `searched`, counting searches.
+    struct Searching {
+        found: Lyrics,
+        searched: Result<Vec<repick::Candidate>, &'static str>,
+        searches: std::sync::atomic::AtomicUsize,
+        /// The search never answers, as one cut off mid-request.
+        stalls: bool,
+        /// A search naming the album finds nothing, as a provider that
+        /// files the song under another album.
+        album_hides: bool,
+    }
+
+    impl OnlineLyrics for Searching {
+        fn name(&self) -> &'static str {
+            "searching"
+        }
+        fn find<'a>(
+            &'a self,
+            _song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>
+        {
+            Box::pin(std::future::ready(Ok(Some(self.found.clone()))))
+        }
+        fn search<'a>(
+            &'a self,
+            song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
+        {
+            self.searches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stalls {
+                return Box::pin(std::future::pending());
+            }
+            if self.album_hides && song.album.is_some() {
+                return Box::pin(std::future::ready(Ok(Vec::new())));
+            }
+            let out = self.searched.clone().map_err(|detail| OnlineError {
+                provider: "searching",
+                detail: detail.to_owned(),
+            });
+            Box::pin(std::future::ready(out))
+        }
+    }
+
+    const SONG_MS: u64 = 200_000;
+
+    fn synced(texts: &[&str], origin: Origin) -> Lyrics {
+        Lyrics::from_lines(
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| line(Some(i as u64 * 4_000), t))
+                .collect(),
+            origin,
+        )
+        .unwrap()
+    }
+
+    fn wrong() -> Lyrics {
+        synced(
+            &[
+                "the lanterns swing in the orchard",
+                "the river keeps its time",
+            ],
+            Origin::Online,
+        )
+    }
+
+    fn sung() -> Lyrics {
+        synced(
+            &[
+                "grey gulls wheel above the quay",
+                "low tide hums along the stones",
+            ],
+            Origin::Online,
+        )
+    }
+
+    fn heard() -> align::Heard {
+        align::Heard {
+            text_recall: Some(0),
+            heard_words: 120,
+            text: "grey gulls wheel above the quay low tide hums along the stones".into(),
+        }
+    }
+
+    fn timed_item(dir: &std::path::Path) -> MediaItem {
+        let mut item = song_item(dir);
+        item.probe.duration_ms = Some(SONG_MS);
+        item
+    }
+
+    fn searching(searched: Result<Vec<repick::Candidate>, &'static str>) -> Arc<Searching> {
+        Arc::new(Searching {
+            found: wrong(),
+            searched,
+            searches: Default::default(),
+            stalls: false,
+            album_hides: false,
+        })
+    }
+
+    fn records(lyrics: Lyrics) -> Vec<repick::Candidate> {
+        vec![
+            repick::Candidate {
+                id: 11,
+                duration_ms: SONG_MS,
+                lyrics: wrong(),
+            },
+            repick::Candidate {
+                id: 12,
+                duration_ms: SONG_MS + 1_000,
+                lyrics,
+            },
+        ]
+    }
+
+    /// Runs `fut` and returns its output with the repick outcomes counted.
+    fn with_outcomes<T>(fut: impl Future<Output = T>) -> (T, Vec<(String, u64)>) {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = metrics::with_local_recorder(&recorder, || rt.block_on(fut));
+        let mut got: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == repick::REPICK_TOTAL)
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == "outcome")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default(),
+                    n,
+                )),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        (out, got)
+    }
+
+    fn searches(online: &Searching) -> usize {
+        online.searches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// B1479, V1468: the record that was sung replaces the one that was not,
+    /// and is what the song's lyrics are from then on.
+    #[test]
+    fn a_lyric_not_sung_is_replaced_by_the_record_that_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let ((before, picked, after), counted) = with_outcomes(async {
+            let before = finder.find(&item).await.unwrap();
+            let picked = finder.repick(&item, &before, &heard()).await;
+            (before, picked, finder.find(&item).await)
+        });
+        assert_eq!(before, wrong());
+        assert_eq!(picked, Some(sung()));
+        assert_eq!(after, Some(sung()));
+        assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A record filed under another album is found by searching again
+    /// without the album.
+    #[test]
+    fn a_record_filed_under_another_album_is_found_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = timed_item(dir.path());
+        item.probe.album = Some("Record".into());
+        let online = Arc::new(Searching {
+            album_hides: true,
+            ..Arc::into_inner(searching(Ok(records(sung())))).unwrap()
+        });
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (picked, counted) = with_outcomes(async {
+            let before = finder.find(&item).await.unwrap();
+            finder.repick(&item, &before, &heard()).await
+        });
+        assert_eq!(picked, Some(sung()));
+        assert_eq!(searches(&online), 2);
+        assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// A disk read that lands while a repick of the song is searching is
+    /// served, but not remembered over what the repick will choose.
+    #[tokio::test]
+    async fn a_disk_read_during_a_repick_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let warm = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        assert_eq!(warm.find(&item).await, Some(wrong()));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let song = Song::of(&item).unwrap();
+        let key = cache::key(online.name(), &song);
+        let searching = Reserved::take(&finder.repicked, (item.id, key.clone())).unwrap();
+        assert_eq!(finder.find(&item).await, Some(wrong()));
+        assert!(finder.remembered(item.id, &key).is_none());
+        drop(searching);
+    }
+
+    /// Without a disk cache the record picked is held apart from the memo,
+    /// so the memo filling and emptying does not bring the wrong lyric back.
+    #[tokio::test]
+    async fn the_record_picked_outlives_the_memo_without_a_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone());
+        let before = finder.find(&item).await.unwrap();
+        assert_eq!(finder.repick(&item, &before, &heard()).await, Some(sung()));
+        for id in 1_000..1_000 + ONLINE_MEMO_MAX as u64 {
+            finder.remember(id, "other".into(), None);
+        }
+        assert_eq!(finder.find(&item).await, Some(sung()));
+    }
+
+    /// A request dropped while the search's answer is being written leaves
+    /// the song held: the write goes on, and a second search would race it.
+    // The cache's writes are held across the polls below so the write is
+    // still running when the request drops.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_repick_dropped_while_writing_its_answer_stays_held() {
+        use std::task::{Context, Waker};
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let before = finder.find(&item).await.unwrap();
+        let heard = heard();
+        let writes = finder.disk.as_ref().unwrap().hold_writes();
+        let mut repick = Box::pin(finder.repick(&item, &before, &heard));
+        let mut cx = Context::from_waker(Waker::noop());
+        // The search answers at once, so every wait after it is the held
+        // write's.
+        for _ in 0..20 {
+            assert!(
+                repick.as_mut().poll(&mut cx).is_pending(),
+                "answered before its write was done"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(searches(&online), 1);
+        drop(repick);
+        drop(writes);
+        let song = Song::of(&item).unwrap();
+        let key = (item.id, cache::key(online.name(), &song));
+        assert!(finder.repicked.lock().unwrap().contains_key(&key));
+    }
+
+    /// A `Searching` whose first lookup notifies `asked` and answers only
+    /// once `gate` is notified, as a slow provider response; later lookups
+    /// answer at once.
+    struct Held {
+        inner: Arc<Searching>,
+        asked: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+        finds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OnlineLyrics for Held {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn find<'a>(
+            &'a self,
+            song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>
+        {
+            let first = self.finds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    self.asked.notify_one();
+                    self.gate.notified().await;
+                }
+                self.inner.find(song).await
+            })
+        }
+        fn search<'a>(
+            &'a self,
+            song: &'a Song,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<repick::Candidate>, OnlineError>> + Send + 'a>>
+        {
+            self.inner.search(song)
+        }
+    }
+
+    /// A lookup in flight while another request repicks the song does not
+    /// put the record the repick replaced back, in memory or on disk.
+    /// Disarm check: with the commit in `online` unguarded, this fails.
+    #[test]
+    fn a_slow_lookup_does_not_undo_a_repick_made_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let cache = dir.path().join("c");
+        let online = Arc::new(Held {
+            inner: searching(Ok(records(sung()))),
+            asked: tokio::sync::Notify::new(),
+            gate: tokio::sync::Notify::new(),
+            finds: Default::default(),
+        });
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+        let ((slow, picked, after, restarted), _) = with_outcomes(async {
+            let (slow, picked) = tokio::join!(finder.find(&item), async {
+                online.asked.notified().await;
+                let before = finder.find(&item).await?;
+                let picked = finder.repick(&item, &before, &heard()).await;
+                online.gate.notify_one();
+                picked
+            });
+            let after = finder.find(&item).await;
+            let later = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+            (slow, picked, after, later.find(&item).await)
+        });
+        assert_eq!(picked, Some(sung()));
+        assert_eq!(slow, Some(sung()));
+        assert_eq!(after, Some(sung()));
+        assert_eq!(restarted, Some(sung()));
+    }
+
+    /// V1468's loop guard: a song is searched once, by this finder or by
+    /// one started later on the same disk cache.
+    /// Disarm check: with the disk cache's `repicked` read skipped in
+    /// `repick`, this fails.
+    #[test]
+    fn a_song_is_searched_for_another_lyric_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let cache = dir.path().join("c");
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+        let ((first, again, restarted), counted) = with_outcomes(async {
+            let first = finder.repick(&item, &wrong(), &heard()).await;
+            let again = finder.repick(&item, &sung(), &heard()).await;
+            let later = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+            let restarted = later.repick(&item, &sung(), &heard()).await;
+            (first, again, restarted)
+        });
+        assert_eq!(first, Some(sung()));
+        assert_eq!((again, restarted), (None, None));
+        assert_eq!(searches(&online), 1);
+        assert_eq!(counted, [("picked".to_owned(), 1)]);
+    }
+
+    /// Disarm check: with the guard keyed by item id alone, the retagged
+    /// song is not searched and this fails.
+    #[test]
+    fn a_retagged_song_is_searched_for_another_lyric_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone());
+        let ((first, again), _) = with_outcomes(async {
+            let first = finder.repick(&item, &wrong(), &heard()).await;
+            let again = finder.repick(&retagged, &wrong(), &heard()).await;
+            (first, again)
+        });
+        assert_eq!(first, Some(sung()));
+        assert_eq!(again, Some(sung()));
+        assert_eq!(searches(&online), 2);
+    }
+
+    /// Disarm check: with the guard built eagerly in `take`, the refused
+    /// first take gives the reservation back and the second succeeds.
+    #[test]
+    fn a_held_song_refuses_every_further_take() {
+        let set = Mutex::new(HashMap::new());
+        let key = (1, "searching/song".to_owned());
+        let held = Reserved::take(&set, key.clone());
+        assert!(held.is_some());
+        assert!(Reserved::take(&set, key.clone()).is_none());
+        assert!(Reserved::take(&set, key).is_none());
+        drop(held);
+    }
+
+    /// Disarm check: with the guard kept when `repick` is dropped, the
+    /// second ask finds the song held and does not search.
+    #[test]
+    fn a_search_cut_off_mid_request_is_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = Arc::new(Searching {
+            found: wrong(),
+            searched: Ok(records(sung())),
+            searches: Default::default(),
+            stalls: true,
+            album_hides: false,
+        });
+        let finder = LyricsFinder::with_online(online.clone());
+        let cut_off = std::time::Duration::from_millis(20);
+        let (asks, _) = with_outcomes(async {
+            let first =
+                tokio::time::timeout(cut_off, finder.repick(&item, &wrong(), &heard())).await;
+            let again =
+                tokio::time::timeout(cut_off, finder.repick(&item, &wrong(), &heard())).await;
+            (first.is_err(), again.is_err())
+        });
+        assert_eq!(asks, (true, true));
+        assert_eq!(searches(&online), 2);
+    }
+
+    #[test]
+    fn with_no_record_sung_the_lyric_stands_and_is_not_searched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let half = synced(
+            &[
+                "grey gulls wheel above the quay",
+                "the river keeps its time",
+            ],
+            Origin::Online,
+        );
+        let online = searching(Ok(records(half)));
+        let cache = dir.path().join("c");
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+        let ((picked, restarted, kept), counted) = with_outcomes(async {
+            let picked = finder.repick(&item, &wrong(), &heard()).await;
+            let later = LyricsFinder::with_online(online.clone()).with_cache(cache.clone());
+            let restarted = later.repick(&item, &wrong(), &heard()).await;
+            (picked, restarted, later.find(&item).await)
+        });
+        assert_eq!((picked, restarted), (None, None));
+        assert_eq!(kept, Some(wrong()));
+        assert_eq!(searches(&online), 1);
+        assert_eq!(counted, [("none".to_owned(), 1)]);
+    }
+
+    /// A lookup that snapshotted the item, then waited on the local read or
+    /// the disk cache while the item was retagged and repicked, does not
+    /// replace the repick when it answers: it was asked before the repick,
+    /// though it reached the provider after. Disarm check: with `asked_at`
+    /// taken in `online` after `read_disk`, this fails at both points.
+    #[test]
+    fn a_lookup_paused_across_a_retag_and_repick_does_not_replace_it() {
+        use tokio::sync::oneshot;
+        for at in ["local", "disk"] {
+            let dir = tempfile::tempdir().unwrap();
+            let item = timed_item(dir.path());
+            let mut retagged = item.clone();
+            retagged.probe.title = Some("Another Song".into());
+            let online = searching(Ok(records(sung())));
+            let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+            let (began_tx, began) = oneshot::channel();
+            let (go, go_rx) = oneshot::channel();
+            finder.paused.lock().unwrap().insert(at, (began_tx, go_rx));
+            let next_second = || async {
+                let now = cache::now_secs();
+                while cache::now_secs() == now {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let ((_, picked), _) = with_outcomes(async {
+                tokio::join!(finder.find(&item), async {
+                    began.await.unwrap();
+                    next_second().await;
+                    let picked = finder.repick(&retagged, &wrong(), &heard()).await;
+                    next_second().await;
+                    go.send(()).unwrap();
+                    picked
+                })
+            });
+            assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))), "{at}");
+            let song = Song::of(&retagged).unwrap();
+            assert!(
+                finder
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .repicked(retagged.id, online.name(), &song),
+                "paused at {at}: the repick was replaced"
+            );
+            the_stale_lookup_was_not_cached(&dir.path().join("c"), &online, &item, at);
+        }
+    }
+
+    /// A lookup whose item was read before a retag and a repick, and that
+    /// only reached the provider after them, does not replace the repick:
+    /// it is asked as of before the read. Disarm check: with `find_read`
+    /// taking `asked_at` after the read, this fails.
+    #[test]
+    fn a_lookup_for_an_item_read_before_a_retag_and_repick_does_not_replace_it() {
+        use tokio::sync::oneshot;
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (began_tx, began) = oneshot::channel();
+        let (go, go_rx) = oneshot::channel::<()>();
+        let next_second = || async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let read = async {
+            began_tx.send(()).unwrap();
+            go_rx.await.unwrap();
+            Ok::<_, ()>(item.clone())
+        };
+        let ((found, picked), _) = with_outcomes(async {
+            tokio::join!(finder.find_read(read), async {
+                began.await.unwrap();
+                next_second().await;
+                let picked = finder.repick(&retagged, &wrong(), &heard()).await;
+                next_second().await;
+                go.send(()).unwrap();
+                picked
+            })
+        });
+        assert!(matches!(found, Ok(Some(_))));
+        assert_eq!(picked, Some(sung().fit_to(Some(SONG_MS))));
+        let song = Song::of(&retagged).unwrap();
+        assert!(
+            finder
+                .disk
+                .as_ref()
+                .unwrap()
+                .repicked(retagged.id, online.name(), &song),
+            "the repick was replaced"
+        );
+        the_stale_lookup_was_not_cached(&dir.path().join("c"), &online, &item, "read");
+    }
+
+    /// The lookup for `item`'s old tags, asked before a repick, left
+    /// nothing in the ordinary cache, and one asked after it still does.
+    fn the_stale_lookup_was_not_cached(
+        cache: &std::path::Path,
+        online: &Arc<Searching>,
+        item: &MediaItem,
+        at: &str,
+    ) {
+        let song = Song::of(item).unwrap();
+        let disk = cache::DiskCache::new(cache.to_path_buf());
+        assert_eq!(
+            disk.get(item.id, online.name(), &song),
+            None,
+            "{at}: the stale lookup was cached"
+        );
+        let (found, _) = with_outcomes(async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            LyricsFinder::with_online(online.clone())
+                .with_cache(cache.to_path_buf())
+                .find(item)
+                .await
+        });
+        assert!(found.is_some(), "{at}");
+        assert!(
+            disk.get(item.id, online.name(), &song).is_some(),
+            "{at}: a lookup asked after the repick was not cached"
+        );
+    }
+
+    /// A request that read the song's old tags, and repicks only after a
+    /// repick for its new tags landed, does not replace that one on disk:
+    /// each set of tags keeps its own repick.
+    #[test]
+    fn a_repick_for_tags_read_before_a_newer_repick_does_not_replace_it() {
+        use tokio::sync::oneshot;
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let mut retagged = item.clone();
+        retagged.probe.title = Some("Another Song".into());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let (began_tx, began) = oneshot::channel();
+        let (go, go_rx) = oneshot::channel::<()>();
+        let next_second = || async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let read = async {
+            began_tx.send(()).unwrap();
+            go_rx.await.unwrap();
+            Ok::<_, ()>(item.clone())
+        };
+        let ((found, newer), _) = with_outcomes(async {
+            tokio::join!(finder.find_read(read), async {
+                began.await.unwrap();
+                next_second().await;
+                let newer = finder.repick(&retagged, &wrong(), &heard()).await;
+                next_second().await;
+                go.send(()).unwrap();
+                newer
+            })
+        });
+        assert!(newer.is_some(), "the newer repick picked");
+        let (read_item, lyrics) = found.unwrap().unwrap();
+        let (older, _) = with_outcomes(finder.repick(&read_item, &lyrics, &heard()));
+        assert!(older.is_some(), "the older repick ran to its write");
+        drop(finder);
+
+        let reopened = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let disk = reopened.disk.as_ref().unwrap();
+        assert!(
+            disk.repicked(item.id, online.name(), &Song::of(&retagged).unwrap()),
+            "the newer repick was replaced"
+        );
+        assert!(disk.repicked(item.id, online.name(), &Song::of(&item).unwrap()));
+    }
+
+    #[test]
+    fn a_song_with_no_length_is_not_searched_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        for duration_ms in [None, Some(0)] {
+            let mut item = timed_item(dir.path());
+            item.probe.duration_ms = duration_ms;
+            let (picked, _) = with_outcomes(finder.repick(&item, &wrong(), &heard()));
+            assert_eq!(picked, None, "{duration_ms:?}");
+            let disk = finder.disk.as_ref().unwrap();
+            assert!(
+                !disk.repicked(item.id, online.name(), &Song::of(&item).unwrap()),
+                "{duration_ms:?}"
+            );
+        }
+        assert_eq!(searches(&online), 0);
+        assert!(finder.repicked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_local_lyric_is_not_searched_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone());
+        let local = synced(&["the lanterns swing in the orchard"], Origin::SidecarLrc);
+        let (picked, counted) = with_outcomes(finder.repick(&item, &local, &heard()));
+        assert_eq!(picked, None);
+        assert_eq!(searches(&online), 0);
+        assert_eq!(counted, [("skipped_local".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn a_failed_search_is_made_again_once_the_provider_cools_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        let online = searching(Err("503"));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        let ((failed, cooling, retried), counted) = with_outcomes(async {
+            let failed = finder.repick(&item, &wrong(), &heard()).await;
+            let cooling = finder.repick(&item, &wrong(), &heard()).await;
+            *finder.down_until.lock().unwrap() = Some(Instant::now());
+            let retried = finder.repick(&item, &wrong(), &heard()).await;
+            (failed, cooling, retried)
+        });
+        assert_eq!((failed, cooling, retried), (None, None, None));
+        assert_eq!(searches(&online), 2);
+        assert_eq!(counted, [("error".to_owned(), 2)]);
+    }
+
+    /// V1468: a lyric found not to be what was sung is never served synced,
+    /// and each time it is served so is counted. Disarm check: with
+    /// `unsync()` removed from `unsync_mismatch`, this fails.
+    /// V1468 on an ask for lines alone: the lines of a lyric found not
+    /// sung follow another song too, so are not served with times; another
+    /// lyric's keep theirs. Disarm check: with the lines-only branch of
+    /// `served` removed, this fails.
+    #[test]
+    fn a_lines_only_ask_for_a_lyric_not_sung_is_served_unsynced() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        std::fs::write(&item.path, b"audio").unwrap();
+        let aligner = align::tests::found_not_sung(dir.path(), &item, &wrong());
+        let finder = LyricsFinder::default().with_aligner(aligner);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (not_sung, pending) = rt.block_on(finder.served(&item, wrong(), false));
+        assert_eq!(pending, None);
+        assert!(not_sung.lines.iter().all(|l| l.start_ms.is_none()));
+        let (other, _) = rt.block_on(finder.served(&item, sung(), false));
+        assert_eq!(other, sung());
+    }
+
+    /// V1468: on a song's first play its words stream before the text
+    /// check: an online lyric with words on some lines (partly enhanced
+    /// LRC) keeps its own while pending, and gains the aligner's lines as
+    /// they are timed.
+    #[test]
+    fn a_lyrics_own_words_stream_before_its_text_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        std::fs::write(&item.path, b"audio").unwrap();
+        let mut lyrics = synced(
+            &[
+                "grey gulls wheel above the quay",
+                "the river keeps its time",
+            ],
+            Origin::Online,
+        );
+        lyrics.lines[0].words = vec![WordStamp {
+            at: 0,
+            start_ms: 200,
+        }];
+        let (aligner, key) = align::tests::in_flight(dir.path(), &item, &lyrics);
+        let finder = LyricsFinder::default().with_aligner(Arc::clone(&aligner));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let serve = || rt.block_on(finder.served(&item, lyrics.clone(), true));
+        let words = |l: &Lyrics| l.lines.iter().map(|l| l.words.len()).collect::<Vec<_>>();
+
+        let (pending, waiting) = serve();
+        assert!(waiting.is_some());
+        assert_eq!(words(&pending), [1, 0], "pending");
+        assert_eq!(pending.lines[0].words[0].start_ms, 200);
+
+        let send = |e: &str| align::tests::send(&aligner, &item, &key, e, 2);
+        send(r#"{"event":"offset","offset_ms":0,"aligner_version":6,"lines":2}"#);
+        send(r#"{"event":"line","index":1,"words":[{"at":0,"start_ms":4100}],"score":null}"#);
+        let (partial, waiting) = serve();
+        assert!(waiting.is_some());
+        assert_eq!(words(&partial), [1, 1], "partial");
+        assert_eq!(partial.lines[0].words[0].start_ms, 200);
+        assert_eq!(partial.lines[1].words[0].start_ms, 4100);
+    }
+
+    #[test]
+    fn a_lyric_not_sung_is_served_unsynced_and_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let mut lyrics = wrong();
+        lyrics.lines[0].words = vec![WordStamp {
+            at: 0,
+            start_ms: 10,
+        }];
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || unsync_mismatch(&mut lyrics, 1));
+        assert!(lyrics
+            .lines
+            .iter()
+            .all(|l| l.start_ms.is_none() && l.words.is_empty()));
+        let got: Vec<(Vec<(String, String)>, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_lyrics_unsynced_total")
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((
+                    k.key()
+                        .labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                    n,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [(
+                vec![
+                    ("reason".to_owned(), "lyrics_mismatch".to_owned()),
+                    ("origin".to_owned(), "online".to_owned()),
+                ],
+                1
+            )]
         );
     }
 }

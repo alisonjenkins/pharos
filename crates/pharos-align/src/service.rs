@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::anchor::{match_lines, Options};
 use crate::audio::DecodeError;
+use crate::check::{Check, TextCheck};
 use crate::crash::CrashGuard;
 use crate::ctc::Emission;
 use crate::line::LineSpans;
@@ -256,6 +257,10 @@ pub struct Answer {
     pub lines: Vec<LineWords>,
     pub offset_ms: i64,
     pub aligner_version: u32,
+    /// The lyric text against what was heard, sent only when a song with a
+    /// transcript fell back (B1479).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
 }
 
 /// Why a song failed as a whole.
@@ -324,6 +329,9 @@ pub struct Aligned {
     pub stages: StageTimes,
     /// Lines reported again because the recogniser moved them.
     pub corrected: usize,
+    /// The lyric's text against what the recogniser heard; `None` when no
+    /// transcript was made.
+    pub check: Option<TextCheck>,
 }
 
 struct Slot {
@@ -650,6 +658,7 @@ struct Today {
     reason: String,
     phases: Phases,
     with_words: usize,
+    check: Option<TextCheck>,
 }
 
 impl Today {
@@ -671,6 +680,9 @@ impl Today {
                 line.placement = Some(Method::Kept);
             }
         }
+        if let (Some(why), Some(check)) = (placement.fallback, &self.check) {
+            self.answer.check = Some(check.answer(why));
+        }
         Aligned {
             answer: self.answer,
             words_aligned: self.words_aligned,
@@ -681,6 +693,7 @@ impl Today {
             fallback_reason,
             stages,
             corrected,
+            check: self.check,
         }
     }
 }
@@ -773,17 +786,35 @@ fn improve(
 ) -> Aligned {
     let mut times = StageTimes::default();
     // `clipped` is the recogniser's count once it has finished, so a later
-    // stage's failure still says what the recogniser did.
+    // stage's failure still says what the recogniser did. Once it has
+    // finished, its text check stands without the later stages: a lyric not
+    // sung is a mismatch whichever of them failed.
     let fail = |today: Today, times: StageTimes, clipped: usize, e: StageError| {
+        let mismatch = today.check.as_ref().filter(|c| c.text_mismatch());
+        let (fallback, reason) = match mismatch {
+            Some(check) => (
+                Fallback::LyricsMismatch,
+                format!(
+                    "{}: text recall {:.3}, heard {} words; {}: {}",
+                    Fallback::LyricsMismatch.label(),
+                    check.text_recall.unwrap_or(0.0),
+                    check.heard_words,
+                    e.fallback.label(),
+                    e.reason
+                ),
+            ),
+            None => (e.fallback, e.reason),
+        };
         tracing::warn!(
             path = %rel_path,
-            fallback = e.fallback.label(),
-            reason = %e.reason,
+            fallback = fallback.label(),
+            stage_fallback = e.fallback.label(),
+            reason = %reason,
             "recogniser stages fell back to today's answer"
         );
-        let mut placement = Placement::kept(today.with_words, e.fallback);
+        let mut placement = Placement::kept(today.with_words, fallback);
         placement.first_words_clipped = clipped;
-        today.into_aligned(placement, e.reason, times, 0)
+        today.into_aligned(placement, reason, times, 0)
     };
     let stage = |fallback: Fallback| move |reason: String| StageError { fallback, reason };
     let deadline = budget.deadline();
@@ -817,6 +848,10 @@ fn improve(
     let heard = match heard {
         Ok(h) => h,
         Err(e) => return fail(today, times, 0, e),
+    };
+    let today = Today {
+        check: Some(TextCheck::new(&today.request, &heard.words)),
+        ..today
     };
 
     let t = Instant::now();
@@ -873,6 +908,17 @@ fn improve(
         Err(e) => return fail(today, times, heard.first_words_clipped, e),
     };
     refined.placement.first_words_clipped = heard.first_words_clipped;
+    let share = refined.placement.anchor_share.unwrap_or(0.0);
+    if let Some(check) = today.check.as_ref().filter(|c| c.mismatch(share)) {
+        refined.placement.fallback = Some(Fallback::LyricsMismatch);
+        let reason = format!(
+            "{}: anchor share {share:.3}, text recall {:.3}, heard {} words",
+            Fallback::LyricsMismatch.label(),
+            check.text_recall.unwrap_or(0.0),
+            check.heard_words
+        );
+        return today.into_aligned(refined.placement, reason, times, 0);
+    }
     if let Some(why) = refined.placement.fallback {
         let reason = format!(
             "{}: anchor share {:.3}",
@@ -1072,12 +1118,14 @@ fn run_song(
             lines: out,
             offset_ms: found.offset_ms,
             aligner_version: ALIGNER_VERSION,
+            check: None,
         },
         words_aligned,
         probes: found.probes,
         reason: found.reason,
         phases,
         with_words,
+        check: None,
     })
 }
 

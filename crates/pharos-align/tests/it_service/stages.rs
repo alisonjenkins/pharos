@@ -417,6 +417,134 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
     assert_eq!(events.len(), 3);
 }
 
+/// V1468: every song with a transcript says how much of its lyric text was
+/// heard, on the placed path, the fallback path and a failed later stage;
+/// a song with no transcript says nothing.
+#[test]
+fn every_song_with_a_transcript_carries_its_text_check() {
+    let (sung, _) = song();
+    let (placed, _) = with(Step::Works, Step::Works, Some(sung));
+    let check = placed.check.expect("a placed song carries its check");
+    assert_eq!(check.text_recall, Some(1.0));
+    assert_eq!(check.heard_words, 6);
+
+    let (no_emission, _) = with(Step::Works, Step::Works, None);
+    assert_eq!(
+        no_emission.placement.fallback,
+        Some(Fallback::EmissionFailed)
+    );
+    assert_eq!(no_emission.check.map(|c| c.heard_words), Some(6));
+
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: transcript(heard("the lanterns swing in the orchard", 1.0)),
+        slow: Duration::ZERO,
+    };
+    let (got, _) =
+        run(&Engine::new(loader(Some(song().0)), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::LowAnchorShare));
+    let check = got.check.expect("a fallen-back song carries its check");
+    assert_eq!(check.text_recall, Some(0.0));
+    assert_eq!(check.heard_words, 6);
+
+    let (failed, _) = with(Step::Works, Step::Fails, None);
+    assert_eq!(failed.check, None);
+    let (before, _) = today();
+    assert_eq!(before.check, None);
+}
+
+/// B1479/V1468: a song heard at length to other words falls back as a
+/// lyrics mismatch, keeps today's answer and says what was heard; a placed
+/// song's answer carries no check.
+#[test]
+fn a_song_sung_to_other_words_is_a_lyrics_mismatch() {
+    let other: Vec<Word> = (0..120)
+        .map(|k| Word {
+            text: format!(" lantern{}", k % 40),
+            start_s: 0.08 * k as f64,
+            end_s: 0.08 * k as f64 + 0.05,
+            prob: 0.9,
+            silent_lead: false,
+        })
+        .collect();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: transcript(other),
+        slow: Duration::ZERO,
+    };
+    let (got, events) =
+        run(&Engine::new(loader(Some(song().0)), silent(), None).with_stages(Box::new(stages)));
+    let (before, _) = today();
+    assert_eq!(got.placement.fallback, Some(Fallback::LyricsMismatch));
+    assert!(
+        got.fallback_reason
+            .starts_with("lyrics_mismatch: anchor share 0.000, text recall 0.000, heard 120 words"),
+        "{}",
+        got.fallback_reason
+    );
+    assert_eq!(words(&got), words(&before));
+    assert!(kept(&got));
+    assert_eq!(events.len(), 3);
+    let answer = serde_json::to_value(&got.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "lyrics_mismatch");
+    assert_eq!(answer["check"]["text_recall"], 0.0);
+    assert_eq!(answer["check"]["heard_words"], 120);
+    assert!(answer["check"]["heard"]
+        .as_str()
+        .unwrap()
+        .starts_with(" lantern0 lantern1"));
+
+    let (placed, _) = with(Step::Works, Step::Works, Some(song().0));
+    assert_eq!(placed.placement.fallback, None);
+    assert!(serde_json::to_value(&placed.answer)
+        .unwrap()
+        .get("check")
+        .is_none());
+
+    // A failed emission after the recogniser heard the song falls back as
+    // EmissionFailed, still with the check for the server.
+    let (barely, _) = with(Step::Works, Step::Works, None);
+    assert_eq!(barely.placement.fallback, Some(Fallback::EmissionFailed));
+    let answer = serde_json::to_value(&barely.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "emission_failed");
+}
+
+/// B1479/V1468: a song heard at length to other words is a lyrics mismatch
+/// even when the letter model then fails, so the server still drops the
+/// lyric's line times.
+#[test]
+fn a_song_sung_to_other_words_is_a_mismatch_though_its_emission_failed() {
+    let other: Vec<Word> = (0..120)
+        .map(|k| Word {
+            text: format!(" lantern{}", k % 40),
+            start_s: 0.08 * k as f64,
+            end_s: 0.08 * k as f64 + 0.05,
+            prob: 0.9,
+            silent_lead: false,
+        })
+        .collect();
+    let stages = Scripted {
+        vocals: Step::Works,
+        recognise: Step::Works,
+        heard: transcript(other),
+        slow: Duration::ZERO,
+    };
+    let (got, _) = run(&Engine::new(loader(None), silent(), None).with_stages(Box::new(stages)));
+    assert_eq!(got.placement.fallback, Some(Fallback::LyricsMismatch));
+    assert!(
+        got.fallback_reason
+            .starts_with("lyrics_mismatch: text recall 0.000, heard 120 words; emission_failed: "),
+        "{}",
+        got.fallback_reason
+    );
+    assert!(kept(&got));
+    let answer = serde_json::to_value(&got.answer).unwrap();
+    assert_eq!(answer["check"]["fallback"], "lyrics_mismatch");
+    assert_eq!(answer["check"]["heard_words"], 120);
+}
+
 #[test]
 fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let (sung, _) = song();

@@ -330,7 +330,12 @@ fn run_song(
             span.record("aligner.device", device);
             span.record("aligner.device_reason", device_reason.as_str());
             a.placement.record();
+            if let Some(c) = &a.check {
+                c.record();
+            }
             let p = &a.placement;
+            let text_recall = a.check.as_ref().and_then(|c| c.text_recall);
+            let heard_words = a.check.as_ref().map(|c| c.heard_words);
             tracing::info!(
                 path = %rel_path,
                 lines = n_lines,
@@ -341,6 +346,8 @@ fn run_song(
                 anchor_share = p.anchor_share,
                 anchors_dropped = p.dropped_anchors,
                 lines_held = p.held_lines,
+                text_recall,
+                heard_words,
                 first_words_clipped = p.first_words_clipped,
                 anchors_from_second_word = p.anchors_from_second_word,
                 fallback = p.fallback_label(),

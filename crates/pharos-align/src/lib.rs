@@ -8,6 +8,7 @@
 
 pub mod anchor;
 pub mod audio;
+pub mod check;
 pub mod config;
 pub mod crash;
 pub mod ctc;
