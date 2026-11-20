@@ -482,6 +482,7 @@ impl LyricsFinder {
             );
             return None;
         }
+        let started_ms = cache::now_ms();
         let online = self.online.as_ref()?;
         let song = Song::of(item)?;
         let Some(reserved) =
@@ -553,8 +554,15 @@ impl LyricsFinder {
         // this request is still waiting for it, and the search is done.
         reserved.keep();
         let Some(pick) = pick else {
-            self.write_repick(item.id, online.name(), song, current.clone(), None)
-                .await;
+            self.write_repick(
+                item.id,
+                online.name(),
+                song,
+                current.clone(),
+                None,
+                started_ms,
+            )
+            .await;
             repick_counted(repick::Outcome::None);
             tracing::warn!(
                 media.id = item.id,
@@ -579,6 +587,7 @@ impl LyricsFinder {
             song,
             found.clone(),
             Some(pick.candidate.id),
+            started_ms,
         )
         .await;
         repick_counted(repick::Outcome::Picked);
@@ -612,12 +621,13 @@ impl LyricsFinder {
         song: Song,
         lyrics: Lyrics,
         picked: Option<u64>,
+        started_ms: u64,
     ) {
         let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
             return;
         };
         let written = tokio::task::spawn_blocking(move || {
-            disk.put_repicked(id, provider, &song, &lyrics, picked);
+            disk.put_repicked(id, provider, &song, &lyrics, picked, started_ms);
         })
         .await;
         if let Err(e) = written {
