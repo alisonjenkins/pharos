@@ -2377,7 +2377,7 @@ pub(crate) mod tests {
             let store = disk_store(&videos, fetcher.clone());
             store.settled().await;
             assert!(fetcher.refused().len() > refused, "recovery did not run");
-            assert_eq!(store.used_bytes("A"), 0);
+            assert_eq!(store.video_bytes("A"), 0);
             // A's session and `me`, before the store is published.
             let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
                 panic!("A's token did not open A's session");
@@ -2396,7 +2396,7 @@ pub(crate) mod tests {
                 "the download did not resume with A's token: {sent:?} refused={:?}",
                 fetcher.refused()
             );
-            assert!(store.used_bytes("A") > 0, "no bytes landed");
+            assert!(store.video_bytes("A") > 0, "no bytes landed");
             assert!(
                 matches!(store.videos("A")[0].state, KeptState::Ready),
                 "{:?}",
@@ -2478,7 +2478,7 @@ pub(crate) mod tests {
                 "a request went out after the session end"
             );
             assert_eq!(
-                store.used_bytes("A"),
+                store.video_bytes("A"),
                 0,
                 "bytes landed after the session end"
             );

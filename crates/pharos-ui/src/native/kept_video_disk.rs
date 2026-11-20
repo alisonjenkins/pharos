@@ -5706,11 +5706,23 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn usage(&self, user: &str) -> super::kept_video::Usage {
-        // One read of the subtotal serves both figures.
-        let video = self.video_bytes(user);
+        // One hold serves both figures. The shared total is what admission
+        // counts against the cap: every user's downloads and reservations,
+        // the folders a removal left, and the other kinds beside them. The
+        // video subtotal is `user`'s own.
+        let (video, kept) = {
+            let st = lock(&self.inner.state);
+            let video = st
+                .list
+                .iter()
+                .filter(|v| v.user == user)
+                .map(KeptVideo::bytes)
+                .sum::<u64>();
+            (video, st.kept())
+        };
         super::kept_video::Usage {
             video,
-            used: video.saturating_add(self.inner.env.budget.other_used_bytes()),
+            used: kept.saturating_add(self.inner.env.budget.other_used_bytes()),
         }
     }
 
@@ -8344,6 +8356,29 @@ pub(crate) mod tests {
                 && refused[0].contains("outstanding="),
             "{refused:?}"
         );
+    }
+
+    /// CR 4644634603: the shared total a user sees is the device's, as
+    /// admission counts it (another user's downloads included); the video
+    /// subtotal is the user's own.
+    #[tokio::test]
+    async fn the_shared_usage_counts_every_users_downloads() {
+        let rig = Rig::new("usage-device-wide");
+        let store = rig.open();
+        let mut other = request("2");
+        other.user = "u2".into();
+        store.start(other).unwrap();
+        store.settled().await;
+        let theirs = store.videos("u2")[0].bytes();
+        assert!(theirs > 0);
+        let usage = store.usage("u1");
+        assert_eq!(
+            (usage.video, usage.used),
+            (0, store.kept_bytes()),
+            "the shared total left out another user's downloads"
+        );
+        assert!(usage.used >= theirs);
+        assert_eq!(store.usage("u2").video, theirs);
     }
 
     /// The host counts these bytes against the cap it shares with music:

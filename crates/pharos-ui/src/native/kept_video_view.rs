@@ -179,8 +179,10 @@ pub fn VideoList(
     #[props(default)]
     leftover: usize,
     #[props(default)] on_discard: EventHandler<()>,
-    /// The videos' own bytes, when `used` also counts what they share the
-    /// cap with (the phone's music). `None`: `used` is the videos' alone.
+    /// The signed-in user's videos' own bytes, when `used` (the device's
+    /// shared total) also counts what they share the cap with: the phone's
+    /// music, other users' downloads, leftover folders. `None`: `used` is
+    /// the videos' alone.
     #[props(default)]
     videos_used: Option<u64>,
     /// A discard is running: its button is disabled until it ends.
@@ -188,12 +190,12 @@ pub fn VideoList(
     discarding: bool,
 ) -> Element {
     rsx! {
-        // Each figure says what it counts: the videos' own bytes, and, when
-        // the cap is shared, the total with the music beside it.
+        // Each figure says what it counts: the user's videos' own bytes, and,
+        // when the cap is shared, the device's total with everything else.
         match videos_used.filter(|v| *v != used) {
             Some(videos) => rsx! {
                 p { class: "pharos-muted", id: "pharos-video-total",
-                    "{format_bytes(videos)} used by downloaded videos. {format_bytes(used)} of {format_bytes(cap)} used with music."
+                    "{format_bytes(videos)} used by your downloaded videos. {format_bytes(used)} of {format_bytes(cap)} used on this device, with music and other downloads."
                 }
             },
             None => rsx! {
@@ -1778,8 +1780,14 @@ mod tests {
             !html.contains("1 GiB of 4 GiB used by downloaded videos"),
             "{html}"
         );
-        assert!(html.contains("0 B used by downloaded videos"), "{html}");
-        assert!(html.contains("1 GiB of 4 GiB used with music"), "{html}");
+        assert!(
+            html.contains("0 B used by your downloaded videos"),
+            "{html}"
+        );
+        assert!(
+            html.contains("1 GiB of 4 GiB used on this device, with music and other downloads"),
+            "{html}"
+        );
         // With nothing else in the cap the one line stays as it was.
         let mut dom = VirtualDom::new(list);
         dom.rebuild_in_place();
