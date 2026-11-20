@@ -372,7 +372,32 @@ pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended
                     target: None,
                 };
             };
-            return mark(path, user, &fingerprint(seen), removal);
+            // A marker for another token (or one that cannot be read, which
+            // refuses every token) is what keeps that token from resuming:
+            // it stays. The ended token's revocation is then unconfirmed.
+            let target = fingerprint(seen);
+            match marker(path) {
+                Marker::Present(r) if r.token != target => {
+                    log::warn!(
+                        "token revocation marker verdict=kept reason=marks_another_token error={e}"
+                    );
+                    return Ended::Unsafe {
+                        removal,
+                        marker: "a marker for another token is in place".to_owned(),
+                        target: Some(target),
+                    };
+                }
+                Marker::Unreadable(why) => {
+                    log::warn!("token revocation marker verdict=kept reason=marker_unreadable marker_error={why} error={e}");
+                    return Ended::Unsafe {
+                        removal,
+                        marker: format!("an unreadable marker is in place ({why})"),
+                        target: Some(target),
+                    };
+                }
+                Marker::Present(_) | Marker::Absent => {}
+            }
+            return mark(path, user, &target, removal);
         }
     };
     let removal = match remove(path) {
@@ -1005,6 +1030,31 @@ pub(crate) mod tests {
         assert_eq!(r.user.as_deref(), Some("A"));
         assert_eq!(load(&p).unwrap(), None, "the ended token was read");
         assert!(matches!(unnamed, Ended::Unsafe { .. }), "{unnamed:?}");
+    }
+
+    /// CR 4637783569: a refusal for A that arrives while the file cannot
+    /// be read does not replace B's marker. B stays refused, and the end
+    /// reports A's revocation unconfirmed.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_unreadable_token_keeps_another_tokens_marker() {
+        let d = dir("token-unreadable-other-marker");
+        let p = d.join("device-token");
+        store(&p, "tokB").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        let b = end_session(&p, Some("tokB"), Some("B"));
+        faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(b, Ended::Marked(_)), "{b:?}");
+        faults::TOKEN_READ.with(|f| f.set(true));
+        let a = end_session(&p, Some("tokA"), Some("A"));
+        faults::TOKEN_READ.with(|f| f.set(false));
+        assert!(
+            matches!(&a, Ended::Unsafe { target: Some(t), .. } if *t == fingerprint("tokA")),
+            "{a:?}"
+        );
+        assert_eq!(revoked(&p).map(|r| r.user), Some(Some("B".to_owned())));
+        assert_eq!(load(&p).unwrap(), None, "B was read after its marker went");
     }
 
     /// (c) A removal that is not durable is marked too; only when the
