@@ -1197,6 +1197,18 @@ impl Worker {
                 why: super::fault::WHY.into(),
             });
         }
+        // An open link whose token has been fenced since is not reused: the
+        // fence holds for every call, not just for the next token read.
+        let fenced_link = self.link.as_ref().is_some_and(|l| {
+            let fp = token::fingerprint(&l.token);
+            with_fence(|f| f.as_deref() == Some(fp.as_str()))
+        });
+        if fenced_link {
+            log::warn!("token read verdict=refused reason=service_fence at=open_link");
+            self.link = None;
+            self.shared.set_auth(AuthState::SignedOut);
+            return Err(ContentError::NeedsSignIn);
+        }
         if let Some(l) = self.link.as_mut() {
             if l.cat.is_closed() {
                 log::info!("connection closed; reconnecting");
@@ -2347,6 +2359,51 @@ mod tests {
         set_fenced(Some(token::fingerprint("tokA")));
         assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
         assert_eq!(fenced(), None);
+    }
+
+    /// CR 4637783594: a link opened with a token fenced since is not
+    /// reused: the next call drops it and asks for a sign-in, sending
+    /// nothing with the fenced token.
+    #[test]
+    fn a_fenced_token_is_not_used_through_an_open_link() {
+        struct Session;
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                let mut t = results.get().init_result().init_token();
+                t.set_token("media");
+                t.set_expires_at_ms(u64::MAX);
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("fence-open-link");
+        let (mut w, _shared, _token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        fence_token(&token::fingerprint("tokA"));
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        set_fenced(None);
+        assert!(
+            matches!(&out, Err(ContentError::NeedsSignIn)),
+            "{:?}",
+            out.err()
+        );
+        assert!(w.link.is_none(), "the fenced link was kept");
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
