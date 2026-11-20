@@ -349,6 +349,15 @@ pub trait VideoStore: Send + Sync {
     fn park_runs(&self, _owner: Option<&str>) {}
     /// `user` signed in: their parked downloads run again.
     fn resume_user(&self, _user: &str) {}
+    /// Stops `user`'s download of `item` where it is, keeping its files:
+    /// the record turns Failed with [`Halt::Paused`], and a later start
+    /// carries on (ADR 0148). Err names why it could not; a store that
+    /// cannot pause keeps the default and the page offers no Pause.
+    ///
+    /// [`Halt::Paused`]: super::download_queue::Halt::Paused
+    fn pause(&self, _user: &str, item: &str) -> Result<(), String> {
+        Err(format!("this device cannot pause the download of {item}"))
+    }
 }
 
 /// A file a [`VideoStore`] holds, ready to answer a request with.
@@ -1073,6 +1082,36 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         stale_on_disk: 0,
         halt: None,
     }
+}
+
+/// The play session a start under `request` renews when `old` is a stopped
+/// download of the same stream (ADR 0148): same version and quality, files
+/// on the device, and a master URL that differs from the stored one only in
+/// its `PlaySessionId`. The stored keys are then kept and fetched under the
+/// returned session; `None` starts afresh as before.
+pub fn renewal(old: &KeptVideo, request: &KeepVideoRequest) -> Option<String> {
+    use pharos_hls::offline::{play_session, rebind};
+    if old.ready() || old.files.is_empty() {
+        return None;
+    }
+    if old.version != request.version || old.quality_bps != request.quality_bps {
+        return None;
+    }
+    let live = play_session(&request.master_url)?;
+    play_session(&old.master_url)?;
+    (rebind(&old.master_url, live) == request.master_url).then(|| live.to_owned())
+}
+
+/// The record a renewing start puts in place of `old`: the request's
+/// settings, the stored keys and the room already admitted.
+pub fn renewed_record(old: &KeptVideo, request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
+    let mut record = new_record(request, saved_at);
+    record.master_url = old.master_url.clone();
+    record.files = old.files.clone();
+    record.estimated_bytes = old.estimated_bytes;
+    record.estimate_from_adoption = old.estimate_from_adoption;
+    record.position_ms = old.position_ms;
+    record
 }
 
 #[cfg(test)]
@@ -1984,5 +2023,47 @@ mod tests {
         }
         let err = Fixed.set_cap_bytes(8 * GIB).unwrap_err();
         assert!(err.contains(&(8 * GIB).to_string()), "{err}");
+    }
+
+    fn renewing(old_url: &str, new_url: &str) -> Option<String> {
+        let request = KeepVideoRequest {
+            item: "8".into(),
+            version: String::new(),
+            user: "u".into(),
+            title: "Invented Film".into(),
+            kind: "movie".into(),
+            runtime_ms: 1,
+            master_url: new_url.into(),
+            audio: None,
+            subtitles: Vec::new(),
+            quality_bps: 2_000_000,
+        };
+        let mut old = new_record(&request, String::new());
+        old.master_url = old_url.into();
+        old.files = vec![old_url.into()];
+        old.state = KeptState::Failed { reason: "x".into() };
+        renewal(&old, &request)
+    }
+
+    /// Disarm check: a `renewal` that skipped the rebind comparison would
+    /// keep the files of another bitrate's stream.
+    #[test]
+    fn a_new_session_of_the_same_stream_renews_and_any_other_change_starts_afresh() {
+        let old = "/videos/8/master.m3u8?PlaySessionId=a&VideoBitrate=2000000";
+        assert_eq!(
+            renewing(
+                old,
+                "/videos/8/master.m3u8?PlaySessionId=b&VideoBitrate=2000000"
+            ),
+            Some("b".into())
+        );
+        assert_eq!(
+            renewing(
+                old,
+                "/videos/8/master.m3u8?PlaySessionId=b&VideoBitrate=1000000"
+            ),
+            None
+        );
+        assert_eq!(renewing(old, "/videos/8/master.m3u8"), None);
     }
 }
