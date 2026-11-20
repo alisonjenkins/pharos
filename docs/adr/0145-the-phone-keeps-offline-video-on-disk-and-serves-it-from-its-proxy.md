@@ -46,6 +46,14 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   sign-out or session end could not remove is marked revoked on disk, and
   one that could be neither removed nor marked is refused for the rest of
   the process, in the media service's library too.
+- The token file holds the token alone, exactly as the build before this
+  ADR writes and reads it, so a rollback to that build reads a usable
+  token. The user the token was issued to lives in a pairing file beside
+  it (`<token path>.user`): the user id and the token's fingerprint,
+  written under the same lock after the token. A pairing counts only
+  while its fingerprint matches the token on file, so a token whose
+  pairing is missing or stale is unpaired and fails closed. A token file
+  in this build's earlier two-line layout is split on read.
 - Revocation markers are keyed by token fingerprint, one file per token,
   and a store never removes or rewrites a marker naming another token; it
   removes the new token's own marker durably (removed, then its folder
