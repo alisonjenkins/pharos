@@ -312,6 +312,27 @@ pub enum NoRoom {
     PartNotTruncated,
 }
 
+/// What a retained `.part` gives back to an admission.
+#[derive(Debug, Clone, Copy)]
+enum Reclaim {
+    /// No part is replaced.
+    Nothing,
+    /// A preflight: the part's bytes count as room; nothing is emptied.
+    Counted(u64),
+    /// A whole body replaces the part: its bytes count as room, and it is
+    /// emptied once the room is found, before any track is evicted for it.
+    Emptied(u64),
+}
+
+impl Reclaim {
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Nothing => 0,
+            Self::Counted(b) | Self::Emptied(b) => b,
+        }
+    }
+}
+
 pub struct Cache {
     dir: PathBuf,
     cap: AtomicU64,
@@ -1057,15 +1078,26 @@ impl Cache {
     fn victim(s: &State, keep: Option<&str>) -> Option<(String, u64)> {
         s.entries
             .iter()
-            .filter(|(id, e)| {
-                e.complete
-                    && !e.pinned
-                    && !s.protected.contains(*id)
-                    && s.current.as_deref() != Some(id.as_str())
-                    && keep != Some(id.as_str())
-            })
+            .filter(|(id, e)| Self::may_evict(s, id, e, keep))
             .min_by(|a, b| (a.1.last_played_ms, a.0).cmp(&(b.1.last_played_ms, b.0)))
             .map(|(id, e)| (id.clone(), e.size))
+    }
+
+    /// Whether the finished track `id` may go (see [`Cache::victim`]).
+    fn may_evict(s: &State, id: &str, e: &Entry, keep: Option<&str>) -> bool {
+        e.complete
+            && !e.pinned
+            && !s.protected.contains(id)
+            && s.current.as_deref() != Some(id)
+            && keep != Some(id)
+    }
+
+    /// The bytes of every finished track [`Cache::victim`] could name.
+    fn evictable_track_bytes(s: &State, keep: Option<&str>) -> u64 {
+        s.entries
+            .iter()
+            .filter(|(id, e)| Self::may_evict(s, id, e, keep))
+            .fold(0u64, |n, (_, e)| n.saturating_add(e.size))
     }
 
     /// The retained `.part` files that may go, oldest first by when each
@@ -1201,7 +1233,7 @@ impl Cache {
         let _admission = admission_guard();
         // An unreadable part reclaims nothing: never room on a guess.
         let reclaim = self.part_len(downloading).unwrap_or(0);
-        let verdict = self.check_free(downloading, 0, true, reclaim);
+        let verdict = self.check_free(downloading, 0, true, Reclaim::Counted(reclaim));
         log::info!(
             "cache admission id={downloading} need=0 reclaim={reclaim} verdict={} reason=preflight_part_retained",
             if verdict.is_ok() { "approved" } else { "refused" }
@@ -1231,34 +1263,24 @@ impl Cache {
         let _admission = admission_guard();
         // An unreadable part reclaims nothing: never room on a guess.
         let reclaim = if replacing {
-            self.part_len(downloading).unwrap_or(0)
+            Reclaim::Emptied(self.part_len(downloading).unwrap_or(0))
         } else {
-            0
+            Reclaim::Nothing
         };
-        let mut verdict = self.check_free(downloading, need, evict, reclaim);
+        // An approved replacement has emptied the old part (see
+        // `check_free`): the new body's reservation is published in the same
+        // step under the admission lock, so no other admission sees both.
+        // Owed is counted from the empty file.
+        let verdict = self.check_free(downloading, need, evict, reclaim);
         if replacing {
             log::info!(
-                "cache admission id={downloading} need={need} reclaim={reclaim} verdict={} reason=whole_body_replaces_part",
+                "cache admission id={downloading} need={need} reclaim={} verdict={} reason=whole_body_replaces_part",
+                reclaim.bytes(),
                 if verdict.is_ok() { "approved" } else { "refused" }
             );
         }
         match verdict {
-            // The old part goes and the new body's reservation is published
-            // in this one step under the admission lock: no other admission
-            // sees both. Owed is counted from the empty file. A part that
-            // will not empty refuses the replacement: its room was counted
-            // as reclaimed, and approving would count the old part and the
-            // whole new body. The part and its validator stay for a retry.
-            Ok(_) if replacing => match self.truncate_part(downloading) {
-                Ok(()) => self.reserve_from(downloading, need, Some(0)),
-                Err(e) => {
-                    log::warn!(
-                        "cache admission id={downloading} verdict=refused reason=truncate_failed error={e}"
-                    );
-                    self.unreserve(downloading);
-                    verdict = Err(NoRoom::PartNotTruncated);
-                }
-            },
+            Ok(_) if replacing => self.reserve_from(downloading, need, Some(0)),
             Ok(_) => self.reserve(downloading, need),
             Err(_) => self.unreserve(downloading),
         }
@@ -1268,8 +1290,13 @@ impl Cache {
     /// Empties `id`'s `.part`, under the cache's lock as
     /// [`Cache::open_part`]'s truncation is.
     fn truncate_part(&self, id: &str) -> std::io::Result<()> {
-        let p = self.part_path(id);
         let _s = self.lock();
+        self.truncate_part_locked(id)
+    }
+
+    /// [`Cache::truncate_part`] with the cache's lock already held.
+    fn truncate_part_locked(&self, id: &str) -> std::io::Result<()> {
+        let p = self.part_path(id);
         #[cfg(test)]
         if TRUNCATE_FAULT.with(std::cell::Cell::get)
             || TRUNCATE_REFUSED
@@ -1541,12 +1568,19 @@ impl Cache {
         (lens, whole)
     }
 
+    /// A replacement's old part ([`Reclaim::Emptied`]) is emptied only once
+    /// the room is found, and before any track is evicted for it: a part
+    /// that will not empty refuses the replacement with nothing evicted
+    /// (its room was counted as reclaimed, and approving would count the
+    /// old part and the whole new body), and a replacement eviction could
+    /// not make room for evicts nothing and keeps the part. Either way the
+    /// part and its validator stay for a retry.
     fn check_free(
         &self,
         downloading: &str,
         need: u64,
         evict: bool,
-        reclaim: u64,
+        reclaim: Reclaim,
     ) -> Result<u64, NoRoom> {
         // Outstanding first, then the probe: a write that lands between the
         // two lowers free and the stale (higher) outstanding keeps the figure
@@ -1566,9 +1600,10 @@ impl Cache {
         let outstanding = outside.outstanding;
         let raw = match (self.free)(&self.dir) {
             // What a truncation is about to free is room for the write.
-            Ok(f) => f.saturating_add(reclaim),
+            Ok(f) => f.saturating_add(reclaim.bytes()),
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
+                self.empty_replaced(downloading, reclaim, None)?;
                 return Ok(u64::MAX);
             }
         };
@@ -1580,6 +1615,7 @@ impl Cache {
             .saturating_add(need)
             .saturating_add(outstanding);
         if raw >= want {
+            self.empty_replaced(downloading, reclaim, None)?;
             return Ok(raw.saturating_sub(outstanding));
         }
         if !evict {
@@ -1588,6 +1624,23 @@ impl Cache {
         let mut s = self.lock();
         let mut now = raw;
         let mut evicted = false;
+        let mut parts = None;
+        if let Reclaim::Emptied(_) = reclaim {
+            // Nothing is evicted for a replacement that cannot proceed:
+            // what eviction could give is added up first, and the part is
+            // emptied before the first track goes.
+            let listed = self.part_victims(&s, Some(downloading));
+            let evictable = Self::evictable_track_bytes(&s, Some(downloading))
+                .saturating_add(listed.iter().fold(0u64, |n, (_, b)| n.saturating_add(*b)));
+            if raw.saturating_add(evictable) < want {
+                log::info!(
+                    "cache admission id={downloading} verdict=refused reason=eviction_cannot_fit free_bytes={raw} evictable={evictable} want={want} part=kept evicted=0"
+                );
+                return Err(NoRoom::LowDisk(raw.saturating_sub(outstanding)));
+            }
+            self.empty_replaced(downloading, reclaim, Some(&*s))?;
+            parts = Some(listed);
+        }
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
@@ -1603,7 +1656,9 @@ impl Cache {
         // that will not go is passed over for the next, its bytes not
         // credited.
         if now < want {
-            let mut queue = self.part_victims(&s, Some(downloading)).into_iter();
+            let mut queue = parts
+                .unwrap_or_else(|| self.part_victims(&s, Some(downloading)))
+                .into_iter();
             while now < want {
                 let Some((id, bytes)) = queue.find(|(id, _)| !self.part_taken(id)) else {
                     break;
@@ -1621,8 +1676,38 @@ impl Cache {
         if now >= want {
             Ok(room)
         } else {
+            if let Reclaim::Emptied(_) = reclaim {
+                // Counted as enough, but a victim would not go.
+                log::warn!(
+                    "cache admission id={downloading} verdict=refused reason=eviction_short free_bytes={now} want={want} part=emptied"
+                );
+            }
             Err(NoRoom::LowDisk(room))
         }
+    }
+
+    /// Empties a replacement's old part (see [`Cache::check_free`]); other
+    /// admissions touch nothing. `locked` is the cache's lock when the
+    /// caller holds it.
+    fn empty_replaced(
+        &self,
+        downloading: &str,
+        reclaim: Reclaim,
+        locked: Option<&State>,
+    ) -> Result<(), NoRoom> {
+        let Reclaim::Emptied(_) = reclaim else {
+            return Ok(());
+        };
+        let emptied = match locked {
+            Some(_) => self.truncate_part_locked(downloading),
+            None => self.truncate_part(downloading),
+        };
+        emptied.map_err(|e| {
+            log::warn!(
+                "cache admission id={downloading} verdict=refused reason=truncate_failed error={e} evicted=0"
+            );
+            NoRoom::PartNotTruncated
+        })
     }
 
     fn persist_locked(&self, s: &State) {
@@ -1954,6 +2039,69 @@ pub(crate) mod tests {
             (c.in_progress_bytes(), c.reserved_bytes()),
             (Some(0), 1000),
             "the old part and the new body were both counted"
+        );
+    }
+
+    /// CR 4644634482: a replacement that needs a track evicted, but whose
+    /// old part will not truncate, evicts nothing: it is refused with the
+    /// track and the part as they were.
+    #[test]
+    fn a_replacement_whose_part_will_not_truncate_evicts_nothing() {
+        let d = tmp("replace-truncate-evicts");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free and 600 reclaimed: 1300 fits only with track/a gone.
+        TRUNCATE_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        TRUNCATE_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes()),
+            (400, Some(600)),
+            "a refused replacement evicted a track or touched its part"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "cache admission id=track/x verdict=refused reason=truncate_failed error=truncate refused for the test evicted=0"
+            )),
+            "the refusal did not say nothing was evicted"
+        );
+        // The control: with the part emptied, the same replacement evicts
+        // the track and proceeds.
+        assert!(c.ensure_free_replacing_part("track/x", 1300, true).is_ok());
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
+            (0, Some(0), 1300)
+        );
+    }
+
+    /// CR 4644634482: a replacement that eviction could not make room for
+    /// evicts nothing and keeps its old part.
+    #[test]
+    fn a_replacement_eviction_cannot_fit_keeps_the_tracks_and_part() {
+        let d = tmp("replace-evict-short");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free, 600 reclaimed and 400 evictable: 5000 cannot fit.
+        let verdict = c.ensure_free_replacing_part("track/x", 5000, true);
+        assert!(matches!(verdict, Err(NoRoom::LowDisk(_))), "{verdict:?}");
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
+            (400, Some(600), 0),
+            "a replacement that could not fit evicted a track or emptied its part"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache admission id=track/x verdict=refused reason=eviction_cannot_fit")
+                && l.contains("evictable=400")
+                && l.contains("part=kept evicted=0")),
+            "the refusal did not name what eviction could give"
         );
     }
 
