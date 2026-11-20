@@ -21,9 +21,10 @@ use super::eta::Eta;
 use super::shadow::{Shadow, Source};
 use super::{Lyrics, WordStamp};
 
-/// The aligner generation: bumped when the aligner's answers change for the
-/// same song and lines, so word times cached by an older generation are
-/// asked for again.
+/// The aligner generation (ADR-0147): bumped when the aligner's answers
+/// change for the same song and lines, so word times cached by an older
+/// generation are asked for again. Until the new answer is stored, the older
+/// one is still served, and the new lines replace it as they stream (V1470).
 /// 2: star tokens stop words smearing across instrumental breaks.
 /// 3: lyrics timed for another cut are shifted onto the audio first (B936).
 /// 4: answers an older aligner gave under version 3, cached with no offset,
@@ -32,10 +33,16 @@ use super::{Lyrics, WordStamp};
 ///    tapped late no longer pins its first word late.
 const ALIGN_GENERATION: u32 = 5;
 
+/// The oldest generation whose words are still served while a newer one is
+/// timed: generation 3 cached answers with no offset (B1007), so its words
+/// can sit on another cut of the song.
+const OLDEST_SERVED_GENERATION: u32 = 4;
+
 /// The oldest aligner whose answers are kept. Its `aligner_version` goes up
-/// with each change to how it times words, so an answer from an aligner
-/// deployed after the server fails the job (retried after `RETRY_AFTER`)
-/// instead of being cached under the new `ALIGN_GENERATION` key.
+/// with each change to how it times words, and this goes up with
+/// [`ALIGN_GENERATION`] when the new generation needs that aligner, so an
+/// answer from an older aligner fails the job (retried after `RETRY_AFTER`)
+/// instead of being cached as the new generation (V1471).
 /// 2: a line's window opens 750 ms before its stamp (B1165).
 const MIN_ALIGNER_VERSION: u32 = 2;
 
@@ -66,21 +73,26 @@ pub fn alignable(lyrics: &Lyrics) -> bool {
         && lyrics.lines.len() <= MAX_LINES
 }
 
-/// One alignment job sent to the background task.
-#[derive(Debug)]
 /// The song's path under the media root, its lines as a job asks for
 /// them, and the cache key both are kept under.
 struct Keyed {
     rel_path: String,
     job_lines: Vec<(u64, u64, String)>,
     key: String,
+    /// The keys older generations kept the same lines under, newest first.
+    older: Vec<(u32, String)>,
 }
 
+/// One alignment job sent to the background task.
+#[derive(Debug)]
 struct Job {
     id: u64,
     path: String,
     lines: Vec<(u64, u64, String)>,
     key: String,
+    /// The older generation whose words are served until this job's answer
+    /// is stored, when there are any.
+    replaces: Option<u32>,
     /// The song's length, which the time estimate is per second of.
     duration_ms: u64,
     queued_at: Instant,
@@ -178,6 +190,13 @@ pub enum Lookup {
     /// words and the song's offset, an empty line for each one still to
     /// come, and the estimate as for [`Lookup::Pending`].
     Partial(Option<u32>, Aligned),
+    /// An older generation's words while this generation times the song
+    /// (ADR-0147, V1470), with each line it has timed so far in place of the
+    /// old one, and the estimate as for [`Lookup::Pending`].
+    Refreshing(Option<u32>, Aligned),
+    /// An older generation's words, served as they are: this generation's
+    /// job failed and waits for its retry, or the queue is full (V1470).
+    Stale(Aligned),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
     /// The song was aligned and found sung to other words (B1479, V1468):
@@ -193,6 +212,8 @@ impl Lookup {
             Self::Ready(_) => "ready",
             Self::Pending(_) => "pending",
             Self::Partial(..) => "partial",
+            Self::Refreshing(..) => "refreshing",
+            Self::Stale(_) => "stale",
             Self::Unavailable => "unavailable",
             Self::Mismatch(_) => "mismatch",
         }
@@ -252,15 +273,30 @@ impl AlignCache {
     /// lyric found not what was sung answers its verdict with no words, even
     /// after another lyric was aligned for the item.
     pub fn get(&self, id: u64, key: &str) -> Option<Aligned> {
-        self.words(id, key).or_else(|| {
-            self.verdict(id, key).map(|heard| Aligned {
-                mismatch: Some(heard),
-                ..Aligned::default()
-            })
-        })
+        self.find(id, &[key]).map(|(_, aligned)| aligned)
     }
 
-    fn words(&self, id: u64, key: &str) -> Option<Aligned> {
+    /// As [`AlignCache::get`] for the first of `keys` the cache holds an
+    /// answer under, with that key's place in `keys`: the item's file is
+    /// read once however many keys are asked about.
+    pub fn find(&self, id: u64, keys: &[&str]) -> Option<(usize, Aligned)> {
+        let words = self.words(id, keys);
+        let verdict = self.verdict(id, keys);
+        match (words, verdict) {
+            (Some((w, aligned)), Some((v, _))) if w <= v => Some((w, aligned)),
+            (Some(found), None) => Some(found),
+            (_, Some((v, heard))) => Some((
+                v,
+                Aligned {
+                    mismatch: Some(heard),
+                    ..Aligned::default()
+                },
+            )),
+            (None, None) => None,
+        }
+    }
+
+    fn words(&self, id: u64, keys: &[&str]) -> Option<(usize, Aligned)> {
         match &*self.backend {
             CacheBackend::Disk(dir, _) => {
                 let path = dir.join(format!("{id}.words.json"));
@@ -279,26 +315,27 @@ impl AlignCache {
                         return None;
                     }
                 };
-                if record.key != key {
-                    return None;
-                }
-                Some(Aligned {
-                    lines: record
-                        .lines
-                        .into_iter()
-                        .map(|line| {
-                            line.into_iter()
-                                .map(|w| WordStamp {
-                                    at: w.at,
-                                    start_ms: w.start_ms,
-                                })
-                                .collect()
-                        })
-                        .collect(),
-                    offset_ms: record.offset_ms,
-                    scores: record.scores,
-                    mismatch: record.mismatch,
-                })
+                let at = keys.iter().position(|k| *k == record.key)?;
+                Some((
+                    at,
+                    Aligned {
+                        lines: record
+                            .lines
+                            .into_iter()
+                            .map(|line| {
+                                line.into_iter()
+                                    .map(|w| WordStamp {
+                                        at: w.at,
+                                        start_ms: w.start_ms,
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                        offset_ms: record.offset_ms,
+                        scores: record.scores,
+                        mismatch: record.mismatch,
+                    },
+                ))
             }
             CacheBackend::Memory(mem, _) => {
                 let map = match mem.lock() {
@@ -306,10 +343,8 @@ impl AlignCache {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 let (entry_key, lines) = map.get(&id)?;
-                if entry_key != key {
-                    return None;
-                }
-                Some(lines.clone())
+                let at = keys.iter().position(|k| k == entry_key)?;
+                Some((at, lines.clone()))
             }
         }
     }
@@ -355,17 +390,25 @@ impl AlignCache {
         }
     }
 
-    fn verdict(&self, id: u64, key: &str) -> Option<Heard> {
+    fn verdict(&self, id: u64, keys: &[&str]) -> Option<(usize, Heard)> {
         match &*self.backend {
-            CacheBackend::Disk(dir, unsaved) => read_verdicts(&verdicts_path(dir, id))
-                .remove(key)
-                .or_else(|| lock(unsaved).get(&(id, key.to_string())).cloned()),
+            CacheBackend::Disk(dir, unsaved) => {
+                let mut saved = read_verdicts(&verdicts_path(dir, id));
+                let unsaved = lock(unsaved);
+                keys.iter().enumerate().find_map(|(at, key)| {
+                    saved
+                        .remove(*key)
+                        .or_else(|| unsaved.get(&(id, (*key).to_string())).cloned())
+                        .map(|heard| (at, heard))
+                })
+            }
             CacheBackend::Memory(_, verdicts) => {
-                let map = match verdicts.lock() {
-                    Ok(m) => m,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                map.get(&(id, key.to_string())).cloned()
+                let map = lock(verdicts);
+                keys.iter().enumerate().find_map(|(at, key)| {
+                    map.get(&(id, (*key).to_string()))
+                        .cloned()
+                        .map(|heard| (at, heard))
+                })
             }
         }
     }
@@ -757,6 +800,8 @@ impl Aligner {
             eta.actual_ms = actual_ms,
             lines_streamed,
             first_line_ms,
+            generation = ALIGN_GENERATION,
+            replaces = job.replaces,
             "lyrics: alignment failed"
         );
         let retry = std::time::Instant::now() + RETRY_AFTER;
@@ -794,6 +839,8 @@ impl Aligner {
             lines_streamed,
             first_line_ms,
             lyrics_mismatch,
+            generation = ALIGN_GENERATION,
+            replaces = job.replaces,
             "lyrics: aligned"
         );
         Ok(())
@@ -961,10 +1008,28 @@ impl Aligner {
                 return Ok(hit);
             }
         }
-        let answered = self
+        let older = older_keys(&["subtitle"], rel, &item.path, lines);
+        match self
             .request(rel, lines, SING_TIMEOUT, None, Ask::default())
-            .await?;
-        Ok(self.store(item.id, key, answered, Source::Lines))
+            .await
+        {
+            Ok(answered) => Ok(self.store(item.id, key, answered, Source::Lines)),
+            // An older generation's lines still stand while this one cannot
+            // time them (V1470).
+            Err(e) => match self.stale_lines(item.id, &older, lines.len()) {
+                Some((generation, old)) => {
+                    tracing::warn!(
+                        media.id = item.id,
+                        error = %e,
+                        generation = ALIGN_GENERATION,
+                        served_generation = generation,
+                        "lyrics: sung lines not aligned; an older generation's served"
+                    );
+                    Ok(old)
+                }
+                None => Err(e),
+            },
+        }
     }
 
     /// Scores for subtitle probe lines of a video (spec 040), asked now and
@@ -1055,11 +1120,64 @@ impl Aligner {
             job_lines.push((start_ms, end_ms, line.text.clone()));
         }
         let key = cache_key(&[], &rel_path, &item.path, &job_lines);
+        let older = older_keys(&[], &rel_path, &item.path, &job_lines);
         Some(Keyed {
             rel_path,
             job_lines,
             key,
+            older,
         })
+    }
+
+    /// The newest older generation's answer for `id` under one of `older`
+    /// (ADR-0147), with the generation that gave it.
+    fn older_answer(&self, id: u64, older: &[(u32, String)]) -> Option<(u32, Aligned)> {
+        let keys: Vec<&str> = older.iter().map(|(_, k)| k.as_str()).collect();
+        let (at, aligned) = self.cache.find(id, &keys)?;
+        Some((older.get(at)?.0, aligned))
+    }
+
+    /// An older generation's answer for a song: its mismatch verdict, or its
+    /// words when they fit the `lines` the song would be sent.
+    fn stale(&self, id: u64, older: &[(u32, String)], lines: usize) -> Option<(u32, Aligned)> {
+        self.older_answer(id, older)
+            .filter(|(_, a)| a.mismatch.is_some() || a.lines.len() == lines)
+    }
+
+    /// An older generation's words for `lines` sung lines; never a verdict.
+    fn stale_lines(
+        &self,
+        id: u64,
+        older: &[(u32, String)],
+        lines: usize,
+    ) -> Option<(u32, Aligned)> {
+        self.older_answer(id, older)
+            .filter(|(_, a)| a.mismatch.is_none() && a.lines.len() == lines)
+    }
+
+    /// The older generation's words with each line this generation has
+    /// timed so far for `id` under `key` in place of the old line. Lines move
+    /// with the song's offset, so when the new offset is not the old one
+    /// the old words stay whole until the new answer is stored.
+    fn refreshed(&self, id: u64, key: &str, old: Aligned) -> Aligned {
+        let partial = self.partial_lock();
+        let Some(p) = partial
+            .get(&id)
+            .filter(|p| p.key == key && p.offset_ms == old.offset_ms)
+        else {
+            return old;
+        };
+        let mut merged = old;
+        for (i, new) in p.lines.iter().enumerate() {
+            let Some(words) = new else { continue };
+            if let Some(line) = merged.lines.get_mut(i) {
+                line.clone_from(words);
+            }
+            if let Some(score) = merged.scores.get_mut(i) {
+                *score = None;
+            }
+        }
+        merged
     }
 
     /// What the cache already says of `lyrics` under `key`: its mismatch
@@ -1078,6 +1196,7 @@ impl Aligner {
             rel_path,
             job_lines,
             key,
+            older,
         }) = self.keyed(item, lyrics)
         else {
             return Lookup::Unavailable;
@@ -1089,6 +1208,18 @@ impl Aligner {
         if !alignable(lyrics) {
             return Lookup::Unavailable;
         }
+        // A verdict is on the lyric, not on how its words were timed, so an
+        // older generation's holds without asking again.
+        let stale = match self.stale(item.id, &older, job_lines.len()) {
+            Some((
+                _,
+                Aligned {
+                    mismatch: Some(heard),
+                    ..
+                },
+            )) => return Lookup::Mismatch(heard),
+            other => other,
+        };
         #[cfg(test)]
         if let Some(run) = self.before_queue.lock().ok().and_then(|mut f| f.take()) {
             run(self);
@@ -1111,9 +1242,10 @@ impl Aligner {
                 .eta_lock()
                 .eta_ms(item.id, self.now_ms())
                 .map(clamp_u32);
-            return match self.partial_for(item.id, &key) {
-                Some(partial) => Lookup::Partial(left, partial),
-                None => Lookup::Pending(left),
+            return match (stale, self.partial_for(item.id, &key)) {
+                (Some((_, old)), _) => Lookup::Refreshing(left, self.refreshed(item.id, &key, old)),
+                (None, Some(partial)) => Lookup::Partial(left, partial),
+                (None, None) => Lookup::Pending(left),
             };
         }
         {
@@ -1122,7 +1254,9 @@ impl Aligner {
                 Err(poisoned) => poisoned.into_inner(),
             };
             match failed.get(&item.id) {
-                Some(&retry) if std::time::Instant::now() < retry => return Lookup::Unavailable,
+                Some(&retry) if std::time::Instant::now() < retry => {
+                    return stale.map_or(Lookup::Unavailable, |(_, old)| Lookup::Stale(old));
+                }
                 Some(_) => {
                     failed.remove(&item.id);
                 }
@@ -1142,17 +1276,21 @@ impl Aligner {
             path: rel_path,
             lines: job_lines,
             key,
+            replaces: stale.as_ref().map(|(g, _)| *g),
             duration_ms,
             queued_at: Instant::now(),
             predicted_ms,
         };
 
+        let left = predicted_ms.map(clamp_u32);
         match self.tx.try_send(job) {
-            Ok(()) => Lookup::Pending(predicted_ms.map(clamp_u32)),
+            Ok(()) => stale.map_or(Lookup::Pending(left), |(_, old)| {
+                Lookup::Refreshing(left, old)
+            }),
             Err(_) => {
                 pending.remove(&item.id);
                 self.eta_lock().forget(item.id);
-                Lookup::Unavailable
+                stale.map_or(Lookup::Unavailable, |(_, old)| Lookup::Stale(old))
             }
         }
     }
@@ -1164,6 +1302,21 @@ impl Aligner {
 /// apart from another's.
 fn cache_key(tag: &[&str], rel: &str, path: &Path, lines: &[(u64, u64, String)]) -> String {
     key_for(ALIGN_GENERATION, tag, rel, file_stamp(path), lines)
+}
+
+/// The keys older generations, back to [`OLDEST_SERVED_GENERATION`], kept
+/// the same lines under, newest first.
+fn older_keys(
+    tag: &[&str],
+    rel: &str,
+    path: &Path,
+    lines: &[(u64, u64, String)],
+) -> Vec<(u32, String)> {
+    let stamp = file_stamp(path);
+    (OLDEST_SERVED_GENERATION..ALIGN_GENERATION)
+        .rev()
+        .map(|g| (g, key_for(g, tag, rel, stamp, lines)))
+        .collect()
 }
 
 /// The file's size and mtime in seconds; zeros when it cannot be read.
@@ -1349,6 +1502,31 @@ pub(super) mod tests {
         (Arc::new(aligner), job.key)
     }
 
+    /// An aligner whose cache holds `aligned` for `lyrics` of `item` as the
+    /// generation before this one gave it, and its job queue, kept open
+    /// while the aligner is used.
+    pub(in crate::services::lyrics) fn timed_before(
+        media_root: &Path,
+        item: &MediaItem,
+        lyrics: &Lyrics,
+        aligned: Aligned,
+    ) -> (Arc<Aligner>, impl Sized) {
+        let (tx, rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root.to_path_buf(), AlignCache::new(None), tx);
+        let keyed = aligner.keyed(item, lyrics).unwrap();
+        let (generation, key) = keyed.older.first().unwrap().clone();
+        assert_eq!(generation, ALIGN_GENERATION - 1);
+        aligner.cache.put(item.id, key, aligned);
+        (Arc::new(aligner), rx)
+    }
+
+    /// Leaves `id` as the worker leaves a song whose job failed.
+    pub(in crate::services::lyrics) fn failed_for_now(aligner: &Aligner, id: u64) {
+        aligner.pending.lock().unwrap().remove(&id);
+        let later = Instant::now() + RETRY_AFTER;
+        aligner.failed.lock().unwrap().insert(id, later);
+    }
+
     /// Sends `event` for `item` under `key` to an aligner from [`in_flight`].
     pub(in crate::services::lyrics) fn send(
         aligner: &Aligner,
@@ -1410,6 +1588,7 @@ pub(super) mod tests {
             path: "a/song.flac".into(),
             lines: vec![(1000, 2000, "two words".into())],
             key: "k".into(),
+            replaces: None,
             duration_ms: 0,
             queued_at: Instant::now(),
             predicted_ms: None,
@@ -1905,6 +2084,7 @@ pub(super) mod tests {
             path: "a/song.flac".into(),
             lines: vec![(1000, 2000, "Line one".into())],
             key: "k".into(),
+            replaces: Some(OLDEST_SERVED_GENERATION),
             duration_ms: 10_000,
             // Queued 5 s ago with 2 s predicted: about 3 s late.
             queued_at: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
@@ -1918,7 +2098,16 @@ pub(super) mod tests {
         let (direction, outcome, seconds) = &seen[0];
         assert_eq!((direction.as_str(), outcome.as_str()), ("late", "aligned"));
         assert!((3.0..4.0).contains(seconds), "{seconds}");
-        eta_line(&logs, "lyrics: aligned");
+        let line = eta_line(&logs, "lyrics: aligned");
+        // The generation that replaced another's words, and which (ADR-0147).
+        assert!(
+            line.contains(&format!("generation={ALIGN_GENERATION}")),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("replaces={OLDEST_SERVED_GENERATION}")),
+            "{line}"
+        );
     }
 
     /// ODD (spec 040 FR-022): the time a job waited before it was sent is on
@@ -1952,6 +2141,7 @@ pub(super) mod tests {
             path: "a/song.flac".into(),
             lines: vec![(1000, 2000, "Line one".into())],
             key: "k".into(),
+            replaces: None,
             duration_ms: 10_000,
             queued_at: Instant::now().checked_sub(Duration::from_secs(3)).unwrap(),
             predicted_ms: None,
@@ -1990,6 +2180,7 @@ pub(super) mod tests {
             path: "a/song.flac".into(),
             lines: Vec::new(),
             key: "k".into(),
+            replaces: Some(OLDEST_SERVED_GENERATION),
             duration_ms: 10_000,
             // Queued just now with 2 s predicted: about 2 s early.
             queued_at: Instant::now(),
@@ -2005,6 +2196,14 @@ pub(super) mod tests {
         assert!((1.0..=2.0).contains(seconds), "{seconds}");
         let line = eta_line(&logs, "lyrics: alignment failed");
         assert!(line.contains("aligner said no"), "{line}");
+        assert!(
+            line.contains(&format!("generation={ALIGN_GENERATION}")),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("replaces={OLDEST_SERVED_GENERATION}")),
+            "{line}"
+        );
         assert!(aligner.failed.lock().unwrap().contains_key(&42));
     }
 
@@ -2018,6 +2217,7 @@ pub(super) mod tests {
             path: "a/song.flac".into(),
             lines: Vec::new(),
             key: "k".into(),
+            replaces: None,
             duration_ms: 0,
             queued_at: Instant::now(),
             predicted_ms: None,
@@ -2459,6 +2659,7 @@ pub(super) mod tests {
                 (3000, 4000, "Line two".into()),
             ],
             key: "k".into(),
+            replaces: None,
             duration_ms: 10_000,
             queued_at: Instant::now(),
             predicted_ms: Some(2_000),
@@ -2754,13 +2955,23 @@ pub(super) mod tests {
         let labels = [
             Lookup::Ready(aligned.clone()).label(),
             Lookup::Pending(None).label(),
-            Lookup::Partial(None, aligned).label(),
+            Lookup::Partial(None, aligned.clone()).label(),
+            Lookup::Refreshing(None, aligned.clone()).label(),
+            Lookup::Stale(aligned).label(),
             Lookup::Unavailable.label(),
             Lookup::Mismatch(Heard::default()).label(),
         ];
         assert_eq!(
             labels,
-            ["ready", "pending", "partial", "unavailable", "mismatch"]
+            [
+                "ready",
+                "pending",
+                "partial",
+                "refreshing",
+                "stale",
+                "unavailable",
+                "mismatch"
+            ]
         );
     }
 
@@ -2999,5 +3210,263 @@ pub(super) mod tests {
 
         assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// An aligner, its job queue, a song, its lyrics and the lines a job
+    /// for it asks for.
+    type TwoLineSong = (
+        Aligner,
+        mpsc::Receiver<Job>,
+        MediaItem,
+        Lyrics,
+        Vec<(u64, u64, String)>,
+    );
+
+    /// A song of two lines under `dir`, an aligner whose cache is `cache`,
+    /// and the lines a job for it asks for.
+    fn two_line_song(dir: &Path, cache: AlignCache) -> TwoLineSong {
+        let song = dir.join("song.flac");
+        std::fs::write(&song, b"x").unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let aligner = test_aligner(dir.to_path_buf(), cache, tx);
+        let lyrics = Lyrics::from_lines(
+            vec![
+                LyricLine {
+                    start_ms: Some(1000),
+                    text: "Line one".into(),
+                    words: vec![],
+                },
+                LyricLine {
+                    start_ms: Some(3000),
+                    text: "Line two".into(),
+                    words: vec![],
+                },
+            ],
+            Origin::SidecarLrc,
+        )
+        .unwrap();
+        let lines = vec![
+            (1000, 3000, "Line one".into()),
+            (3000, 8000, "Line two".into()),
+        ];
+        (aligner, rx, sample_item(song), lyrics, lines)
+    }
+
+    fn words_at(starts: &[u64], offset_ms: i64) -> Aligned {
+        Aligned {
+            lines: starts
+                .iter()
+                .map(|&start_ms| vec![WordStamp { at: 0, start_ms }])
+                .collect(),
+            offset_ms,
+            scores: starts.iter().map(|_| Some(500)).collect(),
+            mismatch: None,
+        }
+    }
+
+    /// Puts `aligned` in the cache as generation `generation` gave it.
+    fn cache_as(
+        aligner: &Aligner,
+        item: &MediaItem,
+        lines: &[(u64, u64, String)],
+        generation: u32,
+        aligned: Aligned,
+    ) {
+        let key = key_for(generation, &[], "song.flac", file_stamp(&item.path), lines);
+        aligner.cache.put(item.id, key, aligned);
+    }
+
+    #[test]
+    fn an_older_generation_key_is_the_key_that_generation_wrote() {
+        // As the cache key was built when generation 4 was current.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        std::fs::write(&path, b"x").unwrap();
+        let lines: Vec<(u64, u64, String)> = vec![(1000, 3000, "Line one".into())];
+        let (size, mtime) = file_stamp(&path);
+        let bytes =
+            serde_json::to_vec(&serde_json::json!([4, "song.flac", size, mtime, &lines])).unwrap();
+        let written: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let older = older_keys(&[], "song.flac", &path, &lines);
+        assert!(older.contains(&(4, written)), "{older:?}");
+        assert_eq!(older.first().map(|(g, _)| *g), Some(ALIGN_GENERATION - 1));
+        assert!(older.iter().all(|(g, _)| *g >= OLDEST_SERVED_GENERATION));
+    }
+
+    #[test]
+    fn an_older_generation_s_words_are_served_and_replaced_line_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aligner, mut rx, item, lyrics, lines) =
+            two_line_song(dir.path(), AlignCache::new(None));
+        let old = words_at(&[1100, 3100], 0);
+        cache_as(&aligner, &item, &lines, ALIGN_GENERATION - 1, old.clone());
+
+        // Queued for this generation, the old words shown meanwhile (V1470).
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Refreshing(None, old.clone())
+        );
+        let job = rx.try_recv().expect("the song is timed again");
+        assert_eq!(job.replaces, Some(ALIGN_GENERATION - 1));
+        assert_eq!(job.key, cache_key(&[], "song.flac", &item.path, &lines));
+
+        // A line this generation has timed takes the old one's place.
+        for event in [
+            &br#"{"event":"offset","offset_ms":0,"aligner_version":5,"lines":2}"#[..],
+            br#"{"event":"line","index":1,"words":[{"at":0,"start_ms":2900}],"score":null}"#,
+        ] {
+            aligner.event((item.id, &job.key), event, 2).unwrap();
+        }
+        let Lookup::Refreshing(None, shown) = aligner.words_for(&item, &lyrics) else {
+            panic!("expected the old words with the new line");
+        };
+        assert_eq!(shown.lines, words_at(&[1100, 2900], 0).lines);
+        assert_eq!(shown.scores, vec![Some(500), None]);
+        assert!(rx.try_recv().is_err(), "one job per song");
+
+        // This generation's answer replaces the old one whole.
+        let new = words_at(&[1050, 2900], 0);
+        aligner.cache.put(item.id, job.key, new.clone());
+        aligner.pending.lock().unwrap().remove(&item.id);
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Ready(new));
+    }
+
+    #[test]
+    fn old_words_stay_whole_while_the_new_offset_moves_the_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aligner, mut rx, item, lyrics, lines) =
+            two_line_song(dir.path(), AlignCache::new(None));
+        let old = words_at(&[1100, 3100], 0);
+        cache_as(&aligner, &item, &lines, ALIGN_GENERATION - 1, old.clone());
+        assert!(matches!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Refreshing(..)
+        ));
+        let job = rx.try_recv().unwrap();
+        for event in [
+            &br#"{"event":"offset","offset_ms":400,"aligner_version":5,"lines":2}"#[..],
+            br#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1500}],"score":null}"#,
+        ] {
+            aligner.event((item.id, &job.key), event, 2).unwrap();
+        }
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Refreshing(None, old)
+        );
+    }
+
+    #[test]
+    fn an_older_generation_s_words_stand_when_this_one_cannot_time_the_song() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aligner, mut rx, item, lyrics, lines) =
+            two_line_song(dir.path(), AlignCache::new(None));
+        let old = words_at(&[1100, 3100], 0);
+        cache_as(&aligner, &item, &lines, ALIGN_GENERATION - 1, old.clone());
+
+        // Failed and waiting for its retry.
+        let later = std::time::Instant::now() + RETRY_AFTER;
+        aligner.failed.lock().unwrap().insert(item.id, later);
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Stale(old.clone())
+        );
+        assert!(rx.try_recv().is_err());
+
+        // The queue is full.
+        aligner.failed.lock().unwrap().clear();
+        let (tx, _full) = mpsc::channel(1);
+        tx.try_send(two_line_job()).unwrap();
+        let aligner = Aligner { tx, ..aligner };
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Stale(old));
+        assert!(aligner.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn words_older_than_the_oldest_served_generation_are_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aligner, mut rx, item, lyrics, lines) =
+            two_line_song(dir.path(), AlignCache::new(None));
+        cache_as(
+            &aligner,
+            &item,
+            &lines,
+            OLDEST_SERVED_GENERATION - 1,
+            words_at(&[1100, 3100], 0),
+        );
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        assert_eq!(rx.try_recv().unwrap().replaces, None);
+    }
+
+    #[test]
+    fn an_older_generation_s_words_for_other_lines_are_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aligner, _rx, item, lyrics, lines) = two_line_song(dir.path(), AlignCache::new(None));
+        cache_as(
+            &aligner,
+            &item,
+            &lines,
+            ALIGN_GENERATION - 1,
+            words_at(&[1100], 0),
+        );
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+    }
+
+    #[test]
+    fn an_older_generation_s_verdict_holds_without_timing_the_song_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AlignCache::new(Some(dir.path().join("cache")));
+        let (aligner, mut rx, item, lyrics, lines) = two_line_song(dir.path(), cache);
+        let heard = Heard {
+            text_recall: Some(81),
+            heard_words: 120,
+            text: "the lanterns swing".into(),
+        };
+        let verdict = Aligned {
+            mismatch: Some(heard.clone()),
+            ..Aligned::default()
+        };
+        cache_as(&aligner, &item, &lines, ALIGN_GENERATION - 1, verdict);
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_disk_cache_serves_an_older_generation_s_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = AlignCache::new(Some(dir.path().join("cache")));
+        let (aligner, _rx, item, lyrics, lines) = two_line_song(dir.path(), cache);
+        let old = words_at(&[1100, 3100], 0);
+        cache_as(&aligner, &item, &lines, ALIGN_GENERATION - 1, old.clone());
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Refreshing(None, old)
+        );
+    }
+
+    #[tokio::test]
+    async fn sung_lines_fall_back_to_an_older_generation_when_the_aligner_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = dir.path().join("song.flac");
+        std::fs::write(&song, b"x").unwrap();
+        // Nothing listens on the aligner's address.
+        let aligner = Aligner::for_tests("http://127.0.0.1:9".into(), dir.path().to_path_buf());
+        let item = sample_item(song);
+        let lines: Vec<(u64, u64, String)> = vec![(1000, 3000, "Line one".into())];
+        let old = words_at(&[1100], 0);
+        let key = key_for(
+            ALIGN_GENERATION - 1,
+            &["subtitle"],
+            "song.flac",
+            file_stamp(&item.path),
+            &lines,
+        );
+        aligner.cache.put(item.id, key, old.clone());
+        assert_eq!(aligner.sing(&item, &lines).await, Ok(old));
+
+        let other: Vec<(u64, u64, String)> = vec![(1000, 3000, "Other".into())];
+        assert!(aligner.sing(&item, &other).await.is_err());
     }
 }
