@@ -2312,15 +2312,26 @@ impl Recovery {
 }
 
 /// Recoveries of one kind before a fatal error is shown. A fragment that
-/// loads refills the budget, so a long film survives scattered blips but a
-/// stream that keeps failing gives up within a few seconds.
+/// loads refills the network budget, and one [`MEDIA_REFILL_FRAGMENTS`] past
+/// the last media rebuild refills the media budget, so a long film survives
+/// scattered blips but a stream that keeps failing gives up within a few
+/// seconds.
 pub const MAX_RECOVERIES: u32 = 3;
+
+/// How many fragments past the one loaded before a media rebuild must load
+/// before the media budget refills. A segment that fails to decode loads fine
+/// each time it is refetched, so its own load proves nothing (V1474).
+pub const MEDIA_REFILL_FRAGMENTS: u64 = 2;
 
 /// Chooses the recovery for each fatal hls.js error.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryBudget {
     network: u32,
     media: u32,
+    /// The sequence number of the last main media fragment that loaded.
+    last_sn: u64,
+    /// `last_sn` when the last media rebuild started, until playback passes it.
+    rebuilt_after_sn: Option<u64>,
 }
 
 impl RecoveryBudget {
@@ -2342,6 +2353,9 @@ impl RecoveryBudget {
             return Recovery::Fail;
         }
         *used += 1;
+        if recovery == Recovery::RecoverMedia {
+            self.rebuilt_after_sn = Some(self.last_sn);
+        }
         recovery
     }
 
@@ -2354,8 +2368,27 @@ impl RecoveryBudget {
         }
     }
 
-    /// A fragment loaded: playback is moving again.
-    pub fn progressed(&mut self) {
+    /// Main fragment `sn` loaded: the network is answering again, and once
+    /// it is [`MEDIA_REFILL_FRAGMENTS`] past the last rebuild's, so is the media.
+    /// An `sn` of 0 is an init segment or an unnumbered report, which says
+    /// nothing about where playback is.
+    pub fn fragment_loaded(&mut self, sn: u64) {
+        self.network = 0;
+        if sn == 0 {
+            return;
+        }
+        self.last_sn = sn;
+        if self
+            .rebuilt_after_sn
+            .is_some_and(|from| sn >= from.saturating_add(MEDIA_REFILL_FRAGMENTS))
+        {
+            self.media = 0;
+            self.rebuilt_after_sn = None;
+        }
+    }
+
+    /// Playback is moving again: both budgets refill.
+    pub fn refill(&mut self) {
         *self = Self::default();
     }
 }
@@ -2462,7 +2495,7 @@ impl MediaRecovery {
             return None;
         }
         let attempt = self.budget.attempts("mediaError");
-        self.budget.progressed();
+        self.budget.refill();
         self.rebuilt = None;
         Some(MediaResumed {
             attempt,
@@ -5639,12 +5672,46 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_fragment_refills_the_budget() {
+    fn a_loaded_fragment_refills_the_network_budget() {
         let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            budget.on_fatal("networkError", "fragLoadError");
+        }
+        budget.fragment_loaded(4);
+        assert_eq!(
+            budget.on_fatal("networkError", "fragLoadError"),
+            Recovery::StartLoad
+        );
+    }
+
+    #[test]
+    fn a_segment_that_never_decodes_runs_out_the_media_budget() {
+        // V1474: the failing segment loads again after every rebuild.
+        let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            budget.fragment_loaded(7);
+            assert_eq!(
+                budget.on_fatal("mediaError", "bufferAppendError"),
+                Recovery::RecoverMedia
+            );
+        }
+        // The init segment the rebuild refetches is no progress either.
+        budget.fragment_loaded(0);
+        budget.fragment_loaded(8);
+        assert_eq!(
+            budget.on_fatal("mediaError", "bufferAppendError"),
+            Recovery::Fail
+        );
+    }
+
+    #[test]
+    fn playback_past_a_rebuild_refills_the_media_budget() {
+        let mut budget = RecoveryBudget::new();
+        budget.fragment_loaded(7);
         for _ in 0..MAX_RECOVERIES {
             budget.on_fatal("mediaError", "bufferAppendError");
         }
-        budget.progressed();
+        budget.fragment_loaded(7 + MEDIA_REFILL_FRAGMENTS);
         assert_eq!(
             budget.on_fatal("mediaError", "bufferAppendError"),
             Recovery::RecoverMedia
