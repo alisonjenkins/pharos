@@ -64,6 +64,18 @@ fn played_badge(kind: ItemKind) -> &'static str {
     }
 }
 
+/// Whether the screens show the device's library with no server (spec
+/// 049): provided by the app root. Controls that need the server leave
+/// themselves out while it is true.
+#[derive(Clone, Copy)]
+pub struct OfflineShown(pub Memo<bool>);
+
+/// Whether the device's library is shown; false where no app root
+/// provides it (a test, the older app).
+pub fn offline_shown() -> bool {
+    try_use_context::<OfflineShown>().is_some_and(|o| (o.0)())
+}
+
 #[component]
 pub fn FavoriteToggle(
     id: ItemRef,
@@ -75,6 +87,9 @@ pub fn FavoriteToggle(
     icon: bool,
 ) -> Element {
     let mark = use_context::<MarkFavorite>();
+    if offline_shown() {
+        return rsx! {};
+    }
     let star = if favorite { "\u{2605}" } else { "\u{2606}" };
     let class = match (favorite, icon) {
         (true, false) => "pharos-button pharos-button-secondary pharos-favorite on",
@@ -128,6 +143,9 @@ pub fn WatchedToggle(
     icon: bool,
 ) -> Element {
     let mark = use_context::<MarkPlayed>();
+    if offline_shown() {
+        return rsx! {};
+    }
     let state = match (listen, played) {
         (true, true) => "unplayed",
         (true, false) => "played",
@@ -284,6 +302,8 @@ pub fn Shell(
         .first()
         .filter(|item| item.kind == ItemKind::Library)
         .map(|library| library.id);
+    // Favourites and Together need the server (spec 049).
+    let offline = offline_shown();
     rsx! {
         div { class: "pharos-app", "data-keys": "page",
             header { class: "pharos-banner pharos-shell",
@@ -291,20 +311,24 @@ pub fn Shell(
                     Link { to: Route::Home, class: "pharos-brand", Brand {} }
                     nav { class: "pharos-shell-nav",
                         {search}
-                        Link { to: Route::Favourites, "Favourites" }
+                        if !offline {
+                            Link { to: Route::Favourites, "Favourites" }
+                        }
                         if offline_store().is_some() || video_store().is_some() {
                             Link { to: Route::Downloads, "Downloads" }
                         }
-                        if in_group {
-                            Link {
-                                to: Route::Together,
-                                class: "pharos-together-link is-in-group",
-                                "Together"
-                                span { class: "pharos-in-group-dot", aria_hidden: "true" }
-                                span { class: "pharos-visually-hidden", " (you're in a group)" }
+                        if !offline {
+                            if in_group {
+                                Link {
+                                    to: Route::Together,
+                                    class: "pharos-together-link is-in-group",
+                                    "Together"
+                                    span { class: "pharos-in-group-dot", aria_hidden: "true" }
+                                    span { class: "pharos-visually-hidden", " (you're in a group)" }
+                                }
+                            } else {
+                                Link { to: Route::Together, "Together" }
                             }
-                        } else {
-                            Link { to: Route::Together, "Together" }
                         }
                         {account}
                     }
@@ -1679,6 +1703,10 @@ pub fn TitleView(
     /// video's Download control (where a video store is registered).
     #[props(default)]
     keep: Option<Element>,
+    /// The page shows the device's copy with no server (spec 049): only
+    /// what works without it is offered.
+    #[props(default)]
+    offline: bool,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
@@ -1728,7 +1756,8 @@ pub fn TitleView(
     });
     // A book's versions are its formats (V1391): picked the same way, named
     // by format, and its file facts already shown as the book's.
-    let pick_version = (item.kind.playable() || detail.book.is_some()) && detail.versions.len() > 1;
+    let pick_version =
+        !offline && (item.kind.playable() || detail.book.is_some()) && detail.versions.len() > 1;
     let version_list = version_list.filter(|_| detail.book.is_none());
     let pick_name = if detail.book.is_some() {
         "Format"
@@ -1804,11 +1833,13 @@ pub fn TitleView(
                                 p { class: "pharos-reader-locked", "{line}" }
                             },
                         }
-                        a {
-                            class: "pharos-button pharos-button-secondary",
-                            href: reader::version_href(item.id, &version),
-                            download: "",
-                            "Download"
+                        if !offline {
+                            a {
+                                class: "pharos-button pharos-button-secondary",
+                                href: reader::version_href(item.id, &version),
+                                download: "",
+                                "Download"
+                            }
                         }
                         if let Some(keep) = keep.clone() {
                             {keep}
@@ -1833,7 +1864,7 @@ pub fn TitleView(
                             }
                         }
                     }
-                    if can_watch_together(item.kind) {
+                    if can_watch_together(item.kind) && !offline {
                         for (label, from, class, key_action) in together_starts(item, in_group) {
                             {
                                 let id = item.id;
@@ -1853,7 +1884,7 @@ pub fn TitleView(
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
-                    if video_kind(item.kind) {
+                    if video_kind(item.kind) && !offline {
                         QueueButtons {
                             name: display_name(item),
                             tracks: vec![item.clone()],
@@ -1861,7 +1892,7 @@ pub fn TitleView(
                             kind: QueueTarget::VideoPage,
                         }
                     }
-                    if video_kind(item.kind) {
+                    if video_kind(item.kind) && !offline {
                         // B1474/V1456: the file itself, for a player like
                         // VLC when there will be no signal.
                         a {
@@ -1873,7 +1904,7 @@ pub fn TitleView(
                             span { class: "pharos-button-label", "Download file" }
                         }
                     }
-                    if item.kind.playable() {
+                    if item.kind.playable() && !offline {
                         WatchedToggle {
                             id: item.id,
                             played: item.played,
@@ -1882,7 +1913,7 @@ pub fn TitleView(
                             icon: video_kind(item.kind),
                         }
                     }
-                    if item.kind.playable() {
+                    if item.kind.playable() && !offline {
                         FavoriteToggle { id: item.id, favorite: item.favorite, name: display_name(item), icon: video_kind(item.kind) }
                     }
                 }
@@ -3643,6 +3674,52 @@ mod tests {
         assert!(actions.contains("keep-slot"), "{actions}");
         let html = with_video_queue(move || rsx! { TitleView { detail: bare.clone() } });
         assert!(!html.contains("keep-slot"), "{html}");
+    }
+
+    /// Spec 049 (V1486): offline, a film's page offers only what works with
+    /// no server: Play and its keep slot stay; Watch together, the queue,
+    /// the file download, the watched and favourite marks and the version
+    /// picker go. Disarm check: drop `offline` from any one of those
+    /// conditions and its label shows up again here.
+    #[test]
+    fn offline_a_films_page_offers_only_what_works_without_the_server() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            rsx! { TitleView { detail: detail.clone(), offline: true, keep: rsx! { span { id: "keep-slot" } } } }
+        });
+        assert!(
+            html.contains(">Play<") && html.contains("keep-slot"),
+            "{html}"
+        );
+        for gone in [
+            "Watch together",
+            "pharos-queue-button",
+            "Download file",
+            "pharos-watched",
+            "pharos-favorite",
+            r#"aria-label="Version""#,
+        ] {
+            assert!(!html.contains(gone), "{gone} offered offline: {html}");
+        }
+    }
+
+    /// Spec 049 (V1486): with the device's library shown, the watched and
+    /// favourite marks leave themselves out wherever they are drawn (a
+    /// series page, a track row), not only on a title page. Disarm check:
+    /// drop the `offline_shown()` return from either toggle and its class
+    /// shows up here.
+    #[test]
+    fn offline_the_marks_leave_themselves_out_everywhere() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            let shown = use_memo(|| true);
+            use_context_provider(|| OfflineShown(shown));
+            rsx! { TitleView { detail: detail.clone() } }
+        });
+        assert!(html.contains(">Play<"), "{html}");
+        for gone in ["pharos-watched", "pharos-favorite"] {
+            assert!(!html.contains(gone), "{gone} offered offline: {html}");
+        }
     }
 
     /// B1353/V1324: a film's page has one row of actions, Play first, then
