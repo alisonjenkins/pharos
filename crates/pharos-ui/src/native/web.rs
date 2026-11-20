@@ -19,8 +19,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind,
-    Fatal, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
-    PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
+    Fatal, FragmentEvent, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment,
+    OverlayEffect, PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
 
 const SESSION: &str = "/pharos/session";
@@ -3907,6 +3907,7 @@ impl PlaybackEngine for HlsJs {
         self.ceiling = Rc::new(RefCell::new(super::playback::BufferCeiling::default()));
         let on_error = {
             let (player, budget, url) = (player.clone(), Rc::clone(&budget), url.to_owned());
+            let on_fragment = Rc::clone(&on_fragment);
             let ceiling = Rc::clone(&self.ceiling);
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_event, data: JsValue| {
                 check_ceiling(&player, &ceiling);
@@ -3920,6 +3921,9 @@ impl PlaybackEngine for HlsJs {
                 let fatal = fatal == "true";
                 let status = js_number(&data, &["response", "code"]) as u16;
                 let refusal = super::playback::hls_refusal(&kind, status, fatal);
+                if super::playback::is_fragment_load_failure(&kind, &details) {
+                    on_fragment(FragmentEvent::Failed);
+                }
                 if !fatal && refusal.is_none() {
                     warn(&format!(
                         "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal=false url={url}"
@@ -3961,7 +3965,7 @@ impl PlaybackEngine for HlsJs {
                 budget.borrow_mut().progressed();
                 check_ceiling(&player, &ceiling);
                 if let Some(load) = fragment_load(&data) {
-                    on_fragment(load);
+                    on_fragment(FragmentEvent::Loaded(load));
                 }
             })
         };

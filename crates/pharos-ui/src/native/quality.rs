@@ -281,6 +281,11 @@ pub struct Watch {
     quiet_until: u64,
     headroom_since: Option<u64>,
     seeking_since: Option<u64>,
+    /// The newest stall when the last fragment loaded: stalls after it are
+    /// dropped if a load then fails.
+    stall_at_load: Option<u64>,
+    /// A fragment failed to load and none has loaded since (B1489).
+    failing: bool,
 }
 
 impl Watch {
@@ -303,6 +308,8 @@ impl Watch {
             quiet_until: now.saturating_add(SETTLE_MS),
             headroom_since: None,
             seeking_since: None,
+            stall_at_load: None,
+            failing: false,
         }
     }
 
@@ -332,6 +339,8 @@ impl Watch {
     /// A fragment of `bytes` took `load_ms` to download and holds
     /// `media_ms` of video.
     pub fn fragment(&mut self, bytes: u64, load_ms: u64, media_ms: u64) {
+        self.failing = false;
+        self.stall_at_load = self.stalls.last().copied();
         // A cache hit answers in a millisecond; that says nothing of the link.
         if bytes < MIN_SAMPLE_BYTES || load_ms < MIN_LOAD_MS || media_ms == 0 {
             return;
@@ -353,9 +362,19 @@ impl Watch {
         }
     }
 
+    /// A fragment's fetch failed. The video runs out of data because it got
+    /// no answer, not a slow one: stalls since the last load, and any until
+    /// the next, are not the link's (B1489).
+    pub fn load_failed(&mut self) {
+        self.failing = true;
+        let kept = self.stall_at_load;
+        self.stalls
+            .retain(|&at| kept.is_some_and(|kept| at <= kept));
+    }
+
     /// The video ran out of data at `now`.
     pub fn stalled(&mut self, now: u64) {
-        if self.seeking_since.is_some() {
+        if self.seeking_since.is_some() || self.failing {
             return;
         }
         let merged = self
@@ -717,6 +736,36 @@ mod tests {
             Some((4_000_000, Reason::Stalls))
         );
         assert_eq!(w.cap(), 4_000_000);
+    }
+
+    /// V1480: a wait on a fetch that failed is not a slow link.
+    #[test]
+    fn stalls_around_a_failed_load_do_not_step_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        // The buffer runs dry before the engine reports the fetch failing.
+        w.stalled(20 * MS);
+        w.load_failed();
+        w.stalled(25 * MS);
+        assert_eq!(w.evaluate(26 * MS), None);
+        // Loads again: a stall now is the link's once more.
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.stalled(30 * MS);
+        assert_eq!(w.evaluate(31 * MS), None);
+        w.stalled(35 * MS);
+        assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    #[test]
+    fn a_stall_before_the_last_load_survives_a_failure() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.stalled(20 * MS);
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.load_failed();
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.stalled(25 * MS);
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
     }
 
     #[test]

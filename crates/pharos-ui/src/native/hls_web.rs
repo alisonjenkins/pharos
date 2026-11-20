@@ -21,9 +21,10 @@ use super::platform::{
 };
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
-    HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
-    PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
+    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentEvent,
+    FragmentLoad, HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal,
+    OnFragment, PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery,
+    StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -1781,7 +1782,7 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
                 load_ms,
                 media_ms,
             };
-            on_fragment(load);
+            on_fragment(FragmentEvent::Loaded(load));
             abr_step(session, index, load, ttfb_ms);
         }
     }

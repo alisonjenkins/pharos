@@ -174,9 +174,23 @@ pub struct FragmentLoad {
     pub media_ms: u64,
 }
 
-/// Told of each video fragment downloaded; engines that cannot see
-/// downloads (the browser's own player) never call it.
-pub type OnFragment = std::rc::Rc<dyn Fn(FragmentLoad)>;
+/// What an engine saw of one video fragment's download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentEvent {
+    Loaded(FragmentLoad),
+    /// The fetch failed: an HTTP error or no answer. The wait that follows
+    /// says nothing of the link's speed (B1489).
+    Failed,
+}
+
+/// Told of each video fragment downloaded, or that failed to; engines that
+/// cannot see downloads (the browser's own player) never call it.
+pub type OnFragment = std::rc::Rc<dyn Fn(FragmentEvent)>;
+
+/// Whether an hls.js error is a video fragment's fetch failing.
+pub fn is_fragment_load_failure(kind: &str, details: &str) -> bool {
+    kind == "networkError" && matches!(details, "fragLoadError" | "fragLoadTimeOut")
+}
 
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
