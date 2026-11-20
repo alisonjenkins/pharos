@@ -1001,6 +1001,7 @@ impl Cache {
         });
         let mut fresh = false;
         let mut evicted = Vec::new();
+        let mut stuck = HashSet::new();
         loop {
             let (_, music) = Self::totals(s);
             let outside = self.outside_bytes().held;
@@ -1016,9 +1017,12 @@ impl Cache {
             let Some((id, bytes)) = Self::victim(s, None) else {
                 // Finished tracks first; then a part no job holds, oldest
                 // first: its bytes leave the parts figure.
-                if let Some((id, bytes)) = self.part_victim(s, None) {
+                if let Some((id, bytes)) = self.part_victim(s, None, &stuck) {
+                    // One that will not go is passed over: the next oldest
+                    // is tried, and its bytes are not credited.
                     if !self.remove_part_locked(&id, bytes, "over_cap") {
-                        break;
+                        stuck.insert(id);
+                        continue;
                     }
                     parts = parts.saturating_sub(bytes);
                     fresh = false;
@@ -1060,7 +1064,14 @@ impl Cache {
     /// written: one no job holds (`active`), not pinned, queued, playing or
     /// `keep`. Asked only once no finished track is left to evict. A part
     /// whose name or metadata cannot be read is never a victim.
-    fn part_victim(&self, s: &State, keep: Option<&str>) -> Option<(String, u64)> {
+    /// `skip` holds parts that would not go this pass: the next oldest is
+    /// tried instead.
+    fn part_victim(
+        &self,
+        s: &State,
+        keep: Option<&str>,
+        skip: &HashSet<String>,
+    ) -> Option<(String, u64)> {
         let active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         let read = std::fs::read_dir(&self.dir).ok()?;
         read.filter_map(Result::ok)
@@ -1068,6 +1079,7 @@ impl Cache {
                 let name = e.file_name();
                 let id = unescape(name.to_str()?.strip_suffix(PART_EXT)?)?;
                 let held = keep == Some(id.as_str())
+                    || skip.contains(&id)
                     || active.contains(&id)
                     || s.entries.get(&id).is_some_and(|e| e.pinned)
                     || s.pins.values().any(|v| v.contains(&id))
@@ -1559,13 +1571,17 @@ impl Cache {
             evicted = true;
             log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
         }
-        // Finished tracks first; then parts no job holds, oldest first.
+        // Finished tracks first; then parts no job holds, oldest first. One
+        // that will not go is passed over for the next, its bytes not
+        // credited.
+        let mut stuck = HashSet::new();
         while now < want {
-            let Some((id, bytes)) = self.part_victim(&s, Some(downloading)) else {
+            let Some((id, bytes)) = self.part_victim(&s, Some(downloading), &stuck) else {
                 break;
             };
             if !self.remove_part_locked(&id, bytes, "low_disk") {
-                break;
+                stuck.insert(id);
+                continue;
             }
             now = now.saturating_add(bytes);
         }
@@ -2841,6 +2857,50 @@ pub(crate) mod tests {
         assert!(verdict.is_ok(), "{verdict:?}");
         assert!(folder.exists());
         assert!(!c.part_path("file").exists(), "the regular part stayed");
+    }
+
+    /// CR 4642574328: a part whose unlink fails is passed over for the
+    /// rest of the pass. The next oldest goes, the stuck one's bytes are
+    /// not credited, and the admission is approved.
+    #[test]
+    fn an_admission_tries_the_next_part_when_one_will_not_go() {
+        let d = tmp("evict-part-stuck");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file()))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 1000).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        retained(&c, "old", 600, 900);
+        retained(&c, "new", 900, 100);
+        // The oldest turns into a folder as its eviction starts: its unlink
+        // fails.
+        let stuck = c.part_path("old");
+        BEFORE_PART_EVICT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&stuck).unwrap();
+                std::fs::create_dir(&stuck).unwrap();
+                std::fs::write(stuck.join("x"), b"x").unwrap();
+            }));
+        });
+        crate::testlog::start();
+        let verdict = c.ensure_free("x", 300);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(c.part_path("old").is_dir());
+        assert!(!c.part_path("new").exists(), "the next part was not tried");
+        assert_eq!(c.take_evicted_parts(), vec!["new".to_owned()]);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines.iter().any(|l| l.contains("id=old")
+                && l.contains("verdict=kept kind=part reason=remove_failed")),
+            "{lines:?}"
+        );
     }
 
     /// CR 4640611255: a job that starts while an eviction holds the cache's
