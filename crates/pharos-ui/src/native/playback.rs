@@ -114,6 +114,17 @@ impl Fatal {
         self.kind == FailureKind::Damaged
     }
 
+    /// [`Self::from_hls`] for an error whose fetch got `status` (0 when it got
+    /// none): an HTTP failure is the server's, as the Rust engine reports it.
+    pub fn from_hls_answer(kind: &str, details: &str, status: u16) -> Self {
+        if (400..600).contains(&status) {
+            let reason = format!("the stream failed ({kind}: {details}, HTTP {status})");
+            Self::of(FailureKind::of_status(status), reason)
+        } else {
+            Self::from_hls(kind, details)
+        }
+    }
+
     /// hls.js reports media it could not parse or append as a `mediaError`
     /// with these details; a stall, a full buffer or a codec the browser
     /// lacks is a `mediaError` too, but not damage. A codec the browser
@@ -136,6 +147,20 @@ impl Fatal {
             Self::other(reason)
         }
     }
+}
+
+/// What to do about an hls.js error that carried an HTTP status, before the
+/// recovery budget is asked: `Some(Fail)` where no retry can change the
+/// answer, `None` to go on as the error's kind says (B1488).
+///
+/// A 401 or 403 fails at its first sight, fatal or not: hls.js would try the
+/// other renditions and `startLoad` would ask again, each refused the same
+/// way, while an ended session's mark waits to renegotiate. Any other 4xx
+/// hls.js gave up on fails too, since `startLoad` would only repeat it.
+pub fn hls_refusal(kind: &str, status: u16, fatal: bool) -> Option<Recovery> {
+    let refused = kind == "networkError" && (400..500).contains(&status);
+    let denied = matches!(status, 401 | 403);
+    (refused && (fatal || denied)).then_some(Recovery::Fail)
 }
 
 /// One video fragment the engine downloaded, for measuring the connection.
@@ -3352,6 +3377,34 @@ mod tests {
         ] {
             assert_eq!(FailureKind::of_media_error(details), want, "{details}");
         }
+    }
+
+    /// V1479: an hls.js fetch the server refused fails as the server's
+    /// failure at once, and a 401 does not wait for hls.js to give up.
+    #[test]
+    fn an_hlsjs_refusal_fails_at_once_as_the_servers() {
+        assert_eq!(
+            hls_refusal("networkError", 401, false),
+            Some(Recovery::Fail)
+        );
+        assert_eq!(
+            hls_refusal("networkError", 403, false),
+            Some(Recovery::Fail)
+        );
+        assert_eq!(hls_refusal("networkError", 404, true), Some(Recovery::Fail));
+        // A level gone while others play: hls.js may switch away from it.
+        assert_eq!(hls_refusal("networkError", 404, false), None);
+        // The server's own failure and a lost network keep their retries.
+        assert_eq!(hls_refusal("networkError", 503, true), None);
+        assert_eq!(hls_refusal("networkError", 0, true), None);
+        assert_eq!(hls_refusal("mediaError", 401, true), None);
+        let refused = Fatal::from_hls_answer("networkError", "fragLoadError", 401);
+        assert_eq!(refused.kind, FailureKind::Server);
+        assert!(refused.reason.contains("HTTP 401"), "{}", refused.reason);
+        assert_eq!(
+            Fatal::from_hls_answer("networkError", "fragLoadError", 0),
+            Fatal::from_hls("networkError", "fragLoadError")
+        );
     }
 
     /// 038 FR-403: a codec the browser lacks is the browser's limit, a
