@@ -761,6 +761,23 @@ pub fn segment_deadlines(device: DeviceClass) -> pharos_hls::retry::Deadlines {
     }
 }
 
+/// How much the Rust engine buffers on `device`. A desktop takes hls.js's
+/// settings ([`hls_buffer_config`]), so a seek ahead lands in data that is
+/// already there as often as it does under hls.js; a TV or phone keeps the
+/// engine's 30 s, the memory it was measured with.
+pub fn engine_buffer_config(device: DeviceClass) -> pharos_hls::planner::Config {
+    use pharos_hls::planner::Config;
+    match device {
+        DeviceClass::Desktop => Config {
+            forward_ms: (HLS_FORWARD_S * 1_000.0) as u64,
+            forward_bytes: HLS_FORWARD_BYTES as u64,
+            forward_ceiling_ms: (HLS_FORWARD_CEILING_S * 1_000.0) as u64,
+            ..Config::default()
+        },
+        DeviceClass::Tv | DeviceClass::Phone => Config::default(),
+    }
+}
+
 /// What the Rust engine does about one failed segment request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentRecovery {
@@ -5069,6 +5086,20 @@ mod tests {
             assert!(d.load_ms > desktop.load_ms);
         }
         assert_eq!(desktop.first_byte_ms, 10_000);
+    }
+
+    #[test]
+    fn a_desktop_buffers_as_far_ahead_as_hls_js_and_weak_devices_do_not() {
+        let desktop = engine_buffer_config(DeviceClass::Desktop);
+        assert_eq!(desktop.forward_ms, 45_000);
+        assert_eq!(desktop.forward_ceiling_ms, 120_000);
+        assert_eq!(desktop.forward_bytes, 60_000_000);
+        for weak in [DeviceClass::Tv, DeviceClass::Phone] {
+            assert_eq!(
+                engine_buffer_config(weak),
+                pharos_hls::planner::Config::default()
+            );
+        }
     }
 
     #[test]

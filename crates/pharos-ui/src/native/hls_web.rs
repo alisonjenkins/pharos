@@ -20,11 +20,11 @@ use super::platform::{
     video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, playlist_retry_policy,
-    ranges_to_ms, rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal,
-    FragmentLoad, HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal,
-    OnFragment, PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery,
-    StallReport,
+    abr_ladder, check_master, engine_buffer_config, forward_buffer_ms, pick_audio_uri, plan_hls,
+    playlist_retry_policy, ranges_to_ms, rung_label, segment_deadlines, with_abr, AbrSwitchReport,
+    FailureKind, Fatal, FragmentLoad, HlsFallbackCause, MediaRecovery, MediaRecoveryReport,
+    MediaVerdict, OnFatal, OnFragment, PlannerNoteReport, PlaybackEngine, SegmentFailureReport,
+    SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -142,6 +142,7 @@ struct Session {
     planner: Option<Planner>,
     deadlines: Deadlines,
     device: &'static str,
+    buffer: Config,
     abr: Option<AbrState>,
     video_track: Option<TrackRunner>,
     audio_track: Option<TrackRunner>,
@@ -218,6 +219,7 @@ impl PlaybackEngine for RustHls {
             planner: None,
             deadlines,
             device: device.label(),
+            buffer: engine_buffer_config(device),
             abr: None,
             video_track: None,
             audio_track: None,
@@ -473,7 +475,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     let Some(session) = weak.upgrade() else {
         return;
     };
-    let Some((video, media_source, deadlines, device)) = ({
+    let Some((video, media_source, deadlines, device, buffer)) = ({
         let s = session.borrow();
         (!s.dead).then(|| {
             (
@@ -481,6 +483,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 s.media_source.clone(),
                 s.deadlines,
                 s.device,
+                s.buffer,
             )
         })
     }) else {
@@ -545,7 +548,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
         video_pl.segments,
         true,
         audio_pl.map(|a| (a.segments, true)),
-        Config::default(),
+        buffer,
         start_ms,
     );
 
@@ -581,8 +584,14 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     let audio_label = plan.audio_mime.as_deref().unwrap_or("none");
     info(&format!(
-        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} url={url}",
-        plan.video_mime, deadlines.first_byte_ms, deadlines.load_ms,
+        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} forward_ms={} forward_ceiling_ms={} forward_bytes={} back_ms={} url={url}",
+        plan.video_mime,
+        deadlines.first_byte_ms,
+        deadlines.load_ms,
+        buffer.forward_ms,
+        buffer.forward_ceiling_ms,
+        buffer.forward_bytes,
+        buffer.back_ms,
     ));
 
     pump(&session);
@@ -1839,6 +1848,14 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
                 t.quota_tries = 0;
             }
             if let Some(planner) = s.planner.as_mut() {
+                if let Some(RunningOp::Append {
+                    request: SegRequest::Media(_),
+                    bytes,
+                    ..
+                }) = &finished
+                {
+                    planner.media_bytes(track, *bytes);
+                }
                 planner.appended(track);
             }
         }
