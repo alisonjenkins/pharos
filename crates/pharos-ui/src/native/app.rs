@@ -6289,9 +6289,16 @@ fn track_notice(audio: bool) -> String {
 }
 
 /// The line shown while the quality step renegotiates from `from` to `to` bps.
+/// A cap of 0 is no cap: the stream goes back to its source rate.
 fn quality_notice(from: u64, to: u64) -> String {
-    let verb = if to < from { "Lowering" } else { "Raising" };
-    format!("{verb} quality to {} Mbps", to / 1_000_000)
+    match (from, to) {
+        (_, 0) => "Raising quality to the original".to_owned(),
+        (0, to) => format!("Lowering quality to {} Mbps", to / 1_000_000),
+        (from, to) => {
+            let verb = if to < from { "Lowering" } else { "Raising" };
+            format!("{verb} quality to {} Mbps", to / 1_000_000)
+        }
+    }
 }
 
 /// The `ui_action` of a play RPC made in `view`.
@@ -9023,6 +9030,16 @@ mod tests {
             quality_notice(2_000_000, 8_000_000),
             "Raising quality to 8 Mbps"
         );
+    }
+
+    /// Auto quality uses a cap of 0 for "no cap", in both directions (B1481).
+    #[test]
+    fn a_quality_notice_reads_a_zero_cap_as_no_cap() {
+        assert_eq!(
+            quality_notice(8_000_000, 0),
+            "Raising quality to the original"
+        );
+        assert_eq!(quality_notice(0, 8_000_000), "Lowering quality to 8 Mbps");
     }
 
     /// An audio track the viewer did not ask for is left to the server's
