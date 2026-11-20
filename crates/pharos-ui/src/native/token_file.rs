@@ -54,17 +54,20 @@ pub fn pair(path: &Path, seen: Option<&str>, user: &str) -> Result<(), String> {
 /// `owner` ([`token_for_owner`](super::kept_video::token_for_owner)). Err
 /// names the refusal; nothing is sent. The phone's fetcher and its host
 /// tests decide through this one function. `fence` is the process's
-/// sign-out fence ([`SignOutFence`]): the token it names is refused, and
-/// one that names none refuses every request before the file is read.
-pub fn run_token(path: &Path, owner: &str, fence: &SignOutFence) -> Result<String, String> {
-    if *fence == SignOutFence::Every {
-        return Err(format!("signed_out_token_not_removed owner={owner}"));
-    }
-    let stored = read(path).map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
-    if token.as_deref().is_some_and(|t| fence.refuses(t)) {
-        return Err(format!("signed_out_token_not_removed owner={owner}"));
-    }
+/// sign-out fence ([`SignOutFence`]), read with the token under the file's
+/// lock (`pharos_content::token::read_for_run`): the token it names is
+/// refused, and one that names none refuses every request.
+pub fn run_token(path: &Path, owner: &str) -> Result<String, String> {
+    watch_stores();
+    let read = pharos_content::token::read_for_run(path)
+        .map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
+    let (token, user) = match read {
+        pharos_content::token::RunRead::Fenced => {
+            return Err(format!("signed_out_token_not_removed owner={owner}"));
+        }
+        pharos_content::token::RunRead::NoToken => (None, None),
+        pharos_content::token::RunRead::Token(s) => (Some(s.token), s.user),
+    };
     super::kept_video::token_for_owner(token.as_deref(), user.as_deref(), owner)
 }
 
@@ -286,20 +289,23 @@ mod sign_out_tests {
         let path = d.path().join("device-token");
         store(&path, "tok").unwrap();
         pair(&path, Some("tok"), "u1").unwrap();
-        let fenced = SignOutFence::for_token(Some("tok"));
+        assert_eq!(run_token(&path, "u1"), Ok("tok".to_owned()));
+        add_fence(&path, &SignOutFence::for_token(Some("tok")), "test");
         assert_eq!(
-            run_token(&path, "u1", &fenced),
+            run_token(&path, "u1"),
             Err("signed_out_token_not_removed owner=u1".to_owned()),
             "a fenced process sent the signed-out token"
         );
+        add_fence(&path, &SignOutFence::Every, "test");
         assert_eq!(
-            run_token(&path, "u1", &SignOutFence::Open),
-            Ok("tok".to_owned())
-        );
-        assert_eq!(
-            run_token(&path, "u1", &SignOutFence::Every),
+            run_token(&path, "u1"),
             Err("signed_out_token_not_removed owner=u1".to_owned())
         );
+        // A store after the fence was set: that token is the one read with
+        // the fence in force now, and it is sent (body item android.rs:221).
+        pharos_content::token::store(&path, "tok2").unwrap();
+        pair(&path, Some("tok2"), "u1").unwrap();
+        assert_eq!(run_token(&path, "u1"), Ok("tok2".to_owned()));
     }
 
     /// CR 4637783579: the fence names the token the sign-out left, so a
@@ -314,11 +320,12 @@ mod sign_out_tests {
         pair(&path, Some("tokA"), "u1").unwrap();
         let fence = SignOutFence::for_token(Some("tokA"));
         assert!(fence.refuses("tokA"));
+        add_fence(&path, &fence, "test");
         // Another sign-in's token, stored past the phone's own path.
         pharos_content::token::store(&path, "tokB").unwrap();
         pair(&path, Some("tokB"), "u1").unwrap();
         assert!(!fence.refuses("tokB"));
-        assert_eq!(run_token(&path, "u1", &fence), Ok("tokB".to_owned()));
+        assert_eq!(run_token(&path, "u1"), Ok("tokB".to_owned()));
         assert!(SignOutFence::for_token(None).refuses("tokB"));
         assert!(!SignOutFence::Open.refuses("tokB"));
     }
@@ -340,7 +347,7 @@ mod sign_out_tests {
         assert_eq!(fence(&path), SignOutFence::Every);
         pharos_content::token::store(&path, "tokB").unwrap();
         pair(&path, Some("tokB"), "u1").unwrap();
-        assert_eq!(run_token(&path, "u1", &fence(&path)), Ok("tokB".to_owned()));
+        assert_eq!(run_token(&path, "u1"), Ok("tokB".to_owned()));
     }
 
     /// CR 4638691172, second ordering: a store of B between the caller's
@@ -365,7 +372,7 @@ mod sign_out_tests {
         assert_eq!(held.as_deref(), Some("tokA"));
         assert_eq!(fence(&path), SignOutFence::for_token(Some("tokB")));
         assert!(
-            run_token(&path, "u1", &fence(&path)).is_err(),
+            run_token(&path, "u1").is_err(),
             "the signed-out token B was sent"
         );
     }
@@ -478,7 +485,7 @@ mod sign_out_tests {
         pharos_content::token::store(&path, "tokB").unwrap();
         pair(&path, Some("tokB"), "u1").unwrap();
         assert_eq!(
-            run_token(&path, "u1", &fence(&path)),
+            run_token(&path, "u1"),
             Ok("tokB".to_owned()),
             "the QuickConnect token stayed refused"
         );

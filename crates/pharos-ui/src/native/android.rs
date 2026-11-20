@@ -218,7 +218,8 @@ fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
 /// sign-out fence as `load_token`. Never log the token.
 pub fn run_token(owner: &str) -> Result<String, String> {
     let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    let decided = token_file::run_token(&path, owner, &fence(&path));
+    // The fence is read with the token, under the file's lock.
+    let decided = token_file::run_token(&path, owner);
     if decided
         .as_ref()
         .is_err_and(|e| e.starts_with("signed_out_token_not_removed"))
