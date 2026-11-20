@@ -1020,11 +1020,14 @@ fn secs_to_ms(s: f64) -> u64 {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "ev", rename_all = "lowercase")]
 pub enum HlsEvent {
-    /// `Hls.Events.ERROR`: its `type` and `details`.
+    /// `Hls.Events.ERROR`: its `type` and `details`, and the HTTP status its
+    /// fetch got (0 for none).
     Error {
         kind: String,
         details: String,
         fatal: bool,
+        #[serde(default)]
+        status: u16,
     },
     /// `Hls.Events.FRAG_LOADED` for a main or audio fragment.
     Frag {
@@ -2290,10 +2293,20 @@ mod tests {
                 event: HlsEvent::Error {
                     kind: "networkError".into(),
                     details: "fragLoadError".into(),
-                    fatal: true
+                    fatal: true,
+                    status: 0,
                 }
             })
         );
+        let refused = serde_json::json!({"t": "hls", "id": "v", "ev": "error",
+            "kind": "networkError", "details": "fragLoadError", "fatal": false, "status": 401});
+        assert!(matches!(
+            parse_bridge(&refused),
+            Some(Bridge::Hls {
+                event: HlsEvent::Error { status: 401, .. },
+                ..
+            })
+        ));
         let f = serde_json::json!({"t": "hls", "id": "v", "ev": "frag",
             "bytes": 10, "load_ms": 2, "media_ms": 4000});
         assert_eq!(
