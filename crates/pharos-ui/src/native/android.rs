@@ -270,29 +270,19 @@ pub fn store_token(token: &str) -> Result<(), String> {
 /// cannot be found. The operation then narrows it to the token it left, or
 /// a store replaces it. A service that connects later reads it too.
 pub fn forget_token() -> token_file::SignedOut {
-    let path = token_path();
-    match &path {
-        Ok(path) => {
-            token_file::set_fence(path, token_file::SignOutFence::Every, "sign_out_started")
-        }
-        Err(_) => token_file::fence_every_file("token_path_unknown"),
-    }
-    let verdict = {
-        let mut cached = token_lock();
-        *cached = Some(None);
-        match path {
-            Ok(path) => {
-                drop_legacy_user(&path);
-                token_file::sign_out(&path)
+    token_file::forget_token_with(
+        token_path,
+        |path| {
+            *token_lock() = Some(None);
+            if let Some(path) = path {
+                drop_legacy_user(path);
             }
-            Err(e) => token_file::SignedOut::NotSaved(e),
-        }
-    };
-    match &verdict {
-        token_file::SignedOut::NotSaved(_) => note_credentials_kept(),
-        _ => note_credentials_changed("forgotten"),
-    }
-    verdict
+        },
+        |notice| match notice {
+            token_file::ServiceNotice::StaySignedOut => note_credentials_kept(),
+            token_file::ServiceNotice::Reload => note_credentials_changed("forgotten"),
+        },
+    )
 }
 
 /// Drops the token a session ended (or a resume was refused) with, only

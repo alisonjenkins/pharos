@@ -166,6 +166,53 @@ pub fn sign_out(path: &Path) -> SignedOut {
     }
 }
 
+/// What a sign-out asks of the media service in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceNotice {
+    /// The token could not be ended: stay signed out, do not reload.
+    StaySignedOut,
+    /// The token file changed: read it again.
+    Reload,
+}
+
+/// The phone's sign-out (`android::forget_token`), with its platform parts
+/// passed in: `path_lookup` finds the token file, `clear` drops what the
+/// caller cached (with the path, when there is one), and `notifier` tells
+/// the media service. Every exit publishes a fence first, so no early
+/// return can skip it: every token at the file's path, or at every path
+/// when the path cannot be found. The sign-out operation then narrows it to
+/// the token it left, or a store replaces it. A `NotSaved`, the failed
+/// lookup included, asks the service to stay signed out.
+pub fn forget_token_with(
+    path_lookup: impl FnOnce() -> Result<PathBuf, String>,
+    clear: impl FnOnce(Option<&Path>),
+    notifier: impl FnOnce(ServiceNotice),
+) -> SignedOut {
+    let path = path_lookup();
+    match &path {
+        Ok(path) => set_fence(path, SignOutFence::Every, "sign_out_started"),
+        Err(_) => fence_every_file("token_path_unknown"),
+    }
+    let verdict = match path {
+        Ok(path) => {
+            clear(Some(&path));
+            sign_out(&path)
+        }
+        Err(e) => {
+            clear(None);
+            log::warn!(
+                "pharos: token forget verdict=not_removed reason=token_path_unknown error={e}"
+            );
+            SignedOut::NotSaved(e)
+        }
+    };
+    notifier(match verdict {
+        SignedOut::NotSaved(_) => ServiceNotice::StaySignedOut,
+        _ => ServiceNotice::Reload,
+    });
+    verdict
+}
+
 /// Ends a session's hold on the token (`pharos_content::token::end_session`):
 /// the token goes while it is `seen` (any with `None`), a replacement is
 /// kept, and one that will not go is marked revoked for `user`.
@@ -188,7 +235,7 @@ pub fn legacy_user_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod sign_out_tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
@@ -301,6 +348,69 @@ mod sign_out_tests {
             run_token(&path, "u1", &fence(&path)).is_err(),
             "the signed-out token B was sent"
         );
+    }
+
+    /// CR 4639608778, 4639798750: a sign-out whose token path cannot be
+    /// found goes through `forget_token_with` as the phone's does. It fences
+    /// every token file, tells the service to stay signed out, and a later
+    /// reload of the service stays signed out. The fence is process-wide,
+    /// so the body runs in a child process of its own, never under another
+    /// test's token reads.
+    #[test]
+    fn a_sign_out_with_no_token_path_keeps_the_service_signed_out() {
+        const CHILD: &str = "PHAROS_TEST_FORGET_NO_PATH";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!(
+                        "{}::a_sign_out_with_no_token_path_keeps_the_service_signed_out",
+                        module_path!().trim_start_matches("pharos_ui::")
+                    ),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "the child ran nothing: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+        let d = super::super::test_dir::TmpDir::new("forget-no-path");
+        let path = d.path().join("device-token");
+        store(&path, "kept-token").unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let lib = pharos_content::Library::connect_with(
+            &server,
+            &path,
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        let notices = std::cell::RefCell::new(Vec::new());
+        let out = forget_token_with(
+            || Err("no files dir".to_owned()),
+            |_| {},
+            |n| notices.borrow_mut().push(n),
+        );
+        assert!(matches!(out, SignedOut::NotSaved(_)), "{out:?}");
+        assert_eq!(*notices.borrow(), [ServiceNotice::StaySignedOut]);
+        lib.reload_credentials()
+            .expect("the reload tried the token the sign-out left");
+        assert_eq!(lib.auth_state(), pharos_content::AuthState::SignedOut);
     }
 
     /// CR 4638522305: a sign-out that could not read its token fences every
