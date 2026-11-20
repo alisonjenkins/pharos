@@ -5377,6 +5377,7 @@ fn offline_playing(
         session,
         grant: RefCell::new(None),
         grant_gen: Cell::new(grant_gen),
+        session_suspect: Cell::new(false),
         track_map,
         audio: copy.audio,
         subtitle: None,
@@ -5410,6 +5411,11 @@ struct Playing {
     offline: Option<OfflineSave>,
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
+    /// A renewal was not adopted, so `session` may have ended. A fragment
+    /// that loads proves nothing: a released session still serves segments
+    /// until its grace runs out. Cleared by a renewal that adopts the
+    /// session, or spent by the failure it renegotiates.
+    session_suspect: Cell<bool>,
     detail: Detail,
     /// The version playing, so a renewed grant stays on that file (empty: the primary).
     version: String,
@@ -5650,6 +5656,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The API generation the latest negotiation started on.
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
+    // Bumped when a renewal marks the session suspect, so a failure the
+    // player showed before the renewal answered is looked at again.
+    let mut suspect_marks = use_signal(|| 0u32);
     let negotiated_at = Rc::clone(&negotiated_gen);
     let gap_notify = Rc::clone(&notify);
     let carry_flag = Rc::clone(&picks_in_primary);
@@ -5858,6 +5867,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         grant: RefCell::new(Some(grant)),
                         offline: None,
                         grant_gen: Cell::new(grant_gen),
+                        session_suspect: Cell::new(false),
                         detail,
                         version,
                         track_map,
@@ -5933,7 +5943,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // When the grant is from an older API (a reconnect, even one during the
     // first negotiation), the stream keeps going and only the grant is
-    // negotiated again.
+    // negotiated again. A renewal the server did not adopt has a new play
+    // session: the stream's own may have ended with the grace, so its next
+    // network failure renegotiates instead of failing (B1482).
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -5966,21 +5978,40 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api
+                    .play(
+                        &info,
+                        id,
+                        &p.0.version,
+                        &negotiation_capabilities(kind, *auto_cap.peek()),
+                        asked,
+                    )
+                    .await
+                {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
+                        let adopted = decision.play_session == p.0.session;
+                        p.0.session_suspect.set(!adopted);
+                        if !adopted {
+                            suspect_marks += 1;
+                        }
                         platform::info(&format!(
-                            "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
+                            "pharos: playback grant renewed after reconnect method={} attempt={attempt} adopted={adopted}",
                             decision.method
                         ));
                         return;
                     }
                     Ok(_) => return,
                     Err(_) if *api_gen.peek() != gen => return,
-                    Err(e) if attempt == RENEW_ATTEMPTS => platform::warn(&format!(
-                        "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
-                    )),
+                    Err(e) if attempt == RENEW_ATTEMPTS => {
+                        // No grant holds the stream's session now: it ends with the grace.
+                        p.0.session_suspect.set(true);
+                        suspect_marks += 1;
+                        platform::warn(&format!(
+                            "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
+                        ));
+                    }
                     Err(e) => {
                         platform::warn(&format!(
                             "pharos: playback grant renewal retry attempt={attempt}: {e}"
@@ -6135,6 +6166,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         notice: notice(),
                         manual_cap: manual_cap(),
                         auto_cap: auto_cap(),
+                        suspect_marks,
                         on_quality_pick: {
                             let (watch, notify) = (watch.clone(), Rc::clone(&notify));
                             move |pick: Option<u64>| {
@@ -6288,10 +6320,32 @@ fn track_notice(audio: bool) -> String {
     .to_owned()
 }
 
+/// A network or server failure on a stream whose session may have ended over a
+/// reconnect negotiates a new one, where the viewer would otherwise be shown
+/// the failure.
+fn renegotiates_quietly(kind: FailureKind, session_suspect: bool) -> bool {
+    // The Rust engine names an HTTP refusal (the ended session's 401) a
+    // server failure; hls.js names it a network one.
+    session_suspect && matches!(kind, FailureKind::Network | FailureKind::Server)
+}
+
+/// A failure already on screen when the session turns suspect is one
+/// [`renegotiates_quietly`] would have cured had the mark come first.
+fn shown_failure_renegotiates(shown: Option<&PlayFailure>, session_suspect: bool) -> bool {
+    shown.is_some_and(|f| renegotiates_quietly(f.kind, session_suspect))
+}
+
 /// The line shown while the quality step renegotiates from `from` to `to` bps.
+/// A cap of 0 is no cap: the stream goes back to its source rate.
 fn quality_notice(from: u64, to: u64) -> String {
-    let verb = if to < from { "Lowering" } else { "Raising" };
-    format!("{verb} quality to {} Mbps", to / 1_000_000)
+    match (from, to) {
+        (_, 0) => "Raising quality to the original".to_owned(),
+        (0, to) => format!("Lowering quality to {} Mbps", to / 1_000_000),
+        (from, to) => {
+            let verb = if to < from { "Lowering" } else { "Raising" };
+            format!("{verb} quality to {} Mbps", to / 1_000_000)
+        }
+    }
 }
 
 /// The `ui_action` of a play RPC made in `view`.
@@ -6467,6 +6521,8 @@ fn Player(
     on_advance: EventHandler<ItemRef>,
     watch: QualityWatch,
     on_quality: EventHandler<u64>,
+    /// Bumped each time a renewal marks this playback's session suspect.
+    suspect_marks: Signal<u32>,
     slot: Slot,
     fade_in: FadeIn,
 ) -> Element {
@@ -7230,6 +7286,19 @@ fn Player(
                     stop();
                     let kind = fatal.kind;
                     let reason = fatal.reason;
+                    // Only a failure the renegotiate can cure spends the mark.
+                    if renegotiates_quietly(kind, p.session_suspect.get()) {
+                        p.session_suspect.set(false);
+                        platform::warn(&format!(
+                            "pharos: playback stream session gone after reconnect, renegotiating item={playing_id} at_ms={} reason={reason}",
+                            last_ms.get()
+                        ));
+                        on_renegotiate.call(TrackPicks {
+                            audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                            subtitle: choice(*subtitle.peek()),
+                        });
+                        continue;
+                    }
                     // Music keeps its own screen, and a group plays one
                     // timeline for all: neither is offered a skip.
                     let skippable = kind == FailureKind::Damaged
@@ -7270,6 +7339,27 @@ fn Player(
                     }));
                 }
             }
+        }
+    });
+    // A failure shown before the renewal marked the session suspect gets
+    // the renegotiation it would have had (B1482).
+    use_effect({
+        let (p, last_ms) = (Rc::clone(&p), Rc::clone(&last_ms.0));
+        move || {
+            suspect_marks.read();
+            if !shown_failure_renegotiates(failed.peek().as_ref(), p.session_suspect.get()) {
+                return;
+            }
+            p.session_suspect.set(false);
+            failed.set(None);
+            platform::warn(&format!(
+                "pharos: playback stream session gone after reconnect, renegotiating shown failure item={playing_id} at_ms={}",
+                last_ms.get()
+            ));
+            on_renegotiate.call(TrackPicks {
+                audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                subtitle: choice(*subtitle.peek()),
+            });
         }
     });
     // Before the stream attaches, so autoplay never starts at full volume.
@@ -9023,6 +9113,39 @@ mod tests {
             quality_notice(2_000_000, 8_000_000),
             "Raising quality to 8 Mbps"
         );
+    }
+
+    /// Only a network failure after an unadopted renewal renegotiates without
+    /// showing the failure (B1482).
+    #[test]
+    fn only_a_network_failure_on_a_suspect_session_renegotiates_quietly() {
+        assert!(renegotiates_quietly(FailureKind::Network, true));
+        assert!(renegotiates_quietly(FailureKind::Server, true));
+        assert!(!renegotiates_quietly(FailureKind::Server, false));
+        assert!(!renegotiates_quietly(FailureKind::Network, false));
+        assert!(!renegotiates_quietly(FailureKind::Damaged, true));
+    }
+
+    /// A network failure shown before the renewal marked the session
+    /// suspect is renegotiated once the mark lands; nothing else is (B1482).
+    #[test]
+    fn a_failure_shown_before_the_mark_renegotiates_once_marked() {
+        let network = PlayFailure::stream(FailureKind::Network, "HTTP 401");
+        let damaged = PlayFailure::damaged("decode", None);
+        assert!(shown_failure_renegotiates(Some(&network), true));
+        assert!(!shown_failure_renegotiates(Some(&network), false));
+        assert!(!shown_failure_renegotiates(Some(&damaged), true));
+        assert!(!shown_failure_renegotiates(None, true));
+    }
+
+    /// Auto quality uses a cap of 0 for "no cap", in both directions (B1481).
+    #[test]
+    fn a_quality_notice_reads_a_zero_cap_as_no_cap() {
+        assert_eq!(
+            quality_notice(8_000_000, 0),
+            "Raising quality to the original"
+        );
+        assert_eq!(quality_notice(0, 8_000_000), "Lowering quality to 8 Mbps");
     }
 
     /// An audio track the viewer did not ask for is left to the server's
