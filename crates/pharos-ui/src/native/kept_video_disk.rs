@@ -11794,7 +11794,10 @@ pub(crate) mod tests {
             let inner = store.inner.clone();
             std::thread::spawn(move || inner.sweep_relist(Sweep::Ordinary))
         };
-        wait_check.recv().unwrap();
+        // Bounded: a sweep that skipped its scan never sends it.
+        wait_check
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("the first sweep never reached its \"checked\" step: {e}"));
         // A second sweep while the first is between its check and its scan.
         store.inner.sweep_relist(Sweep::Ordinary);
         go.send(()).unwrap();
