@@ -894,18 +894,70 @@ pub fn store_published() {
         }
     });
     match (reason, store()) {
-        (None, Some(store)) => match start_resume_if(at, &user, &*store) {
-            Ok(()) => super::platform::info(&format!(
-                "pharos: video keep resume verdict=resumed reason=store_published_after_sign_in user={user}"
-            )),
-            Err(now) => super::platform::info(&format!(
-                "pharos: video keep resume verdict=not_resumed reason=identity_changed_since_validated user={user} at={at} now={now}"
-            )),
-        },
+        (None, Some(store)) => {
+            let mut at = at;
+            for attempt in 1..=RESUME_REVALIDATIONS {
+                let Err(now) = start_resume_if(at, &user, &*store) else {
+                    super::platform::info(&format!(
+                        "pharos: video keep resume verdict=resumed reason=store_published_after_sign_in user={user} attempt={attempt}"
+                    ));
+                    return;
+                };
+                // The generation moved since the validation. A reconnect
+                // with the same credentials (A kept, same token) moves it
+                // too: revalidated against the session as it is now, the
+                // resume goes on at the new generation. A sign-out or a
+                // credential change still refuses it.
+                match revalidate_resume(&user, &seen) {
+                    Ok(next) if attempt < RESUME_REVALIDATIONS => {
+                        super::platform::info(&format!(
+                            "pharos: video keep resume verdict=revalidated reason=same_session_credentials user={user} at={at} now={now} attempt={attempt}"
+                        ));
+                        at = next;
+                    }
+                    Ok(_) => super::platform::info(&format!(
+                        "pharos: video keep resume verdict=not_resumed reason=generation_kept_moving user={user} at={at} now={now} attempt={attempt}"
+                    )),
+                    Err(why) => {
+                        super::platform::info(&format!(
+                            "pharos: video keep resume verdict=not_resumed reason={why} user={user} at={at} now={now}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         (why, _) => super::platform::info(&format!(
             "pharos: video keep resume verdict=not_resumed reason={} user={user}",
             why.unwrap_or("store_not_published")
         )),
+    }
+}
+
+/// How many times an owed resume is revalidated after the generation
+/// moved under it before it gives up.
+const RESUME_REVALIDATIONS: u32 = 3;
+
+/// An owed resume validated for `user` with the paired token `seen`, whose
+/// generation moved before it started: the generation to start at when
+/// `user` is still signed in, the current session's token is still `seen`
+/// and the token on file is still paired with them; else why not.
+fn revalidate_resume(user: &str, seen: &TokenSeen) -> Result<u64, &'static str> {
+    let (at, signed_in, same_token) = with_id(|st| {
+        (
+            st.generation,
+            st.identity == Identity::User(user.to_owned()),
+            st.session_token.as_ref() == Some(seen),
+        )
+    });
+    if !signed_in {
+        Err("identity_changed_since_validated")
+    } else if !same_token {
+        Err("credentials_changed_since_validated")
+    } else if paired_user(seen).as_deref() != Some(user) {
+        Err("token_not_paired")
+    } else {
+        Ok(at)
     }
 }
 
@@ -2511,6 +2563,60 @@ pub(crate) mod tests {
                 store.video_bytes("A"),
                 0,
                 "bytes landed after the session end"
+            );
+        });
+    }
+
+    /// Outside diff offline_video.rs:901 (review 5995575621), the control
+    /// beside the test above: a reconnect with A's same token between the
+    /// owed resume's validation and its start moves the generation but
+    /// keeps A. The resume is revalidated against the session now and
+    /// goes on: A's parked download sends its requests.
+    #[test]
+    fn a_same_token_reconnect_between_a_resumes_validation_and_its_start_resumes() {
+        use super::super::kept_video_disk::tests::stream_files;
+        use super::super::token_file;
+        let d = TmpDir::new("reconnect-mid-resume");
+        let path = d.path().join("device-token");
+        let videos = d.path().join("videos");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let fetcher = FileFetcher::serving(&path, stream_files());
+            {
+                let before = disk_store(&videos, fetcher.clone());
+                first_request_decided(&before, &fetcher, "A", "1").await;
+                before.settled().await;
+            }
+            late_slot();
+            let store = disk_store(&videos, fetcher.clone());
+            store.settled().await;
+            let Resumed::Opened(session_a) = resume_session(&FakeResumer::new(&path)).await else {
+                panic!("A's token did not open A's session");
+            };
+            let Resumed::Opened(again) = resume_session(&FakeResumer::new(&path)).await else {
+                panic!("A's token did not open A's second session");
+            };
+            session_replaced(&session_a);
+            assert!(me_request(true, Some(session_a)).unwrap().answered("A"));
+            let _ = super::super::platform::take_info_lines();
+            AFTER_RESUME_VALIDATED.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || session_replaced(&again)));
+            });
+            super::super::ports::register_video_store(store.clone()).unwrap();
+            store.settled().await;
+            super::super::ports::use_test_video_slot(None);
+            assert!(
+                !fetcher.sent().is_empty(),
+                "a same-token reconnect lost A's owed resume"
+            );
+            let info = super::super::platform::take_info_lines();
+            assert!(
+                info.iter()
+                    .any(|l| l.starts_with("pharos: video keep resume")
+                        && l.contains("verdict=revalidated reason=same_session_credentials")),
+                "{info:?}"
             );
         });
     }
