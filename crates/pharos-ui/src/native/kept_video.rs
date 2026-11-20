@@ -391,42 +391,44 @@ pub fn request_key(url: &str) -> String {
 /// path too. The query is kept as it is; a key with no encoded dot
 /// segment is returned unchanged.
 fn without_encoded_dots(key: String) -> String {
-    let (path, query) = key.split_at(key.find('?').unwrap_or(key.len()));
-    let dot = |s: &str| s == "." || s.eq_ignore_ascii_case("%2e");
+    match decoded_dot_segments(&key) {
+        Some(decoded) => without_dot_segments(&decoded),
+        None => key,
+    }
+}
+
+/// `r` with each percent-encoded dot segment (`%2e`, `.%2E`, `%2e%2e`,
+/// any case) spelled as the `.` or `..` a URL parser reads it as, its
+/// literal ones and its query left as they are, so one later pass removes
+/// both kinds together in path order. None when it has no encoded one.
+fn decoded_dot_segments(r: &str) -> Option<String> {
+    let (path, query) = r.split_at(r.find(['?', '#']).unwrap_or(r.len()));
     let encoded = |s: &str| s.contains('%') && s.len() <= 6;
     let mut changed = false;
-    let segments: Vec<String> = path
+    let segments: Vec<&str> = path
         .split('/')
         .map(|s| {
-            let decoded = if encoded(s) {
-                if dot(s) {
-                    Some(".")
-                } else if s.len() >= 2 {
-                    // `..` spelled with either dot encoded, or both.
-                    let lower = s.to_ascii_lowercase();
-                    ["%2e%2e", ".%2e", "%2e."]
-                        .contains(&lower.as_str())
-                        .then_some("..")
-                } else {
-                    None
-                }
+            if !encoded(s) {
+                return s;
+            }
+            let lower = s.to_ascii_lowercase();
+            let decoded = if lower == "%2e" {
+                Some(".")
             } else {
-                None
+                ["%2e%2e", ".%2e", "%2e."]
+                    .contains(&lower.as_str())
+                    .then_some("..")
             };
             match decoded {
                 Some(d) => {
                     changed = true;
-                    d.to_owned()
+                    d
                 }
-                None => s.to_owned(),
+                None => s,
             }
         })
         .collect();
-    if !changed {
-        return key;
-    }
-    let path = without_dot_segments(&segments.join("/"));
-    format!("{path}{query}")
+    changed.then(|| format!("{}{query}", segments.join("/")))
 }
 
 /// The `Content-Type` the server sends for a stored file, by its extension.
@@ -718,9 +720,12 @@ fn localize_ref<'a>(
     // one after a redirect), base path and all, so a reference that climbs
     // out of the base path is seen to; the key is what is left under it.
     let base_path = url_path(server).trim_end_matches('/');
+    // Encoded dot segments are spelled as dots before resolving, so the
+    // resolver removes them with the literal ones in one pass, in order.
+    let decoded = decoded_dot_segments(r);
     let resolved = normalized(&pharos_hls::uri::resolve(
         &format!("{base_path}{upstream}"),
-        r,
+        decoded.as_deref().unwrap_or(r),
     ));
     let Some(rest) = under_base(&resolved, base_path) else {
         outside_base(r, &resolved);
@@ -744,7 +749,12 @@ fn localize_ref<'a>(
 /// one (`%2e%2e`, either case) as the WebView reads it included, its query
 /// kept: what a base path is checked against.
 fn normalized(r: &str) -> String {
-    without_encoded_dots(without_dot_segments(r))
+    // One pass over both kinds, in path order: `%2e%2e/..` climbs twice,
+    // as the client's parser reads it, never once.
+    match decoded_dot_segments(r) {
+        Some(decoded) => without_dot_segments(&decoded),
+        None => without_dot_segments(r),
+    }
 }
 
 /// What is left of the normalized path `resolved` under `base_path`: None
@@ -1355,6 +1365,40 @@ mod tests {
         );
         // Relative and unmoved, it resolves to the same key: kept as written.
         assert_eq!(one("x/%2E%2E/0.m4s"), Localized::Unchanged);
+    }
+
+    /// CR 4647377545: encoded and literal dot segments are removed in one
+    /// pass, in path order, as the client's URL parser does: `%2e%2e/..`
+    /// climbs twice. Mixed forms that climb out of the base are refused,
+    /// root-relative or relative, either order; one that stays inside
+    /// names the key the client fetches.
+    #[test]
+    fn mixed_encoded_and_literal_dot_segments_resolve_in_one_pass() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        for r in [
+            "/jf/videos/%2e%2e/../media/0.m4s",
+            "%2e%2e/../../media/0.m4s",
+            "../%2E%2E/../media/0.m4s",
+        ] {
+            super::super::platform::take_info_lines();
+            assert_eq!(one(r), Localized::NotLocal(r.to_owned()), "{r}");
+            assert!(
+                super::super::platform::take_info_lines()
+                    .iter()
+                    .any(|l| l.contains("reason=outside_base_path")
+                        && l.contains("resolved_path=/media/0.m4s")),
+                "{r}: the refusal was not logged"
+            );
+        }
+        assert_eq!(
+            one("/jf/videos/x/%2e%2e/../videos/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            key_under_base(server, "https://s.example/jf/videos/%2e%2e/../media/0.m4s"),
+            None
+        );
     }
 
     /// CR 4640611394: a root-relative reference is resolved before the
