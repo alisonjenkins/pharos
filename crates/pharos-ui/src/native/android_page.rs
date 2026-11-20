@@ -2534,7 +2534,10 @@ addEventListener("keydown", () => { backClosed = null; }, true);
 const closeOverlay = () => {
   let el = null;
   for (const o of document.querySelectorAll('__OVERLAYS__')) {
-    if (o.getClientRects().length > 0) { el = o; break; }
+    if (o.getClientRects().length === 0) continue;
+    // The innermost of nested ones (B1508): the queue's Clear confirm, then
+    // the queue.
+    if (!el || el.contains(o)) el = o;
   }
   if (!el || el === backClosed) return null;
   const at = document.activeElement;
