@@ -2500,6 +2500,18 @@ fn QuickConnectSignIn(on_signed_in: EventHandler<SignInReply>) -> Element {
     }
 }
 
+/// Applies attempt `epoch`'s resume when the machine still accepts it, and
+/// says whether it did and the server's schema when that is newer than this
+/// build's. A superseded attempt notes nothing.
+fn accept_resume(m: &mut Machine, epoch: u32, schema: Option<u32>) -> (bool, Option<u32>) {
+    let accepted = m.accepts_resume(epoch);
+    if accepted {
+        m.apply(Event::Resumed { epoch });
+    }
+    let newer = schema.filter(|&v| accepted && pharos_client::is_outdated_by(v));
+    (accepted, newer)
+}
+
 /// One connection attempt: wait out the backoff, open and resume, then
 /// report the socket's close.
 async fn connect(
@@ -2513,28 +2525,18 @@ async fn connect(
     platform::sleep_ms(delay_ms).await;
     let event = match platform::open(&call("connect", "resume")).await {
         Ok(mut open) => {
-            if let Some(server) = open
-                .server_schema
-                .filter(|&v| pharos_client::is_outdated_by(v))
-            {
+            // Published only while the machine still accepts this attempt:
+            // a sign-out (or any screen) that won while it was in flight
+            // keeps it, and its session, out. Decided and applied in one
+            // step, before any other event can land.
+            let (accepted, newer) = accept_resume(&mut machine.write(), epoch, open.server_schema);
+            if let Some(server) = newer {
                 platform::warn(&format!(
                     "pharos: server schema {server} is newer than this page's {}",
                     pharos_client::SCHEMA_VERSION
                 ));
                 outdated.set(Some(server));
             }
-            // Published only while the machine still accepts this attempt:
-            // a sign-out (or any screen) that won while it was in flight
-            // keeps it, and its session, out. Decided and applied in one
-            // step, before any other event can land.
-            let accepted = {
-                let mut m = machine.write();
-                let accepted = m.accepts_resume(epoch);
-                if accepted {
-                    m.apply(Event::Resumed { epoch });
-                }
-                accepted
-            };
             if !accepted {
                 let m = machine.peek();
                 platform::info(&format!(
@@ -9565,6 +9567,34 @@ mod tests {
         let mut m = machine();
         m.apply(Event::NeedsSignIn);
         assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+    }
+
+    /// CR 4638660942: only an accepted resume notes a newer server's
+    /// schema. An attempt a sign-out superseded leaves the notice alone.
+    #[test]
+    fn only_an_accepted_resume_notes_a_newer_schema() {
+        let newer = pharos_client::SCHEMA_VERSION + 1;
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        m.apply(Event::SignInSubmitted);
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(newer)),
+            (false, None),
+            "a rejected attempt set the notice"
+        );
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(newer)),
+            (true, Some(newer))
+        );
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(pharos_client::SCHEMA_VERSION)),
+            (true, None)
+        );
     }
 
     #[test]
