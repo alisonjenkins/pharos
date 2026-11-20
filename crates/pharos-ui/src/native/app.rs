@@ -5579,6 +5579,13 @@ fn downloaded_copy(
     copy.map(|c| (c, user, store))
 }
 
+/// Whether a mounted downloaded copy, played for `owner`, must stop once a
+/// session is replaced: its owner is not the authorized offline user any
+/// more (`authorized`, [`offline_video::last_user`]).
+fn offline_owner_lost(owner: &str, authorized: Option<&str>) -> bool {
+    authorized != Some(owner)
+}
+
 /// A playback of a downloaded copy: the stored master playlist as it was
 /// negotiated, the stored position, and no call to the server.
 fn offline_playing(
@@ -6220,7 +6227,27 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             }
             Some(None) => return,
         };
-        if p.0.grant_gen.replace(gen) == gen || p.0.offline.is_some() {
+        if p.0.grant_gen.replace(gen) == gen {
+            return;
+        }
+        // A downloaded copy has no grant to renew, but the reconnect may
+        // have replaced its owner's session: it plays on only while its
+        // owner is still the authorized offline user (`session_replaced`
+        // ran before the new API was set). Otherwise the player goes, and
+        // the start is decided again for whoever is authorized now.
+        if let Some(save) = &p.0.offline {
+            let authorized = offline_video::last_user();
+            if offline_owner_lost(&save.user, authorized.as_deref()) {
+                platform::info(&format!(
+                    "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={}",
+                    authorized.is_some()
+                ));
+                playing.restart();
+            } else {
+                platform::info(&format!(
+                    "pharos: playback offline item={id} verdict=kept reason=same_owner_authorized"
+                ));
+            }
             return;
         }
         let Some(api) = ctx.api.peek().clone() else {
@@ -9406,10 +9433,15 @@ mod tests {
         let id: ItemRef = "7".parse().unwrap();
         offline_video::remember_user("A");
         assert!(downloaded_copy(id, None, Some("A".into())).is_some());
+        // CR 4640611367: a player mounted for A plays on while A is the
+        // authorized owner, and stops once the replacement fences A.
+        let lost = || offline_owner_lost("A", offline_video::last_user().as_deref());
+        assert!(!lost(), "A's own player was stopped");
         offline_video::session_replaced(&offline_video::Session::opened(
             (),
             Some("tokB".to_owned()),
         ));
+        assert!(lost(), "A's mounted player outlived the replacement");
         let copy = downloaded_copy(id, None, Some("A".into()));
         use_test_video_slot(None);
         assert!(copy.is_none(), "a fenced user's copy was selected");
