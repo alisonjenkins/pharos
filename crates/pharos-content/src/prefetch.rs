@@ -1020,9 +1020,22 @@ impl Gate {
         let mut q = self.lock();
         match part {
             PartFate::Discard => self.cache.discard_part(id),
-            PartFate::Keep(st) => {
-                q.deferred.insert(id.to_owned(), st);
-            }
+            // Only bytes that can be resumed need their validator: a track
+            // refused before it wrote anything keeps no state, which no
+            // eviction notice would ever drop.
+            PartFate::Keep(st) => match std::fs::metadata(self.cache.part_path(id)) {
+                Ok(m) if m.len() == 0 => {
+                    log::info!("cache download id={id} verdict=state_dropped reason=empty_part");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::info!("cache download id={id} verdict=state_dropped reason=no_part");
+                }
+                // Bytes, or a part that cannot be read: kept, never taken
+                // as empty.
+                _ => {
+                    q.deferred.insert(id.to_owned(), st);
+                }
+            },
         }
         self.cache.mark_failed(id);
         if q.current.as_deref() == Some(id) {
@@ -2857,6 +2870,29 @@ mod tests {
             r.dl.events().iter().any(|e| e == "park_cleared:track/1"),
             "{:?}",
             r.dl.events()
+        );
+    }
+
+    /// Outside diff prefetch.rs:1013-1015 (review 5997638687): a track
+    /// refused for space before it wrote a byte keeps no deferred state,
+    /// since no part exists whose eviction would drop it. The control is
+    /// a kept part, which keeps its state (the tests above).
+    #[test]
+    fn a_track_refused_before_any_bytes_keeps_no_state() {
+        let r = rig_with_free(
+            "no-part-no-state",
+            Script::default().file("/audio/1", body(1000, 1)).etag("vA"),
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(|_| Ok(MIN_FREE_BYTES - 1)),
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(5)));
+        assert!(!r.cache.part_path("track/1").exists());
+        assert!(
+            !r.dl.has_deferred("track/1"),
+            "a track with no part kept its state"
         );
     }
 
