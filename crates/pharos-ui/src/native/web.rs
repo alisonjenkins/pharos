@@ -4006,7 +4006,8 @@ fn js_number(from: &JsValue, path: &[&str]) -> f64 {
 }
 
 /// The download an `hlsFragLoaded` event reports; `None` for audio and
-/// subtitle fragments and for ones with no usable timing.
+/// subtitle fragments. A load with no usable timing still ends a failure,
+/// so it is kept; the watch decides what counts as a sample.
 fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
     let kind = js_sys::Reflect::get(data, &"frag".into())
         .ok()
@@ -4025,12 +4026,11 @@ fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
     };
     let seconds = js_number(data, &["frag", "duration"]);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let load = FragmentLoad {
+    Some(FragmentLoad {
         bytes: bytes.max(0.0) as u64,
         load_ms: (end - start).max(0.0) as u64,
         media_ms: (seconds * 1000.0).max(0.0) as u64,
-    };
-    (load.bytes > 0 && load.load_ms > 0 && load.media_ms > 0).then_some(load)
+    })
 }
 
 impl Drop for HlsJs {

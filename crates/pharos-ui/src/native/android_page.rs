@@ -1559,15 +1559,15 @@ impl PlaybackEngine for HlsJs {
                         return;
                     }
                     budget.borrow_mut().progressed();
-                    if bytes > 0 && load_ms > 0 && media_ms > 0 {
-                        on_fragment(super::playback::FragmentEvent::Loaded(
-                            super::playback::FragmentLoad {
-                                bytes,
-                                load_ms,
-                                media_ms,
-                            },
-                        ));
-                    }
+                    // Every load ends a failure, even a cache hit with no
+                    // timing; the watch decides what counts as a sample.
+                    on_fragment(super::playback::FragmentEvent::Loaded(
+                        super::playback::FragmentLoad {
+                            bytes,
+                            load_ms,
+                            media_ms,
+                        },
+                    ));
                 }
                 tv_page::HlsEvent::Buffered {
                     bytes,

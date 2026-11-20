@@ -760,6 +760,19 @@ mod tests {
         assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
     }
 
+    /// V1480: a load with no usable timing, such as a cache hit, still
+    /// ends a failure, so the engines hand every load to the watch.
+    #[test]
+    fn an_untimed_load_ends_a_failure() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.load_failed();
+        w.fragment(4_700_000, 0, 6_000);
+        w.stalled(30 * MS);
+        w.stalled(35 * MS);
+        assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
     #[test]
     fn a_stall_before_the_last_load_survives_a_failure() {
         let mut w = watch();
