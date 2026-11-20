@@ -1251,7 +1251,7 @@ impl Cache {
     pub fn preflight_replacing_part(&self, downloading: &str) -> Result<u64, NoRoom> {
         let _admission = admission_guard();
         // An unreadable part reclaims nothing: never room on a guess.
-        let reclaim = self.part_len(downloading).unwrap_or(0);
+        let reclaim = self.part_held(downloading).unwrap_or(0);
         let verdict = self.check_free(downloading, 0, true, Reclaim::Counted(reclaim));
         log::info!(
             "cache admission id={downloading} need=0 reclaim={reclaim} verdict={} reason=preflight_part_retained",
@@ -1282,7 +1282,7 @@ impl Cache {
         let _admission = admission_guard();
         // An unreadable part reclaims nothing: never room on a guess.
         let reclaim = if replacing {
-            Reclaim::Emptied(self.part_len(downloading).unwrap_or(0))
+            Reclaim::Emptied(self.part_held(downloading).unwrap_or(0))
         } else {
             Reclaim::Nothing
         };
@@ -1383,6 +1383,32 @@ impl Cache {
 
     /// The length of `id`'s `.part`: 0 when there is none, `None` when its
     /// metadata cannot be read (unknown, never taken as empty).
+    /// What emptying `id`'s `.part` gives back: the blocks it holds, never
+    /// more than its length. A sparse part holds less than its length, so
+    /// its length is no credit. 0 when there is none, `None` when unknown.
+    fn part_held(&self, id: &str) -> Option<u64> {
+        let len = self.part_len(id)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(self.part_path(id)) {
+                Ok(m) => {
+                    let held = m.blocks().saturating_mul(512).min(len);
+                    if held < len {
+                        log::info!(
+                            "cache part credit id={id} verdict=held_blocks reason=sparse_part len={len} held={held}"
+                        );
+                    }
+                    Some(held)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        Some(len)
+    }
+
     fn part_len(&self, id: &str) -> Option<u64> {
         let meta = std::fs::metadata(self.part_path(id));
         #[cfg(test)]
@@ -1640,9 +1666,8 @@ impl Cache {
             return Err(NoRoom::AccountingUnknown);
         }
         let outstanding = outside.outstanding;
-        // What a truncation is about to free is room for the write, as an
-        // estimate only: a sparse part frees less than its length, so the
-        // room is measured again once it is gone (`confirm`).
+        // What a truncation is about to free is room for the write: the
+        // blocks the part holds (`part_held`), not its length.
         let measured = match (self.free)(&self.dir) {
             Ok(f) => f,
             Err(e) => {
@@ -1660,12 +1685,9 @@ impl Cache {
             .saturating_add(need)
             .saturating_add(outstanding);
         if raw >= want {
+            // The part's credit is the blocks it holds, read before it is
+            // touched: what emptying it frees.
             self.empty_replaced(downloading, reclaim, None)?;
-            // The part's credit was needed: what its emptying freed is
-            // measured, not taken from its length.
-            if measured < want && matches!(reclaim, Reclaim::Emptied(_)) {
-                return self.confirm(downloading, want, outstanding, raw, 0, "part_emptied");
-            }
             return Ok(raw.saturating_sub(outstanding));
         }
         if !evict {
@@ -1752,28 +1774,28 @@ impl Cache {
             }
             return Err(NoRoom::LowDisk(room));
         }
-        let emptied = part_file.is_some();
+        // An evicted part's length is no measure of what it freed (it may
+        // be sparse): the room is measured, before a replacement's own part
+        // is touched, with that part's held blocks still to come. A
+        // shortfall refuses with the part as it was.
+        let room = if parts_evicted {
+            self.confirm(
+                downloading,
+                want,
+                outstanding,
+                now,
+                reclaim.bytes(),
+                "part_evicted",
+            )?
+        } else {
+            room
+        };
         if let Some(f) = part_file {
             if let Err(e) = empty_opened(&f) {
                 // The evictions made for it cannot be undone; the part is
                 // as it was, and the refusal says how many went.
                 return Err(truncate_refused(downloading, &e, evicted_n, "set_len"));
             }
-        }
-        // A part's length is no measure of what it frees (it may be
-        // sparse): when one was emptied or evicted, the room is measured.
-        // A preflight's credit is for a truncation still to come.
-        if emptied || parts_evicted {
-            let pending = match reclaim {
-                Reclaim::Counted(b) => b,
-                _ => 0,
-            };
-            let why = if emptied {
-                "part_emptied"
-            } else {
-                "part_evicted"
-            };
-            return self.confirm(downloading, want, outstanding, now, pending, why);
         }
         Ok(room)
     }
@@ -2313,9 +2335,9 @@ pub(crate) mod tests {
     }
 
     /// CR 4646280185: a part's length is no measure of what it frees. A
-    /// sparse part counted as room is emptied, the free space measured
-    /// again falls short, and the replacement is refused for it. The
-    /// control: a part that holds its length is approved.
+    /// sparse part is credited the blocks it holds, so the replacement is
+    /// refused with the part as it was (CR 4647361477: LowDisk never
+    /// empties it). The control: a part that holds its length is approved.
     #[test]
     fn a_sparse_part_is_not_counted_as_the_room_it_frees() {
         for sparse in [true, false] {
@@ -2347,22 +2369,58 @@ pub(crate) mod tests {
                     "{verdict:?} {lines:?}"
                 );
                 assert_eq!(c.reserved_bytes(), 0);
+                assert_eq!(
+                    c.part_len("track/x"),
+                    Some(len),
+                    "a refusal emptied the part"
+                );
                 assert!(
                     lines.iter().any(|l| l.contains(
-                        "cache admission id=track/x verdict=refused reason=reclaim_short after=part_emptied"
+                        "cache part credit id=track/x verdict=held_blocks reason=sparse_part"
                     )),
                     "{lines:?}"
                 );
             } else {
                 assert!(verdict.is_ok(), "{verdict:?} {lines:?}");
-                assert!(
-                    lines
-                        .iter()
-                        .any(|l| l.contains("verdict=approved reason=measured_after_reclaim")),
-                    "{lines:?}"
-                );
             }
         }
+    }
+
+    /// CR 4647361477: a replacement that evicts a sparse retained part
+    /// counted at its length measures the room before its own part is
+    /// touched. The measure falls short: LowDisk, with its part as it was.
+    #[test]
+    fn a_replacement_short_after_evicting_a_sparse_part_keeps_its_part() {
+        let d = tmp("replace-evict-sparse");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        // A retained part no job holds, 1000 long and holding nothing.
+        std::fs::File::create(c.part_path("track/y"))
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        crate::testlog::start();
+        // 500 free, 600 held by the part: 1500 fits only on y's length.
+        let verdict = c.ensure_free_replacing_part("track/x", 1500, true);
+        let lines = crate::testlog::lines();
+        assert!(
+            matches!(verdict, Err(NoRoom::LowDisk(_))),
+            "{verdict:?} {lines:?}"
+        );
+        assert_eq!(
+            std::fs::read(c.part_path("track/x")).unwrap(),
+            vec![1u8; 600],
+            "LowDisk emptied the part"
+        );
+        assert_eq!(c.reserved_bytes(), 0);
+        assert!(
+            lines.iter().any(|l| {
+                l.contains(
+                "cache admission id=track/x verdict=refused reason=reclaim_short after=part_evicted"
+            )
+            }),
+            "{lines:?}"
+        );
     }
 
     /// CR 4644634482: a replacement that eviction could not make room for
