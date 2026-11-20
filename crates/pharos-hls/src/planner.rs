@@ -172,7 +172,13 @@ pub struct Buffered {
 #[derive(Debug, Clone)]
 struct TrackState {
     segments: Vec<Segment>,
+    has_init: bool,
     needs_init: bool,
+    /// The index of each part's first segment (a part is a run of segments
+    /// between discontinuities, read with its own init); `[0]` for one part.
+    part_starts: Vec<usize>,
+    /// The part whose init was last asked for.
+    init_part: usize,
     in_flight: Option<Request>,
     seek_target_ms: Option<u64>,
     /// The seek target's segment was fetched again because the target itself
@@ -199,7 +205,10 @@ impl TrackState {
         Self {
             last_appended: segments.is_empty() && !has_init,
             segments,
+            has_init,
             needs_init: has_init,
+            part_starts: vec![0],
+            init_part: 0,
             in_flight: None,
             seek_target_ms: Some(start_ms),
             seek_refetched: false,
@@ -260,6 +269,26 @@ impl Planner {
             eos_noted: false,
             notes: Vec::new(),
         }
+    }
+
+    /// Tells the planner where `track`'s parts start, as segment indices in
+    /// rising order from 0: each part's init is fetched before its segments,
+    /// and again whenever fetching moves to another part.
+    pub fn set_parts(&mut self, track: Track, part_starts: Vec<usize>) {
+        if let Some(state) = self.track_mut(track) {
+            if part_starts.first() == Some(&0) {
+                state.part_starts = part_starts;
+            }
+        }
+    }
+
+    /// The part whose init `track` last asked for with `FetchInit`.
+    pub fn init_part(&self, track: Track) -> usize {
+        match track {
+            Track::Video => Some(&self.video),
+            Track::Audio => self.audio.as_ref(),
+        }
+        .map_or(0, |state| state.init_part)
     }
 
     /// The decisions taken since the last call, oldest first.
@@ -682,6 +711,9 @@ fn plan_track(
     }
 
     if state.needs_init {
+        let at_ms = state.seek_target_ms.unwrap_or(play_ms);
+        state.init_part = clamped_segment_at(&state.segments, at_ms)
+            .map_or(0, |idx| part_of(&state.part_starts, idx));
         state.in_flight = Some(Request::Init);
         actions.push(Action::FetchInit { track });
         return;
@@ -769,6 +801,15 @@ fn plan_track(
     }
     state.held = false;
 
+    // A segment of another part needs that part's init first.
+    let part = part_of(&state.part_starts, candidate_idx);
+    if state.has_init && part != state.init_part {
+        state.init_part = part;
+        state.in_flight = Some(Request::Init);
+        actions.push(Action::FetchInit { track });
+        return;
+    }
+
     if candidate_idx == start_idx && refetch_target {
         state.seek_refetched = true;
     }
@@ -777,6 +818,13 @@ fn plan_track(
         track,
         index: candidate_idx,
     });
+}
+
+/// The part segment `idx` belongs to, given each part's first segment.
+fn part_of(part_starts: &[usize], idx: usize) -> usize {
+    part_starts
+        .partition_point(|&start| start <= idx)
+        .saturating_sub(1)
 }
 
 /// The first gap wider than [`REFILL_HOLE_MS`] in segment `idx` at or after
@@ -2226,6 +2274,67 @@ mod tests {
                 track: Track::Video,
                 start_ms: 70,
                 end_ms: 36_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn each_part_gets_its_own_init_before_its_segments() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, true, None, Config::default(), 0);
+        planner.set_parts(Track::Video, vec![0, 2]);
+        let mut buf = Buffered::default();
+        let mut asked = Vec::new();
+        for _ in 0..6 {
+            for action in planner.tick(0, &buf) {
+                match action {
+                    Action::FetchInit { .. } => {
+                        asked.push(format!("init{}", planner.init_part(Track::Video)));
+                        planner.appended(Track::Video);
+                    }
+                    Action::Fetch { index, .. } => {
+                        asked.push(format!("seg{index}"));
+                        planner.appended(Track::Video);
+                        buf.video = vec![(0, (index as u64 + 1) * 6_000)];
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!(asked, ["init0", "seg0", "seg1", "init1", "seg2", "seg3"]);
+
+        // A seek back into the first part, with nothing buffered there.
+        buf.video = vec![(12_000, 24_000)];
+        planner.seek(1_000, &buf);
+        assert_eq!(
+            planner.tick(1_000, &buf),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        assert_eq!(planner.init_part(Track::Video), 0);
+    }
+
+    #[test]
+    fn a_start_inside_a_later_part_fetches_that_parts_init() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, true, None, Config::default(), 13_000);
+        planner.set_parts(Track::Video, vec![0, 2]);
+        let buf = Buffered::default();
+        assert_eq!(
+            planner.tick(0, &buf),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        assert_eq!(planner.init_part(Track::Video), 1);
+        assert_eq!(planner.first_media(Track::Video), Some(2));
+        planner.appended(Track::Video);
+        assert_eq!(
+            planner.tick(0, &buf),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 2
             }]
         );
     }
