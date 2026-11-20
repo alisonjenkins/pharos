@@ -5,6 +5,20 @@
 
 use std::collections::HashMap;
 
+/// Below this recall the lyric is not what was sung: a wrong lyric measured
+/// 0.107 and the right one 0.917 on the same transcript.
+pub const MAX_MISMATCH_RECALL: f64 = 0.3;
+/// The fewest words heard for a low recall to mean a wrong lyric rather
+/// than a song the recogniser barely heard; a sung song gives hundreds.
+pub const MIN_MISMATCH_HEARD_WORDS: usize = 100;
+
+/// Whether a lyric scoring `recall` ([`bigram_recall`] of its lines) against
+/// a transcript of `heard_words` words is another song's text: little of it
+/// heard, and enough heard for that to mean something.
+pub fn text_mismatch(recall: Option<f64>, heard_words: usize) -> bool {
+    heard_words >= MIN_MISMATCH_HEARD_WORDS && recall.is_some_and(|r| r < MAX_MISMATCH_RECALL)
+}
+
 /// The share of the lyric's word pairs found in `heard`, the transcript's
 /// text joined as the recogniser wrote it, from 0 to 1, or
 /// `None` when the lyric cannot be judged this way: it has no pair of
@@ -156,6 +170,14 @@ mod tests {
             None
         );
         assert!(recall(&["caf\u{e9} au lait", "s'il vous pla\u{ee}t"], "cafe").is_some());
+    }
+
+    #[test]
+    fn a_low_recall_is_a_mismatch_only_with_enough_heard() {
+        assert!(text_mismatch(Some(0.1), MIN_MISMATCH_HEARD_WORDS));
+        assert!(!text_mismatch(Some(0.1), MIN_MISMATCH_HEARD_WORDS - 1));
+        assert!(!text_mismatch(Some(MAX_MISMATCH_RECALL), 500));
+        assert!(!text_mismatch(None, 500));
     }
 
     #[test]
