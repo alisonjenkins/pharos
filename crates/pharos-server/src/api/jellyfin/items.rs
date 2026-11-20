@@ -2391,6 +2391,7 @@ async fn playback_info(
             stereo_mode: query_param(req.query_string(), "StereoMode"),
             client_is_remote: client_is_remote(&req),
             is_web_client,
+            draws_images: false,
         },
     );
     let playback::Negotiated {
