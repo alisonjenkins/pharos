@@ -28,7 +28,8 @@ const SESSION: &str = "/pharos/session";
 /// A signed-in connection. Dropping it closes the socket.
 pub struct Open {
     pub conn: Connection,
-    pub api: NativeApi,
+    /// The API; the web has no device token, so its session carries none.
+    pub session: super::offline_video::Session<NativeApi>,
     /// The server's schemaVersion; `None` when it could not be asked.
     pub server_schema: Option<u32>,
 }
@@ -38,6 +39,10 @@ pub enum OpenError {
     NotOpened(Probe),
     /// The server knows no session for this browser.
     NotSignedIn,
+    /// The phone's: a refused token that could not be dropped. Never made
+    /// here; the app's match is shared.
+    #[allow(dead_code)]
+    NotSignedInTokenKept,
     Resume(String),
 }
 
@@ -62,7 +67,7 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         .ok();
     match resumed {
         Ok(session) => Ok(Open {
-            api: NativeApi::new(&session),
+            session: super::offline_video::Session::opened(NativeApi::new(&session), None),
             conn,
             server_schema,
         }),
@@ -4136,6 +4141,30 @@ pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
     storage(Kept::Device)?
         .set_item(key, value)
         .map_err(|e| format!("{e:?}"))
+}
+
+/// Whether a device token, not the stored preference, decides who is signed
+/// in at a cold start. Only the phone and TV apps keep one.
+pub const TOKEN_DECIDES_SIGN_IN: bool = false;
+
+/// The user id kept with the device token; none where there is no token.
+pub fn token_user() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// The user kept with the device token `seen`; none where there is no token.
+pub fn token_user_if(_seen: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Drops an ended session's device token; there is none here.
+pub fn forget_token_if(_seen: &str, _user: Option<&str>) -> super::offline_video::TokenEnd {
+    super::offline_video::TokenEnd::Forgotten
+}
+
+/// Keeps `user` with the device token; nothing to do where there is none.
+pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
+    Ok(())
 }
 
 /// Set `data-subtitle-size` on `<html>` so `video::cue` scales to `size`.

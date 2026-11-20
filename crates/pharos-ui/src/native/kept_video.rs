@@ -80,7 +80,9 @@ pub fn quality_label(bps: u64) -> &'static str {
 pub struct KeptSubtitle {
     /// The stream index the player names the track by.
     pub index: u32,
+    #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub language: Option<String>,
     /// The exact URL the player fetches it from; stored under that key.
     pub url: String,
@@ -102,34 +104,68 @@ pub enum KeptState {
 /// player need, with no call to the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptVideo {
+    // Identity and the stored files have no default: a record without them
+    // names nothing it could serve. Every other field falls back, so a field
+    // added later does not strand the manifests written before it (a
+    // stranded manifest holds its folder, and the admission block with it).
     /// The item, as `ItemRef` prints it.
     pub item: String,
     /// The version played; empty is the primary.
+    #[serde(default)]
     pub version: String,
     /// The signed-in user's id (hex, as `Session.me` reports), so one
     /// user's downloads are never listed for another.
     pub user: String,
     /// The display name ("Show · S1E2 · Title" for an episode).
+    #[serde(default)]
     pub title: String,
     /// "movie" or "episode".
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub runtime_ms: u64,
     /// The exact master playlist URL the player opens.
     pub master_url: String,
     /// The audio and subtitle stream indexes the stream was made with.
+    #[serde(default)]
     pub audio: Option<u32>,
+    #[serde(default)]
     pub subtitles: Vec<KeptSubtitle>,
     /// Every stored key, master first.
     pub files: Vec<String>,
     /// The video bitrate cap it was made at.
+    #[serde(default)]
     pub quality_bps: u64,
     /// The size estimated before starting.
+    #[serde(default)]
     pub estimated_bytes: u64,
     pub state: KeptState,
     /// Where the viewer stopped, saved on the device while offline.
+    #[serde(default)]
     pub position_ms: u64,
     /// ISO 8601 UTC.
+    #[serde(default)]
     pub saved_at: String,
+    /// The estimate was not set by an admitted plan: the record was adopted
+    /// from a manifest that lacked one, so it is the folder's measured size
+    /// and the files still missing were never reserved. A resume of such a
+    /// record plans again and passes the shared-cap check as a fresh
+    /// download. True when the manifest has no such field; false once a plan
+    /// has been admitted and saved.
+    #[serde(default = "estimate_from_adoption_default")]
+    pub estimate_from_adoption: bool,
+    /// The store's accounting, never saved: the bytes an earlier plan left
+    /// on disk that this record's admitted plan could not prune. Part of
+    /// its reservation and on disk already, so not owed. It lives and dies
+    /// with the record: a removal or a replacing record drops it, a
+    /// rollback that puts the record back restores it, and no other site
+    /// has to clear it.
+    #[serde(skip)]
+    pub stale_on_disk: u64,
+}
+
+fn estimate_from_adoption_default() -> bool {
+    true
 }
 
 impl KeptVideo {
@@ -200,6 +236,15 @@ pub fn fits(needed: u64, used: u64, cap: u64, free: u64) -> Result<(), KeepVideo
 pub trait VideoStore: Send + Sync {
     /// The signed-in user's downloads, newest first.
     fn videos(&self, user: &str) -> Vec<KeptVideo>;
+    /// The user's Ready downloads, newest first, for a poll on the UI
+    /// thread: a store whose [`Self::videos`] does filesystem work answers
+    /// from memory and does that work elsewhere, for a later poll to see.
+    fn ready_videos(&self, user: &str) -> Vec<KeptVideo> {
+        self.videos(user)
+            .into_iter()
+            .filter(KeptVideo::ready)
+            .collect()
+    }
     /// Start fetching: plan the files with `pharos_hls::offline`, check
     /// [`fits`], store each under its exact URL, record progress.
     fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal>;
@@ -208,6 +253,50 @@ pub trait VideoStore: Send + Sync {
     /// Note where the viewer stopped, for the next offline start.
     fn save_position(&self, user: &str, item: &str, position_ms: u64);
     fn cap_bytes(&self) -> u64;
+    /// What every user's downloads hold or have reserved on this device,
+    /// for the host to count against the cap it shares with other kinds.
+    /// Zero for a store that shares no cap.
+    fn kept_bytes(&self) -> u64 {
+        0
+    }
+    /// What every user's running downloads are admitted for but have yet
+    /// to write, for the host to take off the free space it guards for
+    /// other kinds. Zero for a store that shares no disk.
+    fn outstanding_bytes(&self) -> u64 {
+        0
+    }
+    /// Whether the store holds a folder whose size or reservation it could
+    /// not read, so the host cannot trust the cap it shares: nothing else
+    /// is admitted either. False for a store that shares no cap.
+    fn size_unknown(&self) -> bool {
+        false
+    }
+    /// The three figures the music cache reads, as one snapshot: what is
+    /// held, what is still owed, and whether a size is unknown. A store
+    /// with state of its own reads them in one hold, so the verdict and the
+    /// bytes describe the same moment.
+    fn accounting(&self) -> (u64, u64, bool) {
+        let unknown = self.size_unknown();
+        (self.kept_bytes(), self.outstanding_bytes(), unknown)
+    }
+    /// How many folders hold downloads whose record cannot be read: they
+    /// are kept, counted and block every admission until they read again or
+    /// are discarded. Zero for a store with no such folders.
+    fn unreadable_count(&self) -> usize {
+        0
+    }
+    /// How many folders a removal or discard could not delete: they still
+    /// count against the cap, and a sweep or a discard tries them again.
+    /// Zero for a store with no such folders.
+    fn leftover_count(&self) -> usize {
+        0
+    }
+    /// Deletes the folders whose record still cannot be read, returning the
+    /// bytes freed. Err names why it could not, or what stayed. A store with
+    /// no folders to discard (the web's) refuses.
+    fn discard_unreadable(&self) -> Result<u64, String> {
+        Err("this device keeps no unreadable downloads".to_owned())
+    }
     /// Set the cap. A host that cannot change it keeps the default and
     /// says why. Lowering it below what is kept deletes nothing; new
     /// downloads are refused until there is room.
@@ -217,8 +306,236 @@ pub trait VideoStore: Send + Sync {
         ))
     }
     fn used_bytes(&self, user: &str) -> u64;
+    /// What `user`'s videos alone hold, leaving out what `used_bytes` adds
+    /// from the kinds the cap is shared with. The same by default.
+    fn video_bytes(&self, user: &str) -> u64 {
+        self.used_bytes(user)
+    }
+    /// `user`'s video subtotal and the shared usage, from one read of the
+    /// subtotal, so a download writing between two calls cannot show more
+    /// video than the shared figure holds. By default both are
+    /// `used_bytes`; a store that overrides `video_bytes` overrides this.
+    fn usage(&self, user: &str) -> Usage {
+        let used = self.used_bytes(user);
+        Usage { video: used, used }
+    }
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
+    /// The stored file for a request's [`request_key`] among `user`'s own
+    /// Ready downloads, if this store holds it whole: one user never reads
+    /// another's, and a download still running (or failed, or paused) serves
+    /// nothing, so the player's local origin is chosen only for a whole
+    /// download. Every offline answer (`offline_file_for`,
+    /// `hls_local_source`, the Android asset handler) goes through here. A host that answers the player's requests itself (the
+    /// phone's server proxy) asks before going to the network; a store whose
+    /// platform answers them another way (the web's service worker) keeps
+    /// the default.
+    fn stored_file(&self, _user: &str, _key: &str) -> Option<StoredFile> {
+        None
+    }
+    /// A signed-in session ended: every running download of `owner`'s
+    /// (every one, with `None`, when whose session it was is not known)
+    /// stops before another user's token can be used. Each is parked: its
+    /// record and files stay, Downloading, until [`resume_user`]. A store
+    /// whose downloads carry no device token keeps the default.
+    ///
+    /// [`resume_user`]: VideoStore::resume_user
+    fn park_runs(&self, _owner: Option<&str>) {}
+    /// `user` signed in: their parked downloads run again.
+    fn resume_user(&self, _user: &str) {}
+}
+
+/// A file a [`VideoStore`] holds, ready to answer a request with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub path: std::path::PathBuf,
+    pub len: u64,
+    /// The `Content-Type` to answer with: derived from the key's extension
+    /// by [`content_type_for`], never stored from the server's header.
+    pub content_type: &'static str,
+}
+
+/// What follows `scheme://` when `url` starts with one. Only a prefix
+/// counts: a `://` inside a path or query (a redirect target, say) is part
+/// of that path or query.
+fn after_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
+}
+
+/// The key a request is stored under on a host that sees no scheme or
+/// host: the path and the query, which names the play session. An absolute
+/// URL is cut down to the same, so both spellings of one file agree. Its
+/// authority ends at the first `/`, `?` or `#`: a URL with no path keeps
+/// its query, under the path `/`.
+pub fn request_key(url: &str) -> String {
+    let path_and_query = match after_scheme(url) {
+        Some(rest) => rest.find(['/', '?', '#']).map_or("", |i| &rest[i..]),
+        None => url,
+    };
+    let key = path_and_query.split('#').next().unwrap_or_default();
+    let key = if key.starts_with('/') {
+        key.to_owned()
+    } else {
+        format!("/{key}")
+    };
+    without_encoded_dots(key)
+}
+
+/// `key` with its dot segments removed when one is percent-encoded
+/// (`%2e`, `.%2E`, ...): the WebView's URL parser reads those as `.` and
+/// `..` and asks for the path without them, so the key must name that
+/// path too. The query is kept as it is; a key with no encoded dot
+/// segment is returned unchanged.
+fn without_encoded_dots(key: String) -> String {
+    match decoded_dot_segments(&key) {
+        Some(decoded) => without_dot_segments(&decoded),
+        None => key,
+    }
+}
+
+/// `r` with each percent-encoded dot segment (`%2e`, `.%2E`, `%2e%2e`,
+/// any case) spelled as the `.` or `..` a URL parser reads it as, its
+/// literal ones and its query left as they are, so one later pass removes
+/// both kinds together in path order. None when it has no encoded one.
+fn decoded_dot_segments(r: &str) -> Option<String> {
+    let (path, query) = r.split_at(r.find(['?', '#']).unwrap_or(r.len()));
+    let encoded = |s: &str| s.contains('%') && s.len() <= 6;
+    let mut changed = false;
+    let segments: Vec<&str> = path
+        .split('/')
+        .map(|s| {
+            if !encoded(s) {
+                return s;
+            }
+            let lower = s.to_ascii_lowercase();
+            let decoded = if lower == "%2e" {
+                Some(".")
+            } else {
+                ["%2e%2e", ".%2e", "%2e."]
+                    .contains(&lower.as_str())
+                    .then_some("..")
+            };
+            match decoded {
+                Some(d) => {
+                    changed = true;
+                    d
+                }
+                None => s,
+            }
+        })
+        .collect();
+    changed.then(|| format!("{}{query}", segments.join("/")))
+}
+
+/// The `Content-Type` the server sends for a stored file, by its extension.
+pub fn content_type_for(key: &str) -> &'static str {
+    let path = url_path(key);
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("m4s" | "mp4" | "m4a" | "m4v") => "video/mp4",
+        Some("ts") => "video/mp2t",
+        Some("vtt") => "text/vtt",
+        _ => "application/octet-stream",
+    }
+}
+
+/// What a user's downloads hold ([`VideoStore::usage`]): the videos'
+/// own bytes, and the figure the shared cap counts, read together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub video: u64,
+    pub used: u64,
+}
+
+/// What a request for a stream is, for the log line a host writes about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestClass {
+    Master,
+    Playlist,
+    Init,
+    Segment,
+    Subtitle,
+    /// Anything else the page asks the server for: not part of a download.
+    Other,
+}
+
+impl RequestClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Master => "master",
+            Self::Playlist => "playlist",
+            Self::Init => "init",
+            Self::Segment => "segment",
+            Self::Subtitle => "subtitle",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The class of the request for `key`.
+pub fn request_class(key: &str) -> RequestClass {
+    let path = url_path(key);
+    let name = path.rsplit('/').next().unwrap_or_default();
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("m3u8") if name.starts_with("master") => RequestClass::Master,
+        Some("m3u8") => RequestClass::Playlist,
+        Some("mp4") if name.starts_with("init") => RequestClass::Init,
+        Some("m4s" | "mp4" | "m4a" | "m4v" | "ts") => RequestClass::Segment,
+        Some("vtt") => RequestClass::Subtitle,
+        _ => RequestClass::Other,
+    }
+}
+
+/// Where a host answered a request from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// From a stored file, with no network.
+    ServedOffline,
+    /// From the server.
+    Network,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ServedOffline => "served_offline",
+            Self::Network => "network",
+        }
+    }
+}
+
+/// How loudly a request's verdict is logged: playlists are few and say
+/// which copy plays, so they are info; a film has a thousand segments, so
+/// those are debug; a request that is no part of a stream is not logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loudness {
+    Info,
+    Debug,
+}
+
+pub fn loudness(class: RequestClass) -> Option<Loudness> {
+    match class {
+        RequestClass::Master | RequestClass::Playlist => Some(Loudness::Info),
+        RequestClass::Init | RequestClass::Segment | RequestClass::Subtitle => {
+            Some(Loudness::Debug)
+        }
+        RequestClass::Other => None,
+    }
+}
+
+/// The log line for a request's verdict. The path only: the query carries
+/// the play session.
+pub fn request_line(key: &str, verdict: Verdict, bytes: u64) -> String {
+    format!(
+        "pharos: video request class={} verdict={} bytes={bytes} url_path={}",
+        request_class(key).label(),
+        verdict.label(),
+        url_path(key)
+    )
 }
 
 /// Where the record of downloaded videos is kept on a device (a JSON array
@@ -238,7 +555,7 @@ pub fn cache_name(user: &str) -> String {
 /// service worker's `caches.match(request.url)` finds. An absolute URL is
 /// returned as is.
 pub fn absolute_url(origin: &str, url: &str) -> String {
-    if url.contains("://") {
+    if after_scheme(url).is_some() {
         url.to_owned()
     } else if url.starts_with('/') {
         format!("{}{url}", origin.trim_end_matches('/'))
@@ -250,9 +567,346 @@ pub fn absolute_url(origin: &str, url: &str) -> String {
 /// The path of `url`, with no query, for log lines (the query carries the
 /// play session).
 pub fn url_path(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let from_path = rest.find('/').map_or("", |i| &rest[i..]);
+    let rest = after_scheme(url).unwrap_or(url);
+    let from_path = match after_scheme(url) {
+        // The authority ends where `request_key`'s does.
+        Some(_) => rest.find(['/', '?', '#']).map_or("", |i| &rest[i..]),
+        // A relative reference: a slash in its query or fragment is no
+        // path, so it is looked for before them only.
+        None => {
+            let path = rest.split(['?', '#']).next().unwrap_or("");
+            path.find('/').map_or("", |i| &path[i..])
+        }
+    };
     from_path.split(['?', '#']).next().unwrap_or("")
+}
+
+/// The request key `final_url` (where a request to the server at `base`
+/// ended up after its redirects) is for: its path and query with the
+/// base's own path taken off, as [`request_key`] spells keys. `None` when
+/// it is outside the base's path, where no key can name it.
+pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
+    // Normalized before the base is checked: a plain `..` would climb
+    // out of it as an encoded one would.
+    let full = normalized(&request_key(final_url));
+    let base_path = url_path(base).trim_end_matches('/');
+    under_base(&full, base_path).map(request_key)
+}
+
+/// Where a download's response landed against the URL it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// The same URL, however each spells it, or one naming the same key.
+    Asked,
+    /// A redirect to another key under the server's base path.
+    Moved(String),
+    /// A redirect out of the server's base path.
+    OutsideBase,
+}
+
+/// Where `final_url` (the response's) leaves a download of `key` that asked
+/// for `asked`, under the server at `base`. URLs are compared parsed, so a
+/// path the client percent-encoded (`/café` sent, `/caf%C3%A9` answered) is
+/// no redirect; the base is held to its parsed path, the response's form.
+pub fn landed(base: &str, asked: &str, final_url: &str, key: &str) -> Landed {
+    let parsed = |u: &str| url::Url::parse(u).ok();
+    let (asked_url, final_parsed) = (parsed(asked), parsed(final_url));
+    if asked_url.is_some() && asked_url == final_parsed {
+        if asked != final_url {
+            super::platform::info(&format!(
+                "pharos: video download url verdict=same reason=spelled_differently url_path={}",
+                url_path(final_url)
+            ));
+        }
+        return Landed::Asked;
+    }
+    // The base as the response spells it: `Url` encodes its path.
+    let base = parsed(base).map_or_else(|| base.to_owned(), |u| u.to_string());
+    match key_under_base(
+        &base,
+        final_parsed.as_ref().map_or(final_url, url::Url::as_str),
+    ) {
+        Some(final_key) if final_key == key => Landed::Asked,
+        Some(final_key) => Landed::Moved(final_key),
+        None => Landed::OutsideBase,
+    }
+}
+
+/// What [`localize_playlist`] made of a playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Localized {
+    /// Every reference already names what the proxy serves: stored as sent.
+    Unchanged,
+    /// Rewritten so every reference names the key it is stored under.
+    Rewritten(String),
+    /// The rewrite would pass the limit.
+    TooLarge,
+    /// This reference names a file the phone cannot serve offline: another
+    /// origin, or a path outside the server's base path.
+    NotLocal(String),
+}
+
+/// The scheme and authority of `url`, lower-cased, when it names one.
+fn origin_of(url: &str) -> Option<String> {
+    let rest = after_scheme(url)?;
+    let scheme = &url[..url.len() - rest.len() - 3];
+    let authority = rest.find(['/', '?', '#']).map_or(rest, |i| &rest[..i]);
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
+}
+
+/// The key the reference `r` in a playlist names, as the offline proxy
+/// serves it. `server` is the server's address with its base path;
+/// `upstream` is the key the playlist was fetched from: the final one after
+/// a redirect (`moved`), else the one requested. Relative references
+/// resolve against it under the base path, in one path either way, and are
+/// rewritten to their key only when `moved`.
+/// Err when no stored key can answer it.
+fn localize_ref<'a>(
+    r: &'a str,
+    upstream: &str,
+    moved: bool,
+    server: &str,
+) -> Result<std::borrow::Cow<'a, str>, ()> {
+    use std::borrow::Cow;
+    if let Some(scheme_relative) = r.strip_prefix("//") {
+        let scheme = origin_of(server).and_then(|o| o.split_once("://").map(|(s, _)| s.to_owned()));
+        let full = format!("{}://{scheme_relative}", scheme.ok_or(())?);
+        return localize_ref(&full, upstream, moved, server).map(|k| Cow::Owned(k.into_owned()));
+    }
+    if after_scheme(r).is_some() {
+        // Scheme, host and effective port, parsed as the client sends: an
+        // explicit default port is the origin without one.
+        let parsed = super::tv_page::origin_of;
+        if parsed(r).is_none() || parsed(r) != parsed(server) {
+            return Err(());
+        }
+        // Same origin: its path and query, under the base path as any
+        // absolute path is. A path that begins `//` is a path, never a
+        // second authority: no key under the base can name it.
+        let path = request_key(r);
+        if path.starts_with("//") {
+            outside_base(r, &path);
+            return Err(());
+        }
+        return localize_ref(&path, upstream, moved, server).map(|k| Cow::Owned(k.into_owned()));
+    }
+    if r.starts_with('/') {
+        // Its dot segments resolved first, percent-encoded ones included:
+        // `/jf/../media/0.m4s` and `/jf/%2e%2e/media/0.m4s` are both
+        // `/media/0.m4s`, outside a `/jf` base, whatever its prefix says.
+        let resolved = normalized(r);
+        let base_path = url_path(server).trim_end_matches('/');
+        if base_path.is_empty() {
+            local_key(&resolved)?;
+            return Ok(if resolved == r {
+                Cow::Borrowed(r)
+            } else {
+                Cow::Owned(resolved)
+            });
+        }
+        return match under_base(&resolved, base_path) {
+            Some(rest) => local_key(rest).map(Cow::Owned),
+            None => {
+                outside_base(r, &resolved);
+                Err(())
+            }
+        };
+    }
+    // Resolved against the URL the playlist was fetched from (the final
+    // one after a redirect), base path and all, so a reference that climbs
+    // out of the base path is seen to; the key is what is left under it.
+    let base_path = url_path(server).trim_end_matches('/');
+    // Encoded dot segments are spelled as dots before resolving, so the
+    // resolver removes them with the literal ones in one pass, in order.
+    let decoded = decoded_dot_segments(r);
+    let resolved = normalized(&pharos_hls::uri::resolve(
+        &format!("{base_path}{upstream}"),
+        decoded.as_deref().unwrap_or(r),
+    ));
+    let Some(rest) = under_base(&resolved, base_path) else {
+        outside_base(r, &resolved);
+        return Err(());
+    };
+    // Where the stored copy is read from is where it was fetched from
+    // unless a redirect moved it: kept as written then, but only while it
+    // resolves to the same key from there (the offline playlist's URL is
+    // its key, under no base path). One that names the base path itself
+    // (`../../jf/videos/0.m4s` under `/jf`) would not: rewritten to its
+    // key, as when moved.
+    let key = local_key(rest)?;
+    if moved || request_key(&pharos_hls::uri::resolve(upstream, r)) != key {
+        Ok(Cow::Owned(key))
+    } else {
+        Ok(Cow::Borrowed(r))
+    }
+}
+
+/// A root-relative path with every dot segment removed, a percent-encoded
+/// one (`%2e%2e`, either case) as the WebView reads it included, its query
+/// kept: what a base path is checked against.
+fn normalized(r: &str) -> String {
+    // One pass over both kinds, in path order: `%2e%2e/..` climbs twice,
+    // as the client's parser reads it, never once.
+    match decoded_dot_segments(r) {
+        Some(decoded) => without_dot_segments(&decoded),
+        None => without_dot_segments(r),
+    }
+}
+
+/// What is left of the normalized path `resolved` under `base_path`: None
+/// when it is outside it.
+fn under_base<'r>(resolved: &'r str, base_path: &str) -> Option<&'r str> {
+    let rest = resolved.strip_prefix(base_path)?;
+    (rest.starts_with('/') || rest.starts_with('?')).then_some(rest)
+}
+
+/// Logs a playlist reference that resolves outside the base path, by its
+/// paths (a query may carry the play session).
+fn outside_base(r: &str, resolved: &str) {
+    super::platform::info(&format!(
+        "pharos: video playlist reference verdict=refused reason=outside_base_path reference_path={} resolved_path={}",
+        url_path(r),
+        url_path(resolved)
+    ));
+}
+
+/// A root-relative reference with its dot segments removed (RFC 3986
+/// 5.2.4), its query kept.
+fn without_dot_segments(r: &str) -> String {
+    pharos_hls::uri::resolve("/", &format!(".{r}"))
+}
+
+/// The key `rest` (a path under the base path) is stored under, when it
+/// reads back as a path on the page's own origin. One that begins `//` is
+/// a network-path reference in a playlist: it names a host, so the player
+/// would never ask the proxy for it. Err then.
+fn local_key(rest: &str) -> Result<String, ()> {
+    let key = request_key(rest);
+    if key.starts_with("//") {
+        Err(())
+    } else {
+        Ok(key)
+    }
+}
+
+/// The HLS tags (RFC 8216bis) whose attribute list can carry a `URI`.
+const URI_TAGS: &[&str] = &[
+    "#EXT-X-KEY",
+    "#EXT-X-MAP",
+    "#EXT-X-MEDIA",
+    "#EXT-X-I-FRAME-STREAM-INF",
+    "#EXT-X-SESSION-DATA",
+    "#EXT-X-SESSION-KEY",
+    "#EXT-X-PART",
+    "#EXT-X-PRELOAD-HINT",
+    "#EXT-X-RENDITION-REPORT",
+];
+
+/// A playlist with each reference it makes (a URI line, and every
+/// `URI="..."` attribute of a tag) rewritten to the key the offline proxy
+/// serves it under ([`localize_ref`]), so the stored copy names exactly
+/// the files that are stored, wherever it is read from. Line endings and
+/// every other line stay as they are. The limit holds while the rewrite is
+/// built: each piece is checked before it is appended.
+pub fn localize_playlist(
+    text: &str,
+    upstream: &str,
+    moved: bool,
+    server: &str,
+    limit: usize,
+) -> Localized {
+    let mut out = String::with_capacity(text.len().min(limit));
+    let mut changed = false;
+    let push = |out: &mut String, piece: &str| -> Result<(), Localized> {
+        if out.len().saturating_add(piece.len()) <= limit {
+            out.push_str(piece);
+            Ok(())
+        } else {
+            Err(Localized::TooLarge)
+        }
+    };
+    let mut reference = |out: &mut String, r: &str| -> Result<(), Localized> {
+        let key = localize_ref(r, upstream, moved, server)
+            .map_err(|()| Localized::NotLocal(r.to_owned()))?;
+        changed |= key != r;
+        push(out, &key)
+    };
+    let mut go = || -> Result<(), Localized> {
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            let trimmed = body.trim();
+            // Blank lines and comments (a `#` line that is not an `#EXT`
+            // tag) are kept as they are; only tags carry URI attributes.
+            if trimmed.is_empty() || (trimmed.starts_with('#') && !trimmed.starts_with("#EXT")) {
+                push(&mut out, line)?;
+            } else if trimmed.starts_with('#') {
+                // The tag's attribute list, parsed by name: only an
+                // attribute named exactly `URI` is a reference, never one
+                // whose name ends in it (`X-COM-EXAMPLE-URI`), and never
+                // text inside another attribute's quoted value.
+                // Only a tag whose value is an attribute list with a URI is
+                // parsed: `EXTINF`'s title, and any other tag, is text.
+                let Some(colon) = body
+                    .find(':')
+                    .filter(|&c| URI_TAGS.contains(&body[..c].trim_start()))
+                else {
+                    push(&mut out, line)?;
+                    continue;
+                };
+                let (head, mut rest) = body.split_at(colon + 1);
+                push(&mut out, head)?;
+                while !rest.is_empty() {
+                    let Some(at) = rest.find(['=', ',']) else {
+                        push(&mut out, rest)?;
+                        break;
+                    };
+                    let (name, sep) = (&rest[..at], &rest[at..=at]);
+                    push(&mut out, &rest[..=at])?;
+                    rest = &rest[at + 1..];
+                    if sep == "," {
+                        continue;
+                    }
+                    if let Some(quoted) = rest.strip_prefix('"') {
+                        let Some(end) = quoted.find('"') else {
+                            push(&mut out, rest)?;
+                            break;
+                        };
+                        push(&mut out, "\"")?;
+                        if name.trim() == "URI" {
+                            reference(&mut out, &quoted[..end])?;
+                        } else {
+                            push(&mut out, &quoted[..end])?;
+                        }
+                        push(&mut out, "\"")?;
+                        rest = &quoted[end + 1..];
+                    } else {
+                        let end = rest.find(',').unwrap_or(rest.len());
+                        push(&mut out, &rest[..end])?;
+                        rest = &rest[end..];
+                    }
+                    if let Some(next) = rest.strip_prefix(',') {
+                        push(&mut out, ",")?;
+                        rest = next;
+                    }
+                }
+                push(&mut out, ending)?;
+            } else {
+                reference(&mut out, trimmed)?;
+                push(&mut out, ending)?;
+            }
+        }
+        Ok(())
+    };
+    match go() {
+        Err(refused) => refused,
+        Ok(()) if changed => Localized::Rewritten(out),
+        Ok(()) => Localized::Unchanged,
+    }
 }
 
 /// Whether a failed `cache.put` is the body transfer breaking (the browser
@@ -267,6 +921,30 @@ pub fn put_is_retryable(error_name: &str) -> bool {
 pub fn retry_delay_secs(attempt: u32) -> Option<u64> {
     const DELAYS: [u64; 6] = [1, 2, 4, 8, 15, 30];
     DELAYS.get(attempt.checked_sub(1)? as usize).copied()
+}
+
+/// The device token a download run for `owner` may send: the stored token,
+/// only while the user stored with it is `owner`. `token` and `token_user`
+/// come from one read of the one token file, so a sign-in landing between
+/// two reads cannot pair one user's token with another user's run. Fails
+/// closed: Err names the refusal, `no_token`, `token_user_unknown` (a token
+/// whose user is not stored yet, as during a sign-in) or
+/// `token_owner_mismatch` with both internal ids.
+pub fn token_for_owner(
+    token: Option<&str>,
+    token_user: Option<&str>,
+    owner: &str,
+) -> Result<String, String> {
+    let Some(token) = token else {
+        return Err(format!("no_token owner={owner}"));
+    };
+    match token_user {
+        None => Err(format!("token_user_unknown owner={owner}")),
+        Some(user) if user != owner => Err(format!(
+            "token_owner_mismatch owner={owner} token_user={user}"
+        )),
+        Some(_) => Ok(token.to_owned()),
+    }
 }
 
 /// Whether a failed fetch is worth another try: no answer at all (`None`),
@@ -395,6 +1073,8 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         },
         position_ms: 0,
         saved_at,
+        estimate_from_adoption: false,
+        stale_on_disk: 0,
     }
 }
 
@@ -402,6 +1082,558 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// Outside-diff item kept_video_disk.rs:2368: the limit holds while the
+    /// rewrite is built. One byte short of the whole rewrite is `None`,
+    /// and exactly its length fits.
+    #[test]
+    fn a_rebase_stops_at_its_limit() {
+        let key = "/videos/7/hls/main.m3u8?s=1";
+        let text = "#EXTINF:6.0,\n0.m4s?s=1\n";
+        let server = "http://s:8096";
+        let Localized::Rewritten(whole) = localize_playlist(text, key, true, server, usize::MAX)
+        else {
+            panic!("not rewritten");
+        };
+        assert_eq!(
+            localize_playlist(text, key, true, server, whole.len()),
+            Localized::Rewritten(whole.clone())
+        );
+        assert_eq!(
+            localize_playlist(text, key, true, server, whole.len() - 1),
+            Localized::TooLarge
+        );
+    }
+
+    #[test]
+    fn a_final_url_is_keyed_under_the_servers_base_path() {
+        let moved = "http://s:8096/videos/7/hls/master.m3u8?s=1";
+        assert_eq!(
+            key_under_base("http://s:8096", moved).as_deref(),
+            Some("/videos/7/hls/master.m3u8?s=1")
+        );
+        assert_eq!(
+            key_under_base("http://s:8096/jf", "http://s:8096/jf/videos/7/a.m3u8?s=1").as_deref(),
+            Some("/videos/7/a.m3u8?s=1")
+        );
+        assert_eq!(key_under_base("http://s:8096/jf", moved), None);
+        assert_eq!(
+            key_under_base("http://s:8096/jf", "http://s:8096/jfx/a.m3u8"),
+            None
+        );
+    }
+
+    /// CR 4638660953: an explicit default port is the same origin as none;
+    /// another port is not.
+    #[test]
+    fn an_explicit_default_port_is_the_same_origin() {
+        let server = "https://s.example/jf";
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\nhttps://s.example:443/jf/videos/1/0.m4s\n",
+                "/videos/1/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/1/0.m4s\n".to_owned())
+        );
+        let other = "https://s.example:8443/jf/videos/1/0.m4s";
+        assert_eq!(
+            localize_playlist(
+                &format!("#EXTINF:6.0,\n{other}\n"),
+                "/videos/1/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::NotLocal(other.to_owned())
+        );
+    }
+
+    /// CR 4644634634: an unmoved playlist's relative reference that names
+    /// the base path itself resolves upstream to a key it would not reach
+    /// offline: it is rewritten to that key. A plain sibling stays as
+    /// written.
+    #[test]
+    fn a_relative_reference_through_the_base_path_is_rewritten_to_its_key() {
+        let server = "https://s.example/jf";
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n../../jf/videos/0.m4s\n#EXTINF:6.0,\n1.m4s\n",
+                "/videos/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/0.m4s\n#EXTINF:6.0,\n1.m4s\n".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n0.m4s\n",
+                "/videos/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Unchanged
+        );
+    }
+
+    /// CR 4644634646: an encoded dot segment is a dot segment, as the
+    /// WebView reads it: the key names the path it asks for. The query is
+    /// kept, and a path with no dot segment is unchanged.
+    #[test]
+    fn an_encoded_dot_segment_is_removed_from_the_key() {
+        assert_eq!(
+            request_key("https://s.example/jf/videos/%2e/0.m4s?p=%2e"),
+            "/jf/videos/0.m4s?p=%2e"
+        );
+        assert_eq!(
+            request_key("https://s.example/jf/videos/x/%2E%2e/0.m4s"),
+            "/jf/videos/0.m4s"
+        );
+        assert_eq!(
+            key_under_base(
+                "https://s.example/jf",
+                "https://s.example/jf/videos/.%2e/v/0.m4s"
+            ),
+            Some("/v/0.m4s".to_owned())
+        );
+        assert_eq!(
+            request_key("https://s.example/jf/videos/a%20b/0.m4s?q=1"),
+            "/jf/videos/a%20b/0.m4s?q=1"
+        );
+    }
+
+    /// CR 4638660955: a relative reference resolves against the URL the
+    /// playlist was answered from, base path and all, before the key is
+    /// taken. One that climbs out of the base path is not local; a sibling
+    /// stays under it.
+    #[test]
+    fn a_relative_reference_resolves_against_the_upstream_url() {
+        let server = "https://s.example/jf";
+        let from = "/videos/main.m3u8";
+        assert_eq!(
+            localize_playlist("#EXTINF:6.0,\n0.m4s\n", from, true, server, usize::MAX),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/0.m4s\n".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n../../x/0.m4s\n",
+                from,
+                true,
+                server,
+                usize::MAX
+            ),
+            Localized::NotLocal("../../x/0.m4s".to_owned()),
+            "a reference outside the base path was kept"
+        );
+    }
+
+    /// CR 4638660961: a comment line is kept verbatim, even one that holds
+    /// `URI="..."`; tags still have theirs localized.
+    #[test]
+    fn a_playlist_comment_is_kept_verbatim() {
+        let server = "https://s.example/jf";
+        let text =
+            "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/jf/videos/1/init.mp4\"\n";
+        assert_eq!(
+            localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// CR 4646280263: an absolute URL's path is checked as a path: one
+    /// that begins `//` is not read as a second authority, so it is not
+    /// local, and an ordinary same-origin URL under the base still is.
+    #[test]
+    fn an_absolute_urls_double_slash_path_is_not_a_second_authority() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        let r = "https://s.example//s.example/jf/videos/0.m4s";
+        assert_eq!(one(r), Localized::NotLocal(r.to_owned()));
+        assert_eq!(
+            one("https://s.example/jf/videos/0.m4s"),
+            Localized::Rewritten("/videos/0.m4s".to_owned())
+        );
+    }
+
+    /// CR 4646280259: a relative reference's logged path is found before
+    /// its query, so no query text reaches the log.
+    #[test]
+    fn a_relative_references_logged_path_holds_no_query() {
+        assert_eq!(url_path("0.m4s?session=a/b"), "");
+        assert_eq!(url_path("x/0.m4s?session=a/b#f/g"), "/0.m4s");
+        assert_eq!(url_path("/videos/0.m4s?session=a/b"), "/videos/0.m4s");
+    }
+
+    /// CR 4646280242: a response URL is compared with the one asked for
+    /// parsed: a path the client percent-encoded is no redirect, under a
+    /// base whose path needs encoding too. A redirect inside the base still
+    /// moves the key, and one out of it is refused.
+    #[test]
+    fn a_percent_encoded_response_url_is_not_a_redirect() {
+        let base = "https://media.example/caf\u{e9}";
+        let key = "/videos/1/main.m3u8?s=1";
+        let asked = format!("{base}{key}");
+        super::super::platform::take_info_lines();
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/caf%C3%A9/videos/1/main.m3u8?s=1",
+                key
+            ),
+            Landed::Asked
+        );
+        assert!(super::super::platform::take_info_lines()
+            .iter()
+            .any(|l| l.contains("verdict=same reason=spelled_differently")));
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/caf%C3%A9/videos/2/main.m3u8?s=1",
+                key
+            ),
+            Landed::Moved("/videos/2/main.m3u8?s=1".to_owned())
+        );
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/other/videos/1/main.m3u8?s=1",
+                key
+            ),
+            Landed::OutsideBase
+        );
+    }
+
+    /// CR 4646045317: a redirect's final URL is normalized before its base
+    /// is checked: a plain or encoded `..` that climbs out names no key,
+    /// and one that stays inside names the key it resolves to.
+    #[test]
+    fn a_final_url_climbing_out_of_the_base_names_no_key() {
+        let base = "https://s.example/jf";
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/../media/0.m4s"),
+            None
+        );
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/%2E%2E/media/0.m4s"),
+            None
+        );
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/videos/x/../0.m4s?s=1").as_deref(),
+            Some("/videos/0.m4s?s=1")
+        );
+    }
+
+    /// CR 4646045317: a percent-encoded `..` is resolved before the base
+    /// path is checked, in a root-relative reference (either case) and in
+    /// a relative one: one that climbs out of the base is refused and
+    /// logged by its paths. An encoded `..` that stays inside the base is
+    /// still accepted.
+    #[test]
+    fn an_encoded_dot_dot_out_of_the_base_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        for r in [
+            "/jf/%2e%2e/media/0.m4s",
+            "/jf/%2E%2E/media/0.m4s",
+            "../../../media/0.m4s",
+            "%2e%2e/%2e%2e/%2E%2E/media/0.m4s",
+        ] {
+            super::super::platform::take_info_lines();
+            assert_eq!(one(r), Localized::NotLocal(r.to_owned()), "{r}");
+            assert!(
+                super::super::platform::take_info_lines()
+                    .iter()
+                    .any(|l| l.contains(
+                        "pharos: video playlist reference verdict=refused reason=outside_base_path"
+                    ) && l.contains("resolved_path=/media/0.m4s")),
+                "{r}: the refusal was not logged"
+            );
+        }
+        assert_eq!(
+            one("/jf/videos/x/%2e%2e/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        // Relative and unmoved, it resolves to the same key: kept as written.
+        assert_eq!(one("x/%2E%2E/0.m4s"), Localized::Unchanged);
+    }
+
+    /// CR 4647377545: encoded and literal dot segments are removed in one
+    /// pass, in path order, as the client's URL parser does: `%2e%2e/..`
+    /// climbs twice. Mixed forms that climb out of the base are refused,
+    /// root-relative or relative, either order; one that stays inside
+    /// names the key the client fetches.
+    #[test]
+    fn mixed_encoded_and_literal_dot_segments_resolve_in_one_pass() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        for r in [
+            "/jf/videos/%2e%2e/../media/0.m4s",
+            "%2e%2e/../../media/0.m4s",
+            "../%2E%2E/../media/0.m4s",
+        ] {
+            super::super::platform::take_info_lines();
+            assert_eq!(one(r), Localized::NotLocal(r.to_owned()), "{r}");
+            assert!(
+                super::super::platform::take_info_lines()
+                    .iter()
+                    .any(|l| l.contains("reason=outside_base_path")
+                        && l.contains("resolved_path=/media/0.m4s")),
+                "{r}: the refusal was not logged"
+            );
+        }
+        assert_eq!(
+            one("/jf/videos/x/%2e%2e/../videos/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            key_under_base(server, "https://s.example/jf/videos/%2e%2e/../media/0.m4s"),
+            None
+        );
+    }
+
+    /// CR 4640611394: a root-relative reference is resolved before the
+    /// base path is checked: one whose dot segments climb out of it is not
+    /// local, and an ordinary one still is.
+    #[test]
+    fn a_root_relative_reference_climbing_out_of_the_base_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        assert_eq!(
+            one("/jf/../media/0.m4s"),
+            Localized::NotLocal("/jf/../media/0.m4s".to_owned())
+        );
+        assert_eq!(
+            one("/jf/videos/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            one("/jf/videos/x/../1/0.m4s?s=1"),
+            Localized::Rewritten("/videos/1/0.m4s?s=1".to_owned())
+        );
+    }
+
+    /// CR 4640611404: a key that would begin `//` names a host in a
+    /// playlist, so it is refused; a single-slash key is kept.
+    #[test]
+    fn a_key_that_would_name_a_host_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        assert_eq!(
+            one("/jf//videos/1/0.m4s"),
+            Localized::NotLocal("/jf//videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "//videos/1/0.m4s",
+                "/videos/1/main.m3u8",
+                false,
+                "https://s.example",
+                usize::MAX
+            ),
+            Localized::NotLocal("//videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "/videos/1/0.m4s",
+                "/videos/1/main.m3u8",
+                false,
+                "https://s.example",
+                usize::MAX
+            ),
+            Localized::Unchanged
+        );
+    }
+
+    /// CR 4640611412: only an attribute named exactly `URI` is a reference.
+    /// Client metadata whose name ends in `URI`, or a quoted value holding
+    /// `URI="`, is kept as it is; a real `EXT-X-MAP` URI is still rewritten.
+    #[test]
+    fn only_an_attribute_named_uri_is_a_reference() {
+        let server = "https://s.example/jf";
+        let text = "#EXT-X-DATERANGE:ID=\"d\",X-COM-EXAMPLE-URI=\"https://elsewhere.example/x\",X-NOTE=\"a,URI=\"\n\
+            #EXT-X-MAP:URI=\"/jf/videos/1/init.mp4\",BYTERANGE=\"10@0\"\n\
+            #EXTINF:6.0,\n\
+            /jf/videos/1/0.m4s\n";
+        assert_eq!(
+            localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXT-X-DATERANGE:ID=\"d\",X-COM-EXAMPLE-URI=\"https://elsewhere.example/x\",X-NOTE=\"a,URI=\"\n\
+                 #EXT-X-MAP:URI=\"/videos/1/init.mp4\",BYTERANGE=\"10@0\"\n\
+                 #EXTINF:6.0,\n\
+                 /videos/1/0.m4s\n"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// CR 4642574446: an `EXTINF` title is text, not an attribute list. A
+    /// title reading like a `URI` attribute is kept verbatim, and an
+    /// off-origin `EXT-X-MAP` URI is still refused.
+    #[test]
+    fn an_extinf_title_is_kept_verbatim() {
+        let server = "https://s.example/jf";
+        let text = "#EXTINF:6.0,URI=\"https://elsewhere.example/x\"\n\
+            /jf/videos/1/0.m4s\n";
+        assert_eq!(
+            localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXTINF:6.0,URI=\"https://elsewhere.example/x\"\n\
+                 /videos/1/0.m4s\n"
+                    .to_owned()
+            )
+        );
+        let off = "#EXT-X-MAP:URI=\"https://elsewhere.example/init.mp4\"\n";
+        assert_eq!(
+            localize_playlist(off, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::NotLocal("https://elsewhere.example/init.mp4".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_redirected_playlist_names_its_files_by_absolute_path() {
+        let master = "#EXTM3U\r\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"../audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
+            main.m3u8?s=1\r\n\
+            \r\n\
+            /already/absolute.m3u8?s=1\r\n\
+            http://S:8096/videos/7/same.m3u8\r\n";
+        assert_eq!(
+            localize_playlist(
+                master,
+                "/videos/7/hls/master.m3u8?s=1",
+                true,
+                "http://s:8096",
+                usize::MAX
+            ),
+            Localized::Rewritten(
+            "#EXTM3U\r\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"/videos/7/audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
+            /videos/7/hls/main.m3u8?s=1\r\n\
+            \r\n\
+            /already/absolute.m3u8?s=1\r\n\
+            /videos/7/same.m3u8\r\n"
+                .to_owned()
+            )
+        );
+        // A media playlist's init and segments, no final newline.
+        assert_eq!(
+            localize_playlist(
+                "#EXT-X-MAP:URI=\"init.mp4?s=1\"\n#EXTINF:6.0,\n./0.m4s?s=1",
+                "/videos/7/hls/main.m3u8?s=1",
+                true,
+                "http://s:8096",
+                usize::MAX
+            ),
+            Localized::Rewritten(
+                "#EXT-X-MAP:URI=\"/videos/7/hls/init.mp4?s=1\"\n#EXTINF:6.0,\n/videos/7/hls/0.m4s?s=1"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// Outside-diff items kept_video_disk.rs:3191 and :2344: a server under
+    /// `/jf` names its files by absolute path or absolute URL with the base
+    /// path in them. Stored, they name the keys (base path off), whether
+    /// or not a redirect moved the playlist. Relative references stay. A
+    /// file on another origin, or outside the base path, cannot be served
+    /// offline.
+    #[test]
+    fn a_playlist_names_its_files_by_key_under_the_base_path() {
+        let server = "https://s.example/jf";
+        let media = "#EXT-X-MAP:URI=\"/jf/videos/1/init.mp4?s=1\"\n\
+            #EXTINF:6.0,\nhttps://s.example/jf/videos/1/0.m4s?s=1\n\
+            #EXTINF:6.0,\n//s.example/jf/videos/1/1.m4s?s=1\n\
+            #EXTINF:6.0,\n2.m4s?s=1\n";
+        assert_eq!(
+            localize_playlist(media, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXT-X-MAP:URI=\"/videos/1/init.mp4?s=1\"\n\
+                #EXTINF:6.0,\n/videos/1/0.m4s?s=1\n\
+                #EXTINF:6.0,\n/videos/1/1.m4s?s=1\n\
+                #EXTINF:6.0,\n2.m4s?s=1\n"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n0.m4s\n",
+                "/videos/1/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Unchanged
+        );
+        for elsewhere in ["https://cdn.example/jf/0.m4s", "/other/0.m4s", "/jfx/0.m4s"] {
+            assert_eq!(
+                localize_playlist(
+                    &format!("#EXTINF:6.0,\n{elsewhere}\n"),
+                    "/videos/1/main.m3u8",
+                    false,
+                    server,
+                    usize::MAX
+                ),
+                Localized::NotLocal(elsewhere.to_owned()),
+                "{elsewhere}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_download_sends_the_token_only_for_the_user_it_belongs_to() {
+        assert_eq!(
+            token_for_owner(Some("tok"), Some("u1"), "u1"),
+            Ok("tok".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(Some("tok"), Some("u2"), "u1"),
+            Err("token_owner_mismatch owner=u1 token_user=u2".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(Some("tok"), None, "u1"),
+            Err("token_user_unknown owner=u1".to_owned())
+        );
+        assert_eq!(
+            token_for_owner(None, Some("u1"), "u1"),
+            Err("no_token owner=u1".to_owned())
+        );
+    }
+
+    /// A manifest written before a field existed still parses, and one
+    /// written by a newer build (an extra field) does too: a manifest that
+    /// does not parse holds its folder and blocks every admission. The
+    /// fields that name the item and its files have no default.
+    #[test]
+    fn an_older_manifest_missing_later_fields_still_parses() {
+        let old = r#"{"item":"7","user":"u1","master_url":"http://h/m.m3u8",
+            "files":["http://h/m.m3u8"],"state":{"state":"ready"},
+            "a_field_from_a_newer_build":1}"#;
+        let v: KeptVideo = serde_json::from_str(old).unwrap();
+        assert_eq!((v.item.as_str(), v.quality_bps, v.position_ms), ("7", 0, 0));
+        assert!(v.subtitles.is_empty() && v.audio.is_none() && v.title.is_empty());
+        assert!(v.ready());
+        // What names the item or what it stored is not invented.
+        for gone in ["item", "user", "master_url", "files", "state"] {
+            let mut j: serde_json::Value = serde_json::from_str(old).unwrap();
+            j.as_object_mut().unwrap().remove(gone);
+            assert!(
+                serde_json::from_value::<KeptVideo>(j).is_err(),
+                "{gone} defaulted"
+            );
+        }
+    }
 
     #[test]
     fn a_download_must_fit_under_the_cap_and_above_the_guard() {
@@ -540,6 +1772,128 @@ mod tests {
         assert_eq!(used_by(&list, "u", Some("b")), 10);
         assert_eq!(used_by(&list, "other", None), 0);
         assert_eq!(interrupted(&list).len(), 1);
+    }
+
+    #[test]
+    fn a_request_key_is_the_path_and_query_whatever_the_spelling() {
+        let k = "/videos/1/0.m4s?PlaySessionId=z";
+        assert_eq!(request_key(k), k);
+        assert_eq!(
+            request_key("https://h:8096/videos/1/0.m4s?PlaySessionId=z#f"),
+            k
+        );
+        assert_eq!(request_key("videos/1/0.m4s?PlaySessionId=z"), k);
+        assert_eq!(request_key("http://h"), "/");
+        // No path: the query stays, under `/`, as the slash spelling has it.
+        assert_eq!(
+            request_key("https://h?PlaySessionId=z"),
+            request_key("/?PlaySessionId=z")
+        );
+        assert_eq!(
+            request_key("https://h:8096?PlaySessionId=z#f"),
+            "/?PlaySessionId=z"
+        );
+        assert_eq!(request_key("https://h#f"), "/");
+        // A `/` inside a query with no path before it is not the path.
+        assert_eq!(request_key("https://h?next=/a"), "/?next=/a");
+        assert_eq!(url_path("https://h?next=/a"), "");
+        // A `://` inside the query is not a scheme.
+        let redirect = "/videos/1/0.m4s?next=https://x.test/a&PlaySessionId=z";
+        assert_eq!(request_key(redirect), redirect);
+        assert_eq!(url_path(redirect), "/videos/1/0.m4s");
+        assert_eq!(
+            request_key("https://h/videos/1/0.m4s?next=https://x.test/a"),
+            "/videos/1/0.m4s?next=https://x.test/a"
+        );
+        assert_eq!(
+            absolute_url("https://h", redirect),
+            format!("https://h{redirect}")
+        );
+    }
+
+    #[test]
+    fn a_stored_file_is_answered_with_the_type_its_key_names() {
+        for (key, want) in [
+            ("/videos/1/master.m3u8?a=b", "application/vnd.apple.mpegurl"),
+            (
+                "/videos/1/h264cmaf/main.m3u8",
+                "application/vnd.apple.mpegurl",
+            ),
+            ("/videos/1/init.mp4?a=b.ts", "video/mp4"),
+            ("/videos/1/0.m4s?a=b", "video/mp4"),
+            ("/hls1/main/0.ts", "video/mp2t"),
+            ("/videos/1/subtitles/3/stream.vtt", "text/vtt"),
+            ("/videos/1/stream", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type_for(key), want, "{key}");
+        }
+    }
+
+    #[test]
+    fn requests_are_classed_and_logged_by_how_often_they_come() {
+        let cases = [
+            (
+                "/videos/1/master.m3u8?p=1",
+                RequestClass::Master,
+                Some(Loudness::Info),
+            ),
+            (
+                "/videos/1/h264cmaf/main.m3u8?p=1",
+                RequestClass::Playlist,
+                Some(Loudness::Info),
+            ),
+            (
+                "/videos/1/h264cmaf/init.mp4?p=1",
+                RequestClass::Init,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/videos/1/h264cmaf/7.m4s?p=1",
+                RequestClass::Segment,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/hls1/main/7.ts",
+                RequestClass::Segment,
+                Some(Loudness::Debug),
+            ),
+            (
+                "/videos/1/subtitles/3/stream.vtt",
+                RequestClass::Subtitle,
+                Some(Loudness::Debug),
+            ),
+            ("/Items/1/Images/Primary", RequestClass::Other, None),
+        ];
+        for (key, class, loud) in cases {
+            assert_eq!(request_class(key), class, "{key}");
+            assert_eq!(loudness(class), loud, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_request_labels_are_distinct_and_the_line_hides_the_query() {
+        let mut labels = vec![
+            RequestClass::Master.label(),
+            RequestClass::Playlist.label(),
+            RequestClass::Init.label(),
+            RequestClass::Segment.label(),
+            RequestClass::Subtitle.label(),
+            RequestClass::Other.label(),
+            Verdict::ServedOffline.label(),
+            Verdict::Network.label(),
+        ];
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 8);
+        let line = request_line(
+            "/videos/1/7.m4s?PlaySessionId=secret",
+            Verdict::ServedOffline,
+            99,
+        );
+        assert_eq!(
+            line,
+            "pharos: video request class=segment verdict=served_offline bytes=99 url_path=/videos/1/7.m4s"
+        );
     }
 
     #[test]

@@ -141,6 +141,366 @@ pub fn proxied(segment: &str) -> bool {
     PROXIED.contains(&segment)
 }
 
+/// Scheme, host and port of an absolute `http(s)` URL, lower-cased, the
+/// port defaulted by scheme, and an IPv6 literal in its one canonical
+/// spelling (`[2001:db8::1]` however it was written), so two spellings of
+/// one address are one origin. None for anything else.
+pub(crate) fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    // The same parser the HTTP client sends with (reqwest's `Url`), so an
+    // origin compares as the request will reach it: IDNA, percent-encoding,
+    // IPv4 shorthands and IPv6 spellings all canonical.
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = parsed.scheme().to_owned();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str().filter(|h| !h.is_empty())?.to_owned();
+    let port = parsed.port_or_known_default()?;
+    Some((scheme, host, port))
+}
+
+/// The redirects a download follows: the tenth is followed, an eleventh is
+/// not (as reqwest's default limit).
+pub const DOWNLOAD_REDIRECTS: usize = 10;
+
+/// Whether a redirect with `previous` URLs already requested in its chain
+/// (the original among them, as reqwest's `Attempt::previous` counts) is
+/// past [`DOWNLOAD_REDIRECTS`].
+pub fn redirects_exceeded(previous: usize) -> bool {
+    previous > DOWNLOAD_REDIRECTS
+}
+
+/// Whether a download's request to `original` may follow a redirect to
+/// `next`: only when scheme, host and port all match. The download sends the
+/// device token in a header, so a redirect to another host would hand it
+/// over, and one from https to http would send it in the clear. Plain http to
+/// the same http origin stays allowed: the server may be on the LAN. Err is
+/// the reason it stops, for the log.
+pub fn redirect_verdict(original: &str, next: &str) -> Result<(), String> {
+    let (Some(from), Some(to)) = (origin_of(original), origin_of(next)) else {
+        return Err("redirect target is not an http(s) URL".to_owned());
+    };
+    if from == to {
+        return Ok(());
+    }
+    if from.0 == "https" && to.0 == "http" {
+        return Err(format!("https to http downgrade to {}:{}", to.1, to.2));
+    }
+    if from.1 != to.1 {
+        return Err(format!("another host, {}", to.1));
+    }
+    if from.2 != to.2 {
+        return Err(format!("another port, {}", to.2));
+    }
+    Err(format!("another scheme, {}", to.0))
+}
+
+/// Whether the device token may go to `url` in a header: only over https,
+/// or to the server the build was pointed at (`PHAROS_TV_SERVER`, passed as
+/// `build_server`), whatever its scheme. Any other plain-http request goes
+/// without the token. Err is the reason, for the log.
+///
+/// A build pointed at a plain-http server that is not loopback (a server on
+/// the LAN) sends the token to it unencrypted, readable by anyone on that
+/// network. That is an accepted risk for LAN builds: the build names its
+/// server, and https is the remedy.
+pub fn token_allowed(url: &str, build_server: &str) -> Result<(), String> {
+    let Some(to) = origin_of(url) else {
+        return Err("not an http(s) URL".to_owned());
+    };
+    if to.0 == "https" {
+        return Ok(());
+    }
+    if origin_of(build_server).as_ref() == Some(&to) {
+        return Ok(());
+    }
+    Err(format!(
+        "plain http to {}:{}, not the build's server",
+        to.1, to.2
+    ))
+}
+
+/// What a request carrying the device token does with one redirect hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hop {
+    /// Same origin, where the token may go: follow and keep it.
+    FollowWithToken,
+    /// Another origin (artwork on another host, say): follow, without the
+    /// token.
+    FollowWithoutToken,
+    /// Not followed, for the reason given (an https-to-http downgrade, a
+    /// target that is not http(s)).
+    Refuse(String),
+}
+
+/// The proxy's decision for one redirect hop from `from` to `to`. The
+/// token stays only on the same origin, and there only where it may go at
+/// all ([`token_allowed`]: https, or the build's own server); another
+/// origin is followed without it, and a downgrade to http is refused.
+pub fn redirect_hop(from: &str, to: &str, build_server: &str) -> Hop {
+    let (Some(a), Some(b)) = (origin_of(from), origin_of(to)) else {
+        return Hop::Refuse("redirect target is not an http(s) URL".to_owned());
+    };
+    if a.0 == "https" && b.0 == "http" {
+        return Hop::Refuse(format!("https to http downgrade to {}:{}", b.1, b.2));
+    }
+    if a == b && token_allowed(to, build_server).is_ok() {
+        return Hop::FollowWithToken;
+    }
+    Hop::FollowWithoutToken
+}
+
+/// The download client, or why there is none. A client that cannot be built
+/// is never replaced by a default one: its redirect policy is what keeps the
+/// device token on the server's origin, so the download is refused with the
+/// error named.
+pub fn built_client<C, E: std::fmt::Display>(
+    build: impl FnOnce() -> Result<C, E>,
+) -> Result<C, String> {
+    built_client_for("download", build)
+}
+
+/// [`built_client`] for the client named `what` (the proxy's, the
+/// download's): one that cannot be built is the error, naming it, never a
+/// default client in its place.
+pub fn built_client_for<C, E: std::fmt::Display>(
+    what: &str,
+    build: impl FnOnce() -> Result<C, E>,
+) -> Result<C, String> {
+    build().map_err(|e| format!("the {what} client could not be built: {e}"))
+}
+
+/// One hop of a proxied request: a GET of `url` with `headers`, no redirect
+/// followed. The phone's is its reqwest client; a host test's can count
+/// what reaches a server.
+pub trait ProxyTransport: Sync {
+    type Response: ProxyResponse + Send;
+    /// Err is the reason, for `stage=send`.
+    fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> impl std::future::Future<Output = Result<Self::Response, String>> + Send;
+}
+
+/// What one hop answered.
+pub trait ProxyResponse {
+    fn status(&self) -> u16;
+    fn header(&self, name: &str) -> Option<String>;
+    /// The redirect target, made absolute against this response's URL, when
+    /// the answer is a redirect with a `Location`; Err when it cannot be
+    /// read.
+    fn redirect(&self) -> Option<Result<String, String>>;
+    /// Err is the reason, for `stage=body`.
+    fn body(self) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+}
+
+/// How loud a proxy log line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Debug,
+    Info,
+    Warn,
+}
+
+/// A proxied GET: where it goes and what it may carry.
+pub struct ProxyGet<'a> {
+    pub url: String,
+    /// The device token, when it may go to `url` ([`token_allowed`]).
+    pub token: Option<String>,
+    pub headers: &'a [(String, String)],
+    pub build_server: &'a str,
+    /// The response headers passed back.
+    pub passed_back: &'a [&'a str],
+    pub max_hops: usize,
+}
+
+/// Whether the request header `name` may go to another origin
+/// ([`CROSS_ORIGIN_HEADERS`]).
+fn crosses_origins(name: &str) -> bool {
+    CROSS_ORIGIN_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
+}
+
+/// The proxy's client from `build`: one that cannot be built is the error,
+/// naming the proxy, never a default client in its place
+/// ([`built_client_for`]).
+pub fn proxy_client<C>(build: impl FnOnce() -> Result<C, String>) -> Result<C, String> {
+    built_client_for("proxy", build)
+}
+
+/// The caller's request headers that may go to another origin than the
+/// request's own: content negotiation and validators, nothing that can
+/// carry a credential. Any other header (`Authorization`, `Cookie`, ...)
+/// is sent only while the request is on its original origin.
+pub const CROSS_ORIGIN_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "if-modified-since",
+    "if-none-match",
+    "range",
+];
+
+/// Runs a proxied GET over `client`, following redirects by hand through
+/// [`redirect_hop`]: the token stays only on its own origin, and at most
+/// `max_hops` are followed. With no client, nothing is sent: the request
+/// is refused with the reason (`stage=client`). Returns the status, the
+/// passed-back headers and the body; `log` gets each decision.
+pub async fn proxy_get<T: ProxyTransport>(
+    client: &Result<T, String>,
+    get: ProxyGet<'_>,
+    log: &(dyn Fn(Level, String) + Sync),
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let client = client.as_ref().map_err(|why| {
+        log(
+            Level::Warn,
+            format!("pharos: proxy request refused reason={why}"),
+        );
+        format!("stage=client {why}")
+    })?;
+    let ProxyGet {
+        mut url,
+        mut token,
+        headers,
+        build_server,
+        passed_back,
+        max_hops,
+    } = get;
+    // Checked here as well as by the caller: the core never sends the token
+    // where it may not go, whatever it was handed.
+    let mut withheld = false;
+    if token.is_some() {
+        if let Err(reason) = token_allowed(&url, build_server) {
+            log(
+                Level::Warn,
+                format!("pharos: proxy token withheld reason={reason}"),
+            );
+            token = None;
+            withheld = true;
+        }
+    }
+    // Why a hop carries no token, when it carries none: the request never
+    // had one, it was withheld from plain http off the build's server, or
+    // an earlier hop dropped it. Stable label strings.
+    let started_with_token = token.is_some();
+    let no_token_reason = || {
+        if started_with_token {
+            "token_dropped_earlier"
+        } else if withheld {
+            "token_withheld_insecure"
+        } else {
+            "no_token"
+        }
+    };
+    let mut hops = 0usize;
+    // Once a redirect leaves the original origin, the caller's headers
+    // keep only those that may cross origins, for the rest of the request,
+    // as the token does.
+    let home = origin_of(&url);
+    let mut left_home = false;
+    let resp = loop {
+        let mut sent = Vec::with_capacity(headers.len() + 1);
+        if let Some(token) = &token {
+            sent.push(("X-Emby-Token".to_owned(), token.clone()));
+        }
+        left_home |= origin_of(&url) != home;
+        if left_home {
+            let dropped: Vec<&str> = headers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| !crosses_origins(n))
+                .collect();
+            if !dropped.is_empty() {
+                log(
+                    Level::Info,
+                    format!(
+                        "pharos: proxy redirect headers verdict=dropped reason=cross_origin names={}",
+                        dropped.join(",")
+                    ),
+                );
+            }
+            sent.extend(headers.iter().filter(|(n, _)| crosses_origins(n)).cloned());
+        } else {
+            sent.extend(headers.iter().cloned());
+        }
+        let resp = client
+            .get(&url, &sent)
+            .await
+            .map_err(|e| format!("stage=send {e}"))?;
+        // Only a real redirect is followed: a 304 (or any other 3xx) is the
+        // answer, its ETag passed back, whatever Location it carries.
+        if !follows(resp.status()) {
+            break resp;
+        }
+        let Some(next) = resp.redirect() else {
+            break resp;
+        };
+        let next = next.map_err(|e| format!("stage=redirect location not understood: {e}"))?;
+        if hops >= max_hops {
+            return Err(format!("stage=redirect more than {max_hops} redirects"));
+        }
+        hops += 1;
+        let status = resp.status();
+        match redirect_hop(&url, &next, build_server) {
+            // The verdict says what the next request carries: a token
+            // dropped on an earlier hop stays dropped, even back on its own
+            // origin.
+            Hop::FollowWithToken if token.is_some() => log(
+                Level::Debug,
+                format!("pharos: proxy redirect verdict=follow_with_token status={status}"),
+            ),
+            Hop::FollowWithToken => log(
+                Level::Debug,
+                format!(
+                    "pharos: proxy redirect verdict=follow_without_token reason={} status={status}",
+                    no_token_reason()
+                ),
+            ),
+            // Every hop without the token says why, whether this hop
+            // dropped it or it was already gone.
+            Hop::FollowWithoutToken => {
+                let reason = if token.take().is_some() {
+                    "cross_origin"
+                } else {
+                    no_token_reason()
+                };
+                log(
+                    Level::Info,
+                    format!(
+                        "pharos: proxy redirect verdict=follow_without_token reason={reason} status={status}"
+                    ),
+                );
+            }
+            Hop::Refuse(reason) => {
+                log(
+                    Level::Warn,
+                    format!(
+                        "pharos: proxy redirect verdict=refused reason={reason} status={status}"
+                    ),
+                );
+                return Err(format!("stage=redirect refused: {reason}"));
+            }
+        }
+        url = next;
+    };
+    let status = resp.status();
+    let back = passed_back
+        .iter()
+        .filter_map(|name| resp.header(name).map(|v| ((*name).to_owned(), v)))
+        .collect();
+    let body = resp
+        .body()
+        .await
+        .map_err(|e| format!("stage=body status={status} {e}"))?;
+    Ok((status, back, body))
+}
+
+/// Whether a response with `status` is a redirect the proxy follows.
+fn follows(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
 /// An error and every cause under it, `outer: inner: ...`, for a log line.
 /// reqwest's own `Display` names only the top layer ("error sending
 /// request"), which hides whether the connection was refused, reset or
@@ -1270,6 +1630,742 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CR 4642574391: `previous` holds the original and each redirect
+    /// before this one, so the tenth redirect sees ten and is followed;
+    /// only an eleventh is refused.
+    #[test]
+    fn the_tenth_download_redirect_is_followed() {
+        assert!(!redirects_exceeded(1), "the first redirect");
+        assert!(!redirects_exceeded(10), "the tenth redirect");
+        assert!(redirects_exceeded(11), "an eleventh redirect");
+    }
+
+    /// The device token goes only over https, or to the build's own server
+    /// at its own origin; any other plain-http URL is refused with the
+    /// origin named.
+    #[test]
+    fn the_device_token_goes_only_over_https_or_to_the_builds_server() {
+        let dev = "http://192.168.1.5:8096";
+        let https = "https://media.example.org";
+        assert!(token_allowed("https://media.example.org/Items", https).is_ok());
+        assert!(token_allowed("https://other.example.org/Items", dev).is_ok());
+        assert!(token_allowed("http://192.168.1.5:8096/Items", dev).is_ok());
+        let Err(why) = token_allowed("http://192.168.1.6:8096/Items", dev) else {
+            panic!("plain http to another LAN host was allowed");
+        };
+        assert!(why.contains("192.168.1.6:8096"), "{why}");
+        assert!(token_allowed("http://192.168.1.5:9000/Items", dev).is_err());
+        assert!(token_allowed("http://media.example.org/Items", https).is_err());
+        assert!(token_allowed("ftp://media.example.org/Items", https).is_err());
+    }
+
+    /// Origins compare as the HTTP client reaches them. A backslash ends
+    /// the authority for http(s) there, so a URL that reads as the build's
+    /// server after an `@` goes to another host, and gets no token; an IPv4
+    /// shorthand or a percent-encoded host is the same origin it names.
+    #[test]
+    fn origins_compare_as_the_http_client_parses_them() {
+        let lan = "http://media.example.org:8096";
+        assert!(
+            token_allowed(
+                "http://other.example.net\\@media.example.org:8096/Items",
+                lan
+            )
+            .is_err(),
+            "a request reqwest sends to another host was given the token"
+        );
+        assert!(token_allowed("http://127.1:8096/Items", "http://127.0.0.1:8096").is_ok());
+        assert!(token_allowed("http://medi%61.example.org:8096/Items", lan).is_ok());
+        assert_eq!(
+            redirect_hop(
+                "https://media.example.org/a",
+                "https://other.example.net\\@media.example.org/b",
+                lan
+            ),
+            Hop::FollowWithoutToken
+        );
+    }
+
+    /// A Unicode host is the punycode origin the client sends to: a redirect
+    /// between the two spellings keeps the token, and one to another IDN
+    /// host goes without it.
+    #[test]
+    fn a_unicode_host_compares_as_its_punycode_origin() {
+        let lan = "http://xn--mdia-bpa.example.org:8096";
+        assert_eq!(
+            redirect_hop(
+                "https://m\u{e9}dia.example.org/a",
+                "https://xn--mdia-bpa.example.org/b",
+                lan
+            ),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(
+                "https://xn--mdia-bpa.example.org/a",
+                "https://m\u{e8}dia.example.org/b",
+                lan
+            ),
+            Hop::FollowWithoutToken
+        );
+        assert!(token_allowed("http://m\u{e9}dia.example.org:8096/Items", lan).is_ok());
+        assert!(token_allowed("http://m\u{e8}dia.example.org:8096/Items", lan).is_err());
+    }
+
+    /// A proxied request's redirect: the same origin keeps the token,
+    /// another https origin is followed without it, a downgrade to http is
+    /// refused, and the build's own plain-http server keeps it on its own
+    /// origin.
+    #[test]
+    fn a_proxy_redirect_keeps_the_token_only_on_its_own_origin() {
+        let https = "https://media.example.org";
+        let from = "https://media.example.org/Items/1/Images/Primary";
+        assert_eq!(
+            redirect_hop(from, "https://media.example.org/cache/1.jpg", https),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(from, "https://art.example.net/1.jpg", https),
+            Hop::FollowWithoutToken
+        );
+        let Hop::Refuse(why) = redirect_hop(from, "http://media.example.org/1.jpg", https) else {
+            panic!("a downgrade to http was followed");
+        };
+        assert!(why.contains("downgrade"), "{why}");
+        let dev = "http://192.168.1.5:8096";
+        assert_eq!(
+            redirect_hop(
+                "http://192.168.1.5:8096/a",
+                "http://192.168.1.5:8096/b",
+                dev
+            ),
+            Hop::FollowWithToken
+        );
+        assert_eq!(
+            redirect_hop(
+                "http://192.168.1.5:8096/a",
+                "http://192.168.1.6:8096/b",
+                dev
+            ),
+            Hop::FollowWithoutToken
+        );
+        assert!(matches!(
+            redirect_hop(from, "ftp://media.example.org/1.jpg", https),
+            Hop::Refuse(_)
+        ));
+    }
+
+    /// A client that cannot be built is an error naming why, and what would
+    /// have been sent with it is not sent. (reqwest has no way to force a
+    /// build failure, so the builder is a fake.)
+    #[test]
+    fn a_download_client_that_cannot_be_built_refuses_the_download() {
+        let mut sent = false;
+        let client = built_client(|| Err::<(), _>("tls backend unavailable"));
+        let outcome = client.as_ref().map(|c| {
+            sent = true;
+            *c
+        });
+        assert!(!sent, "a request went out without its client");
+        let Err(why) = outcome else {
+            panic!("a client that was never built was used");
+        };
+        assert!(why.contains("tls backend unavailable"), "{why}");
+        assert!(why.contains("download client"), "{why}");
+        assert_eq!(built_client(|| Ok::<_, String>(7)), Ok(7));
+    }
+
+    /// A transport that counts the requests it is asked to send and
+    /// answers each with a 200 `ok`: nothing goes over a socket.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    struct Answer(u16, Vec<u8>);
+
+    impl ProxyResponse for Answer {
+        fn status(&self) -> u16 {
+            self.0
+        }
+        fn header(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redirect(&self) -> Option<Result<String, String>> {
+            None
+        }
+        async fn body(self) -> Result<Vec<u8>, String> {
+            Ok(self.1)
+        }
+    }
+
+    impl ProxyTransport for Counting {
+        type Response = Answer;
+        async fn get(&self, _: &str, _: &[(String, String)]) -> Result<Answer, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Answer(200, b"ok".to_vec()))
+        }
+    }
+
+    /// The proxy path itself with a client that cannot be built: the
+    /// request is refused with the reason, and nothing reaches the server.
+    /// With a client, the same request does reach it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_proxy_client_that_cannot_be_built_sends_nothing() {
+        let base = "http://media.example.org";
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let logged = std::sync::Mutex::new(Vec::new());
+        let log = |_: Level, line: String| logged.lock().unwrap().push(line);
+        let get = |url: String| ProxyGet {
+            url,
+            token: Some("tok".to_owned()),
+            headers: &[],
+            build_server: "",
+            passed_back: &[],
+            max_hops: 5,
+        };
+        let broken = proxy_client::<Counting>(|| Err("tls config: no roots".to_owned()));
+        let refused = rt.block_on(proxy_get(&broken, get(format!("{base}/Items")), &log));
+        let Err(why) = refused else {
+            panic!("a client that was never built sent the request");
+        };
+        assert!(why.starts_with("stage=client "), "{why}");
+        assert!(
+            why.contains("proxy client") && why.contains("no roots"),
+            "{why}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a request was sent"
+        );
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("pharos: proxy request refused reason=")
+                    && l.contains("no roots")),
+            "{:?}",
+            logged.lock().unwrap()
+        );
+
+        // The control: a built client reaches the same server.
+        let built = proxy_client(|| Ok(Counting(hits.clone())));
+        let (status, _, body) = rt
+            .block_on(proxy_get(&built, get(format!("{base}/Items")), &log))
+            .unwrap();
+        assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A transport that answers every request with 200 and keeps the
+    /// headers each one was sent with.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<Vec<(String, String)>>>);
+
+    #[allow(clippy::unwrap_used)]
+    impl ProxyTransport for Recording {
+        type Response = Answer;
+        async fn get(&self, _: &str, headers: &[(String, String)]) -> Result<Answer, String> {
+            self.0.lock().unwrap().push(headers.to_vec());
+            Ok(Answer(200, Vec::new()))
+        }
+    }
+
+    /// A transport that answers each request with the next redirect of its
+    /// script (200 once the script is done), keeping each request's URL and
+    /// whether it carried the token.
+    struct Scripted {
+        redirects: std::sync::Mutex<std::collections::VecDeque<String>>,
+        sent: std::sync::Mutex<Vec<(String, bool)>>,
+        /// The header names each request carried.
+        names: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Scripted {
+        fn new(redirects: &[&str]) -> Self {
+            Self {
+                redirects: std::sync::Mutex::new(
+                    redirects.iter().map(|r| (*r).to_owned()).collect(),
+                ),
+                sent: std::sync::Mutex::new(Vec::new()),
+                names: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    struct ScriptedAnswer(Option<String>);
+
+    impl ProxyResponse for ScriptedAnswer {
+        fn status(&self) -> u16 {
+            if self.0.is_some() {
+                302
+            } else {
+                200
+            }
+        }
+        fn header(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redirect(&self) -> Option<Result<String, String>> {
+            self.0.clone().map(Ok)
+        }
+        async fn body(self) -> Result<Vec<u8>, String> {
+            Ok(b"ok".to_vec())
+        }
+    }
+
+    #[allow(clippy::unwrap_used)]
+    impl ProxyTransport for Scripted {
+        type Response = ScriptedAnswer;
+        async fn get(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<ScriptedAnswer, String> {
+            let carries = headers.iter().any(|(n, _)| n == "X-Emby-Token");
+            self.sent.lock().unwrap().push((url.to_owned(), carries));
+            self.names
+                .lock()
+                .unwrap()
+                .push(headers.iter().map(|(n, _)| n.clone()).collect());
+            Ok(ScriptedAnswer(self.redirects.lock().unwrap().pop_front()))
+        }
+    }
+
+    /// A 304 that carries a Location (as some servers send) is returned with
+    /// its ETag after one request: nothing is followed.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_not_modified_answer_is_returned_without_following_its_location() {
+        struct NotModified(std::sync::Mutex<usize>);
+        struct Answer;
+        impl ProxyResponse for Answer {
+            fn status(&self) -> u16 {
+                304
+            }
+            fn header(&self, name: &str) -> Option<String> {
+                (name == "ETag").then(|| "\"v1\"".to_owned())
+            }
+            fn redirect(&self) -> Option<Result<String, String>> {
+                Some(Ok("https://a.example.org/elsewhere".to_owned()))
+            }
+            async fn body(self) -> Result<Vec<u8>, String> {
+                Ok(Vec::new())
+            }
+        }
+        impl ProxyTransport for NotModified {
+            type Response = Answer;
+            async fn get(&self, _: &str, _: &[(String, String)]) -> Result<Answer, String> {
+                *self.0.lock().unwrap() += 1;
+                Ok(Answer)
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(NotModified(std::sync::Mutex::new(0))));
+        let (status, back, _) = rt
+            .block_on(proxy_get(
+                &client,
+                ProxyGet {
+                    url: "https://a.example.org/1".to_owned(),
+                    token: Some("tok".to_owned()),
+                    headers: &[],
+                    build_server: "https://a.example.org",
+                    passed_back: &["ETag"],
+                    max_hops: 5,
+                },
+                &|_, _| {},
+            ))
+            .unwrap();
+        assert_eq!(status, 304);
+        assert_eq!(back, [("ETag".to_owned(), "\"v1\"".to_owned())]);
+        assert_eq!(
+            *client.as_ref().unwrap().0.lock().unwrap(),
+            1,
+            "the 304's Location was followed"
+        );
+    }
+
+    /// Which requests of a proxied GET over `redirects` carried the token,
+    /// starting at `from` with it.
+    #[allow(clippy::unwrap_used)]
+    fn token_per_hop(from: &str, redirects: &[&str]) -> Vec<(String, bool)> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(redirects)));
+        let (status, _, body) = rt
+            .block_on(proxy_get(
+                &client,
+                ProxyGet {
+                    url: from.to_owned(),
+                    token: Some("tok".to_owned()),
+                    headers: &[],
+                    build_server: "https://a.example.org",
+                    passed_back: &[],
+                    max_hops: 5,
+                },
+                &|_, _| {},
+            ))
+            .unwrap();
+        assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+        let sent = client.as_ref().unwrap().sent.lock().unwrap().clone();
+        sent
+    }
+
+    /// Once a redirect leaves the token's origin the token is gone for the
+    /// rest of the request: A to B to B and back to A sends it on the first
+    /// request only, never again, even back on A.
+    #[test]
+    fn a_token_dropped_on_one_hop_stays_dropped_for_the_rest() {
+        let sent = token_per_hop(
+            "https://a.example.org/1",
+            &[
+                "https://b.example.net/2",
+                "https://b.example.net/3",
+                "https://a.example.org/4",
+            ],
+        );
+        let carried: Vec<bool> = sent.iter().map(|(_, c)| *c).collect();
+        assert_eq!(
+            carried,
+            [true, false, false, false],
+            "the token went past its origin: {sent:?}"
+        );
+        assert_eq!(sent[3].0, "https://a.example.org/4");
+    }
+
+    /// CR 4644634678: a caller's credential headers stay on the original
+    /// origin. A redirect to another origin keeps only the headers that may
+    /// cross ([`CROSS_ORIGIN_HEADERS`]) for the rest of the request; a
+    /// same-origin hop keeps them all.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_callers_credential_headers_do_not_follow_a_redirect_off_origin() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| {
+            Ok(Scripted::new(&[
+                "https://a.example.org/2",
+                "https://b.example.net/3",
+                "https://a.example.org/4",
+            ]))
+        });
+        let headers = [
+            ("Authorization".to_owned(), "Bearer x".to_owned()),
+            ("Cookie".to_owned(), "s=1".to_owned()),
+            ("accept".to_owned(), "image/*".to_owned()),
+        ];
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: None,
+                headers: &headers,
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        let full = ["Authorization", "Cookie", "accept"];
+        assert_eq!(names[0], full, "{names:?}");
+        assert_eq!(names[1], full, "a same-origin hop lost a header: {names:?}");
+        assert_eq!(
+            names[2],
+            ["accept"],
+            "credentials crossed origins: {names:?}"
+        );
+        assert_eq!(names[3], ["accept"], "credentials came back: {names:?}");
+        assert!(logged
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("verdict=dropped reason=cross_origin names=Authorization,Cookie")));
+    }
+
+    /// CR 4647753659: a same-origin redirect on a plain-http origin that is
+    /// not the build's server sends no token (it was withheld from the
+    /// first request) and still logs its verdict, with that reason.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_on_plain_http_off_the_build_server_logs_the_withheld_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(&["http://c.example.com/2"])));
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "http://c.example.com/1".to_owned(),
+                token: Some("t".to_owned()),
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.iter().flatten().all(|n| n != "X-Emby-Token"),
+            "a token was sent: {names:?}"
+        );
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=token_withheld_insecure")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4647378697: a request that started with no token logs a
+    /// same-origin hop as carrying none for that reason, not as a token an
+    /// earlier hop dropped, and sends no token on either request.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_of_a_request_with_no_token_says_none_was_sent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(&["https://a.example.org/2"])));
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: None,
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.iter().flatten().all(|n| n != "X-Emby-Token"),
+            "a token was sent: {names:?}"
+        );
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=no_token")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("token_dropped_earlier")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4646280279: a same-origin hop on the token's origin, after the
+    /// token was dropped off it, logs what the next request carries: no
+    /// token.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_back_after_the_token_was_dropped_logs_no_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| {
+            Ok(Scripted::new(&[
+                "https://b.example.net/2",
+                "https://a.example.org/3",
+                "https://a.example.org/4",
+            ]))
+        });
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: Some("t".to_owned()),
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_with_token")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=token_dropped_earlier")),
+            "{lines:?}"
+        );
+    }
+
+    /// The control: redirects that stay on the token's origin keep it on
+    /// every request.
+    #[test]
+    fn a_token_is_kept_on_redirects_within_its_origin() {
+        let sent = token_per_hop(
+            "https://a.example.org/1",
+            &["https://a.example.org/2", "https://a.example.org/3"],
+        );
+        let carried: Vec<bool> = sent.iter().map(|(_, c)| *c).collect();
+        assert_eq!(carried, [true, true, true], "{sent:?}");
+    }
+
+    /// The proxy core withholds the token itself from a URL it may not go
+    /// to (plain http to a server other than the build's), whatever its
+    /// caller passed in, and logs why.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_proxy_request_to_a_disallowed_url_sends_no_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let logged = std::sync::Mutex::new(Vec::new());
+        let log = |_: Level, line: String| logged.lock().unwrap().push(line);
+        let client = proxy_client(|| Ok(Recording::default()));
+        let get = |url: &str| ProxyGet {
+            url: url.to_owned(),
+            token: Some("tok".to_owned()),
+            headers: &[],
+            build_server: "https://media.example.org",
+            passed_back: &[],
+            max_hops: 5,
+        };
+        rt.block_on(proxy_get(
+            &client,
+            get("http://192.168.1.9:8096/Items"),
+            &log,
+        ))
+        .unwrap();
+        rt.block_on(proxy_get(
+            &client,
+            get("https://media.example.org/Items"),
+            &log,
+        ))
+        .unwrap();
+        let sent = client.as_ref().unwrap().0.lock().unwrap().clone();
+        let carries = |h: &Vec<(String, String)>| h.iter().any(|(n, _)| n == "X-Emby-Token");
+        assert!(
+            !carries(&sent[0]),
+            "the token went over plain http: {sent:?}"
+        );
+        assert!(carries(&sent[1]), "the token was withheld over https");
+        assert!(
+            logged
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("pharos: proxy token withheld reason=")),
+            "{:?}",
+            logged.lock().unwrap()
+        );
+    }
+
+    /// An IPv6 server spelled two ways is one origin: a relative redirect
+    /// comes back in the compressed spelling and keeps the token, the
+    /// download follows it, and the build's own server matches either way.
+    /// A different address is still another origin.
+    #[test]
+    fn an_ipv6_origin_spelled_two_ways_is_one_origin() {
+        let expanded = "https://[2001:0DB8:0:0:0:0:0:1]:8096/Items";
+        let compressed = "https://[2001:db8::1]:8096/Videos/1/stream";
+        assert_eq!(redirect_hop(expanded, compressed, ""), Hop::FollowWithToken);
+        assert_eq!(redirect_verdict(expanded, compressed), Ok(()));
+        assert_eq!(
+            token_allowed(
+                "http://[2001:db8::1]:8096/Items",
+                "http://[2001:0db8::0:1]:8096"
+            ),
+            Ok(())
+        );
+        let other = "https://[2001:db8::2]:8096/Videos/1/stream";
+        assert_eq!(redirect_hop(expanded, other, ""), Hop::FollowWithoutToken);
+        assert!(redirect_verdict(expanded, other).is_err());
+        assert!(token_allowed(
+            "http://[2001:db8::2]:8096/Items",
+            "http://[2001:db8::1]:8096"
+        )
+        .is_err());
+    }
+
+    /// The proxy's client that cannot be built is an error naming the proxy
+    /// and why, so every proxied request is refused, never sent through a
+    /// default client without the TLS config and redirect policy.
+    #[test]
+    fn a_proxy_client_that_cannot_be_built_refuses_every_request() {
+        let mut sent = false;
+        let client = built_client_for("proxy", || Err::<(), _>("tls config: no roots"));
+        let outcome = client.as_ref().map(|c| {
+            sent = true;
+            *c
+        });
+        assert!(!sent, "a request went out without its client");
+        let Err(why) = outcome else {
+            panic!("a client that was never built was used");
+        };
+        assert!(why.contains("proxy client"), "{why}");
+        assert!(why.contains("no roots"), "{why}");
+    }
+
+    /// A download sends the device token, so it follows a redirect only to
+    /// the same scheme, host and port. A plain-http server on the LAN keeps
+    /// working: http to the same http origin is followed.
+    #[test]
+    fn a_download_follows_only_same_origin_redirects() {
+        let from = "https://pharos.example/Videos/1/master.m3u8?x=1";
+        assert_eq!(
+            redirect_verdict(from, "https://pharos.example/other"),
+            Ok(())
+        );
+        assert_eq!(
+            redirect_verdict(from, "https://PHAROS.example:443/other"),
+            Ok(()),
+            "case and the default port are the same origin"
+        );
+        let lan = "http://192.168.1.5:8096/Videos/1/a.ts";
+        assert_eq!(
+            redirect_verdict(lan, "http://192.168.1.5:8096/b.ts"),
+            Ok(())
+        );
+        for (next, why) in [
+            ("https://cdn.example/a", "another host"),
+            ("http://pharos.example/a", "https to http"),
+            ("https://pharos.example:8443/a", "another port"),
+            ("https://user@evil.example/a", "another host"),
+            ("ftp://pharos.example/a", "not an http"),
+            ("/relative", "not an http"),
+        ] {
+            let verdict = redirect_verdict(from, next);
+            assert!(
+                verdict.as_ref().is_err_and(|e| e.contains(why)),
+                "{next}: {verdict:?}"
+            );
+        }
+        assert!(redirect_verdict(lan, "http://192.168.1.6:8096/a").is_err());
+        assert!(redirect_verdict(lan, "http://192.168.1.5:9000/a").is_err());
+        assert!(redirect_verdict(lan, "https://192.168.1.5:8096/a").is_err());
+    }
 
     /// B1323 / V1294: the TV's activity handles every configuration change
     /// a TV makes while the app runs; one it does not list recreates the

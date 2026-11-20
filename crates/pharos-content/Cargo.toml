@@ -25,6 +25,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+capnp-rpc = { workspace = true }
 futures = { version = "0.3", features = ["executor"] }
 
 [lints]

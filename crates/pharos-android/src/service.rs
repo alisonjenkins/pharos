@@ -2,6 +2,7 @@
 //! library connection.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Used when the app has stored no `https://` server (`credentials::SERVER_FILE`).
 pub(crate) const DEFAULT_SERVER: &str = "https://prototype.aliflix.alison-jenkins.com";
@@ -11,7 +12,204 @@ pub(crate) struct ContentLog;
 
 pub(crate) static CONTENT_LOG: ContentLog = ContentLog;
 
-pub(crate) fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
+/// What other downloads (the phone's offline video) hold of the cache's
+/// cap, as the app reports it. The library's hook reads this when it runs,
+/// so it can be set after the library is up.
+static OUTSIDE_USED: OnceLock<content::OutsideUsed> = OnceLock::new();
+
+/// Registers the app's count of other downloads' bytes against the music
+/// cache's cap. The cache counts them as used and evicts only unpinned
+/// music for them: pinned music is never evicted, so it can take the total
+/// over the one cap (the pin contract). The hook runs under
+/// the cache's lock and must not call back into the library. Set once;
+/// later calls are ignored.
+pub fn set_outside_used(used: content::OutsideUsed) {
+    let _ = OUTSIDE_USED.set(used);
+}
+
+/// What the app runs, with the files directory, when the library is
+/// connected: it registers the video accounting (`set_outside_used` and the
+/// video store). The app's own start-up does not run in a process the car
+/// started with no activity, so the app fills this slot as its library
+/// loads. Set once. It answers whether it is done: `false` when the video
+/// store could not be opened (its folder or its thread), so a later connect
+/// or prefetch runs it again (`retry_init`). Music stays refused meanwhile:
+/// the accounting reads unknown while no store is registered.
+static INIT_HOOK: OnceLock<fn(&str) -> bool> = OnceLock::new();
+
+pub fn set_init_hook(hook: fn(&str) -> bool) {
+    let _ = INIT_HOOK.set(hook);
+}
+
+/// The files directory the library was connected with, for `retry_init`.
+static FILES: OnceLock<String> = OnceLock::new();
+/// Whether `INIT_HOOK` has said it is done.
+static INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Runs the init hook again unless it is done, so a service-only process
+/// whose video folder failed at connect registers the store once the folder
+/// can be made, with no activity to do it. `when` names the caller in the
+/// log line.
+pub(crate) fn retry_init(when: &str) {
+    let verdict = rerun_init(
+        &INIT_DONE,
+        FILES.get().map(String::as_str),
+        INIT_HOOK.get().copied(),
+    );
+    if verdict != InitRetry::AlreadyDone {
+        log(&format!(
+            "video accounting retry when={when} verdict={}",
+            verdict.label()
+        ));
+    }
+}
+
+/// Whether a background `retry_init` is running now.
+static RETRY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// `retry_init` on a thread of its own, at most one at a time, for a caller
+/// that must not wait: opening the video store walks its folder, and the
+/// playback path would hold the track for it. Music stays refused while it
+/// runs, as the accounting reads not installed until it is done.
+pub(crate) fn retry_init_in_background(when: &'static str) {
+    if INIT_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let verdict = spawn_once(&RETRY_RUNNING, move || retry_init(when));
+    if verdict != Background::Started {
+        log(&format!(
+            "video accounting retry when={when} verdict={}",
+            verdict.label()
+        ));
+    }
+}
+
+/// What `spawn_once` did.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Background {
+    /// The work runs on a new thread.
+    Started,
+    /// One already runs: not started again.
+    AlreadyRunning,
+    /// No thread could be made: not run, and a later caller tries again.
+    SpawnFailed,
+}
+
+impl Background {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::AlreadyRunning => "already_running",
+            Self::SpawnFailed => "spawn_failed",
+        }
+    }
+}
+
+/// Runs `work` on a thread of its own unless `running` says one runs, and
+/// clears `running` when it ends, however it ends.
+pub(crate) fn spawn_once(
+    running: &'static AtomicBool,
+    work: impl FnOnce() + Send + 'static,
+) -> Background {
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Background::AlreadyRunning;
+    }
+    struct Clear(&'static AtomicBool);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("pharos-video-init".to_owned())
+        .spawn(move || {
+            let _clear = Clear(running);
+            work();
+        });
+    if spawned.is_ok() {
+        Background::Started
+    } else {
+        running.store(false, Ordering::Release);
+        Background::SpawnFailed
+    }
+}
+
+/// What `rerun_init` did.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum InitRetry {
+    /// The hook said it was done before: not run.
+    AlreadyDone,
+    /// No hook, or no library connected yet: nothing to run.
+    NothingToRun,
+    /// Run, and done now.
+    Done,
+    /// Run, and still not done: a later caller tries again.
+    StillMissing,
+}
+
+impl InitRetry {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AlreadyDone => "already_done",
+            Self::NothingToRun => "nothing_to_run",
+            Self::Done => "done",
+            Self::StillMissing => "still_missing",
+        }
+    }
+}
+
+/// Runs `hook` over `files` unless `done` says it is done, and records its
+/// answer.
+pub(crate) fn rerun_init(
+    done: &AtomicBool,
+    files: Option<&str>,
+    hook: Option<fn(&str) -> bool>,
+) -> InitRetry {
+    if done.load(Ordering::Acquire) {
+        return InitRetry::AlreadyDone;
+    }
+    let (Some(files), Some(hook)) = (files, hook) else {
+        return InitRetry::NothingToRun;
+    };
+    if hook(files) {
+        done.store(true, Ordering::Release);
+        InitRetry::Done
+    } else {
+        InitRetry::StillMissing
+    }
+}
+
+/// Whether the video's bytes are counted against the music cache. Music
+/// is not prefetched before they are: it would spend room an admitted
+/// video needs.
+pub(crate) fn accounting_installed() -> bool {
+    OUTSIDE_USED.get().is_some()
+}
+
+/// What the library's hook reports. With no accounting installed nothing is
+/// known of what the app's downloads hold, so the size is unknown and the
+/// music cache admits nothing, as prefetch (`prefetch_refusal`) does; it is
+/// not read as zero usage.
+pub(crate) fn outside_bytes(used: Option<&content::OutsideUsed>) -> content::OutsideBytes {
+    used.map_or(
+        content::OutsideBytes {
+            unknown: true,
+            ..content::OutsideBytes::default()
+        },
+        |used| used(),
+    )
+}
+
+/// Why prefetch must not run, when it must not.
+pub(crate) fn prefetch_refusal(installed: bool) -> Option<&'static str> {
+    (!installed).then_some("video accounting is not installed")
+}
+
+/// The app's private files directory (`Context.getFilesDir`).
+pub fn files_dir(env: &mut Env, ctx: &JObject) -> R<String> {
     let dir = env
         .call_method(
             ctx,
@@ -55,7 +253,13 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     let _connecting = CONNECTING
         .lock()
         .map_err(|_| "library connect mutex poisoned".to_owned())?;
-    if LIBRARY.get().is_some() {
+    if let Some(lib) = LIBRARY.get() {
+        retry_init("connect");
+        // A cache that could not be enabled at the first connect (its
+        // folder, say) is tried again here; an enabled one is left alone.
+        if let Some(files) = FILES.get() {
+            ensure_cache(lib, files, "connect");
+        }
         return Ok(());
     }
     if ::log::set_logger(&CONTENT_LOG).is_ok() {
@@ -70,6 +274,10 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         &content::credentials::token_path(Path::new(&files)),
     )
     .map_err(|e| format!("library server_from={server_from}: {}", e.redacted()))?;
+    // Before the cache is enabled or anything prefetches: the app's video
+    // accounting, in a process that never ran the app's own start-up.
+    let _ = FILES.set(files.clone());
+    retry_init("first_connect");
     lib.on_auth_change(|_| notify_changed());
     let auth = match lib.auth_state() {
         content::AuthState::SignedOut => "signed_out",
@@ -77,16 +285,43 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         content::AuthState::SignedIn => "signed_in",
     };
     log(&format!("library server_from={server_from} auth={auth}"));
-    let cache_dir = Path::new(&files).join("audio-cache");
-    match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
-        Ok(()) => log(&format!(
-            "cache enabled cap_bytes={}",
-            lib.cache_cap().unwrap_or(0)
-        )),
-        Err(e) => log(&format!("cache disabled: {}", e.redacted())),
-    }
+    lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
+    ensure_cache(&lib, &files, "first_connect");
     let _ = LIBRARY.set(lib);
     Ok(())
+}
+
+/// What [`ensure_cache`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheSetup {
+    AlreadyEnabled,
+    Enabled,
+    Failed,
+}
+
+/// Enables the music cache under `files` unless it is already, logging the
+/// verdict (`when` names the caller).
+pub(crate) fn ensure_cache(lib: &content::Library, files: &str, when: &str) -> CacheSetup {
+    if lib.cache_enabled() {
+        return CacheSetup::AlreadyEnabled;
+    }
+    let cache_dir = Path::new(files).join("audio-cache");
+    match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
+        Ok(()) => {
+            log(&format!(
+                "cache enabled when={when} cap_bytes={}",
+                lib.cache_cap().unwrap_or(0)
+            ));
+            CacheSetup::Enabled
+        }
+        Err(e) => {
+            log(&format!(
+                "cache disabled when={when} retry=next_connect: {}",
+                e.redacted()
+            ));
+            CacheSetup::Failed
+        }
+    }
 }
 
 #[no_mangle]
@@ -438,7 +673,143 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 
 #[cfg(test)]
 mod tests {
-    use super::{access, Caller};
+    use super::{access, outside_bytes, rerun_init, spawn_once, Background, Caller, InitRetry};
+    use pharos_content as content;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The playback path's retry returns at once while the store opens, and
+    /// a second caller meanwhile does not start another open; once it ends
+    /// the next caller can.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_background_retry_does_not_hold_the_caller_and_runs_once_at_a_time() {
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (done, ended) = std::sync::mpsc::channel::<()>();
+        // The caller runs on a thread of its own: the open it starts waits
+        // for `release`, sent only after the caller returned, so a caller
+        // that waited for the open would never return. The bounded wait is
+        // a deadlock guard, not a latency bound (CR 4644634426).
+        let (returned, caller) = std::sync::mpsc::channel::<Background>();
+        std::thread::spawn(move || {
+            let verdict = spawn_once(&RUNNING, move || {
+                wait.recv().unwrap();
+                done.send(()).unwrap();
+            });
+            returned.send(verdict).unwrap();
+        });
+        let first = caller
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("the caller waited for the open: {e}"));
+        assert_eq!(first, Background::Started);
+        assert!(
+            ended.try_recv().is_err(),
+            "the open ended before it was released"
+        );
+        assert_eq!(
+            spawn_once(&RUNNING, || unreachable!("a second open ran")),
+            Background::AlreadyRunning
+        );
+        release.send(()).unwrap();
+        ended.recv().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while RUNNING.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "never cleared");
+            std::thread::yield_now();
+        }
+        let (again, ran) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            spawn_once(&RUNNING, move || again.send(()).unwrap()),
+            Background::Started
+        );
+        ran.recv().unwrap();
+        assert_ne!(
+            Background::Started.label(),
+            Background::AlreadyRunning.label()
+        );
+        assert_ne!(
+            Background::AlreadyRunning.label(),
+            Background::SpawnFailed.label()
+        );
+    }
+
+    /// A music cache that could not be enabled is tried again by the next
+    /// connect, and an enabled one is left alone.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_cache_that_failed_to_enable_is_tried_again() {
+        use super::{ensure_cache, CacheSetup};
+        /// Removes the fixture folder when the test ends, a panic included.
+        /// Declared before the library, so the library drops first.
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("pharos-android-cache-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _fixture = Fixture(dir.clone());
+        let files = dir.to_str().unwrap().to_owned();
+        let lib = content::Library::connect("http://127.0.0.1:9", &dir.join("token")).unwrap();
+        // A file where the cache's folder should be.
+        std::fs::write(dir.join("audio-cache"), b"x").unwrap();
+        assert_eq!(
+            ensure_cache(&lib, &files, "first_connect"),
+            CacheSetup::Failed
+        );
+        std::fs::remove_file(dir.join("audio-cache")).unwrap();
+        assert_eq!(ensure_cache(&lib, &files, "connect"), CacheSetup::Enabled);
+        assert!(lib.cache_enabled());
+        assert_eq!(
+            ensure_cache(&lib, &files, "connect"),
+            CacheSetup::AlreadyEnabled
+        );
+    }
+
+    /// A hook that failed is run again by the next caller, and one that
+    /// said it is done is not run again.
+    #[test]
+    fn an_init_hook_that_is_not_done_is_run_again_until_it_is() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn hook(files: &str) -> bool {
+            assert_eq!(files, "/files");
+            RUNS.fetch_add(1, Ordering::SeqCst) >= 1
+        }
+        let done = AtomicBool::new(false);
+        assert_eq!(rerun_init(&done, None, Some(hook)), InitRetry::NothingToRun);
+        assert_eq!(
+            rerun_init(&done, Some("/files"), None),
+            InitRetry::NothingToRun
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::StillMissing
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::Done
+        );
+        assert_eq!(
+            rerun_init(&done, Some("/files"), Some(hook)),
+            InitRetry::AlreadyDone
+        );
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2, "a done hook ran again");
+    }
+
+    #[test]
+    fn no_installed_accounting_reads_as_unknown_not_zero() {
+        assert!(outside_bytes(None).unknown);
+        let used: content::OutsideUsed = std::sync::Arc::new(|| content::OutsideBytes {
+            held: 5,
+            outstanding: 2,
+            unknown: false,
+        });
+        let o = outside_bytes(Some(&used));
+        assert_eq!((o.held, o.outstanding, o.unknown), (5, 2, false));
+    }
 
     fn caller(uid: i32, owns_package: bool, system_app: bool) -> Caller {
         Caller {

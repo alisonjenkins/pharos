@@ -8312,6 +8312,7 @@ name = "pharos-content"
 version = "0.0.0"
 dependencies = [
  "capnp",
+ "capnp-rpc",
  "futures",
  "httparse",
  "libc",
@@ -8651,6 +8652,7 @@ dependencies = [
  "ndk-context",
  "pharos-api",
  "pharos-client",
+ "pharos-content",
  "pharos-hls",
  "pharos-subs",
  "quire",
@@ -8664,6 +8666,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml 1.2.1+spec-1.1.0",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

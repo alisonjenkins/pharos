@@ -110,6 +110,28 @@ pub fn credentials_changed() {
     }
 }
 
+/// The phone signed out but its token could be neither removed nor marked
+/// revoked: the car stays signed out rather than reloading it. The
+/// sign-out fenced the token in the token file's own fence, under the
+/// file's lock, before this runs; the service runs in the app's own
+/// process and reads through that fence, connected now or later.
+pub fn credentials_kept() {
+    let Some(lib) = LIBRARY.get() else {
+        log("app credentials_kept verdict=fenced reason=library_not_connected");
+        return;
+    };
+    match lib.stay_signed_out() {
+        Ok(()) => {
+            log("app credentials_kept verdict=fenced");
+            notify_changed();
+        }
+        Err(e) => log(&format!(
+            "app credentials_kept verdict=failed reason={}",
+            e.redacted()
+        )),
+    }
+}
+
 /// What the notification ask did, for the log and the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationAsk {

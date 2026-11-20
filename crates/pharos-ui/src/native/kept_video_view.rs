@@ -5,8 +5,8 @@
 //! [`VideoStore`].
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
 
@@ -19,10 +19,53 @@ use super::offline_ui::format_bytes;
 use super::offline_video;
 use super::offline_view::poll_every;
 use super::platform;
-use super::ports::video_store;
+use super::ports::{video_store, Slot};
 use super::route::Route;
 use super::settings::Choices;
 use super::views::Nav;
+
+/// Bumped when the video store is published after the app mounted. Every
+/// component that reads the store through [`shown_video_store`] subscribes
+/// to it, so one that rendered with no store renders again once there is
+/// one. The phone registers its store from two places, and the second caller
+/// can return before the first has published.
+static VIDEO_PUBLISHED: GlobalSignal<u32> = Signal::global(|| 0);
+
+/// The registered video store, read by a component: it renders again when
+/// a store is published after it rendered without one.
+pub fn shown_video_store() -> Option<std::sync::Arc<dyn super::kept_video::VideoStore>> {
+    let _ = VIDEO_PUBLISHED.read();
+    video_store()
+}
+
+/// Run once by the app's root: when no video store is registered at mount,
+/// waits (in a task, never on the UI thread) for one to be published and
+/// then re-renders every reader of [`shown_video_store`].
+pub fn use_video_store_watch() {
+    use_publish_watch(super::ports::video_slot(), &VIDEO_PUBLISHED, "video_store");
+}
+
+fn use_publish_watch<T: ?Sized + Send + Sync + 'static>(
+    slot: &'static Slot<T>,
+    seen: &'static GlobalSignal<u32>,
+    what: &'static str,
+) {
+    use_hook(move || {
+        if slot.get().is_some() {
+            return;
+        }
+        platform::info(&format!(
+            "pharos: port {what} verdict=awaiting_publish reason=not_registered_at_mount"
+        ));
+        spawn(async move {
+            let _ = slot.published().await;
+            platform::info(&format!(
+                "pharos: port {what} verdict=published_after_mount readers=rerendered"
+            ));
+            *seen.write() += 1;
+        });
+    });
+}
 
 /// How often a screen re-reads the store while it is on screen, so a
 /// download's progress shows. The port has no change feed.
@@ -127,13 +170,80 @@ pub fn VideoList(
     on_play: EventHandler<String>,
     on_remove: EventHandler<String>,
     #[props(default)] problem: Option<String>,
+    /// Downloads on the device whose record cannot be read: they block new
+    /// downloads until removed. The row shows only when there are some.
+    #[props(default)]
+    unreadable: usize,
+    /// Folders a removal could not delete: still on the device and in the
+    /// cap. They keep the row (and Remove them) up until they are gone.
+    #[props(default)]
+    leftover: usize,
+    #[props(default)] on_discard: EventHandler<()>,
+    /// The signed-in user's videos' own bytes, when `used` (the device's
+    /// shared total) also counts what they share the cap with: the phone's
+    /// music, other users' downloads, leftover folders. `None`: `used` is
+    /// the videos' alone.
+    #[props(default)]
+    videos_used: Option<u64>,
+    /// Whether `used` was read. False while no owner is authorized: the
+    /// shared figure is then not shown, never as zero.
+    #[props(default = true)]
+    used_known: bool,
+    /// A discard is running: its button is disabled until it ends.
+    #[props(default)]
+    discarding: bool,
 ) -> Element {
     rsx! {
-        p { class: "pharos-muted", id: "pharos-video-total",
-            "{format_bytes(used)} of {format_bytes(cap)} used by downloaded videos."
+        // Each figure says what it counts: the user's videos' own bytes, and,
+        // when the cap is shared, the device's total with everything else.
+        match videos_used.filter(|v| *v != used) {
+            _ if !used_known => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "Space used on this device shows once your account is confirmed. The space allowance is {format_bytes(cap)}."
+                }
+            },
+            Some(videos) => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "{format_bytes(videos)} used by your downloaded videos. {format_bytes(used)} of {format_bytes(cap)} used on this device, with music and other downloads."
+                }
+            },
+            None => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "{format_bytes(used)} of {format_bytes(cap)} used by downloaded videos."
+                }
+            },
         }
         if let Some(text) = problem {
             p { class: "pharos-notice", role: "alert", "{text}" }
+        }
+        if unreadable > 0 || leftover > 0 {
+            div { class: "pharos-download-head", id: "pharos-video-unreadable",
+                if unreadable > 0 {
+                    span { class: "pharos-muted",
+                        if unreadable == 1 {
+                            "1 download couldn't be read."
+                        } else {
+                            "{unreadable} downloads couldn't be read."
+                        }
+                    }
+                }
+                if leftover > 0 {
+                    span { class: "pharos-muted",
+                        if leftover == 1 {
+                            "1 download couldn't be removed."
+                        } else {
+                            "{leftover} downloads couldn't be removed."
+                        }
+                    }
+                }
+                button {
+                    class: "pharos-button pharos-button-danger is-small",
+                    r#type: "button",
+                    disabled: discarding,
+                    onclick: move |_| on_discard.call(()),
+                    if discarding { "Removing…" } else { "Remove them" }
+                }
+            }
         }
         if videos.is_empty() {
             p { class: "pharos-empty", id: "pharos-video-empty",
@@ -187,65 +297,230 @@ thread_local! {
     static HELD_GRANTS: RefCell<Vec<pharos_client::api::NativeGrant>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The signed-in user: the account when it has loaded, else the one
-/// remembered on this device.
+/// The user whose downloads this screen may list, remove and play: the
+/// authorized offline owner ([`offline_video::last_user`]), never the
+/// account result itself. A replaced session's `me` can still hold the
+/// previous user while the identity is fenced; it decides nothing here.
+/// The account is read only so a sign-in renders the screen again.
 fn use_user() -> Option<String> {
-    let account = try_use_context::<AccountMe>();
-    let me = account
-        .and_then(|a| a.0.read().clone().flatten())
-        .map(|m| m.id);
-    me.or_else(offline_video::last_user)
+    let _ = try_use_context::<AccountMe>().map(|a| a.answer());
+    offline_video::last_user()
 }
 
-/// The user's videos, re-read every [`POLL_MS`] while the component lives.
-fn use_videos(user: Option<String>) -> Signal<Vec<KeptVideo>> {
-    // Each render hands the poller the user as it is now.
-    let current = use_hook(|| Rc::new(RefCell::new(user.clone())));
-    *current.borrow_mut() = user;
-    let read = {
-        let current = Rc::clone(&current);
-        move || match (video_store(), current.borrow().as_deref()) {
-            (Some(store), Some(user)) => store.videos(user),
-            _ => Vec::new(),
-        }
+/// Removes `item` for `rendered` (the owner its row was drawn for) only
+/// while that is still the authorized owner ([`offline_video::last_user`],
+/// read at the click): a sign-out or another user's sign-in since the row
+/// was drawn leaves the download alone. Whether it removed.
+fn remove_if_owner(store: &dyn VideoStore, rendered: Option<&str>, item: &str) -> bool {
+    let now = offline_video::last_user();
+    let Some(user) = rendered.filter(|u| now.as_deref() == Some(*u)) else {
+        platform::info(&format!(
+            "pharos: video remove verdict=skipped reason=owner_changed item={item} rendered_for_set={} owner_set={}",
+            rendered.is_some(),
+            now.is_some()
+        ));
+        return false;
     };
-    let mut videos = use_signal(read.clone());
-    use_future(move || {
-        let read = read.clone();
-        async move {
-            poll_every(
-                platform::SLEEP_IS_REAL,
-                || platform::sleep_ms(POLL_MS),
-                || {
-                    let now = read();
-                    if *videos.peek() != now {
-                        videos.set(now);
+    platform::info(&format!("pharos: video removed item={item}"));
+    store.remove(user, item);
+    true
+}
+
+/// What a screen of downloads shows from the store: the user's videos and
+/// how many folders could not be read. Polled as one value, so either one
+/// changing reaches the screen (a sweep can drop an unreadable folder while
+/// the list stays the same).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Listing {
+    /// Whose videos these are: the user the listing was read for.
+    owner: Option<String>,
+    videos: Vec<KeptVideo>,
+    unreadable: usize,
+    /// Folders a removal left: see [`VideoStore::leftover_count`].
+    leftover: usize,
+    /// The user's usage, polled with the rows: music finishing a download
+    /// changes it with no video row changing, and the page must show it.
+    usage: Option<super::kept_video::Usage>,
+    /// The store's cap, polled so a change made elsewhere (the cache coming
+    /// up) renders the picker and the heading again, together.
+    cap: u64,
+}
+
+/// Which rows a listing reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// Every row, through [`VideoStore::videos`] (which may recover).
+    All,
+    /// The Ready rows, from memory ([`VideoStore::ready_videos`]).
+    Ready,
+    /// None: the parent gave them ([`VideoDownloads`]'s snapshot), so only
+    /// the counts and the usage are read.
+    Given,
+}
+
+/// The listing to show for `user` now: nothing without a store or a user,
+/// except the unreadable count, which is the store's.
+#[cfg(test)]
+fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
+    listing_with(store, user, Rows::All)
+}
+
+/// [`listing`] reading only `rows`.
+fn listing_with(store: Option<&dyn VideoStore>, user: Option<&str>, rows: Rows) -> Listing {
+    let Some(store) = store else {
+        return Listing::default();
+    };
+    Listing {
+        owner: user.map(str::to_owned),
+        videos: user
+            .map(|u| match rows {
+                Rows::All => store.videos(u),
+                Rows::Ready => store.ready_videos(u),
+                Rows::Given => Vec::new(),
+            })
+            .unwrap_or_default(),
+        unreadable: store.unreadable_count(),
+        leftover: store.leftover_count(),
+        usage: user.map(|u| store.usage(u)),
+        cap: store.cap_bytes(),
+    }
+}
+
+/// The rows a screen shows for `user`: the polled listing's while it was
+/// read for that user, else a fresh read for them. Never one user's rows
+/// next to another user's Remove.
+fn rows_for(
+    shown: &Listing,
+    user: Option<&str>,
+    fresh: impl FnOnce() -> Listing,
+) -> Vec<KeptVideo> {
+    if shown.owner.as_deref() == user {
+        return shown.videos.clone();
+    }
+    platform::info(&format!(
+        "pharos: video listing verdict=reread reason=owner_changed from={:?} to={user:?}",
+        shown.owner
+    ));
+    fresh().videos
+}
+
+/// The rows a Downloads screen renders. Given the parent's snapshot (the
+/// offline start's, which its verdict was logged from), those rows, while
+/// they were read for `user`; else the polled listing's ([`rows_for`]).
+/// Never a second read beside the snapshot, and never another user's rows.
+fn downloads_rows(
+    snapshot: Option<&offline_video::ReadyVideos>,
+    shown: &Listing,
+    user: Option<&str>,
+    fresh: impl FnOnce() -> Listing,
+) -> Vec<KeptVideo> {
+    match snapshot {
+        Some(snap) => rows_for(
+            &Listing {
+                owner: snap.owner.clone(),
+                videos: snap.videos.clone(),
+                ..Listing::default()
+            },
+            user,
+            || {
+                let mut now = fresh();
+                now.videos.retain(KeptVideo::ready);
+                now
+            },
+        ),
+        None => rows_for(shown, user, fresh),
+    }
+}
+
+/// [`listing_with`] over a store in hand.
+fn listing_now(store: &dyn VideoStore, user: Option<&str>, rows: Rows) -> Listing {
+    listing_with(Some(store), user, rows)
+}
+
+/// The listing a poll sets, when it differs from the one shown.
+fn refreshed(shown: &Listing, now: Listing) -> Option<Listing> {
+    (*shown != now).then_some(now)
+}
+
+/// What a poll reads: the listing of the authorized offline owner as it
+/// is now ([`offline_video::last_user`]), not of the user the last render
+/// saw. A fence that props and signals do not show (the owner becoming
+/// nobody) changes the listing's owner, and the poll sets it: the screen
+/// renders again for whoever is authorized now.
+#[cfg(test)]
+fn polled(store: Option<&dyn VideoStore>) -> Listing {
+    polled_with(store, Rows::All)
+}
+
+/// [`polled`] reading only `rows`.
+fn polled_with(store: Option<&dyn VideoStore>, rows: Rows) -> Listing {
+    listing_with(store, offline_video::last_user().as_deref(), rows)
+}
+
+/// The user's listing, re-read every [`POLL_MS`] while the component lives,
+/// with only `rows` (fixed for the component's life).
+fn use_listing(rows: Rows) -> Signal<Listing> {
+    let read = move || polled_with(video_store().as_deref(), rows);
+    let mut shown = use_signal(read);
+    use_future(move || async move {
+        poll_every(
+            platform::SLEEP_IS_REAL,
+            || platform::sleep_ms(POLL_MS),
+            || {
+                let (was, was_left) = {
+                    let s = shown.peek();
+                    (s.unreadable, s.leftover)
+                };
+                let next = refreshed(&shown.peek(), read());
+                if let Some(now) = next {
+                    if now.owner != shown.peek().owner {
+                        platform::info(&format!(
+                            "pharos: video listing owner verdict=changed authorized_user={}",
+                            now.owner.is_some()
+                        ));
                     }
-                    true
-                },
-            )
-            .await;
-        }
+                    if now.unreadable != was {
+                        platform::info(&format!(
+                            "pharos: video listing unreadable verdict=changed from={was} to={}",
+                            now.unreadable
+                        ));
+                    }
+                    if now.leftover != was_left {
+                        platform::info(&format!(
+                            "pharos: video listing leftover verdict=changed from={was_left} to={}",
+                            now.leftover
+                        ));
+                    }
+                    shown.set(now);
+                }
+                true
+            },
+        )
+        .await;
     });
-    videos
+    shown
 }
 
 /// The Download control of a film's or episode's title page. Nothing
 /// without a registered store.
 #[component]
 pub fn VideoKeep(detail: Detail, version: String) -> Element {
-    let Some(store) = video_store() else {
+    let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let ctx = use_context::<Ctx>();
     let user = use_user();
-    let videos = use_videos(user.clone());
+    let listing = use_listing(Rows::All);
     let id = detail.item.id;
     let item = id.to_string();
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
     let mut busy = use_signal(|| false);
     let mut message = use_signal(|| None::<String>);
-    let video = videos.read().iter().find(|v| v.item == item).cloned();
+    let video = rows_for(&listing.read(), user.as_deref(), || {
+        listing_now(&*store, user.as_deref(), Rows::All)
+    })
+    .into_iter()
+    .find(|v| v.item == item);
     let remove_user = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
@@ -275,10 +550,7 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
                 });
             },
             on_remove: move |()| {
-                if let Some(user) = &remove_user {
-                    platform::info(&format!("pharos: video removed item={remove_item}"));
-                    remove_store.remove(user, &remove_item);
-                }
+                remove_if_owner(&*remove_store, remove_user.as_deref(), &remove_item);
                 message.set(None);
             },
         }
@@ -344,17 +616,49 @@ pub fn VideoDownloads(
     /// offline start, which only plays, does not).
     #[props(default = true)]
     settings: bool,
+    /// The rows to render, read once by the parent (the offline start,
+    /// which logged its verdict from them). `None`: the polled listing.
+    #[props(default)]
+    rows: Option<offline_video::ReadyVideos>,
 ) -> Element {
-    let Some(store) = video_store() else {
+    let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let user = use_user();
-    let videos = use_videos(user.clone());
+    // Given rows (the offline start's snapshot) are not walked again: the
+    // poll reads the counts and the usage, and an owner change reads the
+    // Ready rows from memory. Recovery stays with the worker's listing.
+    let snapshot = rows.is_some();
+    let listing = use_listing(if snapshot { Rows::Given } else { Rows::All });
+    let fresh_rows = if snapshot { Rows::Ready } else { Rows::All };
     let nav = use_context::<Nav>();
-    let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
+    // Both figures from one read: the polled one while it was read for this
+    // user, else a fresh one.
+    let usage = {
+        let shown = listing.read();
+        if shown.owner == user {
+            shown.usage
+        } else {
+            user.as_deref().map(|u| store.usage(u))
+        }
+    };
+    let used = usage.map_or(0, |u| u.used);
+    let videos_used = usage.map(|u| u.video);
     let remove_user = user.clone();
     let remove_store = store.clone();
-    let mut cap = use_signal(|| store.cap_bytes());
+    // App-wide, not this view's: a discard outlives the page that started
+    // it, and a page mounted again shows the one still running.
+    let discard = DISCARD.read().clone();
+    // Read at each render. The listing polls it with the videos, so a change
+    // a sweep makes renders again even when the list is the same; a discard
+    // sets its result, which renders again too.
+    let unreadable = store.unreadable_count();
+    let leftover = store.leftover_count();
+    let discard_store = store.clone();
+    // Read at each render, for the picker and the heading alike: the poll
+    // renders again when the cap changes ([`Listing::cap`]), a pick at once.
+    let cap = store.cap_bytes();
+    let mut shown = listing;
     let mut cap_notice = use_signal(|| None::<String>);
     let cap_store = store.clone();
     rsx! {
@@ -362,12 +666,12 @@ pub fn VideoDownloads(
             h2 { id: "video-downloads-title", "Downloaded videos" }
             if settings {
                 VideoCapSetting {
-                cap: cap(),
+                cap,
                 notice: cap_notice(),
                 on_pick: move |option: String| match apply_cap(&*cap_store, &option) {
                     Ok(bytes) => {
                         platform::info(&format!("pharos: video cap set bytes={bytes}"));
-                        cap.set(bytes);
+                        shown.write().cap = bytes;
                         cap_notice.set(None);
                     }
                     Err(e) => {
@@ -378,22 +682,154 @@ pub fn VideoDownloads(
                 }
             }
             VideoList {
-                videos: videos(),
+                videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows)),
                 used,
-                cap: cap(),
+                videos_used,
+                used_known: usage.is_some(),
+                cap,
+                problem: discard.problem,
+                unreadable,
+                leftover,
+                discarding: discard.running,
+                on_discard: move |()| start_discard(discard_store.clone()),
                 on_play: move |item: String| match item.parse::<ItemRef>() {
                     Ok(id) => nav.0.call(Route::Watch(id)),
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
                 },
                 on_remove: move |item: String| {
-                    if let Some(user) = &remove_user {
-                        platform::info(&format!("pharos: video removed item={item}"));
-                        remove_store.remove(user, &item);
-                    }
+                    remove_if_owner(&*remove_store, remove_user.as_deref(), &item);
                 },
             }
         }
     }
+}
+
+/// The discard of unreadable folders: whether one runs, and what the last
+/// one left to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Discard {
+    running: bool,
+    problem: Option<String>,
+}
+
+/// Held for the whole app, not by the Downloads page: a page left while
+/// the folders are deleting would otherwise come back with the button
+/// enabled (a second discard beside the first) and lose the result.
+static DISCARD: GlobalSignal<Discard> = Signal::global(Discard::default);
+
+/// Discards the folders whose record cannot be read (`discard_unreadable`
+/// deletes folders, so it can take a while). The deleting runs on its own
+/// thread, off the UI executor, and its task is the app's, not the page's:
+/// `DISCARD` says it runs until it ends (the button is disabled meanwhile)
+/// and then holds its result. Runs once at a time, whatever page asks.
+fn start_discard(store: std::sync::Arc<dyn super::kept_video::VideoStore>) {
+    if DISCARD.peek().running {
+        platform::info("pharos: video discard unreadable verdict=skipped reason=already_running");
+        return;
+    }
+    {
+        let mut d = DISCARD.write();
+        d.running = true;
+        d.problem = None;
+    }
+    spawn_forever(async move {
+        let outcome = off_ui(move || store.discard_unreadable()).await;
+        platform::info(&format!(
+            "pharos: video discard unreadable result={outcome:?}"
+        ));
+        let problem = match outcome {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some(format!("Some downloads could not be removed: {e}")),
+            Err(OffUi::Stopped) => {
+                Some("Some downloads could not be removed: the removal stopped".to_owned())
+            }
+            Err(OffUi::NotStarted(e)) => Some(format!(
+                "Some downloads could not be removed: the removal could not start ({e}). Try again."
+            )),
+        };
+        *DISCARD.write() = Discard {
+            running: false,
+            problem,
+        };
+    });
+}
+
+/// Why work sent off the UI gave no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OffUi {
+    /// Its thread could not be made (the system refused one).
+    NotStarted(String),
+    /// Its thread ended without a result (it panicked).
+    Stopped,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next `off_ui` on this thread fail to start its thread.
+    static OFF_UI_SPAWN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `work` on a thread of its own and resolves with its result, so a
+/// blocking job (deleting folders) never holds the UI executor. Err when
+/// the thread could not be made, or ended without a result.
+async fn off_ui<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, OffUi> {
+    use futures_util::task::AtomicWaker;
+    use std::sync::{Arc, Mutex};
+
+    struct Slot<T> {
+        value: Mutex<Option<Option<T>>>,
+        waker: AtomicWaker,
+    }
+    /// Delivers `None` if the thread unwinds before it delivers a value.
+    struct Deliver<T>(Arc<Slot<T>>, Option<T>);
+    impl<T> Drop for Deliver<T> {
+        fn drop(&mut self) {
+            let value = self.1.take();
+            if let Ok(mut held) = self.0.value.lock() {
+                *held = Some(value);
+            }
+            self.0.waker.wake();
+        }
+    }
+
+    let slot = Arc::new(Slot {
+        value: Mutex::new(None),
+        waker: AtomicWaker::new(),
+    });
+    let sender = Arc::clone(&slot);
+    let job = move || {
+        let mut deliver = Deliver(sender, None);
+        deliver.1 = Some(work());
+    };
+    #[cfg(test)]
+    let job = (!OFF_UI_SPAWN_FAULT.with(|f| f.replace(false))).then_some(job);
+    #[cfg(not(test))]
+    let job = Some(job);
+    let spawned = match job {
+        Some(job) => std::thread::Builder::new()
+            .name("pharos-off-ui".to_owned())
+            .spawn(job)
+            .map(drop),
+        None => Err(std::io::Error::other("no thread for the test")),
+    };
+    if let Err(e) = spawned {
+        platform::warn(&format!(
+            "pharos: video off_ui verdict=not_started reason=thread_refused error={e}"
+        ));
+        return Err(OffUi::NotStarted(e.to_string()));
+    }
+    std::future::poll_fn(move |cx| {
+        slot.waker.register(cx.waker());
+        match slot.value.lock() {
+            Ok(mut held) => match held.take() {
+                Some(value) => std::task::Poll::Ready(value),
+                None => std::task::Poll::Pending,
+            },
+            Err(_) => std::task::Poll::Ready(None),
+        }
+    })
+    .await
+    .ok_or(OffUi::Stopped)
 }
 
 /// Applies a cap option to the store: the bytes set, or why not.
@@ -429,18 +865,80 @@ pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<S
     }
 }
 
+/// Bumped when the ready videos differ from the snapshot the offline start
+/// rendered: the start reads it ([`shown_ready_snapshot`]), so it reads,
+/// logs and renders a new snapshot.
+static OFFLINE_READY_CHANGED: GlobalSignal<u32> = Signal::global(|| 0);
+
+thread_local! {
+    /// The snapshot the offline start last rendered from, empty included:
+    /// what [`check_offline_ready`] compares the store with.
+    static LAST_READY: RefCell<Option<offline_video::ReadyVideos>> = const { RefCell::new(None) };
+}
+
+/// The ready videos for the offline start, read once per render: it renders
+/// again when they change or a store is published.
+pub fn shown_ready_snapshot() -> offline_video::ReadyVideos {
+    let _ = OFFLINE_READY_CHANGED.read();
+    let _ = shown_video_store();
+    let snap = offline_video::ready_snapshot();
+    LAST_READY.with(|l| *l.borrow_mut() = Some(snap.clone()));
+    snap
+}
+
+/// One poll of the ready videos against the snapshot the offline start
+/// last rendered, an empty one included: when they differ (the first video
+/// turning Ready, say), the start renders again with a new read. True
+/// then. Nothing before the start has rendered once.
+pub fn check_offline_ready() -> bool {
+    let now = offline_video::ready_snapshot();
+    let was = LAST_READY.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.as_ref() {
+            Some(was) if *was != now => l.replace(now.clone()),
+            _ => None,
+        }
+    });
+    let Some(was) = was else {
+        return false;
+    };
+    platform::info(&format!(
+        "pharos: offline videos verdict=changed from={} to={} owner={:?}",
+        was.videos.len(),
+        now.videos.len(),
+        now.owner
+    ));
+    *OFFLINE_READY_CHANGED.write() += 1;
+    true
+}
+
 /// The offline start's list of videos: the ready ones, which play with no
-/// server. Nothing when there are none.
+/// server. `ready` is the snapshot the parent read, logged and chose this
+/// screen by, and the rows render from it; nothing when it is empty. Not
+/// read again for the render: a poll that finds the videos changed has the
+/// parent take a new snapshot instead. Mounted with an empty snapshot too
+/// (the waiting page, the books' list), so the first video turning Ready
+/// is seen there.
 #[component]
-pub fn OfflineVideos() -> Element {
-    let videos = offline_video::ready_for_last_user();
-    if videos.is_empty() {
+pub fn OfflineVideos(ready: offline_video::ReadyVideos) -> Element {
+    use_future(move || async move {
+        poll_every(
+            platform::SLEEP_IS_REAL,
+            || platform::sleep_ms(POLL_MS),
+            || {
+                check_offline_ready();
+                true
+            },
+        )
+        .await;
+    });
+    if ready.videos.is_empty() {
         return rsx! {};
     }
     rsx! {
         section { class: "pharos-offline", id: "pharos-offline-videos",
             h2 { "Offline: videos on this device" }
-            VideoDownloads { settings: false }
+            VideoDownloads { settings: false, rows: Some(ready) }
         }
     }
 }
@@ -448,7 +946,768 @@ pub fn OfflineVideos() -> Element {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// A store published after the app mounted (the second registration
+    /// returned while the first was still opening it) reaches a component
+    /// that rendered without one: the root's watch re-renders it, with no
+    /// remount and nothing blocking.
+    #[test]
+    fn a_store_published_after_mount_reaches_a_component_that_rendered_without_it() {
+        static SLOT: Slot<u32> = Slot::new();
+        static SEEN: GlobalSignal<u32> = Signal::global(|| 0);
+        thread_local! {
+            static SAW: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        }
+        #[component]
+        fn Reader() -> Element {
+            let _ = SEEN.read();
+            SAW.with(|s| s.set(SLOT.get().map(|p| *p)));
+            rsx! {}
+        }
+        fn root() -> Element {
+            use_publish_watch(&SLOT, &SEEN, "test_store");
+            rsx! { Reader {} }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        assert_eq!(
+            SAW.with(std::cell::Cell::get),
+            None,
+            "a store before it was set"
+        );
+        std::thread::spawn(|| SLOT.set(std::sync::Arc::new(7)).unwrap())
+            .join()
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..5 {
+                if SAW.with(std::cell::Cell::get).is_some() {
+                    break;
+                }
+                let woke =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dom.wait_for_work())
+                        .await;
+                assert!(woke.is_ok(), "no work came: the reader was never told");
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert_eq!(SAW.with(std::cell::Cell::get), Some(7));
+    }
     use super::*;
+
+    /// Discarding the unreadable folders deletes folders: it runs off the
+    /// UI executor, so a render goes on meanwhile with the button disabled,
+    /// and the result reaches `problem` once the work ends.
+    #[test]
+    fn a_discard_runs_off_the_ui_with_its_button_disabled_until_it_ends() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        use std::sync::{Arc, Mutex};
+        /// Says when the removal starts, is held until the test lets it
+        /// finish, and records that it finished.
+        struct Slow {
+            held: Mutex<std::sync::mpsc::Receiver<()>>,
+            started: Mutex<std::sync::mpsc::Sender<()>>,
+            finished: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl VideoStore for Slow {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+            fn discard_unreadable(&self) -> Result<u64, String> {
+                let _ = self.started.lock().unwrap().send(());
+                // Held until the test lets it finish.
+                let _ = self.held.lock().unwrap().recv();
+                self.finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("one folder stayed".to_owned())
+            }
+        }
+        thread_local! {
+            static STORE: RefCell<Option<Arc<dyn VideoStore>>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            use_hook(|| {
+                let store = STORE.with(|s| s.borrow().clone()).unwrap();
+                start_discard(store);
+            });
+            let discard = DISCARD.read().clone();
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: discard.problem,
+                    unreadable: 1,
+                    discarding: discard.running,
+                }
+            }
+        }
+        let (release, held) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        STORE.with(|s| {
+            *s.borrow_mut() = Some(Arc::new(Slow {
+                held: Mutex::new(held),
+                started: Mutex::new(started_tx),
+                finished: finished.clone(),
+            }))
+        });
+        // A watchdog: an inline discard would block the UI executor until it
+        // fires, and the checks below then see the removal already over.
+        let watchdog = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = watchdog.send(());
+        });
+        let started = std::time::Instant::now();
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the discard ran on the UI executor"
+        );
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("disabled"), "{html}");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Drive the UI until the removal has started: the spawned task runs
+        // only once the executor is polled.
+        let seen = rt.block_on(async {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) {
+                if started_rx.try_recv().is_ok() {
+                    return true;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            false
+        });
+        assert!(seen, "the removal never started");
+        // A UI update of its own while the removal is still held.
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the removal ended before the UI rendered beside it: it ran on the UI executor"
+        );
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("disabled") && !html.contains("one folder stayed"),
+            "{html}"
+        );
+        release.send(()).unwrap();
+        let html = rt.block_on(async {
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("one folder stayed")
+                    || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break html;
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            html.contains("Some downloads could not be removed: one folder stayed"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("disabled"),
+            "the button stayed disabled: {html}"
+        );
+    }
+
+    /// A discard outlives the page that started it: the page mounted again
+    /// while the folders are deleting shows it running (no second discard
+    /// starts), and its result reaches the page shown when it ends.
+    #[test]
+    fn a_discard_survives_its_page_unmounting() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        struct Slow {
+            held: Mutex<std::sync::mpsc::Receiver<()>>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl VideoStore for Slow {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+            fn discard_unreadable(&self) -> Result<u64, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self.held.lock().unwrap().recv();
+                Err("one folder stayed".to_owned())
+            }
+        }
+        thread_local! {
+            static STORE: RefCell<Option<Arc<dyn VideoStore>>> = const { RefCell::new(None) };
+            static SHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        }
+        #[component]
+        fn Page() -> Element {
+            // Each mount presses the button.
+            use_hook(|| start_discard(STORE.with(|s| s.borrow().clone()).unwrap()));
+            let discard = DISCARD.read().clone();
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: discard.problem,
+                    unreadable: 1,
+                    discarding: discard.running,
+                }
+            }
+        }
+        fn root() -> Element {
+            rsx! {
+                if SHOWN.with(std::cell::Cell::get) {
+                    Page {}
+                }
+            }
+        }
+        let (release, held) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        STORE.with(|s| {
+            *s.borrow_mut() = Some(Arc::new(Slow {
+                held: Mutex::new(held),
+                calls: calls.clone(),
+            }))
+        });
+        let watchdog = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = watchdog.send(());
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let drive = |dom: &mut VirtualDom, until: &dyn Fn(&VirtualDom) -> bool| {
+            rt.block_on(async {
+                let start = std::time::Instant::now();
+                while !until(dom) && start.elapsed() < std::time::Duration::from_secs(3) {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        dom.wait_for_work(),
+                    )
+                    .await;
+                    dom.render_immediate_to_vec();
+                }
+            });
+        };
+        drive(&mut dom, &|_| calls.load(Ordering::SeqCst) == 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the removal never started");
+        // Leave the page, then come back while the folders are deleting.
+        SHOWN.with(|s| s.set(false));
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        assert!(!dioxus_ssr::render(&dom).contains("Remove them"));
+        SHOWN.with(|s| s.set(true));
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("disabled"),
+            "the page came back enabled: {html}"
+        );
+        release.send(()).unwrap();
+        drive(&mut dom, &|dom| {
+            dioxus_ssr::render(dom).contains("one folder stayed")
+        });
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("Some downloads could not be removed: one folder stayed"),
+            "the result was lost with the page: {html}"
+        );
+        assert!(!html.contains("disabled"), "a retry is not offered: {html}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a second discard ran");
+    }
+
+    /// The offline start's video section renders from the count its parent
+    /// read and logged, not a later read: a video gone in between leaves
+    /// the section the verdict named, never a blank screen.
+    #[test]
+    fn the_offline_videos_render_from_the_parents_read() {
+        assert!(offline_video::ready_for_last_user().is_empty());
+        fn root() -> Element {
+            rsx! {
+                OfflineVideos {
+                    ready: offline_video::ReadyVideos {
+                        owner: Some("A".into()),
+                        videos: vec![video("7", KeptState::Ready)],
+                    },
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Offline: videos on this device"), "{html}");
+        fn none() -> Element {
+            rsx! { OfflineVideos { ready: offline_video::ReadyVideos::default() } }
+        }
+        let mut dom = VirtualDom::new(none);
+        dom.rebuild_in_place();
+        assert_eq!(dioxus_ssr::render(&dom), "");
+    }
+
+    /// CR 4638524434: the offline start renders the rows of the snapshot its
+    /// verdict was logged from. A video removed after that read (the second
+    /// read here finds none) still leaves the rendered rows matching the
+    /// logged count; a snapshot read for another user is never shown.
+    #[test]
+    fn the_offline_rows_are_the_snapshot_the_verdict_was_logged_from() {
+        let snapshot = offline_video::ReadyVideos {
+            owner: Some("A".into()),
+            videos: vec![video("7", KeptState::Ready)],
+        };
+        // The listing read after the snapshot: the video is gone.
+        let later = Listing {
+            owner: Some("A".into()),
+            ..Listing::default()
+        };
+        let logged = snapshot.videos.len();
+        let rows = downloads_rows(Some(&snapshot), &later, Some("A"), || {
+            unreachable!("read again beside the snapshot")
+        });
+        assert_eq!(rows.len(), logged, "the rows and the logged count differ");
+        thread_local! {
+            static ROWS: RefCell<Vec<KeptVideo>> = const { RefCell::new(Vec::new()) };
+        }
+        fn root() -> Element {
+            let videos = ROWS.with(|r| r.borrow().clone());
+            rsx! {
+                VideoList {
+                    videos,
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                }
+            }
+        }
+        ROWS.with(|r| *r.borrow_mut() = rows);
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("data-kind=\"video\""),
+            "no video row rendered: {html}"
+        );
+        // The snapshot is A's; the screen is B's: B's rows, read fresh.
+        let rows = downloads_rows(Some(&snapshot), &later, Some("B"), || Listing {
+            owner: Some("B".into()),
+            ..Listing::default()
+        });
+        assert!(rows.is_empty(), "A's rows were shown to B");
+        // No snapshot: the polled listing, as on the Downloads page.
+        assert!(downloads_rows(None, &later, Some("A"), Listing::default).is_empty());
+    }
+
+    /// A store that counts its `videos` walks and answers Ready rows from
+    /// memory.
+    struct Walks(std::sync::atomic::AtomicUsize);
+    impl VideoStore for Walks {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![video("7", KeptState::Ready)]
+        }
+        fn ready_videos(&self, _: &str) -> Vec<KeptVideo> {
+            vec![video("7", KeptState::Ready)]
+        }
+        fn start(
+            &self,
+            _: super::super::kept_video::KeepVideoRequest,
+        ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    /// CR 4644634592: with rows given by the parent, the screen's poll and
+    /// an owner change's reread never walk the store's `videos` (which may
+    /// recover); the polled listing without a snapshot still does.
+    #[test]
+    fn given_rows_are_not_walked_again() {
+        use std::sync::atomic::Ordering;
+        let store = Walks(std::sync::atomic::AtomicUsize::new(0));
+        let polled = listing_with(Some(&store), Some("A"), Rows::Given);
+        assert!(polled.videos.is_empty());
+        let snapshot = offline_video::ReadyVideos {
+            owner: Some("A".into()),
+            videos: vec![video("7", KeptState::Ready)],
+        };
+        let rows = downloads_rows(Some(&snapshot), &polled, Some("B"), || {
+            listing_now(&store, Some("B"), Rows::Ready)
+        });
+        assert_eq!(rows.len(), 1, "B's Ready rows were not read");
+        assert_eq!(
+            store.0.load(Ordering::SeqCst),
+            0,
+            "given rows were walked again"
+        );
+        let _ = listing(Some(&store), Some("A"));
+        assert_eq!(
+            store.0.load(Ordering::SeqCst),
+            1,
+            "the polled listing stopped walking"
+        );
+    }
+
+    /// A poll refreshes the screen when only the unreadable count changed:
+    /// a sweep can drop an unreadable folder while the list stays empty.
+    #[test]
+    fn a_poll_refreshes_an_unreadable_count_that_changed_alone() {
+        let shown = Listing {
+            owner: None,
+            videos: vec![],
+            unreadable: 1,
+            leftover: 0,
+            usage: None,
+            cap: 0,
+        };
+        let now = Listing {
+            owner: None,
+            videos: vec![],
+            unreadable: 0,
+            leftover: 0,
+            usage: None,
+            cap: 0,
+        };
+        assert_eq!(
+            refreshed(&shown, now.clone()),
+            Some(now),
+            "the count changed and the screen kept the old one"
+        );
+        assert_eq!(refreshed(&shown, shown.clone()), None);
+    }
+
+    /// A store whose usage is given, and whose separate figures must not
+    /// be read: the screen takes both from one `usage` call.
+    struct Shared(std::sync::atomic::AtomicU64);
+    impl VideoStore for Shared {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(
+            &self,
+            _: super::super::kept_video::KeepVideoRequest,
+        ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            0
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            unreachable!("used_bytes read apart from the video subtotal")
+        }
+        fn video_bytes(&self, _: &str) -> u64 {
+            unreachable!("video_bytes read apart from the shared usage")
+        }
+        fn usage(&self, _: &str) -> super::super::kept_video::Usage {
+            super::super::kept_video::Usage {
+                video: 100,
+                used: 100 + self.0.load(std::sync::atomic::Ordering::SeqCst),
+            }
+        }
+        fn free_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    /// CR 4644634617: a cap changed elsewhere (the cache coming up) reaches
+    /// the poll, which renders the picker and the heading again.
+    #[test]
+    fn a_poll_refreshes_a_cap_that_changed_alone() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Capped(AtomicU64);
+        impl VideoStore for Capped {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(
+                &self,
+                _: super::super::kept_video::KeepVideoRequest,
+            ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let store = Capped(AtomicU64::new(1024));
+        let shown = listing(Some(&store), Some("A"));
+        assert_eq!(shown.cap, 1024);
+        store.0.store(4096, Ordering::SeqCst);
+        let now = listing(Some(&store), Some("A"));
+        assert_eq!(
+            refreshed(&shown, now.clone()).map(|l| l.cap),
+            Some(4096),
+            "the cap changed and the screen kept the old one"
+        );
+    }
+
+    /// CR 4640611377: music finishing a download changes the shared usage
+    /// with no video row or folder count changing; the poll still renders
+    /// it again. CR 4640611383: both figures come from one `usage` read.
+    #[test]
+    fn a_poll_refreshes_a_usage_that_changed_alone() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let store = Shared(AtomicU64::new(0));
+        let shown = listing(Some(&store), Some("A"));
+        assert_eq!(
+            shown.usage,
+            Some(super::super::kept_video::Usage {
+                video: 100,
+                used: 100
+            })
+        );
+        assert_eq!(refreshed(&shown, listing(Some(&store), Some("A"))), None);
+        store.0.store(20, Ordering::SeqCst);
+        let now = listing(Some(&store), Some("A"));
+        assert_eq!(
+            refreshed(&shown, now.clone()),
+            Some(now),
+            "music's change left the old usage on screen"
+        );
+        assert_eq!(listing(Some(&store), None).usage, None);
+    }
+
+    /// CR 4642574429: a poll reads the authorized owner as it is now. Once
+    /// a replacement session fences A, the polled listing is nobody's and
+    /// differs from A's on screen, so the screen renders again without A's
+    /// rows, though no prop or signal changed.
+    #[test]
+    fn a_poll_after_a_fence_drops_the_previous_owners_rows() {
+        use std::sync::atomic::AtomicU64;
+        let store = Shared(AtomicU64::new(0));
+        offline_video::remember_user("A");
+        let shown = polled(Some(&store));
+        assert_eq!(shown.owner.as_deref(), Some("A"));
+        offline_video::session_replaced(&offline_video::Session::opened(
+            (),
+            Some("tokB".to_owned()),
+        ));
+        let now = polled(Some(&store));
+        offline_video::forget_user();
+        assert_eq!(now.owner, None, "the poll read A's listing after the fence");
+        assert!(now.videos.is_empty());
+        assert!(refreshed(&shown, now).is_some(), "the poll kept A's rows");
+    }
+
+    /// A listing read for A is never shown once the screen is B's: B's
+    /// rows are read fresh, so A's rows never sit next to B's Remove. A
+    /// listing read for the same user is shown as polled.
+    #[test]
+    fn a_listing_read_for_another_user_is_not_shown() {
+        let a_rows = vec![video("7", KeptState::Ready)];
+        let shown = Listing {
+            owner: Some("A".into()),
+            videos: a_rows.clone(),
+            unreadable: 0,
+            leftover: 0,
+            usage: None,
+            cap: 0,
+        };
+        let rows = rows_for(&shown, Some("B"), || Listing {
+            owner: Some("B".into()),
+            ..Listing::default()
+        });
+        assert!(rows.is_empty(), "A's rows were shown to B: {rows:?}");
+        let rows = rows_for(&shown, Some("A"), || panic!("read again for the same user"));
+        assert_eq!(rows, a_rows);
+        let rows = rows_for(&shown, None, Listing::default);
+        assert!(rows.is_empty(), "A's rows were shown to nobody");
+    }
+
+    /// The listing carries the store's unreadable count with the videos,
+    /// and the count even with nobody signed in.
+    #[test]
+    fn a_listing_reads_the_unreadable_count_with_the_videos() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest};
+        struct Two;
+        impl VideoStore for Two {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                2
+            }
+        }
+        assert_eq!(listing(Some(&Two), Some("u")).unreadable, 2);
+        assert_eq!(listing(Some(&Two), None).unreadable, 2);
+        assert_eq!(listing(None, Some("u")), Listing::default());
+    }
+
+    /// A discard whose thread the system refuses says so and enables the
+    /// button again, so the user can retry; it never stays "removing".
+    #[test]
+    fn a_discard_whose_thread_is_refused_reports_it_and_can_be_retried() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest};
+        use std::sync::Arc;
+        struct Never;
+        impl VideoStore for Never {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+        }
+        fn root() -> Element {
+            use_hook(|| {
+                OFF_UI_SPAWN_FAULT.with(|f| f.set(true));
+                start_discard(Arc::new(Never));
+            });
+            let discard = DISCARD.read().clone();
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: discard.problem,
+                    unreadable: 1,
+                    discarding: discard.running,
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let html = rt.block_on(async {
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("could not start")
+                    || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break html;
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            html.contains("the removal could not start (no thread for the test). Try again."),
+            "{html}"
+        );
+        assert!(
+            !html.contains("disabled"),
+            "the button stayed disabled: {html}"
+        );
+    }
 
     fn video(item: &str, state: KeptState) -> KeptVideo {
         KeptVideo {
@@ -467,6 +1726,8 @@ mod tests {
             state,
             position_ms: 0,
             saved_at: "2026-11-16T09:00:00Z".into(),
+            estimate_from_adoption: false,
+            stale_on_disk: 0,
         }
     }
 
@@ -554,6 +1815,157 @@ mod tests {
         }
     }
 
+    /// Review 5987743326 (kept_video_view.rs:189): with 1 GiB of music and no
+    /// videos, the head does not call the music video. The videos' own
+    /// figure is labelled as video, and the shared total says it includes
+    /// music.
+    #[test]
+    fn the_head_does_not_label_music_as_video() {
+        fn head() -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 1024 * 1024 * 1024,
+                    videos_used: Some(0),
+                    cap: 4 * 1024 * 1024 * 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(head);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            !html.contains("1 GiB of 4 GiB used by downloaded videos"),
+            "{html}"
+        );
+        assert!(
+            html.contains("0 B used by your downloaded videos"),
+            "{html}"
+        );
+        assert!(
+            html.contains("1 GiB of 4 GiB used on this device, with music and other downloads"),
+            "{html}"
+        );
+        // With nothing else in the cap the one line stays as it was.
+        let mut dom = VirtualDom::new(list);
+        dom.rebuild_in_place();
+        assert!(dioxus_ssr::render(&dom).contains("3 MiB of 4 GiB used by downloaded videos"));
+    }
+
+    /// The unreadable-downloads row shows only when some exist, in the slim
+    /// pill family, and counts them.
+    #[test]
+    fn the_unreadable_row_shows_only_when_there_are_some() {
+        fn with(n: usize) -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    unreadable: n,
+                }
+            }
+        }
+        let none = render(|| with(0));
+        assert!(!none.contains("be read."), "{none}");
+        assert!(!none.contains("Remove them"), "{none}");
+        let one = render(|| with(1));
+        assert!(one.contains(">1 download couldn"), "{one}");
+        let two = render(|| with(2));
+        assert!(two.contains(">2 downloads couldn"), "{two}");
+        assert!(
+            two.contains("pharos-button pharos-button-danger is-small")
+                && two.contains("Remove them"),
+            "{two}"
+        );
+    }
+
+    /// A row's Remove acts only while the owner it was drawn for is still
+    /// the authorized one when it is clicked.
+    #[test]
+    fn a_remove_clicked_after_the_owner_changed_removes_nothing() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        #[derive(Default)]
+        struct Log(std::sync::Mutex<Vec<(String, String)>>);
+        impl VideoStore for Log {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, user: &str, item: &str) {
+                self.0.lock().unwrap().push((user.into(), item.into()));
+            }
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let store = Log::default();
+        offline_video::remember_user("alice");
+        assert!(remove_if_owner(&store, Some("alice"), "7"));
+        offline_video::remember_user("bob");
+        assert!(
+            !remove_if_owner(&store, Some("alice"), "8"),
+            "removed for an old owner"
+        );
+        offline_video::forget_user();
+        assert!(
+            !remove_if_owner(&store, Some("alice"), "9"),
+            "removed with nobody signed in"
+        );
+        assert_eq!(
+            *store.0.lock().unwrap(),
+            vec![("alice".to_owned(), "7".to_owned())]
+        );
+    }
+
+    /// Folders a removal left behind keep the row, and its Remove them, up
+    /// after the unreadable ones are gone; the row goes once cleanup is done.
+    #[test]
+    fn folders_left_after_a_failed_removal_keep_remove_them() {
+        fn with(unreadable: usize, leftover: usize) -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    unreadable,
+                    leftover,
+                }
+            }
+        }
+        let left = render(|| with(0, 2));
+        assert!(
+            left.contains(">2 downloads couldn&#39;t be removed."),
+            "{left}"
+        );
+        assert!(left.contains("Remove them"), "{left}");
+        assert!(!left.contains("be read."), "{left}");
+        let both = render(|| with(1, 1));
+        assert!(both.contains(">1 download couldn&#39;t be read."), "{both}");
+        assert!(
+            both.contains(">1 download couldn&#39;t be removed."),
+            "{both}"
+        );
+        assert_eq!(both.matches("Remove them").count(), 1, "{both}");
+        let done = render(|| with(0, 0));
+        assert!(!done.contains("Remove them"), "{done}");
+    }
+
     /// Only a ready video has Play; both have Remove; the total heads it.
     #[test]
     fn the_downloads_list_plays_only_what_is_ready() {
@@ -563,6 +1975,20 @@ mod tests {
         assert!(html.contains("3 MiB of 4 GiB used"), "{html}");
         assert!(html.contains("Medium (2 Mbps)"));
         assert!(html.contains("Downloading 25%"));
+    }
+
+    /// CR 4646280250: with no authorized owner the usage was not read: no
+    /// figure is shown, never 0 B. The control is the test above.
+    #[test]
+    fn an_unread_usage_shows_no_figure() {
+        let html = render(|| {
+            rsx! { VideoList { videos: vec![], used: 0, cap: 1024, used_known: false, on_play: |_| {}, on_remove: |_| {} } }
+        });
+        assert!(!html.contains("0 B"), "{html}");
+        assert!(
+            html.contains("shows once your account is confirmed"),
+            "{html}"
+        );
     }
 
     #[test]
