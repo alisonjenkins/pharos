@@ -80,6 +80,10 @@ rules, the log lines and their fields) are in V1464 in
   growth does not start a trim; it is counted at the next one. The trim
   evicts the least recently played finished music that is not pinned,
   queued or playing, and keeps the video. Video is never evicted for music.
+  Once no such track is left, the trim and music's low-disk admission
+  evict retained music parts no job holds and no pin wants, oldest first
+  (`verdict=evicted kind=part`); the downloader then drops the state it
+  kept to resume them, so the track starts again from zero.
 - The cache can stay over its cap when all the music left is protected
   (pinned, queued or playing): nothing is evictable, and the cache logs
   `cache over cap ... nothing is evictable`.
