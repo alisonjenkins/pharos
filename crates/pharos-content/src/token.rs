@@ -28,6 +28,122 @@ fn hold() -> MutexGuard<'static, ()> {
     FILE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The in-process sign-out fence of one token file: set when a session
+/// ended and its token could be neither removed nor marked revoked, so
+/// nothing in this process resumes from it. It names that token by
+/// fingerprint; with no token to name it refuses every token until a store
+/// installs one. Kept per path, so one file's sign-out refuses nothing at
+/// another. Set and replaced only under the file's lock, by the operation
+/// that decided it ([`end_session`], [`store`]), and honored by [`read`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Fence {
+    /// No sign-out left a token behind.
+    #[default]
+    Open,
+    /// The token with this fingerprint is refused.
+    Token(String),
+    /// The token left behind could not be named: every token is refused.
+    Every,
+}
+
+impl Fence {
+    /// The fence for a session end that left the token fingerprinted
+    /// `target` on file (`None`: it could not be named).
+    pub fn for_target(target: Option<&str>) -> Self {
+        target.map_or(Self::Every, |fp| Self::Token(fp.to_owned()))
+    }
+
+    /// The fence for a sign-out that left `held` on file.
+    pub fn for_token(held: Option<&str>) -> Self {
+        held.map_or(Self::Every, |t| Self::Token(fingerprint(t)))
+    }
+
+    /// Whether `token` is refused.
+    pub fn refuses(&self, token: &str) -> bool {
+        match self {
+            Self::Open => false,
+            Self::Token(fp) => fingerprint(token) == *fp,
+            Self::Every => true,
+        }
+    }
+
+    /// The verdict word for logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Token(_) => "token",
+            Self::Every => "every",
+        }
+    }
+
+    /// The fence once a store installed the token fingerprinted `stored`
+    /// over the one fingerprinted `replaced` (when that could be read).
+    /// A fence naming another token stays: it refuses only that token. One
+    /// naming the stored token, or none, opens. An unnamed one names the
+    /// token the store overwrote, if it could be read and differs, and
+    /// opens otherwise: the token it could not name is no longer on file.
+    pub fn after_store(&self, stored: &str, replaced: Option<&str>) -> Self {
+        match self {
+            Self::Open => Self::Open,
+            Self::Token(fp) if fp != stored => self.clone(),
+            Self::Token(_) => Self::Open,
+            Self::Every => match replaced {
+                Some(old) if old != stored => Self::Token(old.to_owned()),
+                _ => Self::Open,
+            },
+        }
+    }
+}
+
+/// Every token file's fence ([`Fence`]), by path. Changed only while the
+/// file's lock ([`FILE`]) is held.
+static FENCES: Mutex<std::collections::BTreeMap<PathBuf, Fence>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn fence_held(path: &Path) -> Fence {
+    FENCES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(path)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Replaces the fence of `path`; the caller holds the file's lock.
+fn set_fence_held(path: &Path, next: Fence, reason: &str) {
+    let was = {
+        let mut all = FENCES.lock().unwrap_or_else(PoisonError::into_inner);
+        let was = all.get(path).cloned().unwrap_or_default();
+        if next == Fence::Open {
+            all.remove(path);
+        } else {
+            all.insert(path.to_owned(), next.clone());
+        }
+        was
+    };
+    if was != next {
+        log::warn!(
+            "token fence verdict={} reason={reason} was={}",
+            next.label(),
+            was.label()
+        );
+    }
+}
+
+/// The fence of the token file at `path`, read under the file's lock.
+pub fn fence(path: &Path) -> Fence {
+    let _held = hold();
+    fence_held(path)
+}
+
+/// Sets the fence of the token file at `path`, under the file's lock: for a
+/// caller that decided it from a read of its own (a test, or a host whose
+/// sign-out was refused before it reached the file).
+pub fn set_fence(path: &Path, next: Fence, reason: &str) {
+    let _held = hold();
+    set_fence_held(path, next, reason);
+}
+
 fn err(path: &Path, e: impl std::fmt::Display) -> ContentError {
     ContentError::TokenFile {
         path: path.to_owned(),
@@ -95,7 +211,17 @@ pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
             );
             Ok(None)
         }
-        Marker::Present(_) | Marker::Absent => Ok(Some(stored)),
+        Marker::Present(_) | Marker::Absent => {
+            let fence = fence_held(path);
+            if fence.refuses(&stored.token) {
+                log::info!(
+                    "token read verdict=refused reason=sign_out_fence fence={}",
+                    fence.label()
+                );
+                return Ok(None);
+            }
+            Ok(Some(stored))
+        }
     }
 }
 
@@ -239,6 +365,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // the new token: a fence it lifts is for a token really gone.
     match read_raw(path) {
         Ok(Some(s)) if s.token == token => {
+            let stored = fingerprint(token);
+            let next = fence_held(path).after_store(&stored, replaced.as_deref());
+            set_fence_held(path, next, "token_stored");
             if let Some(hook) = ON_STORED.get() {
                 hook(&fingerprint(token), replaced.as_deref());
             }
@@ -383,8 +512,26 @@ impl Ended {
 /// synced file beside it naming its user (`user`, else the one paired with
 /// it) and its fingerprint, so it never resumes; when the marker cannot be
 /// written either, says so.
+///
+/// A session end that is `Unsafe` fences the token it targeted in this
+/// process ([`Fence`]), in the same hold of the lock: by fingerprint, or
+/// every token when it could not be named. No store can land between the
+/// operation and its fence, so the fence names what the operation saw.
 pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
     let _held = hold();
+    let ended = end_session_held(path, seen, user);
+    if let Ended::Unsafe { target, .. } = &ended {
+        set_fence_held(
+            path,
+            Fence::for_target(target.as_deref()),
+            "token_neither_removed_nor_marked",
+        );
+    }
+    ended
+}
+
+/// [`end_session`]'s work, under the lock its caller holds.
+fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
     let read = {
         #[cfg(debug_assertions)]
         let failed = faults::TOKEN_READ.with(std::cell::Cell::get);
@@ -1114,6 +1261,74 @@ pub(crate) mod tests {
         assert_eq!(load(&p).unwrap(), None, "B was read after its marker went");
     }
 
+    /// CR 4638691172, 4638660897: a sign-out whose token can be neither
+    /// removed nor marked, and cannot be read to be named, fences every
+    /// token at that path, inside the operation and under the file's lock.
+    /// A sign-in stored after it is read: the store replaces the fence in
+    /// the same lock, so neither ordering refuses the new token.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_unnamed_unsafe_sign_out_fences_every_token_until_a_store() {
+        let d = dir("fence-unnamed");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        faults::TOKEN_READ.with(|f| f.set(true));
+        let ended = end_session(&p, None, None);
+        faults::TOKEN_READ.with(|f| f.set(false));
+        assert!(
+            matches!(&ended, Ended::Unsafe { target: None, .. }),
+            "{ended:?}"
+        );
+        assert_eq!(fence(&p), Fence::Every);
+        assert_eq!(load(&p).unwrap(), None, "the unnamed token was read");
+        store(&p, "tokB").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+    }
+
+    /// CR 4638691172, 4638660989: a sign-in stored after the caller read
+    /// A and before the sign-out ran is the token the sign-out targets.
+    /// When it can be neither removed nor marked, the fence names B, the
+    /// token on file, not A from the earlier read.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_unsafe_sign_out_fences_the_token_it_targeted() {
+        let d = dir("fence-target");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        let held = load(&p).unwrap();
+        store(&p, "tokB").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let ended = end_session(&p, None, None);
+        faults::REMOVE.with(|f| f.set(false));
+        faults::MARKER.with(|f| f.set(false));
+        assert!(
+            matches!(&ended, Ended::Unsafe { target: Some(t), .. } if *t == fingerprint("tokB")),
+            "{ended:?}"
+        );
+        assert_eq!(held.as_deref(), Some("tokA"));
+        assert_eq!(fence(&p), Fence::Token(fingerprint("tokB")));
+        assert_eq!(load(&p).unwrap(), None, "the targeted token was read");
+    }
+
+    /// A fence is per token file: one path's sign-out refuses nothing at
+    /// another.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_fence_holds_only_for_its_own_token_file() {
+        let d = dir("fence-path");
+        let (p, q) = (d.join("device-token"), d.join("other-token"));
+        store(&p, "tokA").unwrap();
+        store(&q, "tokA").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let _ = end_session(&p, None, None);
+        faults::REMOVE.with(|f| f.set(false));
+        faults::MARKER.with(|f| f.set(false));
+        assert_eq!(load(&p).unwrap(), None);
+        assert_eq!(load(&q).unwrap().as_deref(), Some("tokA"));
+    }
+
     /// CR 4637783563: a sign-in whose old marker cannot be removed and
     /// would refuse the new token (here it cannot be read: a folder in
     /// its place) fails, rather than report a token no read returns.
@@ -1175,6 +1390,12 @@ pub(crate) mod tests {
         faults::MARKER.with(|f| f.set(false));
         assert!(matches!(ended, Ended::Unsafe { .. }), "{ended:?}");
         assert_eq!(ended.label(), "restart_unsafe");
-        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
+        // Still on file, so a restart may resume it; in this process the
+        // fence the operation set refuses it.
+        assert_eq!(
+            read_raw(&p).unwrap().map(|s| s.token).as_deref(),
+            Some("tokA")
+        );
+        assert_eq!(load(&p).unwrap(), None);
     }
 }
