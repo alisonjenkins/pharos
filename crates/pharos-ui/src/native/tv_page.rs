@@ -730,8 +730,9 @@ pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .
 /// What the remote's Back closes, with an Escape, before it goes back a page
 /// (FR-607): dialogs, menus, an open search list, the player's settings
 /// sheet and its queue, and the music queue while it holds the focus (B1508:
-/// its arrows stay inside it, so Back is the only way out).
-pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue, .pharos-queue:focus-within"#;
+/// its arrows stay inside it, so Back is the only way out) with its Clear
+/// confirm, which Back closes first.
+pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue, .pharos-queue:focus-within"#;
 
 pub fn bridge_script(template: &str) -> String {
     template
@@ -1918,6 +1919,9 @@ mod tests {
             "{OVERLAYS}"
         );
         assert!(!overlays.contains(&".pharos-queue"), "{OVERLAYS}");
+        // The Clear confirm inside it is its own overlay, so the Back that
+        // cancels it is not the queue's: the next Back closes the queue.
+        assert!(overlays.contains(&r#"[role="alertdialog"]"#), "{OVERLAYS}");
     }
 
     #[test]
