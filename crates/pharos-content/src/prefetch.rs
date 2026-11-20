@@ -88,6 +88,10 @@ struct Queue {
     /// Where a pin that yielded to playback left off, so its resume still
     /// sends `If-Range` for the partial file it kept.
     deferred: HashMap<String, JobState>,
+    /// Pins refused for low disk with a part kept: still in `pinned`, but
+    /// not started again before `until`, so the worker moves on to other
+    /// work meanwhile. `backoff` is the wait the next refusal takes.
+    parked: HashMap<String, Parked>,
     generation: u64,
     budget: u64,
     busy: bool,
@@ -150,6 +154,11 @@ impl Fail {
     }
 }
 
+struct Parked {
+    until: Instant,
+    backoff: Duration,
+}
+
 #[derive(Default, Clone)]
 struct JobState {
     etag: Option<String>,
@@ -180,6 +189,9 @@ enum Outcome {
     /// A retrying pin download stepped aside for playback read-ahead; the pin
     /// is queued again.
     Yielded,
+    /// A pin refused for low disk with its part kept: parked with its
+    /// state for this long, then tried again; the worker moves on.
+    Parked(Duration),
 }
 
 /// Whether a retained part can be resumed: only under a strong ETag, as
@@ -209,6 +221,7 @@ impl Downloader {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
                 deferred: HashMap::new(),
+                parked: HashMap::new(),
                 generation: 0,
                 budget: 0,
                 busy: false,
@@ -442,7 +455,7 @@ impl Gate {
             if self.closed() {
                 return None;
             }
-            {
+            let earliest = {
                 let mut q = self.lock();
                 while let Some(id) = q.wanted.pop_front() {
                     if self.cache.is_complete(&id) {
@@ -452,9 +465,24 @@ impl Gate {
                     q.current = Some(id.clone());
                     return Some((id, q.generation));
                 }
-                while let Some(id) = q.pinned.pop_front() {
+                // A parked pin waits out its backoff at the back of the
+                // queue; the others go meanwhile.
+                let now = Instant::now();
+                let mut earliest: Option<Instant> = None;
+                for _ in 0..q.pinned.len() {
+                    let Some(id) = q.pinned.pop_front() else {
+                        break;
+                    };
                     if self.cache.is_complete(&id) || !self.is_pin_work(&id) {
+                        q.parked.remove(&id);
                         continue;
+                    }
+                    if let Some(until) = q.parked.get(&id).map(|p| p.until) {
+                        if until > now {
+                            earliest = Some(earliest.map_or(until, |e| e.min(until)));
+                            q.pinned.push_back(id);
+                            continue;
+                        }
                     }
                     q.busy = true;
                     q.current = Some(id.clone());
@@ -463,8 +491,15 @@ impl Gate {
                 q.busy = false;
                 q.current = None;
                 self.idle.notify_all();
+                earliest
+            };
+            match earliest {
+                Some(at) => tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                    () = &mut wait => {}
+                },
+                None => wait.await,
             }
-            wait.await;
         }
     }
 
@@ -611,17 +646,21 @@ impl Gate {
     async fn job(&self, id: &str, mut generation: u64) {
         let started = Instant::now();
         let mut url: Option<String> = None;
-        let mut backoff = self.tuning.backoff_min;
         let mut epoch = self.online_epoch.load(Ordering::SeqCst);
         let mut refreshed = false;
         let mut attempt = 0u32;
         // Held before the deferred state is read: from here no eviction
         // takes this track's part, and one that took it before is named.
         let _active = Active::start(&self.cache, id);
-        let mut st = {
+        // A parked pin carries its backoff across the park.
+        let (mut st, mut backoff) = {
             let mut q = self.lock();
             self.drop_evicted_states(&mut q);
-            q.deferred.remove(id).unwrap_or_default()
+            let backoff = q
+                .parked
+                .remove(id)
+                .map_or(self.tuning.backoff_min, |p| p.backoff);
+            (q.deferred.remove(id).unwrap_or_default(), backoff)
         };
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
         self.cache.clear_failed(id);
@@ -644,8 +683,9 @@ impl Gate {
             match preflight {
                 // A preflight replaces no part, so it never truncates one.
                 Ok(_) | Err(NoRoom::PartNotTruncated) => {}
-                // A pin with a part on disk waits for room and resumes it;
-                // anything else stops here (its part, if any, is kept).
+                // A pin with a part on disk is parked with its part and
+                // state, so the worker moves on; anything else stops here
+                // (its part, if any, is kept).
                 Err(NoRoom::LowDisk(free)) if part_len() > 0 && self.is_pin_work(id) => {
                     log::info!(
                         "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=preflight replacing={replacing} free_bytes={free} attempt={attempt} wait_ms={}",
@@ -653,14 +693,7 @@ impl Gate {
                         started.elapsed().as_millis(),
                         backoff.as_millis()
                     );
-                    self.sleep_backoff(&mut backoff, &mut epoch).await;
-                    if self.yield_to_playback(id, &st) {
-                        break Outcome::Yielded;
-                    }
-                    if !self.pause_until_online(id, &mut generation).await {
-                        break Outcome::Cancelled;
-                    }
-                    continue;
+                    break Outcome::Parked(backoff);
                 }
                 Err(NoRoom::LowDisk(free)) => break Outcome::LowDisk(free),
                 Err(NoRoom::AccountingUnknown) => {
@@ -726,17 +759,15 @@ impl Gate {
                 Err(Fail::ReplacementLowDisk(free)) => {
                     // The old bytes are on disk and counted already: deleting
                     // them frees nothing an eviction would not, and keeping
-                    // them lets a later try resume.
+                    // them lets a later try resume. The pin is parked, so it
+                    // does not hold the worker.
                     log::info!(
-                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk free_bytes={free} attempt={attempt} wait_ms={}",
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=replacement free_bytes={free} attempt={attempt} wait_ms={}",
                         part_len(),
                         started.elapsed().as_millis(),
                         backoff.as_millis()
                     );
-                    self.sleep_backoff(&mut backoff, &mut epoch).await;
-                    if self.yield_to_playback(id, &st) {
-                        break Outcome::Yielded;
-                    }
+                    break Outcome::Parked(backoff);
                 }
                 Err(Fail::AccountingUnknown) => {
                     if self
@@ -778,6 +809,32 @@ impl Gate {
             Outcome::Ok => {
                 let bytes = self.cache.entry(id).map_or(0, |e| e.size);
                 log::info!("cache download id={id} bytes={bytes} ms={ms} outcome=ok reason=- attempts={attempt}");
+            }
+            Outcome::Parked(wait) => {
+                #[cfg(test)]
+                self.waits
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(wait);
+                let next = wait.saturating_mul(2).min(self.tuning.backoff_max);
+                let mut q = self.lock();
+                q.deferred.insert(id.to_owned(), st);
+                if !q.pinned.iter().any(|p| p == id) {
+                    q.pinned.push_back(id.to_owned());
+                }
+                q.parked.insert(
+                    id.to_owned(),
+                    Parked {
+                        until: Instant::now() + wait,
+                        backoff: next,
+                    },
+                );
+                log::info!(
+                    "cache download id={id} bytes={} ms={ms} outcome=parked reason=low_disk retry_in_ms={} next_wait_ms={}; part and validator kept, worker moves on",
+                    part_len(),
+                    wait.as_millis(),
+                    next.as_millis()
+                );
             }
             Outcome::Yielded => {
                 log::info!(
@@ -1489,6 +1546,7 @@ mod tests {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
                 deferred: HashMap::new(),
+                parked: HashMap::new(),
                 // A newer request has dropped the read-ahead being fetched.
                 generation: 1,
                 budget: 0,
@@ -1535,6 +1593,7 @@ mod tests {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
                 deferred: HashMap::new(),
+                parked: HashMap::new(),
                 generation: 0,
                 budget: u64::MAX,
                 busy: true,
@@ -1591,6 +1650,7 @@ mod tests {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
                 deferred: HashMap::new(),
+                parked: HashMap::new(),
                 generation: 0,
                 budget: u64::MAX,
                 busy: true,
@@ -1659,6 +1719,7 @@ mod tests {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
                 deferred: HashMap::new(),
+                parked: HashMap::new(),
                 generation: 0,
                 budget: u64::MAX,
                 busy: true,
@@ -2523,9 +2584,9 @@ mod tests {
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
     }
 
-    /// CR 4637783552: a pin whose part is kept waits through a preflight
-    /// refused for low disk, rather than ending, and resumes the part once
-    /// there is room.
+    /// CR 4637783552, CR 4638660900: a pin whose part is kept is parked
+    /// through a preflight refused for low disk, with a backoff, rather
+    /// than given up, and resumes the part once there is room.
     #[test]
     fn a_pin_waits_through_a_low_disk_preflight_and_resumes() {
         let script = Script::default()
@@ -2762,6 +2823,85 @@ mod tests {
             r.srv.seen()
         );
         assert_eq!(read(&r.cache, "track/1"), body(400, 2));
+    }
+
+    /// CR 4638660900: a pin refused at the preflight does not hold the only
+    /// worker. It is parked with its part and validator and a backoff, the
+    /// next pin downloads, and the parked one resumes its part once there
+    /// is room.
+    #[test]
+    fn a_pin_refused_for_low_disk_is_parked_and_the_next_pin_goes() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600)
+            .file("/audio/2", body(100, 2));
+        let starve = Arc::new(AtomicBool::new(true));
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let cache: Arc<Mutex<std::sync::Weak<Cache>>> = Arc::default();
+        let (p2, s2, c2) = (slot.clone(), starve.clone(), cache.clone());
+        // Below the guard while track 1 holds its part, except for track
+        // 2's own job: only a worker that moved on reaches it.
+        let r = rig_with_free(
+            "pin-parked",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let len = p2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                let two = c2
+                    .lock()
+                    .unwrap()
+                    .upgrade()
+                    .is_some_and(|c| c.is_active("track/2"));
+                Ok(if s2.load(Ordering::SeqCst) && len >= 600 && !two {
+                    MIN_FREE_BYTES - 1
+                } else {
+                    MIN_FREE_BYTES + 5000
+                })
+            }),
+        );
+        *cache.lock().unwrap() = Arc::downgrade(&r.cache);
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1", "track/2"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.dl.waits().is_empty() || !r.dl.has_deferred("track/1") {
+            assert!(Instant::now() < until, "track 1 never stopped for room");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        r.dl.enqueue(&ids(&["track/2"]));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !r.cache.is_complete("track/2") {
+            assert!(
+                Instant::now() < until,
+                "the refused pin held the worker: {:?}",
+                r.srv.seen()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        starve.store(false, Ordering::SeqCst);
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "track 1 never resumed"
+        );
+        let one: Vec<_> = r
+            .srv
+            .seen()
+            .into_iter()
+            .filter(|s| s.path == "/audio/1")
+            .collect();
+        assert_eq!(one.len(), 2, "{one:?}");
+        assert_eq!(one[1].if_range.as_deref(), Some("\"vA\""), "{one:?}");
+        assert!(r.cache.is_complete("track/1"));
     }
 
     /// A whole new body that replaces a partial file is admitted with the

@@ -1278,6 +1278,15 @@ impl Cache {
             .insert(id.to_owned());
     }
 
+    /// Whether a job holds `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_active(&self, id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id)
+    }
+
     /// The job for `id` is over: a `.part` it left may be evicted.
     pub fn job_ended(&self, id: &str) {
         self.active
