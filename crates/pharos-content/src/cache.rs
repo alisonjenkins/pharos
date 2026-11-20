@@ -1749,11 +1749,22 @@ pub(crate) mod tests {
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::scope(|scope| {
             let cache = &c;
+            // Bounded: a trim that never reaches its scan (a failed save)
+            // leaves the worker to give up rather than hang the scope.
             scope.spawn(move || {
-                if rx.recv().is_ok() {
+                if rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
                     cache.discard_part("track/p");
                 }
             });
+            /// Clears the hook however the trim ends, an unwind included,
+            /// which drops `tx` and frees the worker.
+            struct ClearHook;
+            impl Drop for ClearHook {
+                fn drop(&mut self) {
+                    AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            let _clear = ClearHook;
             let seen2 = seen.clone();
             let part2 = part.clone();
             AFTER_TRIM_SCAN.with(|h| {
@@ -1764,7 +1775,6 @@ pub(crate) mod tests {
                 }));
             });
             c.set_cap(150).unwrap();
-            AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
         });
         assert!(
             seen.load(std::sync::atomic::Ordering::SeqCst),
