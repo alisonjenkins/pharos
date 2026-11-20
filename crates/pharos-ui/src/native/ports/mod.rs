@@ -441,11 +441,42 @@ pub fn credentials_changed() -> bool {
 /// `fingerprint`, in order with every other credentials change; returns
 /// whether one was registered.
 pub fn credentials_kept(fingerprint: &str) -> bool {
-    let Some(hook) = ON_CREDENTIALS_KEPT.get() else {
+    credentials_kept_via(
+        PROCESS_FENCE,
+        ON_CREDENTIALS_KEPT.get().copied(),
+        notifier,
+        fingerprint,
+    )
+}
+
+/// The media service's process-wide fence. Only the phone build hosts
+/// that service in this process; elsewhere there is nothing to fence.
+#[cfg(any(feature = "mobile", test))]
+const PROCESS_FENCE: fn(&str) = pharos_content::fence_token;
+#[cfg(not(any(feature = "mobile", test)))]
+const PROCESS_FENCE: fn(&str) = |_| {};
+
+/// `credentials_kept` with its parts named. The process-wide fence (`fence`,
+/// a mutex set) goes in on the caller's thread first, whatever becomes of
+/// the hook: no hook registered, no notifier thread, or a closed channel
+/// still leave the token refused. Only the hook, which can block on the
+/// content worker, goes to the notifier thread.
+fn credentials_kept_via(
+    fence: fn(&str),
+    hook: Option<fn(&str)>,
+    notifier: fn() -> Option<&'static std::sync::mpsc::Sender<HostCall>>,
+    fingerprint: &str,
+) -> bool {
+    fence(fingerprint);
+    let Some(hook) = hook else {
+        eprintln!("warn: credentials kept verdict=fenced reason=no_host_hook");
         return false;
     };
-    let (hook, fingerprint) = (*hook, fingerprint.to_owned());
-    queue_hook(notifier(), Box::new(move || hook(&fingerprint)));
+    let fingerprint = fingerprint.to_owned();
+    let queued = queue_hook(notifier(), Box::new(move || hook(&fingerprint)));
+    if !queued {
+        eprintln!("warn: credentials kept verdict=fenced reason=hook_not_queued");
+    }
     true
 }
 
@@ -662,6 +693,32 @@ mod tests {
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn count() {
         RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static FENCED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn record_fence(fp: &str) {
+        FENCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(fp.to_owned());
+    }
+    fn no_notifier() -> Option<&'static std::sync::mpsc::Sender<HostCall>> {
+        None
+    }
+    fn hook(_: &str) {}
+
+    /// CR 4637783594: the fence goes in on the caller's thread even when
+    /// the hook cannot be queued (no notifier thread) or none is set.
+    #[test]
+    fn a_kept_token_is_fenced_without_a_notifier() {
+        credentials_kept_via(record_fence, Some(hook), no_notifier, "fp-no-thread");
+        credentials_kept_via(record_fence, None, no_notifier, "fp-no-hook");
+        let fenced = FENCED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(fenced.contains(&"fp-no-thread".to_owned()), "{fenced:?}");
+        assert!(fenced.contains(&"fp-no-hook".to_owned()), "{fenced:?}");
     }
 
     /// A store that failed to register (its folder could not be created)
