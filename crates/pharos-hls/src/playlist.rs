@@ -74,7 +74,6 @@ pub struct Segment {
 pub enum Unsupported {
     Encrypted,
     ByteRange,
-    Discontinuity,
     Live,
     IFramesOnly,
     MediaTypeSubtitles,
@@ -87,7 +86,6 @@ impl Unsupported {
         match self {
             Self::Encrypted => "encrypted",
             Self::ByteRange => "byte_range",
-            Self::Discontinuity => "discontinuity",
             Self::Live => "live",
             Self::IFramesOnly => "iframes_only",
             Self::MediaTypeSubtitles => "subtitles",
@@ -382,7 +380,6 @@ pub fn parse_media(text: &str, base_url: &str) -> Result<MediaPlaylist, ParseErr
             push_unsupported(&mut unsupported, Unsupported::ByteRange);
         } else if line == "#EXT-X-DISCONTINUITY" {
             discontinuity = true;
-            push_unsupported(&mut unsupported, Unsupported::Discontinuity);
         } else if line == "#EXT-X-I-FRAMES-ONLY" {
             push_unsupported(&mut unsupported, Unsupported::IFramesOnly);
         } else if line == "#EXT-X-STREAM-INF" || line.starts_with("#EXT-X-STREAM-INF:") {
@@ -705,7 +702,6 @@ mod tests {
         let all = [
             Unsupported::Encrypted,
             Unsupported::ByteRange,
-            Unsupported::Discontinuity,
             Unsupported::Live,
             Unsupported::IFramesOnly,
             Unsupported::MediaTypeSubtitles,
@@ -715,7 +711,6 @@ mod tests {
         assert_eq!(labels.len(), all.len());
         assert_eq!(Unsupported::Encrypted.label(), "encrypted");
         assert_eq!(Unsupported::ByteRange.label(), "byte_range");
-        assert_eq!(Unsupported::Discontinuity.label(), "discontinuity");
         assert_eq!(Unsupported::Live.label(), "live");
         assert_eq!(Unsupported::IFramesOnly.label(), "iframes_only");
         assert_eq!(Unsupported::MediaTypeSubtitles.label(), "subtitles");
@@ -903,7 +898,6 @@ mod tests {
                 Unsupported::IFramesOnly,
                 Unsupported::ByteRange,
                 Unsupported::Encrypted,
-                Unsupported::Discontinuity,
                 Unsupported::Live,
             ]
         );
