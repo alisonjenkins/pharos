@@ -5933,7 +5933,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // When the grant is from an older API (a reconnect, even one during the
     // first negotiation), the stream keeps going and only the grant is
-    // negotiated again.
+    // negotiated again. A reconnect after the server's grace finds the old
+    // play session ended, and its stream URLs with it, so the stream starts
+    // again from where it was (B1482).
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -5970,10 +5972,18 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
-                        platform::info(&format!(
-                            "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
-                            decision.method
-                        ));
+                        if decision.play_session == p.0.session {
+                            platform::info(&format!(
+                                "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
+                                decision.method
+                            ));
+                        } else {
+                            platform::warn(&format!(
+                                "pharos: playback session ended during reconnect, restarting stream item={id} method={} attempt={attempt}",
+                                decision.method
+                            ));
+                            playing.restart();
+                        }
                         return;
                     }
                     Ok(_) => return,
