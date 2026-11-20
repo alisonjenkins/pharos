@@ -239,7 +239,35 @@ static ADMISSION: Mutex<()> = Mutex::new(());
 /// Holds the shared admission lock until dropped. Never call this while
 /// holding the cache's lock or a host's state lock.
 pub fn admission_guard() -> MutexGuard<'static, ()> {
-    ADMISSION.lock().unwrap_or_else(PoisonError::into_inner)
+    lock_noting(&ADMISSION)
+}
+
+/// Locks `m`. In tests, a thread that finds it held is listed as waiting
+/// on a lock until it gets it, so a test can see that a thread really is
+/// blocked at the lock ([`tests::wait_until_blocked`]), not merely about
+/// to reach it.
+pub(crate) fn lock_noting<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(test)]
+    {
+        match m.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let me = std::thread::current().id();
+        tests::WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(me);
+        let g = m.lock().unwrap_or_else(PoisonError::into_inner);
+        tests::WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|t| *t != me);
+        g
+    }
+    #[cfg(not(test))]
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Bytes that other kinds of download hold against the same cap (the
@@ -617,7 +645,7 @@ impl Cache {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_noting(&self.state)
     }
 
     fn totals(s: &State) -> (usize, u64) {
@@ -1604,6 +1632,28 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// Threads blocked in [`lock_noting`] right now.
+    pub(crate) static WAITING: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+    /// Waits until `thread` is blocked on a lock taken through
+    /// [`lock_noting`]: listed only after its attempt found the lock held,
+    /// so no signal sent before the attempt can pass this. Panics after
+    /// 10 s.
+    pub(crate) fn wait_until_blocked(thread: std::thread::ThreadId) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&thread)
+        {
+            assert!(
+                std::time::Instant::now() < until,
+                "the thread never blocked on the lock"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// A test's own cache folder, removed when the guard drops: bind it
     /// before the cache, so it outlives the cache and its workers.
     pub(crate) fn tmp(name: &str) -> crate::testdir::TmpDir {
@@ -1710,7 +1760,7 @@ pub(crate) mod tests {
                 done.store(true, Ordering::SeqCst);
             })
         };
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        wait_until_blocked(worker.thread().id());
         assert!(
             !done.load(Ordering::SeqCst),
             "the commit went ahead of the admission lock"
@@ -1736,7 +1786,7 @@ pub(crate) mod tests {
                 done.store(true, Ordering::SeqCst);
             })
         };
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        wait_until_blocked(worker.thread().id());
         assert!(
             !done.load(Ordering::SeqCst),
             "the cap changed ahead of the admission lock"
@@ -1933,11 +1983,13 @@ pub(crate) mod tests {
             let cache = &c;
             // Bounded: a trim that never reaches its scan (a failed save)
             // leaves the worker to give up rather than hang the scope.
-            scope.spawn(move || {
+            let (id_tx, id_rx) = std::sync::mpsc::channel();
+            let discarder = scope.spawn(move || {
                 if rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
                     cache.discard_part("track/p");
                 }
             });
+            id_tx.send(discarder.thread().id()).unwrap();
             /// Clears the hook however the trim ends, an unwind included,
             /// which drops `tx` and frees the worker.
             struct ClearHook;
@@ -1952,7 +2004,9 @@ pub(crate) mod tests {
             AFTER_TRIM_SCAN.with(|h| {
                 *h.borrow_mut() = Some(Box::new(move || {
                     let _ = tx.send(());
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    // The discard is at the cache's lock, which the trim
+                    // holds: the part must still be there.
+                    wait_until_blocked(id_rx.recv().unwrap());
                     seen2.store(part2.exists(), std::sync::atomic::Ordering::SeqCst);
                 }));
             });
