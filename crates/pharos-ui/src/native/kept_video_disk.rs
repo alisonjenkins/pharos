@@ -1868,10 +1868,16 @@ impl Inner {
                     0,
                     free,
                 )),
-                Check::Fresh { unknown: true, .. } => {
+                // Accounting first, whatever the cap policy: a resume held
+                // by its reservation is not admitted on free space alone
+                // while music's unfinished downloads cannot be measured.
+                Check::Fresh { unknown: true, .. } | Check::Resume { unknown: true, .. } => {
                     emit(
                         true,
-                        format!("pharos: video keep refused item={item} reason=music_size_unknown"),
+                        format!(
+                            "pharos: video keep refused item={item} reason=music_size_unknown resume={}",
+                            matches!(check, Check::Resume { .. })
+                        ),
                     );
                     Err((
                         KeepVideoRefusal::Host(
@@ -7066,6 +7072,79 @@ pub(crate) mod tests {
         fn admission_guard(&self) -> Box<dyn std::any::Any> {
             self.base.admission_guard()
         }
+    }
+
+    /// A budget whose music parts are unmeasurable while `armed`.
+    struct FlipBudget {
+        base: Arc<FakeBudget>,
+        armed: AtomicBool,
+    }
+
+    impl Budget for FlipBudget {
+        fn cap_bytes(&self) -> u64 {
+            self.base.cap_bytes()
+        }
+        fn other_used_bytes(&self) -> u64 {
+            self.base.other_used_bytes()
+        }
+        fn free_bytes(&self) -> u64 {
+            self.base.free_bytes()
+        }
+        fn accounting_ready(&self) -> bool {
+            self.base.accounting_ready()
+        }
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+            let (owed, parts) = self.base.other_pending_bytes();
+            if self.armed.load(Ordering::SeqCst) {
+                (owed, None)
+            } else {
+                (owed, parts)
+            }
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            self.base.admission_guard()
+        }
+    }
+
+    /// CR outside-diff kept_video_disk.rs:1894: music accounting readable
+    /// when the accounting wait ends but unreadable at the plan's admission
+    /// refuses a resume too, not only a fresh download: it is never
+    /// admitted on free space alone.
+    #[tokio::test]
+    async fn a_resume_is_refused_when_music_turns_unmeasurable_before_admission() {
+        let rig = Rig::new("resume-music-unknown");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let budget = Arc::new(FlipBudget {
+            base: rig.budget.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let store = rig.open_with(budget.clone());
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(!only(&store).files.is_empty(), "no plan to resume");
+        // Armed once the accounting wait has passed, before the plan reads
+        // the figures for its admission.
+        let b2 = budget.clone();
+        set_hook(&AFTER_PRUNE, move || b2.armed.store(true, Ordering::SeqCst));
+        store.resume_user("u1");
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        assert!(
+            !only(&store).ready(),
+            "a resume was admitted with music unmeasured: {:?}",
+            only(&store).state
+        );
+        assert!(
+            lines("pharos: video keep refused item=1 reason=music_size_unknown")
+                .iter()
+                .any(|l| l.contains("resume=true")),
+            "{:?}",
+            captured()
+        );
     }
 
     /// A music download held mid-window leaves one window of free space
