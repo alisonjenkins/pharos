@@ -26,6 +26,11 @@ const MAX_TRACK_LEAD_MS: u64 = 2_000;
 /// refetch can repair a partial remove, a third cannot change the answer.
 const MAX_APPENDS_PER_SEGMENT: u32 = 2;
 
+/// A gap this wide inside a segment ahead of the play head has the segment
+/// fetched again, though its midpoint is buffered: the stall watchdog jumps
+/// nothing wider, so the play head would stop at it for good.
+const REFILL_HOLE_MS: u64 = crate::stall::MAX_JUMP_MS;
+
 /// A skip lands this far past the start of the data it jumps to, as the stall
 /// watchdog's jumps do (hls.js `skipBufferHolePadding`).
 const SKIP_PADDING_MS: u64 = 100;
@@ -127,6 +132,14 @@ pub enum Note {
         from_ms: u64,
         to_ms: u64,
     },
+    /// Segment `index` of `track` is fetched again to fill the gap
+    /// `[start_ms, end_ms)` in it.
+    Refill {
+        track: Track,
+        index: usize,
+        start_ms: u64,
+        end_ms: u64,
+    },
     /// `track` waits for the other: it would buffer `lead_ms` ahead of it,
     /// over `limit_ms`. Noted once per wait.
     Held {
@@ -143,6 +156,7 @@ impl Note {
             Self::EndOfStream { .. } => "end_of_stream",
             Self::GaveUp { .. } => "gave_up",
             Self::Held { .. } => "held",
+            Self::Refill { .. } => "refill",
             Self::Skipped { .. } => "skipped",
         }
     }
@@ -564,7 +578,7 @@ fn skip_given_up(
     }
     let Some((index, seg_end)) = state.given_up.iter().copied().find_map(|idx| {
         range_of_slice(&state.segments, idx)
-            .filter(|&(s, e)| s <= play_ms && play_ms < e)
+            .filter(|&(s, e)| s <= play_ms.saturating_add(SKIP_PADDING_MS) && play_ms < e)
             .map(|(_, e)| (idx, e))
     }) else {
         return;
@@ -576,7 +590,13 @@ fn skip_given_up(
     // anything fetched in between would be skipped, and the seek aborts it.
     let next = index.saturating_add(1);
     let next_given_up = state.given_up.contains(&next);
-    let base_ms = if next_given_up || point_buffered(track_buffered, seg_end) {
+    let inside = track_buffered
+        .iter()
+        .map(|&(start, _)| start)
+        .find(|&start| play_ms < start && start < seg_end);
+    let base_ms = if let Some(start) = inside {
+        start
+    } else if next_given_up || point_buffered(track_buffered, seg_end) {
         seg_end
     } else if let Some(start) = range_of_slice(&state.segments, next)
         .filter(|_| is_settled(state, next, track_buffered))
@@ -661,11 +681,10 @@ fn plan_track(
         && !point_buffered(track_buffered, anchor_ms);
     // Appends only count against a segment that stays unbuffered.
     if let Some((idx, _)) = state.appends {
-        if state
-            .segments
-            .get(idx)
-            .is_some_and(|seg| is_segment_covered(seg, track_buffered))
-        {
+        if state.segments.get(idx).is_some_and(|seg| {
+            is_segment_covered(seg, track_buffered)
+                && hole_ahead(state, idx, track_buffered, anchor_ms).is_none()
+        }) {
             state.appends = None;
         }
     }
@@ -678,7 +697,8 @@ fn plan_track(
             found = Some((idx, seg.clone()));
             break;
         }
-        if is_settled(state, idx, track_buffered) {
+        let hole = hole_ahead(state, idx, track_buffered, anchor_ms);
+        if is_settled(state, idx, track_buffered) && hole.is_none() {
             continue;
         }
         match state.appends {
@@ -691,6 +711,14 @@ fn plan_track(
                 });
             }
             _ => {
+                if let Some((start_ms, end_ms)) = hole {
+                    notes.push(Note::Refill {
+                        track,
+                        index: idx,
+                        start_ms,
+                        end_ms,
+                    });
+                }
                 found = Some((idx, seg.clone()));
                 break;
             }
@@ -731,6 +759,42 @@ fn plan_track(
         track,
         index: candidate_idx,
     });
+}
+
+/// The first gap wider than [`REFILL_HOLE_MS`] in segment `idx` at or after
+/// `from_ms`, when the segment otherwise counts as buffered and has not been
+/// given up on: a later append of another rendition removed part of it, or its
+/// data stops well short of its end with the next segment buffered.
+fn hole_ahead(
+    state: &TrackState,
+    idx: usize,
+    buffered: &[(u64, u64)],
+    from_ms: u64,
+) -> Option<(u64, u64)> {
+    let seg = state.segments.get(idx)?;
+    if state.given_up.contains(&idx) || !is_segment_covered(seg, buffered) {
+        return None;
+    }
+    let seg_end = seg.start_ms.saturating_add(seg.duration_ms);
+    let mut at = from_ms.max(seg.start_ms);
+    for &(start, end) in buffered {
+        if end <= at {
+            continue;
+        }
+        if start >= seg_end {
+            break;
+        }
+        if start > at.saturating_add(REFILL_HOLE_MS) {
+            return Some((at, start));
+        }
+        at = at.max(end);
+    }
+    // A short tail only strands the play head once the next segment is in.
+    let next_buffered = state
+        .segments
+        .get(idx.saturating_add(1))
+        .is_some_and(|next| is_segment_covered(next, buffered));
+    (next_buffered && seg_end > at.saturating_add(REFILL_HOLE_MS)).then_some((at, seg_end))
 }
 
 /// The start of the segment holding `at_ms`, so eviction removes whole
@@ -894,7 +958,10 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{Action, Buffered, Config, Note, Planner, Request, Track};
+    use super::{
+        Action, Buffered, Config, Note, Planner, Request, Track, MAX_APPENDS_PER_SEGMENT,
+        SKIP_PADDING_MS,
+    };
     use crate::playlist::Segment;
     use crate::timeline::segments_duration_ms;
 
@@ -1969,6 +2036,121 @@ mod tests {
             planner.appended(Track::Video);
             buf.video = vec![(0, segs[index].start_ms + segs[index].duration_ms)];
         }
+    }
+
+    #[test]
+    fn a_gap_inside_a_buffered_segment_ahead_is_fetched_again() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        // Segment 2 lost its first two seconds to an append of another
+        // rendition; its midpoint (15 s) is still buffered.
+        let holed = Buffered {
+            video: vec![(0, 12_070), (14_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(11_000, &holed),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 2
+            }]
+        );
+        assert_eq!(
+            planner.take_notes(),
+            vec![Note::Refill {
+                track: Track::Video,
+                index: 2,
+                start_ms: 12_070,
+                end_ms: 14_000,
+            }]
+        );
+
+        // The append fills it: nothing more to fetch.
+        planner.appended(Track::Video);
+        let whole = Buffered {
+            video: vec![(0, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(11_500, &whole), Vec::new());
+    }
+
+    #[test]
+    fn a_segment_that_stops_short_is_fetched_again_once_the_next_is_in() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let short = Buffered {
+            video: vec![(0, 4_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(0, &short),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 1
+            }]
+        );
+        planner.appended(Track::Video);
+        let stranded = Buffered {
+            video: vec![(0, 4_000), (6_000, 12_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(1_000, &stranded),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_gap_the_watchdog_can_jump_is_not_fetched_again() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let buf = Buffered {
+            video: vec![(0, 12_070), (13_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(11_000, &buf), Vec::new());
+        // Nor is a gap behind the play head.
+        let behind = Buffered {
+            video: vec![(0, 6_000), (9_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(10_000, &behind), Vec::new());
+    }
+
+    #[test]
+    fn a_gap_that_stays_after_two_appends_is_skipped() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let holed = Buffered {
+            video: vec![(0, 12_070), (14_000, 24_000)],
+            audio: Vec::new(),
+        };
+        for _ in 0..MAX_APPENDS_PER_SEGMENT {
+            assert_eq!(
+                planner.tick(11_000, &holed),
+                vec![Action::Fetch {
+                    track: Track::Video,
+                    index: 2
+                }]
+            );
+            planner.appended(Track::Video);
+        }
+        assert_eq!(planner.tick(11_000, &holed), Vec::new());
+        assert!(planner.take_notes().contains(&Note::GaveUp {
+            track: Track::Video,
+            index: 2,
+            appends: MAX_APPENDS_PER_SEGMENT,
+        }));
+        // The play head stops at the gap and is moved to the data after it.
+        assert_eq!(
+            planner.tick(12_070, &holed),
+            vec![Action::Skip {
+                to_ms: 14_000 + SKIP_PADDING_MS
+            }]
+        );
     }
 
     #[test]
