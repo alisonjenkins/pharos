@@ -717,6 +717,9 @@ impl Gate {
             cache: &self.cache,
             id,
         };
+        // The network epoch the current attempt runs in: a refusal parks
+        // under it, so a reconnect after the attempt makes the park due.
+        let mut attempt_epoch = epoch;
         let outcome = loop {
             // Online and still wanted first: the preflight below may evict
             // other retained parts, which a job that cannot run yet (or is
@@ -724,6 +727,7 @@ impl Gate {
             if !self.pause_until_online(id, &mut generation).await {
                 break Outcome::Cancelled;
             }
+            attempt_epoch = self.online_epoch.load(Ordering::SeqCst);
             // A retained part always gets its response inspected: the
             // preflight counts its bytes as room (a whole body's admission
             // reclaims them) and authorizes no write. The headers decide:
@@ -916,7 +920,7 @@ impl Gate {
                     Parked {
                         until: Instant::now() + wait,
                         backoff: next,
-                        epoch: self.online_epoch.load(Ordering::SeqCst),
+                        epoch: attempt_epoch,
                     },
                 );
                 #[cfg(test)]
@@ -2817,6 +2821,66 @@ mod tests {
         r.dl.set_online(true);
         assert!(r.dl.wait_idle(Duration::from_secs(5)), "the pin was lost");
         assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// CR review 5995575621 (prefetch.rs:876): a reconnect after the
+    /// refusal, before the park is recorded, makes the park due: the park
+    /// carries the refused attempt's epoch, not the one after it.
+    #[test]
+    fn a_reconnect_before_a_park_is_recorded_makes_it_due() {
+        let starve = Arc::new(AtomicBool::new(true));
+        let fired = Arc::new(AtomicBool::new(false));
+        let gate: Arc<Mutex<Option<Arc<Gate>>>> = Arc::default();
+        let (s2, f2, g2) = (starve.clone(), fired.clone(), gate.clone());
+        let hook: Box<dyn FnMut() + Send> = Box::new(move || {
+            if !f2.swap(true, Ordering::SeqCst) {
+                s2.store(false, Ordering::SeqCst);
+                if let Some(g) = g2.lock().unwrap().as_ref() {
+                    g.online_epoch.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        // The gate is known once the rig is: the hook reads it through
+        // the slot, filled before the first park.
+        let r = {
+            let script = Script::default()
+                .file("/audio/1", body(1000, 1))
+                .etag("vA")
+                .drop_first_after(600);
+            let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+            let r = rig_with_free(
+                "park-epoch",
+                script,
+                1 << 20,
+                &["t"],
+                Tuning {
+                    backoff_min: Duration::from_secs(30),
+                    backoff_max: Duration::from_secs(30),
+                    ..fast()
+                },
+                starved_while_part(slot.clone(), starve.clone(), 600, MIN_FREE_BYTES + 100),
+            );
+            *slot.lock().unwrap() = Some(r.cache.part_path("track/1"));
+            *gate.lock().unwrap() = Some(r.dl.gate.clone());
+            *r.dl.gate.before_park.lock().unwrap() = Some(hook);
+            r.cache.pin("album/a", &ids(&["track/1"]));
+            r.dl.enqueue(&ids(&["track/1"]));
+            let until = Instant::now() + Duration::from_secs(10);
+            while r.srv.seen().is_empty() {
+                assert!(Instant::now() < until, "the pin never started");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            r.dl.set_online(false);
+            r.dl.set_online(true);
+            r
+        };
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(5)),
+            "the reconnect after the refusal left the pin to its 30 s park"
+        );
+        assert!(fired.load(Ordering::SeqCst), "the pin was never parked");
+        assert!(r.cache.is_complete("track/1"));
+        *gate.lock().unwrap() = None;
     }
 
     /// A whole new body refused for low disk keeps the old part and its
