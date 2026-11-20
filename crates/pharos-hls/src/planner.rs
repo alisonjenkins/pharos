@@ -12,6 +12,11 @@ const DEFAULT_BACK_MS: u64 = 15_000;
 /// Minimum forward buffer target in milliseconds after quota reductions.
 const DEFAULT_MIN_FORWARD_MS: u64 = 8_000;
 
+/// Each append keeps this share of the byte-rate history, so the rate follows
+/// a quality switch within a few segments.
+const RATE_DECAY_KEEP: u64 = 3;
+const RATE_DECAY_DIVISOR: u64 = 4;
+
 /// The most one track may buffer ahead of the other. Under one 6 s segment, so
 /// a track never starts a segment whose aligned predecessor the other has not
 /// finished, yet above the few hundred ms their range ends differ by.
@@ -51,6 +56,12 @@ pub struct Config {
     pub back_ms: u64,
     /// The forward target never shrinks below this after quota errors.
     pub min_forward_ms: u64,
+    /// Bytes of media to keep ahead of the play head: a stream light enough
+    /// that `forward_ms` of it is under this buffers further, up to
+    /// `forward_ceiling_ms`. Zero keeps the target at `forward_ms`.
+    pub forward_bytes: u64,
+    /// The furthest ahead `forward_bytes` can take the target.
+    pub forward_ceiling_ms: u64,
 }
 
 impl Default for Config {
@@ -59,6 +70,8 @@ impl Default for Config {
             forward_ms: DEFAULT_FORWARD_MS,
             back_ms: DEFAULT_BACK_MS,
             min_forward_ms: DEFAULT_MIN_FORWARD_MS,
+            forward_bytes: 0,
+            forward_ceiling_ms: DEFAULT_FORWARD_MS,
         }
     }
 }
@@ -158,6 +171,8 @@ struct TrackState {
     given_up: Vec<usize>,
     /// Waiting for the other track; set while the wait has been noted.
     held: bool,
+    /// Bytes and media time of recent appends, the older ones weighing less.
+    rate: (u64, u64),
 }
 
 impl TrackState {
@@ -172,6 +187,7 @@ impl TrackState {
             appends: None,
             given_up: Vec::new(),
             held: false,
+            rate: (0, 0),
         }
     }
 }
@@ -186,6 +202,9 @@ pub struct Planner {
     /// Media kept behind the play head: `config.back_ms` until the browser
     /// refuses an append for room, then nothing but the current segment.
     back_target_ms: u64,
+    /// The browser refused an append for room: `forward_bytes` no longer
+    /// extends the forward target.
+    quota_hit: bool,
     /// A refused append is waiting for room: trim on the next tick even with
     /// its request still in flight.
     quota_trim: bool,
@@ -215,6 +234,7 @@ impl Planner {
             config,
             forward_target_ms,
             back_target_ms: config.back_ms,
+            quota_hit: false,
             quota_trim: false,
             eos_emitted: false,
             eos_noted: false,
@@ -233,6 +253,7 @@ impl Planner {
     pub fn tick(&mut self, play_ms: u64, buffered: &Buffered) -> Vec<Action> {
         let mut actions = Vec::new();
         let has_audio = self.audio.is_some();
+        let forward_limit_ms = self.forward_limit_ms();
 
         let audio_finished = self.audio.as_ref().map_or(true, |a| {
             !a.needs_init && is_track_covered_from_playhead(a, play_ms, &buffered.audio)
@@ -282,7 +303,7 @@ impl Planner {
                 has_audio.then_some((other, other_finished)),
                 self.back_target_ms,
                 self.quota_trim,
-                self.forward_target_ms,
+                forward_limit_ms,
                 &mut actions,
                 &mut self.notes,
             );
@@ -377,6 +398,25 @@ impl Planner {
         }
     }
 
+    /// The media segment in flight on `track` was `bytes` long. Called before
+    /// [`Planner::appended`]; feeds the byte budget of the forward target.
+    pub fn media_bytes(&mut self, track: Track, bytes: u64) {
+        let Some(state) = self.track_mut(track) else {
+            return;
+        };
+        let Some(Request::Media(idx)) = state.in_flight else {
+            return;
+        };
+        let Some(seg) = state.segments.get(idx) else {
+            return;
+        };
+        let (old_bytes, old_ms) = state.rate;
+        state.rate = (
+            (old_bytes / RATE_DECAY_DIVISOR * RATE_DECAY_KEEP).saturating_add(bytes),
+            (old_ms / RATE_DECAY_DIVISOR * RATE_DECAY_KEEP).saturating_add(seg.duration_ms),
+        );
+    }
+
     /// The track moves to another rendition on the same segment grid (a quality
     /// switch): its init is fetched again before the next media segment, and
     /// what is already buffered stays. Refused (`false`) while a request is in
@@ -409,13 +449,36 @@ impl Planner {
     pub fn quota_exceeded(&mut self) -> u64 {
         self.back_target_ms = 0;
         self.quota_trim = true;
+        self.quota_hit = true;
         self.forward_target_ms = (self.forward_target_ms / 2).max(self.config.min_forward_ms);
         self.forward_target_ms
     }
 
-    /// Current forward buffer target in milliseconds.
+    /// Current forward buffer target in milliseconds, before the byte budget.
     pub fn forward_target_ms(&self) -> u64 {
         self.forward_target_ms
+    }
+
+    /// How far ahead of the play head to fetch now: the forward target, or as
+    /// far as `forward_bytes` reaches at the measured byte rate when that is
+    /// further, up to `forward_ceiling_ms`.
+    pub fn forward_limit_ms(&self) -> u64 {
+        let base = self.forward_target_ms;
+        if self.quota_hit || self.config.forward_bytes == 0 {
+            return base;
+        }
+        let bytes_per_s: u64 = std::iter::once(&self.video)
+            .chain(self.audio.as_ref())
+            .map(|t| match t.rate {
+                (_, 0) => 0,
+                (bytes, ms) => bytes.saturating_mul(1_000) / ms,
+            })
+            .sum();
+        if bytes_per_s == 0 {
+            return base;
+        }
+        let affordable_ms = self.config.forward_bytes.saturating_mul(1_000) / bytes_per_s;
+        affordable_ms.clamp(base, self.config.forward_ceiling_ms.max(base))
     }
 
     /// Returns the currently in-flight request for `track`, if any.
@@ -1410,6 +1473,8 @@ mod tests {
                 forward_ms: 30_000,
                 back_ms: 15_000,
                 min_forward_ms: 8_000,
+                forward_bytes: 0,
+                forward_ceiling_ms: 30_000,
             }
         );
     }
@@ -1574,6 +1639,7 @@ mod tests {
             forward_ms: 12_000,
             back_ms: 15_000,
             min_forward_ms: 8_000,
+            ..Config::default()
         };
         let mut planner = Planner::new(segs, false, None, config, 0);
 
@@ -1869,6 +1935,48 @@ mod tests {
         let mut without_init = Planner::new(Vec::new(), false, None, Config::default(), 0);
         assert_eq!(without_init.tick(0, &buf), vec![Action::EndOfStream]);
         assert_eq!(without_init.tick(0, &buf), Vec::new());
+    }
+
+    /// Buffers from a stopped play head until the planner stops fetching, each
+    /// segment `segment_bytes` long; returns the buffered end.
+    fn fill_ahead(planner: &mut Planner, segs: &[Segment], segment_bytes: u64) -> u64 {
+        let mut buf = Buffered::default();
+        loop {
+            let fetched = planner.tick(0, &buf).into_iter().find_map(|a| match a {
+                Action::Fetch { index, .. } => Some(index),
+                _ => None,
+            });
+            let Some(index) = fetched else {
+                return buf.video.first().map_or(0, |&(_, end)| end);
+            };
+            planner.media_bytes(Track::Video, segment_bytes);
+            planner.appended(Track::Video);
+            buf.video = vec![(0, segs[index].start_ms + segs[index].duration_ms)];
+        }
+    }
+
+    #[test]
+    fn a_byte_budget_buffers_a_light_stream_further_ahead() {
+        let segs = make_segments(&[6_000; 40]);
+        let config = Config {
+            forward_ms: 12_000,
+            forward_bytes: 3_000_000,
+            forward_ceiling_ms: 60_000,
+            ..Config::default()
+        };
+        let planner = || Planner::new(segs.clone(), false, None, config, 0);
+
+        // 100 kB/s: the budget is 30 s of it.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 600_000), 30_000);
+        // 500 kB/s: the budget is 6 s of it, under the 12 s target.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 3_000_000), 12_000);
+        // 10 kB/s: the budget is 300 s of it, over the ceiling.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 60_000), 60_000);
+
+        let mut refused = planner();
+        refused.quota_exceeded();
+        // Halved to the 8 s floor, and the budget no longer extends it.
+        assert_eq!(fill_ahead(&mut refused, &segs, 60_000), 12_000);
     }
 
     #[test]

@@ -2535,9 +2535,20 @@ test.describe("pharos Dioxus UI", () => {
 
       // Bytes per second each segment body is trickled at; 0 is full speed.
       let rateBps = 0;
+      // A desktop buffers up to 120 s ahead, which is all of this clip and
+      // fast once its segments are cached (a retry, or an earlier test), so
+      // every segment past the first few waits for the link to slow: the
+      // engine then still has segments to load at the slow rate.
+      const AHEAD = 4;
+      let slowed: () => void = () => {};
+      const slow = new Promise<void>((r) => (slowed = r));
+      let first: number | undefined;
       const http = await import("node:http");
       const proxy = http.createServer(async (req, res) => {
         try {
+          const seg = Number(/\/(\d+)\.m4s(?:\?|$)/.exec(req.url ?? "")?.[1] ?? 0);
+          first ??= seg;
+          if (seg > first + AHEAD) await slow;
           // The page signs its requests with its session cookie.
           const upstream = await fetch(`${PHAROS_URL}${req.url}`, {
             headers: req.headers.cookie ? { cookie: req.headers.cookie } : {},
@@ -2626,6 +2637,7 @@ test.describe("pharos Dioxus UI", () => {
 
         // The link drops to 800 kbit/s: room for the 360p rung, not the source.
         rateBps = 100_000;
+        slowed();
         const switched = () => logs.find((l) => l.includes("pharos: abr switch"));
         await expect.poll(switched, { timeout: 120_000 }).toBeTruthy();
         const line = switched() ?? "";
@@ -2650,6 +2662,9 @@ test.describe("pharos Dioxus UI", () => {
         expect(logs.filter((l) => l.includes("playback error engine=rust"))).toEqual([]);
       } finally {
         rateBps = 0;
+        // A failure before the slowdown would leave held segments open, and
+        // proxy.close waits for them.
+        slowed();
         await page.unrouteAll({ behavior: "ignoreErrors" });
         await new Promise((r) => proxy.close(r));
       }
