@@ -1111,6 +1111,22 @@ impl Worker {
             return self.reload(events).await;
         }
         if matches!(op, Op::StaySignedOut) {
+            // Queued behind other work: a sign-in may have stored a newer
+            // token since the sign-out asked. Its store replaced the fence,
+            // so its token is not refused: that session and its sign-in
+            // stay. Only the token the sign-out fenced is dropped.
+            let fence = token::fence(&self.token_path);
+            let newer = match &self.link {
+                Some(l) => !fence.refuses(&l.token),
+                None => self.load_token().ok().flatten().is_some(),
+            };
+            if newer {
+                log::info!(
+                    "credentials stay signed out: verdict=kept reason=newer_sign_in linked={}",
+                    self.link.is_some()
+                );
+                return Ok(Out::Done);
+            }
             self.link = None;
             let polling = self.stop_sign_in();
             self.shared.set_auth(AuthState::SignedOut);
@@ -2202,6 +2218,40 @@ mod tests {
                 |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
             ),
             "the reload resumed the fenced token: {lines:?}"
+        );
+    }
+
+    /// CR 4642574319: a stay-signed-out notice that reaches the worker
+    /// after a newer sign-in stored its token keeps that session: only the
+    /// fenced token is refused. The control is the test above.
+    #[test]
+    fn a_late_stay_signed_out_keeps_a_newer_sign_in() {
+        let root = test_root("stay-signed-out-late");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
+        // A newer sign-in, before the notice is handled.
+        token::store(&token_path, "tok2").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        local.block_on(&rt, async {
+            w.execute(&Op::StaySignedOut, &events).await.unwrap();
+        });
+        assert_eq!(
+            shared.lock().auth,
+            AuthState::SignedIn,
+            "the newer sign-in was dropped"
+        );
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    .contains("credentials stay signed out: verdict=kept reason=newer_sign_in")),
+            "{lines:?}"
         );
     }
 
