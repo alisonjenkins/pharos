@@ -569,7 +569,12 @@ pub fn url_path(url: &str) -> &str {
     let from_path = match after_scheme(url) {
         // The authority ends where `request_key`'s does.
         Some(_) => rest.find(['/', '?', '#']).map_or("", |i| &rest[i..]),
-        None => rest.find('/').map_or("", |i| &rest[i..]),
+        // A relative reference: a slash in its query or fragment is no
+        // path, so it is looked for before them only.
+        None => {
+            let path = rest.split(['?', '#']).next().unwrap_or("");
+            path.find('/').map_or("", |i| &path[i..])
+        }
     };
     from_path.split(['?', '#']).next().unwrap_or("")
 }
@@ -1186,6 +1191,15 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    /// CR 4646280259: a relative reference's logged path is found before
+    /// its query, so no query text reaches the log.
+    #[test]
+    fn a_relative_references_logged_path_holds_no_query() {
+        assert_eq!(url_path("0.m4s?session=a/b"), "");
+        assert_eq!(url_path("x/0.m4s?session=a/b#f/g"), "/0.m4s");
+        assert_eq!(url_path("/videos/0.m4s?session=a/b"), "/videos/0.m4s");
     }
 
     /// CR 4646045317: a redirect's final URL is normalized before its base
