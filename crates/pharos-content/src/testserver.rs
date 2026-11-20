@@ -251,7 +251,19 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         let piece = s.piece;
         let hold = s.hold.clone();
         let etag = (!s.no_etag).then(|| s.etag.clone().unwrap_or_else(|| "v1".to_owned()));
-        let r = plan(&mut s, path, token.as_deref(), range.as_deref());
+        // A range asked for under a validator holds only while that is the
+        // file's ETag now, from this same snapshot: otherwise the whole
+        // file is sent (RFC 9110 If-Range).
+        let validated = if_range.as_deref().is_none_or(|v| {
+            etag.as_deref()
+                .is_some_and(|e| v.trim() == format!("\"{e}\""))
+        });
+        let r = plan(
+            &mut s,
+            path,
+            token.as_deref(),
+            range.as_deref().filter(|_| validated),
+        );
         s.log.push(Seen {
             path: path.to_owned(),
             range: range.clone(),
@@ -523,5 +535,32 @@ mod tests {
             pieces(10, 4, None).collect::<Vec<_>>(),
             [(0, 4), (4, 8), (8, 10)]
         );
+    }
+
+    /// The status the server answers a range request with, under `if_range`.
+    fn status_for(server: &TestServer, if_range: Option<&str>) -> u16 {
+        let mut sock = std::net::TcpStream::connect(server.addr).unwrap();
+        let validator = if_range.map_or(String::new(), |v| format!("If-Range: {v}\r\n"));
+        write!(
+            sock,
+            "GET /f HTTP/1.1\r\nHost: x\r\nRange: bytes=3-\r\n{validator}\r\n"
+        )
+        .unwrap();
+        let mut got = String::new();
+        let _ = sock.read_to_string(&mut got);
+        got.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    /// CR 4640611298: a range under If-Range holds only while the tag is
+    /// the file's ETag: a changed tag gets the whole file, 200, with no
+    /// `ignore_range`.
+    #[test]
+    fn if_range_with_a_changed_etag_gets_the_whole_file() {
+        let server = TestServer::start(Script::default().file("/f", vec![1u8; 10]).etag("vA"));
+        assert_eq!(status_for(&server, None), 206);
+        assert_eq!(status_for(&server, Some("\"vA\"")), 206);
+        server.edit(|s| s.etag("vB"));
+        assert_eq!(status_for(&server, Some("\"vA\"")), 200);
+        assert_eq!(status_for(&server, Some("\"vB\"")), 206);
     }
 }
