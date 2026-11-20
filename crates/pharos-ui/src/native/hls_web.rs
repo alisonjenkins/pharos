@@ -70,6 +70,19 @@ enum RunningOp {
     Remove,
 }
 
+type FetchOutcome = Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure>;
+
+/// A track's first media segment, requested while its init segment loads so
+/// the start costs one round trip less.
+struct Prefetch {
+    index: usize,
+    uri: String,
+    controller: web_sys::AbortController,
+    outcome: futures_util::future::Shared<
+        futures_util::future::LocalBoxFuture<'static, Rc<FetchOutcome>>,
+    >,
+}
+
 /// One rung the engine can switch the video track to.
 struct Rendition {
     entry_label: String,
@@ -102,6 +115,7 @@ struct TrackRunner {
     parked: Option<Op>,
     /// Refusals of the parked append so far.
     quota_tries: u32,
+    prefetch: Option<Prefetch>,
     listeners: Vec<(&'static str, EventListener)>,
 }
 
@@ -125,6 +139,7 @@ impl TrackRunner {
             aborted_updateends: 0,
             parked: None,
             quota_tries: 0,
+            prefetch: None,
             listeners: Vec::new(),
         }
     }
@@ -345,6 +360,9 @@ fn take_track_cleanup(mut track: TrackRunner) -> TrackCleanup {
     track.generation = track.generation.saturating_add(1);
     track.queue.clear();
     track.running = None;
+    if let Some(pre) = track.prefetch.take() {
+        pre.controller.abort();
+    }
     (
         track.source_buffer,
         track.controller.take(),
@@ -1322,6 +1340,9 @@ fn abort_track(session: &Rc<RefCell<Session>>, track: Track) {
         t.queue.retain(|op| !matches!(op, Op::Append { .. }));
         t.parked = None;
         t.quota_tries = 0;
+        if let Some(pre) = t.prefetch.take() {
+            pre.controller.abort();
+        }
         // SourceBuffer.abort() throws while a remove is running, so only an append is cut short.
         let aborting_append = open
             && matches!(t.running, Some(RunningOp::Append { .. }))
@@ -1356,13 +1377,14 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
             return;
         }
     };
-    let signal = controller.signal();
 
-    let (uri, media_ms, generation, old_controller, deadlines) = {
+    let (uri, media_ms, generation, old_controller, deadlines, signal, prefetched) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
         }
+        let deadlines = s.deadlines;
+        let first_media = s.planner.as_ref().and_then(|p| p.first_media(track));
         let Some(t) = s.track_mut(track) else {
             return;
         };
@@ -1375,10 +1397,37 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                 (seg.uri.clone(), seg.duration_ms)
             }
         };
+        let stale = t.prefetch.take();
+        let mut prefetched = None;
+        match (request, stale) {
+            (SegRequest::Media(idx), Some(pre)) if pre.index == idx && pre.uri == uri => {
+                prefetched = Some(pre);
+            }
+            (_, Some(pre)) => {
+                info(&format!(
+                    "pharos: playback engine=rust prefetch=dropped track={} index={} reason=target_moved",
+                    track.label(),
+                    pre.index
+                ));
+                pre.controller.abort();
+            }
+            (_, None) => {}
+        }
+        if request == SegRequest::Init && read_time_ranges(&t.source_buffer).is_empty() {
+            t.prefetch = first_media.and_then(|index| {
+                let seg_uri = t.segments.get(index)?.uri.clone();
+                start_prefetch(track, index, seg_uri, deadlines)
+            });
+        }
+        let (controller, outcome) = match prefetched {
+            Some(pre) => (pre.controller, Some(pre.outcome)),
+            None => (controller, None),
+        };
+        let signal = controller.signal();
         t.generation = t.generation.saturating_add(1);
         let gen = t.generation;
         let old = t.controller.replace(controller);
-        (uri, media_ms, gen, old, s.deadlines)
+        (uri, media_ms, gen, old, deadlines, signal, outcome)
     };
 
     if let Some(old) = old_controller {
@@ -1387,7 +1436,10 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
 
     let weak = Rc::downgrade(session);
     wasm_bindgen_futures::spawn_local(async move {
-        let outcome = fetch_segment(&uri, &signal, deadlines).await;
+        let outcome = match prefetched {
+            Some(shared) => (*shared.await).clone(),
+            None => fetch_segment(&uri, &signal, deadlines).await,
+        };
         if signal.aborted() {
             return;
         }
@@ -1429,7 +1481,36 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
     });
 }
 
+/// Requests media segment `index` of `track` ahead of the planner asking for it.
+fn start_prefetch(
+    track: Track,
+    index: usize,
+    uri: String,
+    deadlines: Deadlines,
+) -> Option<Prefetch> {
+    use futures_util::FutureExt;
+    let controller = web_sys::AbortController::new().ok()?;
+    let signal = controller.signal();
+    info(&format!(
+        "pharos: playback engine=rust prefetch=started track={} index={index}",
+        track.label()
+    ));
+    let fetch_uri = uri.clone();
+    let outcome = async move { Rc::new(fetch_segment(&fetch_uri, &signal, deadlines).await) }
+        .boxed_local()
+        .shared();
+    // Polled here so the request runs before anything waits on it.
+    wasm_bindgen_futures::spawn_local(outcome.clone().map(drop));
+    Some(Prefetch {
+        index,
+        uri,
+        controller,
+        outcome,
+    })
+}
+
 /// Why a segment request failed, and the deadline that passed for a timeout.
+#[derive(Clone)]
 struct FetchFailure {
     cause: Cause,
     deadline_ms: Option<u64>,
