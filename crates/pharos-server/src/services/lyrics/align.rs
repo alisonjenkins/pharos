@@ -21,20 +21,21 @@ use super::eta::Eta;
 use super::shadow::{Shadow, Source};
 use super::{Lyrics, WordStamp};
 
-/// Bumped when the aligner's answers change for the same song and lines, so
-/// word times cached from an older aligner are asked for again.
+/// The aligner generation: bumped when the aligner's answers change for the
+/// same song and lines, so word times cached by an older generation are
+/// asked for again.
 /// 2: star tokens stop words smearing across instrumental breaks.
 /// 3: lyrics timed for another cut are shifted onto the audio first (B936).
 /// 4: answers an older aligner gave under version 3, cached with no offset,
 ///    are asked for again (B1007).
 /// 5: a line's window opens 750 ms before its stamp, not 250 ms, so a stamp
 ///    tapped late no longer pins its first word late.
-const ALIGN_VERSION: u32 = 5;
+const ALIGN_GENERATION: u32 = 5;
 
 /// The oldest aligner whose answers are kept. Its `aligner_version` goes up
 /// with each change to how it times words, so an answer from an aligner
 /// deployed after the server fails the job (retried after `RETRY_AFTER`)
-/// instead of being cached under the new `ALIGN_VERSION` key.
+/// instead of being cached under the new `ALIGN_GENERATION` key.
 /// 2: a line's window opens 750 ms before its stamp (B1165).
 const MIN_ALIGNER_VERSION: u32 = 2;
 
@@ -1157,11 +1158,17 @@ impl Aligner {
     }
 }
 
-/// The cache key for `lines` of the file at `path` (media-relative `rel`):
-/// the file's size and mtime are in it, so a replaced file aligns again.
-/// `tag` keeps one kind of request's answers apart from another's.
+/// The cache key for `lines` of the file at `path` (media-relative `rel`)
+/// under this generation: the file's size and mtime are in it, so a
+/// replaced file aligns again. `tag` keeps one kind of request's answers
+/// apart from another's.
 fn cache_key(tag: &[&str], rel: &str, path: &Path, lines: &[(u64, u64, String)]) -> String {
-    let (size, mtime) = match std::fs::metadata(path) {
+    key_for(ALIGN_GENERATION, tag, rel, file_stamp(path), lines)
+}
+
+/// The file's size and mtime in seconds; zeros when it cannot be read.
+fn file_stamp(path: &Path) -> (u64, u64) {
+    match std::fs::metadata(path) {
         Ok(m) => {
             let size = m.len();
             let mtime = m
@@ -1172,8 +1179,19 @@ fn cache_key(tag: &[&str], rel: &str, path: &Path, lines: &[(u64, u64, String)])
             (size, mtime)
         }
         Err(_) => (0, 0),
-    };
-    let mut parts = vec![serde_json::json!(ALIGN_VERSION)];
+    }
+}
+
+/// The key `generation` keeps `lines` under. Every served generation used
+/// this shape, so each one's key can still be worked out.
+fn key_for(
+    generation: u32,
+    tag: &[&str],
+    rel: &str,
+    (size, mtime): (u64, u64),
+    lines: &[(u64, u64, String)],
+) -> String {
+    let mut parts = vec![serde_json::json!(generation)];
     parts.extend(tag.iter().map(|t| serde_json::json!(t)));
     parts.extend([
         serde_json::json!(rel),
@@ -1203,7 +1221,7 @@ pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String
         lines: Vec<ReplyLine>,
         /// Required: an aligner older than the offset search sends none, and
         /// caching its answer would pin the song's words to a guess of no
-        /// offset until ALIGN_VERSION next changes (B1007). Rejecting it
+        /// offset until ALIGN_GENERATION next changes (B1007). Rejecting it
         /// fails the job, which is retried after `RETRY_AFTER`.
         offset_ms: i64,
         /// Required for the same reason, from an aligner older than B1165.
