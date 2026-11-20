@@ -38,7 +38,10 @@ type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
 enum Op {
     Append {
-        bytes: Vec<u8>,
+        /// The response body as the browser holds it: appended as it is, never
+        /// copied into the wasm heap, which would grow to the largest segment
+        /// and stay there.
+        bytes: js_sys::ArrayBuffer,
         request: SegRequest,
         load_ms: u64,
         ttfb_ms: u64,
@@ -1415,13 +1418,19 @@ async fn within<F: std::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
     }
 }
 
+/// The response body as a browser `ArrayBuffer`.
+async fn body_buffer(resp: web_sys::Response) -> Result<js_sys::ArrayBuffer, JsValue> {
+    let body = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
+    body.dyn_into::<js_sys::ArrayBuffer>()
+}
+
 /// Fetches one segment against `deadlines` (FR-005): the headers must arrive
 /// within the first-byte deadline, the body within the load deadline after.
 async fn fetch_segment(
     uri: &str,
     signal: &web_sys::AbortSignal,
     deadlines: Deadlines,
-) -> Result<(Vec<u8>, u64, u64), FetchFailure> {
+) -> Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure> {
     let sent_at = now_ms();
     let mut watch = Watch::new(deadlines, now_ms_u64());
     let send = Request::get(uri).abort_signal(Some(signal)).send();
@@ -1442,14 +1451,17 @@ async fn fetch_segment(
             reason: resp.status_text(),
         });
     }
-    let bytes = within(resp.binary(), watch.remaining_ms(now_ms_u64()))
-        .await
-        .ok_or_else(|| FetchFailure::timeout(&watch))?
-        .map_err(|e| FetchFailure {
-            cause: Cause::Network,
-            deadline_ms: None,
-            reason: e.to_string(),
-        })?;
+    let bytes = within(
+        body_buffer(web_sys::Response::from(resp)),
+        watch.remaining_ms(now_ms_u64()),
+    )
+    .await
+    .ok_or_else(|| FetchFailure::timeout(&watch))?
+    .map_err(|e| FetchFailure {
+        cause: Cause::Network,
+        deadline_ms: None,
+        reason: js_message(&e),
+    })?;
     let done_at = now_ms();
     let start = if headers_at > 0.0 {
         headers_at
@@ -1648,7 +1660,7 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
                     media_ms,
                 } => RunningOp::Append {
                     request: *request,
-                    bytes: bytes.len() as u64,
+                    bytes: u64::from(bytes.byte_length()),
                     load_ms: *load_ms,
                     ttfb_ms: *ttfb_ms,
                     media_ms: *media_ms,
@@ -1666,8 +1678,8 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     };
 
     match op {
-        Op::Append { mut bytes, .. } => {
-            if let Err(err) = sb.append_buffer_with_u8_array(&mut bytes) {
+        Op::Append { bytes, .. } => {
+            if let Err(err) = sb.append_buffer_with_array_buffer(&bytes) {
                 on_append_error(session, track, &err);
             }
         }
