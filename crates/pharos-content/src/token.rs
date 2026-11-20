@@ -30,9 +30,9 @@ fn hold() -> MutexGuard<'static, ()> {
 
 /// The in-process sign-out fence of one token file: set when a session
 /// ended and its token could be neither removed nor marked revoked, so
-/// nothing in this process resumes from it. It names that token by
-/// fingerprint; with no token to name it refuses every token until a store
-/// installs one. Kept per path, so one file's sign-out refuses nothing at
+/// nothing in this process resumes from it. It names those tokens by
+/// fingerprint, as a set; with no token to name it refuses every token
+/// until a store installs one. Kept per path, so one file's sign-out refuses nothing at
 /// another. Set and replaced only under the file's lock, by the operation
 /// that decided it ([`end_session`], [`store`]), and honored by [`read`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,8 +40,9 @@ pub enum Fence {
     /// No sign-out left a token behind.
     #[default]
     Open,
-    /// The token with this fingerprint is refused.
-    Token(String),
+    /// The tokens with these fingerprints are refused (never empty: no
+    /// name is [`Fence::Open`]).
+    Tokens(std::collections::BTreeSet<String>),
     /// The token left behind could not be named: every token is refused.
     Every,
     /// A store installed the token with this fingerprint over an unnamed
@@ -51,22 +52,27 @@ pub enum Fence {
 }
 
 impl Fence {
+    /// The fence refusing the one token fingerprinted `fp`.
+    pub fn token(fp: &str) -> Self {
+        Self::Tokens(std::iter::once(fp.to_owned()).collect())
+    }
+
     /// The fence for a session end that left the token fingerprinted
     /// `target` on file (`None`: it could not be named).
     pub fn for_target(target: Option<&str>) -> Self {
-        target.map_or(Self::Every, |fp| Self::Token(fp.to_owned()))
+        target.map_or(Self::Every, Self::token)
     }
 
     /// The fence for a sign-out that left `held` on file.
     pub fn for_token(held: Option<&str>) -> Self {
-        held.map_or(Self::Every, |t| Self::Token(fingerprint(t)))
+        held.map_or(Self::Every, |t| Self::token(&fingerprint(t)))
     }
 
     /// Whether `token` is refused.
     pub fn refuses(&self, token: &str) -> bool {
         match self {
             Self::Open => false,
-            Self::Token(fp) => fingerprint(token) == *fp,
+            Self::Tokens(fps) => fps.contains(&fingerprint(token)),
             Self::Every => true,
             Self::AllBut(fp) => fingerprint(token) != *fp,
         }
@@ -76,7 +82,7 @@ impl Fence {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Open => "open",
-            Self::Token(_) => "token",
+            Self::Tokens(_) => "token",
             Self::Every => "every",
             Self::AllBut(_) => "all_but",
         }
@@ -84,8 +90,8 @@ impl Fence {
 
     /// The fence once a store installed the token fingerprinted `stored`
     /// (over the one fingerprinted `replaced`, when that could be read).
-    /// A fence naming another token stays: it refuses only that token. One
-    /// naming the stored token, or none, opens. An unnamed one allows the
+    /// The fence's names lose the stored token's and keep the others: they
+    /// refuse only those tokens. One left with no name, or none, opens. An unnamed one allows the
     /// stored token and nothing else: the write proves what is on disk
     /// now, not which token an older live link still holds, so every
     /// other token, the replaced one included, stays refused.
@@ -93,23 +99,32 @@ impl Fence {
         let _ = replaced;
         match self {
             Self::Open => Self::Open,
-            Self::Token(fp) if fp != stored => self.clone(),
-            Self::Token(_) => Self::Open,
+            Self::Tokens(fps) => {
+                let left: std::collections::BTreeSet<String> =
+                    fps.iter().filter(|fp| *fp != stored).cloned().collect();
+                if left.is_empty() {
+                    Self::Open
+                } else {
+                    Self::Tokens(left)
+                }
+            }
             Self::Every | Self::AllBut(_) => Self::AllBut(stored.to_owned()),
         }
     }
 
     /// A fence that refuses whatever `self` or `other` refuses: a sign-out
-    /// that fails never lifts an earlier refusal. Two named tokens, or a
-    /// name the allowed token of an [`Fence::AllBut`], become
-    /// [`Fence::Every`].
+    /// that fails never lifts an earlier refusal. [`Fence::Every`] stays
+    /// every; named tokens join into one set; a name that is the allowed
+    /// token of an [`Fence::AllBut`], or two different allowed tokens,
+    /// become [`Fence::Every`].
     pub fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Open, x) | (x, Self::Open) => x.clone(),
             (a, b) if a == b => a.clone(),
             (Self::Every, _) | (_, Self::Every) => Self::Every,
-            (Self::Token(t), Self::AllBut(a)) | (Self::AllBut(a), Self::Token(t)) => {
-                if t == a {
+            (Self::Tokens(a), Self::Tokens(b)) => Self::Tokens(a.union(b).cloned().collect()),
+            (Self::Tokens(t), Self::AllBut(a)) | (Self::AllBut(a), Self::Tokens(t)) => {
+                if t.contains(a) {
                     Self::Every
                 } else {
                     Self::AllBut(a.clone())
@@ -497,7 +512,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         Err(why) => {
             // Installed, but a crash may undo or keep the rename: the new token
             // is refused here, and by a marker of its own after a restart.
-            set_fence_held(path, Fence::Token(new.clone()), "store_not_durable");
+            set_fence_held(path, Fence::token(&new), "store_not_durable");
             let marked = write_marker(path, None, &new);
             log::warn!(
                 "token store verdict=refused reason=folder_not_synced marker={} error={why}",
@@ -1611,7 +1626,7 @@ pub(crate) mod tests {
             "{ended:?}"
         );
         assert_eq!(held.as_deref(), Some("tokA"));
-        assert_eq!(fence(&p), Fence::Token(fingerprint("tokB")));
+        assert_eq!(fence(&p), Fence::token(&fingerprint("tokB")));
         assert_eq!(load(&p).unwrap(), None, "the targeted token was read");
     }
 
@@ -1976,6 +1991,28 @@ pub(crate) mod tests {
         store(&p, "tokC").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
         set_fence(&p, Fence::Open, "test");
+    }
+
+    /// Named fences join into one set: each name stays refused, and a
+    /// store lifts only its own.
+    #[test]
+    fn named_fences_join_into_one_set() {
+        let (a, b) = (fingerprint("tokA"), fingerprint("tokB"));
+        let both = Fence::token(&a).union(&Fence::token(&b));
+        assert!(both.refuses("tokA") && both.refuses("tokB"), "{both:?}");
+        assert!(!both.refuses("tokC"), "{both:?}");
+        assert_eq!(both.after_store(&a, None), Fence::token(&b));
+        assert_eq!(Fence::token(&a).after_store(&a, None), Fence::Open);
+        assert_eq!(Fence::Every.union(&both), Fence::Every);
+        assert_eq!(
+            both.union(&Fence::AllBut(a.clone())),
+            Fence::Every,
+            "the allowed token is named"
+        );
+        assert_eq!(
+            Fence::token(&b).union(&Fence::AllBut(a.clone())),
+            Fence::AllBut(a)
+        );
     }
 
     /// CR 4640624099: the token file holds the token alone, as the base
