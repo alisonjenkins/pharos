@@ -836,9 +836,22 @@ impl Gate {
                 return Err(Fail::Cancelled);
             }
             let pos = std::fs::metadata(&part).map_or(0, |m| m.len());
+            // A part resumes only under a strong ETag (`If-Range` takes no
+            // weak one). With none, a bare `Range` could append another
+            // version's suffix: the whole file is asked for instead, and a
+            // whole body replaces the part from byte zero under the
+            // replacement's reservation rules.
+            let validator = st.etag.as_deref().filter(|e| !e.starts_with("W/"));
+            let resume = pos > 0 && validator.is_some();
+            if pos > 0 && !resume {
+                log::info!(
+                    "cache download id={id} bytes={pos} outcome=restart reason=no_validator etag={}",
+                    if st.etag.is_some() { "weak" } else { "none" }
+                );
+            }
             let req = Request {
-                range_from: (pos > 0).then_some(pos),
-                if_range: st.etag.as_deref().filter(|_| pos > 0),
+                range_from: resume.then_some(pos),
+                if_range: validator.filter(|_| resume),
             };
             let mut resp = http::get(
                 &parsed,
@@ -856,7 +869,7 @@ impl Gate {
             let mut validator = st.etag.clone();
             let total = match resp.status {
                 200 => {
-                    if pos > 0 {
+                    if resume {
                         log::info!("cache download id={id} server sent the whole file for a range request; restarting at 0");
                     }
                     validator = resp.etag.clone();
@@ -2194,6 +2207,50 @@ mod tests {
             "the retry resumed the old bytes with the new version's tag: {seen:?}"
         );
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
+    }
+
+    /// CR 4639706368: a part fetched with no ETag has no validator to
+    /// resume it under. The retry asks for the whole file, so a new version
+    /// served meanwhile replaces the part from byte zero, never a bare
+    /// `Range` stitching its suffix onto the old bytes.
+    #[test]
+    fn a_part_with_no_validator_restarts_from_zero_when_the_file_changed() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .no_etag()
+            .drop_first_after(300);
+        let r = rig(
+            "no-validator",
+            script,
+            1 << 20,
+            &["t"],
+            Tuning {
+                // Only a network change ends a wait in this test.
+                backoff_min: Duration::from_secs(30),
+                backoff_max: Duration::from_secs(30),
+                ..fast()
+            },
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        let part = r.cache.part_path("track/1");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 300) {
+            assert!(Instant::now() < until, "timed out waiting for the part");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A new version of the same length, still with no ETag.
+        r.srv.edit(|s| s.file("/audio/1", body(1000, 2)));
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(20)));
+        let seen = r.srv.seen();
+        let retry = seen.get(1).unwrap_or_else(|| panic!("no retry: {seen:?}"));
+        assert_eq!(retry.range, None, "resumed with a bare Range: {seen:?}");
+        assert_eq!(
+            read(&r.cache, "track/1"),
+            body(1000, 2),
+            "versions were stitched"
+        );
     }
 
     /// A body of known length whose last chunk reaches the check window is
