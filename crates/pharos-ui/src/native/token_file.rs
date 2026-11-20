@@ -89,6 +89,14 @@ pub fn set_fence(path: &Path, next: SignOutFence, reason: &str) {
     pharos_content::token::set_fence(path, next, reason);
 }
 
+/// Fences every token at every path in this process
+/// (`pharos_content::token::fence_every_file`): for a sign-out that could
+/// not find its token file. The next store replaces it.
+pub fn fence_every_file(reason: &str) {
+    watch_stores();
+    pharos_content::token::fence_every_file(reason);
+}
+
 /// Set by every token store: the token a cache holds may be another now.
 static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

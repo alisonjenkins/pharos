@@ -264,16 +264,29 @@ pub fn store_token(token: &str) -> Result<(), String> {
 /// could not name one): no store lands between it and its fence, and no
 /// earlier read names the wrong token. A `NotSaved` is never reported as
 /// forgotten: the media service stays signed out instead.
+///
+/// Every exit publishes a fence first, so no early return can skip it:
+/// every token at the token file's path, or at every path when the path
+/// cannot be found. The operation then narrows it to the token it left, or
+/// a store replaces it. A service that connects later reads it too.
 pub fn forget_token() -> token_file::SignedOut {
+    let path = token_path();
+    match &path {
+        Ok(path) => {
+            token_file::set_fence(path, token_file::SignOutFence::Every, "sign_out_started")
+        }
+        Err(_) => token_file::fence_every_file("token_path_unknown"),
+    }
     let verdict = {
         let mut cached = token_lock();
         *cached = Some(None);
-        let path = match token_path() {
-            Ok(path) => path,
-            Err(e) => return token_file::SignedOut::NotSaved(e),
-        };
-        drop_legacy_user(&path);
-        token_file::sign_out(&path)
+        match path {
+            Ok(path) => {
+                drop_legacy_user(&path);
+                token_file::sign_out(&path)
+            }
+            Err(e) => token_file::SignedOut::NotSaved(e),
+        }
     };
     match &verdict {
         token_file::SignedOut::NotSaved(_) => note_credentials_kept(),
