@@ -174,9 +174,33 @@ pub struct FragmentLoad {
     pub media_ms: u64,
 }
 
-/// Told of each video fragment downloaded; engines that cannot see
-/// downloads (the browser's own player) never call it.
-pub type OnFragment = std::rc::Rc<dyn Fn(FragmentLoad)>;
+/// What an engine saw of one video fragment's download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentEvent {
+    Loaded(FragmentLoad),
+    /// The fetch was answered with an error. The wait that follows says
+    /// nothing of the link's speed (B1489).
+    Failed,
+    /// The fetch got no answer in time: the link is too slow for the stream,
+    /// so the waits that follow are its, even after an earlier failure.
+    TimedOut,
+}
+
+/// Told of each video fragment downloaded, or that failed to; engines that
+/// cannot see downloads (the browser's own player) never call it.
+pub type OnFragment = std::rc::Rc<dyn Fn(FragmentEvent)>;
+
+/// What an hls.js error says of a video fragment's fetch, if anything. A
+/// timeout (`fragLoadTimeOut`) is not a failure: it is the link too slow for
+/// the stream, and the stalls it leaves must still step auto quality down,
+/// including after an earlier failure.
+pub fn fragment_load_event(kind: &str, details: &str) -> Option<FragmentEvent> {
+    match (kind, details) {
+        ("networkError", "fragLoadError") => Some(FragmentEvent::Failed),
+        ("networkError", "fragLoadTimeOut") => Some(FragmentEvent::TimedOut),
+        _ => None,
+    }
+}
 
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
