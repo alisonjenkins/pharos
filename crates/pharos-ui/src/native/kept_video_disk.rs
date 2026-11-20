@@ -32,8 +32,9 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::kept_video::{
     check_not_kept, content_type_for, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, new_record, progress_due, rebase_playlist, request_key, retry_delay_secs, take,
-    url_path, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, StoredFile, VideoStore,
+    localize_playlist, missing_files, new_record, progress_due, request_key, retry_delay_secs,
+    take, url_path, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, Localized,
+    StoredFile, VideoStore,
 };
 use super::platform;
 
@@ -114,6 +115,12 @@ pub trait Fetcher: Send + Sync {
     /// file is promoted: it takes none of the store's locks (the token
     /// file's own lock is the innermost).
     fn check_owner(&self, owner: &str) -> Result<(), String>;
+    /// The server's address with its base path, which keys are under: a
+    /// playlist's references on it are stored as keys. The default is the
+    /// planning origin with no base path.
+    fn server_base(&self) -> String {
+        PLAN_ORIGIN.to_owned()
+    }
 }
 
 /// How much video may be kept and how much room there is.
@@ -2117,6 +2124,22 @@ async fn fetch_file(
                 );
                 return Err(Stop::Refused(reason));
             }
+            FetchOnce::NotLocal(reference) => {
+                let reason = format!(
+                    "{} names {}, which the phone cannot serve offline (reason=reference_not_local)",
+                    url_path(key),
+                    url_path(&reference)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=reference_not_local url_path={} reference_path={}",
+                        url_path(key),
+                        url_path(&reference)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
             FetchOnce::OverReservation(why) => {
                 let reason = format!(
                     "{} is larger than its download's reservation, which could not grow: {why}",
@@ -2167,6 +2190,8 @@ enum FetchOnce {
     /// The credentials are not the run's owner's, and why: nothing was
     /// sent, or a fetched file was not promoted.
     NotOwner(String),
+    /// A playlist names this file, which no stored key can serve offline.
+    NotLocal(String),
 }
 
 /// Waits for a chunk's write to complete. In a test the write can be held
@@ -2336,70 +2361,97 @@ async fn fetch_once(
             },
         )
     };
-    // A playlist answered from another key (a same-origin redirect) is held
-    // whole and stored with its references rebased onto that key
-    // (CR 4637279590): what is written, reserved and capped is the
-    // rewritten text. The raw body is held to the same cap, so memory stays
-    // bounded.
-    let mut rebase = limit.and(body.final_key().filter(|f| f != key));
+    // A playlist is held whole and stored with every reference it makes
+    // naming the key the offline proxy serves it under (`localize_playlist`):
+    // relative ones rebased onto the key a same-origin redirect answered it
+    // from (CR 4637279590), and absolute ones on the server cut to their
+    // keys under its base path. What is written, reserved and capped is the
+    // stored text. The raw body is held to the same cap, so memory stays
+    // bounded. A playlist naming a file no key can serve is refused: the
+    // copy would not play offline.
+    let mut localize: Option<Option<String>> = limit.map(|_| body.final_key().filter(|f| f != key));
     let mut held: Vec<u8> = Vec::new();
     let mut ended = false;
     let mut len = 0u64;
-    loop {
+    'chunks: loop {
         if ended {
             break;
         }
-        let next = match body.next_chunk().await {
-            Ok(Some(chunk)) if rebase.is_some() => {
-                let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
-                if (held.len() as u64).saturating_add(chunk.len() as u64) > cap {
-                    drop(file);
-                    staged.abandon("too_large");
-                    return Err(FetchOnce::TooLarge(cap));
-                }
-                held.extend_from_slice(&chunk);
-                continue;
-            }
-            Ok(Some(chunk)) => Ok(Some(chunk)),
-            Ok(None) => match rebase.take() {
-                Some(final_key) => {
-                    ended = true;
-                    let raw = std::mem::take(&mut held);
+        let next = 'body: {
+            match body.next_chunk().await {
+                Ok(Some(chunk)) if localize.is_some() => {
                     let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
-                    let Some(text) = rebase_playlist(
-                        &String::from_utf8_lossy(&raw),
-                        &final_key,
-                        usize::try_from(cap).unwrap_or(usize::MAX),
-                    ) else {
-                        emit(
-                            true,
-                            format!(
-                                "pharos: video keep playlist verdict=too_large item={item} url_path={} final_path={} from_len={} cap={cap}",
-                                url_path(key),
-                                url_path(&final_key),
-                                raw.len()
-                            ),
-                        );
+                    if (held.len() as u64).saturating_add(chunk.len() as u64) > cap {
                         drop(file);
                         staged.abandon("too_large");
                         return Err(FetchOnce::TooLarge(cap));
-                    };
-                    emit(
-                        false,
-                        format!(
-                            "pharos: video keep playlist verdict=rebased item={item} url_path={} final_path={} from_len={} to_len={} cap={}",
-                            url_path(key),
-                            url_path(&final_key),
-                            raw.len(),
-                            text.len(),
-                            limit.unwrap_or_default()
-                        ),
-                    );
-                    Ok(Some(text.into_bytes()))
+                    }
+                    held.extend_from_slice(&chunk);
+                    continue 'chunks;
                 }
-                None => Ok(None),
-            },
-            Err(e) => Err(e),
+                Ok(Some(chunk)) => Ok(Some(chunk)),
+                Ok(None) => match localize.take() {
+                    Some(final_key) => {
+                        ended = true;
+                        let raw = std::mem::take(&mut held);
+                        let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
+                        let moved = final_key.as_deref().map_or("-", url_path).to_owned();
+                        let server = inner.env.fetcher.server_base();
+                        // Not text: stored as sent, and planning refuses it.
+                        let Ok(text) = std::str::from_utf8(&raw) else {
+                            break 'body Ok(Some(raw));
+                        };
+                        match localize_playlist(
+                            text,
+                            final_key.as_deref(),
+                            &server,
+                            usize::try_from(cap).unwrap_or(usize::MAX),
+                        ) {
+                            Localized::Unchanged => Ok(Some(raw)),
+                            Localized::Rewritten(text) => {
+                                emit(
+                                false,
+                                format!(
+                                    "pharos: video keep playlist verdict=rebased item={item} url_path={} final_path={moved} from_len={} to_len={} cap={cap}",
+                                    url_path(key),
+                                    raw.len(),
+                                    text.len()
+                                ),
+                            );
+                                Ok(Some(text.into_bytes()))
+                            }
+                            Localized::TooLarge => {
+                                emit(
+                                true,
+                                format!(
+                                    "pharos: video keep playlist verdict=too_large item={item} url_path={} final_path={moved} from_len={} cap={cap}",
+                                    url_path(key),
+                                    raw.len()
+                                ),
+                            );
+                                drop(file);
+                                staged.abandon("too_large");
+                                return Err(FetchOnce::TooLarge(cap));
+                            }
+                            Localized::NotLocal(reference) => {
+                                emit(
+                                true,
+                                format!(
+                                    "pharos: video keep playlist verdict=not_local item={item} url_path={} final_path={moved} reference_path={}",
+                                    url_path(key),
+                                    url_path(&reference)
+                                ),
+                            );
+                                drop(file);
+                                staged.abandon("not_local");
+                                return Err(FetchOnce::NotLocal(reference));
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                },
+                Err(e) => Err(e),
+            }
         };
         match next {
             Ok(Some(chunk)) => {
@@ -5782,6 +5834,9 @@ pub(crate) mod tests {
         /// key -> the key the server redirects it to (followed, as the
         /// phone's client follows a same-origin redirect).
         redirects: Mutex<HashMap<String, String>>,
+        /// The server's address with its base path; unset, the planning
+        /// origin with none.
+        base: Mutex<Option<String>>,
     }
 
     impl FakeServer {
@@ -5956,6 +6011,14 @@ pub(crate) mod tests {
     impl Fetcher for FakeServer {
         fn check_owner(&self, owner: &str) -> Result<(), String> {
             self.token(owner).map(|_| ())
+        }
+
+        fn server_base(&self) -> String {
+            self.base
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| PLAN_ORIGIN.to_owned())
         }
 
         fn open<'a>(
@@ -12916,6 +12979,94 @@ pub(crate) mod tests {
         crate::native::offline_video::forget_user();
     }
 
+    /// Outside-diff items kept_video_disk.rs:3191 and :2344: a server
+    /// mounted under `/jf` names its files by absolute path and absolute
+    /// URL, base path included. Each is asked for by its key (the fetcher
+    /// puts the base path back once, never twice), and the stored playlists
+    /// name those keys, so the copy plays offline.
+    #[tokio::test]
+    async fn a_server_under_a_base_path_downloads_and_plays_offline() {
+        let rig = Rig::new("base-path");
+        *rig.server.base.lock().unwrap() = Some("https://h/jf".to_owned());
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            f.insert(
+                MASTER_KEY.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\n/jf/videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                MEDIA_KEY.into(),
+                b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"https://h/jf/videos/1/h264cmaf/init.mp4?PlaySessionId=p\"\n#EXTINF:6.0,\nhttps://h/jf/videos/1/h264cmaf/0.m4s?PlaySessionId=p\n#EXTINF:6.0,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n".to_vec(),
+            );
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(
+            kept.state,
+            KeptState::Ready,
+            "{kept:?} asked {:?}",
+            rig.server.asked()
+        );
+        assert!(
+            rig.server.asked().iter().all(|k| !k.starts_with("/jf")),
+            "a key kept the base path: {:?}",
+            rig.server.asked()
+        );
+        rig.server.files.lock().unwrap().clear();
+        let asked = rig.server.asked().len();
+        crate::native::offline_video::remember_user("u1");
+        let store: Arc<dyn VideoStore> = store;
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let first_ref = |text: &str| {
+            text.lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .expect("the playlist names no file")
+        };
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url)
+                .expect("the stored master was not given a local source");
+        let master = local(&source).expect("the master was not served locally");
+        let playlist = resolve_against(&source, &first_ref(&master));
+        assert_eq!(playlist, MEDIA_KEY);
+        let media = local(&playlist).expect("the playlist was not served locally");
+        let segment = resolve_against(&playlist, &first_ref(&media));
+        assert_eq!(segment, SEG0);
+        assert_eq!(local(&segment).map(String::into_bytes), Some(vec![2; 100]));
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// A playlist that names a file on another origin cannot play offline:
+    /// the download is refused with the reason, and is never Ready.
+    #[tokio::test]
+    async fn a_playlist_naming_another_origin_is_not_kept() {
+        let rig = Rig::new("not-local");
+        rig.server.files.lock().unwrap().insert(
+            MEDIA_KEY.into(),
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttps://cdn.example/0.m4s\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("{kept:?}");
+        };
+        assert!(reason.contains("reference_not_local"), "{reason}");
+        assert!(!lines("pharos: video keep refused item=1 reason=reference_not_local").is_empty());
+    }
+
     /// The playlist cap is on what is stored: a redirected master under
     /// the cap as sent, over it once its references are rebased, is refused
     /// as too large and nothing of it is kept.
@@ -12927,9 +13078,12 @@ pub(crate) mod tests {
         let lines_sent = usize::try_from(PLAYLIST_MAX_BYTES / 4).unwrap();
         let raw = "x\n".repeat(lines_sent);
         assert!(raw.len() as u64 <= PLAYLIST_MAX_BYTES);
-        assert!(
-            rebase_playlist(&raw, moved, usize::MAX).unwrap().len() as u64 > PLAYLIST_MAX_BYTES
-        );
+        let Localized::Rewritten(rebased) =
+            localize_playlist(&raw, Some(moved), PLAN_ORIGIN, usize::MAX)
+        else {
+            panic!("not rewritten");
+        };
+        assert!(rebased.len() as u64 > PLAYLIST_MAX_BYTES);
         rig.server
             .files
             .lock()

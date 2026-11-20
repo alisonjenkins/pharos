@@ -510,50 +510,138 @@ pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
     (rest.starts_with('/') || rest.starts_with('?')).then(|| request_key(rest))
 }
 
-/// A playlist answered from `final_key` (after a redirect), with each
-/// reference it makes rewritten to the absolute path (and its own query)
-/// it resolves to against `final_key`, so the stored copy names its files
-/// wherever it is read from: a URI line, and every `URI="..."` attribute
-/// of a tag. A reference that is already absolute, or names a scheme, is
-/// left as it is; so are the line endings and every other line. `None`
-/// once the rewrite would pass `limit` bytes.
-pub fn rebase_playlist(text: &str, final_key: &str, limit: usize) -> Option<String> {
+/// What [`localize_playlist`] made of a playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Localized {
+    /// Every reference already names what the proxy serves: stored as sent.
+    Unchanged,
+    /// Rewritten so every reference names the key it is stored under.
+    Rewritten(String),
+    /// The rewrite would pass the limit.
+    TooLarge,
+    /// This reference names a file the phone cannot serve offline: another
+    /// origin, or a path outside the server's base path.
+    NotLocal(String),
+}
+
+/// The scheme and authority of `url`, lower-cased, when it names one.
+fn origin_of(url: &str) -> Option<String> {
+    let rest = after_scheme(url)?;
+    let scheme = &url[..url.len() - rest.len() - 3];
+    let authority = rest.find(['/', '?', '#']).map_or(rest, |i| &rest[..i]);
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
+}
+
+/// The key the reference `r` in a playlist names, as the offline proxy
+/// serves it. `server` is the server's address with its base path;
+/// `final_key` is the key the playlist was answered from when a redirect
+/// moved it (relative references resolve against it), `None` when it was
+/// answered from the key it is stored under (they resolve as they are).
+/// Err when no stored key can answer it.
+fn localize_ref<'a>(
+    r: &'a str,
+    final_key: Option<&str>,
+    server: &str,
+) -> Result<std::borrow::Cow<'a, str>, ()> {
+    use std::borrow::Cow;
+    if let Some(scheme_relative) = r.strip_prefix("//") {
+        let scheme = origin_of(server).and_then(|o| o.split_once("://").map(|(s, _)| s.to_owned()));
+        let full = format!("{}://{scheme_relative}", scheme.ok_or(())?);
+        return localize_ref(&full, final_key, server).map(|k| Cow::Owned(k.into_owned()));
+    }
+    if after_scheme(r).is_some() {
+        if origin_of(r) != origin_of(server) {
+            return Err(());
+        }
+        return key_under_base(server, r).map(Cow::Owned).ok_or(());
+    }
+    if r.starts_with('/') {
+        let base_path = url_path(server).trim_end_matches('/');
+        if base_path.is_empty() {
+            return Ok(Cow::Borrowed(r));
+        }
+        let rest = r.strip_prefix(base_path).ok_or(())?;
+        return if rest.starts_with('/') || rest.starts_with('?') {
+            Ok(Cow::Owned(request_key(rest)))
+        } else {
+            Err(())
+        };
+    }
+    match final_key {
+        Some(base) => Ok(Cow::Owned(pharos_hls::uri::resolve(base, r))),
+        None => Ok(Cow::Borrowed(r)),
+    }
+}
+
+/// A playlist with each reference it makes (a URI line, and every
+/// `URI="..."` attribute of a tag) rewritten to the key the offline proxy
+/// serves it under ([`localize_ref`]), so the stored copy names exactly
+/// the files that are stored, wherever it is read from. Line endings and
+/// every other line stay as they are. The limit holds while the rewrite is
+/// built: each piece is checked before it is appended.
+pub fn localize_playlist(
+    text: &str,
+    final_key: Option<&str>,
+    server: &str,
+    limit: usize,
+) -> Localized {
     let mut out = String::with_capacity(text.len().min(limit));
-    // Each piece is checked against `limit` before it is appended: a
-    // rewrite past it stops there, never building the whole of it.
-    let push = |out: &mut String, piece: &str| -> Option<()> {
-        (out.len().saturating_add(piece.len()) <= limit).then(|| out.push_str(piece))
+    let mut changed = false;
+    let push = |out: &mut String, piece: &str| -> Result<(), Localized> {
+        if out.len().saturating_add(piece.len()) <= limit {
+            out.push_str(piece);
+            Ok(())
+        } else {
+            Err(Localized::TooLarge)
+        }
     };
-    for line in text.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\r', '\n']);
-        let ending = &line[body.len()..];
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            push(&mut out, line)?;
-        } else if trimmed.starts_with('#') {
-            let mut rest = body;
-            while let Some(at) = rest.find("URI=\"") {
-                let (head, tail) = rest.split_at(at + 5);
-                push(&mut out, head)?;
-                match tail.find('"') {
-                    Some(end) => {
-                        push(&mut out, &pharos_hls::uri::resolve(final_key, &tail[..end]))?;
-                        rest = &tail[end..];
-                    }
-                    None => {
-                        rest = tail;
-                        break;
+    let mut reference = |out: &mut String, r: &str| -> Result<(), Localized> {
+        let key =
+            localize_ref(r, final_key, server).map_err(|()| Localized::NotLocal(r.to_owned()))?;
+        changed |= key != r;
+        push(out, &key)
+    };
+    let mut go = || -> Result<(), Localized> {
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                push(&mut out, line)?;
+            } else if trimmed.starts_with('#') {
+                let mut rest = body;
+                while let Some(at) = rest.find("URI=\"") {
+                    let (head, tail) = rest.split_at(at + 5);
+                    push(&mut out, head)?;
+                    match tail.find('"') {
+                        Some(end) => {
+                            reference(&mut out, &tail[..end])?;
+                            rest = &tail[end..];
+                        }
+                        None => {
+                            rest = tail;
+                            break;
+                        }
                     }
                 }
+                push(&mut out, rest)?;
+                push(&mut out, ending)?;
+            } else {
+                reference(&mut out, trimmed)?;
+                push(&mut out, ending)?;
             }
-            push(&mut out, rest)?;
-            push(&mut out, ending)?;
-        } else {
-            push(&mut out, &pharos_hls::uri::resolve(final_key, trimmed))?;
-            push(&mut out, ending)?;
         }
+        Ok(())
+    };
+    match go() {
+        Err(refused) => refused,
+        Ok(()) if changed => Localized::Rewritten(out),
+        Ok(()) => Localized::Unchanged,
     }
-    Some(out)
 }
 
 /// Whether a failed `cache.put` is the body transfer breaking (the browser
@@ -737,9 +825,19 @@ mod tests {
     fn a_rebase_stops_at_its_limit() {
         let key = "/videos/7/hls/main.m3u8?s=1";
         let text = "#EXTINF:6.0,\n0.m4s?s=1\n";
-        let whole = rebase_playlist(text, key, usize::MAX).unwrap();
-        assert_eq!(rebase_playlist(text, key, whole.len()), Some(whole.clone()));
-        assert_eq!(rebase_playlist(text, key, whole.len() - 1), None);
+        let server = "http://s:8096";
+        let Localized::Rewritten(whole) = localize_playlist(text, Some(key), server, usize::MAX)
+        else {
+            panic!("not rewritten");
+        };
+        assert_eq!(
+            localize_playlist(text, Some(key), server, whole.len()),
+            Localized::Rewritten(whole.clone())
+        );
+        assert_eq!(
+            localize_playlist(text, Some(key), server, whole.len() - 1),
+            Localized::TooLarge
+        );
     }
 
     #[test]
@@ -768,27 +866,79 @@ mod tests {
             main.m3u8?s=1\r\n\
             \r\n\
             /already/absolute.m3u8?s=1\r\n\
-            https://h/elsewhere.m3u8\r\n";
+            http://S:8096/videos/7/same.m3u8\r\n";
         assert_eq!(
-            rebase_playlist(master, "/videos/7/hls/master.m3u8?s=1", usize::MAX).unwrap(),
+            localize_playlist(
+                master,
+                Some("/videos/7/hls/master.m3u8?s=1"),
+                "http://s:8096",
+                usize::MAX
+            ),
+            Localized::Rewritten(
             "#EXTM3U\r\n\
             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"/videos/7/audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
             #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
             /videos/7/hls/main.m3u8?s=1\r\n\
             \r\n\
             /already/absolute.m3u8?s=1\r\n\
-            https://h/elsewhere.m3u8\r\n"
+            /videos/7/same.m3u8\r\n"
+                .to_owned()
+            )
         );
         // A media playlist's init and segments, no final newline.
         assert_eq!(
-            rebase_playlist(
+            localize_playlist(
                 "#EXT-X-MAP:URI=\"init.mp4?s=1\"\n#EXTINF:6.0,\n./0.m4s?s=1",
-                "/videos/7/hls/main.m3u8?s=1",
+                Some("/videos/7/hls/main.m3u8?s=1"),
+                "http://s:8096",
                 usize::MAX
+            ),
+            Localized::Rewritten(
+                "#EXT-X-MAP:URI=\"/videos/7/hls/init.mp4?s=1\"\n#EXTINF:6.0,\n/videos/7/hls/0.m4s?s=1"
+                    .to_owned()
             )
-            .unwrap(),
-            "#EXT-X-MAP:URI=\"/videos/7/hls/init.mp4?s=1\"\n#EXTINF:6.0,\n/videos/7/hls/0.m4s?s=1"
         );
+    }
+
+    /// Outside-diff items kept_video_disk.rs:3191 and :2344: a server under
+    /// `/jf` names its files by absolute path or absolute URL with the base
+    /// path in them. Stored, they name the keys (base path off), whether
+    /// or not a redirect moved the playlist. Relative references stay. A
+    /// file on another origin, or outside the base path, cannot be served
+    /// offline.
+    #[test]
+    fn a_playlist_names_its_files_by_key_under_the_base_path() {
+        let server = "https://s.example/jf";
+        let media = "#EXT-X-MAP:URI=\"/jf/videos/1/init.mp4?s=1\"\n\
+            #EXTINF:6.0,\nhttps://s.example/jf/videos/1/0.m4s?s=1\n\
+            #EXTINF:6.0,\n//s.example/jf/videos/1/1.m4s?s=1\n\
+            #EXTINF:6.0,\n2.m4s?s=1\n";
+        assert_eq!(
+            localize_playlist(media, None, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXT-X-MAP:URI=\"/videos/1/init.mp4?s=1\"\n\
+                #EXTINF:6.0,\n/videos/1/0.m4s?s=1\n\
+                #EXTINF:6.0,\n/videos/1/1.m4s?s=1\n\
+                #EXTINF:6.0,\n2.m4s?s=1\n"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            localize_playlist("#EXTINF:6.0,\n0.m4s\n", None, server, usize::MAX),
+            Localized::Unchanged
+        );
+        for elsewhere in ["https://cdn.example/jf/0.m4s", "/other/0.m4s", "/jfx/0.m4s"] {
+            assert_eq!(
+                localize_playlist(
+                    &format!("#EXTINF:6.0,\n{elsewhere}\n"),
+                    None,
+                    server,
+                    usize::MAX
+                ),
+                Localized::NotLocal(elsewhere.to_owned()),
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]

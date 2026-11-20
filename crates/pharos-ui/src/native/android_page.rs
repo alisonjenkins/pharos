@@ -3353,7 +3353,7 @@ fn token_for_run(owner: &str) -> Result<String, String> {
 /// sends the device token): a cross-host redirect or an https-to-http
 /// downgrade stops and is logged. A playlist followed to another key is
 /// stored with its references rebased onto it ([`key_under_base`],
-/// [`rebase_playlist`](super::kept_video::rebase_playlist)). Not
+/// [`localize_playlist`](super::kept_video::localize_playlist)). Not
 /// `https_only`: a plain-http server on the LAN must keep working. [`http`] is the proxy's and is unchanged.
 fn download_http() -> &'static Result<reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
@@ -3429,6 +3429,10 @@ impl Body for ServerBody {
 impl Fetcher for ServerFetcher {
     fn check_owner(&self, owner: &str) -> Result<(), String> {
         token_for_run(owner).map(|_| ())
+    }
+
+    fn server_base(&self) -> String {
+        server()
     }
 
     fn open<'a>(
