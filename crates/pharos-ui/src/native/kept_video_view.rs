@@ -8,9 +8,11 @@ use std::cell::RefCell;
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
+use pharos_client::api::{Detail, ItemRef};
 
-use super::app::{call, AccountMe, Ctx};
+use super::app::{AccountMe, Ctx};
+use super::download_driver;
+use super::download_queue::{self, Halt, RowState};
 use super::kept_video::{
     cap_from_option, cap_options, cap_selected, quality_label, KeptState, KeptVideo, VideoStore,
     DEFAULT_QUALITY_BPS, QUALITY_CHOICES_BPS,
@@ -92,6 +94,9 @@ pub fn state_line(v: &KeptVideo) -> String {
             format!("Downloading {}%", percent(*done, *total))
         }
         KeptState::Ready => format!("On this device \u{b7} {}", format_bytes(v.bytes())),
+        KeptState::Failed { .. } if v.halt == Some(Halt::Paused) => "Paused".to_owned(),
+        // ADR 0148: the queue carries it on by itself.
+        KeptState::Failed { .. } if v.halt.is_some() => "Waiting to carry on".to_owned(),
         KeptState::Failed { reason } => format!("Failed: {reason}"),
     }
 }
@@ -108,10 +113,20 @@ pub fn VideoKeepControl(
     on_quality: EventHandler<u64>,
     on_download: EventHandler<()>,
     on_remove: EventHandler<()>,
+    /// The queue's word for a download not started yet ("Queued · 3rd").
+    #[props(default)]
+    queued: Option<String>,
 ) -> Element {
+    // Only a failure no later try mends offers Retry (ADR 0148).
     let state = video
         .as_ref()
-        .map(|v| (state_line(v), matches!(v.state, KeptState::Failed { .. })));
+        .map(|v| {
+            (
+                state_line(v),
+                matches!(v.state, KeptState::Failed { .. }) && v.halt.is_none(),
+            )
+        })
+        .or_else(|| queued.map(|line| (line, false)));
     let idle = !matches!(&state, Some((_, false)));
     let label = match (&state, busy) {
         (_, true) => "Starting\u{2026}",
@@ -288,13 +303,6 @@ pub fn VideoList(
             }
         }
     }
-}
-
-thread_local! {
-    /// The play sessions of started downloads. A session ends when its
-    /// grant is dropped, and the stream URL the store fetches carries it, so
-    /// the grants stay until the page closes.
-    static HELD_GRANTS: RefCell<Vec<pharos_client::api::NativeGrant>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The user whose downloads this screen may list, remove and play: the
@@ -524,9 +532,15 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     let remove_user = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
+    let _ = download_driver::QUEUE_CHANGED.read();
+    let queued = match (&video, user.as_deref()) {
+        (None, Some(u)) => queued_line(&download_driver::load(), u, &item),
+        _ => None,
+    };
     rsx! {
         VideoKeepControl {
             video,
+            queued,
             quality: quality(),
             busy: busy(),
             message: message(),
@@ -537,7 +551,7 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
                 busy.set(true);
                 message.set(None);
                 spawn(async move {
-                    match start_download(ctx, id, &detail, &version, bps, &*store).await {
+                    match download_driver::enqueue(ctx, &detail, &version, bps, &*store).await {
                         Ok(()) => {}
                         Err(line) => {
                             platform::warn(&format!(
@@ -550,63 +564,207 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
                 });
             },
             on_remove: move |()| {
-                remove_if_owner(&*remove_store, remove_user.as_deref(), &remove_item);
+                if remove_if_owner(&*remove_store, remove_user.as_deref(), &remove_item) {
+                    if let Some(u) = remove_user.as_deref() {
+                        download_driver::forget(u, &remove_item);
+                    }
+                }
                 message.set(None);
             },
         }
     }
 }
 
-/// Negotiates an HLS stream at `quality_bps`, hands it to the store and
-/// keeps the grant alive. The error is the line to show.
-async fn start_download(
-    ctx: Ctx,
-    id: ItemRef,
-    detail: &Detail,
-    version: &str,
-    quality_bps: u64,
-    store: &dyn super::kept_video::VideoStore,
-) -> Result<(), String> {
-    let Some(api) = ctx.api.peek().clone() else {
-        return Err("Connect to the server to download this video.".into());
+/// The ordinal of a place in line: 1st, 2nd, 3rd, 4th, 11th, 21st.
+pub fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
     };
-    let me = api
-        .me(&call("title", "download"))
-        .await
-        .map_err(|e| format!("Could not tell who is signed in: {e}"))?;
-    // The chosen file's tracks are its own.
-    let own;
-    let detail = if version.is_empty() {
-        detail
-    } else {
-        own = api
-            .detail_version(&call("title", "download"), id, version)
-            .await
-            .map_err(|e| format!("Could not read this version: {e}"))?;
-        &own
+    format!("{n}{suffix}")
+}
+
+/// What the title page says of `item` while it is queued with no record
+/// yet: its place, paused, or why it could not start.
+fn queued_line(queue: &download_queue::Queue, user: &str, item: &str) -> Option<String> {
+    let mine: Vec<_> = queue.entries.iter().filter(|e| e.user == user).collect();
+    let at = mine.iter().position(|e| e.item == item)?;
+    let e = mine[at];
+    Some(match (&e.failed, e.paused) {
+        (Some(reason), _) => format!("Failed: {reason}"),
+        (None, true) => "Paused".to_owned(),
+        (None, false) => format!("Queued \u{b7} {}", ordinal(at + 1)),
+    })
+}
+
+/// A queue row's state in words.
+fn row_line(state: &RowState, estimate: u64) -> String {
+    match state {
+        RowState::Downloading { percent, bytes } => format!(
+            "Downloading {percent}% \u{b7} {} of {}",
+            format_bytes(*bytes),
+            format_bytes(estimate)
+        ),
+        RowState::Waiting {
+            halt,
+            bytes,
+            in_secs,
+        } => {
+            let kept = if *bytes > 0 {
+                format!(" \u{b7} {} kept", format_bytes(*bytes))
+            } else {
+                String::new()
+            };
+            format!("{}{kept}", download_queue::waiting_line(*halt, *in_secs))
+        }
+        RowState::Queued => "Queued".to_owned(),
+        RowState::Paused { percent, bytes } => {
+            format!("Paused at {percent}% \u{b7} {} kept", format_bytes(*bytes))
+        }
+        RowState::Failed { reason } => format!("Failed: {reason}"),
+    }
+}
+
+fn row_kind(state: &RowState) -> &'static str {
+    match state {
+        RowState::Downloading { .. } => "downloading",
+        RowState::Waiting { .. } => "waiting",
+        RowState::Queued => "queued",
+        RowState::Paused { .. } => "paused",
+        RowState::Failed { .. } => "failed",
+    }
+}
+
+/// The download queue (ADR 0148): every download not on the device yet, in
+/// the order they run, each with what it is doing and what the viewer can
+/// do. Nothing when the queue is empty.
+#[component]
+pub fn VideoQueue() -> Element {
+    let Some(store) = shown_video_store() else {
+        return rsx! {};
     };
-    let caps = offline_video::download_caps(platform::capabilities(), quality_bps);
-    let (decision, grant) = api
-        .play(
-            &call("title", "download"),
-            id,
-            version,
-            &caps,
-            TrackPicks::default(),
-        )
-        .await
-        .map_err(|e| format!("The server would not start a stream: {e}"))?;
-    platform::info(&format!(
-        "pharos: video keep negotiated item={id} method={} quality_bps={quality_bps} audio={:?} url={}",
-        decision.method, decision.audio, decision.stream_url
-    ));
-    let request = offline_video::keep_request(detail, version, &me.id, &decision, quality_bps)?;
-    HELD_GRANTS.with(|g| g.borrow_mut().push(grant));
-    store.start(request).map_err(|e| e.to_string())?;
-    platform::info(&format!(
-        "pharos: video keep started item={id} quality_bps={quality_bps}"
-    ));
-    Ok(())
+    let user = use_user();
+    let listing = use_listing(Rows::All);
+    let _ = download_driver::QUEUE_CHANGED.read();
+    let Some(user) = user else {
+        return rsx! {};
+    };
+    let records = rows_for(&listing.read(), Some(&user), || {
+        listing_now(&*store, Some(&user), Rows::All)
+    });
+    let queue = download_driver::load();
+    let now = platform::now_ms().max(0.0) as u64;
+    let rows = download_queue::rows(&queue, &records, &download_driver::tries(), &user, now);
+    if rows.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        h3 { id: "video-queue-title", "Queue" }
+        ol { class: "pharos-download-list", id: "pharos-video-queue", aria_labelledby: "video-queue-title",
+            for row in rows {
+                QueueRow { key: "{row.item}", row: row.clone(), user: user.clone(), store: StoreRef(store.clone()) }
+            }
+        }
+    }
+}
+
+/// A store handle for props (compared by pointer).
+#[derive(Clone)]
+pub struct StoreRef(pub std::sync::Arc<dyn VideoStore>);
+
+impl PartialEq for StoreRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[component]
+fn QueueRow(row: download_queue::Row, user: String, store: StoreRef) -> Element {
+    let ctx = use_context::<Ctx>();
+    let line = row_line(&row.state, row.estimate);
+    let kind = row_kind(&row.state);
+    let progress = match row.state {
+        RowState::Downloading { percent, .. } | RowState::Paused { percent, .. } => Some(percent),
+        RowState::Waiting { bytes, .. } if row.estimate > 0 => {
+            Some(u32::try_from((bytes.saturating_mul(100) / row.estimate).min(100)).unwrap_or(100))
+        }
+        _ => None,
+    };
+    let (item, title) = (row.item.clone(), row.title.clone());
+    let act = move |what: &'static str| {
+        let (user, item, store) = (user.clone(), item.clone(), store.0.clone());
+        move |_| match what {
+            "pause" => {
+                if let Err(e) = download_driver::pause(&*store, &user, &item) {
+                    platform::warn(&format!(
+                        "pharos: video queue pause failed item={item} error={e}"
+                    ));
+                }
+            }
+            "resume" => download_driver::resume(&user, &item),
+            "retry" => download_driver::retry(ctx, &user, &item),
+            "up" => download_driver::shift(&user, &item, true),
+            "down" => download_driver::shift(&user, &item, false),
+            _ => {
+                if remove_if_owner(&*store, Some(&user), &item) {
+                    download_driver::forget(&user, &item);
+                }
+            }
+        }
+    };
+    rsx! {
+        li { class: "pharos-download", "data-kind": "video", "data-queue": kind,
+            div { class: "pharos-download-head",
+                span { class: "pharos-queue-place", aria_label: "Place {row.position}", "{row.position}" }
+                div { class: "pharos-download-name",
+                    span { "{title}" }
+                    span { class: "pharos-muted",
+                        "{quality_label(row.quality_bps)} \u{b7} about {format_bytes(row.estimate)}"
+                    }
+                    span { class: "pharos-queue-state", "data-state": kind, role: "status", "{line}" }
+                }
+                match &row.state {
+                    RowState::Downloading { .. } => rsx! {
+                        button { class: "pharos-button pharos-button-secondary is-small", r#type: "button",
+                            aria_label: "Pause {title}", onclick: act("pause"), "Pause" }
+                    },
+                    RowState::Waiting { .. } => rsx! {
+                        button { class: "pharos-button pharos-button-secondary is-small", r#type: "button",
+                            aria_label: "Try {title} now", onclick: act("resume"), "Try now" }
+                        button { class: "pharos-button pharos-button-quiet is-small", r#type: "button",
+                            aria_label: "Pause {title}", onclick: act("pause"), "Pause" }
+                    },
+                    RowState::Paused { .. } => rsx! {
+                        button { class: "pharos-button pharos-button-secondary is-small", r#type: "button",
+                            aria_label: "Resume {title}", onclick: act("resume"), "Resume" }
+                    },
+                    RowState::Failed { .. } => rsx! {
+                        button { class: "pharos-button pharos-button-secondary is-small", r#type: "button",
+                            aria_label: "Retry {title}", onclick: act("retry"), "Retry" }
+                    },
+                    RowState::Queued => rsx! {},
+                }
+                if row.can_move_up {
+                    button { class: "pharos-button pharos-button-quiet is-small", r#type: "button",
+                        aria_label: "Move {title} up", onclick: act("up"), "\u{2191}" }
+                }
+                if row.can_move_down {
+                    button { class: "pharos-button pharos-button-quiet is-small", r#type: "button",
+                        aria_label: "Move {title} down", onclick: act("down"), "\u{2193}" }
+                }
+                button { class: "pharos-button pharos-button-danger is-small", r#type: "button",
+                    aria_label: "Remove {title} from the queue", onclick: act("remove"), "Remove" }
+            }
+            if let Some(p) = progress {
+                div { class: "pharos-queue-bar", "data-state": kind, role: "presentation",
+                    i { style: "width: {p}%" }
+                }
+            }
+        }
+    }
 }
 
 /// The Downloads page's videos. Nothing without a registered store.
@@ -681,8 +839,14 @@ pub fn VideoDownloads(
                 },
                 }
             }
+            if !snapshot {
+                VideoQueue {}
+            }
             VideoList {
-                videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows)),
+                videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows))
+                    .into_iter()
+                    .filter(|v| snapshot || v.ready())
+                    .collect::<Vec<_>>(),
                 used,
                 videos_used,
                 used_known: usage.is_some(),
@@ -697,7 +861,11 @@ pub fn VideoDownloads(
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
                 },
                 on_remove: move |item: String| {
-                    remove_if_owner(&*remove_store, remove_user.as_deref(), &item);
+                    if remove_if_owner(&*remove_store, remove_user.as_deref(), &item) {
+                        if let Some(u) = remove_user.as_deref() {
+                            download_driver::forget(u, &item);
+                        }
+                    }
                 },
             }
         }
@@ -997,6 +1165,87 @@ mod tests {
         assert_eq!(SAW.with(std::cell::Cell::get), Some(7));
     }
     use super::*;
+
+    #[test]
+    fn places_in_line_read_as_ordinals() {
+        let got: Vec<String> = [1, 2, 3, 4, 11, 12, 13, 21, 22, 103].map(ordinal).into();
+        assert_eq!(
+            got,
+            ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "103rd"]
+        );
+    }
+
+    /// The title page names a queued download's place among the user's
+    /// own, and says when it is paused or could not start.
+    #[test]
+    fn a_queued_download_says_its_place_on_the_title_page() {
+        let entry = |user: &str, item: &str| download_queue::QueueEntry {
+            user: user.into(),
+            item: item.into(),
+            version: String::new(),
+            title: "Invented Film".into(),
+            kind: "movie".into(),
+            runtime_ms: 1,
+            subtitles: Vec::new(),
+            quality_bps: 1,
+            paused: false,
+            failed: None,
+        };
+        let mut queue = download_queue::Queue {
+            entries: vec![entry("u", "1"), entry("other", "9"), entry("u", "2")],
+        };
+        assert_eq!(
+            queued_line(&queue, "u", "2").as_deref(),
+            Some("Queued \u{b7} 2nd")
+        );
+        assert_eq!(queued_line(&queue, "u", "9"), None);
+        queue.set_paused("u", "2", true);
+        assert_eq!(queued_line(&queue, "u", "2").as_deref(), Some("Paused"));
+        queue.entries[2].failed = Some("no room".into());
+        assert_eq!(
+            queued_line(&queue, "u", "2").as_deref(),
+            Some("Failed: no room")
+        );
+    }
+
+    #[test]
+    fn queue_rows_say_what_they_do_in_words() {
+        assert_eq!(
+            row_line(
+                &RowState::Downloading {
+                    percent: 43,
+                    bytes: 1024
+                },
+                2048
+            ),
+            "Downloading 43% \u{b7} 1 KiB of 2 KiB"
+        );
+        assert_eq!(
+            row_line(
+                &RowState::Waiting {
+                    halt: Halt::Unreachable,
+                    bytes: 1024,
+                    in_secs: 5
+                },
+                2048
+            ),
+            "Waiting for a connection \u{b7} tries again in 5 s \u{b7} 1 KiB kept"
+        );
+        assert_eq!(row_kind(&RowState::Queued), "queued");
+    }
+
+    /// A halted record is not offered Retry on its title page: the queue
+    /// carries it on by itself.
+    #[test]
+    fn a_halted_download_waits_rather_than_failing() {
+        let mut v = offline_video::tests::video("8", "", KeptState::Failed { reason: "x".into() });
+        v.halt = Some(Halt::SessionEnded);
+        assert_eq!(state_line(&v), "Waiting to carry on");
+        v.halt = Some(Halt::Paused);
+        assert_eq!(state_line(&v), "Paused");
+        v.halt = None;
+        assert_eq!(state_line(&v), "Failed: x");
+    }
 
     /// Discarding the unreadable folders deletes folders: it runs off the
     /// UI executor, so a render goes on meanwhile with the button disabled,
@@ -1728,6 +1977,7 @@ mod tests {
             saved_at: "2026-11-16T09:00:00Z".into(),
             estimate_from_adoption: false,
             stale_on_disk: 0,
+            halt: None,
         }
     }
 

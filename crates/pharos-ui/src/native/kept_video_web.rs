@@ -11,20 +11,23 @@
 //! value and posts nothing unless a download was left half done.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt as _};
-use pharos_hls::offline::{estimate_bytes, plan_master, plan_media};
+use pharos_hls::offline::{
+    estimate_bytes, plan_master, plan_media, play_session, rebind, same_playlist,
+};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
+use super::download_queue::{halt_for_status, Halt};
 use super::kept_video::{
     absolute_url, cache_name, cap_from_stored, cap_selected, check_not_kept, find, fits,
     insert_front, interrupted, is_retryable, missing_files, needs_admission, new_record,
-    progress_due, put_is_retryable, reserved_by, retry_delay_secs, stale_files, still_needed, take,
-    url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
-    CAP_KEY, RECORDS_KEY,
+    progress_due, put_is_retryable, renewal, renewed_record, reserved_by, retry_delay_secs,
+    stale_files, still_needed, take, url_path, used_by, KeepVideoRefusal, KeepVideoRequest,
+    KeptState, KeptVideo, VideoStore, CAP_KEY, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -36,6 +39,35 @@ thread_local! {
     static FREE: Cell<u64> = const { Cell::new(0) };
     static PERSIST_ASKED: Cell<bool> = const { Cell::new(false) };
     static LAST_SAVE_MS: Cell<f64> = const { Cell::new(0.0) };
+    /// The play session each renewed download fetches under, by user and
+    /// item, when it is not the one its stored keys carry (ADR 0148).
+    static LIVE: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
+}
+
+/// The URL a stored key is fetched from: the key itself, or the key under
+/// the download's renewed play session.
+fn fetch_url(user: &str, item: &str, key: &str) -> String {
+    LIVE.with(
+        |l| match l.borrow().get(&(user.to_owned(), item.to_owned())) {
+            Some(live) => rebind(key, live),
+            None => key.to_owned(),
+        },
+    )
+}
+
+fn live_session(user: &str, item: &str) -> Option<String> {
+    LIVE.with(|l| l.borrow().get(&(user.to_owned(), item.to_owned())).cloned())
+}
+
+fn set_live(user: &str, item: &str, live: Option<String>) {
+    LIVE.with(|l| {
+        let mut l = l.borrow_mut();
+        let key = (user.to_owned(), item.to_owned());
+        match live {
+            Some(s) => l.insert(key, s),
+            None => l.remove(&key),
+        };
+    });
 }
 
 fn describe(e: &JsValue) -> String {
@@ -205,6 +237,9 @@ enum Stop {
     Refused(String),
     /// A file could not be fetched or stored; stored files stay for a retry.
     Failed(String),
+    /// Stopped by something a later try can mend (ADR 0148): the files stay
+    /// and the queue tries again by itself.
+    Halted(Halt, String),
 }
 
 enum FetchErr {
@@ -240,7 +275,7 @@ async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Respo
         if !wanted(user, item) {
             return Err(Stop::Gone);
         }
-        let err = match fetch_once(url).await {
+        let err = match fetch_once(&fetch_url(user, item, url)).await {
             Ok(r) => return Ok(r),
             Err(e) => e,
         };
@@ -255,7 +290,13 @@ async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Respo
         ));
         match (is_retryable(status), retry_delay_secs(attempt)) {
             (true, Some(secs)) => platform::sleep_ms(secs as u32 * 1000).await,
-            _ => return Err(Stop::Failed(format!("{} answered {shown}", url_path(url)))),
+            _ => {
+                let reason = format!("{} answered {shown}", url_path(url));
+                return Err(match halt_for_status(status) {
+                    Some(halt) => Stop::Halted(halt, reason),
+                    None => Stop::Failed(reason),
+                });
+            }
         }
     }
 }
@@ -419,8 +460,23 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     notify_worker();
     let origin = origin();
     let master = absolute_url(&origin, &record.master_url);
+    // ADR 0148: fetching under a renewed play session. Every playlist must
+    // be stored already, so the plan comes from the stored text and names
+    // the stored keys.
+    let renewing = live_session(user, item)
+        .zip(play_session(&record.master_url).map(str::to_owned))
+        .filter(|(live, kept)| live != kept);
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let mut inits: Vec<String> = Vec::new();
+    if renewing.is_some() && !is_cached(&cache, &master).await {
+        return Err(Stop::Halted(
+            Halt::StreamChanged,
+            format!("{} was never stored", url_path(&master)),
+        ));
+    }
 
     let text = playlist(&cache, user, item, &master).await?;
+    texts.push((master.clone(), text.clone()));
     let plan = plan_master(&master, &text)
         .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
     let mut stored = vec![master.clone()];
@@ -428,13 +484,27 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     let mut duration_ms = 0u64;
     let mut short_tails: HashSet<String> = HashSet::new();
     for url in &plan.media_playlists {
+        if renewing.is_some() && !is_cached(&cache, url).await {
+            return Err(Stop::Halted(
+                Halt::StreamChanged,
+                format!("{} was never stored", url_path(url)),
+            ));
+        }
         let text = playlist(&cache, user, item, url).await?;
         stored.push(url.clone());
         let media = plan_media(url, &text)
             .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(url))))?;
+        if renewing.is_some() {
+            orphan_check(&cache, item, &media).await?;
+        }
         duration_ms = duration_ms.max(media.duration_ms);
         short_tails.extend(media.short_tail);
         files.extend(media.files);
+        inits.extend(media.inits);
+        texts.push((url.clone(), text));
+    }
+    if let Some((live, kept)) = &renewing {
+        verify_renewal(&cache, user, item, &texts, &inits, kept, live).await?;
     }
     let mut all = stored.clone();
     all.extend(files);
@@ -512,7 +582,9 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
             Ok((_, len)) => len,
             // B1476: the sliver of a last segment can fail to encode; the
             // copy plays without it, ending a frame early.
-            Err(Stop::Failed(reason)) if short_tails.contains(url) => {
+            Err(Stop::Failed(reason) | Stop::Halted(Halt::Unreachable, reason))
+                if short_tails.contains(url) =>
+            {
                 warn(&format!(
                     "pharos: video keep skipped short tail item={item} url_path={} reason={reason}",
                     url_path(url)
@@ -540,11 +612,120 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     Ok(if bytes == 0 { estimate } else { bytes })
 }
 
+async fn is_cached(cache: &web_sys::Cache, url: &str) -> bool {
+    JsFuture::from(cache.match_with_str(url))
+        .await
+        .is_ok_and(|v| !v.is_undefined())
+}
+
+async fn body_bytes(response: &web_sys::Response) -> Result<Vec<u8>, String> {
+    let promise = response.array_buffer().map_err(|e| describe(&e))?;
+    let buffer = JsFuture::from(promise).await.map_err(|e| describe(&e))?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
+/// A segment stored without its init came from the ended session's encoder,
+/// and nothing stored is left to check the renewed init against: such a
+/// download is [`Halt::StreamChanged`], not spliced (ADR 0148).
+async fn orphan_check(
+    cache: &web_sys::Cache,
+    item: &str,
+    media: &pharos_hls::offline::MediaPlan,
+) -> Result<(), Stop> {
+    for init in &media.inits {
+        if is_cached(cache, init).await {
+            continue;
+        }
+        let mut segments = 0usize;
+        for file in media.files.iter().filter(|f| !media.inits.contains(f)) {
+            if is_cached(cache, file).await {
+                segments += 1;
+            }
+        }
+        if segments > 0 {
+            let what = format!(
+                "url_path={} init_never_stored segments_stored={segments}",
+                url_path(init)
+            );
+            warn(&format!(
+                "pharos: video keep renewed item={item} verdict=stream_changed {what}"
+            ));
+            return Err(Stop::Halted(
+                Halt::StreamChanged,
+                format!("the stream changed: {what}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks the renewed session hands out the stored stream (ADR 0148): each
+/// playlist says the same once its session ids are put back, and each
+/// stored init segment is the same bytes. Anything else is
+/// [`Halt::StreamChanged`], naming the first difference, and the queue
+/// starts the download afresh.
+async fn verify_renewal(
+    cache: &web_sys::Cache,
+    user: &str,
+    item: &str,
+    texts: &[(String, String)],
+    inits: &[String],
+    kept: &str,
+    live: &str,
+) -> Result<(), Stop> {
+    let changed = |what: String| {
+        warn(&format!(
+            "pharos: video keep renewed item={item} verdict=stream_changed {what}"
+        ));
+        Stop::Halted(Halt::StreamChanged, format!("the stream changed: {what}"))
+    };
+    for (key, stored) in texts {
+        let response = fetch_retry(user, item, key).await?;
+        let renewed = JsFuture::from(response.text().map_err(|e| Stop::Failed(describe(&e)))?)
+            .await
+            .map_err(|e| Stop::Failed(describe(&e)))?
+            .as_string()
+            .unwrap_or_default();
+        if let Err(m) = same_playlist(stored, &renewed, kept, live) {
+            return Err(changed(format!("url_path={} {m}", url_path(key))));
+        }
+    }
+    let mut compared = 0usize;
+    for key in inits {
+        let Ok(hit) = JsFuture::from(cache.match_with_str(key)).await else {
+            continue;
+        };
+        let Ok(stored) = hit.dyn_into::<web_sys::Response>() else {
+            continue;
+        };
+        let stored = body_bytes(&stored).await.map_err(Stop::Failed)?;
+        let renewed = fetch_retry(user, item, key).await?;
+        let renewed = body_bytes(&renewed).await.map_err(Stop::Failed)?;
+        if stored != renewed {
+            return Err(changed(format!(
+                "url_path={} init_bytes kept={} renewed={}",
+                url_path(key),
+                stored.len(),
+                renewed.len()
+            )));
+        }
+        compared += 1;
+    }
+    info(&format!(
+        "pharos: video keep renewed item={item} verdict=same_stream playlists={} inits={compared}",
+        texts.len()
+    ));
+    Ok(())
+}
+
 /// Records progress; saved at most once a second unless `force`.
 fn publish(user: &str, item: &str, done: usize, total: u32, bytes: u64, force: bool) {
     let done = u32::try_from(done).unwrap_or(u32::MAX);
     let alive = update(user, item, |v| {
-        v.state = KeptState::Downloading { done, total, bytes };
+        // A pause landed meanwhile: it stays paused.
+        if matches!(v.state, KeptState::Downloading { .. }) {
+            v.state = KeptState::Downloading { done, total, bytes };
+        }
     });
     if alive && (force || progress_due(LAST_SAVE_MS.with(Cell::get), js_sys::Date::now())) {
         let _ = save();
@@ -614,12 +795,23 @@ async fn warm_player_script() -> Result<(), String> {
 }
 
 async fn run(user: String, item: String, resume: bool) {
-    match download(&user, &item, resume).await {
+    let outcome = download(&user, &item, resume).await;
+    set_live(&user, &item, None);
+    // A pause or a removal that landed while the run ended leaves its
+    // record as the viewer set it.
+    let running = |v: &KeptVideo| matches!(v.state, KeptState::Downloading { .. });
+    match outcome {
         Ok(bytes) => {
-            if update(&user, &item, |v| {
-                v.state = KeptState::Ready;
-                v.estimated_bytes = bytes;
-            }) {
+            let mut applied = false;
+            update(&user, &item, |v| {
+                if running(v) {
+                    v.state = KeptState::Ready;
+                    v.estimated_bytes = bytes;
+                    v.halt = None;
+                    applied = true;
+                }
+            });
+            if applied {
                 let _ = save();
                 info(&format!(
                     "pharos: video keep ready item={item} bytes={bytes}"
@@ -627,13 +819,38 @@ async fn run(user: String, item: String, resume: bool) {
             }
         }
         Err(Stop::Gone) => info(&format!(
-            "pharos: video keep stopped item={item} reason=removed"
+            "pharos: video keep stopped item={item} reason=not_downloading"
         )),
         Err(Stop::Refused(reason)) | Err(Stop::Failed(reason)) => {
             warn(&format!(
-                "pharos: video keep failed item={item} reason={reason}"
+                "pharos: video keep failed item={item} reason={reason} halt=none"
             ));
-            if update(&user, &item, |v| v.state = KeptState::Failed { reason }) {
+            let mut applied = false;
+            update(&user, &item, |v| {
+                if running(v) {
+                    v.state = KeptState::Failed { reason };
+                    v.halt = None;
+                    applied = true;
+                }
+            });
+            if applied {
+                let _ = save();
+            }
+        }
+        Err(Stop::Halted(halt, reason)) => {
+            warn(&format!(
+                "pharos: video keep failed item={item} reason={reason} halt={}",
+                halt.label()
+            ));
+            let mut applied = false;
+            update(&user, &item, |v| {
+                if running(v) {
+                    v.state = KeptState::Failed { reason };
+                    v.halt = Some(halt);
+                    applied = true;
+                }
+            });
+            if applied {
                 let _ = save();
             }
         }
@@ -659,13 +876,27 @@ impl VideoStore for WebVideoStore {
         }
         let (user, item) = (request.user.clone(), request.item.clone());
         let mut previous = None;
+        let mut live = None;
         let started = with_list(|list| {
             check_not_kept(list, &user, &item)?;
             previous = find(list, &user, &item).cloned();
-            let mut record = new_record(&request, js_sys::Date::new_0().to_iso_string().into());
-            if let Some(old) = find(list, &user, &item) {
-                record.files = old.files.clone();
-            }
+            let now: String = js_sys::Date::new_0().to_iso_string().into();
+            let record = match find(list, &user, &item) {
+                // ADR 0148: the same stream under a new play session keeps
+                // its stored keys and fetches them under the new session.
+                Some(old) => match renewal(old, &request) {
+                    Some(session) => {
+                        live = Some(session);
+                        renewed_record(old, &request, now)
+                    }
+                    None => {
+                        let mut record = new_record(&request, now);
+                        record.files = old.files.clone();
+                        record
+                    }
+                },
+                None => new_record(&request, now),
+            };
             insert_front(list, record);
             Ok(())
         });
@@ -692,7 +923,35 @@ impl VideoStore for WebVideoStore {
             )));
         }
         request_persist();
-        wasm_bindgen_futures::spawn_local(run(user, item, false));
+        let renewing = live.is_some();
+        info(&format!(
+            "pharos: video keep renewal item={item} verdict={} files_kept={}",
+            if renewing { "renewing" } else { "fresh" },
+            previous
+                .as_ref()
+                .map_or(0, |p| if renewing { p.files.len() } else { 0 })
+        ));
+        set_live(&user, &item, live);
+        wasm_bindgen_futures::spawn_local(run(user, item, renewing));
+        Ok(())
+    }
+
+    fn pause(&self, user: &str, item: &str) -> Result<(), String> {
+        let mut paused = false;
+        update(user, item, |v| {
+            if matches!(v.state, KeptState::Downloading { .. }) {
+                v.state = KeptState::Failed {
+                    reason: "paused".to_owned(),
+                };
+                v.halt = Some(Halt::Paused);
+                paused = true;
+            }
+        });
+        if !paused {
+            return Err(format!("{item} is not downloading"));
+        }
+        save()?;
+        info(&format!("pharos: video keep paused item={item}"));
         Ok(())
     }
 

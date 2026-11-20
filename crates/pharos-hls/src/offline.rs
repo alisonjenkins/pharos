@@ -54,6 +54,9 @@ pub struct MediaPlan {
     /// stream then ends a frame early. A URI another segment needs is never
     /// one, so its failed fetch is never excused.
     pub short_tail: Option<String>,
+    /// The init segments among `files`: compared byte for byte when a
+    /// download carries on under a renewed play session (ADR 0148).
+    pub inits: Vec<String>,
 }
 
 /// A last segment shorter than this is a short tail (see [`MediaPlan`]).
@@ -94,13 +97,15 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
     }
     inits.dedup();
     let files = inits
-        .into_iter()
+        .iter()
+        .cloned()
         .chain(media.segments.into_iter().map(|s| s.uri))
         .collect();
     Ok(MediaPlan {
         files,
         duration_ms,
         short_tail,
+        inits,
     })
 }
 
@@ -120,6 +125,129 @@ fn map_uri(attributes: &str) -> Option<&str> {
 pub fn estimate_bytes(bandwidth_bps: u64, duration_ms: u64) -> u64 {
     let bits = u128::from(bandwidth_bps) * u128::from(duration_ms) / 1000;
     u64::try_from(bits / 8).unwrap_or(u64::MAX)
+}
+
+/// The query key that carries a playback's capability (ADR 0148).
+pub const SESSION_KEY: &str = "PlaySessionId";
+
+/// The `PlaySessionId` value `url`'s query carries, if any (key matched
+/// without regard to case, as the server does).
+pub fn play_session(url: &str) -> Option<&str> {
+    let (_, query) = url.split_once('?')?;
+    let query = query.split('#').next().unwrap_or(query);
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.eq_ignore_ascii_case(SESSION_KEY) && !v.is_empty()).then_some(v)
+    })
+}
+
+/// `url` with every `PlaySessionId` value replaced by `session`: the URL a
+/// stored key is fetched from under a renewed play session (ADR 0148). The
+/// rest of the URL is left byte for byte, so the stored key never changes.
+pub fn rebind(url: &str, session: &str) -> String {
+    swap_session(url, |_| session.to_owned())
+}
+
+/// `url` with its `PlaySessionId` value hidden, for log lines: the id is a
+/// capability, everything else is not.
+pub fn redact_session(url: &str) -> String {
+    swap_session(url, |_| "~".to_owned())
+}
+
+fn swap_session(url: &str, with: impl Fn(&str) -> String) -> String {
+    let Some((head, rest)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let (query, fragment) = match rest.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (rest, None),
+    };
+    let query = query
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) if k.eq_ignore_ascii_case(SESSION_KEY) => format!("{k}={}", with(v)),
+            _ => kv.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(f) => format!("{head}?{query}#{f}"),
+        None => format!("{head}?{query}"),
+    }
+}
+
+/// Whether a playlist fetched under the renewed session `live` says what
+/// the one stored under `kept` says, once its session ids are put back:
+/// the same segments, durations and inits. `Err` names the first line that
+/// differs (1-based), with the session hidden.
+pub fn same_playlist(
+    stored: &str,
+    renewed: &str,
+    kept: &str,
+    live: &str,
+) -> Result<(), PlanMismatch> {
+    let renewed = if live.is_empty() {
+        renewed.to_owned()
+    } else {
+        renewed.replace(live, kept)
+    };
+    let (mut a, mut b) = (stored.lines(), renewed.lines());
+    let mut at = 0;
+    loop {
+        at += 1;
+        match (a.next(), b.next()) {
+            (None, None) => return Ok(()),
+            (x, y) if x == y => {}
+            (x, y) => {
+                return Err(PlanMismatch {
+                    at,
+                    kept: x.map(redact_session).unwrap_or_default(),
+                    renewed: y.map(redact_session).unwrap_or_default(),
+                })
+            }
+        }
+    }
+}
+
+/// Where a renewed stream's plan first parts from the stored one, with the
+/// play session hidden in both URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanMismatch {
+    /// The position of the first difference in the file list.
+    pub at: usize,
+    /// The stored plan's URL there (empty past its end).
+    pub kept: String,
+    /// The renewed plan's URL there (empty past its end).
+    pub renewed: String,
+}
+
+impl std::fmt::Display for PlanMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "file {} differs: kept {:?}, renewed {:?}",
+            self.at, self.kept, self.renewed
+        )
+    }
+}
+
+/// Whether `renewed` (a plan made under play session `session`) names the
+/// same files as `kept` once each kept key is rebound to `session`: only
+/// then may the files already stored be kept (ADR 0148).
+pub fn same_plan(kept: &[String], renewed: &[String], session: &str) -> Result<(), PlanMismatch> {
+    let len = kept.len().max(renewed.len());
+    for at in 0..len {
+        let k = kept.get(at).map(|k| rebind(k, session));
+        let r = renewed.get(at);
+        if k.as_ref() != r {
+            return Err(PlanMismatch {
+                at,
+                kept: k.as_deref().map(redact_session).unwrap_or_default(),
+                renewed: r.map(|r| redact_session(r)).unwrap_or_default(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -168,6 +296,10 @@ mod tests {
         );
         assert_eq!(plan.duration_ms, 10_500);
         assert_eq!(plan.short_tail, None);
+        assert_eq!(
+            plan.inits,
+            ["https://h/videos/9/h264cmaf/init.mp4?PlaySessionId=p"]
+        );
     }
 
     /// A multi-part film's playlist gives each part its own init after a
@@ -226,5 +358,78 @@ mod tests {
     #[test]
     fn an_hour_at_two_megabits_is_about_900_mb() {
         assert_eq!(estimate_bytes(2_000_000, 3_600_000), 900_000_000);
+    }
+
+    #[test]
+    fn a_renewed_playlist_matches_once_its_session_is_put_back() {
+        let kept = MEDIA;
+        let renewed = MEDIA.replace("PlaySessionId=p", "PlaySessionId=q");
+        assert_eq!(same_playlist(kept, &renewed, "p", "q"), Ok(()));
+        let regridded = renewed.replace("#EXTINF:4.5,", "#EXTINF:4.0,");
+        let err = same_playlist(kept, &regridded, "p", "q").unwrap_err();
+        assert_eq!(err.at, 8);
+        assert_eq!(
+            (err.kept.as_str(), err.renewed.as_str()),
+            ("#EXTINF:4.5,", "#EXTINF:4.0,")
+        );
+        let longer = format!("{renewed}#EXTINF:1.0,\n2.m4s?PlaySessionId=q\n");
+        assert!(same_playlist(kept, &longer, "p", "q").is_err());
+    }
+
+    #[test]
+    fn the_play_session_is_read_whatever_the_case_of_its_key() {
+        assert_eq!(play_session("/v/0.m4s?a=1&PlaySessionId=p&b=2"), Some("p"));
+        assert_eq!(play_session("/v/0.m4s?playsessionid=q"), Some("q"));
+        assert_eq!(play_session("/v/0.m4s?PlaySessionId=&x=1"), None);
+        assert_eq!(play_session("/v/0.m4s"), None);
+    }
+
+    /// Disarm check: a `rebind` that also touched `VideoBitrate` fails the
+    /// first assertion.
+    #[test]
+    fn rebinding_swaps_only_the_play_session() {
+        assert_eq!(
+            rebind(
+                "https://h/v/0.m4s?PlaySessionId=old&VideoBitrate=2000000#t",
+                "new"
+            ),
+            "https://h/v/0.m4s?PlaySessionId=new&VideoBitrate=2000000#t"
+        );
+        assert_eq!(rebind("/v/0.m4s?x=1", "new"), "/v/0.m4s?x=1");
+        assert_eq!(rebind("/v/0.m4s", "new"), "/v/0.m4s");
+        assert_eq!(
+            redact_session("/v/0.m4s?PlaySessionId=secret"),
+            "/v/0.m4s?PlaySessionId=~"
+        );
+    }
+
+    #[test]
+    fn a_renewed_plan_with_the_same_files_matches() {
+        let kept = vec![
+            "/v/init.mp4?PlaySessionId=a".to_owned(),
+            "/v/0.m4s?PlaySessionId=a".to_owned(),
+        ];
+        let renewed: Vec<String> = kept.iter().map(|k| rebind(k, "b")).collect();
+        assert_eq!(same_plan(&kept, &renewed, "b"), Ok(()));
+    }
+
+    /// The first difference is named, with the session hidden, so the log
+    /// line says what changed without leaking the capability.
+    #[test]
+    fn a_renewed_plan_that_differs_names_the_first_difference() {
+        let kept = vec![
+            "/v/init.mp4?PlaySessionId=a".to_owned(),
+            "/v/0.m4s?PlaySessionId=a".to_owned(),
+        ];
+        let renewed = vec![
+            "/v/init.mp4?PlaySessionId=b".to_owned(),
+            "/v/0.m4s?PlaySessionId=b&VideoBitrate=1".to_owned(),
+        ];
+        let err = same_plan(&kept, &renewed, "b").unwrap_err();
+        assert_eq!(err.at, 1);
+        assert_eq!(err.kept, "/v/0.m4s?PlaySessionId=~");
+        assert_eq!(err.renewed, "/v/0.m4s?PlaySessionId=~&VideoBitrate=1");
+        let shorter = same_plan(&kept, &renewed[..1], "b").unwrap_err();
+        assert_eq!((shorter.at, shorter.renewed.as_str()), (1, ""));
     }
 }
