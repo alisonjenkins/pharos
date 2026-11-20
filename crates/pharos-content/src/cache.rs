@@ -1078,20 +1078,48 @@ impl Cache {
             );
         }
         match verdict {
+            // The old part goes and the new body's reservation is published
+            // in this one step under the admission lock: no other admission
+            // sees both. Owed is counted from the empty file.
+            Ok(_) if replacing => match self.truncate_part(downloading) {
+                Ok(()) => self.reserve_from(downloading, need, Some(0)),
+                Err(e) => {
+                    log::warn!(
+                        "cache admission id={downloading} verdict=approved reason=part_not_truncated error={e}"
+                    );
+                    self.reserve(downloading, need);
+                }
+            },
             Ok(_) => self.reserve(downloading, need),
             Err(_) => self.unreserve(downloading),
         }
         verdict
     }
 
-    fn reserve(&self, id: &str, bytes: u64) {
-        let at_len = self.part_len(id);
+    /// Empties `id`'s `.part`, under the cache's lock as
+    /// [`Cache::open_part`]'s truncation is.
+    fn truncate_part(&self, id: &str) -> std::io::Result<()> {
+        let p = self.part_path(id);
+        let _s = self.lock();
+        match std::fs::OpenOptions::new().write(true).open(&p) {
+            Ok(f) => f.set_len(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn reserve_from(&self, id: &str, bytes: u64, at_len: Option<u64>) {
         let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes == 0 {
             r.remove(id);
         } else {
             r.insert(id.to_owned(), Reservation { bytes, at_len });
         }
+    }
+
+    fn reserve(&self, id: &str, bytes: u64) {
+        let at_len = self.part_len(id);
+        self.reserve_from(id, bytes, at_len);
     }
 
     /// `id`'s `.part` was truncated to start a whole new body: what its
@@ -1625,6 +1653,30 @@ pub(crate) mod tests {
                 .iter()
                 .any(|l| l == "cache cap bytes=150 source=set tracks=1 used=100 evicted=1"),
             "{lines:?}"
+        );
+    }
+
+    /// CR 4637783537: an approved replacement truncates the old part and
+    /// publishes the new reservation in the same step as the approval, so
+    /// no other admission counts the old part and the whole new body at
+    /// once. A refused one leaves the old part as it was.
+    #[test]
+    fn an_approved_replacement_counts_the_old_part_once() {
+        let d = tmp("replace-once");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        // 500 free and 600 reclaimed: 2000 does not fit, and nothing moves.
+        assert!(c.ensure_free_replacing_part("track/x", 2000, true).is_err());
+        assert_eq!(
+            c.in_progress_bytes(),
+            Some(600),
+            "a refusal touched the part"
+        );
+        assert!(c.ensure_free_replacing_part("track/x", 1000, true).is_ok());
+        assert_eq!(
+            (c.in_progress_bytes(), c.reserved_bytes()),
+            (Some(0), 1000),
+            "the old part and the new body were both counted"
         );
     }
 

@@ -843,8 +843,9 @@ impl Gate {
             // that would pass it is reserved for before it is written, not
             // after, so the bytes a host admits against never lag the disk.
             // A whole body over a partial file is admitted with the old
-            // bytes as room (they go when the part is truncated, below); a
-            // refusal keeps them and their validator.
+            // bytes as room: the approval empties the part and publishes
+            // the new reservation in one step. A refusal keeps them and
+            // their validator.
             let replacing = !append && pos > 0;
             let mut reserved_ahead = match self.reserve(id, left(start), 0, unknown_len, replacing)
             {
