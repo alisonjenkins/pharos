@@ -183,6 +183,12 @@ pub struct Planner {
     audio: Option<TrackState>,
     config: Config,
     forward_target_ms: u64,
+    /// Media kept behind the play head: `config.back_ms` until the browser
+    /// refuses an append for room, then nothing but the current segment.
+    back_target_ms: u64,
+    /// A refused append is waiting for room: trim on the next tick even with
+    /// its request still in flight.
+    quota_trim: bool,
     /// The source is ended as far as the planner has asked: cleared by anything
     /// that reopens it (a fetch, a trim, a seek back).
     eos_emitted: bool,
@@ -208,6 +214,8 @@ impl Planner {
             audio: audio.map(|(segs, init)| TrackState::new(segs, init, start_ms)),
             config,
             forward_target_ms,
+            back_target_ms: config.back_ms,
+            quota_trim: false,
             eos_emitted: false,
             eos_noted: false,
             notes: Vec::new(),
@@ -272,12 +280,15 @@ impl Planner {
                 play_ms,
                 own,
                 has_audio.then_some((other, other_finished)),
-                self.config.back_ms,
+                self.back_target_ms,
+                self.quota_trim,
                 self.forward_target_ms,
                 &mut actions,
                 &mut self.notes,
             );
         }
+
+        self.quota_trim = false;
 
         // An append or a remove reopens an ended MediaSource.
         if actions.iter().any(|a| {
@@ -391,11 +402,13 @@ impl Planner {
     }
 
     /// The browser refused an append with QuotaExceededError: halve the
-    /// forward target (not below `min_forward_ms`), return the new target.
-    pub fn quota_exceeded(&mut self, track: Track) -> u64 {
-        if let Some(state) = self.track_mut(track) {
-            state.in_flight = None;
-        }
+    /// forward target (not below `min_forward_ms`) and keep nothing behind the
+    /// play head but its own segment, for the rest of the session. The next
+    /// tick trims both tracks to that; the request stays in flight, for the
+    /// adapter to append again once there is room. Returns the new target.
+    pub fn quota_exceeded(&mut self) -> u64 {
+        self.back_target_ms = 0;
+        self.quota_trim = true;
         self.forward_target_ms = (self.forward_target_ms / 2).max(self.config.min_forward_ms);
         self.forward_target_ms
     }
@@ -524,11 +537,12 @@ fn plan_track(
     track_buffered: &[(u64, u64)],
     other_track: Option<(&[(u64, u64)], bool)>,
     back_ms: u64,
+    trim_in_flight: bool,
     forward_target_ms: u64,
     actions: &mut Vec<Action>,
     notes: &mut Vec<Note>,
 ) {
-    if state.in_flight.is_some() {
+    if state.in_flight.is_some() && !trim_in_flight {
         return;
     }
 
@@ -544,6 +558,10 @@ fn plan_track(
                 end_ms: cutoff_ms,
             });
         }
+    }
+
+    if state.in_flight.is_some() {
+        return;
     }
 
     if state.needs_init {
@@ -1219,6 +1237,56 @@ mod tests {
         assert_eq!(ends_noted, 1, "the end is noted once, not per trim");
     }
 
+    // B1495: a refused append dropped its request and its bytes, so the same
+    // segment was downloaded again at once, and nothing more was trimmed: with
+    // a buffer that still did not fit, that repeated without a pause.
+    #[test]
+    fn a_refused_append_trims_to_the_current_segment_and_keeps_its_request() {
+        let segs = make_segments(&[6_000; 100]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let mut buffered = Buffered {
+            video: vec![(0, 21_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(15_000, &buffered),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 3
+            }]
+        );
+
+        planner.quota_exceeded();
+        assert_eq!(planner.in_flight(Track::Video), Some(Request::Media(3)));
+        assert_eq!(
+            planner.tick(15_000, &buffered),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 0,
+                end_ms: 12_000
+            }]
+        );
+        buffered.video = vec![(12_000, 21_000)];
+        assert_eq!(planner.tick(15_000, &buffered), Vec::new());
+
+        // The back buffer stays at the current segment once the append lands.
+        planner.appended(Track::Video);
+        buffered.video = vec![(12_000, 24_000)];
+        let later: Vec<Action> = planner
+            .tick(19_000, &buffered)
+            .into_iter()
+            .filter(|a| matches!(a, Action::Evict { .. }))
+            .collect();
+        assert_eq!(
+            later,
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 12_000,
+                end_ms: 18_000
+            }]
+        );
+    }
+
     #[test]
     fn giving_up_on_a_segment_is_noted_once() {
         let segs = make_segments(&[6_000; 6]);
@@ -1812,12 +1880,11 @@ mod tests {
         planner.tick(0, &buf);
         assert_eq!(planner.in_flight(Track::Video), Some(Request::Media(0)));
 
-        assert_eq!(planner.quota_exceeded(Track::Video), 15_000);
+        assert_eq!(planner.quota_exceeded(), 15_000);
         assert_eq!(planner.forward_target_ms(), 15_000);
-        assert_eq!(planner.in_flight(Track::Video), None);
 
-        assert_eq!(planner.quota_exceeded(Track::Video), 8_000);
-        assert_eq!(planner.quota_exceeded(Track::Video), 8_000);
+        assert_eq!(planner.quota_exceeded(), 8_000);
+        assert_eq!(planner.quota_exceeded(), 8_000);
         assert_eq!(planner.forward_target_ms(), 8_000);
     }
 
@@ -1851,7 +1918,7 @@ mod tests {
         Seek(f64),
         Appended(Track),
         Failed(Track),
-        Quota(Track),
+        Quota,
     }
 
     fn event_strategy() -> impl Strategy<Value = Event> {
@@ -1860,7 +1927,7 @@ mod tests {
             2 => (0.0f64..1.1f64).prop_map(Event::Seek),
             3 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Appended),
             1 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Failed),
-            1 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Quota),
+            1 => Just(Event::Quota),
         ]
     }
 
@@ -1894,6 +1961,8 @@ mod tests {
             let mut shadow_audio: Option<Request> = None;
             let mut pending_seek_video: Option<usize> = None;
             let mut pending_seek_audio: Option<usize> = None;
+            let mut back_ms = config.back_ms;
+            let mut quota_trim = false;
 
             for event in events {
                 match event {
@@ -1904,6 +1973,7 @@ mod tests {
                         }
                         let had_video = shadow_video;
                         let had_audio = shadow_audio;
+                        let trim_in_flight = std::mem::take(&mut quota_trim);
                         let actions = planner.tick(play_ms, &buffered);
 
                         let mut video_fetches = 0usize;
@@ -1943,14 +2013,14 @@ mod tests {
                                 }
                                 Action::Evict { track, start_ms: ev_start, end_ms: ev_end } => {
                                     prop_assert!(ev_start < ev_end);
-                                    prop_assert!(ev_end <= play_ms.saturating_sub(config.back_ms));
+                                    prop_assert!(ev_end <= play_ms.saturating_sub(back_ms));
                                     match track {
                                         Track::Video => {
-                                            prop_assert!(had_video.is_none());
+                                            prop_assert!(had_video.is_none() || trim_in_flight);
                                             evict_range(&mut buffered.video, ev_start, ev_end);
                                         }
                                         Track::Audio => {
-                                            prop_assert!(had_audio.is_none());
+                                            prop_assert!(had_audio.is_none() || trim_in_flight);
                                             evict_range(&mut buffered.audio, ev_start, ev_end);
                                         }
                                     }
@@ -2048,13 +2118,11 @@ mod tests {
                             Track::Audio => shadow_audio = None,
                         }
                     }
-                    Event::Quota(track) => {
-                        let new_target = planner.quota_exceeded(track);
+                    Event::Quota => {
+                        let new_target = planner.quota_exceeded();
                         prop_assert!(new_target >= config.min_forward_ms);
-                        match track {
-                            Track::Video => shadow_video = None,
-                            Track::Audio => shadow_audio = None,
-                        }
+                        back_ms = 0;
+                        quota_trim = true;
                     }
                 }
 
