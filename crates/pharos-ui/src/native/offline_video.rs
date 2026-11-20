@@ -1559,6 +1559,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// The replay is refused for a changed token even when the new token
+    /// is paired with the same user: A's sign-in on tokA, then tokA2 stored
+    /// and paired with A before the store is published, resumes nothing.
+    /// The control replays on the unchanged token and resumes A.
+    #[test]
+    fn a_replayed_sign_in_resumes_nothing_once_its_token_was_replaced() {
+        use super::super::token_file;
+        for replaced in [false, true] {
+            let d = TmpDir::new("replay-token");
+            let path = d.path().join("device-token");
+            let p = pref();
+            *p.file.borrow_mut() = Some(path.clone());
+            token_file::store(&path, "tokA").unwrap();
+            late_slot();
+            remember_user("A");
+            assert_eq!(p.token_user(), Ok(Some("A".to_owned())));
+            if replaced {
+                token_file::store(&path, "tokA2").unwrap();
+                token_file::pair(&path, Some("tokA2"), "A").unwrap();
+                assert_eq!(p.token_user(), Ok(Some("A".to_owned())));
+            }
+            let runs = std::sync::Arc::new(Runs::default());
+            super::super::ports::register_video_store(runs.clone()).unwrap();
+            super::super::ports::use_test_video_slot(None);
+            let resumed = runs.0.lock().unwrap().clone();
+            if replaced {
+                assert_eq!(resumed, Vec::<String>::new(), "resumed on a replaced token");
+            } else {
+                assert_eq!(resumed, ["resume A"], "the control resumed nothing");
+            }
+        }
+    }
+
     /// The session-end hook parks the ended user's downloads (all of them
     /// when whose session it was is not known), and a sign-in resumes the
     /// new user's.
