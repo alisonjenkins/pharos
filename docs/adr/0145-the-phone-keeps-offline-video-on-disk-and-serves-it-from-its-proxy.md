@@ -35,8 +35,11 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   The download client does not go hop by hand: its own reqwest redirect
   policy (`Policy::custom`) follows a redirect only to the same origin, so
   a stored file always comes from the server. A playlist redirected to
-  another key is stored with its references rebased onto that key, as
-  absolute paths. Neither client falls back to a default one.
+  another key under the server's base path is stored with its references
+  rebased onto that key, as absolute paths. A download is refused when a
+  file it needs falls outside the base path, or outside the routes the
+  phone's proxy serves: such a file could not be played offline. Neither
+  client falls back to a default one.
 - The device token goes only over https or to the build's own server. A
   LAN build on plain http sends it unencrypted: an accepted risk, with
   https as the remedy.
