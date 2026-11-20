@@ -332,6 +332,9 @@ struct Listing {
     /// The user's usage, polled with the rows: music finishing a download
     /// changes it with no video row changing, and the page must show it.
     usage: Option<super::kept_video::Usage>,
+    /// The store's cap, polled so a change made elsewhere (the cache coming
+    /// up) renders the picker and the heading again, together.
+    cap: u64,
 }
 
 /// Which rows a listing reads.
@@ -370,6 +373,7 @@ fn listing_with(store: Option<&dyn VideoStore>, user: Option<&str>, rows: Rows) 
         unreadable: store.unreadable_count(),
         leftover: store.leftover_count(),
         usage: user.map(|u| store.usage(u)),
+        cap: store.cap_bytes(),
     }
 }
 
@@ -642,7 +646,10 @@ pub fn VideoDownloads(
     let unreadable = store.unreadable_count();
     let leftover = store.leftover_count();
     let discard_store = store.clone();
-    let mut cap = use_signal(|| store.cap_bytes());
+    // Read at each render, for the picker and the heading alike: the poll
+    // renders again when the cap changes ([`Listing::cap`]), a pick at once.
+    let cap = store.cap_bytes();
+    let mut shown = listing;
     let mut cap_notice = use_signal(|| None::<String>);
     let cap_store = store.clone();
     rsx! {
@@ -650,12 +657,12 @@ pub fn VideoDownloads(
             h2 { id: "video-downloads-title", "Downloaded videos" }
             if settings {
                 VideoCapSetting {
-                cap: cap(),
+                cap,
                 notice: cap_notice(),
                 on_pick: move |option: String| match apply_cap(&*cap_store, &option) {
                     Ok(bytes) => {
                         platform::info(&format!("pharos: video cap set bytes={bytes}"));
-                        cap.set(bytes);
+                        shown.write().cap = bytes;
                         cap_notice.set(None);
                     }
                     Err(e) => {
@@ -669,7 +676,7 @@ pub fn VideoDownloads(
                 videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows)),
                 used,
                 videos_used,
-                cap: store.cap_bytes(),
+                cap,
                 problem: discard.problem,
                 unreadable,
                 leftover,
@@ -1412,6 +1419,7 @@ mod tests {
             unreadable: 1,
             leftover: 0,
             usage: None,
+            cap: 0,
         };
         let now = Listing {
             owner: None,
@@ -1419,6 +1427,7 @@ mod tests {
             unreadable: 0,
             leftover: 0,
             usage: None,
+            cap: 0,
         };
         assert_eq!(
             refreshed(&shown, now.clone()),
@@ -1461,6 +1470,46 @@ mod tests {
         fn free_bytes(&self) -> u64 {
             0
         }
+    }
+
+    /// CR 4644634617: a cap changed elsewhere (the cache coming up) reaches
+    /// the poll, which renders the picker and the heading again.
+    #[test]
+    fn a_poll_refreshes_a_cap_that_changed_alone() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Capped(AtomicU64);
+        impl VideoStore for Capped {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(
+                &self,
+                _: super::super::kept_video::KeepVideoRequest,
+            ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let store = Capped(AtomicU64::new(1024));
+        let shown = listing(Some(&store), Some("A"));
+        assert_eq!(shown.cap, 1024);
+        store.0.store(4096, Ordering::SeqCst);
+        let now = listing(Some(&store), Some("A"));
+        assert_eq!(
+            refreshed(&shown, now.clone()).map(|l| l.cap),
+            Some(4096),
+            "the cap changed and the screen kept the old one"
+        );
     }
 
     /// CR 4640611377: music finishing a download changes the shared usage
@@ -1523,6 +1572,7 @@ mod tests {
             unreadable: 0,
             leftover: 0,
             usage: None,
+            cap: 0,
         };
         let rows = rows_for(&shown, Some("B"), || Listing {
             owner: Some("B".into()),
