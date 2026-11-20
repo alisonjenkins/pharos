@@ -27,13 +27,14 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
 - Downloads run on one thread of their own and stream to disk; only the
   owner's device token goes with a download's requests, and every check
   that cannot be made fails closed.
-- Redirects are followed by hand, one hop at a time (`redirect_hop`). The
-  proxy keeps the device token only on the same origin, and there only
-  where the token may go at all. A cross-origin https redirect (artwork on
-  another host, say) is followed without the token
+- The asset proxy follows redirects by hand, one hop at a time
+  (`redirect_hop`). It keeps the device token only on the same origin,
+  and there only where the token may go at all. A cross-origin https
+  redirect (artwork on another host, say) is followed without the token
   (`Hop::FollowWithoutToken`), and an https-to-http downgrade is refused.
-  The download client follows a redirect only to the same origin, so a
-  stored file always comes from the server. A playlist redirected to
+  The download client does not go hop by hand: its own reqwest redirect
+  policy (`Policy::custom`) follows a redirect only to the same origin, so
+  a stored file always comes from the server. A playlist redirected to
   another key is stored with its references rebased onto that key, as
   absolute paths. Neither client falls back to a default one.
 - The device token goes only over https or to the build's own server. A
