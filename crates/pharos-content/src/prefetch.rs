@@ -490,6 +490,16 @@ impl Gate {
                     // A parked pin waits out its park here too: its retry
                     // stays scheduled in `pinned`, and other playback
                     // tracks go meanwhile.
+                    // A park whose pin is gone delays nothing: it is
+                    // dropped, and the track goes as playback work.
+                    if q.parked.contains_key(&id) && !self.is_pin_work(&id) {
+                        q.parked.remove(&id);
+                        log::info!(
+                            "cache download id={id} verdict=dispatched reason=park_cleared_unpinned queue=wanted"
+                        );
+                        #[cfg(test)]
+                        self.event(format!("park_cleared:{id}"));
+                    }
                     if let Some(p) = q.parked.get(&id) {
                         if p.epoch == epoch && p.until > now {
                             log::info!(
@@ -2821,6 +2831,33 @@ mod tests {
         r.dl.set_online(true);
         assert!(r.dl.wait_idle(Duration::from_secs(5)), "the pin was lost");
         assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// Outside diff prefetch.rs:493-503 (review 5997638687): a parked pin
+    /// whose pin is gone, asked for by playback once space came back, runs
+    /// as playback work: its stale park is dropped, not waited out. The
+    /// control is the test above, whose pin stays.
+    #[test]
+    fn an_unpinned_parked_track_asked_for_by_playback_runs() {
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = parked_pin("park-unpinned", starve.clone());
+        starve.store(false, Ordering::SeqCst);
+        r.cache.unpin("album/a");
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(5)),
+            "the request was lost"
+        );
+        assert!(
+            r.cache.is_complete("track/1"),
+            "playback of an unpinned parked track never ran: {:?}",
+            r.srv.seen()
+        );
+        assert!(
+            r.dl.events().iter().any(|e| e == "park_cleared:track/1"),
+            "{:?}",
+            r.dl.events()
+        );
     }
 
     /// CR review 5995575621 (prefetch.rs:876): a reconnect after the
