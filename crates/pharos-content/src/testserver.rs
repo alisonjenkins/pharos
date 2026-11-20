@@ -307,18 +307,22 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
 /// The byte ranges a body of `len` is sent in: `piece` bytes each, with the
 /// piece that crosses `at` split there, so a hold stops after exactly `at`
 /// bytes whatever the piece size.
-fn pieces(len: usize, piece: usize, at: Option<usize>) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+/// Computed one range at a time as the body is sent, so a small piece size
+/// on a large body allocates nothing up front.
+fn pieces(len: usize, piece: usize, at: Option<usize>) -> impl Iterator<Item = (usize, usize)> {
     let mut start = 0;
-    while start < len {
+    std::iter::from_fn(move || {
+        if start >= len {
+            return None;
+        }
         let mut end = start.saturating_add(piece).min(len);
         if let Some(at) = at.filter(|&a| a > start && a < end) {
             end = at;
         }
-        out.push((start, end));
+        let range = (start, end);
         start = end;
-    }
-    out
+        Some(range)
+    })
 }
 
 /// Marks the hold reached and waits for its release.
@@ -406,10 +410,16 @@ mod tests {
     /// overflowing; ordinary sizes split as before.
     #[test]
     fn an_oversized_piece_ends_at_the_body() {
-        assert_eq!(pieces(10, usize::MAX, None), [(0, 10)]);
+        assert_eq!(pieces(10, usize::MAX, None).collect::<Vec<_>>(), [(0, 10)]);
         // From a hold past 0, an unclamped end would overflow.
-        assert_eq!(pieces(2, usize::MAX, Some(1)), [(0, 1), (1, 2)]);
-        assert_eq!(pieces(10, 4, Some(6)), [(0, 4), (4, 6), (6, 10)]);
+        assert_eq!(
+            pieces(2, usize::MAX, Some(1)).collect::<Vec<_>>(),
+            [(0, 1), (1, 2)]
+        );
+        assert_eq!(
+            pieces(10, 4, Some(6)).collect::<Vec<_>>(),
+            [(0, 4), (4, 6), (6, 10)]
+        );
     }
     use std::io::{Read, Write};
 
@@ -491,8 +501,17 @@ mod tests {
 
     #[test]
     fn pieces_split_at_the_hold_and_keep_aligned_ones() {
-        assert_eq!(pieces(10, 4, Some(6)), [(0, 4), (4, 6), (6, 10)]);
-        assert_eq!(pieces(10, 4, Some(8)), [(0, 4), (4, 8), (8, 10)]);
-        assert_eq!(pieces(10, 4, None), [(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(
+            pieces(10, 4, Some(6)).collect::<Vec<_>>(),
+            [(0, 4), (4, 6), (6, 10)]
+        );
+        assert_eq!(
+            pieces(10, 4, Some(8)).collect::<Vec<_>>(),
+            [(0, 4), (4, 8), (8, 10)]
+        );
+        assert_eq!(
+            pieces(10, 4, None).collect::<Vec<_>>(),
+            [(0, 4), (4, 8), (8, 10)]
+        );
     }
 }
