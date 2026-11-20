@@ -1562,6 +1562,30 @@ pub(crate) mod tests {
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
     }
 
+    /// CR 4640059241, case 2: the folder sync fails after the new token is
+    /// written and the crash loses the write. The previous token comes back
+    /// on disk, and its own marker, which store never touches, still
+    /// refuses it after the restart.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_write_lost_after_a_failed_sync_leaves_the_revoked_token_refused() {
+        let d = dir("store-lost-write");
+        let p = d.join("device-token");
+        marked_a(&p);
+        let before = std::fs::read(&p).unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let stored = store(&p, "tokN");
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        assert!(stored.is_err(), "{stored:?}");
+        // The crash: the unsynced rename never reached the disk.
+        std::fs::write(&p, before).unwrap();
+        assert_eq!(
+            read_raw(&p).unwrap().map(|s| s.token).as_deref(),
+            Some("tokA")
+        );
+        assert_eq!(after_restart(&p), None, "the revoked token came back");
+    }
+
     /// CR 4638660923, CR 4640059241: the removal of a marker that would
     /// refuse the new token is synced before the token is written. A sync
     /// that fails is named and refuses the sign-in: nothing is written, the
