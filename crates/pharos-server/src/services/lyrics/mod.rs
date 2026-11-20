@@ -1799,6 +1799,7 @@ mod tests {
                     .repicked(retagged.id, online.name(), &song),
                 "paused at {at}: the repick was replaced"
             );
+            the_stale_lookup_was_not_cached(&dir.path().join("c"), &online, &item, at);
         }
     }
 
@@ -1848,6 +1849,39 @@ mod tests {
                 .unwrap()
                 .repicked(retagged.id, online.name(), &song),
             "the repick was replaced"
+        );
+        the_stale_lookup_was_not_cached(&dir.path().join("c"), &online, &item, "read");
+    }
+
+    /// The lookup for `item`'s old tags, asked before a repick, left
+    /// nothing in the ordinary cache, and one asked after it still does.
+    fn the_stale_lookup_was_not_cached(
+        cache: &std::path::Path,
+        online: &Arc<Searching>,
+        item: &MediaItem,
+        at: &str,
+    ) {
+        let song = Song::of(item).unwrap();
+        let disk = cache::DiskCache::new(cache.to_path_buf());
+        assert_eq!(
+            disk.get(item.id, online.name(), &song),
+            None,
+            "{at}: the stale lookup was cached"
+        );
+        let (found, _) = with_outcomes(async {
+            let now = cache::now_secs();
+            while cache::now_secs() == now {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            LyricsFinder::with_online(online.clone())
+                .with_cache(cache.to_path_buf())
+                .find(item)
+                .await
+        });
+        assert!(found.is_some(), "{at}");
+        assert!(
+            disk.get(item.id, online.name(), &song).is_some(),
+            "{at}: a lookup asked after the repick was not cached"
         );
     }
 
