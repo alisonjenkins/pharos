@@ -126,6 +126,9 @@ enum Fail {
     Cancelled,
     /// Writing on would leave less than the minimum free; carries free bytes.
     LowDisk(u64),
+    /// A whole new body would not fit over the partial file it replaces:
+    /// the part and its validator stay, and the job tries again later.
+    ReplacementLowDisk(u64),
     /// The cap shared with other downloads cannot be checked yet: wait and
     /// try again, keeping the partial file.
     AccountingUnknown,
@@ -628,6 +631,21 @@ impl Gate {
                 Ok(()) => break Outcome::Ok,
                 Err(Fail::Cancelled) => break Outcome::Cancelled,
                 Err(Fail::LowDisk(free)) => break Outcome::LowDisk(free),
+                Err(Fail::ReplacementLowDisk(free)) => {
+                    // The old bytes are on disk and counted already: deleting
+                    // them frees nothing an eviction would not, and keeping
+                    // them lets a later try resume.
+                    log::info!(
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk free_bytes={free} attempt={attempt} wait_ms={}",
+                        part_len(),
+                        started.elapsed().as_millis(),
+                        backoff.as_millis()
+                    );
+                    self.sleep_backoff(&mut backoff, &mut epoch).await;
+                    if self.yield_to_playback(id, &st) {
+                        break Outcome::Yielded;
+                    }
+                }
                 Err(Fail::AccountingUnknown) => {
                     if self
                         .wait_for_accounting(id, &st, attempt, started, &mut backoff, &mut epoch)
@@ -811,7 +829,13 @@ impl Gate {
             // bytes as room (they go when the part is truncated, below); a
             // refusal keeps them and their validator.
             let replacing = !append && pos > 0;
-            let mut reserved_ahead = self.reserve(id, left(start), 0, unknown_len, replacing)?;
+            let mut reserved_ahead = match self.reserve(id, left(start), 0, unknown_len, replacing)
+            {
+                Err(Fail::LowDisk(free)) if replacing => {
+                    return Err(Fail::ReplacementLowDisk(free))
+                }
+                other => other?,
+            };
             let mut written = start;
             let mut since_check = 0u64;
             let mut file = self
@@ -2060,6 +2084,57 @@ mod tests {
         release.store(true, Ordering::SeqCst);
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert_eq!(read(&r.cache, "track/1"), body(1000, 1));
+    }
+
+    /// A whole new body refused for low disk keeps the old part and its
+    /// validator: the bytes are on disk and counted already, so the job
+    /// backs off and tries again, resuming them once there is room.
+    #[test]
+    fn a_replacement_refused_for_low_disk_keeps_the_part_and_its_validator() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let room = Arc::new(AtomicU64::new(MIN_FREE_BYTES + 100));
+        let r2 = room.clone();
+        let r = rig_with_free(
+            "replacement-low-disk",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| Ok(r2.load(Ordering::SeqCst))),
+        );
+        let part = r.cache.part_path("track/1");
+        // The first attempt has room; the drop leaves 600 bytes.
+        room.store(MIN_FREE_BYTES + 5000, Ordering::SeqCst);
+        r.dl.prefetch(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 600) {
+            assert!(Instant::now() < until, "no partial file");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Too little for the new version even with the old part as room.
+        room.store(MIN_FREE_BYTES + 100, Ordering::SeqCst);
+        r.srv.edit(|s| s.etag("vB").ignore_range());
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.srv.seen().len() < 4 {
+            assert!(Instant::now() < until, "no retries: {:?}", r.srv.seen());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            std::fs::metadata(&part).map(|m| m.len()).ok(),
+            Some(600),
+            "the refused replacement deleted the part"
+        );
+        let seen = r.srv.seen();
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|s| s.if_range.as_deref() == Some("\"vA\"")),
+            "a retry lost the part's validator: {seen:?}"
+        );
+        assert!(!r.cache.is_complete("track/1"));
     }
 
     /// A whole new body that replaces a partial file is admitted with the
