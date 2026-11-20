@@ -3955,11 +3955,22 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     // A walk that fell short leaves the folder unknown from before the
     // terminal record is published: an admission must not see the low
     // figure first.
+    // Only while this run owns the item: a replacement that took it over
+    // measures the folder itself, and an old run's short walk must not
+    // leave it unknown under the replacement's admission.
     if !disk.is_whole() {
         let dir = inner.item_dir(&user, &item);
         let mut st = lock(&inner.state);
-        if !st.leftover.contains(&dir) {
+        let owner = st.runs.get(&(user.clone(), item.clone())) == Some(&run);
+        if owner && !st.leftover.contains(&dir) {
             st.leftover.push(dir);
+        } else if !owner {
+            emit(
+                false,
+                format!(
+                    "pharos: video folder short walk not marked item={item} run={run} reason=run_superseded"
+                ),
+            );
         }
     }
     let mut cleaned = None;
@@ -4118,7 +4129,11 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     let mut resume = None;
     let owned = {
         let mut st = lock(&inner.state);
-        if !cleaned || !disk.is_whole() {
+        let key = (user.clone(), item.clone());
+        let owned = st.runs.get(&key) == Some(&run);
+        // A cleanup that failed leaves the folder unknown whoever owns it;
+        // a short walk only while this run still does.
+        if !cleaned || (owned && !disk.is_whole()) {
             let dir = inner.item_dir(&user, &item);
             if !st.leftover.contains(&dir) {
                 st.leftover.push(dir);
@@ -4130,8 +4145,6 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         if let Some(i) = st.terminating.iter().position(|d| *d == dir) {
             st.terminating.remove(i);
         }
-        let key = (user.clone(), item.clone());
-        let owned = st.runs.get(&key) == Some(&run);
         if owned {
             st.runs.remove(&key);
         }
@@ -11973,6 +11986,40 @@ pub(crate) mod tests {
         );
         assert!(store.size_unknown(), "a short walk left the folder known");
         UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
+    /// CR review 5995575621 (kept_video_disk.rs:3957-3964): a run that a
+    /// replacement took over before its short terminal walk does not mark
+    /// the folder unknown: the replacement's admission is not refused over
+    /// an old run's walk.
+    #[tokio::test]
+    async fn a_superseded_runs_short_walk_leaves_the_folder_known() {
+        let rig = Rig::new("short-walk-superseded");
+        let dir = rig.dir.join("u1").join("1");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        {
+            let mut st = lock(&store.inner.state);
+            let key = ("u1".to_owned(), "1".to_owned());
+            let run = st.runs[&key];
+            st.runs.insert(key, run + 1_000);
+        }
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        assert!(
+            !lock(&store.inner.state).leftover.contains(&dir),
+            "the superseded run's short walk left the folder unknown"
+        );
+        assert!(
+            !lines("pharos: video folder short walk not marked item=1").is_empty(),
+            "no verdict logged"
+        );
     }
 
     /// A download bigger than its estimate, finished while the walk of its
