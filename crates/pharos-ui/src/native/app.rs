@@ -5966,7 +5966,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // first negotiation), the stream keeps going and only the grant is
     // negotiated again. A renewal the server did not adopt has a new play
     // session: the stream's own may have ended with the grace, so its next
-    // network failure renegotiates instead of failing (B1482).
+    // network failure renegotiates instead of failing (B1482). The renewal
+    // names the stream's session so a server that lost its grant in a
+    // rollout keeps it rather than listing a second one (B1490).
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -6000,12 +6002,13 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     return;
                 }
                 match api
-                    .play(
+                    .renew(
                         &info,
                         id,
                         &p.0.version,
                         &negotiation_capabilities(kind, *auto_cap.peek()),
                         asked,
+                        &p.0.session,
                     )
                     .await
                 {
