@@ -1312,6 +1312,16 @@ impl Cache {
 
     /// [`Cache::truncate_part`] with the cache's lock already held.
     fn truncate_part_locked(&self, id: &str) -> std::io::Result<()> {
+        match self.open_for_truncate(id)? {
+            Some(f) => f.set_len(0),
+            None => Ok(()),
+        }
+    }
+
+    /// `id`'s `.part` opened for writing, to be emptied (None when there is
+    /// none): the step a truncation fails at, taken before a replacement
+    /// evicts anything for it.
+    fn open_for_truncate(&self, id: &str) -> std::io::Result<Option<std::fs::File>> {
         let p = self.part_path(id);
         #[cfg(test)]
         if TRUNCATE_FAULT.with(std::cell::Cell::get)
@@ -1323,8 +1333,8 @@ impl Cache {
             return Err(std::io::Error::other("truncate refused for the test"));
         }
         match std::fs::OpenOptions::new().write(true).open(&p) {
-            Ok(f) => f.set_len(0),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1653,10 +1663,15 @@ impl Cache {
         let mut now = raw;
         let mut evicted = false;
         let mut parts = None;
-        if let Reclaim::Emptied(_) = reclaim {
+        // A replacement's part is touched last: opened for emptying before
+        // anything goes (where a truncation fails), emptied only once the
+        // evictions and its credit cover the need.
+        let mut part_file = None;
+        let replacing = matches!(reclaim, Reclaim::Emptied(_));
+        let mut evicted_n = 0usize;
+        if replacing {
             // Nothing is evicted for a replacement that cannot proceed:
-            // what eviction could give is added up first, and the part is
-            // emptied before the first track goes.
+            // what eviction could give is added up first.
             let listed = self.part_victims(&s, Some(downloading));
             let evictable = Self::evictable_track_bytes(&s, Some(downloading))
                 .saturating_add(listed.iter().fold(0u64, |n, (_, b)| n.saturating_add(*b)));
@@ -1666,24 +1681,32 @@ impl Cache {
                 );
                 return Err(NoRoom::LowDisk(raw.saturating_sub(outstanding)));
             }
-            self.empty_replaced(downloading, reclaim, Some(&*s))?;
+            part_file = match self.open_for_truncate(downloading) {
+                Ok(f) => f,
+                Err(e) => return Err(truncate_refused(downloading, &e, 0)),
+            };
             parts = Some(listed);
         }
+        let mut stopped = false;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
             };
             if !self.remove_locked(&mut s, &id) {
+                stopped = true;
                 break;
             }
             now = now.saturating_add(bytes);
             evicted = true;
+            evicted_n += 1;
             log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
         }
         // Finished tracks first; then parts no job holds, oldest first. One
         // that will not go is passed over for the next, its bytes not
         // credited.
-        if now < want {
+        // A replacement stops at the first victim that will not go: the
+        // shortfall is known, and nothing more is evicted for it.
+        if now < want && !(replacing && stopped) {
             let mut queue = parts
                 .unwrap_or_else(|| self.part_victims(&s, Some(downloading)))
                 .into_iter();
@@ -1692,26 +1715,35 @@ impl Cache {
                     break;
                 };
                 if !self.remove_part_locked(&id, bytes, "low_disk") {
+                    if replacing {
+                        break;
+                    }
                     continue;
                 }
                 now = now.saturating_add(bytes);
+                evicted_n += 1;
             }
         }
         if evicted {
             self.persist_locked(&s);
         }
         let room = now.saturating_sub(outstanding);
-        if now >= want {
-            Ok(room)
-        } else {
-            if let Reclaim::Emptied(_) = reclaim {
-                // Counted as enough, but a victim would not go.
+        if now < want {
+            if replacing {
+                // Counted as enough, but a victim would not go. Evicted
+                // tracks are gone; the part is kept as it was.
                 log::warn!(
-                    "cache admission id={downloading} verdict=refused reason=eviction_short free_bytes={now} want={want} part=emptied"
+                    "cache admission id={downloading} verdict=refused reason=eviction_short free_bytes={now} want={want} evicted={evicted_n} part=kept"
                 );
             }
-            Err(NoRoom::LowDisk(room))
+            return Err(NoRoom::LowDisk(room));
         }
+        if let Some(f) = part_file {
+            if let Err(e) = f.set_len(0) {
+                return Err(truncate_refused(downloading, &e, evicted_n));
+            }
+        }
+        Ok(room)
     }
 
     /// Empties a replacement's old part (see [`Cache::check_free`]); other
@@ -1730,14 +1762,20 @@ impl Cache {
             Some(_) => self.truncate_part_locked(downloading),
             None => self.truncate_part(downloading),
         };
-        emptied.map_err(|e| {
-            log::warn!(
-                "cache admission id={downloading} verdict=refused reason=truncate_failed error={e} evicted=0"
-            );
-            NoRoom::PartNotTruncated
-        })
+        emptied.map_err(|e| truncate_refused(downloading, &e, 0))
     }
+}
 
+/// The refusal of a replacement whose part would not empty, after
+/// `evicted` evictions made for it.
+fn truncate_refused(downloading: &str, e: &std::io::Error, evicted: usize) -> NoRoom {
+    log::warn!(
+        "cache admission id={downloading} verdict=refused reason=truncate_failed error={e} evicted={evicted}"
+    );
+    NoRoom::PartNotTruncated
+}
+
+impl Cache {
     fn persist_locked(&self, s: &State) {
         let index = IndexFile {
             version: INDEX_VERSION,
@@ -2125,6 +2163,42 @@ pub(crate) mod tests {
             (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
             (0, Some(0), 1300)
         );
+    }
+
+    /// CR 4646035938: a replacement's part is touched last. A track that
+    /// will not go after the estimate said eviction would fit stops the
+    /// eviction there: the refusal is LowDisk, the part is as it was, and
+    /// no track after the failing one is evicted.
+    #[test]
+    fn a_replacement_whose_victim_will_not_go_keeps_its_part() {
+        let d = tmp("replace-victim-stuck");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        put(&c, "track/a", 400);
+        put(&c, "track/b", 400);
+        c.protect(&[]);
+        // The oldest track's file will not unlink: a folder in its place.
+        let stuck = c.final_path("track/a");
+        std::fs::remove_file(&stuck).unwrap();
+        std::fs::create_dir_all(stuck.join("held")).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free, 600 reclaimed: 1300 needs one track; both count as
+        // evictable, so the estimate says it fits.
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        assert!(matches!(verdict, Err(NoRoom::LowDisk(_))), "{verdict:?}");
+        assert_eq!(c.in_progress_bytes(), Some(600), "the part was touched");
+        assert_eq!(c.reserved_bytes(), 0);
+        assert!(
+            c.final_path("track/b").exists(),
+            "a track was evicted after the failing unlink"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache admission id=track/x verdict=refused reason=eviction_short")
+                && l.contains("evicted=0 part=kept")),
+            "the refusal did not say the part was kept"
+        );
+        std::fs::remove_dir_all(&stuck).unwrap();
     }
 
     /// CR 4644634482: a replacement that eviction could not make room for
