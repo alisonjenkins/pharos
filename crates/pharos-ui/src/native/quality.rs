@@ -367,6 +367,7 @@ impl Watch {
     /// the next, are not the link's (B1489).
     pub fn load_failed(&mut self) {
         self.failing = true;
+        self.headroom_since = None;
         let kept = self.stall_at_load;
         self.stalls
             .retain(|&at| kept.is_some_and(|kept| at <= kept));
@@ -415,7 +416,10 @@ impl Watch {
             (_, None) => None,
         };
         let estimate = self.estimate_bps.filter(|_| self.samples >= MIN_SAMPLES);
+        // A link that is failing fetches has no headroom, however fast its
+        // last answers were.
         let headroom = !settling
+            && !self.failing
             && up_target(self.cap, self.ceiling, self.source_bps).is_some_and(|(_, to)| {
                 estimate.is_some_and(|e| e.saturating_mul(10) >= to.saturating_mul(UP_ABOVE_TENTHS))
             });
@@ -903,6 +907,23 @@ mod tests {
         assert_eq!(w.evaluate(81 * MS), None);
         assert_eq!(w.evaluate(101 * MS), None);
         assert!(w.evaluate(141 * MS).is_some());
+    }
+
+    /// V1480: a failing fetch is no headroom, and a failure restarts the
+    /// headroom clock.
+    #[test]
+    fn a_failed_load_restarts_the_headroom_clock() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 1_200_000, 3);
+        assert!(w.evaluate(20 * MS).is_some());
+        downloads(&mut w, 1_000_000, 12_000_000, 8);
+        assert_eq!(w.evaluate(40 * MS), None);
+        w.load_failed();
+        assert_eq!(w.evaluate(101 * MS), None, "no step up while failing");
+        downloads(&mut w, 1_000_000, 12_000_000, 1);
+        assert_eq!(w.evaluate(110 * MS), None);
+        assert_eq!(w.evaluate(169 * MS), None, "the clock restarted");
+        assert!(w.evaluate(171 * MS).is_some());
     }
 
     #[test]
