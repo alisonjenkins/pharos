@@ -1132,8 +1132,11 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
   - Accounting that is not ready is a wait, never a failure. The music
     downloader keeps a track's `.part` and retries with backoff while the
     video store's size is unknown (`NoRoom::AccountingUnknown`); a video run
-    waits before it plans until the music accounting is ready. Readiness only
-    moves from false to true in the app, so neither waits for long.
+    waits before it plans until the music accounting is ready. The cache's
+    readiness at start only moves from false to true in the app. A runtime
+    wait for unknown size accounting is another matter: it ends only when
+    the accounting is known again or the job is cancelled, and the capped
+    backoff bounds each retry's delay, not the whole wait.
   - Two downloads can store the same request key: the index keeps one copy
     per item folder, and a removal drops only its own.
   - A Ready record is published only after the folders above it (the user's,
