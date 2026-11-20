@@ -5688,9 +5688,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The API generation the latest negotiation started on.
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
-    // Bumped when a renewal marks the session suspect, so a failure the
-    // player showed before the renewal answered is looked at again.
-    let mut suspect_marks = use_signal(|| 0u32);
+    // Bumped each time a renewal answers, adopted, resumed or not, so a
+    // failure the player showed before it answered is looked at again.
+    let mut renewal_marks = use_signal(|| 0u32);
     let negotiated_at = Rc::clone(&negotiated_gen);
     let gap_notify = Rc::clone(&notify);
     let carry_flag = Rc::clone(&picks_in_primary);
@@ -5981,7 +5981,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // first negotiation), the stream keeps going and only the grant is
     // negotiated again. A renewal the server did not adopt has a new play
     // session: the stream's own may have ended with the grace, so its next
-    // network failure renegotiates instead of failing (B1482).
+    // network failure renegotiates instead of failing (B1482). The renewal
+    // names the stream's session so a server that lost its grant in a
+    // rollout keeps it rather than listing a second one (B1490).
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -6015,12 +6017,13 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     return;
                 }
                 match api
-                    .play(
+                    .renew(
                         &info,
                         id,
                         &p.0.version,
                         &negotiation_capabilities(kind, *auto_cap.peek()),
                         asked,
+                        &p.0.session,
                     )
                     .await
                 {
@@ -6029,9 +6032,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         // The play session id is a stream credential (B256).
                         let adopted = decision.play_session == p.0.session;
                         p.0.session_suspect.set(!adopted);
-                        if !adopted {
-                            suspect_marks += 1;
-                        }
+                        // A failure shown while the renewal was out is retried
+                        // on the renewed grant even when it kept the session:
+                        // a rollout fails the stream, then resumes it (B1490).
+                        renewal_marks += 1;
                         platform::info(&format!(
                             "pharos: playback grant renewed after reconnect method={} attempt={attempt} adopted={adopted}",
                             decision.method
@@ -6043,7 +6047,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     Err(e) if attempt == RENEW_ATTEMPTS => {
                         // No grant holds the stream's session now: it ends with the grace.
                         p.0.session_suspect.set(true);
-                        suspect_marks += 1;
+                        renewal_marks += 1;
                         platform::warn(&format!(
                             "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
                         ));
@@ -6204,7 +6208,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         notice: notice(),
                         manual_cap: manual_cap(),
                         auto_cap: quality::auto_in_force(auto_cap(), hls_engine_adapts()),
-                        suspect_marks,
+                        renewal_marks,
                         on_quality_pick: {
                             let (watch, notify) = (watch.clone(), Rc::clone(&notify));
                             move |pick: Option<u64>| {
@@ -6367,10 +6371,12 @@ fn renegotiates_quietly(kind: FailureKind, session_suspect: bool) -> bool {
     session_suspect && matches!(kind, FailureKind::Network | FailureKind::Server)
 }
 
-/// A failure already on screen when the session turns suspect is one
-/// [`renegotiates_quietly`] would have cured had the mark come first.
-fn shown_failure_renegotiates(shown: Option<&PlayFailure>, session_suspect: bool) -> bool {
-    shown.is_some_and(|f| renegotiates_quietly(f.kind, session_suspect))
+/// A failure already on screen when a renewal answers is one
+/// [`renegotiates_quietly`] would cure on a suspect session; once the grant
+/// is renewed it is retried whether or not the session was kept, since the
+/// server the stream failed on is back (B1482, B1490).
+fn renewal_retries_shown(shown: Option<&PlayFailure>) -> bool {
+    shown.is_some_and(|f| renegotiates_quietly(f.kind, true))
 }
 
 /// The line shown while the quality step renegotiates from `from` to `to` bps.
@@ -6559,8 +6565,8 @@ fn Player(
     on_advance: EventHandler<ItemRef>,
     watch: QualityWatch,
     on_quality: EventHandler<u64>,
-    /// Bumped each time a renewal marks this playback's session suspect.
-    suspect_marks: Signal<u32>,
+    /// Bumped each time a renewal of this playback's grant answers.
+    renewal_marks: Signal<u32>,
     slot: Slot,
     fade_in: FadeIn,
 ) -> Element {
@@ -7379,13 +7385,13 @@ fn Player(
             }
         }
     });
-    // A failure shown before the renewal marked the session suspect gets
-    // the renegotiation it would have had (B1482).
+    // A failure shown before the renewal answered gets the renegotiation it
+    // would have had (B1482), also when the renewal kept the session (B1490).
     use_effect({
         let (p, last_ms) = (Rc::clone(&p), Rc::clone(&last_ms.0));
         move || {
-            suspect_marks.read();
-            if !shown_failure_renegotiates(failed.peek().as_ref(), p.session_suspect.get()) {
+            renewal_marks.read();
+            if !renewal_retries_shown(failed.peek().as_ref()) {
                 return;
             }
             p.session_suspect.set(false);
@@ -9183,16 +9189,18 @@ mod tests {
         assert!(!renegotiates_quietly(FailureKind::Damaged, true));
     }
 
-    /// A network failure shown before the renewal marked the session
-    /// suspect is renegotiated once the mark lands; nothing else is (B1482).
+    /// A network or server failure shown before a renewal answered is
+    /// renegotiated once it lands, whether the renewal kept the session or
+    /// not; a damaged file and a healthy player are left alone (B1482, B1490).
     #[test]
-    fn a_failure_shown_before_the_mark_renegotiates_once_marked() {
+    fn a_failure_shown_before_the_renewal_renegotiates_once_it_lands() {
         let network = PlayFailure::stream(FailureKind::Network, "HTTP 401");
+        let server = PlayFailure::stream(FailureKind::Server, "HTTP 503");
         let damaged = PlayFailure::damaged("decode", None);
-        assert!(shown_failure_renegotiates(Some(&network), true));
-        assert!(!shown_failure_renegotiates(Some(&network), false));
-        assert!(!shown_failure_renegotiates(Some(&damaged), true));
-        assert!(!shown_failure_renegotiates(None, true));
+        assert!(renewal_retries_shown(Some(&network)));
+        assert!(renewal_retries_shown(Some(&server)));
+        assert!(!renewal_retries_shown(Some(&damaged)));
+        assert!(!renewal_retries_shown(None));
     }
 
     /// Auto quality uses a cap of 0 for "no cap", in both directions (B1481).
