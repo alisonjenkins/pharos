@@ -6,8 +6,6 @@
 //! production fence. The fence is kept per token file, so the other tests
 //! of the group, each with a file of its own, cannot set or lift it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::path::PathBuf;
 use std::time::Duration;
 
