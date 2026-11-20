@@ -652,7 +652,8 @@ impl Cache {
     /// Count what `used` reports (bytes other kinds of download hold) against
     /// the cap from now on, and evict music at once if that puts the cache
     /// over. Those bytes are never candidates for eviction here; only music
-    /// goes, so a full shared budget turns away new music, not video.
+    /// that is not pinned goes, so pinned music can keep the total over the
+    /// cap (a pin is never evicted).
     /// Returns the evicted ids.
     pub fn set_outside_used(&self, used: OutsideUsed) -> Vec<String> {
         *self.outside.lock().unwrap_or_else(PoisonError::into_inner) = Some(used);
@@ -1512,10 +1513,12 @@ impl Cache {
         }
     }
 
-    /// Bytes in every `.part` file in the cache folder, reserved or not. A
-    /// host's cap check adds this to `used_bytes` (finished tracks) and
-    /// `reserved_bytes` (what running downloads have yet to write): together
-    /// they are every byte the music cache holds or has claimed. A download
+    /// Bytes in every `.part` file in the cache folder, reserved or not: a
+    /// measurement on its own. A shared-cap check reads [`Cache::pending`]
+    /// instead, which takes what running downloads owe and what their parts
+    /// hold from one read of each part's length; this and `reserved_bytes`
+    /// read apart could count a write that lands between them twice, or
+    /// not at all. A download
     /// that was cancelled or yielded keeps its `.part` to resume from but
     /// drops its reservation, so this reads the folder, not the reserved ids.
     /// Free space already lacks these bytes, so the free-space check never
