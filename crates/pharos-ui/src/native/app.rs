@@ -5411,8 +5411,10 @@ struct Playing {
     offline: Option<OfflineSave>,
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
-    /// A renewal was not adopted, so `session` may have ended. Cleared by a
-    /// fragment that loads, which proves the stream's session alive.
+    /// A renewal was not adopted, so `session` may have ended. A fragment
+    /// that loads proves nothing: a released session still serves segments
+    /// until its grace runs out. Cleared by a renewal that adopts the
+    /// session, or spent by the failure it renegotiates.
     session_suspect: Cell<bool>,
     detail: Detail,
     /// The version playing, so a renewed grant stays on that file (empty: the primary).
@@ -7390,9 +7392,7 @@ fn Player(
                 let adapts = p.engine.adapts_quality();
                 let on_fragment: OnFragment = {
                     let (watch, assess) = (watch.clone(), Rc::clone(&assess));
-                    let p = Rc::clone(&p);
                     Rc::new(move |load| {
-                        p.session_suspect.set(false);
                         // Handing over, or already decided: no more downloads
                         // count. An engine that adapts itself needs no help.
                         if adapts || retiring.get() || decided.get() {
