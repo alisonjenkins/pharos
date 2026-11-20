@@ -266,6 +266,11 @@ struct State {
     /// has fetched and promoted. On disk, so no longer owed, but in no
     /// stored figure until the plan's inventory counts them.
     playlists_landed: HashMap<(String, String, u64), u64>,
+    /// Per run, after its plan is admitted: the bytes of media files it
+    /// has renamed to their final names and progress has not recorded
+    /// yet. On disk, so not owed, and in no stored figure until the
+    /// `publish` that counts them takes them out, in the same hold.
+    promoted: HashMap<(String, String, u64), u64>,
     /// Per run, before its plan is admitted: the record's reservation
     /// before the run's first playlist allowance. A run that ends with no
     /// plan gives its allowances back down to this, keeping the playlists
@@ -763,6 +768,7 @@ impl State {
         let stale = v.stale_on_disk;
         stored
             .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+            .saturating_add(self.promoted.get(&who).copied().unwrap_or(0))
             .saturating_add(stale)
     }
 
@@ -2045,18 +2051,45 @@ impl Inner {
     }
 
     /// Records progress; the record is written at most once a second
-    /// unless `force`.
+    /// unless `force`. `landed` is what this call adds to `bytes` of a
+    /// media file promoted since the last: it leaves the run's promoted
+    /// figure in the hold that puts it in the record's, so no reader
+    /// counts it twice, or not at all.
     fn publish(
         &self,
         user: &str,
         item: &str,
         run: u64,
         (done, total, bytes): (usize, u32, u64),
+        landed: u64,
         force: bool,
     ) {
         let done = u32::try_from(done).unwrap_or(u32::MAX);
         let due = {
             let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run) {
+                #[cfg(test)]
+                let before = find(&st.list, user, item).map(|v| st.owed(v, Some(run)));
+                if let Some(v) = st
+                    .list
+                    .iter_mut()
+                    .find(|v| v.user == user && v.item == item)
+                {
+                    v.state = KeptState::Downloading { done, total, bytes };
+                }
+                let who = (user.to_owned(), item.to_owned(), run);
+                if let Some(held) = st.promoted.get_mut(&who) {
+                    *held = held.saturating_sub(landed);
+                    if *held == 0 {
+                        st.promoted.remove(&who);
+                    }
+                }
+                #[cfg(test)]
+                tests::published(
+                    before,
+                    find(&st.list, user, item).map(|v| st.owed(v, Some(run))),
+                );
+            }
             let now = Instant::now();
             let due = force
                 || st.last_saved.map_or(true, |t| {
@@ -2073,17 +2106,6 @@ impl Inner {
             let _ = self.update_run(user, item, run, |v| {
                 v.state = KeptState::Downloading { done, total, bytes };
             });
-        } else {
-            let mut st = lock(&self.state);
-            if st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run) {
-                if let Some(v) = st
-                    .list
-                    .iter_mut()
-                    .find(|v| v.user == user && v.item == item)
-                {
-                    v.state = KeptState::Downloading { done, total, bytes };
-                }
-            }
         }
     }
 }
@@ -2640,6 +2662,18 @@ async fn fetch_once(
                     }
                 }
                 *st.playlists_landed.entry(staged.who.clone()).or_default() += moved;
+            } else if renamed.is_ok() && limit.is_none() {
+                // A media file moves from staged to promoted in this hold,
+                // with the rename, and stays there until the `publish`
+                // that records it: on disk throughout, and counted once.
+                let moved = std::mem::take(&mut staged.len);
+                if let Some(held) = st.staged.get_mut(&staged.who) {
+                    *held = held.saturating_sub(moved);
+                    if *held == 0 {
+                        st.staged.remove(&staged.who);
+                    }
+                }
+                *st.promoted.entry(staged.who.clone()).or_default() += moved;
             }
             Promote::Renamed(renamed)
         }
@@ -3753,7 +3787,7 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
     }
     let todo = missing_files(&all, &have);
     let mut done = all.len() - todo.len();
-    inner.publish(user, item, run, (done, total, bytes), true);
+    inner.publish(user, item, run, (done, total, bytes), 0, true);
 
     let short_tails = &short_tails;
     let mut results = stream::iter(todo)
@@ -3767,7 +3801,14 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
             None => skipped.push(key),
         }
         done += 1;
-        inner.publish(user, item, run, (done, total, bytes), false);
+        inner.publish(
+            user,
+            item,
+            run,
+            (done, total, bytes),
+            len.unwrap_or(0),
+            false,
+        );
     }
     Ok(Finished {
         bytes,
@@ -4008,6 +4049,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         let who = (user.clone(), item.clone(), run);
         let pre_plan = st.playlists_taken.remove(&who).is_some();
         let landed = st.playlists_landed.remove(&who).unwrap_or(0);
+        st.promoted.remove(&who);
         let base = st.playlists_base.remove(&who);
         // A run that ends before its plan is admitted (it parked, or
         // failed) gives back the playlist allowances it did not use: what
@@ -5863,6 +5905,17 @@ pub(crate) mod tests {
         /// The admitted record's figure (`reserved`), set as a plan is
         /// admitted, before anything is fetched.
         static ADMITTED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// Each progress publish's owed figure for its run, before and
+        /// after it, read in the one hold.
+        pub(super) static PUBLISHED: RefCell<Vec<(Option<u64>, Option<u64>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn published(before: Option<u64>, after: Option<u64>) {
+        PUBLISHED.with(|p| p.borrow_mut().push((before, after)));
     }
 
     pub(super) fn admitted(inner: &Inner, user: &str, item: &str) {
@@ -10428,6 +10481,30 @@ pub(crate) mod tests {
             refused.iter().any(|l| l.contains("step=plan")),
             "{refused:?}"
         );
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:2582): a media file renamed to
+    /// its final name stays counted as on disk until the progress publish
+    /// that records it, and that publish moves it into the record's figure
+    /// without counting it again: the run's owed figure is the same either
+    /// side of every publish.
+    #[tokio::test]
+    async fn a_promoted_segment_is_counted_once_until_progress_records_it() {
+        let rig = Rig::new("promoted-counted-once");
+        let store = rig.open();
+        PUBLISHED.with(|p| p.borrow_mut().clear());
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let published = PUBLISHED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        assert!(published.len() > 1, "{published:?}");
+        for (before, after) in &published {
+            assert!(before.is_some(), "{published:?}");
+            assert_eq!(
+                before, after,
+                "a publish moved the owed figure: {published:?}"
+            );
+        }
     }
 
     /// Review 5987746170 (kept_video_disk.rs:3357): a run whose inventory
