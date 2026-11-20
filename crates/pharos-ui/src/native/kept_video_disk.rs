@@ -91,6 +91,9 @@ pub enum OpenFailed {
     /// owner's ([`token_for_owner`](super::kept_video::token_for_owner)),
     /// and why.
     NotOwner(String),
+    /// Failed in a way no retry changes (no client could be built, too many
+    /// redirects, an answer from outside the server's base path), and why.
+    Refused(String),
 }
 
 impl From<FetchError> for OpenFailed {
@@ -2278,6 +2281,20 @@ async fn fetch_file(
                 );
                 return Err(Stop::Refused(reason));
             }
+            FetchOnce::Refused(why) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep file failed item={item} url_path={} status=none attempt={} terminal=true why={why}",
+                        url_path(key),
+                        attempt + 1
+                    ),
+                );
+                return Err(Stop::Failed(format!(
+                    "{} could not be fetched: {why}",
+                    url_path(key)
+                )));
+            }
             FetchOnce::Fetch(e) => e,
         };
         attempt += 1;
@@ -2316,6 +2333,8 @@ enum FetchOnce {
     NotOwner(String),
     /// A playlist names this file, which no stored key can serve offline.
     NotLocal(String),
+    /// The request failed in a way no retry changes, and why.
+    Refused(String),
 }
 
 /// Waits for a chunk's write to complete. In a test the write can be held
@@ -2440,6 +2459,7 @@ async fn fetch_once(
         .await
         .map_err(|e| match e {
             OpenFailed::Fetch(e) => FetchOnce::Fetch(e),
+            OpenFailed::Refused(why) => FetchOnce::Refused(why),
             OpenFailed::NotOwner(why) => {
                 // Marked at the refusal: a sign-in from here on finds the
                 // run parking and leaves it a pending resume.
@@ -6137,6 +6157,8 @@ pub(crate) mod tests {
         /// The server's address with its base path; unset, the planning
         /// origin with none.
         base: Mutex<Option<String>>,
+        /// key -> why its request fails in a way no retry changes.
+        refusals: Mutex<HashMap<String, String>>,
     }
 
     impl FakeServer {
@@ -6338,6 +6360,9 @@ pub(crate) mod tests {
                 // fetcher reads it.
                 let token = self.token(owner).map_err(OpenFailed::NotOwner)?;
                 self.sent.lock().unwrap().push((key.to_owned(), token));
+                if let Some(why) = self.refusals.lock().unwrap().get(key).cloned() {
+                    return Err(OpenFailed::Refused(why));
+                }
                 self.body(key).await.map_err(OpenFailed::Fetch)
             })
         }
@@ -6828,6 +6853,36 @@ pub(crate) mod tests {
         assert!(
             !failed[0].contains("PlaySessionId"),
             "no query in a log line"
+        );
+    }
+
+    /// CR 4642574399: a request that fails in a way no retry changes (here
+    /// too many redirects) fails the download at once, not after the
+    /// network backoff, and the log says it was terminal.
+    #[tokio::test]
+    async fn a_terminal_request_failure_is_not_retried() {
+        let rig = Rig::new("terminal");
+        rig.server
+            .refusals
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), "too many redirects".into());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed");
+        };
+        assert!(reason.contains("too many redirects"), "{reason}");
+        assert!(
+            rig.slept.lock().unwrap().is_empty(),
+            "a terminal failure was retried"
+        );
+        let failed = lines("pharos: video keep file failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            failed[0].contains("terminal=true") && failed[0].contains("attempt=1"),
+            "{failed:?}"
         );
     }
 

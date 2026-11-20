@@ -3461,10 +3461,9 @@ impl Fetcher for ServerFetcher {
             let token = token_for_run(owner).map_err(OpenFailed::NotOwner)?;
             // No client, no download: never a default one without the
             // redirect policy.
-            let client = download_http().as_ref().map_err(|why| FetchError {
-                status: None,
-                message: why.clone(),
-            })?;
+            let client = download_http()
+                .as_ref()
+                .map_err(|why| OpenFailed::Refused(format!("no client: {why}")))?;
             let base = server();
             let url = tv_page::server_url(&base, key);
             let mut req = client.get(&url);
@@ -3474,9 +3473,18 @@ impl Fetcher for ServerFetcher {
             let resp = tokio::time::timeout(DOWNLOAD_STALL, req.send())
                 .await
                 .map_err(|_| no_answer("request"))?
-                .map_err(|e| FetchError {
-                    status: None,
-                    message: format!("send {}", tv_page::error_chain(&e.without_url())),
+                .map_err(|e| {
+                    // Too many redirects answers the same on every try.
+                    let redirect = e.is_redirect();
+                    let chain = tv_page::error_chain(&e.without_url());
+                    if redirect {
+                        OpenFailed::Refused(format!("send {chain}"))
+                    } else {
+                        OpenFailed::Fetch(FetchError {
+                            status: None,
+                            message: format!("send {chain}"),
+                        })
+                    }
                 })?;
             let status = resp.status();
             // Where a followed redirect left the request: a playlist's
@@ -3492,10 +3500,9 @@ impl Fetcher for ServerFetcher {
                             url_path(key),
                             url_path(resp.url().as_str())
                         );
-                        return Err(OpenFailed::Fetch(FetchError {
-                            status: None,
-                            message: "redirected outside the server's base path".to_owned(),
-                        }));
+                        return Err(OpenFailed::Refused(
+                            "redirected outside the server's base path".to_owned(),
+                        ));
                     }
                 }
             };
