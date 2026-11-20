@@ -13,12 +13,14 @@ pub use pharos_content::token::{fingerprint, Ended, ForgetIf, Forgotten, Pairing
 /// The stored token and its user; `None` when the file is absent or holds no
 /// token.
 pub fn read(path: &Path) -> Result<Option<Stored>, String> {
+    watch_stores();
     pharos_content::token::read(path).map_err(|e| e.to_string())
 }
 
 /// A new sign-in's token. Whoever the file held it for is gone with it: the
 /// new token's user is unknown until `store_user`.
 pub fn store(path: &Path, token: &str) -> Result<(), String> {
+    watch_stores();
     pharos_content::token::store(path, token).map_err(|e| e.to_string())
 }
 
@@ -97,17 +99,26 @@ pub fn fence_every_file(reason: &str) {
     pharos_content::token::fence_every_file(reason);
 }
 
-/// Set by every token store: the token a cache holds may be another now.
+/// Set by every change to what a token read returns (a store, a removal,
+/// a revocation marker, a fence), from inside that operation: the token a
+/// cache holds may be another now, or none.
 static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a token store ran since the last call.
+/// Whether the token file changed since the last call.
 pub fn take_stale() -> bool {
     STALE.swap(false, std::sync::atomic::Ordering::AcqRel)
 }
 
-/// Registers [`after_store`] with `pharos_content::token`, once.
+/// Registers [`after_store`] and [`after_change`] with
+/// `pharos_content::token`, once.
 fn watch_stores() {
     pharos_content::token::on_stored(after_store);
+    pharos_content::token::on_changed(after_change);
+}
+
+/// The change hook: marks a cached token stale, whatever the change was.
+fn after_change(_reason: &str) {
+    STALE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// The store hook: marks a cached token stale. The store replaced the
@@ -217,6 +228,7 @@ pub fn forget_token_with(
 /// the token goes while it is `seen` (any with `None`), a replacement is
 /// kept, and one that will not go is marked revoked for `user`.
 pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
+    watch_stores();
     pharos_content::token::end_session(path, seen, user)
 }
 
@@ -431,10 +443,78 @@ mod sign_out_tests {
             fence(&path).refuses("tokA"),
             "the overwritten token was let back"
         );
-        assert!(take_stale(), "the cached token was not marked stale");
         // A fence naming another token stays when a third is stored.
         pharos_content::token::store(&path, "tokC").unwrap();
         assert!(fence(&path).refuses("tokA"));
         assert!(!fence(&path).refuses("tokC"));
+    }
+
+    /// Runs the calling test, named `name` in this module, in a child
+    /// process of its own with `env` set: true in the child, which goes on
+    /// with the test body; the parent asserts the child passed and returns
+    /// false. For tests of process-wide state other tests also change.
+    fn in_child(name: &str, env: &str) -> bool {
+        if std::env::var_os(env).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!(
+                    "{}::{name}",
+                    module_path!().trim_start_matches("pharos_ui::")
+                ),
+                "--test-threads=1",
+            ])
+            .env(env, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran nothing: {stdout}"
+        );
+        false
+    }
+
+    /// CR 4640611429 and the body item on android.rs:198: every change to
+    /// what a token read returns marks a cached token stale, from inside
+    /// the operation: a store, a session end that removes the token, one
+    /// that marks it revoked, and a fence. Process-wide, so in a child.
+    #[test]
+    fn every_token_file_change_marks_the_cache_stale() {
+        if !in_child(
+            "every_token_file_change_marks_the_cache_stale",
+            "PHAROS_TEST_TOKEN_STALE",
+        ) {
+            return;
+        }
+        let d = super::super::test_dir::TmpDir::new("stale-every-change");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        let _ = take_stale();
+        store(&path, "tokB").unwrap();
+        assert!(take_stale(), "a store did not mark the cache stale");
+        // The content worker's own end of a refused session, not through
+        // this module: the hook is registered once, process-wide.
+        let _ = pharos_content::token::end_session(&path, Some("tokB"), None);
+        assert!(take_stale(), "a removal did not mark the cache stale");
+        store(&path, "tokC").unwrap();
+        let _ = take_stale();
+        pharos_content::token::faults::REMOVE.with(|f| f.set(true));
+        let ended = pharos_content::token::end_session(&path, Some("tokC"), None);
+        pharos_content::token::faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+        assert!(
+            take_stale(),
+            "a revocation marker did not mark the cache stale"
+        );
+        pharos_content::token::set_fence(&path, SignOutFence::Every, "test");
+        assert!(take_stale(), "a fence did not mark the cache stale");
     }
 }

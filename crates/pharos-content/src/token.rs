@@ -137,6 +137,7 @@ pub fn fence_every_file(reason: &str) {
     let _held = hold();
     EVERY_FILE.store(true, std::sync::atomic::Ordering::SeqCst);
     log::warn!("token fence verdict=every scope=process reason={reason}");
+    changed("fence");
 }
 
 fn fence_held(path: &Path) -> Fence {
@@ -169,6 +170,7 @@ fn set_fence_held(path: &Path, next: Fence, reason: &str) {
             next.label(),
             was.label()
         );
+        changed("fence");
     }
 }
 
@@ -406,6 +408,24 @@ pub fn on_stored(hook: fn(&str, Option<&str>)) {
     let _ = ON_STORED.set(hook);
 }
 
+/// What runs whenever an operation changed what a read of a token file
+/// returns: a store, a removal, a revocation marker written, or a fence
+/// set or lifted. Called from inside that operation, under the file's
+/// lock, so a cache of the token cannot miss a change: the same rules as
+/// [`ON_STORED`] apply.
+static ON_CHANGED: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Registers the change hook ([`ON_CHANGED`]), once; it gets the reason.
+pub fn on_changed(hook: fn(&str)) {
+    let _ = ON_CHANGED.set(hook);
+}
+
+fn changed(reason: &str) {
+    if let Some(hook) = ON_CHANGED.get() {
+        hook(reason);
+    }
+}
+
 pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let _held = hold();
     let token = token.trim();
@@ -517,6 +537,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             if let Some(hook) = ON_STORED.get() {
                 hook(&fingerprint(token), replaced.as_deref());
             }
+            changed("stored");
         }
         Ok(other) => {
             let found = if other.is_some() {
@@ -765,6 +786,7 @@ fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ende
 fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: String) -> Ended {
     match write_marker(path, named, token_fingerprint) {
         Ok(()) => {
+            changed("marked");
             log::warn!(
                 "token revocation marker verdict=written reason=token_not_removed user={} error={removal}",
                 named.unwrap_or("")
@@ -902,7 +924,7 @@ fn remove(path: &Path) -> Result<Forgotten, ContentError> {
         return Err(err(path, "removal failed"));
     }
     match std::fs::remove_file(path) {
-        Ok(()) => {}
+        Ok(()) => changed("removed"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(absent(path)),
         Err(e) => return Err(err(path, e)),
     }
