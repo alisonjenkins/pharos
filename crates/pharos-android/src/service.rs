@@ -728,10 +728,19 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn a_cache_that_failed_to_enable_is_tried_again() {
         use super::{ensure_cache, CacheSetup};
+        /// Removes the fixture folder when the test ends, a panic included.
+        /// Declared before the library, so the library drops first.
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let dir =
             std::env::temp_dir().join(format!("pharos-android-cache-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _fixture = Fixture(dir.clone());
         let files = dir.to_str().unwrap().to_owned();
         let lib = content::Library::connect("http://127.0.0.1:9", &dir.join("token")).unwrap();
         // A file where the cache's folder should be.
@@ -747,8 +756,6 @@ mod tests {
             ensure_cache(&lib, &files, "connect"),
             CacheSetup::AlreadyEnabled
         );
-        drop(lib);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A hook that failed is run again by the next caller, and one that
