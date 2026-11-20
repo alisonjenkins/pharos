@@ -21,10 +21,10 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::kept_video::{
     absolute_url, cache_name, cap_from_stored, cap_selected, check_not_kept, find, fits,
-    insert_front, interrupted, is_retryable, missing_files, needs_admission, new_record,
-    progress_due, put_is_retryable, reserved_by, retry_delay_secs, stale_files, still_needed, take,
-    url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
-    CAP_KEY, RECORDS_KEY,
+    insert_front, interrupted, is_retryable, is_server_failure, missing_files, needs_admission,
+    new_record, progress_due, put_is_retryable, reserved_by, retry_delay_secs, stale_files,
+    still_needed, take, url_path, used_by, KeepVideoRefusal, KeepVideoRequest, KeptState,
+    KeptVideo, VideoStore, CAP_KEY, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -205,6 +205,9 @@ enum Stop {
     Refused(String),
     /// A file could not be fetched or stored; stored files stay for a retry.
     Failed(String),
+    /// The server answered every attempt at a file with an error of its own
+    /// (5xx): what a short tail it cannot encode gets. Kept for a retry too.
+    ServerFailed(String),
 }
 
 enum FetchErr {
@@ -255,7 +258,14 @@ async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Respo
         ));
         match (is_retryable(status), retry_delay_secs(attempt)) {
             (true, Some(secs)) => platform::sleep_ms(secs as u32 * 1000).await,
-            _ => return Err(Stop::Failed(format!("{} answered {shown}", url_path(url)))),
+            _ => {
+                let reason = format!("{} answered {shown}", url_path(url));
+                return Err(if is_server_failure(status) {
+                    Stop::ServerFailed(reason)
+                } else {
+                    Stop::Failed(reason)
+                });
+            }
         }
     }
 }
@@ -511,8 +521,9 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         let len = match fetch_put(cache, user, item, url, false).await {
             Ok((_, len)) => len,
             // B1476: the sliver of a last segment can fail to encode; the
-            // copy plays without it, ending a frame early.
-            Err(Stop::Failed(reason)) if short_tails.contains(url) => {
+            // copy plays without it, ending a frame early. Only the server's
+            // own refusal says so: a 401 or a lost network is not (B1484).
+            Err(Stop::ServerFailed(reason)) if short_tails.contains(url) => {
                 warn(&format!(
                     "pharos: video keep skipped short tail item={item} url_path={} reason={reason}",
                     url_path(url)
@@ -629,7 +640,7 @@ async fn run(user: String, item: String, resume: bool) {
         Err(Stop::Gone) => info(&format!(
             "pharos: video keep stopped item={item} reason=removed"
         )),
-        Err(Stop::Refused(reason)) | Err(Stop::Failed(reason)) => {
+        Err(Stop::Refused(reason) | Stop::Failed(reason) | Stop::ServerFailed(reason)) => {
             warn(&format!(
                 "pharos: video keep failed item={item} reason={reason}"
             ));
