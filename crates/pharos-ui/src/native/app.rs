@@ -5684,6 +5684,31 @@ fn offline_owner_lost(owner: &str, authorized: Option<&str>) -> bool {
     authorized != Some(owner)
 }
 
+/// A reconnect's verdict on a mounted downloaded copy played for `owner`:
+/// true when the player must go ([`offline_owner_lost`]). The position it
+/// carried (`last_ms`) is the old owner's then, and is dropped, so the
+/// start decided again for whoever is authorized resumes from their own
+/// saved position. A same-owner reconnect keeps it.
+fn offline_reconnect_stops(
+    id: ItemRef,
+    owner: &str,
+    authorized: Option<&str>,
+    last_ms: &Cell<u64>,
+) -> bool {
+    if !offline_owner_lost(owner, authorized) {
+        platform::info(&format!(
+            "pharos: playback offline item={id} verdict=kept reason=same_owner_authorized"
+        ));
+        return false;
+    }
+    let carried = last_ms.replace(0);
+    platform::info(&format!(
+        "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={} carried_ms={carried} carried=dropped",
+        authorized.is_some()
+    ));
+    true
+}
+
 /// What the watch screen may show of a negotiation's `state`: a downloaded
 /// copy only while the owner it was negotiated for is still the authorized
 /// offline user; otherwise nothing, the pending state. A restarted
@@ -6355,6 +6380,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // When the grant is from an older API (a reconnect, even one during the
     // first negotiation), the stream keeps going and only the grant is
     // negotiated again.
+    let owner_last_ms = Rc::clone(&last_ms);
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -6381,16 +6407,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // the start is decided again for whoever is authorized now.
         if let Some(save) = &p.0.offline {
             let authorized = offline_video::last_user();
-            if offline_owner_lost(&save.user, authorized.as_deref()) {
-                platform::info(&format!(
-                    "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={}",
-                    authorized.is_some()
-                ));
+            if offline_reconnect_stops(id, &save.user, authorized.as_deref(), &owner_last_ms) {
                 playing.restart();
-            } else {
-                platform::info(&format!(
-                    "pharos: playback offline item={id} verdict=kept reason=same_owner_authorized"
-                ));
             }
             return;
         }
@@ -9584,6 +9602,27 @@ mod tests {
         let copy = downloaded_copy(id, None, Some("A".into()));
         use_test_video_slot(None);
         assert!(copy.is_none(), "a fenced user's copy was selected");
+    }
+
+    /// CR 4644634578: a reconnect that stops a downloaded copy because its
+    /// owner is not authorized drops the position it carried, so the new
+    /// owner's start resumes from their own saved one. A same-owner
+    /// reconnect keeps it.
+    #[test]
+    fn an_owner_change_drops_the_carried_position() {
+        let id: ItemRef = "7".parse().unwrap();
+        let carried = std::cell::Cell::new(90_000u64);
+        assert!(!offline_reconnect_stops(id, "A", Some("A"), &carried));
+        assert_eq!(
+            carried.get(),
+            90_000,
+            "a same-owner reconnect lost its place"
+        );
+        assert!(offline_reconnect_stops(id, "A", Some("B"), &carried));
+        assert_eq!(carried.get(), 0, "B's start carried on from A's position");
+        carried.set(5);
+        assert!(offline_reconnect_stops(id, "A", None, &carried));
+        assert_eq!(carried.get(), 0, "a signed-out start carried A's position");
     }
 
     /// A downloaded copy's player as [`offline_playing`] builds it for
