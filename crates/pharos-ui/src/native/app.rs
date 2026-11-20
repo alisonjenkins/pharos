@@ -2521,11 +2521,8 @@ fn NativeApp(route: Route) -> Element {
     match phase {
         Phase::Connecting | Phase::Ready => {
             let m = machine.read();
-            // Cut off from the server, kept books still open (spec 036 US3).
-            let cut_off = m.waiting().is_some() || platform_offline() || slow_connect();
-            if let Some(offline) = cut_off.then(|| offline_start(&route)).flatten() {
-                return offline;
-            }
+            // Cut off with something on the device, the shell above shows
+            // it (spec 049) once the verdict has run, right after this.
             match m.waiting() {
                 Some(why) => rsx! {
                     StatusView {
@@ -2802,65 +2799,6 @@ fn kept_any() -> bool {
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 fn kept_any() -> bool {
     super::offline_start::any_downloaded()
-}
-
-/// The app with no connection: a downloaded video that was asked for plays
-/// in the full player, as it does online; else the lists of what is on the
-/// device, the videos beside the books or music. `None` when nothing is, so
-/// the usual waiting page shows.
-fn offline_start(route: &Route) -> Option<Element> {
-    let videos = offline_video::ready_for_last_user();
-    if let Route::Watch(id) = route {
-        if videos.iter().any(|v| v.item == id.to_string()) {
-            platform::info(&format!("pharos: offline start verdict=play item={id}"));
-            return Some(rsx! {
-                div { class: "pharos-app",
-                    Screen { route: route.clone() }
-                    StageView {}
-                }
-            });
-        }
-    }
-    let others = offline_start_books(route);
-    platform::info(&format!(
-        "pharos: offline start verdict={} videos={} books_or_music={}",
-        if others.is_some() || !videos.is_empty() {
-            "list"
-        } else {
-            "waiting"
-        },
-        videos.len(),
-        others.is_some()
-    ));
-    match (others, videos.is_empty()) {
-        (others, true) => others,
-        (Some(others), false) => Some(rsx! {
-            {others}
-            super::kept_video_view::OfflineVideos {}
-        }),
-        (None, false) => Some(rsx! { super::kept_video_view::OfflineVideos {} }),
-    }
-}
-
-/// The app with no connection and books kept on the device: the list, or
-/// the reader when a kept book was asked for. `None` when nothing is kept,
-/// so the usual waiting page shows. Two builds have one: the browser (kept books) and the phone (downloads).
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
-fn offline_start_books(route: &Route) -> Option<Element> {
-    let store = super::kept_web::read()?;
-    Some(match route {
-        Route::Read(id) if store.find(&id.to_string()).is_some() => {
-            remount_on(&id.to_string(), reader_screen(*id))
-        }
-        _ => rsx! { super::kept_web::OfflineHome {} },
-    })
-}
-
-/// The phone: the music and books downloaded on it, which play without the
-/// server. `None` where no store is registered or nothing is downloaded.
-#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-fn offline_start_books(_route: &Route) -> Option<Element> {
-    super::offline_start::start()
 }
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
