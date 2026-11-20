@@ -586,15 +586,22 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             } else {
                 "none"
             };
-            log::warn!("token store verdict=incomplete reason=read_back_differs found={found}");
+            // The file may hold the new token, unconfirmed: refused, as a
+            // store that could not sync its folder refuses it, until a
+            // store confirms it.
+            add_fence_held(path, &Fence::token(&new), "store_incomplete");
+            log::warn!(
+                "token store verdict=incomplete reason=read_back_differs found={found} fenced=new_token"
+            );
             return Err(err(
                 path,
                 format!("{STORE_INCOMPLETE}: the file read back holds {found}"),
             ));
         }
         Err(e) => {
+            add_fence_held(path, &Fence::token(&new), "store_incomplete");
             log::warn!(
-                "token store verdict=incomplete reason=read_back_failed error={}",
+                "token store verdict=incomplete reason=read_back_failed fenced=new_token error={}",
                 e.redacted()
             );
             return Err(err(
@@ -1969,6 +1976,32 @@ pub(crate) mod tests {
         );
         assert!(!is_store_incomplete(&store(&p, "").unwrap_err()));
         clear_fence(&p);
+    }
+
+    /// CR 4642574336: a store that cannot read its token back fences that
+    /// token: a reader that finds it on file refuses it. A later store
+    /// that confirms the same token lifts the fence.
+    #[test]
+    fn a_store_that_cannot_read_back_fences_its_token_until_confirmed() {
+        let d = dir("read-back-fence");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        crate::testlog::start();
+        FAIL_READ_BACK.with(|f| f.set(true));
+        let stored = store(&p, "tokB");
+        FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(is_store_incomplete(&stored.unwrap_err()));
+        assert!(
+            fence(&p).refuses("tokB"),
+            "the unconfirmed token was not fenced"
+        );
+        assert_eq!(load(&p).unwrap(), None, "the unconfirmed token was read");
+        assert!(crate::testlog::lines()
+            .iter()
+            .any(|l| l.contains("reason=read_back_failed fenced=new_token")));
+        store(&p, "tokB").unwrap();
+        assert_eq!(fence(&p), Fence::Open, "a confirmed store left the fence");
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
     }
 
     /// CR 4640611307: a store over an unnamed fence that cannot read the
