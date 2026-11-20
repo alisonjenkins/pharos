@@ -428,9 +428,18 @@ pub async fn proxy_get<T: ProxyTransport>(
         hops += 1;
         let status = resp.status();
         match redirect_hop(&url, &next, build_server) {
-            Hop::FollowWithToken => log(
+            // The verdict says what the next request carries: a token
+            // dropped on an earlier hop stays dropped, even back on its own
+            // origin.
+            Hop::FollowWithToken if token.is_some() => log(
                 Level::Debug,
                 format!("pharos: proxy redirect verdict=follow_with_token status={status}"),
+            ),
+            Hop::FollowWithToken => log(
+                Level::Debug,
+                format!(
+                    "pharos: proxy redirect verdict=follow_without_token reason=token_dropped_earlier status={status}"
+                ),
             ),
             Hop::FollowWithoutToken => {
                 if token.take().is_some() {
@@ -2061,6 +2070,51 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("verdict=dropped reason=cross_origin names=Authorization,Cookie")));
+    }
+
+    /// CR 4646280279: a same-origin hop on the token's origin, after the
+    /// token was dropped off it, logs what the next request carries: no
+    /// token.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_back_after_the_token_was_dropped_logs_no_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| {
+            Ok(Scripted::new(&[
+                "https://b.example.net/2",
+                "https://a.example.org/3",
+                "https://a.example.org/4",
+            ]))
+        });
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: Some("t".to_owned()),
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_with_token")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=token_dropped_earlier")),
+            "{lines:?}"
+        );
     }
 
     /// The control: redirects that stay on the token's origin keep it on
