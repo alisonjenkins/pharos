@@ -5938,28 +5938,29 @@ pub(crate) mod tests {
     }
 
     struct Rig {
+        /// The store's root, the same for every reopen: a folder inside
+        /// `_scope`, not made until the store makes it.
         dir: PathBuf,
         server: Arc<FakeServer>,
         budget: Arc<FakeBudget>,
         slept: Arc<Mutex<Vec<u64>>>,
         opened: AtomicUsize,
+        /// The folder this rig made for itself, removed when it drops (a
+        /// failed assertion included). Last, so it goes after the rest.
+        _scope: super::super::test_dir::TmpDir,
     }
 
     impl Rig {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "pharos-kept-video-{tag}-{}-{}",
-                std::process::id(),
-                iso_now().replace(':', "")
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
+            let scope = super::super::test_dir::TmpDir::new(&format!("kept-video-{tag}"));
             CAPTURED.with(|c| c.borrow_mut().clear());
             Self {
-                dir,
+                dir: scope.path().join("videos"),
                 server: FakeServer::with_stream(),
                 budget: FakeBudget::roomy(),
                 slept: Arc::default(),
                 opened: AtomicUsize::new(0),
+                _scope: scope,
             }
         }
 
