@@ -642,22 +642,50 @@ pub fn localize_playlist(
             if trimmed.is_empty() || (trimmed.starts_with('#') && !trimmed.starts_with("#EXT")) {
                 push(&mut out, line)?;
             } else if trimmed.starts_with('#') {
-                let mut rest = body;
-                while let Some(at) = rest.find("URI=\"") {
-                    let (head, tail) = rest.split_at(at + 5);
-                    push(&mut out, head)?;
-                    match tail.find('"') {
-                        Some(end) => {
-                            reference(&mut out, &tail[..end])?;
-                            rest = &tail[end..];
-                        }
-                        None => {
-                            rest = tail;
+                // The tag's attribute list, parsed by name: only an
+                // attribute named exactly `URI` is a reference, never one
+                // whose name ends in it (`X-COM-EXAMPLE-URI`), and never
+                // text inside another attribute's quoted value.
+                let Some(colon) = body.find(':') else {
+                    push(&mut out, line)?;
+                    continue;
+                };
+                let (head, mut rest) = body.split_at(colon + 1);
+                push(&mut out, head)?;
+                while !rest.is_empty() {
+                    let Some(at) = rest.find(['=', ',']) else {
+                        push(&mut out, rest)?;
+                        break;
+                    };
+                    let (name, sep) = (&rest[..at], &rest[at..=at]);
+                    push(&mut out, &rest[..=at])?;
+                    rest = &rest[at + 1..];
+                    if sep == "," {
+                        continue;
+                    }
+                    if let Some(quoted) = rest.strip_prefix('"') {
+                        let Some(end) = quoted.find('"') else {
+                            push(&mut out, rest)?;
                             break;
+                        };
+                        push(&mut out, "\"")?;
+                        if name.trim() == "URI" {
+                            reference(&mut out, &quoted[..end])?;
+                        } else {
+                            push(&mut out, &quoted[..end])?;
                         }
+                        push(&mut out, "\"")?;
+                        rest = &quoted[end + 1..];
+                    } else {
+                        let end = rest.find(',').unwrap_or(rest.len());
+                        push(&mut out, &rest[..end])?;
+                        rest = &rest[end..];
+                    }
+                    if let Some(next) = rest.strip_prefix(',') {
+                        push(&mut out, ",")?;
+                        rest = next;
                     }
                 }
-                push(&mut out, rest)?;
                 push(&mut out, ending)?;
             } else {
                 reference(&mut out, trimmed)?;
@@ -951,6 +979,28 @@ mod tests {
             localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
             Localized::Rewritten(
                 "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// CR 4640611412: only an attribute named exactly `URI` is a reference.
+    /// Client metadata whose name ends in `URI`, or a quoted value holding
+    /// `URI="`, is kept as it is; a real `EXT-X-MAP` URI is still rewritten.
+    #[test]
+    fn only_an_attribute_named_uri_is_a_reference() {
+        let server = "https://s.example/jf";
+        let text = "#EXT-X-DATERANGE:ID=\"d\",X-COM-EXAMPLE-URI=\"https://elsewhere.example/x\",X-NOTE=\"a,URI=\"\n\
+            #EXT-X-MAP:URI=\"/jf/videos/1/init.mp4\",BYTERANGE=\"10@0\"\n\
+            #EXTINF:6.0,\n\
+            /jf/videos/1/0.m4s\n";
+        assert_eq!(
+            localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXT-X-DATERANGE:ID=\"d\",X-COM-EXAMPLE-URI=\"https://elsewhere.example/x\",X-NOTE=\"a,URI=\"\n\
+                 #EXT-X-MAP:URI=\"/videos/1/init.mp4\",BYTERANGE=\"10@0\"\n\
+                 #EXTINF:6.0,\n\
+                 /videos/1/0.m4s\n"
                     .to_owned()
             )
         );
