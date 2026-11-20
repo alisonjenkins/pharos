@@ -178,6 +178,11 @@ pub struct NegotiateRequest<'a> {
     pub client_is_remote: bool,
     /// A browser (`Mozilla` user agent) rather than a native app.
     pub is_web_client: bool,
+    /// The client is handed this server's image-subtitle route for the item
+    /// (spec 019) and draws the image subtitles its profile declares from it.
+    /// Off for a Jellyfin client and for a version, which have no such
+    /// route: there an image subtitle can only be burned.
+    pub draws_images: bool,
 }
 
 /// The negotiated outcome for one item, with the facts the wire layer needs
@@ -203,9 +208,9 @@ pub struct Negotiated {
     pub downgrade: Option<&'static str>,
     /// The WAN bitrate cap applied to this client, if it is remote.
     pub remote_ceiling: Option<u64>,
-    /// Subtitle streams this client cannot render itself and so must have
-    /// burned in. Registered with the session: later segment URLs carry only
-    /// a bare index.
+    /// Subtitle streams this client cannot render or draw itself and so must
+    /// have burned in: text and image alike, despite the name. Registered
+    /// with the session: later segment URLs carry only a bare index.
     pub burn_text_indices: BTreeSet<u32>,
     /// The subtitle this playback acts on (explicit pick, else the
     /// container's default), when there is one.
@@ -500,10 +505,19 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // set for TEXT tracks. Relocated here (was computed just before the DTO
     // build) so it's available to the downgrade below AND the URL-forward
     // predicate further down, not just the MediaStreams ctx.
+    //
+    // Image subs land here too: one the profile cannot take is Burn, and so
+    // is every image sub when the client is not handed the image route
+    // (`draws_images`), whatever its profile declares. An image sub the
+    // client draws itself must stay out: burning it as well put two copies
+    // of every cue on screen (B1492).
     let mut burn_text_indices = std::collections::BTreeSet::new();
     for track in &probe.subtitle_tracks {
-        if decide_subtitle_delivery(track.codec.as_deref(), &profile.subtitle_profiles)
-            == SubtitleDelivery::Burn
+        let image_without_route = !req.draws_images
+            && is_image_subtitle_codec(&track.codec.as_deref().unwrap_or("").to_ascii_lowercase());
+        if image_without_route
+            || decide_subtitle_delivery(track.codec.as_deref(), &profile.subtitle_profiles)
+                == SubtitleDelivery::Burn
         {
             burn_text_indices.insert(track.stream_index);
         }
@@ -1085,13 +1099,12 @@ fn renditions(n: &Negotiated, r: &DeliveryRequest<'_>) -> Vec<String> {
     renditions
 }
 
-/// Whether the server draws `track` into the video for this client: an image
-/// subtitle, or a text one it cannot render (`burn_text_indices`). The one
-/// predicate behind the URL's `SubtitleStreamIndex`, the per-eye 3D burn and
-/// the shape a released grant is adopted by.
+/// Whether the server draws `track` into the video for this client: one it
+/// cannot render or draw itself (`burn_text_indices`, image subs included).
+/// The one predicate behind the URL's `SubtitleStreamIndex`, the per-eye 3D
+/// burn and the shape a released grant is adopted by.
 fn burns_subtitle(track: &SubtitleTrack, burn_text_indices: &BTreeSet<u32>) -> bool {
-    is_image_subtitle_codec(track.codec.as_deref().unwrap_or(""))
-        || burn_text_indices.contains(&track.stream_index)
+    burn_text_indices.contains(&track.stream_index)
 }
 
 impl Negotiated {
@@ -1107,8 +1120,8 @@ impl Negotiated {
 /// The track picks the segment handler needs: the audio stream, the subtitle
 /// to burn, and the 3D output.
 ///
-/// A subtitle rides the URL only when it must burn: an image subtitle, or a
-/// text one this client cannot render (`burn_text_indices`). Burning a text
+/// A subtitle rides the URL only when it must burn: one this client cannot
+/// render or draw itself (`burn_text_indices`). Burning a text
 /// subtitle the client renders itself is redundant and slow: a burned segment
 /// seeks by decoding from the start. `-1` ("off") always rides, since it
 /// clears an earlier burn.
@@ -1806,6 +1819,8 @@ pub async fn grant(
             stereo_mode: None,
             client_is_remote: r.client_is_remote,
             is_web_client: false,
+            draws_images: crate::services::watch::extracts_image_subtitles(state)
+                && item.edition.is_none(),
         },
     );
     let shape = crate::pending_release::StreamShape {
@@ -2580,6 +2595,7 @@ mod burn_on_packed_3d_tests {
                 stereo_mode,
                 client_is_remote: false,
                 is_web_client: false,
+                draws_images: false,
             },
         )
     }
@@ -2649,6 +2665,148 @@ mod burn_on_packed_3d_tests {
             playback_3d_reason(false, false, true, false, true, None, block),
             "stereo_mode_query"
         );
+    }
+}
+
+/// V1491 — an image subtitle burns only when the client cannot draw it from
+/// this server's image route: never both, or every cue shows twice (B1492).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod image_subtitle_burn_tests {
+    use super::*;
+    use crate::state::Stores;
+    use pharos_core::{MediaKind, MediaProbe, SubtitleTrack};
+
+    const PGS: u32 = 3;
+
+    /// An H.264 Matroska source the native profile below must transcode
+    /// (it plays MP4 only), with one PGS track.
+    fn item() -> MediaItem {
+        MediaItem {
+            id: 1,
+            path: "/m/a.mkv".into(),
+            kind: MediaKind::Episode,
+            probe: MediaProbe {
+                container: Some("matroska".into()),
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                subtitle_tracks: vec![SubtitleTrack {
+                    stream_index: PGS,
+                    codec: Some("hdmv_pgs_subtitle".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The native app's profile: it declares PGS as drawn from extracted
+    /// images when `extracted` (the server extracts them).
+    fn native_profile(extracted: bool) -> DeviceProfile {
+        Capabilities {
+            video_codecs: vec!["h264".into()],
+            audio_codecs: vec!["aac".into()],
+            containers: vec!["mp4".into()],
+            image_subtitles: vec!["hdmv_pgs_subtitle".into()],
+            ..Default::default()
+        }
+        .profile(extracted)
+    }
+
+    async fn negotiated(profile: &DeviceProfile, draws_images: bool) -> Negotiated {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = AppState::new(stores, "t".into());
+        negotiate(
+            &state,
+            &item(),
+            &NegotiateRequest {
+                profile,
+                switches: PlaybackSwitches::default(),
+                explicit_subtitle_index: Some(i64::from(PGS)),
+                stereo_mode: None,
+                client_is_remote: false,
+                is_web_client: false,
+                draws_images,
+            },
+        )
+    }
+
+    /// The `SubtitleStreamIndex` the stream URL carries, if any.
+    fn url_subtitle(n: &Negotiated, profile: &DeviceProfile) -> Option<String> {
+        let probe = item().probe;
+        let selection = stream_selection(
+            n,
+            &DeliveryRequest {
+                profile,
+                probe: &probe,
+                item_wire_id: "1",
+                source_param: "",
+                play_session_id: "p",
+                audio_stream_index: None,
+                explicit_subtitle_index: Some(i64::from(PGS)),
+                is_web_client: false,
+                resume_ticks: 0,
+                transcoding: true,
+                size_limits: pharos_transcode::SizeLimits::default(),
+            },
+        );
+        selection
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("SubtitleStreamIndex="))
+            .map(str::to_owned)
+    }
+
+    #[actix_web::test]
+    async fn an_image_subtitle_the_client_draws_is_not_burned() {
+        let profile = native_profile(true);
+        let n = negotiated(&profile, true).await;
+        assert_eq!(
+            n.selected_subtitle.as_ref().map(|t| t.stream_index),
+            Some(PGS)
+        );
+        assert_eq!(n.burned_subtitle(), None);
+        assert_eq!(url_subtitle(&n, &profile), None);
+    }
+
+    #[actix_web::test]
+    async fn an_image_subtitle_without_the_image_route_still_burns() {
+        // A version (no image route) declares PGS as drawn but is not handed
+        // the route, so the server must burn it.
+        let profile = native_profile(true);
+        let n = negotiated(&profile, false).await;
+        assert_eq!(n.burned_subtitle(), Some(PGS));
+        assert_eq!(url_subtitle(&n, &profile).as_deref(), Some("3"));
+    }
+
+    #[actix_web::test]
+    async fn an_image_subtitle_the_server_does_not_extract_still_burns() {
+        let profile = native_profile(false);
+        let n = negotiated(&profile, false).await;
+        assert_eq!(n.burned_subtitle(), Some(PGS));
+        assert_eq!(url_subtitle(&n, &profile).as_deref(), Some("3"));
+    }
+
+    #[actix_web::test]
+    async fn a_jellyfin_client_declaring_pgs_still_gets_it_burned() {
+        // A Jellyfin client is never handed the image route; its DTO says
+        // Encode, so a profile that claims PGS must not stop the burn.
+        let mut profile = native_profile(false);
+        profile.subtitle_profiles = vec![
+            pharos_jellyfin_api::device_profile::SubtitleProfileDto {
+                format: "pgssub".into(),
+                method: "External".into(),
+                ..Default::default()
+            },
+            pharos_jellyfin_api::device_profile::SubtitleProfileDto {
+                format: "hdmv_pgs_subtitle".into(),
+                method: "External".into(),
+                ..Default::default()
+            },
+        ];
+        let n = negotiated(&profile, false).await;
+        assert_eq!(n.burned_subtitle(), Some(PGS));
+        assert_eq!(url_subtitle(&n, &profile).as_deref(), Some("3"));
     }
 }
 
@@ -2777,6 +2935,7 @@ mod split_film_tests {
                 stereo_mode: None,
                 client_is_remote: false,
                 is_web_client: false,
+                draws_images: false,
             },
         )
     }
