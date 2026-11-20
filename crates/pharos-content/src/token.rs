@@ -365,11 +365,21 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // Markers are keyed by fingerprint and, for store, append-only: it
     // never removes or rewrites a marker naming any token but this one. One
     // naming a token no longer on disk refuses only that token, so it is
-    // harmless. The marker naming THIS token goes only once the token is
-    // written, fsynced, renamed and its folder synced; one that will not go
-    // fails the sign-in with the token refused (fail closed). A write that
-    // fails leaves the old file and every marker as they were.
+    // harmless. The marker naming THIS token goes first, durably (removed,
+    // then its folder synced); one that will not go refuses the sign-in
+    // before anything is written, so no token is ever installed while its
+    // own marker is pending. A write that fails leaves the old file and
+    // every other marker as they were.
     let new = fingerprint(token);
+    if let Err(e) = remove_marker(path, &new) {
+        log::warn!(
+            "token store verdict=refused reason=revocation_marker_blocks_token step=before_write error={e}"
+        );
+        return Err(err(
+            path,
+            format!("the revocation marker refuses the new token and cannot be removed: {e}"),
+        ));
+    }
     write(path, token, None).map_err(|e| err(path, e))?;
     let dir = path.parent().ok_or_else(|| err(path, "no directory"))?;
     match durable_dir(dir) {
@@ -397,13 +407,6 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 format!("the token's folder could not be synced: {why}"),
             ));
         }
-    }
-    if let Err(e) = remove_marker(path, &new) {
-        log::warn!("token store verdict=refused reason=revocation_marker_blocks_token error={e}");
-        return Err(err(
-            path,
-            format!("the revocation marker refuses the new token and cannot be removed: {e}"),
-        ));
     }
     // The hook hears of the store only once the file is read back holding
     // the new token: a fence it lifts is for a token really gone.
@@ -660,11 +663,13 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
     }
 }
 
-/// Removes the revocation marker beside `path` (absent is fine), and
-/// syncs the folder once it went, so the removal is on disk before the
-/// store reports success. A sync that fails is logged apart from a removal
-/// that failed: the marker is gone for every reader, and a crash that brings
-/// it back only refuses again (fail closed), so the store still holds.
+/// Removes the revocation marker naming `fingerprint` beside `path`
+/// (absent is fine), and syncs the folder once it went, so the removal is on
+/// disk before the store writes the token it named. A sync that fails is an
+/// error: a crash could bring the marker back over a token the user was
+/// told is signed in, so the store refuses before writing. A folder that
+/// cannot be synced at all (EINVAL, ENOTSUP) is the one exception, logged as
+/// not durable: refusing there would leave no way to sign in.
 fn remove_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
     match std::fs::remove_file(revoked_path(path, fingerprint)) {
         Ok(()) => {}
@@ -672,24 +677,34 @@ fn remove_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     #[cfg(test)]
-    if tests::FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
-        log::warn!(
-            "token revocation marker verdict=cleared_not_durable reason=signed_in error=directory sync failed"
-        );
-        return Ok(());
-    }
-    match path.parent().map(durable_dir) {
+    let synced = if tests::FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
+        Some(Err("directory sync failed".to_owned()))
+    } else {
+        path.parent().map(durable_dir)
+    };
+    #[cfg(not(test))]
+    let synced = path.parent().map(durable_dir);
+    match synced {
         Some(Ok(())) => {
             log::info!("token revocation marker verdict=cleared reason=signed_in");
+            Ok(())
         }
-        Some(Err(why)) => log::warn!(
-            "token revocation marker verdict=cleared_not_durable reason=signed_in error={why}"
-        ),
-        None => log::warn!(
-            "token revocation marker verdict=cleared_not_durable reason=signed_in error=no_directory"
-        ),
+        Some(Err(why)) if why.starts_with(DIR_SYNC_UNSUPPORTED) => {
+            log::warn!(
+                "token revocation marker verdict=cleared_not_durable reason=dir_sync_unsupported error={why}"
+            );
+            Ok(())
+        }
+        Some(Err(why)) => {
+            log::warn!(
+                "token revocation marker verdict=removed_not_synced reason=folder_not_synced error={why}"
+            );
+            Err(std::io::Error::other(format!(
+                "the marker's removal could not be synced: {why}"
+            )))
+        }
+        None => Err(std::io::Error::other("no directory")),
     }
-    Ok(())
 }
 
 /// Writes the marker whole (temp file, fsync, rename, folder sync). The
@@ -1512,60 +1527,66 @@ pub(crate) mod tests {
         );
     }
 
-    /// CR 4639801671, case 3 (where the rollback was): the marker naming
-    /// the new token will not go once the token is installed. The sign-in
-    /// fails and the token stays refused, after a restart too; A's marker
-    /// stays.
+    /// CR 4639801671 case 3, CR 4640059241: the marker naming the new
+    /// token will not go. The sign-in is refused before anything is
+    /// written: A stays on file and refused, and a read after the marker is
+    /// repaired by hand (before any retry) still finds A, never the token
+    /// that was refused.
     #[cfg(debug_assertions)]
     #[test]
-    fn a_store_whose_own_marker_will_not_go_fails_closed() {
+    fn a_store_whose_own_marker_will_not_go_installs_nothing() {
         let d = dir("store-own-marker");
         let p = d.join("device-token");
         marked_a(&p);
         std::fs::create_dir_all(revoked_path(&p, &fingerprint("tokN")).join("held")).unwrap();
         let stored = store(&p, "tokN");
         assert!(stored.is_err(), "{stored:?}");
+        let on_file = || read_raw(&p).unwrap().map(|s| s.token);
         assert_eq!(
-            read_raw(&p).unwrap().map(|s| s.token).as_deref(),
-            Some("tokN")
+            on_file().as_deref(),
+            Some("tokA"),
+            "the refused token was installed"
         );
-        assert_eq!(load(&p).unwrap(), None, "a token its marker names was read");
+        assert_eq!(load(&p).unwrap(), None);
+        // Repaired by hand, no retry: the old state, still refused.
+        std::fs::remove_dir_all(revoked_path(&p, &fingerprint("tokN"))).unwrap();
+        assert_eq!(on_file().as_deref(), Some("tokA"));
+        assert_eq!(load(&p).unwrap(), None, "a token nobody stored was read");
+        assert_eq!(after_restart(&p), None, "A became readable");
         assert!(
             revoked(&p, &fingerprint("tokA")).is_some(),
             "A's marker went"
         );
-        assert_eq!(
-            after_restart(&p),
-            None,
-            "the refused token was read after a restart"
-        );
         // Once its marker can go, a sign-in with it holds.
-        std::fs::remove_dir_all(revoked_path(&p, &fingerprint("tokN"))).unwrap();
         store(&p, "tokN").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
     }
 
-    /// CR 4638660923: the removal of a marker that would refuse the new
-    /// token is synced before the store reports success; a sync that fails
-    /// is logged apart, as not durable, and the store still holds.
+    /// CR 4638660923, CR 4640059241: the removal of a marker that would
+    /// refuse the new token is synced before the token is written. A sync
+    /// that fails is named and refuses the sign-in: nothing is written, the
+    /// old token stays, and a retry once the folder syncs holds.
     #[test]
-    fn a_cleared_marker_is_synced_and_a_failed_sync_is_named() {
+    fn a_cleared_marker_is_synced_before_the_token_is_written() {
         let d = dir("token-marker-sync");
         let p = d.join("device-token");
         store(&p, "tokA").unwrap();
         write_marker(&p, Some("A"), &fingerprint("tokN")).unwrap();
         crate::testlog::start();
         FAIL_MARKER_SYNC.with(|f| f.set(true));
-        store(&p, "tokN").unwrap();
+        let stored = store(&p, "tokN");
         FAIL_MARKER_SYNC.with(|f| f.set(false));
-        assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
+        assert!(stored.is_err(), "{stored:?}");
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
         let lines = crate::testlog::lines();
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("token revocation marker verdict=cleared_not_durable")),
+                .any(|l| l.contains("token revocation marker verdict=removed_not_synced")),
             "{lines:?}"
         );
+        store(&p, "tokN").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
     }
 
     /// (c) A removal that is not durable is marked too; only when the
