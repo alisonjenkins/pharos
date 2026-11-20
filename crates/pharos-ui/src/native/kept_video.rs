@@ -575,11 +575,12 @@ fn localize_ref<'a>(
     if r.starts_with('/') {
         let base_path = url_path(server).trim_end_matches('/');
         if base_path.is_empty() {
+            local_key(r)?;
             return Ok(Cow::Borrowed(r));
         }
         let rest = r.strip_prefix(base_path).ok_or(())?;
         return if rest.starts_with('/') || rest.starts_with('?') {
-            Ok(Cow::Owned(request_key(rest)))
+            local_key(rest).map(Cow::Owned)
         } else {
             Err(())
         };
@@ -597,9 +598,22 @@ fn localize_ref<'a>(
     // unless a redirect moved it: kept as written then, rewritten to its
     // key otherwise.
     if moved {
-        Ok(Cow::Owned(request_key(rest)))
+        local_key(rest).map(Cow::Owned)
     } else {
         Ok(Cow::Borrowed(r))
+    }
+}
+
+/// The key `rest` (a path under the base path) is stored under, when it
+/// reads back as a path on the page's own origin. One that begins `//` is
+/// a network-path reference in a playlist: it names a host, so the player
+/// would never ask the proxy for it. Err then.
+fn local_key(rest: &str) -> Result<String, ()> {
+    let key = request_key(rest);
+    if key.starts_with("//") {
+        Err(())
+    } else {
+        Ok(key)
     }
 }
 
@@ -981,6 +995,38 @@ mod tests {
                 "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
                     .to_owned()
             )
+        );
+    }
+
+    /// CR 4640611404: a key that would begin `//` names a host in a
+    /// playlist, so it is refused; a single-slash key is kept.
+    #[test]
+    fn a_key_that_would_name_a_host_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        assert_eq!(
+            one("/jf//videos/1/0.m4s"),
+            Localized::NotLocal("/jf//videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "//videos/1/0.m4s",
+                "/videos/1/main.m3u8",
+                false,
+                "https://s.example",
+                usize::MAX
+            ),
+            Localized::NotLocal("//videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "/videos/1/0.m4s",
+                "/videos/1/main.m3u8",
+                false,
+                "https://s.example",
+                usize::MAX
+            ),
+            Localized::Unchanged
         );
     }
 
