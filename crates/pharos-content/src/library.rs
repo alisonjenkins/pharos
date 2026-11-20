@@ -1079,6 +1079,9 @@ impl Worker {
                 }
                 let cat = NativeCatalogue::new(bootstrap, closed, &session);
                 match cat.media_token().await {
+                    // A sign-out may have fenced the token while the media
+                    // token was out: the link is not published.
+                    Ok(_) if self.fenced_after(&token, "quickconnect") => {}
                     Ok(media) => {
                         self.link = Some(Link::new(cat, media, token));
                         self.shared.set_auth(AuthState::SignedIn);
@@ -2434,6 +2437,12 @@ mod tests {
     struct HookBoot;
     impl bootstrap::Server for HookBoot {}
 
+    thread_local! {
+        /// The token file a hook session fences, once armed.
+        static HOOK_PATH: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     fn approve(
         w: &mut Worker,
         rt: &tokio::runtime::Runtime,
@@ -2450,6 +2459,38 @@ mod tests {
             })
             .await;
         });
+    }
+
+    /// CR 4640611270: a sign-out that fences the approved token while the
+    /// QuickConnect media token call is out is honored when it returns:
+    /// no link is published and the worker does not sign in.
+    #[test]
+    fn a_fence_set_during_a_quickconnect_approval_is_honored() {
+        let root = test_root("fence-during-qc");
+        let (mut w, shared, token_path) = worker(&root);
+        HOOK_PATH.with(|p| *p.borrow_mut() = Some(token_path.clone()));
+        let (rt, local) = local_rt();
+        crate::testlog::start();
+        approve(
+            &mut w,
+            &rt,
+            &local,
+            || {
+                if let Some(path) = HOOK_PATH.with(|p| p.borrow_mut().take()) {
+                    token::set_fence(&path, token::Fence::for_token(Some("tokA")), "test");
+                }
+            },
+            "tokA",
+        );
+        let lines = crate::testlog::lines();
+        assert!(w.link.is_none(), "a fenced approval opened a link");
+        assert_ne!(shared.lock().auth, AuthState::SignedIn);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=service_fence at=quickconnect")),
+            "{lines:?}"
+        );
     }
 
     /// CR 4640611326: an approval whose token store cannot be confirmed
