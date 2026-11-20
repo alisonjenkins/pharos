@@ -729,11 +729,43 @@ pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .
 
 /// What the remote's Back closes, with an Escape, before it goes back a page
 /// (FR-607): dialogs, menus, an open search list, the player's settings
-/// sheet and its queue.
-pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue"#;
+/// sheet and its queue, and the music queue while it holds the focus (B1508:
+/// its arrows stay inside it, so Back is the only way out) with its Clear
+/// confirm, which Back closes first.
+pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue, .pharos-queue:focus-within"#;
+
+/// The remote's Back, before it goes back a page: `closeOverlay()` sends an
+/// Escape to the innermost open [`OVERLAYS`] entry and names it, or returns
+/// `null` when there is none, or when that one ignored the Escape of the
+/// last Back (no key pressed since), so this Back navigates. The Android
+/// bridge's `popstate` handler calls it; the B1508 test drives it in node.
+pub const BACK_CLOSE_JS: &str = r#"
+// Back closes an open dialog or menu before it goes back a page (FR-607),
+// with the Escape each of them already closes on. One that is still open
+// at the next Back, with no key pressed between, does not close on Escape:
+// that Back goes on as usual.
+let backClosed = null;
+addEventListener("keydown", () => { backClosed = null; }, true);
+const closeOverlay = () => {
+  let el = null;
+  for (const o of document.querySelectorAll('__OVERLAYS__')) {
+    if (o.getClientRects().length === 0) continue;
+    // The innermost of nested ones (B1508): the queue's Clear confirm, then
+    // the queue.
+    if (!el || el.contains(o)) el = o;
+  }
+  if (!el || el === backClosed) return null;
+  const at = document.activeElement;
+  const target = at && el.contains(at) ? at : el;
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  backClosed = el;
+  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
+};
+"#;
 
 pub fn bridge_script(template: &str) -> String {
     template
+        .replace("__BACK_CLOSE__", BACK_CLOSE_JS)
         .replace("__BAR_KEYS__", BAR_KEY_JS)
         .replace("__TILE_HOLD__", TILE_HOLD_JS)
         .replace("__ARROWS_SKIP_VDOM__", ARROWS_SKIP_VDOM_JS)
@@ -1901,6 +1933,134 @@ mod tests {
         assert_eq!(server_base(Some("http://media.example")), DEFAULT_SERVER);
         assert_eq!(server_base(Some("https://")), DEFAULT_SERVER);
         assert_eq!(server_base(None), DEFAULT_SERVER.trim_end_matches('/'));
+    }
+
+    /// B1508 / V1507: Back closes the music queue while the focus is in it,
+    /// since its arrows never leave it; one merely shown beside the player
+    /// stays, and Back goes on as usual.
+    #[test]
+    fn back_closes_the_music_queue_only_while_it_holds_the_focus() {
+        let overlays: Vec<&str> = OVERLAYS.split(", ").collect();
+        assert!(
+            overlays.contains(&".pharos-queue:focus-within"),
+            "{OVERLAYS}"
+        );
+        assert!(!overlays.contains(&".pharos-queue"), "{OVERLAYS}");
+        // The Clear confirm inside it is its own overlay, so the Back that
+        // cancels it is not the queue's: the next Back closes the queue.
+        assert!(overlays.contains(&r#"[role="alertdialog"]"#), "{OVERLAYS}");
+    }
+
+    /// The page the B1508 Back test runs [`BACK_CLOSE_JS`] in: just enough of
+    /// a DOM for `closeOverlay()`. An element is in `querySelectorAll` when
+    /// one of the entries of the [`OVERLAYS`] it is given matches it, and
+    /// each overlay's Escape does what the app's does. `back()` is the
+    /// remote's Back; `key()` is a key the person presses.
+    const BACK_PAGE_JS: &str = r#"
+const keydown = [];
+globalThis.addEventListener = (type, f) => { if (type === "keydown") keydown.push(f); };
+globalThis.KeyboardEvent = class { constructor(type, init) { this.type = type; this.key = init.key; } };
+const els = [];
+const escapes = [];
+class El {
+  constructor(name, parent, o = {}) {
+    Object.assign(this, { name, parent, role: o.role || null, className: o.className || "",
+      tagName: o.tag || "DIV", shown: true, removed: false, matches: o.matches || (() => false),
+      onEscape: o.onEscape || null });
+    els.push(this);
+  }
+  contains(o) { for (let e = o; e; e = e.parent) if (e === this) return true; return false; }
+  getClientRects() { return this.shown ? [{}] : []; }
+  getAttribute(a) { return a === "role" ? this.role : null; }
+  dispatchEvent(ev) {
+    for (const f of keydown) f(ev);
+    for (let e = this; e; e = e.parent) {
+      if (e.onEscape) { escapes.push(e.name); e.onEscape(); return; }
+    }
+  }
+}
+globalThis.document = {
+  activeElement: null,
+  querySelectorAll: (sel) => {
+    const parts = sel.split(", ");
+    return els.filter((e) => !e.removed && parts.some((p) => e.matches(p)));
+  },
+};
+const focus = (e) => { document.activeElement = e; };
+const back = () => closeOverlay();
+const key = () => { for (const f of keydown) f({ key: "ArrowDown" }); };
+__BACK_CLOSE__
+const out = {};
+
+// The music queue, holding the focus, with its Clear confirm open.
+{
+  els.length = 0; escapes.length = 0;
+  const page = new El("page", null);
+  const toggle = new El("toggle", page);
+  const queue = new El("queue", page, {
+    tag: "ASIDE", className: "pharos-queue",
+    matches: (p) => p === ".pharos-queue" || (p === ".pharos-queue:focus-within" && queue.contains(document.activeElement)),
+    onEscape: () => { queue.shown = false; focus(toggle); },
+  });
+  const clear = new El("clear", queue);
+  const confirm = new El("confirm", queue, {
+    role: "alertdialog", className: "pharos-queue-confirm",
+    matches: (p) => p === '[role="alertdialog"]',
+    onEscape: () => { confirm.removed = true; focus(clear); },
+  });
+  const cancel = new El("cancel", confirm);
+  focus(cancel);
+  out.queue = { backs: [back(), back(), back()], escapes: [...escapes], focus: document.activeElement.name };
+}
+
+// A dialog that ignores the Escape: the next Back navigates, unless a key
+// was pressed since.
+{
+  els.length = 0; escapes.length = 0;
+  const page = new El("page", null);
+  const dialog = new El("dialog", page, { role: "dialog", className: "pharos-sheet",
+    matches: (p) => p === '[role="dialog"]' });
+  const button = new El("button", dialog);
+  focus(button);
+  out.ignored = { backs: [back(), back(), (key(), back()), back()] };
+}
+
+process.stdout.write(JSON.stringify(out));
+"#;
+
+    /// B1508 / V1507: the remote's Back, run in node on the shipped
+    /// [`BACK_CLOSE_JS`] and [`OVERLAYS`]. With the music queue holding the
+    /// focus and its Clear confirm open, the first Back cancels the confirm,
+    /// the second closes the queue (the focus goes to its toggle), and the
+    /// third goes back a page. An overlay that ignores the Escape is closed
+    /// once: the next Back navigates, unless a key was pressed between.
+    /// Needs `node` on PATH (the devShell and CI's test check carry it).
+    #[test]
+    fn back_cancels_the_queue_clear_then_closes_the_queue_then_navigates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let script = BACK_PAGE_JS
+            .replace("__BACK_CLOSE__", BACK_CLOSE_JS)
+            .replace("__OVERLAYS__", OVERLAYS);
+        let run = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| format!("node (needed for this test) did not start: {e}"))?;
+        let stdout = String::from_utf8(run.stdout)?;
+        assert!(
+            run.status.success(),
+            "node failed: {}\n{stdout}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            stdout,
+            concat!(
+                r#"{"queue":{"backs":["alertdialog.pharos-queue-confirm",".pharos-queue",null],"#,
+                r#""escapes":["confirm","queue"],"focus":"toggle"},"#,
+                r#""ignored":{"backs":["dialog.pharos-sheet",null,"dialog.pharos-sheet",null]}}"#,
+            )
+        );
+        Ok(())
     }
 
     #[test]

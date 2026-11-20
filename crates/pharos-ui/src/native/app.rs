@@ -8841,6 +8841,18 @@ fn Player(
                         on_queue,
                         playing: queued.then_some(playing_id),
                         audiobook: p.detail.item.audiobook,
+                        // The panel's arrows stay inside it, so Escape (the
+                        // TV's Back) is the way out (B1508).
+                        on_escape: move |()| {
+                            dock.set(false);
+                            super::listen::store_dock(false);
+                            platform::info(&super::stage::dock_line(
+                                false,
+                                view,
+                                queue.peek().upcoming().len(),
+                            ));
+                            platform::focus_by_id(super::stage::STAGE_QUEUE_ID);
+                        },
                     }
                 }
             }
