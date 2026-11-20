@@ -717,6 +717,18 @@ impl State {
             .unwrap_or(0);
         for run in stale {
             let who = (user.to_owned(), item.to_owned(), run);
+            // A revoked run whose writer is still going may yet land a
+            // playlist write in its allowance: it stays reserved on the
+            // record until the new run's plan replaces the estimate.
+            if self.writers.get(&who).is_some_and(|n| *n > 0) {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance kept item={item} run={run} reason=writer_running"
+                    ),
+                );
+                continue;
+            }
             self.playlists_taken.remove(&who);
             let landed = self.playlists_landed.remove(&who).unwrap_or(0);
             let base = self.playlists_base.remove(&who);
@@ -10038,6 +10050,50 @@ pub(crate) mod tests {
             "the parked run's allowance still counts after the claim"
         );
         assert!(!lines("pharos: video playlist allowance released item=1").is_empty());
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// CR outside-diff kept_video_disk.rs:5165: a parked run whose
+    /// playlist writer is still going keeps its allowance through the
+    /// claim, since the write may still land in it. With no writer it is
+    /// released at once (the test above).
+    #[tokio::test]
+    async fn a_parked_runs_allowance_stays_reserved_while_its_writer_runs() {
+        let rig = Rig::new("resume-keeps-writer-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let old = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied()
+            .unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        let inflated = only(&store).estimated_bytes;
+        // A playlist write of the old run, still pending.
+        *lock(&store.inner.state)
+            .writers
+            .entry(who.clone())
+            .or_default() += 1;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        assert_eq!(
+            only(&store).estimated_bytes,
+            inflated,
+            "a running writer's allowance was released"
+        );
+        assert!(lock(&store.inner.state).playlists_taken.contains_key(&who));
+        assert!(
+            lines("pharos: video playlist allowance kept item=1 run=")
+                .iter()
+                .any(|l| l.contains("reason=writer_running")),
+            "the kept allowance was not logged"
+        );
+        lock(&store.inner.state).writers.remove(&who);
         later.store(true, Ordering::SeqCst);
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
