@@ -381,6 +381,13 @@ pub struct MusicPending {
     pub written: Option<u64>,
 }
 
+/// See [`Cache::part_figures`].
+struct PartFigures {
+    owed: u64,
+    written: u64,
+    whole: bool,
+}
+
 impl MusicPending {
     /// Nothing in flight: no cache, so no music.
     pub const NONE: Self = Self {
@@ -1010,16 +1017,20 @@ impl Cache {
         // that recheck runs on the first fit too, not only after an evict.
         // An incomplete scan counts what it did read, a lower bound: the
         // cache trims for at least that much and never deletes on a guess.
+        // What approved writes still owe counts too, as the shared cap
+        // does: read with the parts, from the same scan.
         let parts_now = || {
-            let (parts, whole) = self.scan_parts();
-            if !whole {
+            let f = self.part_figures();
+            if !f.whole {
                 log::warn!(
-                    "cache trim with parts unknown parts_known={parts} reason=part_scan_incomplete"
+                    "cache trim with parts unknown parts_known={} owed={} reason=part_scan_incomplete",
+                    f.written,
+                    f.owed
                 );
             }
-            parts
+            (f.written, f.owed)
         };
-        let mut parts = parts_now();
+        let (mut parts, mut owed) = parts_now();
         #[cfg(test)]
         AFTER_TRIM_SCAN.with(|h| {
             if let Some(f) = h.borrow().as_ref() {
@@ -1033,12 +1044,15 @@ impl Cache {
         loop {
             let (_, music) = Self::totals(s);
             let outside = self.outside_bytes().held;
-            let used = music.saturating_add(outside).saturating_add(parts);
+            let used = music
+                .saturating_add(outside)
+                .saturating_add(parts)
+                .saturating_add(owed);
             if used <= self.cap() {
                 if fresh {
                     break;
                 }
-                parts = parts_now();
+                (parts, owed) = parts_now();
                 fresh = true;
                 continue;
             }
@@ -1058,7 +1072,7 @@ impl Cache {
                     continue;
                 }
                 log::warn!(
-                    "cache over cap used={used} music={music} outside={outside} parts={parts} cap={} and nothing is evictable (pinned, queued or playing)",
+                    "cache over cap used={used} music={music} outside={outside} parts={parts} owed={owed} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap()
                 );
                 break;
@@ -1066,7 +1080,9 @@ impl Cache {
             if !self.remove_locked(s, &id) {
                 break;
             }
-            log::info!("cache evict id={id} bytes={bytes} reason=over_cap outside={outside}");
+            log::info!(
+                "cache evict id={id} bytes={bytes} reason=over_cap outside={outside} owed={owed}"
+            );
             evicted.push(id);
             fresh = false;
         }
@@ -1453,6 +1469,17 @@ impl Cache {
     /// mid-read is counted as owed or as written, never as both or neither.
     /// Read under the shared admission lock, before any free-space probe.
     pub fn pending(&self) -> MusicPending {
+        let f = self.part_figures();
+        MusicPending {
+            owed: f.owed,
+            written: f.whole.then_some(f.written),
+        }
+    }
+
+    /// What [`Cache::pending`] reads: the reservations first, then one
+    /// read of each part's length. `written` is a lower bound when the
+    /// scan is not `whole`.
+    fn part_figures(&self) -> PartFigures {
         let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
         let (lens, whole) = self.scan_part_lens();
         let written = lens
@@ -1468,9 +1495,10 @@ impl Cache {
             };
             sum.saturating_add(v.owed(len))
         });
-        MusicPending {
+        PartFigures {
             owed,
-            written: whole.then_some(written),
+            written,
+            whole,
         }
     }
 
@@ -1981,6 +2009,27 @@ pub(crate) mod tests {
             scans <= 2,
             "scanned {scans} times for {} victims",
             evicted.len()
+        );
+    }
+
+    /// CR 4644634437: a trim counts what approved writes still owe, as the
+    /// shared cap does, and evicts a finished track to fit it.
+    #[test]
+    fn a_trim_counts_what_approved_writes_still_owe() {
+        let d = tmp("trim-owed");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(1 << 40)).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        assert!(c.ensure_free("track/w", 100).is_ok());
+        crate::testlog::start();
+        // 100 finished fits 150; with the 100 the write owes it does not.
+        c.set_cap(150).unwrap();
+        assert_eq!(c.used_bytes(), 0, "the trim left owed bytes over the cap");
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache evict id=track/a bytes=100 reason=over_cap")
+                && l.contains("owed=100")),
+            "the eviction did not name what was owed"
         );
     }
 
