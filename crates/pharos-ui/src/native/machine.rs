@@ -317,8 +317,10 @@ impl Machine {
             Event::NeedsSignIn if self.phase == Phase::Ready => {
                 self.sign_in(Some("Your session ended. Sign in again.".into()));
             }
+            // The current session's refusal ends it while it lasts, Ready or
+            // reconnecting; a stale one never does.
             Event::SessionNeedsSignIn { session }
-                if self.phase == Phase::Ready && session == self.session =>
+                if self.had_session && session == self.session =>
             {
                 self.sign_in(Some("Your session ended. Sign in again.".into()));
             }
@@ -828,6 +830,34 @@ mod tests {
         let now = m.session();
         m.apply(Event::SessionNeedsSignIn { session: now });
         assert!(sign_in_error_of(&m).is_some());
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
+    /// CR 4638660965: a refusal from the current session lands while the
+    /// socket is reconnecting (not Ready): it still ends that session and
+    /// runs the hook. A stale one still does not.
+    #[test]
+    fn a_current_refusal_during_a_reconnect_ends_the_session() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() {
+            ENDED.with(|n| n.set(n.get() + 1));
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let now = m.session();
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "gone".into(),
+        });
+        assert_eq!(m.phase(), &Phase::Connecting);
+        m.apply(Event::SessionNeedsSignIn {
+            session: now.wrapping_sub(1),
+        });
+        assert_eq!(m.phase(), &Phase::Connecting, "a stale refusal acted");
+        m.apply(Event::SessionNeedsSignIn { session: now });
+        assert!(sign_in_error_of(&m).is_some(), "the refusal was dropped");
         assert_eq!(ENDED.with(std::cell::Cell::get), 1);
     }
 
