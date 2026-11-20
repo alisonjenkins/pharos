@@ -834,7 +834,7 @@ pub fn HomeView(home: Home) -> Element {
         && home.next_up.is_empty();
     let admin = empty
         && try_use_context::<super::app::AccountMe>()
-            .is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+            .is_some_and(|me| me.me().is_some_and(|m| m.is_admin));
     let mut rails: Vec<&HomeRail> = home.rails.iter().collect();
     rails.sort_by_key(|rail| rail_rank(rail.library.library_kind));
     // Music to resume sits just before the music libraries.

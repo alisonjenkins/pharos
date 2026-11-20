@@ -292,7 +292,7 @@ thread_local! {
 /// previous user while the identity is fenced; it decides nothing here.
 /// The account is read only so a sign-in renders the screen again.
 fn use_user() -> Option<String> {
-    let _ = try_use_context::<AccountMe>().map(|a| a.0.read().clone());
+    let _ = try_use_context::<AccountMe>().map(|a| a.answer());
     offline_video::last_user()
 }
 

@@ -1841,7 +1841,7 @@ pub(crate) mod tests {
                 String::as_str,
                 Rc::new(|_: &String| ON_ME_RAN.with(|r| r.set(true))),
             );
-            let value = me.read().clone();
+            let value = me.read().clone().map(|s| s.me);
             SEEN.with(|s| *s.borrow_mut() = value);
             rsx! {}
         }

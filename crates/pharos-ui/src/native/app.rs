@@ -1795,9 +1795,90 @@ fn release_track_skips(skips: &TrackSkipCtx, owner: u64) {
 struct StartOver(Signal<Option<ItemRef>>);
 
 /// Who is signed in, as the account menu shows them; a screen that changes
-/// the avatar restarts it.
-#[derive(Clone, Copy)]
-pub(super) struct AccountMe(pub(super) Resource<Option<pharos_client::api::Me>>);
+/// the avatar restarts it. Read through its methods, which show an answer
+/// only while the session it was asked on is still the published one.
+pub(super) type AccountMe = ScopedMe<NativeApi, pharos_client::api::Me>;
+
+/// A `me` resource read against the published session: the screens' only
+/// way to its answer ([`current_answer`]).
+pub(crate) struct ScopedMe<A: 'static, M: 'static>(
+    Resource<Stamped<M>>,
+    Signal<Option<Session<A>>>,
+);
+
+impl<A, M> Clone for ScopedMe<A, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A, M> Copy for ScopedMe<A, M> {}
+
+impl<A, M: Clone> ScopedMe<A, M> {
+    /// The answer of `me` (from [`use_me`]), scoped to `session`.
+    pub(crate) fn new(me: Resource<Stamped<M>>, session: Signal<Option<Session<A>>>) -> Self {
+        Self(me, session)
+    }
+
+    /// `None` while no answer is current (none yet, or the one held was
+    /// asked on a session since replaced); `Some(None)` when it failed.
+    /// Subscribes to the answer and the session.
+    pub(crate) fn answer(&self) -> Option<Option<M>> {
+        current_answer(
+            self.0.read().as_ref(),
+            self.1.read().as_ref().map(Session::id),
+        )
+    }
+
+    /// The signed-in user, when a current answer names one.
+    pub(crate) fn me(&self) -> Option<M> {
+        self.answer().flatten()
+    }
+
+    /// [`Self::me`] without subscribing.
+    pub(crate) fn peek_me(&self) -> Option<M> {
+        current_answer(
+            self.0.peek().as_ref(),
+            self.1.peek().as_ref().map(Session::id),
+        )
+        .flatten()
+    }
+
+    /// Asks again.
+    pub(crate) fn restart(&mut self) {
+        self.0.restart();
+    }
+}
+
+/// A `me` answer with the session it was asked on (`None`: nothing was
+/// asked, as with no ready session). `me` is `None` when the ask failed or
+/// its answer was stale.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamped<M> {
+    pub(crate) session: Option<u64>,
+    pub(crate) me: Option<M>,
+}
+
+/// The answer the screens may use. Dioxus keeps a finished value through a
+/// restart, so after a reconnect the answer held can be the previous
+/// session's: it is hidden once another session is published, and kept
+/// while none is (an outage keeps the last name) or while its own session
+/// is. `None` while nothing current is held.
+pub(crate) fn current_answer<M: Clone>(
+    held: Option<&Stamped<M>>,
+    published: Option<u64>,
+) -> Option<Option<M>> {
+    let held = held?;
+    match (held.session, published) {
+        (Some(asked), Some(now)) if asked != now => {
+            platform::info(&format!(
+                "pharos: account me verdict=hidden reason=session_replaced asked_on={asked} published={now}"
+            ));
+            None
+        }
+        _ => Some(held.me.clone()),
+    }
+}
 
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
@@ -1965,7 +2046,7 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
     fetch: MeFetch<A, M>,
     id: fn(&M) -> &str,
     on_me: Rc<dyn Fn(&M)>,
-) -> Resource<Option<M>> {
+) -> Resource<Stamped<M>> {
     // A memo, so other machine changes do not ask again.
     let screens = use_memo(move || machine.read().shows_screens());
     use_resource(move || {
@@ -1979,16 +2060,27 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
         let ask = offline_video::me_request(ready, session.read().clone());
         let (fetch, on_me) = (fetch.clone(), on_me.clone());
         async move {
-            let ask = ask?;
-            let me = fetch(ask.api.clone()).await?;
+            let Some(ask) = ask else {
+                return Stamped {
+                    session: None,
+                    me: None,
+                };
+            };
+            let session = Some(ask.session);
+            let Some(me) = fetch(ask.api.clone()).await else {
+                return Stamped { session, me: None };
+            };
             // A stale answer (its session ended after it was asked) names a
             // user who is no longer current: nothing runs for it.
             if !ask.answered(id(&me)) {
                 platform::info("pharos: video user me verdict=stale_answer_dropped");
-                return None;
+                return Stamped { session, me: None };
             }
             on_me(&me);
-            Some(me)
+            Stamped {
+                session,
+                me: Some(me),
+            }
         }
     })
 }
@@ -2355,7 +2447,8 @@ fn NativeApp(route: Route) -> Element {
         }),
     );
 
-    use_context_provider(|| AccountMe(me));
+    let account = AccountMe::new(me, session);
+    use_context_provider(|| account);
 
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
@@ -2374,7 +2467,7 @@ fn NativeApp(route: Route) -> Element {
             }
         };
         let reconnecting = machine.read().reconnecting();
-        let me = me.read().clone().flatten();
+        let me = account.me();
         // The update notice waits while the full player is up: it sat over
         // the picture for the whole film, and nothing in it is urgent there.
         let on_player = {
@@ -3306,8 +3399,7 @@ fn PaletteScreen() -> Element {
         }
     };
     let account = try_use_context::<AccountMe>();
-    let admin =
-        move || account.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+    let admin = move || account.is_some_and(|me| me.me().is_some_and(|m| m.is_admin));
     let rows = use_memo(move || {
         let home = home.read();
         let libraries: Vec<_> = home.rails.iter().map(|rail| rail.library.clone()).collect();
@@ -3739,7 +3831,7 @@ fn AccountScreen() -> Element {
     // Saves run one at a time, so quick picks can't land out of order.
     let mut description_language_saves = use_signal(|| None::<account_settings::SerialPref>);
     let mut description_language_failed = use_signal(|| None::<String>);
-    let me = account.0.read().clone().flatten();
+    let me = account.me();
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
             let mut machine = ctx.machine;
@@ -3820,7 +3912,7 @@ fn AccountScreen() -> Element {
                     };
                     let result = api.set_avatar(&call("account", "set_avatar"), &picture).await;
                     match &result {
-                        Ok(_) => account.0.restart(),
+                        Ok(_) => account.restart(),
                         Err(e) => report(e, "set avatar"),
                     }
                     avatar_outcome.set(Some(
@@ -3841,7 +3933,7 @@ fn AccountScreen() -> Element {
                 spawn(async move {
                     let result = api.remove_avatar(&call("account", "remove_avatar")).await;
                     match &result {
-                        Ok(()) => account.0.restart(),
+                        Ok(()) => account.restart(),
                         Err(e) => report(e, "remove avatar"),
                     }
                     avatar_outcome.set(result.err().map(|e| Err(account_settings::avatar_refusal_message(&e))));
@@ -4066,7 +4158,7 @@ fn ReaderPasswordsScreen() -> Element {
     let mut problem = use_signal(|| None::<String>);
     let mut opds_path = use_signal(|| "/opds/".to_owned());
     let mut connection = use_signal(|| 0u64);
-    let username = account.0.read().clone().flatten().map(|me| me.name);
+    let username = account.me().map(|me| me.name);
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
             let mut machine = ctx.machine;
@@ -6015,9 +6107,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // A downloaded copy plays whatever the connection is: a weak signal
         // never breaks it. `peek`: the account loading must not restart it.
         let wanted = picked_here.clone().or_else(|| stored_version(id));
-        let signed_in = account
-            .and_then(|a| a.0.peek().clone().flatten())
-            .map(|me| me.id);
+        let signed_in = account.and_then(|a| a.peek_me()).map(|me| me.id);
         // With no connection the downloaded copy is all there is, so a
         // preferred version that is another file does not hide it.
         let wanted = wanted.filter(|_| api.is_some());
@@ -8813,12 +8903,7 @@ fn Player(
         let skips = skips.clone();
         move || release_track_skips(&skips, skip_owner)
     });
-    let me = account.and_then(|a| {
-        a.0.read()
-            .as_ref()
-            .and_then(Option::as_ref)
-            .map(|m| (m.id.clone(), m.name.clone()))
-    });
+    let me = account.and_then(|a| a.me().map(|m| (m.id, m.name)));
     let members_waiting: Vec<String> = match me {
         Some((id, name)) if group.drives(playing_id) => group
             .members
@@ -9669,6 +9754,102 @@ mod tests {
             !lines.iter().any(|l| l.contains("verdict=hidden")),
             "{lines:?}"
         );
+    }
+
+    /// CR 4642574422: Dioxus keeps A's finished `me` through the restart a
+    /// reconnect causes. Once B's session is published, A's answer is not
+    /// shown (no name, no admin links) while B's `me` is pending; B's
+    /// answer shows when it comes.
+    #[test]
+    fn a_replaced_sessions_me_is_not_shown_while_the_next_is_pending() {
+        use super::super::machine::{Event, Machine};
+        use offline_video::Session;
+        type Answers = Vec<tokio::sync::oneshot::Receiver<String>>;
+        thread_local! {
+            static ANSWERS: RefCell<Answers> = const { RefCell::new(Vec::new()) };
+            static SESSION: RefCell<Option<Signal<Option<Session<()>>>>> =
+                const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let machine = use_signal(|| {
+                let mut m = Machine::new();
+                m.apply(Event::Resumed { epoch: 0 });
+                m
+            });
+            let session = use_signal(|| Some(offline_video::tests::seam_session()));
+            SESSION.with(|s| s.replace(Some(session)));
+            let me = use_me(
+                machine,
+                session,
+                Rc::new(|()| {
+                    Box::pin(async {
+                        let rx = ANSWERS.with(|a| {
+                            let mut a = a.borrow_mut();
+                            (!a.is_empty()).then(|| a.remove(0))
+                        })?;
+                        rx.await.ok()
+                    })
+                }),
+                String::as_str,
+                Rc::new(|_: &String| {}),
+            );
+            match ScopedMe::new(me, session).me() {
+                Some(user) => rsx! { div { "me {user}" } },
+                None => rsx! { div { "no me" } },
+            }
+        }
+        /// Renders until `want` shows or `ms` pass. Each check follows a
+        /// render, so a change made before the call is on screen.
+        async fn drive(dom: &mut VirtualDom, want: &str, ms: u64) -> String {
+            let start = std::time::Instant::now();
+            loop {
+                dom.render_immediate_to_vec();
+                let html = dioxus_ssr::render(dom);
+                if html.contains(want) || start.elapsed() > std::time::Duration::from_millis(ms) {
+                    return html;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+        }
+        offline_video::tests::use_pref_seam();
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<String>();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel::<String>();
+        ANSWERS.with(|a| a.replace(vec![rx_a, rx_b]));
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (during, after, lines) = rt.block_on(async {
+            tx_a.send("A".to_owned()).unwrap();
+            let html = drive(&mut dom, "me A", 2000).await;
+            assert!(html.contains("me A"), "A's answer never showed: {html}");
+            platform::take_info_lines();
+            let mut session = SESSION.with(|s| s.borrow().unwrap());
+            dom.in_runtime(|| session.set(Some(offline_video::tests::seam_session())));
+            dom.mark_dirty(ScopeId::APP);
+            // A's name, if it shows, shows at once.
+            let during = drive(&mut dom, "me A", 300).await;
+            let lines = platform::take_info_lines();
+            tx_b.send("B".to_owned()).unwrap();
+            let after = drive(&mut dom, "me B", 2000).await;
+            (during, after, lines)
+        });
+        offline_video::forget_user();
+        assert!(
+            during.contains("no me"),
+            "A's answer showed for B's session: {during}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                .starts_with("pharos: account me verdict=hidden reason=session_replaced")),
+            "{lines:?}"
+        );
+        assert!(after.contains("me B"), "B's answer never showed: {after}");
     }
 
     /// End to end, through the app's own timer, screen and store watch: an
