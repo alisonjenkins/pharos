@@ -1989,6 +1989,32 @@ fn NativeApp(route: Route) -> Element {
             }
         });
     });
+    // Something kept since sign-in (a download started, a book kept) gets
+    // its notes within a few minutes, so it shows in full offline even if
+    // the connection drops before the next sign-in. A pass with every kept
+    // item noted makes no call.
+    use_hook(move || {
+        spawn_forever(async move {
+            loop {
+                platform::sleep_ms(NOTES_EVERY_MS).await;
+                let up = {
+                    let m = machine.peek();
+                    matches!(m.phase(), Phase::Ready) && !m.reconnecting()
+                };
+                let (true, Some(api), Some(user)) =
+                    (up, api.peek().clone(), offline_video::last_user())
+                else {
+                    continue;
+                };
+                let began = platform::now_ms();
+                let filled =
+                    super::offline_device::fill_notes(&api, &user, platform::unix_ms()).await;
+                if filled.noted > 0 || filled.failed > 0 {
+                    platform::info(&filled.log_line(platform::now_ms() - began));
+                }
+            }
+        })
+    });
     // Whether the screens read the device's library, decided on every
     // change of connection; the "Back online" line shows for a moment after.
     let mut back_online = use_signal(|| false);
@@ -6449,6 +6475,9 @@ type LeaveInFlight =
 pub struct ConnectionLost(pub Memo<bool>);
 
 const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
+
+/// How often, while online, what was kept since gets its notes (spec 049).
+const NOTES_EVERY_MS: u32 = 5 * 60 * 1000;
 
 /// How long "Back online" stays up after the device's library gives way
 /// to the server's (spec 049).
