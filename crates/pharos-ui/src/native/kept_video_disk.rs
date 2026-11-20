@@ -958,11 +958,8 @@ impl Drop for Staged<'_> {
                 st.staged.remove(&self.who);
             }
         }
-        // A playlist promoted before the plan moves from staged to landed
-        // in this hold, so it is never counted as owed in between.
-        if self.promoted && st.playlists_taken.contains_key(&self.who) {
-            *st.playlists_landed.entry(self.who.clone()).or_default() += self.len;
-        }
+        // A playlist promoted before the plan was moved to landed in the
+        // hold that renamed it (its `len` is 0 since): nothing to move.
         let claim = std::mem::take(&mut self.claim);
         st.unclaim(&self.who, claim);
         drop(st);
@@ -2545,12 +2542,31 @@ async fn fetch_once(
         } else {
             #[cfg(test)]
             tests::sync_step(format!("rename {}", shown_name(path)));
-            Promote::Renamed(std::fs::rename(&part, path))
+            let renamed = std::fs::rename(&part, path);
+            // A playlist promoted before the plan moves from staged to
+            // landed in this hold, with the rename: no reader sees it under
+            // its final name and still staged. The guard's drop then has
+            // nothing of it left to move.
+            if renamed.is_ok() && st.playlists_taken.contains_key(&staged.who) {
+                let moved = std::mem::take(&mut staged.len);
+                if let Some(held) = st.staged.get_mut(&staged.who) {
+                    *held = held.saturating_sub(moved);
+                    if *held == 0 {
+                        st.staged.remove(&staged.who);
+                    }
+                }
+                *st.playlists_landed.entry(staged.who.clone()).or_default() += moved;
+            }
+            Promote::Renamed(renamed)
         }
     };
     match promoted {
         Promote::Renamed(Ok(())) => {
             staged.promoted = true;
+            #[cfg(test)]
+            if let Some(hook) = tests::AFTER_PROMOTE.with(|h| h.borrow_mut().take()) {
+                hook(&lock(&inner.state), &staged.who, len);
+            }
             Ok(len)
         }
         Promote::Renamed(Err(e)) => {
@@ -5435,7 +5451,13 @@ pub(crate) mod tests {
         /// While `Some`, every sync, rename and the Ready publication, in
         /// the order they happen.
         static SYNC_STEPS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        /// Runs once right after a file is renamed into place, before its
+        /// staging guard drops: it sees the state as a reader would.
+        pub(super) static AFTER_PROMOTE: RefCell<Option<AfterPromote>> = RefCell::new(None);
     }
+
+    /// What `AFTER_PROMOTE` runs: the state, the staged key, its length.
+    pub(super) type AfterPromote = Box<dyn FnOnce(&State, &(String, String, u64), u64)>;
 
     thread_local! {
         /// A folder sync of the folder named `.0` fails with OS error `.1`,
@@ -9547,6 +9569,36 @@ pub(crate) mod tests {
             before,
             "the stale run changed the resumed record's reservation: {:?}",
             captured()
+        );
+    }
+
+    /// Outside-diff item kept_video_disk.rs:2478: a playlist renamed into
+    /// place before the plan is counted as landed, not staged, in the same
+    /// hold as the rename. A reader between the rename and the staging
+    /// guard's drop (a park and resume settling the run's allowance) sees
+    /// its bytes once, as landed.
+    #[tokio::test]
+    async fn a_promoted_playlist_is_landed_in_the_hold_that_renames_it() {
+        let rig = Rig::new("promote-landed");
+        let seen: std::rc::Rc<RefCell<Option<(u64, u64, u64)>>> = std::rc::Rc::default();
+        let s2 = seen.clone();
+        AFTER_PROMOTE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |st, who, len| {
+                *s2.borrow_mut() = Some((
+                    st.playlists_landed.get(who).copied().unwrap_or(0),
+                    st.staged.get(who).copied().unwrap_or(0),
+                    len,
+                ));
+            }));
+        });
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let (landed, staged, len) = seen.borrow().expect("no file was promoted");
+        assert_eq!(
+            (landed, staged),
+            (len, 0),
+            "counted as staged after its rename"
         );
     }
 
