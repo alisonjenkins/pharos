@@ -100,7 +100,24 @@ impl Fence {
 static FENCES: Mutex<std::collections::BTreeMap<PathBuf, Fence>> =
     Mutex::new(std::collections::BTreeMap::new());
 
+/// Set by a sign-out that could not even find its token file: it cannot
+/// name the file, so every token at every path is refused until a store
+/// installs one. Changed only while the file lock ([`FILE`]) is held.
+static EVERY_FILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Fences every token at every path in this process, under the file lock:
+/// for a sign-out that could not find its token file (`reason` for the
+/// log). The next store, at any path, replaces it.
+pub fn fence_every_file(reason: &str) {
+    let _held = hold();
+    EVERY_FILE.store(true, std::sync::atomic::Ordering::SeqCst);
+    log::warn!("token fence verdict=every scope=process reason={reason}");
+}
+
 fn fence_held(path: &Path) -> Fence {
+    if EVERY_FILE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Fence::Every;
+    }
     FENCES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -415,6 +432,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             let stored = fingerprint(token);
             let next = fence_held(path).after_store(&stored, replaced.as_deref());
             set_fence_held(path, next, "token_stored");
+            if EVERY_FILE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                log::info!("token fence verdict=open scope=process reason=token_stored");
+            }
             if let Some(hook) = ON_STORED.get() {
                 hook(&fingerprint(token), replaced.as_deref());
             }

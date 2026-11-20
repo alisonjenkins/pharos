@@ -6,41 +6,9 @@
 //! production fence. The fence is kept per token file, so the other tests
 //! of the group, each with a file of its own, cannot set or lift it.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use pharos_content::{token, AuthState, Library, Timeouts};
-
-/// A folder of this test's own, removed when it drops (a failed assertion
-/// included).
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "pharos-content-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// An address nothing listens on: a link attempt fails at once.
-fn dead_server() -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    format!("http://{}", l.local_addr().unwrap())
-}
 
 /// CR 4637279773: a token fenced by a sign-out on another thread is refused
 /// by the service's reload on its worker thread. The reload reads no token
@@ -48,11 +16,12 @@ fn dead_server() -> String {
 /// server; a different token on file is read and tried.
 #[test]
 fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
-    let scratch = Scratch::new("fence-cross-thread");
+    let _serial = super::serial();
+    let scratch = super::Scratch::new("fence-cross-thread");
     let token_path = scratch.0.join("token");
     token::store(&token_path, "fenced-token").unwrap();
     let lib = Library::connect_with(
-        &dead_server(),
+        &super::dead_server(),
         &token_path,
         Timeouts {
             command: Duration::from_secs(3),
