@@ -464,6 +464,16 @@ impl Planner {
         true
     }
 
+    /// Whether [`Planner::reinit`] would take a switch of `track` once its
+    /// request in flight is over: not after the last segment is appended.
+    pub fn switchable(&self, track: Track) -> bool {
+        match track {
+            Track::Video => Some(&self.video),
+            Track::Audio => self.audio.as_ref(),
+        }
+        .is_some_and(|state| !state.last_appended)
+    }
+
     /// The request failed or was aborted; the segment is fetched again on a later tick.
     pub fn failed(&mut self, track: Track) {
         if let Some(state) = self.track_mut(track) {
@@ -1617,9 +1627,12 @@ mod tests {
         let mut planner = Planner::new(segs, false, None, Config::default(), 0);
         let buffered = Buffered::default();
         assert!(!planner.reinit(Track::Audio), "no audio track");
+        assert!(!planner.switchable(Track::Audio));
         let _ = planner.tick(0, &buffered);
+        assert!(planner.switchable(Track::Video), "while the request runs");
         planner.appended(Track::Video);
         assert!(!planner.reinit(Track::Video), "nothing left to fetch");
+        assert!(!planner.switchable(Track::Video));
     }
 
     #[test]

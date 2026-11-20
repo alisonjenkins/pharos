@@ -418,6 +418,16 @@ fn download_ms(bandwidth_bps: u64, segment_ms: u64, estimate_bps: u64) -> u64 {
     u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
+/// Whether a media download still running should be given up for the rung
+/// below: its body has been arriving for longer than the segment plays, so the
+/// link is slower than the rung, and less than one segment is buffered ahead,
+/// so playback would stall before it lands (hls.js's abandon rule, on time
+/// alone). `since_headers_ms` leaves out the wait for the first byte, which is
+/// the server encoding and no fault of the link.
+pub fn abandon_slow_load(since_headers_ms: u64, media_ms: u64, forward_ms: u64) -> bool {
+    media_ms > 0 && since_headers_ms >= media_ms && forward_ms < media_ms
+}
+
 #[cfg(test)]
 mod tests {
     // Panicking on unexpected ABR states is the intended failure mode in tests.
@@ -427,6 +437,7 @@ mod tests {
 
     use proptest::prelude::*;
 
+    use super::abandon_slow_load;
     use super::{
         download_ms, Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Reason, Rung, Switch,
     };
@@ -979,5 +990,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_download_slower_than_playback_is_abandoned_only_when_the_buffer_is_short() {
+        // 6 s of media still arriving after 6 s, 2 s buffered: abandon.
+        assert!(abandon_slow_load(6_000, 6_000, 2_000));
+        // Not yet slower than playback.
+        assert!(!abandon_slow_load(5_999, 6_000, 0));
+        // Slow, but a segment or more is buffered: let it finish.
+        assert!(!abandon_slow_load(20_000, 6_000, 6_000));
+        // An init segment has no play time to compare against.
+        assert!(!abandon_slow_load(20_000, 0, 0));
     }
 }

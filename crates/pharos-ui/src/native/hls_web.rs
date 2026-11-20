@@ -6,7 +6,9 @@ use std::rc::{Rc, Weak};
 
 use gloo_net::http::Request;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
-use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
+use pharos_hls::abr::{
+    abandon_slow_load, Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung,
+};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
 use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
 use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Verdict as RetryVerdict, Watch};
@@ -38,6 +40,9 @@ const STALL_TICK_MS: i32 = 250;
 /// tried again, and how many refusals of one append are a media error.
 const QUOTA_RETRY_MS: u32 = 500;
 const QUOTA_MAX_TRIES: u32 = 4;
+
+/// How often a download still arriving is checked against the abandon rule.
+const ABANDON_CHECK_MS: u64 = 500;
 
 type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
@@ -1438,7 +1443,16 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
     wasm_bindgen_futures::spawn_local(async move {
         let outcome = match prefetched {
             Some(shared) => (*shared.await).clone(),
-            None => fetch_segment(&uri, &signal, deadlines).await,
+            None => {
+                let watcher = weak.clone();
+                let abandon = move |since_headers_ms| {
+                    track == Track::Video
+                        && watcher.upgrade().is_some_and(|session| {
+                            should_abandon(&session, since_headers_ms, media_ms)
+                        })
+                };
+                fetch_segment(&uri, &signal, deadlines, abandon).await
+            }
         };
         if signal.aborted() {
             return;
@@ -1481,6 +1495,33 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
     });
 }
 
+/// Whether the video download in flight should be given up for the rung below
+/// (`abr::abandon_slow_load`); never when the step down would be refused (no
+/// lower rung, or the last segment is in), where giving up would only fetch
+/// the same bytes again and count as a failure.
+fn should_abandon(session: &Rc<RefCell<Session>>, since_headers_ms: u64, media_ms: u64) -> bool {
+    let can_step_down = {
+        let s = session.borrow();
+        let has_lower_rung = s
+            .abr
+            .as_ref()
+            .and_then(|st| st.abr.current())
+            .is_some_and(|current| current > 0);
+        has_lower_rung
+            && s.planner
+                .as_ref()
+                .is_some_and(|p| p.switchable(Track::Video))
+    };
+    can_step_down
+        && snapshot_state(session).is_some_and(|(play_ms, buffered)| {
+            abandon_slow_load(
+                since_headers_ms,
+                media_ms,
+                forward_buffer_ms(&buffered.video, play_ms),
+            )
+        })
+}
+
 /// Requests media segment `index` of `track` ahead of the planner asking for it.
 fn start_prefetch(
     track: Track,
@@ -1496,9 +1537,10 @@ fn start_prefetch(
         track.label()
     ));
     let fetch_uri = uri.clone();
-    let outcome = async move { Rc::new(fetch_segment(&fetch_uri, &signal, deadlines).await) }
-        .boxed_local()
-        .shared();
+    let outcome =
+        async move { Rc::new(fetch_segment(&fetch_uri, &signal, deadlines, |_| false).await) }
+            .boxed_local()
+            .shared();
     // Polled here so the request runs before anything waits on it.
     wasm_bindgen_futures::spawn_local(outcome.clone().map(drop));
     Some(Prefetch {
@@ -1547,10 +1589,14 @@ async fn body_buffer(resp: web_sys::Response) -> Result<js_sys::ArrayBuffer, JsV
 
 /// Fetches one segment against `deadlines` (FR-005): the headers must arrive
 /// within the first-byte deadline, the body within the load deadline after.
+///
+/// `abandon` is asked, every [`ABANDON_CHECK_MS`] the body is still arriving,
+/// whether to give the download up, with the time since the headers.
 async fn fetch_segment(
     uri: &str,
     signal: &web_sys::AbortSignal,
     deadlines: Deadlines,
+    abandon: impl Fn(u64) -> bool,
 ) -> Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure> {
     let sent_at = now_ms();
     let mut watch = Watch::new(deadlines, now_ms_u64());
@@ -1572,12 +1618,26 @@ async fn fetch_segment(
             reason: resp.status_text(),
         });
     }
-    let bytes = within(
-        body_buffer(web_sys::Response::from(resp)),
-        watch.remaining_ms(now_ms_u64()),
-    )
-    .await
-    .ok_or_else(|| FetchFailure::timeout(&watch))?
+    let headers_ms = now_ms_u64();
+    let body = body_buffer(web_sys::Response::from(resp));
+    futures_util::pin_mut!(body);
+    let bytes = loop {
+        let remaining_ms = watch.remaining_ms(now_ms_u64());
+        if let Some(done) = within(&mut body, remaining_ms.min(ABANDON_CHECK_MS)).await {
+            break done;
+        }
+        if watch.remaining_ms(now_ms_u64()) == 0 {
+            return Err(FetchFailure::timeout(&watch));
+        }
+        let since_headers_ms = now_ms_u64().saturating_sub(headers_ms);
+        if abandon(since_headers_ms) {
+            return Err(FetchFailure {
+                cause: Cause::TimeoutLoad,
+                deadline_ms: Some(since_headers_ms),
+                reason: "abandoned: slower than playback".to_owned(),
+            });
+        }
+    }
     .map_err(|e| FetchFailure {
         cause: Cause::Network,
         deadline_ms: None,
