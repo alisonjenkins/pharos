@@ -32,8 +32,8 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::kept_video::{
     check_not_kept, content_type_for, find, fits, insert_front, interrupted, is_retryable,
-    missing_files, new_record, progress_due, request_key, retry_delay_secs, take, url_path,
-    KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, StoredFile, VideoStore,
+    missing_files, new_record, progress_due, rebase_playlist, request_key, retry_delay_secs, take,
+    url_path, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, StoredFile, VideoStore,
 };
 use super::platform;
 
@@ -73,6 +73,12 @@ impl FetchError {
 pub trait Body: Send {
     /// The next chunk, or `None` at the end.
     fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>>;
+    /// The key the body was answered from after the server's redirects
+    /// (path and query, as [`request_key`] cuts it), when that is not the
+    /// key asked for: a playlist's relative references resolve against it.
+    fn final_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Why a request was not answered with a body.
@@ -2330,9 +2336,54 @@ async fn fetch_once(
             },
         )
     };
+    // A playlist answered from another key (a same-origin redirect) is held
+    // whole and stored with its references rebased onto that key
+    // (CR 4637279590): what is written, reserved and capped is the
+    // rewritten text. The raw body is held to the same cap, so memory stays
+    // bounded.
+    let mut rebase = limit.and(body.final_key().filter(|f| f != key));
+    let mut held: Vec<u8> = Vec::new();
+    let mut ended = false;
     let mut len = 0u64;
     loop {
-        match body.next_chunk().await {
+        if ended {
+            break;
+        }
+        let next = match body.next_chunk().await {
+            Ok(Some(chunk)) if rebase.is_some() => {
+                let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
+                if (held.len() as u64).saturating_add(chunk.len() as u64) > cap {
+                    drop(file);
+                    staged.abandon("too_large");
+                    return Err(FetchOnce::TooLarge(cap));
+                }
+                held.extend_from_slice(&chunk);
+                continue;
+            }
+            Ok(Some(chunk)) => Ok(Some(chunk)),
+            Ok(None) => match rebase.take() {
+                Some(final_key) => {
+                    ended = true;
+                    let raw = std::mem::take(&mut held);
+                    let text = rebase_playlist(&String::from_utf8_lossy(&raw), &final_key);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep playlist verdict=rebased item={item} url_path={} final_path={} from_len={} to_len={} cap={}",
+                            url_path(key),
+                            url_path(&final_key),
+                            raw.len(),
+                            text.len(),
+                            limit.unwrap_or_default()
+                        ),
+                    );
+                    Ok(Some(text.into_bytes()))
+                }
+                None => Ok(None),
+            },
+            Err(e) => Err(e),
+        };
+        match next {
             Ok(Some(chunk)) => {
                 // A run a removal or restart has revoked writes no more.
                 if !inner.owns(user, item, run) {
@@ -5703,6 +5754,9 @@ pub(crate) mod tests {
         token_file: Mutex<Option<(String, Option<String>)>>,
         /// Each request sent, with the token it carried.
         sent: Mutex<Vec<(String, Option<String>)>>,
+        /// key -> the key the server redirects it to (followed, as the
+        /// phone's client follows a same-origin redirect).
+        redirects: Mutex<HashMap<String, String>>,
     }
 
     impl FakeServer {
@@ -5838,6 +5892,8 @@ pub(crate) mod tests {
         Option<Arc<std::sync::atomic::AtomicBool>>,
         /// Fails once released, rather than sending the rest.
         bool,
+        /// The key a redirect answered it from.
+        Option<String>,
     );
 
     impl Body for FakeBody {
@@ -5865,6 +5921,10 @@ pub(crate) mod tests {
                     Some(self.0.remove(0))
                 })
             })
+        }
+
+        fn final_key(&self) -> Option<String> {
+            self.4.clone()
         }
     }
 
@@ -5919,6 +5979,8 @@ pub(crate) mod tests {
                         message: "no signal".into(),
                     });
                 }
+                let moved = self.redirects.lock().unwrap().get(key).cloned();
+                let key = moved.as_deref().unwrap_or(key);
                 match self.files.lock().unwrap().get(key) {
                     // Two chunks, so a body really streams.
                     Some(b) => {
@@ -5936,6 +5998,7 @@ pub(crate) mod tests {
                             gate,
                             reached,
                             fails,
+                            moved,
                         )) as Box<dyn Body>)
                     }
                     None => Err(FetchError {
@@ -12739,6 +12802,123 @@ pub(crate) mod tests {
             None
         );
         crate::native::offline_video::forget_user();
+    }
+
+    /// CR 4637279590: a master the server redirects into another folder
+    /// still downloads and plays. Its relative references name files in the
+    /// folder it was answered from, so the stored playlists name them by
+    /// absolute path: the copy is Ready, and with the server gone the
+    /// master, its playlist and its first segment are answered from disk
+    /// by exactly the keys the playlists name.
+    #[tokio::test]
+    async fn a_master_redirected_into_another_folder_downloads_and_plays_offline() {
+        let rig = Rig::new("redirected-master");
+        {
+            let moved_master = "/videos/1/hls/master.m3u8?PlaySessionId=p";
+            let mut f = rig.server.files.lock().unwrap();
+            f.clear();
+            f.insert(
+                moved_master.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\nmain.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                "/videos/1/hls/main.m3u8?PlaySessionId=p".into(),
+                MEDIA.as_bytes().to_vec(),
+            );
+            f.insert("/videos/1/hls/init.mp4?PlaySessionId=p".into(), vec![1; 10]);
+            f.insert("/videos/1/hls/0.m4s?PlaySessionId=p".into(), vec![2; 100]);
+            f.insert("/videos/1/hls/1.m4s?PlaySessionId=p".into(), vec![3; 100]);
+            drop(f);
+            rig.server
+                .redirects
+                .lock()
+                .unwrap()
+                .insert(MASTER_KEY.into(), moved_master.into());
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(
+            kept.state,
+            KeptState::Ready,
+            "{kept:?} asked {:?}",
+            rig.server.asked()
+        );
+        assert!(
+            !lines("pharos: video keep playlist verdict=rebased").is_empty(),
+            "the rebasing was not logged"
+        );
+        // The network is gone.
+        rig.server.files.lock().unwrap().clear();
+        let asked = rig.server.asked().len();
+        crate::native::offline_video::remember_user("u1");
+        let store: Arc<dyn VideoStore> = store;
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let first_ref = |text: &str| {
+            text.lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .expect("the playlist names no file")
+        };
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url)
+                .expect("the stored master was not given a local source");
+        let master = local(&source).expect("the master was not served locally");
+        let playlist = resolve_against(&source, &first_ref(&master));
+        assert_eq!(playlist, "/videos/1/hls/main.m3u8?PlaySessionId=p");
+        // Asked for by the key it was answered from, it was not rebased:
+        // its references resolve against that key as they are.
+        let media = local(&playlist).expect("the playlist was not served locally");
+        let segment = resolve_against(&playlist, &first_ref(&media));
+        assert_eq!(segment, "/videos/1/hls/0.m4s?PlaySessionId=p");
+        assert_eq!(
+            local(&segment).map(|s| s.into_bytes()),
+            Some(vec![2; 100]),
+            "the first segment was not served locally"
+        );
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// The playlist cap is on what is stored: a redirected master under
+    /// the cap as sent, over it once its references are rebased, is refused
+    /// as too large and nothing of it is kept.
+    #[tokio::test]
+    async fn a_rebased_playlist_over_the_cap_is_refused() {
+        let rig = Rig::new("rebased-cap");
+        let moved = "/videos/1/hls/master.m3u8?PlaySessionId=p";
+        // Two bytes a line as sent, sixteen once rebased.
+        let lines_sent = usize::try_from(PLAYLIST_MAX_BYTES / 4).unwrap();
+        let raw = "x\n".repeat(lines_sent);
+        assert!(raw.len() as u64 <= PLAYLIST_MAX_BYTES);
+        assert!(rebase_playlist(&raw, moved).len() as u64 > PLAYLIST_MAX_BYTES);
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(moved.into(), raw.into_bytes());
+        rig.server
+            .redirects
+            .lock()
+            .unwrap()
+            .insert(MASTER_KEY.into(), moved.into());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("{:?}", only(&store));
+        };
+        assert!(reason.contains("playlist_too_large"), "{reason}");
+        assert!(store.indexed_file("u1", MASTER_KEY).is_none());
     }
 
     /// `rel` resolved against `base`'s folder, as hls.js does.
