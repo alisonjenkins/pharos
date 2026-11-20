@@ -2365,7 +2365,25 @@ async fn fetch_once(
                 Some(final_key) => {
                     ended = true;
                     let raw = std::mem::take(&mut held);
-                    let text = rebase_playlist(&String::from_utf8_lossy(&raw), &final_key);
+                    let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
+                    let Some(text) = rebase_playlist(
+                        &String::from_utf8_lossy(&raw),
+                        &final_key,
+                        usize::try_from(cap).unwrap_or(usize::MAX),
+                    ) else {
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video keep playlist verdict=too_large item={item} url_path={} final_path={} from_len={} cap={cap}",
+                                url_path(key),
+                                url_path(&final_key),
+                                raw.len()
+                            ),
+                        );
+                        drop(file);
+                        staged.abandon("too_large");
+                        return Err(FetchOnce::TooLarge(cap));
+                    };
                     emit(
                         false,
                         format!(
@@ -12909,7 +12927,9 @@ pub(crate) mod tests {
         let lines_sent = usize::try_from(PLAYLIST_MAX_BYTES / 4).unwrap();
         let raw = "x\n".repeat(lines_sent);
         assert!(raw.len() as u64 <= PLAYLIST_MAX_BYTES);
-        assert!(rebase_playlist(&raw, moved).len() as u64 > PLAYLIST_MAX_BYTES);
+        assert!(
+            rebase_playlist(&raw, moved, usize::MAX).unwrap().len() as u64 > PLAYLIST_MAX_BYTES
+        );
         rig.server
             .files
             .lock()

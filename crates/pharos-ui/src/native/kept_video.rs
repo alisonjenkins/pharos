@@ -515,23 +515,29 @@ pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
 /// it resolves to against `final_key`, so the stored copy names its files
 /// wherever it is read from: a URI line, and every `URI="..."` attribute
 /// of a tag. A reference that is already absolute, or names a scheme, is
-/// left as it is; so are the line endings and every other line.
-pub fn rebase_playlist(text: &str, final_key: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 4);
+/// left as it is; so are the line endings and every other line. `None`
+/// once the rewrite would pass `limit` bytes.
+pub fn rebase_playlist(text: &str, final_key: &str, limit: usize) -> Option<String> {
+    let mut out = String::with_capacity(text.len().min(limit));
+    // Each piece is checked against `limit` before it is appended: a
+    // rewrite past it stops there, never building the whole of it.
+    let push = |out: &mut String, piece: &str| -> Option<()> {
+        (out.len().saturating_add(piece.len()) <= limit).then(|| out.push_str(piece))
+    };
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\r', '\n']);
         let ending = &line[body.len()..];
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            out.push_str(line);
+            push(&mut out, line)?;
         } else if trimmed.starts_with('#') {
             let mut rest = body;
             while let Some(at) = rest.find("URI=\"") {
                 let (head, tail) = rest.split_at(at + 5);
-                out.push_str(head);
+                push(&mut out, head)?;
                 match tail.find('"') {
                     Some(end) => {
-                        out.push_str(&pharos_hls::uri::resolve(final_key, &tail[..end]));
+                        push(&mut out, &pharos_hls::uri::resolve(final_key, &tail[..end]))?;
                         rest = &tail[end..];
                     }
                     None => {
@@ -540,14 +546,14 @@ pub fn rebase_playlist(text: &str, final_key: &str) -> String {
                     }
                 }
             }
-            out.push_str(rest);
-            out.push_str(ending);
+            push(&mut out, rest)?;
+            push(&mut out, ending)?;
         } else {
-            out.push_str(&pharos_hls::uri::resolve(final_key, trimmed));
-            out.push_str(ending);
+            push(&mut out, &pharos_hls::uri::resolve(final_key, trimmed))?;
+            push(&mut out, ending)?;
         }
     }
-    out
+    Some(out)
 }
 
 /// Whether a failed `cache.put` is the body transfer breaking (the browser
@@ -724,6 +730,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
+    /// Outside-diff item kept_video_disk.rs:2368: the limit holds while the
+    /// rewrite is built. One byte short of the whole rewrite is `None`,
+    /// and exactly its length fits.
+    #[test]
+    fn a_rebase_stops_at_its_limit() {
+        let key = "/videos/7/hls/main.m3u8?s=1";
+        let text = "#EXTINF:6.0,\n0.m4s?s=1\n";
+        let whole = rebase_playlist(text, key, usize::MAX).unwrap();
+        assert_eq!(rebase_playlist(text, key, whole.len()), Some(whole.clone()));
+        assert_eq!(rebase_playlist(text, key, whole.len() - 1), None);
+    }
+
     #[test]
     fn a_final_url_is_keyed_under_the_servers_base_path() {
         let moved = "http://s:8096/videos/7/hls/master.m3u8?s=1";
@@ -752,7 +770,7 @@ mod tests {
             /already/absolute.m3u8?s=1\r\n\
             https://h/elsewhere.m3u8\r\n";
         assert_eq!(
-            rebase_playlist(master, "/videos/7/hls/master.m3u8?s=1"),
+            rebase_playlist(master, "/videos/7/hls/master.m3u8?s=1", usize::MAX).unwrap(),
             "#EXTM3U\r\n\
             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"/videos/7/audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
             #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
@@ -765,8 +783,10 @@ mod tests {
         assert_eq!(
             rebase_playlist(
                 "#EXT-X-MAP:URI=\"init.mp4?s=1\"\n#EXTINF:6.0,\n./0.m4s?s=1",
-                "/videos/7/hls/main.m3u8?s=1"
-            ),
+                "/videos/7/hls/main.m3u8?s=1",
+                usize::MAX
+            )
+            .unwrap(),
             "#EXT-X-MAP:URI=\"/videos/7/hls/init.mp4?s=1\"\n#EXTINF:6.0,\n/videos/7/hls/0.m4s?s=1"
         );
     }
