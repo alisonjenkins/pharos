@@ -57,6 +57,10 @@ thread_local! {
     static TRUNCATE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Parts whose `truncate_part` fails, from any thread (the downloader's).
+#[cfg(test)]
+pub(crate) static TRUNCATE_REFUSED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
@@ -1248,7 +1252,12 @@ impl Cache {
         let p = self.part_path(id);
         let _s = self.lock();
         #[cfg(test)]
-        if TRUNCATE_FAULT.with(std::cell::Cell::get) {
+        if TRUNCATE_FAULT.with(std::cell::Cell::get)
+            || TRUNCATE_REFUSED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&p)
+        {
             return Err(std::io::Error::other("truncate refused for the test"));
         }
         match std::fs::OpenOptions::new().write(true).open(&p) {

@@ -139,6 +139,9 @@ enum Fail {
     /// The cap shared with other downloads cannot be checked yet: wait and
     /// try again, keeping the partial file.
     AccountingUnknown,
+    /// A replacement's old part could not be emptied: the part and its
+    /// validator stay, and the job tries again later.
+    PartNotTruncated,
     Unauthorized,
     Transient(String),
     Permanent(String),
@@ -149,7 +152,7 @@ impl Fail {
         match no {
             NoRoom::LowDisk(room) => Self::LowDisk(room),
             NoRoom::AccountingUnknown => Self::AccountingUnknown,
-            NoRoom::PartNotTruncated => Self::Transient("part_not_truncated".to_owned()),
+            NoRoom::PartNotTruncated => Self::PartNotTruncated,
         }
     }
 }
@@ -793,6 +796,30 @@ impl Gate {
                         .wait_for_accounting(id, &st, attempt, started, &mut backoff, &mut epoch)
                         .await
                     {
+                        break Outcome::Yielded;
+                    }
+                }
+                // A pin is parked with its part, validator and backoff, as
+                // for room, so the worker moves on to other pins. Read-ahead
+                // retries in place.
+                Err(Fail::PartNotTruncated) if self.is_pin_work(id) => {
+                    log::info!(
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=part_not_truncated step=replacement attempt={attempt} wait_ms={}",
+                        part_len(),
+                        started.elapsed().as_millis(),
+                        backoff.as_millis()
+                    );
+                    break Outcome::Parked(backoff);
+                }
+                Err(Fail::PartNotTruncated) => {
+                    log::info!(
+                        "cache download id={id} bytes={} ms={} outcome=retry reason=part_not_truncated attempt={attempt} wait_ms={}",
+                        part_len(),
+                        started.elapsed().as_millis(),
+                        backoff.as_millis()
+                    );
+                    self.sleep_backoff(&mut backoff, &mut epoch).await;
+                    if self.yield_to_playback(id, &st) {
                         break Outcome::Yielded;
                     }
                 }
@@ -2584,6 +2611,41 @@ mod tests {
             .etag("vB")
             .ignore_range()
             .drop_first_after(600)
+    }
+
+    /// CR outside-diff prefetch.rs:152: a pin whose replacement cannot
+    /// empty its old part is parked with the part and its validator, so
+    /// the worker downloads the next pin. Once the part can be emptied,
+    /// the parked pin is retried and completes.
+    #[test]
+    fn a_pin_whose_part_will_not_truncate_is_parked_and_the_next_pin_goes() {
+        let script = replacing_origin().file("/audio/2", body(100, 2));
+        let r = rig("part-not-truncated", script, 1 << 20, &["t"], fast());
+        let part = r.cache.part_path("track/1");
+        crate::cache::TRUNCATE_REFUSED
+            .lock()
+            .unwrap()
+            .push(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1", "track/2"]));
+        r.dl.enqueue(&ids(&["track/1", "track/2"]));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !r.cache.is_complete("track/2") {
+            assert!(
+                Instant::now() < until,
+                "the untruncatable part held the worker: {:?}",
+                r.srv.seen()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!r.cache.is_complete("track/1"));
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        assert!(!r.dl.waits().is_empty(), "track 1 was not parked");
+        crate::cache::TRUNCATE_REFUSED.lock().unwrap().clear();
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "track 1 never retried"
+        );
+        assert!(r.cache.is_complete("track/1"));
     }
 
     /// A whole new body refused for low disk keeps the old part and its
