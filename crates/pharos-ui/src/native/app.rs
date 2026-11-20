@@ -6297,11 +6297,13 @@ fn track_notice(audio: bool) -> String {
     .to_owned()
 }
 
-/// A network failure on a stream whose session may have ended over a
+/// A network or server failure on a stream whose session may have ended over a
 /// reconnect negotiates a new one, where the viewer would otherwise be shown
 /// the failure.
 fn renegotiates_quietly(kind: FailureKind, session_suspect: bool) -> bool {
-    session_suspect && kind == FailureKind::Network
+    // The Rust engine names an HTTP refusal (the ended session's 401) a
+    // server failure; hls.js names it a network one.
+    session_suspect && matches!(kind, FailureKind::Network | FailureKind::Server)
 }
 
 /// The line shown while the quality step renegotiates from `from` to `to` bps.
@@ -9066,6 +9068,8 @@ mod tests {
     #[test]
     fn only_a_network_failure_on_a_suspect_session_renegotiates_quietly() {
         assert!(renegotiates_quietly(FailureKind::Network, true));
+        assert!(renegotiates_quietly(FailureKind::Server, true));
+        assert!(!renegotiates_quietly(FailureKind::Server, false));
         assert!(!renegotiates_quietly(FailureKind::Network, false));
         assert!(!renegotiates_quietly(FailureKind::Damaged, true));
     }
