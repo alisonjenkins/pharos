@@ -681,7 +681,13 @@ impl std::fmt::Debug for TokenSeen {
 pub struct Session<A> {
     api: A,
     token: TokenSeen,
+    /// Names this session among every one opened in the process: an answer
+    /// asked on it is shown only while it is the published one.
+    id: u64,
 }
+
+/// The id the next opened session gets.
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<A> Session<A> {
     /// A session resumed with `token` (none where the platform has no
@@ -690,11 +696,17 @@ impl<A> Session<A> {
         Self {
             api,
             token: TokenSeen(token),
+            id: NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
     pub fn api(&self) -> &A {
         &self.api
+    }
+
+    /// This session's id, unique in the process.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -709,6 +721,8 @@ pub struct MeAsk<A> {
     /// The token the session was resumed with: the answer's user is paired
     /// with this token only.
     pub token: TokenSeen,
+    /// The id of the session it is sent on ([`Session::id`]).
+    pub session: u64,
 }
 
 /// Whether to ask who is signed in: only with a session and a ready
@@ -726,6 +740,7 @@ pub fn me_request<A>(ready: bool, session: Option<Session<A>>) -> Option<MeAsk<A
         api: session.api,
         asked_at: identity_generation(),
         token: session.token,
+        session: session.id,
     })
 }
 
@@ -2680,8 +2695,8 @@ pub(crate) mod tests {
         match run(resume_session(&r)) {
             Resumed::Opened(session) => {
                 assert_eq!(
-                    session,
-                    Session::opened("A".to_owned(), Some("tokA".to_owned()))
+                    (session.api.as_str(), &session.token),
+                    ("A", &TokenSeen(Some("tokA".to_owned())))
                 );
             }
             _ => panic!("A's token did not resume A's session"),
@@ -2730,8 +2745,8 @@ pub(crate) mod tests {
         }));
         match run(resume_session(&r)) {
             Resumed::Opened(session) => assert_eq!(
-                session,
-                Session::opened("B".to_owned(), Some("tokB".to_owned()))
+                (session.api.as_str(), &session.token),
+                ("B", &TokenSeen(Some("tokB".to_owned())))
             ),
             _ => panic!("the replacement token was not resumed"),
         }
