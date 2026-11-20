@@ -1639,15 +1639,18 @@ impl Cache {
             return Err(NoRoom::AccountingUnknown);
         }
         let outstanding = outside.outstanding;
-        let raw = match (self.free)(&self.dir) {
-            // What a truncation is about to free is room for the write.
-            Ok(f) => f.saturating_add(reclaim.bytes()),
+        // What a truncation is about to free is room for the write, as an
+        // estimate only: a sparse part frees less than its length, so the
+        // room is measured again once it is gone (`confirm`).
+        let measured = match (self.free)(&self.dir) {
+            Ok(f) => f,
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
                 self.empty_replaced(downloading, reclaim, None)?;
                 return Ok(u64::MAX);
             }
         };
+        let raw = measured.saturating_add(reclaim.bytes());
         // The raw probe is held against the whole requirement, what admitted
         // video still has to write included: taking the outstanding bytes
         // off the probe first clamps a deficit at zero and eviction would
@@ -1657,6 +1660,11 @@ impl Cache {
             .saturating_add(outstanding);
         if raw >= want {
             self.empty_replaced(downloading, reclaim, None)?;
+            // The part's credit was needed: what its emptying freed is
+            // measured, not taken from its length.
+            if measured < want && matches!(reclaim, Reclaim::Emptied(_)) {
+                return self.confirm(downloading, want, outstanding, raw, 0, "part_emptied");
+            }
             return Ok(raw.saturating_sub(outstanding));
         }
         if !evict {
@@ -1691,6 +1699,7 @@ impl Cache {
             parts = Some(listed);
         }
         let mut stopped = false;
+        let mut parts_evicted = false;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
@@ -1725,6 +1734,7 @@ impl Cache {
                 }
                 now = now.saturating_add(bytes);
                 evicted_n += 1;
+                parts_evicted = true;
             }
         }
         if evicted {
@@ -1741,12 +1751,66 @@ impl Cache {
             }
             return Err(NoRoom::LowDisk(room));
         }
+        let emptied = part_file.is_some();
         if let Some(f) = part_file {
             if let Err(e) = f.set_len(0) {
                 return Err(truncate_refused(downloading, &e, evicted_n));
             }
         }
+        // A part's length is no measure of what it frees (it may be
+        // sparse): when one was emptied or evicted, the room is measured.
+        // A preflight's credit is for a truncation still to come.
+        if emptied || parts_evicted {
+            let pending = match reclaim {
+                Reclaim::Counted(b) => b,
+                _ => 0,
+            };
+            let why = if emptied {
+                "part_emptied"
+            } else {
+                "part_evicted"
+            };
+            return self.confirm(downloading, want, outstanding, now, pending, why);
+        }
         Ok(room)
+    }
+
+    /// The room an admission approved on parts' lengths, measured once
+    /// they are gone: approved only when the free space now (plus a
+    /// preflight's `pending` credit, for a part not emptied yet) meets
+    /// `want`. `estimated` is the figure the lengths gave.
+    fn confirm(
+        &self,
+        downloading: &str,
+        want: u64,
+        outstanding: u64,
+        estimated: u64,
+        pending: u64,
+        after: &str,
+    ) -> Result<u64, NoRoom> {
+        match (self.free)(&self.dir) {
+            Ok(f) => {
+                let now = f.saturating_add(pending);
+                if now >= want {
+                    log::info!(
+                        "cache admission id={downloading} verdict=approved reason=measured_after_reclaim after={after} free_bytes={f} estimated={estimated} want={want}"
+                    );
+                    Ok(now.saturating_sub(outstanding))
+                } else {
+                    log::warn!(
+                        "cache admission id={downloading} verdict=refused reason=reclaim_short after={after} free_bytes={f} estimated={estimated} want={want}"
+                    );
+                    Err(NoRoom::LowDisk(now.saturating_sub(outstanding)))
+                }
+            }
+            // Never room on a guess: the lengths are no measure.
+            Err(e) => {
+                log::warn!(
+                    "cache admission id={downloading} verdict=refused reason=free_unknown_after_reclaim after={after} estimated={estimated} error={e}"
+                );
+                Err(NoRoom::LowDisk(0))
+            }
+        }
     }
 
     /// Empties a replacement's old part (see [`Cache::check_free`]); other
@@ -2115,7 +2179,7 @@ pub(crate) mod tests {
     #[test]
     fn an_approved_replacement_counts_the_old_part_once() {
         let d = tmp("replace-once");
-        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
         std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
         // 500 free and 600 reclaimed: 2000 does not fit, and nothing moves.
         assert!(c.ensure_free_replacing_part("track/x", 2000, true).is_err());
@@ -2138,7 +2202,7 @@ pub(crate) mod tests {
     #[test]
     fn a_replacement_whose_part_will_not_truncate_evicts_nothing() {
         let d = tmp("replace-truncate-evicts");
-        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1500)).unwrap();
         put(&c, "track/a", 400);
         c.protect(&[]);
         std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
@@ -2204,6 +2268,59 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&stuck).unwrap();
     }
 
+    /// CR 4646280185: a part's length is no measure of what it frees. A
+    /// sparse part counted as room is emptied, the free space measured
+    /// again falls short, and the replacement is refused for it. The
+    /// control: a part that holds its length is approved.
+    #[test]
+    fn a_sparse_part_is_not_counted_as_the_room_it_frees() {
+        for sparse in [true, false] {
+            let d = tmp(if sparse {
+                "replace-sparse"
+            } else {
+                "replace-dense"
+            });
+            let len = 1u64 << 20;
+            let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 500 + len))
+                .unwrap();
+            let part = std::fs::File::create(c.part_path("track/x")).unwrap();
+            if sparse {
+                part.set_len(len).unwrap();
+            } else {
+                std::io::Write::write_all(&mut &part, &vec![1u8; 1 << 20]).unwrap();
+            }
+            drop(part);
+            crate::testlog::start();
+            // A dense part leaves 500 free and gives back its length; a
+            // sparse one leaves its length free already and gives nothing
+            // back. Each need fits only with the part's length credited.
+            let need = if sparse { len + 1000 } else { len };
+            let verdict = c.ensure_free_replacing_part("track/x", need, true);
+            let lines = crate::testlog::lines();
+            if sparse {
+                assert!(
+                    matches!(verdict, Err(NoRoom::LowDisk(_))),
+                    "{verdict:?} {lines:?}"
+                );
+                assert_eq!(c.reserved_bytes(), 0);
+                assert!(
+                    lines.iter().any(|l| l.contains(
+                        "cache admission id=track/x verdict=refused reason=reclaim_short after=part_emptied"
+                    )),
+                    "{lines:?}"
+                );
+            } else {
+                assert!(verdict.is_ok(), "{verdict:?} {lines:?}");
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("verdict=approved reason=measured_after_reclaim")),
+                    "{lines:?}"
+                );
+            }
+        }
+    }
+
     /// CR 4644634482: a replacement that eviction could not make room for
     /// evicts nothing and keeps its old part.
     #[test]
@@ -2237,7 +2354,7 @@ pub(crate) mod tests {
     #[test]
     fn a_replacement_whose_part_will_not_truncate_is_refused() {
         let d = tmp("replace-truncate-fails");
-        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
         std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
         crate::testlog::start();
         TRUNCATE_FAULT.with(|f| f.set(true));
@@ -2568,6 +2685,31 @@ pub(crate) mod tests {
 
     fn fixed_free(bytes: u64) -> FreeProbe {
         Box::new(move |_| Ok(bytes))
+    }
+
+    /// A disk of `size` bytes under `dir`: free is what the cache's
+    /// tracks and parts leave of it, counted by the blocks they take, so a
+    /// sparse file frees only what it holds.
+    pub(crate) fn disk_of(dir: &Path, size: u64) -> FreeProbe {
+        fn held(dir: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::read_dir(dir).map_or(0, |rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| {
+                        let path = e.path();
+                        match e.metadata() {
+                            Ok(m) if m.is_dir() && e.file_name() != "listings" => held(&path),
+                            Ok(m) if m.is_file() && e.file_name() != "index.json" => {
+                                m.blocks().saturating_mul(512).min(m.len())
+                            }
+                            _ => 0,
+                        }
+                    })
+                    .sum()
+            })
+        }
+        let dir = dir.to_path_buf();
+        Box::new(move |_| Ok(size.saturating_sub(held(&dir))))
     }
 
     #[test]
