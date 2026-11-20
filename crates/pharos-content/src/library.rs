@@ -1060,9 +1060,13 @@ impl Worker {
                     // taken it up (fence, hooks): the sign-in stops here.
                     Err(e) if token::is_store_incomplete(&e) => {
                         log::warn!(
-                            "quickconnect sign-in verdict=stopped reason=token_store_incomplete error={}",
+                            "quickconnect sign-in verdict=stopped reason=token_store_incomplete auth=signed_out error={}",
                             e.redacted()
                         );
+                        // The approved code is consumed: a Pending row
+                        // left showing it would offer a code no poller
+                        // serves. The next browse waits for a new one.
+                        self.shared.set_auth(AuthState::SignedOut);
                         self.shared.set_error(e.redacted());
                         return;
                     }
@@ -2642,6 +2646,27 @@ mod tests {
         token::tests::FAIL_READ_BACK.with(|f| f.set(false));
         assert!(w.link.is_none(), "an unconfirmed store signed in");
         assert_ne!(shared.lock().auth, AuthState::SignedIn);
+    }
+
+    /// CR 4644634491: an approval whose store is incomplete, reached while
+    /// its code shows (Pending), leaves the service signed out, not Pending
+    /// with the consumed code: the next browse waits for a new code.
+    #[test]
+    fn an_incomplete_store_clears_the_consumed_code() {
+        let root = test_root("qc-store-incomplete-pending");
+        let (mut w, shared, _) = worker(&root);
+        let (rt, local) = local_rt();
+        shared.set_auth(AuthState::Pending {
+            code: "123456".to_owned(),
+        });
+        token::tests::FAIL_READ_BACK.with(|f| f.set(true));
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        token::tests::FAIL_READ_BACK.with(|f| f.set(false));
+        assert_eq!(
+            shared.lock().auth,
+            AuthState::SignedOut,
+            "the consumed code is still shown"
+        );
     }
 
     /// CR 4640611278: an open link whose token is fenced is dropped, and the
