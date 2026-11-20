@@ -1149,8 +1149,11 @@ fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
         );
         std::io::Error::other(format!("the marker could not be cleared ({step}): {why}"))
     };
-    // 1. The guard, unless a clearing that failed left it.
-    if !guarded {
+    // 1. The guard: the marker as it is now. A guard a failed clearing
+    // left is written again from the marker while that still holds a
+    // state, so a revocation written since is what it carries forward,
+    // never the stale one.
+    if !guarded || !is_cleared(&at) && exists(&at)? {
         let original = std::fs::read(&at)?;
         if let Err(e) = write_whole(&guard, &original) {
             return Err(kept(&e.to_string(), "guard_not_written"));
@@ -2188,6 +2191,49 @@ pub(crate) mod tests {
             store(&path, "new").is_err(),
             "refused after the restart too"
         );
+    }
+
+    /// CR 4647925841: a clearing that finds a stale guard and a marker
+    /// holding a revocation copies the revocation forward into the guard,
+    /// so one that fails after its rename still leaves the revocation, not
+    /// the stale unconfirmed install. The control: an unconfirmed guard
+    /// with no revocation clears on a clean retry (the test below).
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_clearing_carries_a_revocation_forward_into_its_guard() {
+        let d = dir("guard-copy-forward");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(false));
+        faults::REMOVE.with(|f| f.set(true));
+        assert!(matches!(
+            end_session(&path, Some("new"), Some("u1")),
+            Ended::Marked(_)
+        ));
+        faults::REMOVE.with(|f| f.set(false));
+        // A clearing that fails after its rename (the marker now `cleared`).
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(true));
+        let cleared = {
+            let _held = hold();
+            clear_marker(&path, &fingerprint("new"))
+        };
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(false));
+        assert!(cleared.is_err());
+        assert!(
+            revoked(&path, &fingerprint("new")).is_some_and(|r| !r.install_unconfirmed),
+            "the stale guard's unconfirmed install came back"
+        );
+        assert!(
+            store(&path, "new").is_err(),
+            "a store cleared the revocation"
+        );
+        assert_eq!(after_restart(&path), None);
     }
 
     /// CR 4647745000: a retry whose clearing renamed, then could neither
