@@ -1135,7 +1135,24 @@ impl Worker {
             // The fenced link is gone. A token on file the fence does not
             // refuse (a sign-in that stored one since) resumes, as a reload
             // would: the service is not signed out over a usable token.
-            if dropped && self.load_token()?.is_some() {
+            // A lookup that fails leaves no link and no token to resume:
+            // the service is signed out, said so, and the error returned.
+            let stored = if dropped {
+                match self.load_token() {
+                    Ok(t) => t.is_some(),
+                    Err(e) => {
+                        let polling = self.stop_sign_in();
+                        self.shared.set_auth(AuthState::SignedOut);
+                        log::warn!(
+                            "credentials stay signed out: verdict=signed_out reason=token_lookup_failed quickconnect_stopped={polling} error={e}"
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                false
+            };
+            if stored {
                 let result = self.link(events).await.map(|_| Out::Done);
                 log::info!(
                     "credentials stay signed out: verdict=resumed_stored reason=fenced_link_dropped outcome={}",
@@ -2556,6 +2573,46 @@ mod tests {
             !lines
                 .iter()
                 .any(|l| l.contains("verdict=fenced reason=token_neither")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4646280193: StaySignedOut drops a fenced link, and the lookup
+    /// for a token to resume fails. The service is signed out (no link is
+    /// left), says so, and returns the error.
+    #[test]
+    fn a_stay_signed_out_whose_token_lookup_fails_signs_out() {
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("stay-signed-out-lookup-fails");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(|| {})),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        assert_ne!(shared.lock().auth, AuthState::SignedOut);
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        // A token file that cannot be read.
+        let _ = std::fs::remove_file(&token_path);
+        std::fs::create_dir_all(&token_path).unwrap();
+        crate::testlog::start();
+        let result = local.block_on(&rt, w.execute(&Op::StaySignedOut, &events));
+        let lines = crate::testlog::lines();
+        assert!(result.is_err(), "the lookup error was not returned");
+        assert!(w.link.is_none());
+        assert_eq!(shared.lock().auth, AuthState::SignedOut, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "credentials stay signed out: verdict=signed_out reason=token_lookup_failed"
+            )),
             "{lines:?}"
         );
     }
