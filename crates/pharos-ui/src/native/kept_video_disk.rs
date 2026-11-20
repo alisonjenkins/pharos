@@ -4635,9 +4635,9 @@ impl Inner {
     /// Deletes the held folders whose record is still unreadable, and
     /// returns the bytes they held. One whose record reads now is released,
     /// never deleted. A folder that will not delete becomes a tombstone,
-    /// counted and swept like a removed download's. Err names how many
-    /// would not delete.
-    fn discard_held(self: &Arc<Self>) -> Result<u64, String> {
+    /// counted and swept like a removed download's. Returns the bytes freed
+    /// and the folders that would not delete.
+    fn discard_held(self: &Arc<Self>) -> (u64, Vec<PathBuf>) {
         let mut freed = 0u64;
         let mut failed = Vec::new();
         for dir in self.claim_held() {
@@ -4694,7 +4694,7 @@ impl Inner {
                                     m.counted(0)
                                 ),
                             );
-                            failed.push(dir.display().to_string());
+                            failed.push(dir.clone());
                         }
                     }
                 }
@@ -4711,16 +4711,67 @@ impl Inner {
                         dir.display()
                     ),
                 );
-                failed.push(dir.display().to_string());
+                failed.push(dir.clone());
             }
         }
-        if failed.is_empty() {
+        (freed, failed)
+    }
+
+    /// Discards the held folders, retries at once the ones that would not
+    /// delete, and returns the final outcome over every folder attempted:
+    /// the bytes both passes freed, or Err naming the folders still there.
+    fn discard_and_retry(self: &Arc<Self>) -> Result<u64, String> {
+        let (mut freed, failed) = self.discard_held();
+        // What a folder that would not delete is counted for now, read
+        // before the retry re-measures it.
+        let before: Vec<(PathBuf, u64)> = {
+            let st = lock(&self.state);
+            failed
+                .iter()
+                .map(|dir| {
+                    let bytes = st
+                        .tombstones
+                        .iter()
+                        .find(|(d, _)| d == dir)
+                        .map_or(0, |(_, b)| *b);
+                    (dir.clone(), bytes)
+                })
+                .collect()
+        };
+        // What would not delete is a tombstone now: try it again at once.
+        self.sweep_tombstones();
+        let mut remaining = Vec::new();
+        {
+            let st = lock(&self.state);
+            for (dir, bytes) in before {
+                let still = st.tombstones.iter().any(|(d, _)| *d == dir)
+                    || st.held.iter().any(|(d, _)| *d == dir);
+                if still {
+                    remaining.push(dir.display().to_string());
+                } else {
+                    freed = freed.saturating_add(bytes);
+                }
+            }
+        }
+        emit(
+            !remaining.is_empty(),
+            format!(
+                "pharos: video held discard verdict={} freed={freed} remaining={}",
+                if remaining.is_empty() {
+                    "done"
+                } else {
+                    "partial"
+                },
+                remaining.len()
+            ),
+        );
+        if remaining.is_empty() {
             Ok(freed)
         } else {
             Err(format!(
                 "{} folders could not be deleted and stay counted: {}",
-                failed.len(),
-                failed.join(", ")
+                remaining.len(),
+                remaining.join(", ")
             ))
         }
     }
@@ -5353,10 +5404,7 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn discard_unreadable(&self) -> Result<u64, String> {
-        let freed = self.inner.discard_held();
-        // What would not delete is a tombstone now: try it again at once.
-        self.inner.sweep_tombstones();
-        freed
+        self.inner.discard_and_retry()
     }
 
     fn outstanding_bytes(&self) -> u64 {
@@ -10591,6 +10639,39 @@ pub(crate) mod tests {
         assert!(!dir.exists());
         assert!(!store.size_unknown());
         assert_eq!(store.leftover_count(), 0, "cleanup done but still offered");
+    }
+
+    /// A folder that will not delete at first but goes on the retry is
+    /// reported freed, with its bytes: the Downloads page gets the final
+    /// outcome, not the first attempt's.
+    #[tokio::test]
+    async fn a_discard_whose_retry_deletes_the_folder_reports_it_freed() {
+        let (_rig, store, _good, manifest) = held_download("held-discard-retry").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        let held = store.kept_bytes();
+        assert!(held > 0);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c2 = calls.clone();
+        FAIL_REMOVE.with(|f| f.set(true));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                c2.set(c2.get() + 1);
+                if c2.get() > 1 {
+                    FAIL_REMOVE.with(|f| f.set(false));
+                }
+            }));
+        });
+        let outcome = store.discard_unreadable();
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(calls.get(), 2, "no retry ran");
+        assert!(!dir.exists(), "the retry left the folder");
+        assert_eq!(outcome, Ok(held), "not the final outcome");
+        assert_eq!(store.leftover_count(), 0);
+        assert!(!lines(&format!(
+            "pharos: video held discard verdict=done freed={held} remaining=0"
+        ))
+        .is_empty());
     }
 
     /// A discard never deletes a download whose manifest reads: it is
