@@ -1081,8 +1081,13 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
     token is kept only on its own origin (an IPv6 host compared by address,
     whatever its spelling), dropped on another origin, and a
     hop down to http is refused. The download client follows a redirect only
-    to the same scheme, host and port, and a playlist only within its folder
-    (`kept_video::playlist_base_verdict`).
+    to the same scheme, host and port. A playlist answered from another key
+    (`Body::final_key`, cut to the server's base path by
+    `kept_video::key_under_base`; outside it, refused) is held whole and
+    stored with each relative reference rewritten to the absolute path it
+    resolves to there (`kept_video::rebase_playlist`). The rewritten text is
+    what is reserved, counted and held to `PLAYLIST_MAX_BYTES`, so the
+    offline proxy answers exactly the keys the stored playlist names.
   - Neither client has a fallback. One that cannot be built (its TLS config
     included) is kept as the error (`tv_page::built_client_for`): every
     request through it is refused with the logged reason, never sent through a

@@ -28,8 +28,9 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   owner's device token goes with a download's requests, and every check
   that cannot be made fails closed.
 - Redirects keep the origin: the proxy follows them by hand on its own
-  origin, the download client only to the same origin, and a playlist only
-  within its folder. Neither client falls back to a default one.
+  origin, and the download client only to the same origin. A playlist
+  redirected to another key is stored with its references rebased onto that
+  key, as absolute paths. Neither client falls back to a default one.
 - The device token goes only over https or to the build's own server. A
   LAN build on plain http sends it unencrypted: an accepted risk, with
   https as the remedy.
