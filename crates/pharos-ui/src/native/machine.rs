@@ -298,7 +298,11 @@ impl Machine {
                     self.phase = not_opened(&probe);
                 }
             }
-            Event::Closed { epoch, reason } if current(epoch) => {
+            // A session the sign-in screen already ended has no socket to
+            // reconnect, and its warning stays.
+            Event::Closed { epoch, reason }
+                if current(epoch) && !matches!(self.phase, Phase::SignIn { .. }) =>
+            {
                 if reason == REVOKED {
                     let error = (!self.signing_out)
                         .then(|| "Your session ended. Sign in again.".to_owned());
@@ -825,6 +829,39 @@ mod tests {
         m.apply(Event::SessionNeedsSignIn { session: now });
         assert!(sign_in_error_of(&m).is_some());
         assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
+    /// Review 5987743326 (machine.rs:301): a socket close at the current
+    /// epoch after a sign-out that could not forget the token does not
+    /// reconnect or replace the sign-in screen's warning.
+    #[test]
+    fn a_close_after_the_sign_in_screen_is_ignored() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotSaved(
+            "disk".into(),
+        )));
+        let warning = sign_in_error_of(&m).map(str::to_owned);
+        assert!(warning.is_some());
+        let epoch = m.epoch();
+        m.apply(Event::Closed {
+            epoch,
+            reason: "gone".into(),
+        });
+        assert_eq!(
+            sign_in_error_of(&m),
+            warning.as_deref(),
+            "the close reconnected"
+        );
+        m.apply(Event::Closed {
+            epoch,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            sign_in_error_of(&m),
+            warning.as_deref(),
+            "the warning was replaced"
+        );
     }
 
     /// A reconnect may publish another token (B) than the one a pending
