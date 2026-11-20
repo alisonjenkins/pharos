@@ -1200,13 +1200,10 @@ impl Inner {
                 return;
             }
         }
-        // A run owns the folder: its staging files stay, and the plan it
-        // admits next must reserve them (its inventory leaves `.part` out).
-        let retained = if owned {
-            parts_bytes(dir)
-        } else {
-            Measure::Whole(0)
-        };
+        // What the staging files hold now, after any deletion above: a
+        // run's stay, and one that would not delete stays too. The plan
+        // admitted next must reserve them (its inventory leaves `.part` out).
+        let retained = parts_bytes(dir);
         // Staging files that could not all be measured: what the plan
         // would reserve for them is not known, so the folder stays unknown.
         let Some(retained) = retained.whole() else {
@@ -1226,6 +1223,8 @@ impl Inner {
         st.leftover.retain(|d| d != dir);
         if retained > 0 {
             st.retained_parts.insert(dir.to_path_buf(), retained);
+        } else {
+            st.retained_parts.remove(dir);
         }
         drop(st);
         emit(
@@ -12125,6 +12124,40 @@ pub(crate) mod tests {
     /// A resume whose plan the kept staging file widens past its
     /// reservation is checked against the shared cap, not only the free
     /// space: here the widened plan does not fit the cap, and is refused.
+    /// Review 5987746170 (kept_video_disk.rs:1219): what a settlement keeps
+    /// for a folder's staging files is measured after its deletion, owned
+    /// or not: a file that would not go stays reserved, and a folder with
+    /// none left drops an earlier figure.
+    #[tokio::test]
+    async fn a_settlement_keeps_what_its_staging_files_hold_after_deletion() {
+        let rig = Rig::new("settle-retained");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let part = dir.join("files").join("x.9.part");
+        std::fs::File::create(&part).unwrap().set_len(500).unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert!(part.exists());
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            Some(500),
+            "a staging file that would not delete was not kept reserved"
+        );
+        // Gone now: the next settlement drops the figure.
+        std::fs::remove_file(&part).unwrap();
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            None,
+            "a stale figure stayed"
+        );
+    }
+
     #[tokio::test]
     async fn a_resume_widened_by_a_kept_staging_file_is_checked_against_the_cap() {
         let rig = Rig::new("host-resume-part-cap");
