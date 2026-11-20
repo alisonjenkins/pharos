@@ -98,6 +98,26 @@ impl Fence {
             Self::Every | Self::AllBut(_) => Self::AllBut(stored.to_owned()),
         }
     }
+
+    /// A fence that refuses whatever `self` or `other` refuses: a sign-out
+    /// that fails never lifts an earlier refusal. Two named tokens, or a
+    /// name the allowed token of an [`Fence::AllBut`], become
+    /// [`Fence::Every`].
+    pub fn union(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Open, x) | (x, Self::Open) => x.clone(),
+            (a, b) if a == b => a.clone(),
+            (Self::Every, _) | (_, Self::Every) => Self::Every,
+            (Self::Token(t), Self::AllBut(a)) | (Self::AllBut(a), Self::Token(t)) => {
+                if t == a {
+                    Self::Every
+                } else {
+                    Self::AllBut(a.clone())
+                }
+            }
+            _ => Self::Every,
+        }
+    }
 }
 
 /// Every token file's fence ([`Fence`]), by path. Changed only while the
@@ -635,11 +655,10 @@ pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended
     let _held = hold();
     let ended = end_session_held(path, seen, user);
     if let Ended::Unsafe { target, .. } = &ended {
-        set_fence_held(
-            path,
-            Fence::for_target(target.as_deref()),
-            "token_neither_removed_nor_marked",
-        );
+        // Added to what is already refused, never in its place: an earlier
+        // sign-out's token may still be held by a live link.
+        let next = fence_held(path).union(&Fence::for_target(target.as_deref()));
+        set_fence_held(path, next, "token_neither_removed_nor_marked");
     }
     ended
 }
@@ -1838,6 +1857,34 @@ pub(crate) mod tests {
         );
         assert!(!f.refuses("tokB"));
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+        set_fence(&p, Fence::Open, "test");
+    }
+
+    /// CR 4640611335: an unsafe sign-out of B after an unsafe sign-out of A
+    /// keeps A refused; a later sign-in still reads its own token.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_second_unsafe_sign_out_keeps_the_first_refusal() {
+        let d = dir("fence-union");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        faults::REMOVE.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let _ = end_session(&p, None, None);
+        faults::REMOVE.with(|f| f.set(false));
+        faults::MARKER.with(|f| f.set(false));
+        store(&p, "tokB").unwrap();
+        assert!(fence(&p).refuses("tokA"));
+        faults::REMOVE.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let _ = end_session(&p, None, None);
+        faults::REMOVE.with(|f| f.set(false));
+        faults::MARKER.with(|f| f.set(false));
+        let f = fence(&p);
+        assert!(f.refuses("tokA"), "A's refusal was lost: {f:?}");
+        assert!(f.refuses("tokB"), "{f:?}");
+        store(&p, "tokC").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
         set_fence(&p, Fence::Open, "test");
     }
 }
