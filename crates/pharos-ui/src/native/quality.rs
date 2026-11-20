@@ -12,16 +12,37 @@
 /// always one the server has seen.
 pub const RUNGS: [u64; 4] = [8_000_000, 4_000_000, 2_000_000, 1_000_000];
 
-/// Where the last cap auto quality settled on is kept, in bits per second;
-/// absent or `0` is none. It is where the next video starts.
+/// Where the last cap auto quality settled on is kept, as `<bps>@<unix ms>`
+/// (see [`format_rung`]); absent or `0` is none. It is where the next video
+/// starts, until [`AUTO_RUNG_TTL_MS`] has passed.
 pub const AUTO_RUNG_KEY: &str = "pharos.player.auto_rung";
 
-/// The cap a stored [`AUTO_RUNG_KEY`] value holds; anything that is not
-/// one of the [`RUNGS`] is none.
-pub fn parse_rung(stored: &str) -> u64 {
-    stored
-        .trim()
-        .parse::<u64>()
+/// How long a remembered cap holds: about one sitting on the same network.
+/// A cap older than that says nothing about the connection now, and one
+/// bad minute must not hold every later video down (B1487).
+pub const AUTO_RUNG_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The [`AUTO_RUNG_KEY`] value for `bps`, set at `set_at_ms`.
+pub fn format_rung(bps: u64, set_at_ms: u64) -> String {
+    format!("{bps}@{set_at_ms}")
+}
+
+/// The cap a stored [`AUTO_RUNG_KEY`] value holds at `now_ms`: none once it
+/// is older than [`AUTO_RUNG_TTL_MS`], stamped after now, unstamped (from
+/// before caps carried a time) or not one of the [`RUNGS`].
+pub fn parse_rung(stored: &str, now_ms: u64) -> u64 {
+    let Some((bps, set_at)) = stored.trim().split_once('@') else {
+        return 0;
+    };
+    let Ok(set_at) = set_at.parse::<u64>() else {
+        return 0;
+    };
+    // A stamp after now came from a clock since corrected: it says nothing
+    // about how long ago the cap was set.
+    if set_at > now_ms || now_ms - set_at > AUTO_RUNG_TTL_MS {
+        return 0;
+    }
+    bps.parse::<u64>()
         .ok()
         .filter(|bps| RUNGS.contains(bps))
         .unwrap_or(0)
@@ -880,12 +901,26 @@ mod tests {
 
     #[test]
     fn a_stored_rung_is_read_only_when_it_is_one() {
-        assert_eq!(parse_rung("2000000"), 2_000_000);
-        assert_eq!(parse_rung(" 1000000 "), 1_000_000);
-        assert_eq!(parse_rung("0"), 0);
-        assert_eq!(parse_rung("3000000"), 0);
-        assert_eq!(parse_rung("fast"), 0);
-        assert_eq!(parse_rung(""), 0);
+        let now = 10 * AUTO_RUNG_TTL_MS;
+        assert_eq!(parse_rung(&format_rung(2_000_000, now), now), 2_000_000);
+        assert_eq!(parse_rung(" 1000000@1000 ", 1_000), 1_000_000);
+        assert_eq!(parse_rung(&format_rung(0, now), now), 0);
+        assert_eq!(parse_rung(&format_rung(3_000_000, now), now), 0);
+        assert_eq!(parse_rung("fast@1000", 1_000), 0);
+        assert_eq!(parse_rung("2000000@soon", 1_000), 0);
+        assert_eq!(parse_rung("", now), 0);
+    }
+
+    /// A remembered cap holds for one sitting, not for good: it lapses after
+    /// the TTL, and one stored before caps carried a time is not read (B1487).
+    #[test]
+    fn a_remembered_cap_lapses() {
+        let set = 5 * AUTO_RUNG_TTL_MS;
+        let stored = format_rung(1_000_000, set);
+        assert_eq!(parse_rung(&stored, set + AUTO_RUNG_TTL_MS), 1_000_000);
+        assert_eq!(parse_rung(&stored, set + AUTO_RUNG_TTL_MS + 1), 0);
+        assert_eq!(parse_rung(&stored, set - 1), 0, "stamped after now");
+        assert_eq!(parse_rung("1000000", set), 0, "unstamped");
     }
 
     #[test]
