@@ -46,11 +46,11 @@ use super::playback::{
     styled_subtitle_signals, styled_subtitle_url, styled_track_url, subtitle_switch,
     tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill, volume_setting,
     DeviceClass, EffectsDetail, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
-    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
-    OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
-    TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_DETAIL_KEY,
-    EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
-    SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    FragmentEvent, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment,
+    Outgoing, OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize,
+    SubtitleSwitch, Tier, TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY,
+    EFFECTS_DETAIL_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY,
+    OVERLAY_EFFECT_KEY, SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::ports::{native_audio, offline_store};
@@ -7458,10 +7458,17 @@ fn Player(
                         if adapts || retiring.get() || decided.get() {
                             return;
                         }
-                        watch
-                            .0
-                            .borrow_mut()
-                            .fragment(load.bytes, load.load_ms, load.media_ms);
+                        match load {
+                            FragmentEvent::Loaded(load) => {
+                                watch.0.borrow_mut().fragment(
+                                    load.bytes,
+                                    load.load_ms,
+                                    load.media_ms,
+                                );
+                            }
+                            FragmentEvent::Failed => watch.0.borrow_mut().load_failed(),
+                            FragmentEvent::TimedOut => watch.0.borrow_mut().load_timed_out(),
+                        }
                         assess();
                     })
                 };
