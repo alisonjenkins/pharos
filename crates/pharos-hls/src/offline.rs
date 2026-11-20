@@ -66,11 +66,20 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         .segments
         .last()
         .map_or(0, |s| s.start_ms.saturating_add(s.duration_ms));
+    // One file per URI less its fragment, as a host fetches and keys them:
+    // a segment that differs only by `#...` names the same file.
     let short_tail = media
         .segments
         .last()
         .filter(|s| s.duration_ms < SHORT_TAIL_MS)
-        .filter(|s| media.segments.iter().filter(|o| o.uri == s.uri).count() == 1)
+        .filter(|s| {
+            media
+                .segments
+                .iter()
+                .filter(|o| without_fragment(&o.uri) == without_fragment(&s.uri))
+                .count()
+                == 1
+        })
         .map(|s| s.uri.clone());
     // A multi-part film names one `EXT-X-MAP` per part (after each
     // discontinuity), and the parser keeps only the last: list them all.
@@ -93,6 +102,11 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         duration_ms,
         short_tail,
     })
+}
+
+/// `uri` without its fragment: what a fetch of it asks for.
+fn without_fragment(uri: &str) -> &str {
+    uri.split_once('#').map_or(uri, |(file, _)| file)
 }
 
 /// The `URI="..."` value of an `EXT-X-MAP` tag's attributes.
@@ -194,6 +208,17 @@ mod tests {
         let text = MEDIA
             .replace("#EXTINF:4.5,", "#EXTINF:0.042,")
             .replace("1.m4s?PlaySessionId=p", "0.m4s?PlaySessionId=p");
+        let plan = plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &text).unwrap();
+        assert_eq!(plan.short_tail, None);
+    }
+
+    /// CR 4646280204: a short last segment that differs from an earlier
+    /// one only by its fragment names the same file: no short tail.
+    #[test]
+    fn a_short_last_segment_differing_only_by_fragment_is_no_short_tail() {
+        let text = MEDIA
+            .replace("#EXTINF:4.5,", "#EXTINF:0.042,")
+            .replace("1.m4s?PlaySessionId=p", "0.m4s?PlaySessionId=p#t=6");
         let plan = plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &text).unwrap();
         assert_eq!(plan.short_tail, None);
     }
