@@ -273,22 +273,46 @@ mod tests {
         assert_eq!(got.map(|p| p.candidate.id), Some(99));
     }
 
+    /// `n` lines of what was heard, all timed inside the song, so only
+    /// their count can keep them from being picked.
+    fn many_lines(n: usize) -> Lyrics {
+        let mut long = lyrics(&std::iter::repeat(HEARD).take(n).collect::<Vec<_>>());
+        let step = SONG_MS / (n as u64 + 1);
+        for (i, line) in long.lines.iter_mut().enumerate() {
+            line.start_ms = Some(i as u64 * step);
+        }
+        long
+    }
+
+    /// What was heard sung over `n` times, so a record of `n` such lines
+    /// scores in full.
+    fn heard_times(n: usize) -> String {
+        vec![HEARD; n].join(" ")
+    }
+
+    #[test]
+    fn a_record_of_as_many_lines_as_the_aligner_takes_is_kept() {
+        let got = choose(
+            vec![candidate(10, SONG_MS, many_lines(500))],
+            &wrong(),
+            SONG_MS,
+            &heard_times(500),
+        );
+        assert_eq!(got.map(|p| p.candidate.id), Some(10));
+    }
+
     #[test]
     fn records_the_aligner_would_not_take_take_no_slot() {
         // Five records closer in length the aligner refuses: timed word by
         // word already, or longer than it takes, so never checked.
-        let mut timed = sung();
+        let mut timed = many_lines(450);
         for line in &mut timed.lines {
             line.words = vec![super::super::WordStamp {
                 at: 0,
                 start_ms: line.start_ms.unwrap(),
             }];
         }
-        let long = lyrics(
-            &std::iter::repeat("grey gulls wheel above the quay low tide hums")
-                .take(501)
-                .collect::<Vec<_>>(),
-        );
+        let long = many_lines(501);
         let mut all: Vec<Candidate> = (0..MAX_CANDIDATES as u64)
             .map(|i| {
                 let refused = if i % 2 == 0 {
@@ -299,8 +323,9 @@ mod tests {
                 candidate(10 + i, SONG_MS + i * 100, refused)
             })
             .collect();
-        all.push(candidate(99, SONG_MS + 1_500, sung()));
-        let got = choose(all, &wrong(), SONG_MS, HEARD);
+        // Long enough to cover what was heard, and within the line limit.
+        all.push(candidate(99, SONG_MS + 1_500, many_lines(400)));
+        let got = choose(all, &wrong(), SONG_MS, &heard_times(501));
         assert_eq!(got.map(|p| p.candidate.id), Some(99));
     }
 
