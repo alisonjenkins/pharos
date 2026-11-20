@@ -300,8 +300,11 @@ pub trait VideoStore: Send + Sync {
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
     /// The stored file for a request's [`request_key`] among `user`'s own
-    /// downloads, if this store holds it whole: one user never reads
-    /// another's. A host that answers the player's requests itself (the
+    /// Ready downloads, if this store holds it whole: one user never reads
+    /// another's, and a download still running (or failed, or paused) serves
+    /// nothing, so the player's local origin is chosen only for a whole
+    /// download. Every offline answer (`offline_file_for`,
+    /// `hls_local_source`, the Android asset handler) goes through here. A host that answers the player's requests itself (the
     /// phone's server proxy) asks before going to the network; a store whose
     /// platform answers them another way (the web's service worker) keeps
     /// the default.

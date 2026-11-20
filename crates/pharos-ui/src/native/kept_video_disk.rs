@@ -190,8 +190,9 @@ impl Index {
         copies.push((path, len));
     }
 
-    fn get(&self, at: &(String, String)) -> Option<&(PathBuf, u64)> {
-        self.0.get(at)?.last()
+    /// Every copy indexed for `at`, oldest first.
+    fn copies(&self, at: &(String, String)) -> &[(PathBuf, u64)] {
+        self.0.get(at).map_or(&[], Vec::as_slice)
     }
 
     /// Keeps only the copies whose path `keep` accepts.
@@ -4491,6 +4492,23 @@ impl Inner {
 }
 
 impl DiskVideoStore {
+    /// The newest whole file indexed for `user`'s `key`, Ready download or
+    /// not (tests): what a download has stored so far, which
+    /// [`VideoStore::stored_file`] serves only once the download is Ready.
+    #[cfg(test)]
+    fn indexed_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+        let (path, len) = lock(&self.inner.state)
+            .index
+            .copies(&(user.to_owned(), key.to_owned()))
+            .last()
+            .cloned()?;
+        Some(StoredFile {
+            path,
+            len,
+            content_type: content_type_for(key),
+        })
+    }
+
     /// Opens the store at `root`: reads every manifest, indexes the whole
     /// files, and restarts the downloads a closed app left half done.
     pub fn open(root: PathBuf, env: Env) -> Arc<Self> {
@@ -5119,10 +5137,34 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn stored_file(&self, user: &str, key: &str) -> Option<StoredFile> {
-        let (path, len) = lock(&self.inner.state)
-            .index
-            .get(&(user.to_owned(), key.to_owned()))
-            .cloned()?;
+        let (path, len) = {
+            let st = lock(&self.inner.state);
+            let copies = st.index.copies(&(user.to_owned(), key.to_owned()));
+            // The newest copy that belongs to one of the user's Ready
+            // downloads: a running download's files are not served yet.
+            let ready = copies.iter().rev().find(|(p, _)| {
+                let dir = p.parent().and_then(Path::parent);
+                st.list.iter().any(|v| {
+                    v.user == user && v.ready() && dir == Some(st.dir_of(user, &v.item).as_path())
+                })
+            });
+            match ready {
+                Some(copy) => copy.clone(),
+                None => {
+                    if !copies.is_empty() {
+                        emit(
+                            false,
+                            format!(
+                                "pharos: video request verdict=not_served_offline reason=download_not_ready url_path={} copies={}",
+                                url_path(key),
+                                copies.len()
+                            ),
+                        );
+                    }
+                    return None;
+                }
+            }
+        };
         Some(StoredFile {
             path,
             len,
@@ -6603,7 +6645,7 @@ pub(crate) mod tests {
             let store = rig.open();
             store.start(request("1")).unwrap();
             store.settled().await;
-            let gone = store.stored_file("u1", SEG1).unwrap().path;
+            let gone = store.indexed_file("u1", SEG1).unwrap().path;
             drop(store);
             std::fs::remove_file(gone).unwrap();
             rig.server.asked.lock().unwrap().clear();
@@ -6624,7 +6666,7 @@ pub(crate) mod tests {
                 "{refused:?}"
             );
             // The stored files stay: with room again the copy finishes.
-            assert!(store.stored_file("u1", SEG0).is_some());
+            assert!(store.indexed_file("u1", SEG0).is_some());
         }
     }
 
@@ -6638,7 +6680,7 @@ pub(crate) mod tests {
         let store = rig.open();
         store.start(request("1")).unwrap();
         store.settled().await;
-        let gone = store.stored_file("u1", SEG1).unwrap().path;
+        let gone = store.indexed_file("u1", SEG1).unwrap().path;
         drop(store);
         std::fs::remove_file(&gone).unwrap();
         rig.server.asked.lock().unwrap().clear();
@@ -6662,7 +6704,7 @@ pub(crate) mod tests {
         );
         assert!(!lines("pharos: video resume replanned item=1 reason=estimate_raised").is_empty());
         assert!(
-            store.stored_file("u1", SEG0).is_some(),
+            store.indexed_file("u1", SEG0).is_some(),
             "stored files dropped"
         );
     }
@@ -7068,7 +7110,7 @@ pub(crate) mod tests {
         let store = rig.open();
         store.start(request("1")).unwrap();
         let mut waited = 0;
-        while store.stored_file("u1", SEG0).is_none() {
+        while store.indexed_file("u1", SEG0).is_none() {
             waited += 1;
             assert!(waited < 5_000, "the first segment was not stored");
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -7161,7 +7203,7 @@ pub(crate) mod tests {
         let store = rig.open();
         store.start(request("1")).unwrap();
         let mut waited = 0;
-        while store.stored_file("u1", SEG0).is_none() {
+        while store.indexed_file("u1", SEG0).is_none() {
             waited += 1;
             assert!(waited < 5_000, "the first segment was not stored");
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -7628,7 +7670,7 @@ pub(crate) mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         assert!(
-            store.stored_file("u1", INIT).is_some(),
+            store.indexed_file("u1", INIT).is_some(),
             "the old plan left files"
         );
 
@@ -7653,7 +7695,7 @@ pub(crate) mod tests {
         let v = only(&store);
         assert_eq!(v.state, KeptState::Ready, "{v:?}");
         assert!(
-            store.stored_file("u1", INIT).is_none(),
+            store.indexed_file("u1", INIT).is_none(),
             "the old file is not indexed"
         );
         let dir = rig.dir.join("u1").join("1").join("files");
@@ -8863,7 +8905,7 @@ pub(crate) mod tests {
         let start = std::time::Instant::now();
         while [INIT, SEG1]
             .iter()
-            .any(|k| store.stored_file("u1", k).is_none())
+            .any(|k| store.indexed_file("u1", k).is_none())
         {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(30),
@@ -8949,7 +8991,7 @@ pub(crate) mod tests {
         let start = std::time::Instant::now();
         while [INIT, SEG1]
             .iter()
-            .any(|k| store.stored_file("u1", k).is_none())
+            .any(|k| store.indexed_file("u1", k).is_none())
         {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(30),
@@ -9092,7 +9134,7 @@ pub(crate) mod tests {
         // run stops, and the held fetch is dropped with its staging file:
         // there is then no writer to drain, and nothing to count.
         until_within(|| {
-            store.stored_file("u1", INIT).is_some() && store.stored_file("u1", SEG1).is_some()
+            store.indexed_file("u1", INIT).is_some() && store.indexed_file("u1", SEG1).is_some()
         })
         .await;
         store.park_runs(Some("u1"));
@@ -11771,15 +11813,15 @@ pub(crate) mod tests {
         store.start(request("1")).unwrap();
         // The master playlist is stored; the media playlist is held.
         rig.server.asked_times(MEDIA_KEY, 1).await;
-        assert!(store.stored_file("u1", MASTER_KEY).is_some(), "not stored");
+        assert!(store.indexed_file("u1", MASTER_KEY).is_some(), "not stored");
         store.remove("u1", "1");
         assert!(
-            store.stored_file("u1", MASTER_KEY).is_none(),
+            store.indexed_file("u1", MASTER_KEY).is_none(),
             "the master playlist still answers after the removal"
         );
         hold.store(true, Ordering::SeqCst);
         store.settled().await;
-        assert!(store.stored_file("u1", MASTER_KEY).is_none());
+        assert!(store.indexed_file("u1", MASTER_KEY).is_none());
     }
 
     /// The retry is a new play session: every file is named afresh, the old
@@ -12313,7 +12355,7 @@ pub(crate) mod tests {
                     let on_disk = on_disk(&rig.dir.join("u1").join("1").join("files"));
                     assert!(store.kept_bytes() >= on_disk, "{case}: files uncounted");
                     assert!(
-                        store.stored_file("u1", SEG0).is_some(),
+                        store.indexed_file("u1", SEG0).is_some(),
                         "{case}: files dropped"
                     );
                 }
@@ -12415,6 +12457,45 @@ pub(crate) mod tests {
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
         assert!(rig.server.asked().is_empty(), "{:?}", rig.server.asked());
+    }
+
+    /// Only a Ready download is served: while one runs, the files it has
+    /// stored are not answered offline and the player is not pointed at the
+    /// local origin; once it is Ready, both are.
+    #[tokio::test]
+    async fn a_running_download_serves_nothing_until_it_is_ready() {
+        let rig = Rig::new("ready-only");
+        let slow = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.indexed_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        crate::native::offline_video::remember_user("u1");
+        let master = only(&store).master_url;
+        let dyn_store: Arc<dyn VideoStore> = store.clone();
+        assert!(
+            store.stored_file("u1", SEG0).is_none(),
+            "a running download's file was served"
+        );
+        assert!(
+            crate::native::offline_video::hls_local_source(Some(&*dyn_store), &master).is_none(),
+            "a running download was given the local origin"
+        );
+        assert!(!lines(
+            "pharos: video request verdict=not_served_offline reason=download_not_ready"
+        )
+        .is_empty());
+        slow.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(store.stored_file("u1", SEG0).is_some());
+        assert!(
+            crate::native::offline_video::hls_local_source(Some(&*dyn_store), &master).is_some()
+        );
     }
 
     /// The proxy asks with the path and query the WebView sent; a stored
