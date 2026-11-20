@@ -378,6 +378,9 @@ pub async fn proxy_get<T: ProxyTransport>(
             token = None;
         }
     }
+    // Whether the request carried a token at all: a hop with none tells a
+    // token never sent from one an earlier hop dropped.
+    let started_with_token = token.is_some();
     let mut hops = 0usize;
     // Once a redirect leaves the original origin, the caller's headers
     // keep only those that may cross origins, for the rest of the request,
@@ -438,7 +441,12 @@ pub async fn proxy_get<T: ProxyTransport>(
             Hop::FollowWithToken => log(
                 Level::Debug,
                 format!(
-                    "pharos: proxy redirect verdict=follow_without_token reason=token_dropped_earlier status={status}"
+                    "pharos: proxy redirect verdict=follow_without_token reason={} status={status}",
+                    if started_with_token {
+                        "token_dropped_earlier"
+                    } else {
+                        "no_token"
+                    }
                 ),
             ),
             Hop::FollowWithoutToken => {
@@ -2070,6 +2078,49 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("verdict=dropped reason=cross_origin names=Authorization,Cookie")));
+    }
+
+    /// CR 4647378697: a request that started with no token logs a
+    /// same-origin hop as carrying none for that reason, not as a token an
+    /// earlier hop dropped, and sends no token on either request.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_of_a_request_with_no_token_says_none_was_sent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(&["https://a.example.org/2"])));
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: None,
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.iter().flatten().all(|n| n != "X-Emby-Token"),
+            "a token was sent: {names:?}"
+        );
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=no_token")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("token_dropped_earlier")),
+            "{lines:?}"
+        );
     }
 
     /// CR 4646280279: a same-origin hop on the token's origin, after the
