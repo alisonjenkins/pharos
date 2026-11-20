@@ -16,10 +16,6 @@ use super::{LyricLine, Lyrics, Origin, Song, WordStamp};
 /// again.
 pub const MISS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// The most tag sets an item keeps a repick for, the oldest dropped first:
-/// a retag and a retag back are a few, and each costs a search at most.
-const MAX_REPICKED_KEYS: usize = 4;
-
 /// A provider's answer as it was cached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cached {
@@ -153,6 +149,8 @@ impl DiskCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = key(provider, song);
         let mut repicks = self.read_repicks(id);
+        // No cap: an entry exists only for a tag set that got a mismatch
+        // verdict and a search, so the list grows only with real retags.
         repicks.retain(|r| r.key != key);
         repicks.push(Repicked {
             key,
@@ -160,8 +158,6 @@ impl DiskCache {
             lines: lines_of(lyrics),
             picked,
         });
-        let over = repicks.len().saturating_sub(MAX_REPICKED_KEYS);
-        repicks.drain(..over);
         if let Err(e) = write(&self.dir, &self.repicks_path(id), &repicks) {
             tracing::warn!(media.id = id, dir = %self.dir.display(), error = %e, "lyrics: repick cache write failed");
         }
@@ -546,22 +542,34 @@ mod tests {
         }
     }
 
-    /// Only the latest few tag sets keep a repick, the oldest dropped.
+    /// Repicks for old tags finishing after the current tags' repick do
+    /// not push the current one out, however many there are.
     #[test]
-    fn the_oldest_repick_is_dropped_past_the_limit() {
+    fn late_repicks_for_old_tags_keep_the_current_ones() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::new(dir.path().to_path_buf());
-        let tagged = |n: usize| Song {
-            title: format!("Song {n}"),
+        let current = Song {
+            title: "Song (Live)".into(),
             ..song()
         };
-        for n in 0..=MAX_REPICKED_KEYS {
-            cache.put_repicked(7, "lrclib", &tagged(n), &words(), None);
+        let mut sung = words();
+        sung.lines[0].text = "the lanterns swing".into();
+        cache.put_repicked(7, "lrclib", &current, &sung, Some(43));
+        for n in 0..8 {
+            let old = Song {
+                title: format!("Song {n}"),
+                ..song()
+            };
+            cache.put_repicked(7, "lrclib", &old, &words(), None);
         }
-        assert!(!cache.repicked(7, "lrclib", &tagged(0)));
-        for n in 1..=MAX_REPICKED_KEYS {
-            assert!(cache.repicked(7, "lrclib", &tagged(n)), "{n}");
-        }
+        drop(cache);
+
+        let reopened = DiskCache::new(dir.path().to_path_buf());
+        assert!(reopened.repicked(7, "lrclib", &current));
+        assert_eq!(
+            reopened.get(7, "lrclib", &current),
+            Some(Cached::Found(sung))
+        );
     }
 
     /// A record written before repicks were kept apart still reads as
