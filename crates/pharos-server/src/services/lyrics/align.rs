@@ -1001,9 +1001,11 @@ impl Aligner {
     }
 
     /// What a job for `lyrics` of `item` asks and is cached under; `None`
-    /// when the aligner has nothing to do for these lyrics.
+    /// when the lyrics have no line times. Lyrics that are not
+    /// [`alignable`] still have a key: their verdict from before they were
+    /// word-timed holds, as the key does not count the words.
     fn keyed(&self, item: &MediaItem, lyrics: &Lyrics) -> Option<Keyed> {
-        if !alignable(lyrics) {
+        if !lyrics.synced() {
             return None;
         }
         let rel_path = match item.path.strip_prefix(&self.media_root).ok()?.to_str() {
@@ -1046,9 +1048,12 @@ impl Aligner {
             if let Some(heard) = aligned.mismatch {
                 return Lookup::Mismatch(heard);
             }
-            if aligned.lines.len() == job_lines.len() {
+            if alignable(lyrics) && aligned.lines.len() == job_lines.len() {
                 return Lookup::Ready(aligned);
             }
+        }
+        if !alignable(lyrics) {
+            return Lookup::Unavailable;
         }
 
         let mut pending = match self.pending.lock() {
@@ -2783,6 +2788,56 @@ pub(super) mod tests {
             assert_eq!(cache.get(4, "wrong").and_then(|a| a.mismatch), Some(heard));
             assert_eq!(cache.get(5, "wrong"), None);
         }
+    }
+
+    /// V1468: a lyric found not to be what was sung is still a mismatch
+    /// once every line is word-timed (a sidecar given its own words), as
+    /// its text and line times are unchanged; a fully word-timed lyric with
+    /// no verdict is still never queued. Disarm check: with `keyed`
+    /// refusing lyrics that are not `alignable`, this fails.
+    #[test]
+    fn a_mismatch_holds_once_the_lyric_is_word_timed_and_none_is_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let line = |text: &str, start_ms| LyricLine {
+            start_ms: Some(start_ms),
+            text: text.into(),
+            words: Vec::new(),
+        };
+        let lyrics =
+            Lyrics::from_lines(vec![line("grey gulls wheel", 1000)], Origin::SidecarLrc).unwrap();
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        aligner.pending.lock().unwrap().remove(&item.id);
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+        aligner.cache.put(item.id, job.key, aligned);
+
+        let mut word_timed = lyrics.clone();
+        for l in &mut word_timed.lines {
+            l.words = vec![WordStamp {
+                at: 0,
+                start_ms: l.start_ms.unwrap(),
+            }];
+        }
+        assert!(!alignable(&word_timed));
+        assert_eq!(
+            aligner.words_for(&item, &word_timed),
+            Lookup::Mismatch(heard.clone())
+        );
+        assert_eq!(aligner.mismatched(&item, &word_timed), Some(heard));
+
+        let mut other = word_timed.clone();
+        other.lines[0].text = "the lanterns swing".into();
+        assert_eq!(aligner.words_for(&item, &other), Lookup::Unavailable);
+        assert_eq!(aligner.mismatched(&item, &other), None);
+        assert!(rx.try_recv().is_err(), "nothing queued");
     }
 
     /// V1468: words aligned to lyrics that were not what was sung are never
