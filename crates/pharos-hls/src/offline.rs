@@ -48,9 +48,11 @@ pub struct MediaPlan {
     pub files: Vec<String>,
     /// The playlist's length.
     pub duration_ms: u64,
-    /// The last segment, when it is under [`SHORT_TAIL_MS`]: a sliver the
-    /// server's grid leaves at the very end, which an encoder can fail to
-    /// fill. A host may go without it; the stream then ends a frame early.
+    /// The last segment, when it is under [`SHORT_TAIL_MS`] and no other
+    /// segment names its URI: a sliver the server's grid leaves at the very
+    /// end, which an encoder can fail to fill. A host may go without it; the
+    /// stream then ends a frame early. A URI another segment needs is never
+    /// one, so its failed fetch is never excused.
     pub short_tail: Option<String>,
 }
 
@@ -68,6 +70,7 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
         .segments
         .last()
         .filter(|s| s.duration_ms < SHORT_TAIL_MS)
+        .filter(|s| media.segments.iter().filter(|o| o.uri == s.uri).count() == 1)
         .map(|s| s.uri.clone());
     // A multi-part film names one `EXT-X-MAP` per part (after each
     // discontinuity), and the parser keeps only the last: list them all.
@@ -181,6 +184,18 @@ mod tests {
             plan.short_tail.as_deref(),
             Some("https://h/videos/9/h264cmaf/1.m4s?PlaySessionId=p")
         );
+    }
+
+    /// CR review 5995575621 (kept_video_disk.rs:3431): a short last
+    /// segment whose URI an earlier, longer segment also names is no short
+    /// tail: that file is needed whole.
+    #[test]
+    fn a_short_last_segment_sharing_its_uri_is_no_short_tail() {
+        let text = MEDIA
+            .replace("#EXTINF:4.5,", "#EXTINF:0.042,")
+            .replace("1.m4s?PlaySessionId=p", "0.m4s?PlaySessionId=p");
+        let plan = plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &text).unwrap();
+        assert_eq!(plan.short_tail, None);
     }
 
     #[test]
