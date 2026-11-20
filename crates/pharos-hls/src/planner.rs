@@ -187,6 +187,11 @@ struct TrackState {
     held: bool,
     /// Bytes and media time of recent appends, the older ones weighing less.
     rate: (u64, u64),
+    /// The last range asked to be evicted. Asked again only once the buffer
+    /// or the cutoff has moved: a remove the browser leaves data behind from
+    /// would otherwise be asked for on every tick, and each remove's
+    /// `updateend` is a tick.
+    last_evict: Option<(u64, u64)>,
 }
 
 impl TrackState {
@@ -202,6 +207,7 @@ impl TrackState {
             given_up: Vec::new(),
             held: false,
             rate: (0, 0),
+            last_evict: None,
         }
     }
 }
@@ -660,7 +666,9 @@ fn plan_track(
         eviction_anchor(state, play_ms).saturating_sub(back_ms),
     );
     if let Some(&(range_start, range_end)) = track_buffered.first() {
-        if range_start < range_end && range_start < cutoff_ms {
+        let range = (range_start, cutoff_ms);
+        if range_start < range_end && range_start < cutoff_ms && state.last_evict != Some(range) {
+            state.last_evict = Some(range);
             actions.push(Action::Evict {
                 track,
                 start_ms: range_start,
@@ -2182,6 +2190,42 @@ mod tests {
             planner.tick(12_070, &holed),
             vec![Action::Skip {
                 to_ms: 14_000 + SKIP_PADDING_MS
+            }]
+        );
+    }
+
+    #[test]
+    fn an_evict_that_changes_nothing_is_not_asked_for_again() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 50_000);
+        let buf = Buffered {
+            video: vec![(70, 120_000)],
+            audio: Vec::new(),
+        };
+        let evicts = |actions: Vec<Action>| {
+            actions
+                .into_iter()
+                .filter(|a| matches!(a, Action::Evict { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            evicts(planner.tick(50_000, &buf)),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 70,
+                end_ms: 30_000,
+            }]
+        );
+        // The remove left the range as it was: the same tick again asks nothing.
+        assert_eq!(evicts(planner.tick(50_000, &buf)), Vec::new());
+        assert_eq!(evicts(planner.tick(50_100, &buf)), Vec::new());
+        // A cutoff that moved on is a new range to ask for.
+        assert_eq!(
+            evicts(planner.tick(56_000, &buf)),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 70,
+                end_ms: 36_000,
             }]
         );
     }
