@@ -1127,7 +1127,21 @@ impl Worker {
                 );
                 return Ok(Out::Done);
             }
-            self.link = None;
+            let dropped = self.link.take().is_some();
+            // The fenced link is gone. A token on file the fence does not
+            // refuse (a sign-in that stored one since) resumes, as a reload
+            // would: the service is not signed out over a usable token.
+            if dropped && self.load_token()?.is_some() {
+                let result = self.link(events).await.map(|_| Out::Done);
+                log::info!(
+                    "credentials stay signed out: verdict=resumed_stored reason=fenced_link_dropped outcome={}",
+                    match &result {
+                        Ok(_) => "signed_in",
+                        Err(e) => e.label(),
+                    }
+                );
+                return result;
+            }
             let polling = self.stop_sign_in();
             self.shared.set_auth(AuthState::SignedOut);
             log::warn!(
@@ -1238,6 +1252,8 @@ impl Worker {
         events: &UnboundedSender<(u64, Event)>,
         device_token: String,
     ) -> Result<Option<Link>, ContentError> {
+        #[cfg(test)]
+        tests::RESUMED_WITH.with(|r| r.borrow_mut().push(device_token.clone()));
         let (bootstrap, closed) = net::open(&self.base).await?;
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
@@ -1498,6 +1514,9 @@ mod tests {
         /// Runs once in `end_session` before the token file is ended.
         pub(super) static BEFORE_END_SESSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             std::cell::RefCell::new(None);
+        /// The device token each resume was sent with, in order.
+        pub(super) static RESUMED_WITH: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     fn dead_server() -> String {
@@ -2481,6 +2500,58 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.contains("token read verdict=refused reason=service_fence at=refresh")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR reply 4644229275: the service holds a link on A, fenced, when the
+    /// phone has stored B. StaySignedOut drops A's link and resumes with B,
+    /// as a reload would: SignedOut is not reported and QuickConnect is not
+    /// stopped over a usable token.
+    #[test]
+    fn a_stay_signed_out_over_a_fenced_link_resumes_the_stored_token() {
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("stay-signed-out-resumes");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(|| {})),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        token::store(&token_path, "tokB").unwrap();
+        RESUMED_WITH.with(|r| r.borrow_mut().clear());
+        crate::testlog::start();
+        let _ = local.block_on(&rt, w.execute(&Op::StaySignedOut, &events));
+        let lines = crate::testlog::lines();
+        assert_eq!(
+            RESUMED_WITH.with(|r| r.borrow().clone()),
+            ["tokB".to_owned()],
+            "B was not used"
+        );
+        assert_ne!(
+            shared.lock().auth,
+            AuthState::SignedOut,
+            "SignedOut was reported"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "credentials stay signed out: verdict=resumed_stored reason=fenced_link_dropped"
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("verdict=fenced reason=token_neither")),
             "{lines:?}"
         );
     }
