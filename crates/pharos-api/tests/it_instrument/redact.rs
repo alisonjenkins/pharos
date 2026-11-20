@@ -9,7 +9,7 @@ use std::rc::Rc;
 use capnp::introspect::{Introspect, TypeVariant};
 use capnp::schema::StructSchema;
 use pharos_api::pharos_capnp::{
-    bootstrap, playback_grant, session, telemetry, telemetry_event, EventKind, Level,
+    bootstrap, playback, playback_grant, session, telemetry, telemetry_event, EventKind, Level,
 };
 use pharos_api::redact::{is_secret, REDACTED};
 use pharos_api::server::{self, SECRET_METHODS};
@@ -25,6 +25,7 @@ const FIELD_SECRET: &str = "clientfield-secret-xyz";
 const MEDIA_TOKEN: &str = "mediatok-9876543210-secret";
 const MANAGE_TOKEN: &str = "managetok-1357924680-secret";
 const READER_PASSWORD: &str = "readerpw-abcdef-ghjk-secret";
+const PLAY_SESSION: &str = "playsession-24680-secret";
 const REPORT_NOTE: &str = "reportnote-secret-subtitles-vanished";
 const REPORT_BUNDLE: &str = "{\"breadcrumbs\":[\"reportbundle-secret\"]}";
 
@@ -37,6 +38,9 @@ struct TelemetryBoot;
 
 /// Answers `PlaybackGrant.decision` with an error, so the call completes.
 struct GrantBoot;
+
+/// Answers `Playback.negotiate` with an error, so the call completes.
+struct PlaybackBoot;
 
 /// Answers `Session.changePassword` ok and `Session.mediaToken` and
 /// `Session.manageToken` with a token, and `Session.createReaderPassword`
@@ -130,6 +134,21 @@ impl server::playback_grant::Handler for GrantBoot {
             .init_result()
             .init_error()
             .set_reason("no grant");
+        std::future::ready(Ok(()))
+    }
+}
+
+impl server::playback::Handler for PlaybackBoot {
+    fn negotiate(
+        self: Rc<Self>,
+        _params: playback::NegotiateParams,
+        results: &mut playback::NegotiateResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        results
+            .get()
+            .init_result()
+            .init_error()
+            .set_reason("no item");
         std::future::ready(Ok(()))
     }
 }
@@ -257,6 +276,12 @@ fn call_all() -> Observed {
             fill_ctx(r.get().init_ctx());
             r.send().promise.await.unwrap();
 
+            let play: playback::Client = server::playback::client(PlaybackBoot, &Connection::new());
+            let mut r = play.negotiate_request();
+            fill_ctx(r.get().init_ctx());
+            r.get().init_resumes().set_value(PLAY_SESSION);
+            r.send().promise.await.unwrap();
+
             let sess: session::Client = server::session::client(SessionBoot, &Connection::new());
             let mut r = sess.change_password_request();
             fill_ctx(r.get().init_ctx());
@@ -283,7 +308,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 13] = [
+const COVERED: [(&str, &str); 14] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -292,6 +317,7 @@ const COVERED: [(&str, &str); 13] = [
     ("telemetry", "submit"),
     ("telemetry", "report"),
     ("telemetry", "list_reports"),
+    ("playback", "negotiate"),
     ("playback_grant", "decision"),
     ("session", "change_password"),
     ("session", "media_token"),
@@ -318,6 +344,7 @@ fn secrets_never_reach_logs_or_spans() {
         MEDIA_TOKEN,
         MANAGE_TOKEN,
         READER_PASSWORD,
+        PLAY_SESSION,
         REPORT_NOTE,
         "reportbundle-secret",
     ] {
@@ -336,7 +363,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        26,
+        28,
         "a request and a response per call:\n{}",
         o.logs
     );
