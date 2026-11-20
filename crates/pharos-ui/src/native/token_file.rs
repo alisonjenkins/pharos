@@ -563,5 +563,24 @@ mod sign_out_tests {
         }
         pharos_content::token::add_fence(&path, &SignOutFence::Every, "test");
         assert!(take_stale(), "a fence did not mark the cache stale");
+        // CR 4642574367: a store whose rename landed but whose read-back
+        // failed marks the cache stale too, even when its fence adds
+        // nothing (every token is fenced already); the reload refuses the
+        // unconfirmed token.
+        #[cfg(debug_assertions)]
+        {
+            pharos_content::token::faults::READ_BACK.with(|f| f.set(true));
+            let stored = pharos_content::token::store(&path, "tokD");
+            pharos_content::token::faults::READ_BACK.with(|f| f.set(false));
+            assert!(stored.is_err());
+            assert!(
+                take_stale(),
+                "an unconfirmed store did not mark the cache stale"
+            );
+            assert!(
+                read(&path).unwrap().is_none(),
+                "the unconfirmed token loads"
+            );
+        }
     }
 }

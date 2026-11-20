@@ -560,13 +560,16 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // but the fence and the hook have not followed, so the caller is told
     // the sign-in is incomplete ([`is_store_incomplete`]).
     #[cfg(test)]
-    let back = if tests::FAIL_READ_BACK.with(std::cell::Cell::get) {
+    let fail_read_back = tests::FAIL_READ_BACK.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let fail_read_back = false;
+    #[cfg(debug_assertions)]
+    let fail_read_back = fail_read_back || faults::READ_BACK.with(std::cell::Cell::get);
+    let back = if fail_read_back {
         Err(err(path, "read back failed"))
     } else {
         read_raw(path)
     };
-    #[cfg(not(test))]
-    let back = read_raw(path);
     match back {
         Ok(Some(s)) if s.token == token => {
             let stored = fingerprint(token);
@@ -593,6 +596,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             log::warn!(
                 "token store verdict=incomplete reason=read_back_differs found={found} fenced=new_token"
             );
+            // The rename may have landed: a cached token is stale now, and
+            // reloads through the fence above.
+            changed("store_incomplete");
             return Err(err(
                 path,
                 format!("{STORE_INCOMPLETE}: the file read back holds {found}"),
@@ -604,6 +610,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 "token store verdict=incomplete reason=read_back_failed fenced=new_token error={}",
                 e.redacted()
             );
+            changed("store_incomplete");
             return Err(err(
                 path,
                 format!("{STORE_INCOMPLETE}: the file could not be read back"),
@@ -946,6 +953,8 @@ pub mod faults {
         pub static MARKER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The token file cannot be read in `end_session`.
         pub static TOKEN_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A store cannot read its token back.
+        pub static READ_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
