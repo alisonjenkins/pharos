@@ -2177,6 +2177,32 @@ async fn an_adopting_reconnect_reports_the_subtitle_it_named() {
     assert_eq!(again.subtitle, Some(3), "{again:?}");
 }
 
+/// B1490: two renewals naming one session at once keep it for one of them
+/// only; the other gets its own, so no two grants share a stream. The RPC
+/// may run them one after the other; the claim's exclusion itself is pinned
+/// by `a_claimed_session_is_not_claimed_twice_until_released`.
+#[actix_web::test]
+async fn concurrent_renewals_keep_a_session_for_one_only() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let one = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let two = crate::revocation::signed_in(&client2, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = play_on(&one, &direct).await.unwrap();
+    as_after_a_rollout(&fx, grant, &first.psid).await;
+    let (a, b) = tokio::join!(
+        renew_naming(&one, &direct, &first.psid),
+        renew_naming(&two, &direct, &first.psid),
+    );
+    let (_ga, a) = a.unwrap();
+    let (_gb, b) = b.unwrap();
+    let kept = [&a, &b].iter().filter(|d| d.psid == first.psid).count();
+    assert_eq!(kept, 1, "one keeps it, one does not: {a:?} {b:?}");
+}
+
 /// What `pharos_play_session_resume_total{outcome}` has counted so far.
 fn resume_count(outcome: &str) -> u64 {
     let _ = pharos_server::obs::init("info", None);

@@ -1573,6 +1573,39 @@ pub struct Grant {
     /// Whether the tracks this playback reports may be remembered for the
     /// item: only the primary file's, whose stream indexes they name.
     pub remembers_tracks: bool,
+    /// Held while a renewal that kept its named session is made live; drop
+    /// it once the grant is in `/Sessions`.
+    pub resume_claim: Option<ResumeClaim>,
+}
+
+/// The play sessions a renewal on this replica is taking over right now. A
+/// second renewal naming one of them is answered as if a live grant held it:
+/// between the live-grant check and `/Sessions` there is no other guard, and
+/// two takeovers would leave two grants on one stream.
+static RESUMING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One renewal's hold on the session it names, released on drop.
+#[derive(Debug)]
+pub struct ResumeClaim(String);
+
+impl ResumeClaim {
+    fn take(play_session_id: &str) -> Option<Self> {
+        let mut held = RESUMING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.insert(play_session_id.to_owned())
+            .then(|| Self(play_session_id.to_owned()))
+    }
+}
+
+impl Drop for ResumeClaim {
+    fn drop(&mut self) {
+        RESUMING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
 }
 
 #[derive(Debug)]
@@ -1830,6 +1863,7 @@ pub async fn grant(
                 adopted.subtitle
             },
             remembers_tracks: adopted.remembers_tracks,
+            resume_claim: None,
             item_id: id,
             version: r.version.to_owned(),
             shape,
@@ -1839,7 +1873,8 @@ pub async fn grant(
     }
     let resumed = resume_named(state, user, id, r, &item.probe, &negotiated).await;
     let play_session_id = resumed
-        .clone()
+        .as_ref()
+        .map(|c| c.0.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let resume_ticks = if user_data.played {
         0
@@ -1963,6 +1998,7 @@ pub async fn grant(
         shape,
         adopted: false,
         reported_ms: None,
+        resume_claim: resumed,
     })
 }
 
@@ -2094,12 +2130,17 @@ async fn resume_named(
     r: &GrantRequest<'_>,
     probe: &pharos_core::MediaProbe,
     negotiated: &Negotiated,
-) -> Option<String> {
+) -> Option<ResumeClaim> {
     let named = r.resumes;
     if named.is_empty() {
         return None;
     }
     let psid = pharos_core::PlaySessionId::from(named);
+    let Some(claim) = ResumeClaim::take(named) else {
+        let outcome = ResumeOutcome::Live;
+        outcome.record(named, "another renewal is resuming it");
+        return None;
+    };
     let (outcome, reason) = match state.sessions.snapshot().await {
         Err(e) => (
             ResumeOutcome::Failed,
@@ -2144,7 +2185,7 @@ async fn resume_named(
         },
     };
     outcome.record(named, &reason);
-    (outcome == ResumeOutcome::Resumed).then(|| named.to_owned())
+    (outcome == ResumeOutcome::Resumed).then_some(claim)
 }
 
 /// The first way the stored session `s` is not the stream negotiated now.
@@ -2213,6 +2254,30 @@ fn server_codec_support(caps: &pharos_transcode::ServerEncodeCapabilities) -> Se
         ServerCodecSupport::default()
     } else {
         ServerCodecSupport { encodable }
+    }
+}
+
+#[cfg(test)]
+mod resume_claim_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::ResumeClaim;
+
+    /// B1490: while one renewal holds a session's claim a second gets none,
+    /// so only one of two concurrent renewals takes the stream over; the
+    /// claim frees on drop.
+    /// Disarm check: with `take` always answering `Some`, the second holds.
+    #[test]
+    fn a_claimed_session_is_not_claimed_twice_until_released() {
+        let id = "resume-claim-test-session";
+        let first = ResumeClaim::take(id).expect("the first renewal claims it");
+        assert!(ResumeClaim::take(id).is_none(), "a second is refused");
+        assert!(
+            ResumeClaim::take("another-session").is_some(),
+            "others are free"
+        );
+        drop(first);
+        assert!(ResumeClaim::take(id).is_some(), "free again once released");
     }
 }
 

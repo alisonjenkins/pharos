@@ -93,12 +93,14 @@ impl server::playback::Handler for Playback {
                     resumes: &resumes,
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
-                    Ok(grant) => {
+                    Ok(mut grant) => {
                         // An adopted grant's entry in `/Sessions` never left.
                         if !grant.adopted {
                             start_session(session, &user, &grant, device.clone(), client_version)
                                 .await;
                         }
+                        // Listed now: a later renewal naming it sees it live.
+                        drop(grant.resume_claim.take());
                         Ok(grant)
                     }
                     Err(GrantError::Item(e)) => Err(item_denial(id, &e, "negotiate")),
