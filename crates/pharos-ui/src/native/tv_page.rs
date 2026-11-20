@@ -1702,33 +1702,13 @@ mod tests {
         assert_eq!(built_client(|| Ok::<_, String>(7)), Ok(7));
     }
 
-    /// A local server that counts the connections it accepts and answers
-    /// each with a 200.
-    #[allow(clippy::unwrap_used)]
-    fn counting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::io::{Read as _, Write as _};
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", l.local_addr().unwrap());
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let h = hits.clone();
-        std::thread::spawn(move || {
-            for mut s in l.incoming().flatten() {
-                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 1024];
-                let _ = s.read(&mut buf);
-                let _ = s.write_all(b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok");
-            }
-        });
-        (base, hits)
-    }
+    /// A transport that counts the requests it is asked to send and
+    /// answers each with a 200 `ok`: nothing goes over a socket.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-    /// A transport over a plain TCP connection: one request per hop.
-    #[derive(Default)]
-    struct Tcp;
+    struct Answer(u16, Vec<u8>);
 
-    struct TcpAnswer(u16, Vec<u8>);
-
-    impl ProxyResponse for TcpAnswer {
+    impl ProxyResponse for Answer {
         fn status(&self) -> u16 {
             self.0
         }
@@ -1743,22 +1723,11 @@ mod tests {
         }
     }
 
-    impl ProxyTransport for Tcp {
-        type Response = TcpAnswer;
-        async fn get(&self, url: &str, _: &[(String, String)]) -> Result<TcpAnswer, String> {
-            use std::io::{Read as _, Write as _};
-            let rest = url.strip_prefix("http://").ok_or("not http")?;
-            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-            let mut s = std::net::TcpStream::connect(host).map_err(|e| e.to_string())?;
-            s.write_all(format!("GET /{path} HTTP/1.0\r\n\r\n").as_bytes())
-                .map_err(|e| e.to_string())?;
-            let mut answer = Vec::new();
-            s.read_to_end(&mut answer).map_err(|e| e.to_string())?;
-            let body = answer
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map_or_else(Vec::new, |i| answer[i + 4..].to_vec());
-            Ok(TcpAnswer(200, body))
+    impl ProxyTransport for Counting {
+        type Response = Answer;
+        async fn get(&self, _: &str, _: &[(String, String)]) -> Result<Answer, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Answer(200, b"ok".to_vec()))
         }
     }
 
@@ -1768,7 +1737,8 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn a_proxy_client_that_cannot_be_built_sends_nothing() {
-        let (base, hits) = counting_server();
+        let base = "http://media.example.org";
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1782,7 +1752,7 @@ mod tests {
             passed_back: &[],
             max_hops: 5,
         };
-        let broken = proxy_client::<Tcp>(|| Err("tls config: no roots".to_owned()));
+        let broken = proxy_client::<Counting>(|| Err("tls config: no roots".to_owned()));
         let refused = rt.block_on(proxy_get(&broken, get(format!("{base}/Items")), &log));
         let Err(why) = refused else {
             panic!("a client that was never built sent the request");
@@ -1795,7 +1765,7 @@ mod tests {
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "a request reached the server"
+            "a request was sent"
         );
         assert!(
             logged
@@ -1809,7 +1779,7 @@ mod tests {
         );
 
         // The control: a built client reaches the same server.
-        let built = proxy_client(|| Ok(Tcp));
+        let built = proxy_client(|| Ok(Counting(hits.clone())));
         let (status, _, body) = rt
             .block_on(proxy_get(&built, get(format!("{base}/Items")), &log))
             .unwrap();
@@ -1824,10 +1794,10 @@ mod tests {
 
     #[allow(clippy::unwrap_used)]
     impl ProxyTransport for Recording {
-        type Response = TcpAnswer;
-        async fn get(&self, _: &str, headers: &[(String, String)]) -> Result<TcpAnswer, String> {
+        type Response = Answer;
+        async fn get(&self, _: &str, headers: &[(String, String)]) -> Result<Answer, String> {
             self.0.lock().unwrap().push(headers.to_vec());
-            Ok(TcpAnswer(200, Vec::new()))
+            Ok(Answer(200, Vec::new()))
         }
     }
 
