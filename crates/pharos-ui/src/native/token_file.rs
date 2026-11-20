@@ -547,16 +547,20 @@ mod sign_out_tests {
         // this module: the hook is registered once, process-wide.
         let _ = pharos_content::token::end_session(&path, Some("tokB"), None);
         assert!(take_stale(), "a removal did not mark the cache stale");
-        store(&path, "tokC").unwrap();
-        let _ = take_stale();
-        pharos_content::token::faults::REMOVE.with(|f| f.set(true));
-        let ended = pharos_content::token::end_session(&path, Some("tokC"), None);
-        pharos_content::token::faults::REMOVE.with(|f| f.set(false));
-        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
-        assert!(
-            take_stale(),
-            "a revocation marker did not mark the cache stale"
-        );
+        // Fault injection exists in debug builds only.
+        #[cfg(debug_assertions)]
+        {
+            store(&path, "tokC").unwrap();
+            let _ = take_stale();
+            pharos_content::token::faults::REMOVE.with(|f| f.set(true));
+            let ended = pharos_content::token::end_session(&path, Some("tokC"), None);
+            pharos_content::token::faults::REMOVE.with(|f| f.set(false));
+            assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+            assert!(
+                take_stale(),
+                "a revocation marker did not mark the cache stale"
+            );
+        }
         pharos_content::token::add_fence(&path, &SignOutFence::Every, "test");
         assert!(take_stale(), "a fence did not mark the cache stale");
     }
