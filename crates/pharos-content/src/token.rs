@@ -1365,9 +1365,15 @@ pub(crate) mod tests {
             load(&p2).unwrap()
         });
         rx.recv().unwrap();
-        store(&p, "tokB").unwrap();
+        // The competing writer clears the very marker the reader checks,
+        // under the file's lock, as a store of a token does. (A store of
+        // tokA itself is refused while tokA is on file: same_token_revoked.)
+        {
+            let _held = hold();
+            std::fs::remove_file(revoked_path(&p, &fingerprint("tokA"))).unwrap();
+        }
         assert_eq!(reader.join().unwrap(), None, "the revoked token was read");
-        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
     }
 
     /// A sign-out retried after an unlink whose folder sync failed is
