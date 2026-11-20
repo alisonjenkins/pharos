@@ -41,10 +41,14 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   sign-out or session end could not remove is marked revoked on disk, and
   one that could be neither removed nor marked is refused for the rest of
   the process, in the media service's library too.
-- Who may reach the downloads is one offline-owner state. Every sign-out
-  and session end fences that state first and tears down after (parks the
-  user's runs, then clears the token); every resume starts under the same
-  fence.
+- Who may reach the downloads is one offline-owner state. A session end
+  (the server refused the session, or it ended) fences that state first
+  and tears down after: it parks the user's runs, then clears the token.
+  An explicit sign-out on Android runs in another order. `app.rs` calls
+  `platform::sign_out()`, which removes the token through
+  `forget_token()`. Only once the machine applies the reply does
+  `offline_video::session_ended` fence the owner and park the runs. Every
+  resume starts under the same fence.
 - Signals are log lines: the phone has no Prometheus.
 
 The mechanics that carry these decisions out (lock orders, generation
