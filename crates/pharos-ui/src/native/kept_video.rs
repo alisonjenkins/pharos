@@ -646,6 +646,19 @@ fn local_key(rest: &str) -> Result<String, ()> {
     }
 }
 
+/// The HLS tags (RFC 8216bis) whose attribute list can carry a `URI`.
+const URI_TAGS: &[&str] = &[
+    "#EXT-X-KEY",
+    "#EXT-X-MAP",
+    "#EXT-X-MEDIA",
+    "#EXT-X-I-FRAME-STREAM-INF",
+    "#EXT-X-SESSION-DATA",
+    "#EXT-X-SESSION-KEY",
+    "#EXT-X-PART",
+    "#EXT-X-PRELOAD-HINT",
+    "#EXT-X-RENDITION-REPORT",
+];
+
 /// A playlist with each reference it makes (a URI line, and every
 /// `URI="..."` attribute of a tag) rewritten to the key the offline proxy
 /// serves it under ([`localize_ref`]), so the stored copy names exactly
@@ -689,7 +702,12 @@ pub fn localize_playlist(
                 // attribute named exactly `URI` is a reference, never one
                 // whose name ends in it (`X-COM-EXAMPLE-URI`), and never
                 // text inside another attribute's quoted value.
-                let Some(colon) = body.find(':') else {
+                // Only a tag whose value is an attribute list with a URI is
+                // parsed: `EXTINF`'s title, and any other tag, is text.
+                let Some(colon) = body
+                    .find(':')
+                    .filter(|&c| URI_TAGS.contains(&body[..c].trim_start()))
+                else {
                     push(&mut out, line)?;
                     continue;
                 };
@@ -1099,6 +1117,29 @@ mod tests {
                  /videos/1/0.m4s\n"
                     .to_owned()
             )
+        );
+    }
+
+    /// CR 4642574446: an `EXTINF` title is text, not an attribute list. A
+    /// title reading like a `URI` attribute is kept verbatim, and an
+    /// off-origin `EXT-X-MAP` URI is still refused.
+    #[test]
+    fn an_extinf_title_is_kept_verbatim() {
+        let server = "https://s.example/jf";
+        let text = "#EXTINF:6.0,URI=\"https://elsewhere.example/x\"\n\
+            /jf/videos/1/0.m4s\n";
+        assert_eq!(
+            localize_playlist(text, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::Rewritten(
+                "#EXTINF:6.0,URI=\"https://elsewhere.example/x\"\n\
+                 /videos/1/0.m4s\n"
+                    .to_owned()
+            )
+        );
+        let off = "#EXT-X-MAP:URI=\"https://elsewhere.example/init.mp4\"\n";
+        assert_eq!(
+            localize_playlist(off, "/videos/1/main.m3u8", false, server, usize::MAX),
+            Localized::NotLocal("https://elsewhere.example/init.mp4".to_owned())
         );
     }
 
