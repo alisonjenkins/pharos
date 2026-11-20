@@ -22,7 +22,7 @@ pub struct Scratch(pub PathBuf);
 
 impl Scratch {
     pub fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let stem = std::env::temp_dir().join(format!(
             "pharos-content-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -30,9 +30,36 @@ impl Scratch {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(create_exclusive(&stem))
     }
+}
+
+/// Creates a folder that did not exist before: `stem-0`, else `stem-1`, and
+/// so on. One that is already there is never taken (nor, so, removed by
+/// [`Scratch`]'s drop).
+pub fn create_exclusive(stem: &std::path::Path) -> PathBuf {
+    for n in 0u32.. {
+        let mut name = stem.as_os_str().to_owned();
+        name.push(format!("-{n}"));
+        let dir = PathBuf::from(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("scratch folder {}: {e}", dir.display()),
+        }
+    }
+    unreachable!("no free scratch folder name")
+}
+
+#[test]
+fn a_scratch_folder_is_never_one_that_was_already_there() {
+    let root = Scratch::new("exclusive");
+    let stem = root.0.join("s");
+    std::fs::create_dir(root.0.join("s-0")).unwrap();
+    std::fs::write(root.0.join("s-0").join("kept"), "x").unwrap();
+    let made = create_exclusive(&stem);
+    assert_eq!(made, root.0.join("s-1"));
+    assert!(root.0.join("s-0").join("kept").exists());
 }
 
 impl Drop for Scratch {
