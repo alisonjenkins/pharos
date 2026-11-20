@@ -4,7 +4,7 @@
 //! zero, as does a song the recogniser heard little of, so the two are told
 //! apart by `heard_words`.
 
-use pharos_core::lyrics_text::{bigram_recall, words};
+use pharos_core::lyrics_text::{bigram_recall, text_mismatch, words};
 
 use serde::Serialize;
 
@@ -17,12 +17,6 @@ use crate::transcript::Word;
 pub const TEXT_RECALL: &str = "pharos_aligner_text_recall";
 /// Tenths: the wrong-lyric songs measured near 0.1, matching ones near 0.9.
 pub const TEXT_RECALL_BUCKETS: &[f64] = &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
-/// Below this recall the lyric is not what was sung: a wrong lyric measured
-/// 0.107 and the right one 0.917 on the same transcript.
-pub const MAX_MISMATCH_RECALL: f64 = 0.3;
-/// The fewest words heard for a low recall to mean a wrong lyric rather
-/// than a song the recogniser barely heard; a sung song gives hundreds.
-pub const MIN_MISMATCH_HEARD_WORDS: usize = 100;
 
 /// What the recogniser heard against the lyric's text.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,8 +70,7 @@ impl TextCheck {
     /// heard, and enough heard for that to mean something. A song whose
     /// later stages failed has no anchor share, and is judged by this.
     pub fn text_mismatch(&self) -> bool {
-        self.heard_words >= MIN_MISMATCH_HEARD_WORDS
-            && self.text_recall.is_some_and(|r| r < MAX_MISMATCH_RECALL)
+        text_mismatch(self.text_recall, self.heard_words)
     }
 
     /// The answer's account of this check for a song that fell back because of `why`.
