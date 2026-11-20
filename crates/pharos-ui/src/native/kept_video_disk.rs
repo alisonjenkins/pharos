@@ -2479,9 +2479,12 @@ async fn fetch_once(
                         let Ok(text) = std::str::from_utf8(&raw) else {
                             break 'body Ok(Some(raw));
                         };
+                        // Resolved against the URL fetched: the final one
+                        // after a redirect, else the one requested.
                         match localize_playlist(
                             text,
-                            final_key.as_deref(),
+                            final_key.as_deref().unwrap_or(key),
+                            final_key.is_some(),
                             &server,
                             usize::try_from(cap).unwrap_or(usize::MAX),
                         ) {
@@ -13448,6 +13451,32 @@ pub(crate) mod tests {
     /// URL, base path included. Each is asked for by its key (the fetcher
     /// puts the base path back once, never twice), and the stored playlists
     /// name those keys, so the copy plays offline.
+    /// CR 4639073839: with no redirect, a relative reference that climbs out
+    /// of the server's base path (`/jf`) is refused, as it is after one:
+    /// it is resolved against the URL fetched, not the key that lost the
+    /// base path, so it is never fetched as a file under `/jf`.
+    #[tokio::test]
+    async fn an_escaping_reference_under_a_base_path_is_refused_without_a_redirect() {
+        let rig = Rig::new("base-path-escape");
+        *rig.server.base.lock().unwrap() = Some("https://h/jf".to_owned());
+        rig.server.files.lock().unwrap().insert(
+            MASTER_KEY.into(),
+            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\n/jf/videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n".to_vec(),
+        );
+        rig.server.files.lock().unwrap().insert(
+            MEDIA_KEY.into(),
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=p\"\n#EXTINF:6.0,\n../../../../videos/1/h264cmaf/0.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("an escaping reference was kept: {:?}", kept.state);
+        };
+        assert!(reason.contains("reference_not_local"), "{reason}");
+    }
+
     #[tokio::test]
     async fn a_server_under_a_base_path_downloads_and_plays_offline() {
         let rig = Rig::new("base-path");
@@ -13543,7 +13572,7 @@ pub(crate) mod tests {
         let raw = "x\n".repeat(lines_sent);
         assert!(raw.len() as u64 <= PLAYLIST_MAX_BYTES);
         let Localized::Rewritten(rebased) =
-            localize_playlist(&raw, Some(moved), PLAN_ORIGIN, usize::MAX)
+            localize_playlist(&raw, moved, true, PLAN_ORIGIN, usize::MAX)
         else {
             panic!("not rewritten");
         };
