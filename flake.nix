@@ -176,9 +176,11 @@
             # real ffmpeg in CI, not only in a devShell.
             # dvdauthor's spumux builds the real dvd_subtitle source the
             # image-subtitle extraction test decodes (spec 019).
+            # node runs the TV bridge's Back handling on a stub page (B1508).
             nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [
               pkgs.ffmpeg-headless
               pkgs.dvdauthor
+              pkgs.nodejs_22
             ];
           }
         );
