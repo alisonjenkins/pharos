@@ -182,6 +182,12 @@ enum Outcome {
     Yielded,
 }
 
+/// Whether a retained part can be resumed: only under a strong ETag, as
+/// `attempt` sends it. Any other part is replaced by a whole body.
+fn part_resumable(st: &JobState) -> bool {
+    st.etag.as_deref().is_some_and(|e| !e.starts_with("W/"))
+}
+
 impl Downloader {
     pub fn start(
         cache: Arc<Cache>,
@@ -625,14 +631,24 @@ impl Gate {
             id,
         };
         let outcome = loop {
-            match self.cache.ensure_free(id, 0) {
+            // A part that cannot be resumed is replaced by a whole body,
+            // whose admission reclaims the part: the preflight counts its
+            // bytes as room so the request goes out and the response is
+            // inspected. A resumable part's 206 adds to it, so it does not.
+            let replacing = part_len() > 0 && !part_resumable(&st);
+            let preflight = if replacing {
+                self.cache.preflight_replacing_part(id)
+            } else {
+                self.cache.ensure_free(id, 0)
+            };
+            match preflight {
                 // A preflight replaces no part, so it never truncates one.
                 Ok(_) | Err(NoRoom::PartNotTruncated) => {}
                 // A pin with a part on disk waits for room and resumes it;
                 // anything else stops here (its part, if any, is kept).
                 Err(NoRoom::LowDisk(free)) if part_len() > 0 && self.is_pin_work(id) => {
                     log::info!(
-                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=preflight free_bytes={free} attempt={attempt} wait_ms={}",
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=preflight replacing={replacing} free_bytes={free} attempt={attempt} wait_ms={}",
                         part_len(),
                         started.elapsed().as_millis(),
                         backoff.as_millis()
@@ -2700,6 +2716,52 @@ mod tests {
             "the evicted part's state was kept: {seen:?}"
         );
         assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// CR 4638660900: a pin whose retained part cannot be resumed (no
+    /// validator) is a whole-body replacement candidate. Its preflight
+    /// credits the part's bytes, so the request goes out and the response
+    /// is inspected: here a whole, smaller new body that fits once the
+    /// part is truncated, though the disk is below the guard with the part.
+    #[test]
+    fn a_pin_whose_part_will_be_replaced_sends_its_request_through_low_disk() {
+        // The new version is smaller: 400 bytes fit where the part was.
+        let script = Script::default().file("/audio/1", body(400, 2)).no_etag();
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let s2 = slot.clone();
+        // 100 bytes under the guard while the part holds its 600.
+        let r = rig_with_free(
+            "preflight-credits-part",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let part = s2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                Ok(if part >= 600 {
+                    MIN_FREE_BYTES - 100
+                } else {
+                    MIN_FREE_BYTES + 5000
+                })
+            }),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        // A part an earlier version left, with no validator to resume it.
+        std::fs::write(&part, body(600, 1)).unwrap();
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(5)),
+            "the preflight held the request: {:?}",
+            r.srv.seen()
+        );
+        assert_eq!(read(&r.cache, "track/1"), body(400, 2));
     }
 
     /// A whole new body that replaces a partial file is admitted with the

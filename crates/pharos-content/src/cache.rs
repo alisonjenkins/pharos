@@ -1118,6 +1118,25 @@ impl Cache {
         self.approve(downloading, need, evict, true)
     }
 
+    /// A preflight for a job whose `.part` a whole new body will replace
+    /// (it cannot be resumed): as [`Cache::ensure_free`] with no bytes to
+    /// write, but the part's bytes, read under the admission lock, count
+    /// as room, since the replacement's own admission
+    /// ([`Cache::ensure_free_replacing_part`]) reclaims them. It authorizes
+    /// no write: it reserves nothing and truncates nothing.
+    pub fn preflight_replacing_part(&self, downloading: &str) -> Result<u64, NoRoom> {
+        let _admission = admission_guard();
+        // An unreadable part reclaims nothing: never room on a guess.
+        let reclaim = self.part_len(downloading).unwrap_or(0);
+        let verdict = self.check_free(downloading, 0, true, reclaim);
+        log::info!(
+            "cache admission id={downloading} need=0 reclaim={reclaim} verdict={} reason=preflight_part_will_be_replaced",
+            if verdict.is_ok() { "approved" } else { "refused" }
+        );
+        self.unreserve(downloading);
+        verdict
+    }
+
     /// As [`Cache::ensure_free`], but never evicts: for room a write may
     /// not need (a speculative window), which must not cost a cached track.
     /// A refusal reserves nothing.
