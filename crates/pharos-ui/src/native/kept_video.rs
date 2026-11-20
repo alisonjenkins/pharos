@@ -573,12 +573,19 @@ fn localize_ref<'a>(
         return localize_ref(&path, upstream, moved, server).map(|k| Cow::Owned(k.into_owned()));
     }
     if r.starts_with('/') {
+        // Its dot segments resolved first: `/jf/../media/0.m4s` is
+        // `/media/0.m4s`, outside a `/jf` base, whatever its prefix says.
+        let resolved = without_dot_segments(r);
         let base_path = url_path(server).trim_end_matches('/');
         if base_path.is_empty() {
-            local_key(r)?;
-            return Ok(Cow::Borrowed(r));
+            local_key(&resolved)?;
+            return Ok(if resolved == r {
+                Cow::Borrowed(r)
+            } else {
+                Cow::Owned(resolved)
+            });
         }
-        let rest = r.strip_prefix(base_path).ok_or(())?;
+        let rest = resolved.strip_prefix(base_path).ok_or(())?;
         return if rest.starts_with('/') || rest.starts_with('?') {
             local_key(rest).map(Cow::Owned)
         } else {
@@ -602,6 +609,12 @@ fn localize_ref<'a>(
     } else {
         Ok(Cow::Borrowed(r))
     }
+}
+
+/// A root-relative reference with its dot segments removed (RFC 3986
+/// 5.2.4), its query kept.
+fn without_dot_segments(r: &str) -> String {
+    pharos_hls::uri::resolve("/", &format!(".{r}"))
 }
 
 /// The key `rest` (a path under the base path) is stored under, when it
@@ -995,6 +1008,27 @@ mod tests {
                 "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
                     .to_owned()
             )
+        );
+    }
+
+    /// CR 4640611394: a root-relative reference is resolved before the
+    /// base path is checked: one whose dot segments climb out of it is not
+    /// local, and an ordinary one still is.
+    #[test]
+    fn a_root_relative_reference_climbing_out_of_the_base_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        assert_eq!(
+            one("/jf/../media/0.m4s"),
+            Localized::NotLocal("/jf/../media/0.m4s".to_owned())
+        );
+        assert_eq!(
+            one("/jf/videos/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        assert_eq!(
+            one("/jf/videos/x/../1/0.m4s?s=1"),
+            Localized::Rewritten("/videos/1/0.m4s?s=1".to_owned())
         );
     }
 
