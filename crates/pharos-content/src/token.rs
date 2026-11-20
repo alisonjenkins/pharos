@@ -442,6 +442,10 @@ pub fn marker(path: &Path, fingerprint: &str) -> Marker {
         Err(e) => return Marker::Unreadable(e.to_string()),
     }
     let raw = std::fs::read_to_string(&at).unwrap_or_default();
+    // A cleared marker is no marker (see `clear_marker`).
+    if raw.trim_end() == CLEARED {
+        return Marker::Absent;
+    }
     let mut lines = raw.lines();
     let user = lines
         .next()
@@ -531,8 +535,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // Markers are keyed by fingerprint and, for store, append-only: it
     // never removes or rewrites a marker naming any token but this one. One
     // naming a token no longer on disk refuses only that token, so it is
-    // harmless. The marker naming THIS token goes first, durably (removed,
-    // then its folder synced); one that will not go refuses the sign-in
+    // harmless. The marker naming THIS token is cleared first, durably
+    // (`clear_marker`: renamed over, never unlinked, its folder synced); one
+    // that will not clear refuses the sign-in
     // before anything is written, so no token is ever installed while its
     // own marker is pending. A write that fails leaves the old file and
     // every other marker as they were.
@@ -571,16 +576,16 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             "a revocation marker refuses this token, and it is the one on file",
         ));
     }
-    // A retry's marker names the token already on file: removed only once
+    // A retry's marker names the token already on file: cleared only once
     // this write, its fsync and rename and the folder's sync have all held
     // (below), so a write that fails leaves that token refused after a
     // restart. Any other marker naming this token names one not on file:
-    // removed first, durably, so a write that fails leaves nothing
+    // cleared first, durably, so a write that fails leaves nothing
     // readable and the old token as it was.
     let clear_after = same && retry;
     if clear_after {
         // Nothing to remove before the write.
-    } else if let Err(e) = remove_marker(path, &new) {
+    } else if let Err(e) = clear_marker(path, &new) {
         log::warn!(
             "token store verdict=refused reason=revocation_marker_blocks_token step=before_write error={e}"
         );
@@ -634,11 +639,11 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             ));
         }
     }
-    // The retry's token is on disk, durably: its marker goes last. One
+    // The retry's token is on disk, durably: its marker clears last. One
     // that will not go keeps the token refused, here by the fence and
     // after a restart by the marker; a later retry clears it.
     if clear_after {
-        if let Err(e) = remove_marker(path, &new) {
+        if let Err(e) = clear_marker(path, &new) {
             add_fence_held(path, &Fence::token(&new), "store_marker_not_cleared");
             log::warn!(
                 "token store verdict=refused reason=revocation_marker_blocks_token step=after_write error={e}"
@@ -955,84 +960,110 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
     }
 }
 
-/// Removes the revocation marker naming `fingerprint` beside `path`
-/// (absent is fine), and syncs the folder once it went, so the removal is on
-/// disk before the store writes the token it named. A sync that fails is an
-/// error: a crash could bring the marker back over a token the user was
-/// told is signed in, so the store refuses before writing. A folder that
-/// cannot be synced at all (EINVAL, ENOTSUP) is the one exception, logged as
-/// not durable: refusing there would leave no way to sign in.
+/// What a cleared marker holds: a reader takes it as no marker.
+const CLEARED: &str = "cleared";
+
+/// Clears the revocation marker naming `fingerprint` beside `path` (absent
+/// is fine), so the store may write the token it named. A marker is never
+/// unlinked: its state changes only by an atomic rename over it. The
+/// cleared content (`CLEARED`) goes to a temp file, fsynced; the folder is
+/// synced; the temp file is renamed over the marker; the folder is synced
+/// again. At every moment the file on disk is the old marker or the cleared
+/// one, so no failure leaves the token with no marker:
 ///
-/// Every marker removal goes through here: removed durably, or put back. A
-/// removal whose folder sync fails restores the marker (written whole and
-/// synced) before it returns the error, so a restart still finds it. A
-/// marker that cannot be put back either is logged with
-/// `restart_safety=not_guaranteed`; the caller keeps its in-process fence.
-fn remove_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
+/// - the folder will not sync before the rename, or the rename fails: the
+///   old marker stays as it was, and the error is returned;
+/// - the folder will not sync after the rename: the cleared marker is in
+///   place but a crash may bring the old one back, which refuses the
+///   token (the safe side); the error is returned, and the caller keeps
+///   its in-process fence.
+///
+/// A folder that cannot be synced at all (EINVAL, ENOTSUP) is the one
+/// exception, logged as not durable: refusing there would leave no way to
+/// sign in. Cleared markers are left in place; they cost one small file.
+fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
     let at = revoked_path(path, fingerprint);
-    let saved = match std::fs::read(&at) {
-        Ok(saved) => saved,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    match std::fs::remove_file(&at) {
-        Ok(()) => {}
+    match std::fs::symlink_metadata(&at) {
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
-    #[cfg(test)]
-    let synced = if tests::FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
-        Some(Err("directory sync failed".to_owned()))
-    } else {
-        path.parent().map(durable_dir)
+    if is_cleared(&at) {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory"))?;
+    let mut tmp_name = at.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let sync = || -> Result<(), String> {
+        #[cfg(test)]
+        if tests::FAIL_MARKER_SYNC.with(std::cell::Cell::get) {
+            return Err("directory sync failed".to_owned());
+        }
+        durable_dir(dir)
     };
-    #[cfg(not(test))]
-    let synced = path.parent().map(durable_dir);
-    match synced {
-        Some(Ok(())) => {
+    let kept = |why: &str, step: &str| {
+        let _ = std::fs::remove_file(&tmp);
+        log::warn!("token revocation marker verdict=kept reason={step} error={why}");
+        std::io::Error::other(format!("the marker could not be cleared ({step}): {why}"))
+    };
+    let staged = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(format!("{CLEARED}\n").as_bytes())?;
+        f.sync_all()
+    })();
+    if let Err(e) = staged {
+        return Err(kept(&e.to_string(), "temp_not_written"));
+    }
+    let unsupported = |why: &str| why.starts_with(DIR_SYNC_UNSUPPORTED);
+    match sync() {
+        Ok(()) => {}
+        Err(why) if unsupported(&why) => {}
+        Err(why) => return Err(kept(&why, "folder_not_synced")),
+    }
+    #[cfg(debug_assertions)]
+    let renamed = if faults::MARKER_RENAME.with(std::cell::Cell::get) {
+        Err(std::io::Error::other("marker rename failed"))
+    } else {
+        std::fs::rename(&tmp, &at)
+    };
+    #[cfg(not(debug_assertions))]
+    let renamed = std::fs::rename(&tmp, &at);
+    if let Err(e) = renamed {
+        return Err(kept(&e.to_string(), "rename_failed"));
+    }
+    match sync() {
+        Ok(()) => {
             log::info!("token revocation marker verdict=cleared reason=signed_in");
             Ok(())
         }
-        Some(Err(why)) if why.starts_with(DIR_SYNC_UNSUPPORTED) => {
+        Err(why) if unsupported(&why) => {
             log::warn!(
                 "token revocation marker verdict=cleared_not_durable reason=dir_sync_unsupported error={why}"
             );
             Ok(())
         }
-        Some(Err(why)) => {
+        Err(why) => {
             log::warn!(
-                "token revocation marker verdict=removed_not_synced reason=folder_not_synced error={why}"
+                "token revocation marker verdict=cleared_not_synced reason=folder_not_synced error={why}"
             );
-            restore_marker(path, fingerprint, &saved);
             Err(std::io::Error::other(format!(
-                "the marker's removal could not be synced: {why}"
+                "the marker's clearing could not be synced: {why}"
             )))
-        }
-        None => {
-            restore_marker(path, fingerprint, &saved);
-            Err(std::io::Error::other("no directory"))
         }
     }
 }
 
-/// Puts back a marker whose removal was not made durable, as it was.
-fn restore_marker(path: &Path, fingerprint: &str, saved: &[u8]) {
-    #[cfg(debug_assertions)]
-    let put = if faults::MARKER.with(std::cell::Cell::get) {
-        Err(std::io::Error::other("marker write failed"))
-    } else {
-        put_marker(path, fingerprint, saved)
-    };
-    #[cfg(not(debug_assertions))]
-    let put = put_marker(path, fingerprint, saved);
-    match put {
-        Ok(()) => log::warn!(
-            "token revocation marker verdict=restored reason=removal_not_synced"
-        ),
-        Err(e) => log::warn!(
-            "token revocation marker verdict=not_restored reason=removal_not_synced restart_safety=not_guaranteed error={e}"
-        ),
-    }
+/// Whether the marker at `at` is one [`clear_marker`] cleared.
+fn is_cleared(at: &Path) -> bool {
+    std::fs::read_to_string(at).is_ok_and(|raw| raw.trim_end() == CLEARED)
 }
 
 /// Writes the marker whole (temp file, fsync, rename, folder sync). The
@@ -1100,6 +1131,8 @@ pub mod faults {
     thread_local! {
         pub static REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The rename that clears a marker fails.
+        pub static MARKER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The marker cannot be read (it is there).
         pub static MARKER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The token file cannot be read in `end_session`.
@@ -1309,7 +1342,7 @@ pub(crate) mod tests {
     thread_local! {
         /// While set, store cannot read the token it replaces.
         pub(super) static FAIL_PREVIOUS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// While set, a store's marker removal reports its folder sync failed.
+        /// While set, a store's marker clearing reports its folder sync failed.
         pub(super) static FAIL_MARKER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, a store cannot read back the token it wrote.
         pub(crate) static FAIL_READ_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1808,11 +1841,11 @@ pub(crate) mod tests {
             .any(|l| l.contains("verdict=retried reason=install_unconfirmed marker=cleared")));
     }
 
-    /// CR reply 4644656366: a retry whose marker removal cannot be synced
-    /// puts the marker back, so after a restart (the fence reset) the token
-    /// on file is still refused.
+    /// CR reply 4644656366: a retry whose marker clearing cannot be synced
+    /// keeps the marker as it was, so after a restart (the fence reset) the
+    /// token on file is still refused.
     #[test]
-    fn a_retry_whose_marker_removal_is_not_synced_restores_the_marker() {
+    fn a_retry_whose_marker_clearing_is_not_synced_keeps_the_marker() {
         let d = dir("retry-marker-sync");
         let path = d.join("device-token");
         store(&path, "old").unwrap();
@@ -1832,7 +1865,70 @@ pub(crate) mod tests {
         assert_eq!(after_restart(&path), None, "the token became readable");
         assert!(crate::testlog::lines()
             .iter()
-            .any(|l| l.contains("token revocation marker verdict=restored")));
+            .any(|l| l.contains("token revocation marker verdict=kept reason=folder_not_synced")));
+    }
+
+    /// CR 4646025360: a marker is never unlinked, so no failure while it is
+    /// cleared leaves the token with no marker. A retry whose clearing
+    /// fails, with every marker write failing too (what used to put an
+    /// unlinked marker back), leaves the old marker on disk: after a
+    /// restart the token is still refused. Each failing step is tried: the
+    /// folder sync and the rename.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_failed_marker_clearing_never_leaves_the_token_unguarded() {
+        for step in ["folder_not_synced", "rename_failed"] {
+            let d = dir(&format!("marker-clear-{step}"));
+            let path = d.join("device-token");
+            store(&path, "old").unwrap();
+            FAIL_DIR_SYNC.with(|f| f.set(true));
+            assert!(store(&path, "new").is_err());
+            FAIL_DIR_SYNC.with(|f| f.set(false));
+            let marker_file = revoked_path(&path, &fingerprint("new"));
+            let before = std::fs::read(&marker_file).unwrap();
+            crate::testlog::start();
+            let fault = |on: bool| {
+                faults::MARKER.with(|f| f.set(on));
+                if step == "rename_failed" {
+                    faults::MARKER_RENAME.with(|f| f.set(on));
+                } else {
+                    FAIL_MARKER_SYNC.with(|f| f.set(on));
+                }
+            };
+            fault(true);
+            let retried = store(&path, "new");
+            fault(false);
+            assert!(retried.is_err(), "{step}: {retried:?}");
+            assert_eq!(
+                std::fs::read(&marker_file).unwrap(),
+                before,
+                "{step}: the marker on disk changed"
+            );
+            assert_eq!(
+                after_restart(&path),
+                None,
+                "{step}: the token became readable"
+            );
+            assert!(crate::testlog::lines().iter().any(|l| l.contains(&format!(
+                "token revocation marker verdict=kept reason={step}"
+            ))));
+        }
+    }
+
+    /// A cleared marker reads as no marker, and the clearing renames over
+    /// the marker instead of unlinking it: the file stays.
+    #[test]
+    fn a_cleared_marker_stays_on_disk_and_reads_as_absent() {
+        let d = dir("marker-cleared");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        write_marker(&p, Some("A"), &fingerprint("tokN"), false).unwrap();
+        store(&p, "tokN").unwrap();
+        let at = revoked_path(&p, &fingerprint("tokN"));
+        assert!(at.exists(), "the marker was unlinked");
+        assert_eq!(marker(&p, &fingerprint("tokN")), Marker::Absent);
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
     }
 
     /// A sign-out retried after an unlink whose folder sync failed is
@@ -2154,9 +2250,9 @@ pub(crate) mod tests {
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
         let lines = crate::testlog::lines();
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("token revocation marker verdict=removed_not_synced")),
+            lines.iter().any(
+                |l| l.contains("token revocation marker verdict=kept reason=folder_not_synced")
+            ),
             "{lines:?}"
         );
         store(&p, "tokN").unwrap();
