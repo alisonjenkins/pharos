@@ -1544,6 +1544,9 @@ mod tests {
 
     /// A request dropped while the search's answer is being written leaves
     /// the song held: the write goes on, and a second search would race it.
+    // The cache's writes are held across the polls below so the write is
+    // still running when the request drops.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_repick_dropped_while_writing_its_answer_stays_held() {
         use std::task::{Context, Waker};
@@ -1553,17 +1556,21 @@ mod tests {
         let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
         let before = finder.find(&item).await.unwrap();
         let heard = heard();
+        let writes = finder.disk.as_ref().unwrap().hold_writes();
         let mut repick = Box::pin(finder.repick(&item, &before, &heard));
         let mut cx = Context::from_waker(Waker::noop());
-        // The search answers at once, so the first wait after it is the
+        // The search answers at once, so every wait after it is the held
         // write's.
-        while searches(&online) == 0 {
-            if repick.as_mut().poll(&mut cx).is_ready() {
-                panic!("answered before its write was awaited");
-            }
+        for _ in 0..20 {
+            assert!(
+                repick.as_mut().poll(&mut cx).is_pending(),
+                "answered before its write was done"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        assert_eq!(searches(&online), 1);
         drop(repick);
+        drop(writes);
         let song = Song::of(&item).unwrap();
         let key = (item.id, cache::key(online.name(), &song));
         assert!(finder.repicked.lock().unwrap().contains_key(&key));

@@ -91,6 +91,15 @@ impl DiskCache {
         self.dir.join(format!("{id}.json"))
     }
 
+    /// Holds every write back until the guard drops, so a test can catch a
+    /// caller mid-write.
+    #[cfg(test)]
+    pub fn hold_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn repicks_path(&self, id: u64) -> PathBuf {
         self.dir.join(format!("{id}.repicks.json"))
     }
