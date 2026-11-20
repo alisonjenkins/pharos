@@ -119,6 +119,14 @@ struct Gate {
     /// Test signal: each backoff wait, in order.
     #[cfg(test)]
     waits: Mutex<Vec<Duration>>,
+    /// Test signal: what jobs decided, in order (`parked:<id>`,
+    /// `replacement_low_disk:<id>`, ...), for a test to assert an event
+    /// rather than sample state a later attempt may change.
+    #[cfg(test)]
+    events: Mutex<Vec<String>>,
+    /// Test hook: runs as a refused pin is about to be parked.
+    #[cfg(test)]
+    before_park: Mutex<Option<Box<dyn FnMut() + Send>>>,
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
@@ -216,6 +224,10 @@ impl Downloader {
             yields: AtomicU64::new(0),
             #[cfg(test)]
             waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -368,6 +380,16 @@ impl Downloader {
     pub fn waits(&self) -> Vec<Duration> {
         self.gate
             .waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What the jobs decided, in order (see `Gate::events`).
+    #[cfg(test)]
+    pub fn events(&self) -> Vec<String> {
+        self.gate
+            .events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -776,7 +798,9 @@ impl Gate {
                 // cannot fit: it stops with the part and its validator kept,
                 // and the next request for the track resumes it.
                 Err(Fail::ReplacementLowDisk(free)) if !self.is_pin_work(id) => {
-                    break Outcome::LowDisk(free)
+                    #[cfg(test)]
+                    self.event(format!("replacement_low_disk:{id}"));
+                    break Outcome::LowDisk(free);
                 }
                 Err(Fail::ReplacementLowDisk(free)) => {
                     // The old bytes are on disk and counted already: deleting
@@ -862,6 +886,15 @@ impl Gate {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(wait);
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .before_park
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_mut()
+                {
+                    hook();
+                }
                 let next = wait.saturating_mul(2).min(self.tuning.backoff_max);
                 let mut q = self.lock();
                 q.deferred.insert(id.to_owned(), st);
@@ -876,6 +909,8 @@ impl Gate {
                         epoch: self.online_epoch.load(Ordering::SeqCst),
                     },
                 );
+                #[cfg(test)]
+                self.event(format!("parked:{id}"));
                 log::info!(
                     "cache download id={id} bytes={} ms={ms} outcome=parked reason=low_disk retry_in_ms={} next_wait_ms={}; part and validator kept, worker moves on",
                     part_len(),
@@ -940,6 +975,14 @@ impl Gate {
     /// queued as new work; one it saw before was folded into a job that was
     /// still running. Were `current` left set until the worker cleared it,
     /// a pin in between would be taken for in-flight work and lost.
+    #[cfg(test)]
+    fn event(&self, what: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(what);
+    }
+
     fn give_up(&self, id: &str, part: PartFate) {
         #[cfg(test)]
         tests::before_give_up();
@@ -1675,6 +1718,10 @@ mod tests {
             yields: AtomicU64::new(0),
             #[cfg(test)]
             waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1722,6 +1769,10 @@ mod tests {
             yields: AtomicU64::new(0),
             #[cfg(test)]
             waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1779,6 +1830,10 @@ mod tests {
             yields: AtomicU64::new(0),
             #[cfg(test)]
             waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1848,6 +1903,10 @@ mod tests {
             yields: AtomicU64::new(0),
             #[cfg(test)]
             waits: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -2640,7 +2699,10 @@ mod tests {
         assert!(!r.cache.is_complete("track/1"));
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
         assert!(!r.dl.waits().is_empty(), "track 1 was not parked");
-        crate::cache::TRUNCATE_REFUSED.lock().unwrap().clear();
+        crate::cache::TRUNCATE_REFUSED
+            .lock()
+            .unwrap()
+            .retain(|p| *p != part);
         assert!(
             r.dl.wait_idle(Duration::from_secs(10)),
             "track 1 never retried"
@@ -2805,7 +2867,13 @@ mod tests {
             "{retries:?}"
         );
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
-        assert!(r.dl.has_deferred("track/1"), "the pin was not parked");
+        // An event, not the deferred state: the next retry may already have
+        // taken that state when this line runs.
+        assert!(
+            r.dl.events().iter().any(|e| e == "parked:track/1"),
+            "the pin was not parked: {:?}",
+            r.dl.events()
+        );
         starve.store(false, Ordering::SeqCst);
         assert!(
             r.dl.wait_idle(Duration::from_secs(10)),
@@ -3266,7 +3334,10 @@ mod tests {
     /// even so is refused with the part kept.
     #[test]
     fn a_replacement_of_unknown_length_shrinks_its_window_to_the_first_chunk() {
-        for (under, fits) in [(100u64, true), (700, false)] {
+        // 600 short: the preflight passes (the part's 600 bytes are room),
+        // and no nonempty first piece fits, so the refusal is the
+        // first-chunk admission's (CR review 5995575621, prefetch.rs:3269).
+        for (under, fits) in [(100u64, true), (600, false)] {
             let script = Script::default()
                 .file("/audio/1", body(400, 2))
                 .chunked()
@@ -3299,9 +3370,17 @@ mod tests {
             } else {
                 assert!(!r.cache.is_complete("track/1"), "{under}");
                 assert_eq!(
-                    std::fs::metadata(&part).map(|m| m.len()).ok(),
-                    Some(600),
-                    "{under}: a refused first chunk deleted the part"
+                    std::fs::read(&part).ok(),
+                    Some(body(600, 1)),
+                    "{under}: a refused first chunk changed the part"
+                );
+                assert!(
+                    r.dl.events()
+                        .iter()
+                        .any(|e| e == "replacement_low_disk:track/1"),
+                    "{under}: the refusal was not the first chunk's: {:?} {:?}",
+                    r.dl.events(),
+                    r.srv.seen()
                 );
             }
         }
