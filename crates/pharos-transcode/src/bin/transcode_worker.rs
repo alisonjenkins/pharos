@@ -304,12 +304,10 @@ async fn run_job(
                 stderr_text.trim()
             );
             let mut error = exec::classify_failure(&stderr_text, is_hw);
-            // B550: a device fault whose encoder never opened may only be a
-            // window with no picture in it. Ask the source before the
-            // scheduler cools the device for every other title.
-            if matches!(error, WorkerError::DeviceBusy(_))
-                && exec::encoder_never_opened(&stderr_text)
-            {
+            // B550: a failure whose encoder never opened may only be a window
+            // with no picture in it. Ask the source before the scheduler cools
+            // the device for every other title, or the request fails.
+            if exec::may_be_empty_window(&error, &stderr_text) {
                 error = exec::settle_no_frames(error, exec::window_has_video(&spec).await);
             }
             let _ = write_frame(wr, &WorkerEvent::Failed { job_id, error }).await;
