@@ -582,10 +582,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         && probe
             .video_3d_format
             .is_some_and(|f| f.is_packed_sbs_or_tab())
-        && selected_sub.is_some_and(|t| {
-            is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
-                || burn_text_indices.contains(&t.stream_index)
-        });
+        && selected_sub.is_some_and(|t| burns_subtitle(t, &burn_text_indices));
     let stereo_output = if !explicit_preserve && (explicit_mono || profile_rejected_3d) {
         pharos_transcode::StereoOutput::Mono2D
     } else {
@@ -1088,6 +1085,25 @@ fn renditions(n: &Negotiated, r: &DeliveryRequest<'_>) -> Vec<String> {
     renditions
 }
 
+/// Whether the server draws `track` into the video for this client: an image
+/// subtitle, or a text one it cannot render (`burn_text_indices`). The one
+/// predicate behind the URL's `SubtitleStreamIndex`, the per-eye 3D burn and
+/// the shape a released grant is adopted by.
+fn burns_subtitle(track: &SubtitleTrack, burn_text_indices: &BTreeSet<u32>) -> bool {
+    is_image_subtitle_codec(track.codec.as_deref().unwrap_or(""))
+        || burn_text_indices.contains(&track.stream_index)
+}
+
+impl Negotiated {
+    /// The subtitle this playback burns into the video, if any.
+    pub fn burned_subtitle(&self) -> Option<u32> {
+        self.selected_subtitle
+            .as_ref()
+            .filter(|t| burns_subtitle(t, &self.burn_text_indices))
+            .map(|t| t.stream_index)
+    }
+}
+
 /// The track picks the segment handler needs: the audio stream, the subtitle
 /// to burn, and the 3D output.
 ///
@@ -1107,9 +1123,7 @@ fn stream_selection(n: &Negotiated, r: &DeliveryRequest<'_>) -> String {
     if r.explicit_subtitle_index == Some(-1) {
         push("SubtitleStreamIndex", &-1);
     } else if let Some(t) = &n.selected_subtitle {
-        if is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
-            || n.burn_text_indices.contains(&t.stream_index)
-        {
+        if burns_subtitle(t, &n.burn_text_indices) {
             push("SubtitleStreamIndex", &t.stream_index);
         }
     }
@@ -1798,14 +1812,7 @@ pub async fn grant(
         decision: negotiated.decision.clone(),
         burn_subtitle_indices: negotiated.burn_text_indices.clone(),
         audio: audio.index,
-        burned_subtitle: negotiated
-            .selected_subtitle
-            .as_ref()
-            .filter(|t| {
-                is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
-                    || negotiated.burn_text_indices.contains(&t.stream_index)
-            })
-            .map(|t| t.stream_index),
+        burned_subtitle: negotiated.burned_subtitle(),
     };
     if let Some(adopted) = match &release_key {
         Some(key) => adopt_released(state, user, id, r, key, &shape).await,
