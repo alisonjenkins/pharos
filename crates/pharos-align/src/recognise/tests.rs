@@ -202,6 +202,19 @@ fn a_word_carries_its_tokens_mean_probability() {
     assert!((w[0].prob - 0.4).abs() < 1e-6);
 }
 
+/// Pieces of a word, the later ones with no leading space, are one word,
+/// so the text check can take each word as whole.
+#[test]
+fn sub_word_pieces_make_one_word() {
+    let w = words(&[
+        tok(" grey", 0.0, 0.3),
+        tok(" gul", 0.3, 0.5),
+        tok("ls", 0.5, 0.7),
+    ]);
+    let texts: Vec<&str> = w.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(texts, [" grey", " gulls"]);
+}
+
 #[test]
 fn blank_tokens_make_no_word() {
     let w = words(&[tok(" ", 0.0, 0.1), tok(" la", 0.2, 0.5)]);

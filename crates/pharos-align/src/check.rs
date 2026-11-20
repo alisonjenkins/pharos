@@ -49,7 +49,15 @@ pub struct Check {
 
 impl TextCheck {
     pub fn new(lines: &[Line], heard: &[Word]) -> Self {
-        let text: String = heard.iter().map(|w| w.text.as_str()).collect();
+        // Each word is whole, its pieces joined already; only a segment's
+        // first word may lack a leading space, and it is a word of its own.
+        let mut text = String::new();
+        for w in heard {
+            if !text.is_empty() && !w.text.starts_with(char::is_whitespace) {
+                text.push(' ');
+            }
+            text.push_str(&w.text);
+        }
         Self {
             text_recall: bigram_recall(lines.iter().map(|l| l.text.as_str()), &text),
             heard_words: words(&text).len(),
@@ -131,8 +139,11 @@ mod tests {
         assert_eq!(got.heard_words, 6);
     }
 
+    /// A segment's first word, written with no leading space, is not run
+    /// into the last word of the segment before. Disarm check: with the
+    /// words joined as written, this fails.
     #[test]
-    fn sub_word_pieces_join_into_the_words_heard() {
+    fn a_segment_s_first_word_stays_a_word_of_its_own() {
         let mut h = heard("grey gulls");
         h.push(Word {
             text: "wheel".into(),
@@ -141,9 +152,9 @@ mod tests {
             prob: 0.9,
             silent_lead: false,
         });
-        let got = TextCheck::new(&[line("grey gullswheel")], &h);
+        let got = TextCheck::new(&[line("grey gulls wheel")], &h);
         assert_eq!(got.text_recall, Some(1.0));
-        assert_eq!(got.heard_words, 2);
+        assert_eq!(got.heard_words, 3);
     }
 
     fn check(text_recall: Option<f64>, heard_words: usize) -> TextCheck {
