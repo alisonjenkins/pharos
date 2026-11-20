@@ -209,13 +209,12 @@ impl DiskCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = key(provider, song);
         let standing = |repick_key: &str, fetched_at: u64| repick_key == key || fetched_at >= at;
-        let standing_repick = self
-            .read_repicks(id)
-            .iter()
-            .any(|r| standing(&r.key, r.fetched_at))
-            || self
-                .read(id)
-                .is_some_and(|r| r.repick.is_some() && standing(&r.key, r.fetched_at));
+        let mut repicks = self.read_repicks(id);
+        let legacy = self.read(id).filter(|r| r.repick.is_some());
+        let standing_repick = repicks.iter().any(|r| standing(&r.key, r.fetched_at))
+            || legacy
+                .as_ref()
+                .is_some_and(|r| standing(&r.key, r.fetched_at));
         if standing_repick {
             tracing::debug!(
                 media.id = id,
@@ -223,6 +222,22 @@ impl DiskCache {
                 "lyrics: lookup answer not cached, the song was repicked meanwhile"
             );
             return;
+        }
+        // The record about to be replaced holds an older repick for other
+        // tags: it moves beside the record first, or the record stays.
+        if let Some(old) = legacy {
+            if !repicks.iter().any(|r| r.key == old.key) {
+                repicks.push(Repicked {
+                    key: old.key,
+                    fetched_at: old.fetched_at,
+                    lines: old.lines.unwrap_or_default(),
+                    picked: old.repick.and_then(|r| r.picked),
+                });
+                if let Err(e) = write(&self.dir, &self.repicks_path(id), &repicks) {
+                    tracing::warn!(media.id = id, dir = %self.dir.display(), error = %e, "lyrics: old repick not moved, lookup answer not cached");
+                    return;
+                }
+            }
         }
         let record = Record {
             repick: None,
@@ -578,6 +593,37 @@ mod tests {
         assert_eq!(
             reopened.get(7, "lrclib", &current),
             Some(Cached::Found(sung))
+        );
+    }
+
+    /// A lookup for new tags that replaces a record written before repicks
+    /// were kept apart keeps that record's repick for its own tags.
+    /// Disarm check: with the old repick not moved first, this fails.
+    #[test]
+    fn a_lookup_replacing_an_old_record_keeps_its_repick() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = Record {
+            key: key("lrclib", &song()),
+            fetched_at: now_secs().saturating_sub(10),
+            lines: Some(lines_of(&words())),
+            repick: Some(Repick { picked: Some(42) }),
+        };
+        write(dir.path(), &dir.path().join("7.json"), &record).unwrap();
+        let mut retagged = song();
+        retagged.title = "Song (Live)".into();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        cache.put_at(7, "lrclib", &retagged, Some(&words()), now_secs());
+        drop(cache);
+
+        let reopened = DiskCache::new(dir.path().to_path_buf());
+        assert!(reopened.repicked(7, "lrclib", &song()));
+        assert_eq!(
+            reopened.get(7, "lrclib", &song()),
+            Some(Cached::Found(words()))
+        );
+        assert_eq!(
+            reopened.get(7, "lrclib", &retagged),
+            Some(Cached::Found(words()))
         );
     }
 
