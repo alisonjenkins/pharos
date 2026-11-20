@@ -12,6 +12,11 @@ const DEFAULT_BACK_MS: u64 = 15_000;
 /// Minimum forward buffer target in milliseconds after quota reductions.
 const DEFAULT_MIN_FORWARD_MS: u64 = 8_000;
 
+/// Each append keeps this share of the byte-rate history, so the rate follows
+/// a quality switch within a few segments.
+const RATE_DECAY_KEEP: u64 = 3;
+const RATE_DECAY_DIVISOR: u64 = 4;
+
 /// The most one track may buffer ahead of the other. Under one 6 s segment, so
 /// a track never starts a segment whose aligned predecessor the other has not
 /// finished, yet above the few hundred ms their range ends differ by.
@@ -20,6 +25,11 @@ const MAX_TRACK_LEAD_MS: u64 = 2_000;
 /// Appends of one segment that leave it unbuffered before it is given up on: a
 /// refetch can repair a partial remove, a third cannot change the answer.
 const MAX_APPENDS_PER_SEGMENT: u32 = 2;
+
+/// A gap this wide inside a segment ahead of the play head has the segment
+/// fetched again, though its midpoint is buffered: the stall watchdog jumps
+/// nothing wider, so the play head would stop at it for good.
+const REFILL_HOLE_MS: u64 = crate::stall::MAX_JUMP_MS;
 
 /// A skip lands this far past the start of the data it jumps to, as the stall
 /// watchdog's jumps do (hls.js `skipBufferHolePadding`).
@@ -51,6 +61,12 @@ pub struct Config {
     pub back_ms: u64,
     /// The forward target never shrinks below this after quota errors.
     pub min_forward_ms: u64,
+    /// Bytes of media to keep ahead of the play head: a stream light enough
+    /// that `forward_ms` of it is under this buffers further, up to
+    /// `forward_ceiling_ms`. Zero keeps the target at `forward_ms`.
+    pub forward_bytes: u64,
+    /// The furthest ahead `forward_bytes` can take the target.
+    pub forward_ceiling_ms: u64,
 }
 
 impl Default for Config {
@@ -59,6 +75,8 @@ impl Default for Config {
             forward_ms: DEFAULT_FORWARD_MS,
             back_ms: DEFAULT_BACK_MS,
             min_forward_ms: DEFAULT_MIN_FORWARD_MS,
+            forward_bytes: 0,
+            forward_ceiling_ms: DEFAULT_FORWARD_MS,
         }
     }
 }
@@ -114,6 +132,14 @@ pub enum Note {
         from_ms: u64,
         to_ms: u64,
     },
+    /// Segment `index` of `track` is fetched again to fill the gap
+    /// `[start_ms, end_ms)` in it.
+    Refill {
+        track: Track,
+        index: usize,
+        start_ms: u64,
+        end_ms: u64,
+    },
     /// `track` waits for the other: it would buffer `lead_ms` ahead of it,
     /// over `limit_ms`. Noted once per wait.
     Held {
@@ -130,6 +156,7 @@ impl Note {
             Self::EndOfStream { .. } => "end_of_stream",
             Self::GaveUp { .. } => "gave_up",
             Self::Held { .. } => "held",
+            Self::Refill { .. } => "refill",
             Self::Skipped { .. } => "skipped",
         }
     }
@@ -158,6 +185,13 @@ struct TrackState {
     given_up: Vec<usize>,
     /// Waiting for the other track; set while the wait has been noted.
     held: bool,
+    /// Bytes and media time of recent appends, the older ones weighing less.
+    rate: (u64, u64),
+    /// The last range asked to be evicted. Asked again only once the buffer
+    /// or the cutoff has moved: a remove the browser leaves data behind from
+    /// would otherwise be asked for on every tick, and each remove's
+    /// `updateend` is a tick.
+    last_evict: Option<(u64, u64)>,
 }
 
 impl TrackState {
@@ -172,6 +206,8 @@ impl TrackState {
             appends: None,
             given_up: Vec::new(),
             held: false,
+            rate: (0, 0),
+            last_evict: None,
         }
     }
 }
@@ -183,7 +219,20 @@ pub struct Planner {
     audio: Option<TrackState>,
     config: Config,
     forward_target_ms: u64,
+    /// Media kept behind the play head: `config.back_ms` until the browser
+    /// refuses an append for room, then nothing but the current segment.
+    back_target_ms: u64,
+    /// The browser refused an append for room: `forward_bytes` no longer
+    /// extends the forward target.
+    quota_hit: bool,
+    /// A refused append is waiting for room: trim on the next tick even with
+    /// its request still in flight.
+    quota_trim: bool,
+    /// The source is ended as far as the planner has asked: cleared by anything
+    /// that reopens it (a fetch, a trim, a seek back).
     eos_emitted: bool,
+    /// The end was noted for this run to the end; a seek back notes it again.
+    eos_noted: bool,
     notes: Vec<Note>,
 }
 
@@ -204,7 +253,11 @@ impl Planner {
             audio: audio.map(|(segs, init)| TrackState::new(segs, init, start_ms)),
             config,
             forward_target_ms,
+            back_target_ms: config.back_ms,
+            quota_hit: false,
+            quota_trim: false,
             eos_emitted: false,
+            eos_noted: false,
             notes: Vec::new(),
         }
     }
@@ -220,6 +273,7 @@ impl Planner {
     pub fn tick(&mut self, play_ms: u64, buffered: &Buffered) -> Vec<Action> {
         let mut actions = Vec::new();
         let has_audio = self.audio.is_some();
+        let forward_limit_ms = self.forward_limit_ms();
 
         let audio_finished = self.audio.as_ref().map_or(true, |a| {
             !a.needs_init && is_track_covered_from_playhead(a, play_ms, &buffered.audio)
@@ -267,26 +321,41 @@ impl Planner {
                 play_ms,
                 own,
                 has_audio.then_some((other, other_finished)),
-                self.config.back_ms,
-                self.forward_target_ms,
+                self.back_target_ms,
+                self.quota_trim,
+                forward_limit_ms,
                 &mut actions,
                 &mut self.notes,
             );
         }
 
+        self.quota_trim = false;
+
+        // An append or a remove reopens an ended MediaSource.
+        if actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Fetch { .. } | Action::FetchInit { .. } | Action::Evict { .. }
+            )
+        }) {
+            self.eos_emitted = false;
+        }
         if !self.eos_emitted && self.ready_for_eos(play_ms, buffered) {
             self.eos_emitted = true;
-            let buffered_end_ms = buffered
-                .video
-                .iter()
-                .chain(&buffered.audio)
-                .map(|&(_, end)| end)
-                .max()
-                .unwrap_or(0);
-            self.notes.push(Note::EndOfStream {
-                play_ms,
-                buffered_end_ms,
-            });
+            if !self.eos_noted {
+                self.eos_noted = true;
+                let buffered_end_ms = buffered
+                    .video
+                    .iter()
+                    .chain(&buffered.audio)
+                    .map(|&(_, end)| end)
+                    .max()
+                    .unwrap_or(0);
+                self.notes.push(Note::EndOfStream {
+                    play_ms,
+                    buffered_end_ms,
+                });
+            }
             actions.push(Action::EndOfStream);
         }
 
@@ -306,6 +375,7 @@ impl Planner {
 
         if to_ms < stream_end || stream_end == 0 {
             self.eos_emitted = false;
+            self.eos_noted = false;
         }
 
         seek_track(
@@ -348,6 +418,41 @@ impl Planner {
         }
     }
 
+    /// The media segment `track` fetches first once the init segment now in
+    /// flight is appended, when that is already certain: a start or a seek
+    /// with nothing buffered at the target. The adapter may request it
+    /// alongside the init.
+    pub fn first_media(&self, track: Track) -> Option<usize> {
+        let state = match track {
+            Track::Video => Some(&self.video),
+            Track::Audio => self.audio.as_ref(),
+        }?;
+        if state.in_flight != Some(Request::Init) {
+            return None;
+        }
+        let idx = clamped_segment_at(&state.segments, state.seek_target_ms?)?;
+        (!state.given_up.contains(&idx)).then_some(idx)
+    }
+
+    /// The media segment in flight on `track` was `bytes` long. Called before
+    /// [`Planner::appended`]; feeds the byte budget of the forward target.
+    pub fn media_bytes(&mut self, track: Track, bytes: u64) {
+        let Some(state) = self.track_mut(track) else {
+            return;
+        };
+        let Some(Request::Media(idx)) = state.in_flight else {
+            return;
+        };
+        let Some(seg) = state.segments.get(idx) else {
+            return;
+        };
+        let (old_bytes, old_ms) = state.rate;
+        state.rate = (
+            (old_bytes / RATE_DECAY_DIVISOR * RATE_DECAY_KEEP).saturating_add(bytes),
+            (old_ms / RATE_DECAY_DIVISOR * RATE_DECAY_KEEP).saturating_add(seg.duration_ms),
+        );
+    }
+
     /// The track moves to another rendition on the same segment grid (a quality
     /// switch): its init is fetched again before the next media segment, and
     /// what is already buffered stays. Refused (`false`) while a request is in
@@ -365,6 +470,16 @@ impl Planner {
         true
     }
 
+    /// Whether [`Planner::reinit`] would take a switch of `track` once its
+    /// request in flight is over: not after the last segment is appended.
+    pub fn switchable(&self, track: Track) -> bool {
+        match track {
+            Track::Video => Some(&self.video),
+            Track::Audio => self.audio.as_ref(),
+        }
+        .is_some_and(|state| !state.last_appended)
+    }
+
     /// The request failed or was aborted; the segment is fetched again on a later tick.
     pub fn failed(&mut self, track: Track) {
         if let Some(state) = self.track_mut(track) {
@@ -373,18 +488,43 @@ impl Planner {
     }
 
     /// The browser refused an append with QuotaExceededError: halve the
-    /// forward target (not below `min_forward_ms`), return the new target.
-    pub fn quota_exceeded(&mut self, track: Track) -> u64 {
-        if let Some(state) = self.track_mut(track) {
-            state.in_flight = None;
-        }
+    /// forward target (not below `min_forward_ms`) and keep nothing behind the
+    /// play head but its own segment, for the rest of the session. The next
+    /// tick trims both tracks to that; the request stays in flight, for the
+    /// adapter to append again once there is room. Returns the new target.
+    pub fn quota_exceeded(&mut self) -> u64 {
+        self.back_target_ms = 0;
+        self.quota_trim = true;
+        self.quota_hit = true;
         self.forward_target_ms = (self.forward_target_ms / 2).max(self.config.min_forward_ms);
         self.forward_target_ms
     }
 
-    /// Current forward buffer target in milliseconds.
+    /// Current forward buffer target in milliseconds, before the byte budget.
     pub fn forward_target_ms(&self) -> u64 {
         self.forward_target_ms
+    }
+
+    /// How far ahead of the play head to fetch now: the forward target, or as
+    /// far as `forward_bytes` reaches at the measured byte rate when that is
+    /// further, up to `forward_ceiling_ms`.
+    pub fn forward_limit_ms(&self) -> u64 {
+        let base = self.forward_target_ms;
+        if self.quota_hit || self.config.forward_bytes == 0 {
+            return base;
+        }
+        let bytes_per_s: u64 = std::iter::once(&self.video)
+            .chain(self.audio.as_ref())
+            .map(|t| match t.rate {
+                (_, 0) => 0,
+                (bytes, ms) => bytes.saturating_mul(1_000) / ms,
+            })
+            .sum();
+        if bytes_per_s == 0 {
+            return base;
+        }
+        let affordable_ms = self.config.forward_bytes.saturating_mul(1_000) / bytes_per_s;
+        affordable_ms.clamp(base, self.config.forward_ceiling_ms.max(base))
     }
 
     /// Returns the currently in-flight request for `track`, if any.
@@ -454,7 +594,7 @@ fn skip_given_up(
     }
     let Some((index, seg_end)) = state.given_up.iter().copied().find_map(|idx| {
         range_of_slice(&state.segments, idx)
-            .filter(|&(s, e)| s <= play_ms && play_ms < e)
+            .filter(|&(s, e)| s <= play_ms.saturating_add(SKIP_PADDING_MS) && play_ms < e)
             .map(|(_, e)| (idx, e))
     }) else {
         return;
@@ -466,7 +606,13 @@ fn skip_given_up(
     // anything fetched in between would be skipped, and the seek aborts it.
     let next = index.saturating_add(1);
     let next_given_up = state.given_up.contains(&next);
-    let base_ms = if next_given_up || point_buffered(track_buffered, seg_end) {
+    let inside = track_buffered
+        .iter()
+        .map(|&(start, _)| start)
+        .find(|&start| play_ms < start && start < seg_end);
+    let base_ms = if let Some(start) = inside {
+        start
+    } else if next_given_up || point_buffered(track_buffered, seg_end) {
         seg_end
     } else if let Some(start) = range_of_slice(&state.segments, next)
         .filter(|_| is_settled(state, next, track_buffered))
@@ -506,11 +652,12 @@ fn plan_track(
     track_buffered: &[(u64, u64)],
     other_track: Option<(&[(u64, u64)], bool)>,
     back_ms: u64,
+    trim_in_flight: bool,
     forward_target_ms: u64,
     actions: &mut Vec<Action>,
     notes: &mut Vec<Note>,
 ) {
-    if state.in_flight.is_some() {
+    if state.in_flight.is_some() && !trim_in_flight {
         return;
     }
 
@@ -519,13 +666,19 @@ fn plan_track(
         eviction_anchor(state, play_ms).saturating_sub(back_ms),
     );
     if let Some(&(range_start, range_end)) = track_buffered.first() {
-        if range_start < range_end && range_start < cutoff_ms {
+        let range = (range_start, cutoff_ms);
+        if range_start < range_end && range_start < cutoff_ms && state.last_evict != Some(range) {
+            state.last_evict = Some(range);
             actions.push(Action::Evict {
                 track,
                 start_ms: range_start,
                 end_ms: cutoff_ms,
             });
         }
+    }
+
+    if state.in_flight.is_some() {
+        return;
     }
 
     if state.needs_init {
@@ -546,11 +699,10 @@ fn plan_track(
         && !point_buffered(track_buffered, anchor_ms);
     // Appends only count against a segment that stays unbuffered.
     if let Some((idx, _)) = state.appends {
-        if state
-            .segments
-            .get(idx)
-            .is_some_and(|seg| is_segment_covered(seg, track_buffered))
-        {
+        if state.segments.get(idx).is_some_and(|seg| {
+            is_segment_covered(seg, track_buffered)
+                && hole_ahead(state, idx, track_buffered, anchor_ms).is_none()
+        }) {
             state.appends = None;
         }
     }
@@ -563,7 +715,8 @@ fn plan_track(
             found = Some((idx, seg.clone()));
             break;
         }
-        if is_settled(state, idx, track_buffered) {
+        let hole = hole_ahead(state, idx, track_buffered, anchor_ms);
+        if is_settled(state, idx, track_buffered) && hole.is_none() {
             continue;
         }
         match state.appends {
@@ -576,6 +729,14 @@ fn plan_track(
                 });
             }
             _ => {
+                if let Some((start_ms, end_ms)) = hole {
+                    notes.push(Note::Refill {
+                        track,
+                        index: idx,
+                        start_ms,
+                        end_ms,
+                    });
+                }
                 found = Some((idx, seg.clone()));
                 break;
             }
@@ -616,6 +777,42 @@ fn plan_track(
         track,
         index: candidate_idx,
     });
+}
+
+/// The first gap wider than [`REFILL_HOLE_MS`] in segment `idx` at or after
+/// `from_ms`, when the segment otherwise counts as buffered and has not been
+/// given up on: a later append of another rendition removed part of it, or its
+/// data stops well short of its end with the next segment buffered.
+fn hole_ahead(
+    state: &TrackState,
+    idx: usize,
+    buffered: &[(u64, u64)],
+    from_ms: u64,
+) -> Option<(u64, u64)> {
+    let seg = state.segments.get(idx)?;
+    if state.given_up.contains(&idx) || !is_segment_covered(seg, buffered) {
+        return None;
+    }
+    let seg_end = seg.start_ms.saturating_add(seg.duration_ms);
+    let mut at = from_ms.max(seg.start_ms);
+    for &(start, end) in buffered {
+        if end <= at {
+            continue;
+        }
+        if start >= seg_end {
+            break;
+        }
+        if start > at.saturating_add(REFILL_HOLE_MS) {
+            return Some((at, start));
+        }
+        at = at.max(end);
+    }
+    // A short tail only strands the play head once the next segment is in.
+    let next_buffered = state
+        .segments
+        .get(idx.saturating_add(1))
+        .is_some_and(|next| is_segment_covered(next, buffered));
+    (next_buffered && seg_end > at.saturating_add(REFILL_HOLE_MS)).then_some((at, seg_end))
 }
 
 /// The start of the segment holding `at_ms`, so eviction removes whole
@@ -768,7 +965,12 @@ fn is_track_covered_from_playhead(
 fn track_ready_for_eos(state: &TrackState, play_ms: u64, track_buffered: &[(u64, u64)]) -> bool {
     !state.needs_init
         && state.in_flight.is_none()
-        && state.last_appended
+        // A last segment its neighbour's data already covers is never appended.
+        && (state.last_appended
+            || state
+                .segments
+                .last()
+                .is_some_and(|last| is_segment_covered(last, track_buffered)))
         && is_track_covered_from_playhead(state, play_ms, track_buffered)
 }
 
@@ -779,7 +981,10 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{Action, Buffered, Config, Note, Planner, Request, Track};
+    use super::{
+        Action, Buffered, Config, Note, Planner, Request, Track, MAX_APPENDS_PER_SEGMENT,
+        SKIP_PADDING_MS,
+    };
     use crate::playlist::Segment;
     use crate::timeline::segments_duration_ms;
 
@@ -1135,6 +1340,122 @@ mod tests {
         assert_eq!(planner.take_notes(), Vec::new());
     }
 
+    // B1493: a back-buffer trim after EndOfStream reopens the MediaSource
+    // (`SourceBuffer.remove` on an ended source), and nothing ended it again:
+    // the video stalled at its last frame and never fired `ended`.
+    #[test]
+    fn a_trim_after_end_of_stream_ends_the_stream_again() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs.clone(), false)),
+            Config::default(),
+            0,
+        );
+        let mut buffered = Buffered::default();
+        let mut ended = false;
+        let mut trims_after_end = 0;
+        for play_ms in (0..120_000).step_by(250) {
+            let actions = planner.tick(play_ms, &buffered);
+            let trimmed = actions.iter().any(|a| matches!(a, Action::Evict { .. }));
+            let ends = actions.last() == Some(&Action::EndOfStream);
+            if ended && trimmed {
+                trims_after_end += 1;
+                assert!(
+                    ends,
+                    "trim at {play_ms} ms left the source open: {actions:?}"
+                );
+            }
+            ended |= ends;
+            for action in actions {
+                match action {
+                    Action::Fetch { track, index } => {
+                        let seg = &segs[index];
+                        let ranges = match track {
+                            Track::Video => &mut buffered.video,
+                            Track::Audio => &mut buffered.audio,
+                        };
+                        merge_range(ranges, seg.start_ms, seg.start_ms + seg.duration_ms);
+                        planner.appended(track);
+                    }
+                    Action::Evict {
+                        track,
+                        start_ms,
+                        end_ms,
+                    } => {
+                        let ranges = match track {
+                            Track::Video => &mut buffered.video,
+                            Track::Audio => &mut buffered.audio,
+                        };
+                        evict_range(ranges, start_ms, end_ms);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            trims_after_end > 0,
+            "the scenario never trimmed after the end"
+        );
+        let ends_noted = planner
+            .take_notes()
+            .iter()
+            .filter(|n| matches!(n, Note::EndOfStream { .. }))
+            .count();
+        assert_eq!(ends_noted, 1, "the end is noted once, not per trim");
+    }
+
+    // B1495: a refused append dropped its request and its bytes, so the same
+    // segment was downloaded again at once, and nothing more was trimmed: with
+    // a buffer that still did not fit, that repeated without a pause.
+    #[test]
+    fn a_refused_append_trims_to_the_current_segment_and_keeps_its_request() {
+        let segs = make_segments(&[6_000; 100]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let mut buffered = Buffered {
+            video: vec![(0, 21_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(15_000, &buffered),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 3
+            }]
+        );
+
+        planner.quota_exceeded();
+        assert_eq!(planner.in_flight(Track::Video), Some(Request::Media(3)));
+        assert_eq!(
+            planner.tick(15_000, &buffered),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 0,
+                end_ms: 12_000
+            }]
+        );
+        buffered.video = vec![(12_000, 21_000)];
+        assert_eq!(planner.tick(15_000, &buffered), Vec::new());
+
+        // The back buffer stays at the current segment once the append lands.
+        planner.appended(Track::Video);
+        buffered.video = vec![(12_000, 24_000)];
+        let later: Vec<Action> = planner
+            .tick(19_000, &buffered)
+            .into_iter()
+            .filter(|a| matches!(a, Action::Evict { .. }))
+            .collect();
+        assert_eq!(
+            later,
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 12_000,
+                end_ms: 18_000
+            }]
+        );
+    }
+
     #[test]
     fn giving_up_on_a_segment_is_noted_once() {
         let segs = make_segments(&[6_000; 6]);
@@ -1258,6 +1579,8 @@ mod tests {
                 forward_ms: 30_000,
                 back_ms: 15_000,
                 min_forward_ms: 8_000,
+                forward_bytes: 0,
+                forward_ceiling_ms: 30_000,
             }
         );
     }
@@ -1312,9 +1635,12 @@ mod tests {
         let mut planner = Planner::new(segs, false, None, Config::default(), 0);
         let buffered = Buffered::default();
         assert!(!planner.reinit(Track::Audio), "no audio track");
+        assert!(!planner.switchable(Track::Audio));
         let _ = planner.tick(0, &buffered);
+        assert!(planner.switchable(Track::Video), "while the request runs");
         planner.appended(Track::Video);
         assert!(!planner.reinit(Track::Video), "nothing left to fetch");
+        assert!(!planner.switchable(Track::Video));
     }
 
     #[test]
@@ -1422,6 +1748,7 @@ mod tests {
             forward_ms: 12_000,
             back_ms: 15_000,
             min_forward_ms: 8_000,
+            ..Config::default()
         };
         let mut planner = Planner::new(segs, false, None, config, 0);
 
@@ -1719,6 +2046,242 @@ mod tests {
         assert_eq!(without_init.tick(0, &buf), Vec::new());
     }
 
+    /// Buffers from a stopped play head until the planner stops fetching, each
+    /// segment `segment_bytes` long; returns the buffered end.
+    fn fill_ahead(planner: &mut Planner, segs: &[Segment], segment_bytes: u64) -> u64 {
+        let mut buf = Buffered::default();
+        loop {
+            let fetched = planner.tick(0, &buf).into_iter().find_map(|a| match a {
+                Action::Fetch { index, .. } => Some(index),
+                _ => None,
+            });
+            let Some(index) = fetched else {
+                return buf.video.first().map_or(0, |&(_, end)| end);
+            };
+            planner.media_bytes(Track::Video, segment_bytes);
+            planner.appended(Track::Video);
+            buf.video = vec![(0, segs[index].start_ms + segs[index].duration_ms)];
+        }
+    }
+
+    #[test]
+    fn a_gap_inside_a_buffered_segment_ahead_is_fetched_again() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        // Segment 2 lost its first two seconds to an append of another
+        // rendition; its midpoint (15 s) is still buffered.
+        let holed = Buffered {
+            video: vec![(0, 12_070), (14_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(11_000, &holed),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 2
+            }]
+        );
+        assert_eq!(
+            planner.take_notes(),
+            vec![Note::Refill {
+                track: Track::Video,
+                index: 2,
+                start_ms: 12_070,
+                end_ms: 14_000,
+            }]
+        );
+
+        // The append fills it: nothing more to fetch.
+        planner.appended(Track::Video);
+        let whole = Buffered {
+            video: vec![(0, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(11_500, &whole), vec![Action::EndOfStream]);
+    }
+
+    #[test]
+    fn a_segment_that_stops_short_is_fetched_again_once_the_next_is_in() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let short = Buffered {
+            video: vec![(0, 4_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(0, &short),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 1
+            }]
+        );
+        planner.appended(Track::Video);
+        let stranded = Buffered {
+            video: vec![(0, 4_000), (6_000, 12_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(1_000, &stranded),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sliver_last_segment_buffered_by_its_neighbour_still_ends_the_stream() {
+        let segs = make_segments(&[6_000, 6_000, 100]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let mut buf = Buffered::default();
+        for end_ms in [6_000, 12_080] {
+            assert!(matches!(planner.tick(0, &buf)[..], [Action::Fetch { .. }]));
+            planner.appended(Track::Video);
+            buf.video = vec![(0, end_ms)];
+        }
+        // The second segment's data runs past the sliver's midpoint, so the
+        // sliver is never requested.
+        assert_eq!(planner.tick(1_000, &buf), vec![Action::EndOfStream]);
+    }
+
+    #[test]
+    fn a_gap_the_watchdog_can_jump_is_not_fetched_again() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let buf = Buffered {
+            video: vec![(0, 12_070), (13_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(11_000, &buf), vec![Action::EndOfStream]);
+        // Nor is a gap behind the play head.
+        let behind = Buffered {
+            video: vec![(0, 6_000), (9_000, 24_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(10_000, &behind), Vec::new());
+    }
+
+    #[test]
+    fn a_gap_that_stays_after_two_appends_is_skipped() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let holed = Buffered {
+            video: vec![(0, 12_070), (14_000, 24_000)],
+            audio: Vec::new(),
+        };
+        for _ in 0..MAX_APPENDS_PER_SEGMENT {
+            assert_eq!(
+                planner.tick(11_000, &holed),
+                vec![Action::Fetch {
+                    track: Track::Video,
+                    index: 2
+                }]
+            );
+            planner.appended(Track::Video);
+        }
+        assert_eq!(planner.tick(11_000, &holed), vec![Action::EndOfStream]);
+        assert!(planner.take_notes().contains(&Note::GaveUp {
+            track: Track::Video,
+            index: 2,
+            appends: MAX_APPENDS_PER_SEGMENT,
+        }));
+        // The play head stops at the gap and is moved to the data after it.
+        assert_eq!(
+            planner.tick(12_070, &holed),
+            vec![Action::Skip {
+                to_ms: 14_000 + SKIP_PADDING_MS
+            }]
+        );
+    }
+
+    #[test]
+    fn an_evict_that_changes_nothing_is_not_asked_for_again() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 50_000);
+        let buf = Buffered {
+            video: vec![(70, 120_000)],
+            audio: Vec::new(),
+        };
+        let evicts = |actions: Vec<Action>| {
+            actions
+                .into_iter()
+                .filter(|a| matches!(a, Action::Evict { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            evicts(planner.tick(50_000, &buf)),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 70,
+                end_ms: 30_000,
+            }]
+        );
+        // The remove left the range as it was: the same tick again asks nothing.
+        assert_eq!(evicts(planner.tick(50_000, &buf)), Vec::new());
+        assert_eq!(evicts(planner.tick(50_100, &buf)), Vec::new());
+        // A cutoff that moved on is a new range to ask for.
+        assert_eq!(
+            evicts(planner.tick(56_000, &buf)),
+            vec![Action::Evict {
+                track: Track::Video,
+                start_ms: 70,
+                end_ms: 36_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_first_media_segment_is_known_while_the_init_loads() {
+        let segs = make_segments(&[6_000; 10]);
+        for start_ms in [0, 5_999, 20_000, 1_000_000] {
+            let mut planner = Planner::new(
+                segs.clone(),
+                true,
+                Some((segs.clone(), true)),
+                Config::default(),
+                start_ms,
+            );
+            let buf = Buffered::default();
+            assert_eq!(planner.first_media(Track::Video), None);
+            planner.tick(0, &buf);
+            for track in [Track::Video, Track::Audio] {
+                let first = planner.first_media(track);
+                assert!(first.is_some(), "{track:?} at {start_ms}");
+                planner.appended(track);
+                assert_eq!(planner.first_media(track), None);
+                let fetched = planner.tick(0, &buf).into_iter().find_map(|a| match a {
+                    Action::Fetch { track: t, index } if t == track => Some(index),
+                    _ => None,
+                });
+                assert_eq!(fetched, first, "{track:?} at {start_ms}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_byte_budget_buffers_a_light_stream_further_ahead() {
+        let segs = make_segments(&[6_000; 40]);
+        let config = Config {
+            forward_ms: 12_000,
+            forward_bytes: 3_000_000,
+            forward_ceiling_ms: 60_000,
+            ..Config::default()
+        };
+        let planner = || Planner::new(segs.clone(), false, None, config, 0);
+
+        // 100 kB/s: the budget is 30 s of it.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 600_000), 30_000);
+        // 500 kB/s: the budget is 6 s of it, under the 12 s target.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 3_000_000), 12_000);
+        // 10 kB/s: the budget is 300 s of it, over the ceiling.
+        assert_eq!(fill_ahead(&mut planner(), &segs, 60_000), 60_000);
+
+        let mut refused = planner();
+        refused.quota_exceeded();
+        // Halved to the 8 s floor, and the budget no longer extends it.
+        assert_eq!(fill_ahead(&mut refused, &segs, 60_000), 12_000);
+    }
+
     #[test]
     fn quota_exceeded_halves_forward_target_down_to_min_forward_ms() {
         let segs = make_segments(&[6_000, 6_000]);
@@ -1728,12 +2291,11 @@ mod tests {
         planner.tick(0, &buf);
         assert_eq!(planner.in_flight(Track::Video), Some(Request::Media(0)));
 
-        assert_eq!(planner.quota_exceeded(Track::Video), 15_000);
+        assert_eq!(planner.quota_exceeded(), 15_000);
         assert_eq!(planner.forward_target_ms(), 15_000);
-        assert_eq!(planner.in_flight(Track::Video), None);
 
-        assert_eq!(planner.quota_exceeded(Track::Video), 8_000);
-        assert_eq!(planner.quota_exceeded(Track::Video), 8_000);
+        assert_eq!(planner.quota_exceeded(), 8_000);
+        assert_eq!(planner.quota_exceeded(), 8_000);
         assert_eq!(planner.forward_target_ms(), 8_000);
     }
 
@@ -1767,7 +2329,7 @@ mod tests {
         Seek(f64),
         Appended(Track),
         Failed(Track),
-        Quota(Track),
+        Quota,
     }
 
     fn event_strategy() -> impl Strategy<Value = Event> {
@@ -1776,7 +2338,7 @@ mod tests {
             2 => (0.0f64..1.1f64).prop_map(Event::Seek),
             3 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Appended),
             1 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Failed),
-            1 => prop_oneof![Just(Track::Video), Just(Track::Audio)].prop_map(Event::Quota),
+            1 => Just(Event::Quota),
         ]
     }
 
@@ -1810,6 +2372,8 @@ mod tests {
             let mut shadow_audio: Option<Request> = None;
             let mut pending_seek_video: Option<usize> = None;
             let mut pending_seek_audio: Option<usize> = None;
+            let mut back_ms = config.back_ms;
+            let mut quota_trim = false;
 
             for event in events {
                 match event {
@@ -1820,6 +2384,7 @@ mod tests {
                         }
                         let had_video = shadow_video;
                         let had_audio = shadow_audio;
+                        let trim_in_flight = std::mem::take(&mut quota_trim);
                         let actions = planner.tick(play_ms, &buffered);
 
                         let mut video_fetches = 0usize;
@@ -1859,14 +2424,14 @@ mod tests {
                                 }
                                 Action::Evict { track, start_ms: ev_start, end_ms: ev_end } => {
                                     prop_assert!(ev_start < ev_end);
-                                    prop_assert!(ev_end <= play_ms.saturating_sub(config.back_ms));
+                                    prop_assert!(ev_end <= play_ms.saturating_sub(back_ms));
                                     match track {
                                         Track::Video => {
-                                            prop_assert!(had_video.is_none());
+                                            prop_assert!(had_video.is_none() || trim_in_flight);
                                             evict_range(&mut buffered.video, ev_start, ev_end);
                                         }
                                         Track::Audio => {
-                                            prop_assert!(had_audio.is_none());
+                                            prop_assert!(had_audio.is_none() || trim_in_flight);
                                             evict_range(&mut buffered.audio, ev_start, ev_end);
                                         }
                                     }
@@ -1964,13 +2529,11 @@ mod tests {
                             Track::Audio => shadow_audio = None,
                         }
                     }
-                    Event::Quota(track) => {
-                        let new_target = planner.quota_exceeded(track);
+                    Event::Quota => {
+                        let new_target = planner.quota_exceeded();
                         prop_assert!(new_target >= config.min_forward_ms);
-                        match track {
-                            Track::Video => shadow_video = None,
-                            Track::Audio => shadow_audio = None,
-                        }
+                        back_ms = 0;
+                        quota_trim = true;
                     }
                 }
 

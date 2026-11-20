@@ -515,6 +515,18 @@ pub fn plan_hls(
     })
 }
 
+/// The `SourceBuffer.remove` range, in seconds, for the planner's evict up to
+/// `end_ms`. It starts at zero, not at the evict's own start: that start is
+/// the first buffered range's, rounded to a millisecond ([`ranges_to_ms`]),
+/// and a start rounded up leaves the first frame in, so the range reads the
+/// same afterwards and the planner asks again without end (B1505). Nothing is
+/// buffered before the first range, so zero removes the same media.
+pub fn evict_range_s(end_ms: u64) -> (f64, f64) {
+    #[allow(clippy::cast_precision_loss)]
+    let end_s = end_ms as f64 / 1000.0;
+    (0.0, end_s)
+}
+
 /// Converts `(start_s, end_s)` `TimeRanges` pairs into sorted millisecond ranges.
 pub fn ranges_to_ms(ranges_s: &[(f64, f64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::with_capacity(ranges_s.len());
@@ -727,6 +739,22 @@ impl AbrSwitchReport {
     }
 }
 
+/// Retries of a playlist fetch after its first failure, as hls.js
+/// `playlistLoadPolicy.errorRetry.maxNumRetry`: without them one blip on the
+/// master or a media playlist fails the start (B1491).
+pub const PLAYLIST_RETRIES: u32 = 2;
+
+/// The backoff for the Rust engine's playlist fetches: the segment backoff,
+/// fewer times. A refusal (4xx other than 408 and 429) is not retried.
+pub fn playlist_retry_policy(
+    deadlines: pharos_hls::retry::Deadlines,
+) -> pharos_hls::retry::RetryPolicy {
+    pharos_hls::retry::RetryPolicy {
+        max_retries: PLAYLIST_RETRIES,
+        ..pharos_hls::retry::RetryPolicy::with_deadlines(deadlines)
+    }
+}
+
 /// Segment deadlines for the Rust engine on `device` (FR-005). Provisional,
 /// not measured: hls.js's ten-second first byte on a desktop, longer on a
 /// TV or phone whose Wi-Fi and CPU answer slower; the slice 0 baseline
@@ -742,6 +770,23 @@ pub fn segment_deadlines(device: DeviceClass) -> pharos_hls::retry::Deadlines {
             first_byte_ms: 15_000,
             load_ms: 90_000,
         },
+    }
+}
+
+/// How much the Rust engine buffers on `device`. A desktop takes hls.js's
+/// settings ([`hls_buffer_config`]), so a seek ahead lands in data that is
+/// already there as often as it does under hls.js; a TV or phone keeps the
+/// engine's 30 s, the memory it was measured with.
+pub fn engine_buffer_config(device: DeviceClass) -> pharos_hls::planner::Config {
+    use pharos_hls::planner::Config;
+    match device {
+        DeviceClass::Desktop => Config {
+            forward_ms: (HLS_FORWARD_S * 1_000.0) as u64,
+            forward_bytes: HLS_FORWARD_BYTES as u64,
+            forward_ceiling_ms: (HLS_FORWARD_CEILING_S * 1_000.0) as u64,
+            ..Config::default()
+        },
+        DeviceClass::Tv | DeviceClass::Phone => Config::default(),
     }
 }
 
@@ -919,14 +964,25 @@ impl PlannerNoteReport {
                 "track={} index={index} from_ms={from_ms} to_ms={to_ms}",
                 track.label()
             ),
+            Note::Refill {
+                track,
+                index,
+                start_ms,
+                end_ms,
+            } => format!(
+                "track={} index={index} start_ms={start_ms} end_ms={end_ms}",
+                track.label()
+            ),
         }
     }
 
-    /// A giving up is the one note that means the stream is off nominal.
+    /// The notes that mean the stream is off nominal.
     pub fn is_warn(&self) -> bool {
         matches!(
             self.0,
-            pharos_hls::planner::Note::GaveUp { .. } | pharos_hls::planner::Note::Skipped { .. }
+            pharos_hls::planner::Note::GaveUp { .. }
+                | pharos_hls::planner::Note::Refill { .. }
+                | pharos_hls::planner::Note::Skipped { .. }
         )
     }
 
@@ -977,6 +1033,17 @@ impl PlannerNoteReport {
                 ("from_ms", from_ms.to_string()),
                 ("to_ms", to_ms.to_string()),
             ],
+            Note::Refill {
+                track,
+                index,
+                start_ms,
+                end_ms,
+            } => vec![
+                ("track", track.label().to_owned()),
+                ("index", index.to_string()),
+                ("start_ms", start_ms.to_string()),
+                ("end_ms", end_ms.to_string()),
+            ],
         };
         let mut all = vec![
             ("engine", "rust".to_owned()),
@@ -984,13 +1051,15 @@ impl PlannerNoteReport {
             ("planner", self.0.label().to_owned()),
         ];
         all.extend(fields);
+        // Only a note that is off nominal counts as a playback error.
+        let (kind, level) = if self.is_warn() {
+            (ClientEventKind::PlaybackError, ClientLevel::Warn)
+        } else {
+            (ClientEventKind::PlaybackDecision, ClientLevel::Info)
+        };
         ClientEvent {
-            kind: ClientEventKind::PlaybackError,
-            level: if self.is_warn() {
-                ClientLevel::Warn
-            } else {
-                ClientLevel::Info
-            },
+            kind,
+            level,
             route,
             fields: all,
         }
@@ -4929,6 +4998,21 @@ mod tests {
             gave_up.line(),
             "pharos: playback engine=rust planner=gave_up track=audio index=4 appends=2"
         );
+        let refill = PlannerNoteReport(Note::Refill {
+            track: Track::Video,
+            index: 120,
+            start_ms: 720_070,
+            end_ms: 722_000,
+        });
+        assert_eq!(
+            refill.line(),
+            "pharos: playback engine=rust planner=refill track=video index=120 start_ms=720070 end_ms=722000"
+        );
+        assert!(refill.is_warn());
+        assert!(refill
+            .event(String::new())
+            .fields
+            .contains(&("start_ms", "720070".to_owned())));
         let e = gave_up.event("/ui/watch/9".to_owned());
         assert_eq!(e.level, ClientLevel::Warn);
         assert!(e.fields.contains(&("planner", "gave_up".to_owned())));
@@ -4943,6 +5027,13 @@ mod tests {
             "pharos: playback engine=rust planner=held track=audio lead_ms=6000 limit_ms=2000"
         );
         assert_eq!(held.event(String::new()).level, ClientLevel::Info);
+        // A nominal decision is not a playback error (B1502).
+        for nominal in [&held, &eos] {
+            assert_eq!(
+                nominal.event(String::new()).kind,
+                ClientEventKind::PlaybackDecision
+            );
+        }
         let skipped = PlannerNoteReport(Note::Skipped {
             track: Track::Video,
             index: 0,
@@ -4954,6 +5045,12 @@ mod tests {
             "pharos: playback engine=rust planner=skipped track=video index=0 from_ms=0 to_ms=6100"
         );
         assert_eq!(skipped.event(String::new()).level, ClientLevel::Warn);
+        for off_nominal in [&gave_up, &refill, &skipped] {
+            assert_eq!(
+                off_nominal.event(String::new()).kind,
+                ClientEventKind::PlaybackError
+            );
+        }
     }
 
     // V637: every failed segment request logs and reports its cause, the
@@ -5053,6 +5150,20 @@ mod tests {
             assert!(d.load_ms > desktop.load_ms);
         }
         assert_eq!(desktop.first_byte_ms, 10_000);
+    }
+
+    #[test]
+    fn a_desktop_buffers_as_far_ahead_as_hls_js_and_weak_devices_do_not() {
+        let desktop = engine_buffer_config(DeviceClass::Desktop);
+        assert_eq!(desktop.forward_ms, 45_000);
+        assert_eq!(desktop.forward_ceiling_ms, 120_000);
+        assert_eq!(desktop.forward_bytes, 60_000_000);
+        for weak in [DeviceClass::Tv, DeviceClass::Phone] {
+            assert_eq!(
+                engine_buffer_config(weak),
+                pharos_hls::planner::Config::default()
+            );
+        }
     }
 
     #[test]
@@ -5332,6 +5443,17 @@ mod tests {
             plan_hls(&empty_master, &fmp4_media, None, |_| true),
             Err((HlsFallbackCause::NoVariant, "none".to_owned()))
         );
+    }
+
+    #[test]
+    fn an_evict_removes_from_before_a_start_that_rounded_up() {
+        // A first frame at 66.7 ms reads as 67 ms.
+        let true_start_s = 0.0667;
+        let buffered = ranges_to_ms(&[(true_start_s, 60.0)]);
+        assert_eq!(buffered, vec![(67, 60_000)]);
+        let (start_s, end_s) = evict_range_s(30_000);
+        assert!(start_s <= true_start_s);
+        assert!((end_s - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5999,5 +6121,43 @@ mod tests {
         for bad in ["tv@", "tv@soon", "ultra@1000000000000", "@5", ""] {
             assert_eq!(parse_tier_drop(bad, set), None, "{bad:?}");
         }
+    }
+
+    /// A playlist fetch that fails on the network or a 5xx is tried again,
+    /// twice; a refusal fails at once (B1491).
+    #[test]
+    fn a_playlist_blip_is_retried_and_a_refusal_is_not() {
+        use pharos_hls::retry::{Cause, GiveUp, Retries, Verdict};
+        let policy = playlist_retry_policy(segment_deadlines(DeviceClass::Desktop));
+        let mut blips = Retries::new(policy);
+        assert!(matches!(
+            blips.on_failure((), Cause::Http(503)),
+            Verdict::Retry {
+                attempt: 1,
+                after_ms: 1_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Retry {
+                attempt: 2,
+                after_ms: 2_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Fail {
+                why: GiveUp::Exhausted,
+                ..
+            }
+        ));
+        let mut refused = Retries::new(policy);
+        assert!(matches!(
+            refused.on_failure((), Cause::Http(401)),
+            Verdict::Fail {
+                why: GiveUp::NotRetryable,
+                ..
+            }
+        ));
     }
 }

@@ -6,24 +6,27 @@ use std::rc::{Rc, Weak};
 
 use gloo_net::http::Request;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
-use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
+use pharos_hls::abr::{
+    abandon_slow_load, Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung,
+};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
 use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
-use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Watch};
+use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Verdict as RetryVerdict, Watch};
 use pharos_hls::stall::{Sample, Verdict as StallVerdict, Watchdog};
 use pharos_hls::timeline::same_grid;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::platform::{
-    current_path, get_text, info, js_message, load_script, now_ms, report_event, seconds_to_ms,
-    sleep_ms, video_element, warn, HlsJs, HLSJS_SRC,
+    current_path, info, js_message, load_script, now_ms, report_event, seconds_to_ms, sleep_ms,
+    video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
-    HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
-    PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
+    abr_ladder, check_master, engine_buffer_config, evict_range_s, forward_buffer_ms,
+    pick_audio_uri, plan_hls, playlist_retry_policy, ranges_to_ms, rung_label, segment_deadlines,
+    with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad, HlsFallbackCause, MediaRecovery,
+    MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment, PlannerNoteReport, PlaybackEngine,
+    SegmentFailureReport, SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -33,12 +36,22 @@ const COLD_WINDOW: usize = 4;
 /// How often the stall watchdog samples the play head. Nothing else fires
 /// while it is stuck: `timeupdate` stops with it.
 const STALL_TICK_MS: i32 = 250;
+/// How long a refused append waits for the trim it asked for before it is
+/// tried again, and how many refusals of one append are a media error.
+const QUOTA_RETRY_MS: u32 = 500;
+const QUOTA_MAX_TRIES: u32 = 4;
+
+/// How often a download still arriving is checked against the abandon rule.
+const ABANDON_CHECK_MS: u64 = 500;
 
 type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
 enum Op {
     Append {
-        bytes: Vec<u8>,
+        /// The response body as the browser holds it: appended as it is, never
+        /// copied into the wasm heap, which would grow to the largest segment
+        /// and stay there.
+        bytes: js_sys::ArrayBuffer,
         request: SegRequest,
         load_ms: u64,
         ttfb_ms: u64,
@@ -60,6 +73,19 @@ enum RunningOp {
         media_ms: u64,
     },
     Remove,
+}
+
+type FetchOutcome = Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure>;
+
+/// A track's first media segment, requested while its init segment loads so
+/// the start costs one round trip less.
+struct Prefetch {
+    index: usize,
+    uri: String,
+    controller: web_sys::AbortController,
+    outcome: futures_util::future::Shared<
+        futures_util::future::LocalBoxFuture<'static, Rc<FetchOutcome>>,
+    >,
 }
 
 /// One rung the engine can switch the video track to.
@@ -90,6 +116,11 @@ struct TrackRunner {
     retries: Retries<SegRequest>,
     /// `updateend`s still to come from `SourceBuffer.abort()`, which belong to no queued op.
     aborted_updateends: u32,
+    /// An append the browser refused for room, held until the back buffer is trimmed.
+    parked: Option<Op>,
+    /// Refusals of the parked append so far.
+    quota_tries: u32,
+    prefetch: Option<Prefetch>,
     listeners: Vec<(&'static str, EventListener)>,
 }
 
@@ -111,6 +142,9 @@ impl TrackRunner {
             running: None,
             retries: Retries::new(policy),
             aborted_updateends: 0,
+            parked: None,
+            quota_tries: 0,
+            prefetch: None,
             listeners: Vec::new(),
         }
     }
@@ -128,6 +162,7 @@ struct Session {
     planner: Option<Planner>,
     deadlines: Deadlines,
     device: &'static str,
+    buffer: Config,
     abr: Option<AbrState>,
     video_track: Option<TrackRunner>,
     audio_track: Option<TrackRunner>,
@@ -204,6 +239,7 @@ impl PlaybackEngine for RustHls {
             planner: None,
             deadlines,
             device: device.label(),
+            buffer: engine_buffer_config(device),
             abr: None,
             video_track: None,
             audio_track: None,
@@ -329,6 +365,9 @@ fn take_track_cleanup(mut track: TrackRunner) -> TrackCleanup {
     track.generation = track.generation.saturating_add(1);
     track.queue.clear();
     track.running = None;
+    if let Some(pre) = track.prefetch.take() {
+        pre.controller.abort();
+    }
     (
         track.source_buffer,
         track.controller.take(),
@@ -346,7 +385,7 @@ fn finish_track_cleanup((sb, controller, listeners): TrackCleanup) {
 }
 
 async fn load(weak: Weak<RefCell<Session>>) {
-    let Some((url, start_ms, epoch, generation)) = weak.upgrade().and_then(|s| {
+    let Some((url, start_ms, epoch, generation, playlist_policy)) = weak.upgrade().and_then(|s| {
         let mut s = s.borrow_mut();
         s.on_source_open = None;
         (!s.dead).then(|| {
@@ -355,6 +394,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 s.start_ms,
                 s.recovery.epoch(),
                 s.generation_floor,
+                playlist_retry_policy(s.deadlines),
             )
         })
     }) else {
@@ -363,7 +403,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     // Only the Rust engine asks for the ladder; a fallback to hls.js loads `url`.
     let master_url = with_abr(&url);
-    let master_text = match get_text(&master_url).await {
+    let master_text = match get_playlist(&weak, &master_url, playlist_policy).await {
         Ok(text) => text,
         Err((status, reason)) => {
             fail_manifest(&weak, "manifestLoadError", status, &reason, &master_url);
@@ -383,7 +423,17 @@ async fn load(weak: Weak<RefCell<Session>>) {
             fallback(&weak, cause, &value).await;
             return;
         }
-        let video_text = match get_text(&variant.uri).await {
+        // One round trip for both media playlists, not one each.
+        let audio_uri = pick_audio_uri(&master, variant);
+        let (video_text, audio_text) =
+            futures_util::future::join(get_playlist(&weak, &variant.uri, playlist_policy), async {
+                match audio_uri.as_deref() {
+                    Some(uri) => Some(get_playlist(&weak, uri, playlist_policy).await),
+                    None => None,
+                }
+            })
+            .await;
+        let video_text = match video_text {
             Ok(t) => t,
             Err((status, reason)) => {
                 fail_manifest(&weak, "levelLoadError", status, &reason, &variant.uri);
@@ -403,8 +453,8 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 return;
             }
         };
-        let audio_pl = if let Some(audio_uri) = pick_audio_uri(&master, variant) {
-            let audio_text = match get_text(&audio_uri).await {
+        let audio_pl = if let (Some(audio_uri), Some(audio_text)) = (audio_uri, audio_text) {
+            let audio_text = match audio_text {
                 Ok(t) => t,
                 Err((status, reason)) => {
                     fail_manifest(&weak, "audioTrackLoadError", status, &reason, &audio_uri);
@@ -448,7 +498,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     let Some(session) = weak.upgrade() else {
         return;
     };
-    let Some((video, media_source, deadlines, device)) = ({
+    let Some((video, media_source, deadlines, device, buffer)) = ({
         let s = session.borrow();
         (!s.dead).then(|| {
             (
@@ -456,6 +506,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 s.media_source.clone(),
                 s.deadlines,
                 s.device,
+                s.buffer,
             )
         })
     }) else {
@@ -520,7 +571,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
         video_pl.segments,
         true,
         audio_pl.map(|a| (a.segments, true)),
-        Config::default(),
+        buffer,
         start_ms,
     );
 
@@ -556,8 +607,14 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     let audio_label = plan.audio_mime.as_deref().unwrap_or("none");
     info(&format!(
-        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} url={url}",
-        plan.video_mime, deadlines.first_byte_ms, deadlines.load_ms,
+        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} forward_ms={} forward_ceiling_ms={} forward_bytes={} back_ms={} url={url}",
+        plan.video_mime,
+        deadlines.first_byte_ms,
+        deadlines.load_ms,
+        buffer.forward_ms,
+        buffer.forward_ceiling_ms,
+        buffer.forward_bytes,
+        buffer.back_ms,
     ));
 
     pump(&session);
@@ -589,7 +646,14 @@ async fn prepare_abr(
         let playlist = if entry.uri == playing_uri {
             Ok(None)
         } else {
-            match get_text(&entry.uri).await {
+            // The player may have closed, or rebuilt, while the last rung loaded.
+            let Some(deadlines) = weak.upgrade().and_then(|s| {
+                let s = s.borrow();
+                (!s.dead && s.recovery.epoch() == epoch).then_some(s.deadlines)
+            }) else {
+                return;
+            };
+            match get_text_within(&entry.uri, deadlines).await {
                 Ok(text) => parse_media(&text, &entry.uri)
                     .map(Some)
                     .map_err(|e| e.to_string()),
@@ -1236,16 +1300,9 @@ fn execute_actions(session: &Rc<RefCell<Session>>, actions: Vec<Action>) {
             Action::FetchInit { track } => start_fetch(session, track, SegRequest::Init),
             Action::Fetch { track, index } => start_fetch(session, track, SegRequest::Media(index)),
             Action::Abort { track } => abort_track(session, track),
-            Action::Evict {
-                track,
-                start_ms,
-                end_ms,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let op = Op::Remove {
-                    start_s: start_ms as f64 / 1000.0,
-                    end_s: end_ms as f64 / 1000.0,
-                };
+            Action::Evict { track, end_ms, .. } => {
+                let (start_s, end_s) = evict_range_s(end_ms);
+                let op = Op::Remove { start_s, end_s };
                 {
                     let mut s = session.borrow_mut();
                     if let Some(t) = s.track_mut(track) {
@@ -1279,6 +1336,11 @@ fn abort_track(session: &Rc<RefCell<Session>>, track: Track) {
         };
         t.generation = t.generation.saturating_add(1);
         t.queue.retain(|op| !matches!(op, Op::Append { .. }));
+        t.parked = None;
+        t.quota_tries = 0;
+        if let Some(pre) = t.prefetch.take() {
+            pre.controller.abort();
+        }
         // SourceBuffer.abort() throws while a remove is running, so only an append is cut short.
         let aborting_append = open
             && matches!(t.running, Some(RunningOp::Append { .. }))
@@ -1313,13 +1375,14 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
             return;
         }
     };
-    let signal = controller.signal();
 
-    let (uri, media_ms, generation, old_controller, deadlines) = {
+    let (uri, media_ms, generation, old_controller, deadlines, signal, prefetched) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
         }
+        let deadlines = s.deadlines;
+        let first_media = s.planner.as_ref().and_then(|p| p.first_media(track));
         let Some(t) = s.track_mut(track) else {
             return;
         };
@@ -1332,10 +1395,37 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                 (seg.uri.clone(), seg.duration_ms)
             }
         };
+        let stale = t.prefetch.take();
+        let mut prefetched = None;
+        match (request, stale) {
+            (SegRequest::Media(idx), Some(pre)) if pre.index == idx && pre.uri == uri => {
+                prefetched = Some(pre);
+            }
+            (_, Some(pre)) => {
+                info(&format!(
+                    "pharos: playback engine=rust prefetch=dropped track={} index={} reason=target_moved",
+                    track.label(),
+                    pre.index
+                ));
+                pre.controller.abort();
+            }
+            (_, None) => {}
+        }
+        if request == SegRequest::Init && read_time_ranges(&t.source_buffer).is_empty() {
+            t.prefetch = first_media.and_then(|index| {
+                let seg_uri = t.segments.get(index)?.uri.clone();
+                start_prefetch(track, index, seg_uri, deadlines)
+            });
+        }
+        let (controller, outcome) = match prefetched {
+            Some(pre) => (pre.controller, Some(pre.outcome)),
+            None => (controller, None),
+        };
+        let signal = controller.signal();
         t.generation = t.generation.saturating_add(1);
         let gen = t.generation;
         let old = t.controller.replace(controller);
-        (uri, media_ms, gen, old, s.deadlines)
+        (uri, media_ms, gen, old, deadlines, signal, outcome)
     };
 
     if let Some(old) = old_controller {
@@ -1344,7 +1434,19 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
 
     let weak = Rc::downgrade(session);
     wasm_bindgen_futures::spawn_local(async move {
-        let outcome = fetch_segment(&uri, &signal, deadlines).await;
+        let outcome = match prefetched {
+            Some(shared) => (*shared.await).clone(),
+            None => {
+                let watcher = weak.clone();
+                let abandon = move |since_headers_ms| {
+                    track == Track::Video
+                        && watcher.upgrade().is_some_and(|session| {
+                            should_abandon(&session, since_headers_ms, media_ms)
+                        })
+                };
+                fetch_segment(&uri, &signal, deadlines, abandon).await
+            }
+        };
         if signal.aborted() {
             return;
         }
@@ -1386,7 +1488,64 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
     });
 }
 
+/// Whether the video download in flight should be given up for the rung below
+/// (`abr::abandon_slow_load`); never when the step down would be refused (no
+/// lower rung, or the last segment is in), where giving up would only fetch
+/// the same bytes again and count as a failure.
+fn should_abandon(session: &Rc<RefCell<Session>>, since_headers_ms: u64, media_ms: u64) -> bool {
+    let can_step_down = {
+        let s = session.borrow();
+        let has_lower_rung = s
+            .abr
+            .as_ref()
+            .and_then(|st| st.abr.current())
+            .is_some_and(|current| current > 0);
+        has_lower_rung
+            && s.planner
+                .as_ref()
+                .is_some_and(|p| p.switchable(Track::Video))
+    };
+    can_step_down
+        && snapshot_state(session).is_some_and(|(play_ms, buffered)| {
+            abandon_slow_load(
+                since_headers_ms,
+                media_ms,
+                forward_buffer_ms(&buffered.video, play_ms),
+            )
+        })
+}
+
+/// Requests media segment `index` of `track` ahead of the planner asking for it.
+fn start_prefetch(
+    track: Track,
+    index: usize,
+    uri: String,
+    deadlines: Deadlines,
+) -> Option<Prefetch> {
+    use futures_util::FutureExt;
+    let controller = web_sys::AbortController::new().ok()?;
+    let signal = controller.signal();
+    info(&format!(
+        "pharos: playback engine=rust prefetch=started track={} index={index}",
+        track.label()
+    ));
+    let fetch_uri = uri.clone();
+    let outcome =
+        async move { Rc::new(fetch_segment(&fetch_uri, &signal, deadlines, |_| false).await) }
+            .boxed_local()
+            .shared();
+    // Polled here so the request runs before anything waits on it.
+    wasm_bindgen_futures::spawn_local(outcome.clone().map(drop));
+    Some(Prefetch {
+        index,
+        uri,
+        controller,
+        outcome,
+    })
+}
+
 /// Why a segment request failed, and the deadline that passed for a timeout.
+#[derive(Clone)]
 struct FetchFailure {
     cause: Cause,
     deadline_ms: Option<u64>,
@@ -1415,13 +1574,23 @@ async fn within<F: std::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
     }
 }
 
+/// The response body as a browser `ArrayBuffer`.
+async fn body_buffer(resp: web_sys::Response) -> Result<js_sys::ArrayBuffer, JsValue> {
+    let body = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
+    body.dyn_into::<js_sys::ArrayBuffer>()
+}
+
 /// Fetches one segment against `deadlines` (FR-005): the headers must arrive
 /// within the first-byte deadline, the body within the load deadline after.
+///
+/// `abandon` is asked, every [`ABANDON_CHECK_MS`] the body is still arriving,
+/// whether to give the download up, with the time since the headers.
 async fn fetch_segment(
     uri: &str,
     signal: &web_sys::AbortSignal,
     deadlines: Deadlines,
-) -> Result<(Vec<u8>, u64, u64), FetchFailure> {
+    abandon: impl Fn(u64) -> bool,
+) -> Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure> {
     let sent_at = now_ms();
     let mut watch = Watch::new(deadlines, now_ms_u64());
     let send = Request::get(uri).abort_signal(Some(signal)).send();
@@ -1442,14 +1611,31 @@ async fn fetch_segment(
             reason: resp.status_text(),
         });
     }
-    let bytes = within(resp.binary(), watch.remaining_ms(now_ms_u64()))
-        .await
-        .ok_or_else(|| FetchFailure::timeout(&watch))?
-        .map_err(|e| FetchFailure {
-            cause: Cause::Network,
-            deadline_ms: None,
-            reason: e.to_string(),
-        })?;
+    let headers_ms = now_ms_u64();
+    let body = body_buffer(web_sys::Response::from(resp));
+    futures_util::pin_mut!(body);
+    let bytes = loop {
+        let remaining_ms = watch.remaining_ms(now_ms_u64());
+        if let Some(done) = within(&mut body, remaining_ms.min(ABANDON_CHECK_MS)).await {
+            break done;
+        }
+        if watch.remaining_ms(now_ms_u64()) == 0 {
+            return Err(FetchFailure::timeout(&watch));
+        }
+        let since_headers_ms = now_ms_u64().saturating_sub(headers_ms);
+        if abandon(since_headers_ms) {
+            return Err(FetchFailure {
+                cause: Cause::TimeoutLoad,
+                deadline_ms: Some(since_headers_ms),
+                reason: "abandoned: slower than playback".to_owned(),
+            });
+        }
+    }
+    .map_err(|e| FetchFailure {
+        cause: Cause::Network,
+        deadline_ms: None,
+        reason: js_message(&e),
+    })?;
     let done_at = now_ms();
     let start = if headers_at > 0.0 {
         headers_at
@@ -1648,7 +1834,7 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
                     media_ms,
                 } => RunningOp::Append {
                     request: *request,
-                    bytes: bytes.len() as u64,
+                    bytes: u64::from(bytes.byte_length()),
                     load_ms: *load_ms,
                     ttfb_ms: *ttfb_ms,
                     media_ms: *media_ms,
@@ -1666,9 +1852,9 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     };
 
     match op {
-        Op::Append { mut bytes, .. } => {
-            if let Err(err) = sb.append_buffer_with_u8_array(&mut bytes) {
-                on_append_error(session, track, &err);
+        Op::Append { ref bytes, .. } => {
+            if let Err(err) = sb.append_buffer_with_array_buffer(bytes) {
+                on_append_error(session, track, &err, op);
             }
         }
         Op::Remove { start_s, end_s } => {
@@ -1686,51 +1872,94 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     }
 }
 
-fn on_append_error(session: &Rc<RefCell<Session>>, track: Track, err: &JsValue) {
+fn on_append_error(session: &Rc<RefCell<Session>>, track: Track, err: &JsValue, op: Op) {
     let is_quota = js_sys::Reflect::get(err, &JsValue::from_str("name"))
         .ok()
         .and_then(|v| v.as_string())
         .as_deref()
         == Some("QuotaExceededError");
 
-    if is_quota {
-        let new_target_ms = {
-            let mut s = session.borrow_mut();
-            if let Some(t) = s.track_mut(track) {
-                t.running = None;
-            }
-            s.planner.as_mut().map_or(0, |p| p.quota_exceeded(track))
-        };
-        warn(&format!(
-            "pharos: playback engine=rust quota_exceeded track={} forward_target_ms={new_target_ms}",
-            track.label()
-        ));
-        session.borrow_mut().trace.quota_exceeded();
-        report_event(ClientEvent {
-            kind: ClientEventKind::PlaybackError,
-            level: ClientLevel::Warn,
-            route: current_path(),
-            fields: vec![
-                ("engine", "rust".to_owned()),
-                ("type", "quotaExceeded".to_owned()),
-                ("track", track.label().to_owned()),
-                ("forward_target_ms", new_target_ms.to_string()),
-                ("action", "lower_target".to_owned()),
-            ],
-        });
-        run_queue(session, track);
-        pump(session);
+    if !is_quota {
+        if let Some(t) = session.borrow_mut().track_mut(track) {
+            t.running = None;
+        }
+        fail_media(
+            &Rc::downgrade(session),
+            "bufferAppendError",
+            &js_message(err),
+        );
         return;
     }
 
-    if let Some(t) = session.borrow_mut().track_mut(track) {
+    // Keep the bytes: the planner trims both tracks behind the play head on
+    // the next tick, and the same append is tried again once that has run.
+    let (tries, generation, new_target_ms) = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
+        let new_target_ms = s.planner.as_mut().map_or(0, Planner::quota_exceeded);
+        let Some(t) = s.track_mut(track) else {
+            return;
+        };
         t.running = None;
+        t.quota_tries = t.quota_tries.saturating_add(1);
+        let give_up = t.quota_tries > QUOTA_MAX_TRIES;
+        t.parked = (!give_up).then_some(op);
+        (t.quota_tries, t.generation, new_target_ms)
+    };
+    let give_up = tries > QUOTA_MAX_TRIES;
+    let action = if give_up { "rebuild" } else { "trim_and_retry" };
+    warn(&format!(
+        "pharos: playback engine=rust quota_exceeded track={} forward_target_ms={new_target_ms} attempt={tries} action={action}",
+        track.label()
+    ));
+    session.borrow_mut().trace.quota_exceeded();
+    report_event(ClientEvent {
+        kind: ClientEventKind::PlaybackError,
+        level: ClientLevel::Warn,
+        route: current_path(),
+        fields: vec![
+            ("engine", "rust".to_owned()),
+            ("type", "quotaExceeded".to_owned()),
+            ("track", track.label().to_owned()),
+            ("forward_target_ms", new_target_ms.to_string()),
+            ("attempt", tries.to_string()),
+            ("action", action.to_owned()),
+        ],
+    });
+    if give_up {
+        fail_media(
+            &Rc::downgrade(session),
+            "bufferFullError",
+            &format!("{} append refused for room {tries} times", track.label()),
+        );
+        return;
     }
-    fail_media(
-        &Rc::downgrade(session),
-        "bufferAppendError",
-        &js_message(err),
-    );
+    pump(session);
+
+    let weak = Rc::downgrade(session);
+    wasm_bindgen_futures::spawn_local(async move {
+        sleep_ms(QUOTA_RETRY_MS).await;
+        let Some(session) = weak.upgrade() else {
+            return;
+        };
+        {
+            let mut s = session.borrow_mut();
+            if s.dead {
+                return;
+            }
+            let Some(t) = s.track_mut(track) else {
+                return;
+            };
+            if t.generation != generation {
+                return;
+            }
+            let Some(op) = t.parked.take() else {
+                return;
+            };
+            t.queue.push_front(op);
+        }
+        run_queue(&session, track);
+    });
 }
 
 fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
@@ -1749,7 +1978,18 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
             }
         });
         if matches!(finished, Some(RunningOp::Append { .. })) {
+            if let Some(t) = s.track_mut(track) {
+                t.quota_tries = 0;
+            }
             if let Some(planner) = s.planner.as_mut() {
+                if let Some(RunningOp::Append {
+                    request: SegRequest::Media(_),
+                    bytes,
+                    ..
+                }) = &finished
+                {
+                    planner.media_bytes(track, *bytes);
+                }
                 planner.appended(track);
             }
         }
@@ -1802,7 +2042,10 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
         }
         let track_idle = |t: Option<&TrackRunner>| {
             t.map_or(true, |r| {
-                r.running.is_none() && r.queue.is_empty() && !r.source_buffer.updating()
+                r.running.is_none()
+                    && r.queue.is_empty()
+                    && r.parked.is_none()
+                    && !r.source_buffer.updating()
             })
         };
         if !track_idle(s.video_track.as_ref()) || !track_idle(s.audio_track.as_ref()) {
@@ -1816,6 +2059,70 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
             "pharos: playback engine=rust end_of_stream refused reason={}",
             js_message(&err)
         ));
+    }
+}
+
+/// A playlist's text, or a failure once its headers or its body take longer
+/// than `deadlines` allow: a connection that hangs would otherwise leave the
+/// player loading for good (B1496).
+async fn get_text_within(url: &str, deadlines: Deadlines) -> Result<String, (Option<u16>, String)> {
+    let controller = web_sys::AbortController::new().ok();
+    let signal = controller.as_ref().map(web_sys::AbortController::signal);
+    let timed_out = |what: &str, ms: u64| {
+        if let Some(c) = &controller {
+            c.abort();
+        }
+        (None, format!("no {what} within {ms} ms"))
+    };
+    let send = Request::get(url).abort_signal(signal.as_ref()).send();
+    let resp = within(send, deadlines.first_byte_ms)
+        .await
+        .ok_or_else(|| timed_out("response", deadlines.first_byte_ms))?
+        .map_err(|e| (None, e.to_string()))?;
+    if !resp.ok() {
+        return Err((Some(resp.status()), resp.status_text()));
+    }
+    within(resp.text(), deadlines.load_ms)
+        .await
+        .ok_or_else(|| timed_out("body", deadlines.load_ms))?
+        .map_err(|e| (None, e.to_string()))
+}
+
+/// Fetch a playlist the start needs, trying again after a network failure or
+/// a 5xx under `policy` (B1491). Stops once the session is torn down.
+async fn get_playlist(
+    weak: &Weak<RefCell<Session>>,
+    url: &str,
+    policy: RetryPolicy,
+) -> Result<String, (Option<u16>, String)> {
+    let mut retries = Retries::new(policy);
+    loop {
+        let (status, reason) = match get_text_within(url, policy.deadlines).await {
+            Ok(text) => return Ok(text),
+            Err(e) => e,
+        };
+        let cause = status.map_or(Cause::Network, Cause::Http);
+        let status_label = status.map_or_else(|| "none".to_owned(), |s| s.to_string());
+        match retries.on_failure((), cause) {
+            RetryVerdict::Retry { attempt, after_ms } => {
+                warn(&format!(
+                    "pharos: playback engine=rust playlist retry attempt={attempt} after_ms={after_ms} cause={} status={status_label} reason={reason} url={url}",
+                    cause.label()
+                ));
+                sleep_ms(u32::try_from(after_ms).unwrap_or(u32::MAX)).await;
+                if !weak.upgrade().is_some_and(|s| !s.borrow().dead) {
+                    return Err((status, reason));
+                }
+            }
+            RetryVerdict::Fail { attempt, why } => {
+                warn(&format!(
+                    "pharos: playback engine=rust playlist gave up attempt={attempt} why={} cause={} status={status_label} url={url}",
+                    why.label(),
+                    cause.label()
+                ));
+                return Err((status, reason));
+            }
+        }
     }
 }
 
