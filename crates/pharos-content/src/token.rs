@@ -189,9 +189,24 @@ pub fn load(path: &Path) -> Result<Option<String>, ContentError> {
 /// A new sign-in's token, the file replaced whole. Whoever the file held it
 /// for is gone with it: the new token's user is unknown until `store_user`.
 /// Surrounding whitespace is not part of a token.
+/// What runs after a store installed its token, with the new token's
+/// fingerprint and the one it overwrote (`None` when there was none, or it
+/// could not be read). Runs under the file's lock: it must not touch the
+/// token file, nor take a lock a token-file caller holds.
+static ON_STORED: std::sync::OnceLock<fn(&str, Option<&str>)> = std::sync::OnceLock::new();
+
+/// Registers the store hook ([`ON_STORED`]). Set once; later calls are
+/// ignored. Every sign-in stores through [`store`], whichever process or
+/// path runs it (the phone's, or the car's QuickConnect), so the hook sees
+/// them all.
+pub fn on_stored(hook: fn(&str, Option<&str>)) {
+    let _ = ON_STORED.set(hook);
+}
+
 pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let _held = hold();
     let token = token.trim();
+    let replaced = read_raw(path).ok().flatten().map(|s| fingerprint(&s.token));
     write(path, token, None).map_err(|e| err(path, e))?;
     // A new sign-in: a marker of an older session no longer has anything to
     // refuse (it names that token only), so it goes. One that will not go
@@ -219,6 +234,27 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 ));
             }
         },
+    }
+    // The hook hears of the store only once the file is read back holding
+    // the new token: a fence it lifts is for a token really gone.
+    match read_raw(path) {
+        Ok(Some(s)) if s.token == token => {
+            if let Some(hook) = ON_STORED.get() {
+                hook(&fingerprint(token), replaced.as_deref());
+            }
+        }
+        Ok(other) => log::warn!(
+            "token store verdict=not_replaced reason=read_back_differs found={}",
+            if other.is_some() {
+                "another_token"
+            } else {
+                "none"
+            }
+        ),
+        Err(e) => log::warn!(
+            "token store verdict=not_replaced reason=read_back_failed error={}",
+            e.redacted()
+        ),
     }
     Ok(())
 }
