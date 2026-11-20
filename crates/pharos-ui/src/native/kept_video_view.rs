@@ -810,45 +810,67 @@ pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<S
 /// logs and renders a new snapshot.
 static OFFLINE_READY_CHANGED: GlobalSignal<u32> = Signal::global(|| 0);
 
+thread_local! {
+    /// The snapshot the offline start last rendered from, empty included:
+    /// what [`check_offline_ready`] compares the store with.
+    static LAST_READY: RefCell<Option<offline_video::ReadyVideos>> = const { RefCell::new(None) };
+}
+
 /// The ready videos for the offline start, read once per render: it renders
 /// again when they change or a store is published.
 pub fn shown_ready_snapshot() -> offline_video::ReadyVideos {
     let _ = OFFLINE_READY_CHANGED.read();
     let _ = shown_video_store();
-    offline_video::ready_snapshot()
+    let snap = offline_video::ready_snapshot();
+    LAST_READY.with(|l| *l.borrow_mut() = Some(snap.clone()));
+    snap
+}
+
+/// One poll of the ready videos against the snapshot the offline start
+/// last rendered, an empty one included: when they differ (the first video
+/// turning Ready, say), the start renders again with a new read. True
+/// then. Nothing before the start has rendered once.
+pub fn check_offline_ready() -> bool {
+    let now = offline_video::ready_snapshot();
+    let was = LAST_READY.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.as_ref() {
+            Some(was) if *was != now => l.replace(now.clone()),
+            _ => None,
+        }
+    });
+    let Some(was) = was else {
+        return false;
+    };
+    platform::info(&format!(
+        "pharos: offline videos verdict=changed from={} to={} owner={:?}",
+        was.videos.len(),
+        now.videos.len(),
+        now.owner
+    ));
+    *OFFLINE_READY_CHANGED.write() += 1;
+    true
 }
 
 /// The offline start's list of videos: the ready ones, which play with no
 /// server. `ready` is the snapshot the parent read, logged and chose this
 /// screen by, and the rows render from it; nothing when it is empty. Not
 /// read again for the render: a poll that finds the videos changed has the
-/// parent take a new snapshot instead.
+/// parent take a new snapshot instead. Mounted with an empty snapshot too
+/// (the waiting page, the books' list), so the first video turning Ready
+/// is seen there.
 #[component]
 pub fn OfflineVideos(ready: offline_video::ReadyVideos) -> Element {
-    let shown = use_hook(|| Rc::new(RefCell::new(ready.clone())));
-    *shown.borrow_mut() = ready.clone();
-    use_future(move || {
-        let shown = Rc::clone(&shown);
-        async move {
-            poll_every(
-                platform::SLEEP_IS_REAL,
-                || platform::sleep_ms(POLL_MS),
-                || {
-                    let now = offline_video::ready_snapshot();
-                    let was = shown.borrow().videos.len();
-                    if *shown.borrow() != now {
-                        platform::info(&format!(
-                            "pharos: offline videos verdict=changed from={was} to={}",
-                            now.videos.len()
-                        ));
-                        *shown.borrow_mut() = now;
-                        *OFFLINE_READY_CHANGED.write() += 1;
-                    }
-                    true
-                },
-            )
-            .await;
-        }
+    use_future(move || async move {
+        poll_every(
+            platform::SLEEP_IS_REAL,
+            || platform::sleep_ms(POLL_MS),
+            || {
+                check_offline_ready();
+                true
+            },
+        )
+        .await;
     });
     if ready.videos.is_empty() {
         return rsx! {};

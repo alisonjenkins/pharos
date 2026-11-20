@@ -2801,7 +2801,10 @@ fn connecting_screen(m: &Machine, route: &Route, slow: bool) -> Element {
     if let Some(offline) = cut_off.then(|| offline_start(route)).flatten() {
         return offline;
     }
-    match m.waiting() {
+    // Cut off with nothing to list yet: the offline videos' poll stays
+    // mounted (it renders nothing), so a first video turning Ready brings
+    // the list up with no other render.
+    let status = match m.waiting() {
         Some(why) => rsx! {
             StatusView {
                 title: "Waiting for the server…",
@@ -2816,6 +2819,12 @@ fn connecting_screen(m: &Machine, route: &Route, slow: bool) -> Element {
                 action: None,
             }
         },
+    };
+    rsx! {
+        {status}
+        if cut_off {
+            super::kept_video_view::OfflineVideos { ready: offline_video::ReadyVideos::default() }
+        }
     }
 }
 
@@ -2896,7 +2905,12 @@ fn offline_start(route: &Route) -> Option<Element> {
         others.is_some()
     ));
     match (others, videos.is_empty()) {
-        (others, true) => others,
+        // Mounted though empty: its poll sees the first video turn Ready.
+        (Some(others), true) => Some(rsx! {
+            {others}
+            super::kept_video_view::OfflineVideos { ready }
+        }),
+        (None, true) => None,
         (Some(others), false) => Some(rsx! {
             {others}
             super::kept_video_view::OfflineVideos { ready }
@@ -9424,6 +9438,134 @@ mod tests {
         });
         use_test_video_slot(None);
         offline_video::forget_user();
+        assert!(html.contains("pharos-offline-videos"), "{html}");
+        assert!(html.contains("Kept Film"), "{html}");
+    }
+
+    /// CR 4640611388: the store is registered with nothing Ready; the
+    /// attempt goes slow and shows "Connecting…". The first video turning
+    /// Ready then brings the offline list up through the start's own poll
+    /// check, with no publish, retry or route change. Host builds run no
+    /// poll timer, so the test makes the one check the timer would.
+    #[test]
+    fn a_first_video_turning_ready_while_connecting_renders_its_offline_list() {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        use super::super::ports::{use_test_video_slot, Slot};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SLOT: Slot<dyn VideoStore> = Slot::new();
+        static READY: AtomicBool = AtomicBool::new(false);
+        thread_local! {
+            static FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        struct Turns;
+        impl VideoStore for Turns {
+            fn videos(&self, user: &str) -> Vec<KeptVideo> {
+                vec![KeptVideo {
+                    item: "7".into(),
+                    version: String::new(),
+                    user: user.into(),
+                    title: "Kept Film".into(),
+                    kind: "movie".into(),
+                    runtime_ms: 60_000,
+                    master_url: "/m.m3u8".into(),
+                    audio: None,
+                    subtitles: vec![],
+                    files: vec![],
+                    quality_bps: 1_000_000,
+                    estimated_bytes: 1_000,
+                    state: if READY.load(Ordering::SeqCst) {
+                        KeptState::Ready
+                    } else {
+                        KeptState::Downloading {
+                            done: 0,
+                            total: 1,
+                            bytes: 0,
+                        }
+                    },
+                    position_ms: 0,
+                    saved_at: "2026-11-18T00:00:00Z".into(),
+                    estimate_from_adoption: false,
+                    stale_on_disk: 0,
+                }]
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        fn root() -> Element {
+            use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+            super::super::kept_video_view::use_video_store_watch();
+            let machine = use_signal(Machine::new);
+            let slow = use_signal(|| false);
+            use_hook(|| start_attempt_timer(machine, machine.peek().epoch(), slow));
+            FIRED.with(|f| f.set(slow()));
+            let m = machine.read();
+            connecting_screen(&m, &Route::Home, slow())
+        }
+        READY.store(false, Ordering::SeqCst);
+        let _ = SLOT.set(std::sync::Arc::new(Turns));
+        use_test_video_slot(Some(&SLOT));
+        FIRED.with(|f| f.set(false));
+        offline_video::remember_user("u1");
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (html, checked) = rt.block_on(async {
+            let start = std::time::Instant::now();
+            while !FIRED.with(std::cell::Cell::get) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "the slow connect never came"
+                );
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+            assert!(dioxus_ssr::render(&dom).contains("Connecting"));
+            // In the app's runtime, as the poll runs it.
+            let check = |dom: &VirtualDom| {
+                dom.in_runtime(super::super::kept_video_view::check_offline_ready)
+            };
+            assert!(!check(&dom), "nothing changed yet");
+            READY.store(true, Ordering::SeqCst);
+            let checked = check(&dom);
+            let start = std::time::Instant::now();
+            loop {
+                let html = dioxus_ssr::render(&dom);
+                if html.contains("Kept Film") || start.elapsed() > std::time::Duration::from_secs(3)
+                {
+                    break (html, checked);
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    dom.wait_for_work(),
+                )
+                .await;
+                dom.render_immediate_to_vec();
+            }
+        });
+        use_test_video_slot(None);
+        offline_video::forget_user();
+        assert!(checked, "the check missed the first Ready video");
         assert!(html.contains("pharos-offline-videos"), "{html}");
         assert!(html.contains("Kept Film"), "{html}");
     }
