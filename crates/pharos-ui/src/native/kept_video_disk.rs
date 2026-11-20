@@ -5079,23 +5079,45 @@ impl Inner {
     /// delete, and returns the final outcome over every folder attempted:
     /// the bytes both passes freed, or Err naming the folders still there.
     fn discard_and_retry(self: &Arc<Self>) -> Result<u64, String> {
+        // Folders an earlier discard or removal left are the retry's too:
+        // its sweep tries them again, and the outcome counts them.
+        let earlier: Vec<PathBuf> = lock(&self.state)
+            .tombstones
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
         let (mut freed, failed) = self.discard_held();
         // What a folder that would not delete is counted for now, read
         // before the retry re-measures it.
         let before: Vec<(PathBuf, u64)> = {
             let st = lock(&self.state);
-            failed
-                .iter()
+            let mut targets = earlier.clone();
+            for dir in &failed {
+                if !targets.contains(dir) {
+                    targets.push(dir.clone());
+                }
+            }
+            targets
+                .into_iter()
                 .map(|dir| {
                     let bytes = st
                         .tombstones
                         .iter()
-                        .find(|(d, _)| d == dir)
+                        .find(|(d, _)| *d == dir)
                         .map_or(0, |(_, b)| *b);
-                    (dir.clone(), bytes)
+                    (dir, bytes)
                 })
                 .collect()
         };
+        if !earlier.is_empty() {
+            emit(
+                false,
+                format!(
+                    "pharos: video held discard retry verdict=included reason=earlier_tombstones count={}",
+                    earlier.len()
+                ),
+            );
+        }
         // What would not delete is a tombstone now: try it again at once.
         self.sweep_tombstones();
         let mut remaining = Vec::new();
@@ -11497,6 +11519,18 @@ pub(crate) mod tests {
         // remove it.
         assert_eq!(store.unreadable_count(), 0);
         assert_eq!(store.leftover_count(), 1, "the folder left is not offered");
+        // Outside diff kept_video_disk.rs:5041-5044 (review 5997638687): a
+        // second cleanup that cannot delete it either says so; the folder
+        // is no longer held, but its tombstone is the retry's.
+        FAIL_REMOVE.with(|f| f.set(true));
+        let again = store.discard_unreadable();
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(
+            again.is_err(),
+            "a repeated failure reported success: {again:?}"
+        );
+        assert!(dir.exists());
+        assert!(!lines("pharos: video held discard retry verdict=included").is_empty());
         // The next sweep deletes it and the block lifts.
         store.start(request("2")).unwrap();
         store.settled().await;
