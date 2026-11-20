@@ -2004,6 +2004,21 @@ impl Inner {
             st.playlists_taken.remove(&who);
             st.playlists_landed.remove(&who);
             st.playlists_base.remove(&who);
+            // The plan's estimate is this run's reservation now: an earlier
+            // run's allowance handed over to it is no longer there to give
+            // back, so that run's exit leaves the record as it is.
+            let before = st.handed_over.len();
+            st.handed_over
+                .retain(|(u, i, _), to| !(u == user && i == item && *to == run));
+            let invalidated = before - st.handed_over.len();
+            if invalidated > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance handover verdict=invalidated item={item} run={run} reason=replacement_admitted runs={invalidated}"
+                    ),
+                );
+            }
         }
         #[cfg(test)]
         self.plans_admitted
@@ -10447,6 +10462,63 @@ pub(crate) mod tests {
                     .any(|l| l.contains("reason=writer_stopped_after_handover")));
             }
         }
+    }
+
+    /// Outside diff kept_video_disk.rs:4204-4209 (review 5997638687): the
+    /// parked run A is held (its writer still running, as in a retry's
+    /// backoff) while the run it handed its allowance to admits its plan
+    /// and is Ready. A's exit then leaves the new reservation as it is.
+    #[tokio::test]
+    async fn a_handover_ends_once_the_replacement_admits_its_plan() {
+        let rig = Rig::new("handover-admitted");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let key = ("u1".to_owned(), "1".to_owned());
+        let old = lock(&store.inner.state).runs.get(&key).copied().unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        *lock(&store.inner.state)
+            .writers
+            .entry(who.clone())
+            .or_default() += 1;
+        store.park_runs(Some("u1"));
+        let new = lock(&store.inner.state).claim_parked("u1", "1");
+        // The replacement admits its plan while A is held.
+        let full = only(&store).estimated_bytes.saturating_mul(4);
+        let plan = Plan {
+            files: Vec::new(),
+            estimate: full,
+            total: 0,
+            stored: 0,
+            stale: 0,
+        };
+        let check = Check::Resume {
+            other: 0,
+            cap: u64::MAX,
+            ready: true,
+            unknown: false,
+        };
+        assert!(store.inner.admit("u1", "1", new, &plan, check, 0).is_ok());
+        assert_eq!(only(&store).estimated_bytes, full);
+        assert!(
+            lines("pharos: video playlist allowance handover verdict=invalidated item=1")
+                .iter()
+                .any(|l| l.contains("reason=replacement_admitted"))
+        );
+        lock(&store.inner.state).writers.remove(&who);
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !lock(&store.inner.state).playlists_base.contains_key(&who),
+            "the held run never exited"
+        );
+        assert_eq!(
+            only(&store).estimated_bytes,
+            full,
+            "the exiting run cut the replacement's reservation"
+        );
     }
 
     /// A download removed and started again between a sign-in's pick and
