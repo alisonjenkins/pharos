@@ -1229,11 +1229,7 @@ pub fn ready_snapshot() -> ReadyVideos {
     let (Some(store), Some(user)) = (super::ports::video_store(), last_user()) else {
         return ReadyVideos::default();
     };
-    let videos = store
-        .videos(&user)
-        .into_iter()
-        .filter(KeptVideo::ready)
-        .collect();
+    let videos = store.ready_videos(&user);
     ReadyVideos {
         owner: Some(user),
         videos,

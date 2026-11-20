@@ -236,6 +236,15 @@ pub fn fits(needed: u64, used: u64, cap: u64, free: u64) -> Result<(), KeepVideo
 pub trait VideoStore: Send + Sync {
     /// The signed-in user's downloads, newest first.
     fn videos(&self, user: &str) -> Vec<KeptVideo>;
+    /// The user's Ready downloads, newest first, for a poll on the UI
+    /// thread: a store whose [`Self::videos`] does filesystem work answers
+    /// from memory and does that work elsewhere, for a later poll to see.
+    fn ready_videos(&self, user: &str) -> Vec<KeptVideo> {
+        self.videos(user)
+            .into_iter()
+            .filter(KeptVideo::ready)
+            .collect()
+    }
     /// Start fetching: plan the files with `pharos_hls::offline`, check
     /// [`fits`], store each under its exact URL, record progress.
     fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal>;

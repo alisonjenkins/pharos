@@ -394,6 +394,9 @@ struct Inner {
     saves: Mutex<()>,
     /// When the unknown-size sweep last ran from the host's size check.
     last_sweep: Mutex<Option<std::time::Instant>>,
+    /// A readiness poll's sweep of the held folders is running on the
+    /// blocking pool: a poll meanwhile starts no second one.
+    ready_sweeping: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Called by `sweep_relist` at its steps, for a test to interleave two.
@@ -4566,6 +4569,34 @@ impl Inner {
     /// gone is dropped; one left without a record is a removed download and
     /// becomes a tombstone; one still unreadable has its size measured again.
     /// Each verdict is logged, a repeat of an unchanged one is not.
+    /// [`Self::sweep_held`] on the blocking pool, unless one started there
+    /// is still running.
+    fn sweep_held_elsewhere(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.ready_sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        /// Clears the flag however the sweep ends, a panic included.
+        struct Done(Arc<Inner>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.ready_sweeping.store(false, Ordering::Release);
+            }
+        }
+        let done = Done(Arc::clone(self));
+        let handle = self.env.runtime.spawn_blocking(move || {
+            done.0.sweep_held(Sweep::Ordinary);
+            drop(done);
+        });
+        #[cfg(test)]
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+        #[cfg(not(test))]
+        drop(handle);
+    }
+
     fn sweep_held(self: &Arc<Self>, sweep: Sweep) {
         for dir in self.claim_held() {
             let now = read_held(&dir);
@@ -5011,6 +5042,7 @@ impl DiskVideoStore {
             state: Mutex::new(State::default()),
             saves: Mutex::new(()),
             last_sweep: Mutex::new(None),
+            ready_sweeping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -5262,6 +5294,21 @@ impl VideoStore for DiskVideoStore {
             .filter(|v| v.user == user)
             .cloned()
             .collect()
+    }
+
+    fn ready_videos(&self, user: &str) -> Vec<KeptVideo> {
+        // The list in memory: the poll runs on the UI thread, and the held
+        // folders' recovery (manifests read again, folders measured) can
+        // take long on a big one. It runs on the blocking pool instead, and
+        // a download it brings back Ready is seen by the next poll.
+        let ready = lock(&self.inner.state)
+            .list
+            .iter()
+            .filter(|v| v.user == user && v.ready())
+            .cloned()
+            .collect();
+        self.inner.sweep_held_elsewhere();
+        ready
     }
 
     fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
@@ -10973,6 +11020,24 @@ pub(crate) mod tests {
         assert!(store.size_unknown(), "the damaged manifest did not block");
         assert_eq!(store.unreadable_count(), 1);
         (rig, store, good, manifest)
+    }
+
+    /// CR 4642574435: the readiness poll answers from memory and runs the
+    /// held folders' recovery on the blocking pool. The poll that starts it
+    /// does not see its result; a later one sees the download Ready.
+    #[tokio::test]
+    async fn a_readiness_poll_recovers_held_folders_off_the_ui_thread() {
+        let (_rig, store, good, manifest) = held_download("ready-poll").await;
+        std::fs::write(&manifest, good).unwrap();
+        assert!(
+            store.ready_videos("u1").is_empty(),
+            "the poll swept the held folders on its own thread"
+        );
+        store.settled().await;
+        let ready = store.ready_videos("u1");
+        assert_eq!(ready.len(), 1, "the recovery off the UI thread did not run");
+        assert!(!store.size_unknown());
+        store.settled().await;
     }
 
     /// A manifest that reads again (a schema a newer build wrote, back on a
