@@ -283,6 +283,9 @@ pub fn session_replaced<A>(session: &Session<A>) {
     let (now, verdict, reason, user) = with_id(|st| {
         st.generation = st.generation.wrapping_add(1);
         st.session_token = Some(session.token.clone());
+        // A cold start that found nobody did so for the session before:
+        // this one's token may be paired, so the next ask reads again.
+        st.cold_tried = false;
         let i = &mut st.identity;
         let (verdict, reason, user) = match i.clone() {
             Identity::User(u) | Identity::Fenced(u) if paired.as_deref() == Some(u.as_str()) => {
@@ -2730,6 +2733,28 @@ pub(crate) mod tests {
             );
             assert_eq!(identity(), Identity::User(answer.to_owned()));
         }
+    }
+
+    /// A cold start that found nobody is not read again for the same
+    /// session, but a new session is a new chance: its token may be paired
+    /// with the remembered user.
+    #[test]
+    fn a_new_session_reads_the_cold_start_again() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        assert_eq!(last_user(), None, "no token paired yet");
+        assert!(
+            with_id(|s| s.cold_tried),
+            "the empty read was not remembered"
+        );
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        assert_eq!(last_user(), None, "the same session read again");
+        session_replaced(&session(()));
+        assert!(
+            !with_id(|s| s.cold_tried),
+            "a new session kept the empty read"
+        );
+        assert_eq!(last_user().as_deref(), Some("A"));
     }
 
     #[test]
