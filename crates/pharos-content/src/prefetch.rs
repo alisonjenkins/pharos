@@ -1486,10 +1486,18 @@ mod tests {
     fn a_pin_between_a_permanent_failure_and_the_give_up_is_queued() {
         // Declared first, so dropped last.
         let dir = TmpDir::new("auto-dl-pin-before-give-up");
-        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
+        // Ample free space: the job reaches the resolver, not the low-disk
+        // preflight, whatever the host's disk holds.
+        let cache =
+            Arc::new(Cache::open_with_probe(&dir, 1 << 20, Box::new(|_| Ok(u64::MAX))).unwrap());
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let counted = resolves.clone();
         let gate = Arc::new(Gate {
             cache: cache.clone(),
-            resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
+            resolve: Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(ResolveError::Permanent("no stream".into()))
+            }),
             tuning: fast(),
             online: AtomicBool::new(true),
             online_epoch: AtomicU64::new(0),
@@ -1526,6 +1534,11 @@ mod tests {
             .build()
             .unwrap()
             .block_on(gate.job("track/1", 0));
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "the job ended before the permanent resolver"
+        );
         BEFORE_GIVE_UP.with(|h| *h.borrow_mut() = None);
         assert_eq!(
             gate.lock().pinned,
@@ -1541,10 +1554,18 @@ mod tests {
     fn a_pin_arriving_after_a_job_failed_for_good_is_queued() {
         // Declared first, so dropped last.
         let dir = TmpDir::new("auto-dl-pin-after-fail");
-        let cache = Arc::new(Cache::open(&dir, 1 << 20).unwrap());
+        // Ample free space: the job reaches the resolver, not the low-disk
+        // preflight, whatever the host's disk holds.
+        let cache =
+            Arc::new(Cache::open_with_probe(&dir, 1 << 20, Box::new(|_| Ok(u64::MAX))).unwrap());
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let counted = resolves.clone();
         let gate = Arc::new(Gate {
             cache: cache.clone(),
-            resolve: Arc::new(|_| Err(ResolveError::Permanent("no stream".into()))),
+            resolve: Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(ResolveError::Permanent("no stream".into()))
+            }),
             tuning: fast(),
             online: AtomicBool::new(true),
             online_epoch: AtomicU64::new(0),
@@ -1574,6 +1595,11 @@ mod tests {
             .build()
             .unwrap()
             .block_on(gate.job("track/1", 0));
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "the job ended before the permanent resolver"
+        );
         // The worker has not cleared the job yet.
         cache.pin("album/a", &ids(&["track/1"]));
         assert_eq!(dl.enqueue(&ids(&["track/1"])), 1, "the pin was not counted");
