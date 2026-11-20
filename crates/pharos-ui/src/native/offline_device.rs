@@ -19,6 +19,55 @@ use super::offline_library::{Catalogue, OfflineLibrary, OnDevice, STORE_KEY};
 use super::offline_video;
 use super::platform;
 
+/// Names the browser's poster caches, `pharos-art-<user>` (ADR-0149).
+pub const ART_PREFIX: &str = "pharos-art-";
+
+/// The width a poster is stored at; a card at any width is answered with
+/// it offline.
+pub const ART_WIDTH: u32 = 360;
+
+/// The key a poster is stored under: its URL without the width and format
+/// a card asks for, so every card size finds the one stored copy. The
+/// service worker makes the same key (`assets/sw.js` `artKey`).
+pub fn art_key(url: &str) -> String {
+    let Some((path, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.is_empty() && !p.starts_with("fillWidth=") && !p.starts_with("format="))
+        .collect();
+    if kept.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
+/// The pictures of every noted item, for the poster store.
+pub fn art_of(catalogue: &Catalogue) -> Vec<String> {
+    catalogue
+        .snaps
+        .values()
+        .filter(|s| s.kind != "library")
+        .filter_map(|s| s.image.clone())
+        .collect()
+}
+
+/// Brings the browser's posters in line with the notes; nothing elsewhere.
+pub async fn sync_art(user: &str) {
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    super::offline_art_web::keep_art(user, &art_of(&load_catalogue(user))).await;
+    #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+    let _ = user;
+}
+
+/// Forgets the browser's posters, as signing out forgets what is kept.
+pub async fn forget_art() {
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    super::offline_art_web::forget_art().await;
+}
+
 /// The most parents a note walks up: as `trail::MAX_STEPS`.
 const MAX_STEPS: usize = 5;
 
@@ -286,6 +335,22 @@ mod tests {
         assert!(run(note_one(&server, &info, &mut c, ItemRef::Real(102))));
         assert_eq!(c.snaps.len(), before.len() + 1);
         assert!(!run(note_one(&server, &info, &mut c, ItemRef::Real(999))));
+    }
+
+    /// Every card width and format finds the one stored poster (V1487).
+    #[test]
+    fn the_art_key_drops_only_the_width_and_format() {
+        let stored = art_key("https://h/Items/7/Images/Primary?tag=ab&fillWidth=360");
+        for asked in [
+            "https://h/Items/7/Images/Primary?tag=ab&fillWidth=240&format=avif",
+            "https://h/Items/7/Images/Primary?fillWidth=480&tag=ab",
+            "https://h/Items/7/Images/Primary?tag=ab",
+        ] {
+            assert_eq!(art_key(asked), stored, "{asked}");
+        }
+        assert_eq!(stored, "https://h/Items/7/Images/Primary?tag=ab");
+        assert_eq!(art_key("https://h/x?fillWidth=1"), "https://h/x");
+        assert_ne!(art_key("https://h/Items/7/Images/Primary?tag=cd"), stored);
     }
 
     #[test]

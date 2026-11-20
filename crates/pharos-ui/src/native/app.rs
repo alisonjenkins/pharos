@@ -2012,6 +2012,9 @@ fn NativeApp(route: Route) -> Element {
                 if filled.noted > 0 || filled.failed > 0 {
                     platform::info(&filled.log_line(platform::now_ms() - began));
                 }
+                if filled.noted > 0 || filled.pruned > 0 {
+                    super::offline_device::sync_art(&user).await;
+                }
             }
         })
     });
@@ -2389,6 +2392,7 @@ fn NativeApp(route: Route) -> Element {
                             if filled.kept > 0 {
                                 platform::info(&filled.log_line(platform::now_ms() - began));
                             }
+                            super::offline_device::sync_art(&user).await;
                         });
                     }
                     claim_queue(queue, held, &me.id);
@@ -2455,6 +2459,7 @@ fn NativeApp(route: Route) -> Element {
                                     forget_kept_books("sign-out").await;
                                     offline_video::forget_user();
                                     super::offline_device::forget_catalogue();
+                                    super::offline_device::forget_art().await;
                                 }
                             });
                         },
