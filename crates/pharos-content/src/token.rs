@@ -44,6 +44,10 @@ pub enum Fence {
     Token(String),
     /// The token left behind could not be named: every token is refused.
     Every,
+    /// A store installed the token with this fingerprint over an unnamed
+    /// fence: that token is allowed, and every other one, an older link's
+    /// included, stays refused.
+    AllBut(String),
 }
 
 impl Fence {
@@ -64,6 +68,7 @@ impl Fence {
             Self::Open => false,
             Self::Token(fp) => fingerprint(token) == *fp,
             Self::Every => true,
+            Self::AllBut(fp) => fingerprint(token) != *fp,
         }
     }
 
@@ -73,24 +78,24 @@ impl Fence {
             Self::Open => "open",
             Self::Token(_) => "token",
             Self::Every => "every",
+            Self::AllBut(_) => "all_but",
         }
     }
 
     /// The fence once a store installed the token fingerprinted `stored`
-    /// over the one fingerprinted `replaced` (when that could be read).
+    /// (over the one fingerprinted `replaced`, when that could be read).
     /// A fence naming another token stays: it refuses only that token. One
-    /// naming the stored token, or none, opens. An unnamed one names the
-    /// token the store overwrote, if it could be read and differs, and
-    /// opens otherwise: the token it could not name is no longer on file.
+    /// naming the stored token, or none, opens. An unnamed one allows the
+    /// stored token and nothing else: the write proves what is on disk
+    /// now, not which token an older live link still holds, so every
+    /// other token, the replaced one included, stays refused.
     pub fn after_store(&self, stored: &str, replaced: Option<&str>) -> Self {
+        let _ = replaced;
         match self {
             Self::Open => Self::Open,
             Self::Token(fp) if fp != stored => self.clone(),
             Self::Token(_) => Self::Open,
-            Self::Every => match replaced {
-                Some(old) if old != stored => Self::Token(old.to_owned()),
-                _ => Self::Open,
-            },
+            Self::Every | Self::AllBut(_) => Self::AllBut(stored.to_owned()),
         }
     }
 }
@@ -1810,6 +1815,29 @@ pub(crate) mod tests {
             "the fence followed an unconfirmed store"
         );
         assert!(!is_store_incomplete(&store(&p, "").unwrap_err()));
+        set_fence(&p, Fence::Open, "test");
+    }
+
+    /// CR 4640611307: a store over an unnamed fence that cannot read the
+    /// token it replaces allows the new token and nothing else: an older
+    /// link's token stays refused.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_store_over_an_unnamed_fence_keeps_older_tokens_refused() {
+        let d = dir("fence-all-but");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        set_fence(&p, Fence::Every, "test");
+        FAIL_PREVIOUS_READ.with(|f| f.set(true));
+        store(&p, "tokB").unwrap();
+        FAIL_PREVIOUS_READ.with(|f| f.set(false));
+        let f = fence(&p);
+        assert!(
+            f.refuses("tokA"),
+            "an older link's token was allowed: {f:?}"
+        );
+        assert!(!f.refuses("tokB"));
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
         set_fence(&p, Fence::Open, "test");
     }
 }
