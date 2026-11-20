@@ -5,7 +5,6 @@
 //! [`VideoStore`].
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
@@ -404,48 +403,54 @@ fn refreshed(shown: &Listing, now: Listing) -> Option<Listing> {
     (*shown != now).then_some(now)
 }
 
+/// What a poll reads: the listing of the authorized offline owner as it
+/// is now ([`offline_video::last_user`]), not of the user the last render
+/// saw. A fence that props and signals do not show (the owner becoming
+/// nobody) changes the listing's owner, and the poll sets it: the screen
+/// renders again for whoever is authorized now.
+fn polled(store: Option<&dyn VideoStore>) -> Listing {
+    listing(store, offline_video::last_user().as_deref())
+}
+
 /// The user's listing, re-read every [`POLL_MS`] while the component lives.
-fn use_listing(user: Option<String>) -> Signal<Listing> {
-    // Each render hands the poller the user as it is now.
-    let current = use_hook(|| Rc::new(RefCell::new(user.clone())));
-    *current.borrow_mut() = user;
-    let read = {
-        let current = Rc::clone(&current);
-        move || listing(video_store().as_deref(), current.borrow().as_deref())
-    };
-    let mut shown = use_signal(read.clone());
-    use_future(move || {
-        let read = read.clone();
-        async move {
-            poll_every(
-                platform::SLEEP_IS_REAL,
-                || platform::sleep_ms(POLL_MS),
-                || {
-                    let (was, was_left) = {
-                        let s = shown.peek();
-                        (s.unreadable, s.leftover)
-                    };
-                    let next = refreshed(&shown.peek(), read());
-                    if let Some(now) = next {
-                        if now.unreadable != was {
-                            platform::info(&format!(
-                                "pharos: video listing unreadable verdict=changed from={was} to={}",
-                                now.unreadable
-                            ));
-                        }
-                        if now.leftover != was_left {
-                            platform::info(&format!(
-                                "pharos: video listing leftover verdict=changed from={was_left} to={}",
-                                now.leftover
-                            ));
-                        }
-                        shown.set(now);
+fn use_listing() -> Signal<Listing> {
+    let read = move || polled(video_store().as_deref());
+    let mut shown = use_signal(read);
+    use_future(move || async move {
+        poll_every(
+            platform::SLEEP_IS_REAL,
+            || platform::sleep_ms(POLL_MS),
+            || {
+                let (was, was_left) = {
+                    let s = shown.peek();
+                    (s.unreadable, s.leftover)
+                };
+                let next = refreshed(&shown.peek(), read());
+                if let Some(now) = next {
+                    if now.owner != shown.peek().owner {
+                        platform::info(&format!(
+                            "pharos: video listing owner verdict=changed authorized_user={}",
+                            now.owner.is_some()
+                        ));
                     }
-                    true
-                },
-            )
-            .await;
-        }
+                    if now.unreadable != was {
+                        platform::info(&format!(
+                            "pharos: video listing unreadable verdict=changed from={was} to={}",
+                            now.unreadable
+                        ));
+                    }
+                    if now.leftover != was_left {
+                        platform::info(&format!(
+                            "pharos: video listing leftover verdict=changed from={was_left} to={}",
+                            now.leftover
+                        ));
+                    }
+                    shown.set(now);
+                }
+                true
+            },
+        )
+        .await;
     });
     shown
 }
@@ -459,7 +464,7 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     };
     let ctx = use_context::<Ctx>();
     let user = use_user();
-    let listing = use_listing(user.clone());
+    let listing = use_listing();
     let id = detail.item.id;
     let item = id.to_string();
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
@@ -574,7 +579,7 @@ pub fn VideoDownloads(
         return rsx! {};
     };
     let user = use_user();
-    let listing = use_listing(user.clone());
+    let listing = use_listing();
     let nav = use_context::<Nav>();
     // Both figures from one read: the polled one while it was read for this
     // user, else a fresh one.
@@ -1384,6 +1389,28 @@ mod tests {
             "music's change left the old usage on screen"
         );
         assert_eq!(listing(Some(&store), None).usage, None);
+    }
+
+    /// CR 4642574429: a poll reads the authorized owner as it is now. Once
+    /// a replacement session fences A, the polled listing is nobody's and
+    /// differs from A's on screen, so the screen renders again without A's
+    /// rows, though no prop or signal changed.
+    #[test]
+    fn a_poll_after_a_fence_drops_the_previous_owners_rows() {
+        use std::sync::atomic::AtomicU64;
+        let store = Shared(AtomicU64::new(0));
+        offline_video::remember_user("A");
+        let shown = polled(Some(&store));
+        assert_eq!(shown.owner.as_deref(), Some("A"));
+        offline_video::session_replaced(&offline_video::Session::opened(
+            (),
+            Some("tokB".to_owned()),
+        ));
+        let now = polled(Some(&store));
+        offline_video::forget_user();
+        assert_eq!(now.owner, None, "the poll read A's listing after the fence");
+        assert!(now.videos.is_empty());
+        assert!(refreshed(&shown, now).is_some(), "the poll kept A's rows");
     }
 
     /// A listing read for A is never shown once the screen is B's: B's
