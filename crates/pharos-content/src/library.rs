@@ -2613,17 +2613,9 @@ mod tests {
     fn a_download_held_mid_window_is_outstanding_until_the_job_ends() {
         use crate::prefetch::{Downloader, Resolver, Tuning, FREE_CHECK_BYTES};
         use crate::testserver::{Script, TestServer};
-        let dir = std::env::temp_dir().join(format!("pharos-lib-window-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        /// Removes the test's directory last: declared before the library
-        /// and downloader, it drops after them, even when an assertion fails.
-        struct RemoveOnDrop(PathBuf);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = RemoveOnDrop(dir.clone());
+        // Declared before the library and downloader, the folder drops
+        // after them, even when an assertion fails.
+        let dir = TmpDir::new("lib-window");
         let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
         let (script, release, reached) = Script::default()
             .file("/audio/1", vec![7u8; size])
@@ -2703,22 +2695,12 @@ mod tests {
         _srv: Arc<crate::testserver::TestServer>,
         // Fields drop in declaration order: last, so the folder goes only
         // after the library's downloader has shut down.
-        _cleanup: RemoveOnDrop,
-    }
-
-    /// Removes a test's directory last, even when an assertion fails.
-    struct RemoveOnDrop(PathBuf);
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+        _cleanup: TmpDir,
     }
 
     fn held_rig(tag: &str, script: crate::testserver::Script) -> HeldRig {
         use crate::prefetch::{Downloader, Resolver, Tuning};
-        let dir = std::env::temp_dir().join(format!("pharos-lib-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cleanup = RemoveOnDrop(dir.clone());
+        let dir = TmpDir::new(&format!("lib-{tag}"));
         let srv = Arc::new(crate::testserver::TestServer::start(script));
         let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
         let cache = Arc::new(
@@ -2734,9 +2716,9 @@ mod tests {
         downloader.set_online(true);
         assert!(lib.offline.set(Offline { cache, downloader }).is_ok());
         HeldRig {
-            _cleanup: cleanup,
             lib,
             _srv: srv,
+            _cleanup: dir,
         }
     }
 
