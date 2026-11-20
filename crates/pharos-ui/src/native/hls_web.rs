@@ -9,7 +9,7 @@ use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
 use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
 use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
-use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Watch};
+use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Verdict as RetryVerdict, Watch};
 use pharos_hls::stall::{Sample, Verdict as StallVerdict, Watchdog};
 use pharos_hls::timeline::same_grid;
 use wasm_bindgen::closure::Closure;
@@ -20,10 +20,11 @@ use super::platform::{
     sleep_ms, video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
-    HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
-    PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
+    abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, playlist_retry_policy,
+    ranges_to_ms, rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal,
+    FragmentLoad, HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal,
+    OnFragment, PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery,
+    StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -346,7 +347,7 @@ fn finish_track_cleanup((sb, controller, listeners): TrackCleanup) {
 }
 
 async fn load(weak: Weak<RefCell<Session>>) {
-    let Some((url, start_ms, epoch, generation)) = weak.upgrade().and_then(|s| {
+    let Some((url, start_ms, epoch, generation, playlist_policy)) = weak.upgrade().and_then(|s| {
         let mut s = s.borrow_mut();
         s.on_source_open = None;
         (!s.dead).then(|| {
@@ -355,6 +356,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 s.start_ms,
                 s.recovery.epoch(),
                 s.generation_floor,
+                playlist_retry_policy(s.deadlines),
             )
         })
     }) else {
@@ -363,7 +365,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     // Only the Rust engine asks for the ladder; a fallback to hls.js loads `url`.
     let master_url = with_abr(&url);
-    let master_text = match get_text(&master_url).await {
+    let master_text = match get_playlist(&weak, &master_url, playlist_policy).await {
         Ok(text) => text,
         Err((status, reason)) => {
             fail_manifest(&weak, "manifestLoadError", status, &reason, &master_url);
@@ -383,7 +385,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
             fallback(&weak, cause, &value).await;
             return;
         }
-        let video_text = match get_text(&variant.uri).await {
+        let video_text = match get_playlist(&weak, &variant.uri, playlist_policy).await {
             Ok(t) => t,
             Err((status, reason)) => {
                 fail_manifest(&weak, "levelLoadError", status, &reason, &variant.uri);
@@ -404,7 +406,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
             }
         };
         let audio_pl = if let Some(audio_uri) = pick_audio_uri(&master, variant) {
-            let audio_text = match get_text(&audio_uri).await {
+            let audio_text = match get_playlist(&weak, &audio_uri, playlist_policy).await {
                 Ok(t) => t,
                 Err((status, reason)) => {
                     fail_manifest(&weak, "audioTrackLoadError", status, &reason, &audio_uri);
@@ -1816,6 +1818,44 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
             "pharos: playback engine=rust end_of_stream refused reason={}",
             js_message(&err)
         ));
+    }
+}
+
+/// Fetch a playlist the start needs, trying again after a network failure or
+/// a 5xx under `policy` (B1491). Stops once the session is torn down.
+async fn get_playlist(
+    weak: &Weak<RefCell<Session>>,
+    url: &str,
+    policy: RetryPolicy,
+) -> Result<String, (Option<u16>, String)> {
+    let mut retries = Retries::new(policy);
+    loop {
+        let (status, reason) = match get_text(url).await {
+            Ok(text) => return Ok(text),
+            Err(e) => e,
+        };
+        let cause = status.map_or(Cause::Network, Cause::Http);
+        let status_label = status.map_or_else(|| "none".to_owned(), |s| s.to_string());
+        match retries.on_failure((), cause) {
+            RetryVerdict::Retry { attempt, after_ms } => {
+                warn(&format!(
+                    "pharos: playback engine=rust playlist retry attempt={attempt} after_ms={after_ms} cause={} status={status_label} reason={reason} url={url}",
+                    cause.label()
+                ));
+                sleep_ms(u32::try_from(after_ms).unwrap_or(u32::MAX)).await;
+                if !weak.upgrade().is_some_and(|s| !s.borrow().dead) {
+                    return Err((status, reason));
+                }
+            }
+            RetryVerdict::Fail { attempt, why } => {
+                warn(&format!(
+                    "pharos: playback engine=rust playlist gave up attempt={attempt} why={} cause={} status={status_label} url={url}",
+                    why.label(),
+                    cause.label()
+                ));
+                return Err((status, reason));
+            }
+        }
     }
 }
 
