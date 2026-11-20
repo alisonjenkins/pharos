@@ -1165,14 +1165,32 @@ pub fn offline_headers(file: &super::kept_video::StoredFile) -> [(&'static str, 
 /// The ready downloads of the remembered user, newest first; empty with no
 /// store or no remembered user.
 pub fn ready_for_last_user() -> Vec<KeptVideo> {
+    ready_snapshot().videos
+}
+
+/// One read of the ready videos and the owner they were read for: what a
+/// screen decides on, logs and renders, so all three agree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadyVideos {
+    /// The authorized owner the videos were read for ([`last_user`]).
+    pub owner: Option<String>,
+    pub videos: Vec<KeptVideo>,
+}
+
+/// The ready videos of the authorized owner, read once.
+pub fn ready_snapshot() -> ReadyVideos {
     let (Some(store), Some(user)) = (super::ports::video_store(), last_user()) else {
-        return Vec::new();
+        return ReadyVideos::default();
     };
-    store
+    let videos = store
         .videos(&user)
         .into_iter()
         .filter(KeptVideo::ready)
-        .collect()
+        .collect();
+    ReadyVideos {
+        owner: Some(user),
+        videos,
+    }
 }
 
 #[cfg(test)]

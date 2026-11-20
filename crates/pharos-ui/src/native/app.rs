@@ -2848,9 +2848,11 @@ fn kept_any() -> bool {
 /// device, the videos beside the books or music. `None` when nothing is, so
 /// the usual waiting page shows.
 fn offline_start(route: &Route) -> Option<Element> {
-    // Subscribed: a store published later shows its videos then.
-    let _store = super::kept_video_view::shown_video_store();
-    let videos = offline_video::ready_for_last_user();
+    // One owner-checked read decides the screen, the logged verdict and the
+    // rows. Subscribed: a store published later, or the ready videos
+    // changing, renders it again with a new read.
+    let ready = super::kept_video_view::shown_ready_snapshot();
+    let videos = &ready.videos;
     if let Route::Watch(id) = route {
         if videos.iter().any(|v| v.item == id.to_string()) {
             platform::info(&format!("pharos: offline start verdict=play item={id}"));
@@ -2874,9 +2876,6 @@ fn offline_start(route: &Route) -> Option<Element> {
         videos.len(),
         others.is_some()
     ));
-    // The video section renders from this read too, so a video removed
-    // after it never leaves the screen the verdict named blank.
-    let ready = videos.len();
     match (others, videos.is_empty()) {
         (others, true) => others,
         (Some(others), false) => Some(rsx! {

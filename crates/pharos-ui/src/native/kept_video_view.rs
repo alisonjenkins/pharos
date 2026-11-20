@@ -347,6 +347,34 @@ fn rows_for(
     fresh().videos
 }
 
+/// The rows a Downloads screen renders. Given the parent's snapshot (the
+/// offline start's, which its verdict was logged from), those rows, while
+/// they were read for `user`; else the polled listing's ([`rows_for`]).
+/// Never a second read beside the snapshot, and never another user's rows.
+fn downloads_rows(
+    snapshot: Option<&offline_video::ReadyVideos>,
+    shown: &Listing,
+    user: Option<&str>,
+    fresh: impl FnOnce() -> Listing,
+) -> Vec<KeptVideo> {
+    match snapshot {
+        Some(snap) => rows_for(
+            &Listing {
+                owner: snap.owner.clone(),
+                videos: snap.videos.clone(),
+                ..Listing::default()
+            },
+            user,
+            || {
+                let mut now = fresh();
+                now.videos.retain(KeptVideo::ready);
+                now
+            },
+        ),
+        None => rows_for(shown, user, fresh),
+    }
+}
+
 /// [`listing`] over a store in hand.
 fn listing_now(store: &dyn VideoStore, user: Option<&str>) -> Listing {
     listing(Some(store), user)
@@ -518,6 +546,10 @@ pub fn VideoDownloads(
     /// offline start, which only plays, does not).
     #[props(default = true)]
     settings: bool,
+    /// The rows to render, read once by the parent (the offline start,
+    /// which logged its verdict from them). `None`: the polled listing.
+    #[props(default)]
+    rows: Option<offline_video::ReadyVideos>,
 ) -> Element {
     let Some(store) = shown_video_store() else {
         return rsx! {};
@@ -561,7 +593,7 @@ pub fn VideoDownloads(
                 }
             }
             VideoList {
-                videos: rows_for(&listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
+                videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
                 used,
                 cap: store.cap_bytes(),
                 problem: discard.problem,
@@ -742,19 +774,58 @@ pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<S
     }
 }
 
+/// Bumped when the ready videos differ from the snapshot the offline start
+/// rendered: the start reads it ([`shown_ready_snapshot`]), so it reads,
+/// logs and renders a new snapshot.
+static OFFLINE_READY_CHANGED: GlobalSignal<u32> = Signal::global(|| 0);
+
+/// The ready videos for the offline start, read once per render: it renders
+/// again when they change or a store is published.
+pub fn shown_ready_snapshot() -> offline_video::ReadyVideos {
+    let _ = OFFLINE_READY_CHANGED.read();
+    let _ = shown_video_store();
+    offline_video::ready_snapshot()
+}
+
 /// The offline start's list of videos: the ready ones, which play with no
-/// server. `ready` is the count the parent read, logged and chose this
-/// screen by; nothing when it is 0. Not read again here: a video removed
-/// in between would leave the screen the verdict named blank.
+/// server. `ready` is the snapshot the parent read, logged and chose this
+/// screen by, and the rows render from it; nothing when it is empty. Not
+/// read again for the render: a poll that finds the videos changed has the
+/// parent take a new snapshot instead.
 #[component]
-pub fn OfflineVideos(ready: usize) -> Element {
-    if ready == 0 {
+pub fn OfflineVideos(ready: offline_video::ReadyVideos) -> Element {
+    let shown = use_hook(|| Rc::new(RefCell::new(ready.clone())));
+    *shown.borrow_mut() = ready.clone();
+    use_future(move || {
+        let shown = Rc::clone(&shown);
+        async move {
+            poll_every(
+                platform::SLEEP_IS_REAL,
+                || platform::sleep_ms(POLL_MS),
+                || {
+                    let now = offline_video::ready_snapshot();
+                    let was = shown.borrow().videos.len();
+                    if *shown.borrow() != now {
+                        platform::info(&format!(
+                            "pharos: offline videos verdict=changed from={was} to={}",
+                            now.videos.len()
+                        ));
+                        *shown.borrow_mut() = now;
+                        *OFFLINE_READY_CHANGED.write() += 1;
+                    }
+                    true
+                },
+            )
+            .await;
+        }
+    });
+    if ready.videos.is_empty() {
         return rsx! {};
     }
     rsx! {
         section { class: "pharos-offline", id: "pharos-offline-videos",
             h2 { "Offline: videos on this device" }
-            VideoDownloads { settings: false }
+            VideoDownloads { settings: false, rows: Some(ready) }
         }
     }
 }
@@ -1101,18 +1172,78 @@ mod tests {
     fn the_offline_videos_render_from_the_parents_read() {
         assert!(offline_video::ready_for_last_user().is_empty());
         fn root() -> Element {
-            rsx! { OfflineVideos { ready: 1 } }
+            rsx! {
+                OfflineVideos {
+                    ready: offline_video::ReadyVideos {
+                        owner: Some("A".into()),
+                        videos: vec![video("7", KeptState::Ready)],
+                    },
+                }
+            }
         }
         let mut dom = VirtualDom::new(root);
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Offline: videos on this device"), "{html}");
         fn none() -> Element {
-            rsx! { OfflineVideos { ready: 0 } }
+            rsx! { OfflineVideos { ready: offline_video::ReadyVideos::default() } }
         }
         let mut dom = VirtualDom::new(none);
         dom.rebuild_in_place();
         assert_eq!(dioxus_ssr::render(&dom), "");
+    }
+
+    /// CR 4638524434: the offline start renders the rows of the snapshot its
+    /// verdict was logged from. A video removed after that read (the second
+    /// read here finds none) still leaves the rendered rows matching the
+    /// logged count; a snapshot read for another user is never shown.
+    #[test]
+    fn the_offline_rows_are_the_snapshot_the_verdict_was_logged_from() {
+        let snapshot = offline_video::ReadyVideos {
+            owner: Some("A".into()),
+            videos: vec![video("7", KeptState::Ready)],
+        };
+        // The listing read after the snapshot: the video is gone.
+        let later = Listing {
+            owner: Some("A".into()),
+            ..Listing::default()
+        };
+        let logged = snapshot.videos.len();
+        let rows = downloads_rows(Some(&snapshot), &later, Some("A"), || {
+            unreachable!("read again beside the snapshot")
+        });
+        assert_eq!(rows.len(), logged, "the rows and the logged count differ");
+        thread_local! {
+            static ROWS: RefCell<Vec<KeptVideo>> = const { RefCell::new(Vec::new()) };
+        }
+        fn root() -> Element {
+            let videos = ROWS.with(|r| r.borrow().clone());
+            rsx! {
+                VideoList {
+                    videos,
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                }
+            }
+        }
+        ROWS.with(|r| *r.borrow_mut() = rows);
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("data-kind=\"video\""),
+            "no video row rendered: {html}"
+        );
+        // The snapshot is A's; the screen is B's: B's rows, read fresh.
+        let rows = downloads_rows(Some(&snapshot), &later, Some("B"), || Listing {
+            owner: Some("B".into()),
+            ..Listing::default()
+        });
+        assert!(rows.is_empty(), "A's rows were shown to B");
+        // No snapshot: the polled listing, as on the Downloads page.
+        assert!(downloads_rows(None, &later, Some("A"), Listing::default).is_empty());
     }
 
     /// A poll refreshes the screen when only the unreadable count changed:
