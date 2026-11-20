@@ -707,11 +707,11 @@ thread_local! {
         });
     /// The non-native player's `change` handler on its `TextTrackList`.
     static ON_TRACKS_CHANGE: std::cell::RefCell<Option<Closure<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
+        const { RefCell::new(None) };
     /// The `ResizeObserver` on the `<video>` in `CUE_VIDEO` and its callback,
     /// which lift the shown cues again for the player's new size.
     static CUE_RESIZE: std::cell::RefCell<Option<CueResize>> =
-        const { std::cell::RefCell::new(None) };
+        const { RefCell::new(None) };
 }
 
 /// The `<video>` a `ResizeObserver` watches, the observer and the callback
@@ -3880,8 +3880,21 @@ pub(super) fn js_message(e: &JsValue) -> String {
 #[derive(Default)]
 pub(super) struct HlsJs {
     player: Option<HlsPlayer>,
+    /// The token its requests carry (the Rust engine's fallback on the
+    /// Android app's page, which has no cookie for the server).
+    token: Option<Rc<str>>,
     ceiling: Rc<RefCell<super::playback::BufferCeiling>>,
     _listeners: Vec<Closure<dyn FnMut(JsValue, JsValue)>>,
+}
+
+impl HlsJs {
+    /// An hls.js player whose requests carry `token` under
+    /// [`wants_token_header`](super::playback::wants_token_header).
+    pub(super) fn with_token(token: Option<Rc<str>>) -> Self {
+        let mut hls = Self::default();
+        hls.token = token;
+        hls
+    }
 }
 
 impl PlaybackEngine for HlsJs {
@@ -3901,6 +3914,55 @@ impl PlaybackEngine for HlsJs {
         for (key, value) in super::playback::hls_buffer_config() {
             js_sys::Reflect::set(&config, &key.into(), &value.into())
                 .map_err(|e| format!("hls.js config {key}={value}: {e:?}"))?;
+        }
+        // The Android app's page has no cookie for the server: hls.js sends
+        // the token its Rust engine sends, under the same rule.
+        let xhr_setup = self.token.clone().map(|token| {
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |xhr: JsValue, url: JsValue| {
+                let url = url.as_string().unwrap_or_default();
+                if !super::playback::wants_token_header(&url) {
+                    return;
+                }
+                let method = |name: &str| {
+                    js_sys::Reflect::get(&xhr, &name.into())
+                        .ok()
+                        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                };
+                // hls.js calls this before it opens the request, and a header
+                // can only be set on an open one: open it here, as hls.js's
+                // docs allow, and hls.js then sends it without reopening.
+                let unopened = js_sys::Reflect::get(&xhr, &"readyState".into())
+                    .ok()
+                    .and_then(|state| state.as_f64())
+                    .is_some_and(|state| state == 0.0);
+                if unopened {
+                    if let Some(open) = method("open") {
+                        let args =
+                            js_sys::Array::of3(&"GET".into(), &url.as_str().into(), &true.into());
+                        if let Err(e) = open.apply(&xhr, &args) {
+                            warn(&format!(
+                                "pharos: hls.js xhrSetup could not open the request: {}",
+                                js_message(&e)
+                            ));
+                            return;
+                        }
+                    }
+                }
+                if let Some(set) = method("setRequestHeader") {
+                    if let Err(e) =
+                        set.call2(&xhr, &"X-Emby-Token".into(), &JsValue::from_str(&token))
+                    {
+                        warn(&format!(
+                            "pharos: hls.js xhrSetup could not set the token header: {}",
+                            js_message(&e)
+                        ));
+                    }
+                }
+            })
+        });
+        if let Some(setup) = &xhr_setup {
+            js_sys::Reflect::set(&config, &"xhrSetup".into(), setup.as_ref())
+                .map_err(|e| format!("hls.js config xhrSetup: {e:?}"))?;
         }
         let player = HlsPlayer::new(&config);
         let budget = Rc::new(RefCell::new(RecoveryBudget::new()));
@@ -3985,6 +4047,7 @@ impl PlaybackEngine for HlsJs {
         player.attach_media(&video);
         self.player = Some(player);
         self._listeners = vec![on_error, on_loaded];
+        self._listeners.extend(xhr_setup);
         Ok(())
     }
 }
@@ -4067,7 +4130,42 @@ impl Drop for HlsJs {
 /// Console lines carry URLs; their credentials stay out of the console, which
 /// ends up in screenshots and pasted logs.
 pub fn warn(message: &str) {
-    web_sys::console::warn_1(&super::report::redact(message).into());
+    // Redacted before either way out: the app's page hands its lines on to
+    // the Android log.
+    let message = super::report::redact(message);
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Line {
+            warn: true,
+            text: &message,
+        });
+        return;
+    }
+    web_sys::console::warn_1(&message.into());
+}
+
+/// A log line or a client event of this page.
+pub enum PageOutput<'a> {
+    Line { warn: bool, text: &'a str },
+    Event(&'a ClientEvent),
+}
+
+/// Where this page's log lines and client events go when the app that owns
+/// the log and the telemetry runs outside the page: the Android app, whose
+/// page runs only the HLS engine (`hls_page`).
+pub type PageSink = Box<dyn Fn(PageOutput<'_>)>;
+
+thread_local! {
+    static PAGE_SINK: RefCell<Option<Rc<PageSink>>> =
+        const { RefCell::new(None) };
+}
+
+/// From now on [`info`], [`warn`] and [`report_event`] hand everything to `sink`.
+pub fn set_page_sink(sink: PageSink) {
+    PAGE_SINK.with(|slot| *slot.borrow_mut() = Some(Rc::new(sink)));
+}
+
+fn page_sink() -> Option<Rc<PageSink>> {
+    PAGE_SINK.with(|slot| slot.borrow().clone())
 }
 
 pub use super::diagnostics::{forget_opt_in, load_opted_in, opted_in, set_opted_in};
@@ -4105,6 +4203,10 @@ pub fn install_telemetry(api: &NativeApi) {
 /// Submits one client event without waiting for it, if opted in. Opted out,
 /// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Event(&event));
+        return;
+    }
     // Kept locally whatever the opt-in: it leaves only inside a pressed report.
     super::report::record_event(&event);
     if let Some((api, event)) = diagnostics::report(event) {
@@ -4142,7 +4244,17 @@ fn hls_event(
 }
 
 pub fn info(message: &str) {
-    web_sys::console::info_1(&super::report::redact(message).into());
+    // Redacted before either way out: the app's page hands its lines on to
+    // the Android log.
+    let message = super::report::redact(message);
+    if let Some(sink) = page_sink() {
+        sink(PageOutput::Line {
+            warn: false,
+            text: &message,
+        });
+        return;
+    }
+    web_sys::console::info_1(&message.into());
 }
 
 /// The theme name stored under `key`. `Err` carries the browser's reason

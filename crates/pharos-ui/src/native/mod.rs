@@ -30,6 +30,8 @@ pub mod group_app;
 ))]
 mod group_rpc;
 pub mod group_session;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub mod hls_page;
 pub mod hls_trace;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod hls_web;

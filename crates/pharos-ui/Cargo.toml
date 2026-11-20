@@ -43,6 +43,13 @@ name = "pharos-tv-visualiser"
 path = "src/bin/tv_visualiser.rs"
 required-features = ["web"]
 
+# The Android app page's HLS engine (spec 031): built to wasm by
+# `scripts/tv-hls.sh`, carried in the APK.
+[[bin]]
+name = "pharos-tv-hls"
+path = "src/bin/tv_hls.rs"
+required-features = ["web"]
+
 [dependencies]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
