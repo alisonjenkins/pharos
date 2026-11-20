@@ -50,6 +50,9 @@ thread_local! {
     static AFTER_PART_LEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     /// Runs in a trim once its first part scan is read.
     static AFTER_TRIM_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs in an eviction of a retained part, with the cache's lock held,
+    /// before the part goes.
+    static BEFORE_PART_EVICT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Makes `truncate_part` fail.
     static TRUNCATE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1085,6 +1088,10 @@ impl Cache {
     /// Delete the retained `.part` of `id` and name it for the downloader
     /// to drop the state it kept to resume it. False when it would not go.
     fn remove_part_locked(&self, id: &str, bytes: u64, why: &str) -> bool {
+        #[cfg(test)]
+        if let Some(f) = BEFORE_PART_EVICT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
         match std::fs::remove_file(self.part_path(id)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1302,6 +1309,10 @@ impl Cache {
     /// A download job for `id` is running: its `.part` is not evicted
     /// until [`Cache::job_ended`].
     pub fn job_started(&self, id: &str) {
+        // Under the cache's lock, which an eviction of a part holds from
+        // choosing it to naming it: the eviction sees this job, or its
+        // notice is out before the job reads the state it kept.
+        let _s = self.lock();
         self.active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2829,5 +2840,41 @@ pub(crate) mod tests {
         assert!(verdict.is_ok(), "{verdict:?}");
         assert!(folder.exists());
         assert!(!c.part_path("file").exists(), "the regular part stayed");
+    }
+
+    /// CR 4640611255: a job that starts while an eviction holds the cache's
+    /// lock waits for it, so the eviction's notice is published before the
+    /// job reads its resume state, or the eviction sees the job.
+    #[test]
+    fn a_job_start_waits_for_a_part_eviction_in_progress() {
+        let d = tmp("evict-part-job-start");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 700).saturating_sub(parts))
+        });
+        let c = std::sync::Arc::new(Cache::open_with_probe(&d, 1 << 20, free).unwrap());
+        retained(&c, "old", 600, 100);
+        let c2 = c.clone();
+        BEFORE_PART_EVICT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let starter = std::thread::spawn(move || c2.job_started("old"));
+                wait_until_blocked(starter.thread().id());
+                std::mem::forget(starter);
+            }));
+        });
+        assert!(c.ensure_free("x", 300).is_ok());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !c.is_active("old") {
+            assert!(std::time::Instant::now() < until, "the job never started");
+            std::thread::yield_now();
+        }
+        assert_eq!(c.take_evicted_parts(), vec!["old".to_owned()]);
+        c.job_ended("old");
     }
 }
