@@ -436,20 +436,45 @@ pub fn marker(path: &Path, fingerprint: &str) -> Marker {
         return Marker::Unreadable("marker read failed".to_owned());
     }
     let marker_at = revoked_path(path, fingerprint);
-    // A clearing's guard is the marker until the clearing is done, whatever
-    // the marker says by then (see `clear_marker`).
-    let guard = clearing_guard(&marker_at);
-    let at = match std::fs::symlink_metadata(&guard) {
-        Ok(_) => guard,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => marker_at,
-        Err(e) => return Marker::Unreadable(e.to_string()),
-    };
-    match std::fs::symlink_metadata(&at) {
+    // A clearing's guard and the marker are both read, and the stronger
+    // refusal wins (`rank`): a genuine revocation outranks a guard naming
+    // an unconfirmed install, whichever file holds it, and a guard keeps
+    // refusing once the marker reads `cleared` (see `clear_marker`).
+    let guard = read_marker_file(&clearing_guard(&marker_at));
+    let at = read_marker_file(&marker_at);
+    if matches!(guard, Marker::Absent) {
+        return at;
+    }
+    if rank(&at) > rank(&guard) {
+        if matches!(&at, Marker::Present(r) if !r.install_unconfirmed) {
+            log::info!("token revocation marker verdict=revoked reason=revoked_over_guard");
+        }
+        at
+    } else {
+        guard
+    }
+}
+
+/// How strongly a marker state refuses its token: none, an unconfirmed
+/// install (a store of the same token may retry), a revocation, and a
+/// state that cannot be read (fail closed).
+fn rank(m: &Marker) -> u8 {
+    match m {
+        Marker::Absent => 0,
+        Marker::Present(r) if r.install_unconfirmed => 1,
+        Marker::Present(_) => 2,
+        Marker::Unreadable(_) => 3,
+    }
+}
+
+/// One marker file (the marker, or a clearing's guard) as a read finds it.
+fn read_marker_file(at: &Path) -> Marker {
+    match std::fs::symlink_metadata(at) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
         Err(e) => return Marker::Unreadable(e.to_string()),
     }
-    let raw = std::fs::read_to_string(&at).unwrap_or_default();
+    let raw = std::fs::read_to_string(at).unwrap_or_default();
     // A cleared marker is no marker (see `clear_marker`).
     if raw.trim_end() == CLEARED {
         return Marker::Absent;
@@ -2114,6 +2139,55 @@ pub(crate) mod tests {
         ));
         assert!(!fence(&p).refuses("tokC"), "a kept replacement was fenced");
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
+    }
+
+    /// CR 4647925841: a clearing that failed leaves a guard naming an
+    /// unconfirmed install. A session end that then cannot remove the token
+    /// writes a genuine revocation: it outranks the guard, so a store of
+    /// that token is refused, here and after a restart, and never clears it.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_revocation_outranks_a_failed_clearings_guard() {
+        let d = dir("revoked-over-guard");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        // The retry's clearing fails after its rename: the guard stays.
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(false));
+        assert!(clearing_guard(&revoked_path(&path, &fingerprint("new"))).exists());
+        // The session ends and the token will not go: a genuine revocation.
+        faults::REMOVE.with(|f| f.set(true));
+        let ended = end_session(&path, Some("new"), Some("u1"));
+        faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+        crate::testlog::start();
+        assert!(
+            revoked(&path, &fingerprint("new")).is_some_and(|r| !r.install_unconfirmed),
+            "the guard's unconfirmed install read over the revocation"
+        );
+        assert!(crate::testlog::lines().iter().any(
+            |l| l.contains("token revocation marker verdict=revoked reason=revoked_over_guard")
+        ));
+        let again = store(&path, "new");
+        assert!(
+            again.is_err(),
+            "a store cleared a genuine revocation: {again:?}"
+        );
+        assert_eq!(load(&path).unwrap(), None);
+        assert_eq!(
+            after_restart(&path),
+            None,
+            "the revoked token became readable"
+        );
+        assert!(
+            store(&path, "new").is_err(),
+            "refused after the restart too"
+        );
     }
 
     /// CR 4647745000: a retry whose clearing renamed, then could neither
