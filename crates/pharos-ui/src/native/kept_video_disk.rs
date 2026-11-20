@@ -1209,9 +1209,11 @@ impl Inner {
     fn keep_after_failed_unlink(&self, mut record: KeptVideo, dir: &Path, e: &std::io::Error) {
         // A regular file found is whole, whether or not the walk read
         // everything: one it missed is left unindexed, and the folder's own
-        // measure below keeps its bytes counted.
-        let names = match stored_entries(dir) {
-            Measure::Whole(e) | Measure::Short(e) => regular_files(&e),
+        // measure below keeps its bytes counted. A short walk leaves a Ready
+        // record with files its index lacks, so it does not come back Ready.
+        let (names, whole) = match stored_entries(dir) {
+            Measure::Whole(e) => (regular_files(&e), true),
+            Measure::Short(e) => (regular_files(&e), false),
         };
         #[cfg(test)]
         tests::at_unlink_failure();
@@ -1227,8 +1229,10 @@ impl Inner {
                 );
             }
         }
-        // Nothing runs it any more.
-        if matches!(record.state, KeptState::Downloading { .. }) {
+        // Nothing runs it any more; and a Ready one whose files could not
+        // all be indexed is no longer whole to the proxy.
+        let short_ready = !whole && record.ready();
+        if matches!(record.state, KeptState::Downloading { .. }) || short_ready {
             // A Failed record reports its estimate as its bytes: what the
             // download had written, or the folder holds, must not drop out
             // of what it reserves in the change.
@@ -1237,14 +1241,21 @@ impl Inner {
             let on_disk = dir_size(dir).counted(0);
             record.estimated_bytes = reserved(&record).max(on_disk);
             record.state = KeptState::Failed {
-                reason: format!("could not be removed: {e}"),
+                reason: if short_ready {
+                    format!(
+                        "could not be removed ({e}), and its files could not all be read: keep it again or remove it"
+                    )
+                } else {
+                    format!("could not be removed: {e}")
+                },
             };
         }
         emit(
             true,
             format!(
-                "pharos: video keep remove item={} verdict=not_removed manifest={} error={e}",
+                "pharos: video keep remove item={} verdict=not_removed index={} manifest={} error={e}",
                 record.item,
+                if whole { "whole" } else { "short" },
                 dir.join("manifest.json").display()
             ),
         );
@@ -10592,6 +10603,52 @@ pub(crate) mod tests {
         assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
         assert_eq!(store.kept_bytes(), kept, "counted twice or not at all");
         assert!(!store.size_unknown(), "the mark outlived the restore");
+    }
+
+    /// A Ready download brought back by a failed unlink over an inventory
+    /// that came back short is not left Ready with files missing from its
+    /// index: it comes back Failed, to be kept again, and says why.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_short_inventory_does_not_stay_ready() {
+        let rig = Rig::new("unlink-fails-short");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let kept = store.kept_bytes();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        let back = only(&store);
+        assert!(
+            matches!(back.state, KeptState::Failed { .. }),
+            "Ready over a short index: {:?}",
+            back.state
+        );
+        assert!(store.kept_bytes() >= kept, "its bytes dropped out");
+        assert!(
+            !lines("pharos: video keep remove item=1 verdict=not_removed index=short").is_empty()
+        );
+    }
+
+    /// The control: a whole inventory keeps a restored Ready download Ready.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_whole_inventory_stays_ready() {
+        let rig = Rig::new("unlink-fails-whole");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert!(only(&store).ready());
+        assert!(store.stored_file("u1", SEG0).is_some());
     }
 
     /// A run that a removal has revoked cannot recreate its folder or its
