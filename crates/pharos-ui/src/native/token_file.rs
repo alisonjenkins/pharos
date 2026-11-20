@@ -227,12 +227,6 @@ pub fn forget_if(path: &Path, seen: &str) -> Result<ForgetIf, String> {
     pharos_content::token::forget_if(path, seen).map_err(|e| e.to_string())
 }
 
-/// The file the older layout kept the user id in. Never read; removed when
-/// found, because the id it holds is not known to belong to the token.
-pub fn legacy_user_path(path: &Path) -> PathBuf {
-    pharos_content::token::legacy_user_path(path)
-}
-
 #[cfg(test)]
 mod sign_out_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

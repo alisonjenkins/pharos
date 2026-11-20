@@ -1,6 +1,6 @@
-//! The device token file, owned here whole (ADR 0145): the token on the
-//! first line and, optionally, the id of the user it was issued to on the
-//! second. The car's sign-in and the phone app both go through this module,
+//! The device token file, owned here whole (ADR 0145): the token alone,
+//! as the build before it reads the file, and beside it a pairing file
+//! naming the user the token was issued to, with the token's fingerprint. The car's sign-in and the phone app both go through this module,
 //! and every write of the file takes one process-wide lock, so a sign-in can
 //! never land between another writer's read and its write (a user id would
 //! otherwise sit beside a token it does not belong to, or a new token be
@@ -9,9 +9,9 @@
 //! The file is in a directory the caller names (the app's private files
 //! directory), replaced whole by a temp file of its own, fsynced and renamed
 //! (mode 0600), with the directory synced after, so a crash leaves the old
-//! file or the new one, never a mixture. A token with no user id (the older
-//! layout kept the id in a sidecar file, which is never trusted) is a token
-//! whose user is unknown. Never logs a value.
+//! file or the new one, never a mixture. A token whose pairing file is
+//! missing or names another token's fingerprint is a token whose user is
+//! unknown. Never logs a value.
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -200,7 +200,9 @@ pub struct Stored {
     pub user: Option<String>,
 }
 
-/// `None` for no token. A user id is the second line, when there is one.
+/// `None` for no token. The token is the first line. A second line is the
+/// user id of an earlier layout of this build, which kept the pair in one
+/// file: [`read_raw`] moves it to the pairing file.
 fn decode(raw: &str) -> Option<Stored> {
     let mut lines = raw.lines();
     let token = lines.next()?.trim().to_owned();
@@ -212,13 +214,6 @@ fn decode(raw: &str) -> Option<Stored> {
         .map(|u| u.trim().to_owned())
         .filter(|u| !u.is_empty());
     Some(Stored { token, user })
-}
-
-fn encode(token: &str, user: Option<&str>) -> String {
-    match user {
-        Some(u) => format!("{token}\n{u}\n"),
-        None => format!("{token}\n"),
-    }
 }
 
 /// The stored token and its user; `None` when the file is absent, holds no
@@ -267,13 +262,51 @@ pub fn read(path: &Path) -> Result<Option<Stored>, ContentError> {
     }
 }
 
-/// The file as it is, marker or not. The writers compare against this.
+/// The file as it is, marker or not, with the user its pairing file names
+/// for it. The writers compare against this. Called with the lock held.
+///
+/// The token file holds the token alone, as the build before ADR 0145
+/// wrote and reads it whole: a rollback to it reads a usable token. The
+/// user lives in the pairing file ([`user_path`]) with the fingerprint of
+/// the token it was paired with, and counts only while that is the token
+/// on file; otherwise the token is unpaired (fail closed). A token file in
+/// the earlier two-line layout is split on read: the pairing file first,
+/// then the token file rewritten to the token alone.
 fn read_raw(path: &Path) -> Result<Option<Stored>, ContentError> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(decode(&raw)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(err(path, e)),
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(err(path, e)),
+    };
+    let Some(stored) = decode(&raw) else {
+        return Ok(None);
+    };
+    if let Some(user) = &stored.user {
+        let migrated =
+            write_pair(path, user, &stored.token).and_then(|()| write(path, &stored.token));
+        match migrated {
+            Ok(()) => log::info!("token file verdict=migrated reason=paired_layout_split"),
+            Err(e) => log::warn!("token file verdict=not_migrated reason=split_failed error={e}"),
+        }
+        return Ok(Some(stored));
     }
+    Ok(Some(Stored {
+        user: paired_user(path, &stored.token),
+        ..stored
+    }))
+}
+
+/// The user the pairing file names for `token`: `None` when there is no
+/// pairing file, it cannot be read, or it names another token.
+fn paired_user(path: &Path, token: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(user_path(path)).ok()?;
+    let mut lines = raw.lines().map(str::trim);
+    let user = lines.next().filter(|u| !u.is_empty())?;
+    if lines.next() != Some(fingerprint(token).as_str()) {
+        log::debug!("token pairing verdict=unpaired reason=fingerprint_differs");
+        return None;
+    }
+    Some(user.to_owned())
 }
 
 /// The revocation marker beside the token file: written when a session
@@ -432,7 +465,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             format!("the revocation marker refuses the new token and cannot be removed: {e}"),
         ));
     }
-    write(path, token, None).map_err(|e| err(path, e))?;
+    write(path, token).map_err(|e| err(path, e))?;
     let dir = path.parent().ok_or_else(|| err(path, "no directory"))?;
     match durable_dir(dir) {
         Ok(()) => {}
@@ -530,7 +563,7 @@ pub fn store_user(path: &Path, user: &str) -> Result<(), ContentError> {
     #[cfg(test)]
     tests::between_read_and_write();
     match stored {
-        Some(s) => write(path, &s.token, Some(user)).map_err(|e| err(path, e)),
+        Some(s) => write_pair(path, user, &s.token).map_err(|e| err(path, e)),
         None => Err(err(path, "no token to keep the user with")),
     }
 }
@@ -554,7 +587,7 @@ pub enum Pairing {
 pub fn store_user_if(path: &Path, seen: &str, user: &str) -> Result<Pairing, ContentError> {
     let _held = hold();
     match read_raw(path)? {
-        Some(s) if s.token == seen.trim() => write(path, &s.token, Some(user))
+        Some(s) if s.token == seen.trim() => write_pair(path, user, &s.token)
             .map(|()| Pairing::Paired)
             .map_err(|e| err(path, e)),
         Some(_) => Ok(Pairing::TokenChanged),
@@ -873,6 +906,13 @@ fn remove(path: &Path) -> Result<Forgotten, ContentError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(absent(path)),
         Err(e) => return Err(err(path, e)),
     }
+    // The pairing goes with its token. One left behind pairs nothing but
+    // that same token, so a failure here is only logged.
+    match std::fs::remove_file(user_path(path)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("token pairing verdict=not_removed error={e}"),
+    }
     let Some(dir) = path.parent() else {
         return Ok(Forgotten::NotDurable("no directory".to_owned()));
     };
@@ -919,9 +959,11 @@ fn durable_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// The file the older layout kept the user id in. Never read; removed when
-/// found, because the id it holds is not known to belong to the token.
-pub fn legacy_user_path(path: &Path) -> PathBuf {
+/// The pairing file beside the token file: the user id on its first line
+/// and the fingerprint of the token it was paired with on its second
+/// ([`read_raw`]). One without a fingerprint (an earlier layout's) pairs
+/// nothing.
+pub fn user_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".user");
     PathBuf::from(name)
@@ -937,12 +979,32 @@ pub fn legacy_user_path(path: &Path) -> PathBuf {
 /// back); it is logged with its reason and the write succeeds, so the
 /// caller's memory and hooks follow the file. A failure before the install
 /// changes nothing and is an error.
-fn write(path: &Path, token: &str, user: Option<&str>) -> std::io::Result<()> {
+fn write(path: &Path, token: &str) -> std::io::Result<()> {
     #[cfg(test)]
     if tests::FAIL_WRITE.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("token write failed"));
     }
-    if token.contains('\n') || user.is_some_and(|u| u.contains('\n')) {
+    install(path, token, &format!("{token}\n"))
+}
+
+/// Pairs `user` with `token` in the pairing file, written whole as the
+/// token file is. Called with the lock held, after the token is on file.
+fn write_pair(path: &Path, user: &str, token: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_WRITE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("pairing write failed"));
+    }
+    install(
+        &user_path(path),
+        user,
+        &format!("{user}\n{}\n", fingerprint(token)),
+    )
+}
+
+/// Installs `contents` at `path` whole (see [`write`]); `value` is what a
+/// line break may not appear in.
+fn install(path: &Path, value: &str, contents: &str) -> std::io::Result<()> {
+    if value.contains('\n') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "a value holds a line break",
@@ -962,7 +1024,7 @@ fn write(path: &Path, token: &str, user: Option<&str>) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(encode(token, user).as_bytes())?;
+        f.write_all(contents.as_bytes())?;
         f.sync_all()?;
         if f.metadata()?.permissions().mode() & 0o077 != 0 {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -1282,7 +1344,7 @@ pub(crate) mod tests {
         let d = dir("legacy");
         let p = d.join("device-token");
         std::fs::write(&p, "tokB").unwrap();
-        std::fs::write(legacy_user_path(&p), "A").unwrap();
+        std::fs::write(user_path(&p), "A").unwrap();
         assert_eq!(read(&p).unwrap().unwrap().user, None);
     }
 
@@ -1892,5 +1954,49 @@ pub(crate) mod tests {
         store(&p, "tokC").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
         set_fence(&p, Fence::Open, "test");
+    }
+
+    /// CR 4640624099: the token file holds the token alone, as the base
+    /// build reads it whole, also once a user is paired; the pairing file
+    /// holds the user and the token's fingerprint.
+    #[test]
+    fn a_paired_token_file_holds_the_token_alone() {
+        let d = dir("pair-format");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        store_user(&p, "A").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "tokA");
+        assert_eq!(
+            std::fs::read_to_string(user_path(&p)).unwrap(),
+            format!("A\n{}\n", fingerprint("tokA"))
+        );
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+    }
+
+    /// CR 4640624099: a token file in the earlier two-line layout is split
+    /// on read: the user moves to the pairing file, the token file keeps
+    /// the token alone, and the pair reads as before.
+    #[test]
+    fn a_two_line_token_file_is_split_on_read() {
+        let d = dir("pair-migrate");
+        let p = d.join("device-token");
+        std::fs::write(&p, "tokA\nA\n").unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "tokA\n");
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+    }
+
+    /// CR 4640624099: a pairing file naming another token's fingerprint
+    /// pairs nothing: the token is unpaired (fail closed).
+    #[test]
+    fn a_pairing_for_another_token_leaves_the_token_unpaired() {
+        let d = dir("pair-mismatch");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        store_user(&p, "A").unwrap();
+        store(&p, "tokB").unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user, None);
+        std::fs::write(user_path(&p), format!("B\n{}\n", fingerprint("tokC"))).unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user, None);
     }
 }

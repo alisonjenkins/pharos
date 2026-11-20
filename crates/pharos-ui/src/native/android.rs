@@ -159,15 +159,6 @@ pub fn pair_token_user(seen: Option<&str>, user: &str) -> Result<(), String> {
     token_file::pair(&token_path()?, seen, user)
 }
 
-/// Removes the older layout's sidecar, best effort.
-fn drop_legacy_user(path: &std::path::Path) {
-    match std::fs::remove_file(token_file::legacy_user_path(path)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("legacy token user: {e}"),
-    }
-}
-
 /// The device token as last loaded, stored or forgotten, kept in memory for
 /// the server proxy, which sends it on every image request. Its lock is
 /// held across each file operation and the cache update that follows it,
@@ -249,12 +240,11 @@ pub fn store_token(token: &str) -> Result<(), String> {
         token_file::store(&path, token)?;
         *cached = Some(Some(token.to_owned()));
     }
-    drop_legacy_user(&path);
     note_credentials_changed("stored");
     Ok(())
 }
 
-/// Signs out on the device: the token and its user go (one file). What
+/// Signs out on the device: the token and its pairing go. What
 /// the removal left is the verdict; a file that would not go is
 /// `NotSaved`, and this process stays signed out all the same: the token
 /// is not read again until a new sign-in stores one.
@@ -272,11 +262,8 @@ pub fn store_token(token: &str) -> Result<(), String> {
 pub fn forget_token() -> token_file::SignedOut {
     token_file::forget_token_with(
         token_path,
-        |path| {
+        |_| {
             *token_lock() = Some(None);
-            if let Some(path) = path {
-                drop_legacy_user(path);
-            }
         },
         |notice| match notice {
             token_file::ServiceNotice::StaySignedOut => note_credentials_kept(),
@@ -310,7 +297,6 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
             return ended;
         }
         *cached = Some(None);
-        drop_legacy_user(&path);
         // An `Unsafe` end fenced its target in the operation, the media
         // service's reads included: it is asked to stay signed out below,
         // not to reload.
