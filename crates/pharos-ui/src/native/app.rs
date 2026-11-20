@@ -692,7 +692,7 @@ fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Ca
 
 /// The bitrate stored under `key`, read by `parse`; 0 when none. The warn
 /// text names the key's last segment (`max_bitrate`, `auto_rung`).
-fn stored_bitrate(key: &str, parse: fn(&str) -> u64) -> u64 {
+fn stored_bitrate(key: &str, parse: impl Fn(&str) -> u64) -> u64 {
     match platform::stored_theme(key) {
         Ok(stored) => stored.as_deref().map_or(0, parse),
         Err(e) => {
@@ -704,7 +704,20 @@ fn stored_bitrate(key: &str, parse: fn(&str) -> u64) -> u64 {
 }
 
 fn store_bitrate(key: &str, bps: u64) {
-    if let Err(e) = platform::store_theme(key, &bps.to_string()) {
+    store_bitrate_value(key, &bps.to_string());
+}
+
+/// Remember `bps` as the cap auto quality settled on, stamped with now so it
+/// lapses (B1487).
+fn store_rung(bps: u64) {
+    store_bitrate_value(
+        quality::AUTO_RUNG_KEY,
+        &quality::format_rung(bps, now_ms_u64()),
+    );
+}
+
+fn store_bitrate_value(key: &str, value: &str) {
+    if let Err(e) = platform::store_theme(key, value) {
         let name = key.rsplit('.').next().unwrap_or(key);
         platform::warn(&format!("pharos: {name} storage write failed error={e}"));
     }
@@ -5557,7 +5570,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // negotiation.
     let watch = use_hook(|| {
         let ceiling = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
-        let rung = stored_bitrate(quality::AUTO_RUNG_KEY, quality::parse_rung);
+        let rung = stored_bitrate(quality::AUTO_RUNG_KEY, |s| {
+            quality::parse_rung(s, now_ms_u64())
+        });
         let w = Watch::new(ceiling, rung, now_ms_u64());
         QualityWatch(Rc::new(RefCell::new(w)))
     });
@@ -6205,7 +6220,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                                             w.set_ceiling(bps, now);
                                             w.cap()
                                         };
-                                        store_bitrate(quality::AUTO_RUNG_KEY, kept);
+                                        store_rung(kept);
                                         platform::info(&format!(
                                             "pharos: max_bitrate set={} from=player auto={}",
                                             max_bitrate_label(bps),
@@ -6217,7 +6232,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                                     }
                                     None => {
                                         watch.0.borrow_mut().clear_cap(now);
-                                        store_bitrate(quality::AUTO_RUNG_KEY, 0);
+                                        store_rung(0);
                                         platform::info("pharos: auto quality reset from=player");
                                         notify("Resetting Auto quality…".to_owned());
                                         auto_cap.set(0);
@@ -6236,7 +6251,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                                 if before != cap {
                                     notify(quality_notice(before, cap));
                                 }
-                                store_bitrate(quality::AUTO_RUNG_KEY, cap);
+                                store_rung(cap);
                                 auto_cap.set(cap);
                             }
                         },
