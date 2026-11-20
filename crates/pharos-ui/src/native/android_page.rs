@@ -435,10 +435,10 @@ pub fn has_mse() -> bool {
     true
 }
 
-/// hls.js plays every HLS stream here, whichever engine was asked for
-/// (B1366, V1336).
+/// The Rust engine plays in the page when asked for; hls.js stands in for
+/// the WebView's own HLS (B1366, V1336).
 pub fn hls_engine_used(picked: Engine) -> Option<(Engine, &'static str)> {
-    matches!(picked, Engine::NativeHls | Engine::RustHls).then_some((Engine::HlsJs, "android"))
+    tv_page::hls_engine_used(picked)
 }
 
 /// What the WebView decodes, as `open` probed it, with no container the
@@ -1432,8 +1432,8 @@ pub fn on_page_lifecycle(
     PageLifecycle(listen(Listener::Hidden(Box::new(on_hidden))))
 }
 
-/// hls.js for every HLS stream; the Rust engine (spec 031) is the web
-/// build's, so it hands over to hls.js here. Video never direct-plays
+/// The Rust engine (spec 031) runs in the page as its own wasm module;
+/// hls.js plays the rest of the HLS streams. Video never direct-plays
 /// (`tv_page::NO_DIRECT_PLAY`), but a song's stream is a plain file, so a
 /// direct stream plays from the server with the media token (B1029, V988).
 pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
@@ -1445,11 +1445,144 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
             engine.token = wait_for_media_token().await?;
             Ok(Box::new(engine))
         }
-        Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
+        Engine::RustHls => {
+            load_engine().await?;
+            Ok(Box::new(PageEngine::default()))
+        }
+        Engine::HlsJs | Engine::NativeHls => {
             load_hlsjs().await?;
             Ok(Box::new(HlsJs::default()))
         }
         Engine::Unsupported => Err("this TV cannot play HLS".into()),
+    }
+}
+
+/// The Rust HLS engine's module: this crate's `pharos-tv-hls` bin, built to
+/// wasm with its wasm-bindgen glue by `scripts/tv-hls.sh`.
+const ENGINE_JS: &str = include_str!("../../assets/generated/tv-hls.js");
+const ENGINE_WASM_B64: &str = include_str!("../../assets/generated/tv-hls.wasm.b64");
+
+/// Load the engine's module into the page once; concurrent callers share the
+/// one load.
+async fn load_engine() -> Result<(), String> {
+    let script = tv_page::engine_load_js(ENGINE_JS, ENGINE_WASM_B64.trim());
+    let at = now_ms();
+    let loaded = match page_eval(&script).join::<bool>().await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("the engine module loaded nothing".to_owned()),
+        Err(e) => Err(format!("engine module: {e}")),
+    };
+    match &loaded {
+        Ok(()) => log::info!(
+            "pharos: playback engine=rust module outcome=loaded wasm_b64_bytes={} took_ms={:.0}",
+            ENGINE_WASM_B64.len(),
+            now_ms() - at
+        ),
+        Err(e) => log::warn!(
+            "pharos: playback engine=rust module outcome=failed took_ms={:.0} error={e}",
+            now_ms() - at
+        ),
+    }
+    loaded
+}
+
+/// The Rust HLS engine playing in the page (`hls_page`). Its failures and
+/// segment loads come back through the bridge, as do its log lines and client
+/// events, which the bridge itself passes on. Dropping it ends the play.
+#[derive(Default)]
+struct PageEngine {
+    video_id: String,
+    listener: Option<u64>,
+    /// Which attach started the page's play, so a late stop cannot end the
+    /// one a later attach started on the same element.
+    generation: u64,
+}
+
+impl PageEngine {
+    fn stop(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            unlisten(listener);
+        }
+        if !self.video_id.is_empty() {
+            run(tv_page::engine_stop_js(&self.video_id, self.generation));
+        }
+    }
+}
+
+impl Drop for PageEngine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl PlaybackEngine for PageEngine {
+    fn attach(
+        &mut self,
+        video_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: super::playback::OnFatal,
+        on_fragment: super::playback::OnFragment,
+    ) -> Result<(), String> {
+        self.stop();
+        let log_url = url.split('?').next().unwrap_or_default().to_owned();
+        let on_event = move |event: tv_page::EngineEvent| match event {
+            tv_page::EngineEvent::Started { error } if error.is_empty() => {
+                log::info!("pharos: playback engine=rust page outcome=started url={log_url}");
+            }
+            tv_page::EngineEvent::Started { error } => {
+                log::warn!(
+                    "pharos: playback engine=rust page outcome=failed error={error} url={log_url}"
+                );
+                turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
+                on_fatal(Fatal::of(
+                    FailureKind::Unplayable,
+                    format!("the player could not start ({error})"),
+                ));
+            }
+            tv_page::EngineEvent::Fatal { kind, reason } => {
+                // The stream is in trouble: show the player's own state,
+                // not the turn, as the browser does.
+                turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
+                on_fatal(Fatal::of(FailureKind::from_label(&kind), reason));
+            }
+            tv_page::EngineEvent::Frag {
+                bytes,
+                load_ms,
+                media_ms,
+            } => on_fragment(super::playback::FragmentEvent::Loaded(
+                super::playback::FragmentLoad {
+                    bytes,
+                    load_ms,
+                    media_ms,
+                },
+            )),
+            tv_page::EngineEvent::FragFailed { timed_out: true } => {
+                on_fragment(super::playback::FragmentEvent::TimedOut);
+            }
+            tv_page::EngineEvent::FragFailed { timed_out: false } => {
+                on_fragment(super::playback::FragmentEvent::Failed);
+            }
+            // The bridge passes these on itself, whichever play sent them.
+            tv_page::EngineEvent::Line { .. } | tv_page::EngineEvent::Event { .. } => {}
+        };
+        let id = video_id.to_owned();
+        self.listener = Some(listen(Listener::Engine(id.clone(), Box::new(on_event))));
+        self.video_id = id.clone();
+        self.generation = NEXT_HLS.fetch_add(1, Ordering::Relaxed);
+        // The previous source's state must not answer for this one:
+        // `video_metadata` would resolve on its `ready` at once.
+        lock(&MEDIA).remove(&id);
+        let token = android::token();
+        run(tv_page::engine_start_js(&tv_page::EngineStart {
+            video_id: &id,
+            generation: self.generation,
+            url: &direct_url(&server(), url),
+            start_ms,
+            device: super::app::this_device().label(),
+            token: token.as_deref(),
+        }));
+        Ok(())
     }
 }
 
@@ -2258,6 +2391,8 @@ enum Listener {
     Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
+    /// The page's Rust HLS engine's events for the player on one media element.
+    Engine(String, Box<dyn FnMut(tv_page::EngineEvent)>),
     /// Every event of the media element `id`, as its state arrived.
     Media(String, Box<dyn FnMut(&tv_page::Media)>),
     /// A media element's `timeupdate`, with its id.
@@ -2912,6 +3047,31 @@ fn on_bridge(message: Bridge) {
                 }
             }
         }
+        Bridge::Engine { id, event } => match event {
+            tv_page::EngineEvent::Line { warn: true, text } => log::warn!("{text}"),
+            tv_page::EngineEvent::Line { warn: false, text } => log::info!("{text}"),
+            tv_page::EngineEvent::Event {
+                kind,
+                level,
+                fields,
+            } => match tv_page::engine_client_event(kind, level, &fields, current_path()) {
+                Ok(event) => report_event(event),
+                Err(unknown) => log::warn!(
+                    "pharos: playback engine=rust client event dropped unknown={unknown}"
+                ),
+            },
+            event => {
+                for f in &listeners {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::Engine(on, f) = &mut f.0 {
+                            if *on == id {
+                                f(event.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        },
         Bridge::Visualiser { id, reason, error } => {
             // The page's own outcome for the run (B1036, V996): only a
             // fallback reaches the music screen.
