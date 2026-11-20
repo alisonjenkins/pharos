@@ -3406,7 +3406,22 @@ async fn plan_and_admit(
         Measure::Whole(entries) => entries,
         Measure::Short(entries) => {
             {
+                // Marked unknown only while this run still owns the item, in
+                // the hold that checks it: a run that lost it (removed, or
+                // replaced by another run) stops as gone and marks nothing a
+                // replacement's admission would refuse on.
                 let mut st = lock(&inner.state);
+                if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                    drop(st);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep inventory verdict=gone item={item} run={run} found={} reason=run_lost_item",
+                            entries.len()
+                        ),
+                    );
+                    return Err(Stop::Gone);
+                }
                 if !st.unmeasured.iter().any(|(d, _)| *d == dir) {
                     st.unmeasured.push((
                         dir.clone(),
@@ -10413,6 +10428,43 @@ pub(crate) mod tests {
             refused.iter().any(|l| l.contains("step=plan")),
             "{refused:?}"
         );
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:3357): a run whose inventory
+    /// comes back short after it lost its item (another run took it over)
+    /// leaves the folder's figure alone: it stops as gone, and marks nothing
+    /// unknown that a replacement's admission would then refuse on.
+    #[tokio::test]
+    async fn a_run_that_lost_its_item_before_a_short_inventory_marks_nothing_unknown() {
+        let rig = Rig::new("plan-inventory-short-gone");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        rig.server.fail(SEG1, &[]);
+        // Another run takes the item over between the prune and the
+        // inventory, with the folder's files still on disk.
+        let s1 = store.clone();
+        set_hook(&AFTER_PRUNE, move || {
+            if let Some(owner) = lock(&s1.inner.state)
+                .runs
+                .get_mut(&("u1".to_owned(), "1".to_owned()))
+            {
+                *owner = owner.wrapping_add(1);
+            }
+            FAIL_ENTRY_READ.with(|f| f.set(true));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        // A sweep clears a mark soon after, so the run's own verdict is
+        // what shows it: gone, not a short inventory marked unknown.
+        assert!(
+            lines("pharos: video keep refused item=1 reason=inventory_short").is_empty(),
+            "a run that no longer owns the item marked its folder unknown"
+        );
+        assert!(!lines("pharos: video keep inventory verdict=gone item=1").is_empty());
     }
 
     #[tokio::test]
