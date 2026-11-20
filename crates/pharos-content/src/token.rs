@@ -525,6 +525,18 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         ));
     }
     write(path, token).map_err(|e| err(path, e))?;
+    // Installed: a token that replaces another starts unpaired. A pairing
+    // left from an earlier install of this same token (A, then B, then A
+    // again) would name a user this sign-in has not confirmed.
+    if !matches!(&previous, Some(s) if s.token == token) {
+        match std::fs::remove_file(user_path(path)) {
+            Ok(()) => log::info!("token pairing verdict=cleared reason=token_replaced"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("token pairing verdict=not_cleared reason=token_replaced error={e}")
+            }
+        }
+    }
     let dir = path.parent().ok_or_else(|| err(path, "no directory"))?;
     match durable_dir(dir) {
         Ok(()) => {}
@@ -1214,6 +1226,32 @@ pub(crate) mod tests {
             }),
             "the sign-in was overwritten by the pairing"
         );
+    }
+
+    /// Body item token.rs:527: A's token, replaced by B's and then stored
+    /// again, comes back unpaired: the pairing from its first install does
+    /// not name A for a sign-in that has not confirmed A. A's own pairing
+    /// then works as before.
+    #[test]
+    fn a_re_stored_token_does_not_keep_its_earlier_pairing() {
+        let d = dir("re-store-pairing");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        store_user(&p, "A").unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+        store(&p, "tokB").unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user, None);
+        store(&p, "tokA").unwrap();
+        assert_eq!(
+            read(&p).unwrap().unwrap().user,
+            None,
+            "the re-stored token kept the user of its first install"
+        );
+        assert_eq!(store_user_if(&p, "tokA", "A").unwrap(), Pairing::Paired);
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
+        // Storing the token already on file keeps its pairing.
+        store(&p, "tokA").unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().user.as_deref(), Some("A"));
     }
 
     /// A new token stored between the request that named the user and the
