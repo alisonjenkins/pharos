@@ -154,6 +154,16 @@ struct JobState {
     got_ok: bool,
 }
 
+/// What a job that gave up does with its partial file.
+enum PartFate {
+    /// The bytes cannot be resumed: the part goes.
+    Discard,
+    /// The bytes are valid under this state's validator, and the job only
+    /// stopped for want of space: the part stays, and the state is kept
+    /// for the next job of the track to resume it with.
+    Keep(JobState),
+}
+
 enum Outcome {
     Ok,
     Cancelled,
@@ -700,33 +710,40 @@ impl Gate {
                 );
             }
             Outcome::LowDisk(free) => {
+                // A refusal for space, from the preflight, the admission or
+                // a write: the bytes on disk are still good, so they stay.
                 log::warn!(
-                    "cache download id={id} bytes={} ms={ms} outcome=skipped reason=low_disk free_bytes={free}",
+                    "cache download id={id} bytes={} ms={ms} outcome=skipped reason=low_disk free_bytes={free} part=kept",
                     part_len()
                 );
-                self.give_up(id);
+                self.give_up(id, PartFate::Keep(st));
             }
             Outcome::Failed(why) => {
                 log::warn!(
                     "cache download id={id} bytes={} ms={ms} outcome=failed reason={why} attempts={attempt}",
                     part_len()
                 );
-                self.give_up(id);
+                self.give_up(id, PartFate::Discard);
             }
         }
     }
 
-    /// Ends a job that gave up: its partial file goes, the track is marked
-    /// failed and the job stops being the track in flight, in one step under
-    /// the queue lock. A pin of the track that `enqueue` sees after this is
+    /// Ends a job that gave up: its partial file goes or stays as `part`
+    /// says, the track is marked failed and the job stops being the track
+    /// in flight, in one step under the queue lock. A pin of the track that `enqueue` sees after this is
     /// queued as new work; one it saw before was folded into a job that was
     /// still running. Were `current` left set until the worker cleared it,
     /// a pin in between would be taken for in-flight work and lost.
-    fn give_up(&self, id: &str) {
+    fn give_up(&self, id: &str, part: PartFate) {
         #[cfg(test)]
         tests::before_give_up();
         let mut q = self.lock();
-        self.cache.discard_part(id);
+        match part {
+            PartFate::Discard => self.cache.discard_part(id),
+            PartFate::Keep(st) => {
+                q.deferred.insert(id.to_owned(), st);
+            }
+        }
         self.cache.mark_failed(id);
         if q.current.as_deref() == Some(id) {
             q.current = None;
@@ -2137,6 +2154,69 @@ mod tests {
         assert!(!r.cache.is_complete("track/1"));
     }
 
+    /// CR 4637705955: a retry whose free-space preflight is refused (the
+    /// disk below the guard, nothing to evict) ends the job without
+    /// deleting the part: its bytes are valid under their validator. A
+    /// later prefetch resumes them with that validator.
+    #[test]
+    fn a_retry_refused_for_low_disk_keeps_the_part_and_its_validator() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let starve = Arc::new(AtomicBool::new(true));
+        let (s2, st2) = (slot.clone(), starve.clone());
+        // Room until the first attempt has left its part; below the guard
+        // from then on, until the test lifts it.
+        let r = rig_with_free(
+            "retry-low-disk",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let part = s2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                Ok(if st2.load(Ordering::SeqCst) && part >= 600 {
+                    MIN_FREE_BYTES - 1
+                } else {
+                    MIN_FREE_BYTES + 5000
+                })
+            }),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the job never ended"
+        );
+        assert_eq!(r.srv.seen().len(), 1, "{:?}", r.srv.seen());
+        assert_eq!(
+            std::fs::metadata(&part).map(|m| m.len()).ok(),
+            Some(600),
+            "the low-disk refusal deleted the part"
+        );
+        // Room again: the part resumes under the validator it was fetched
+        // with.
+        starve.store(false, Ordering::SeqCst);
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the resume never ended"
+        );
+        let seen = r.srv.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].range.as_deref(), Some("bytes=600-"), "{seen:?}");
+        assert_eq!(seen[1].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert!(r.cache.is_complete("track/1"));
+    }
+
     /// A whole new body that replaces a partial file is admitted with the
     /// old part's bytes counted as room: they come back when it is
     /// truncated, so a disk that holds the new body once the old one goes
@@ -2469,7 +2549,8 @@ mod tests {
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert!(!r.cache.is_complete("track/1"));
-        assert!(!r.cache.part_path("track/1").exists());
+        // Refused for space, not for its bytes: what was written stays.
+        assert!(r.cache.part_path("track/1").exists());
         assert!(
             calls.load(Ordering::SeqCst) >= 3,
             "read before and during the write"
