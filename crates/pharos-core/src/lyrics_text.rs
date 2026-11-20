@@ -3,7 +3,7 @@
 //! aligner judges its own lyrics with it, and the server scores other
 //! online records against the same transcript, so both read one measure.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// The share of the lyric's word pairs found in `heard`, the transcript's
 /// text joined as the recogniser wrote it, from 0 to 1, or
@@ -13,8 +13,10 @@ use std::collections::HashSet;
 ///
 /// Pairs are taken within each lyric line, since a line break is not a
 /// gap the singer leaves out, and across the whole transcript, whose
-/// segments split where the recogniser's windows fell. A pair counts once
-/// for each time the lyric holds it.
+/// segments split where the recogniser's windows fell. A pair the lyric
+/// holds more than once counts as many times as the transcript holds it,
+/// and no more: a chorus heard each time scores in full, while a record
+/// repeating one pair heard once cannot stand in for the song.
 pub fn bigram_recall<'a>(
     lyric_lines: impl IntoIterator<Item = &'a str>,
     heard: &str,
@@ -32,13 +34,19 @@ pub fn bigram_recall<'a>(
         return None;
     }
     let heard = words(heard);
-    let pairs: HashSet<(&str, &str)> = heard
-        .windows(2)
-        .map(|w| (w[0].as_str(), w[1].as_str()))
-        .collect();
+    let mut left: HashMap<(&str, &str), usize> = HashMap::new();
+    for w in heard.windows(2) {
+        *left.entry((w[0].as_str(), w[1].as_str())).or_default() += 1;
+    }
     let found = wanted
         .iter()
-        .filter(|(a, b)| pairs.contains(&(a.as_str(), b.as_str())))
+        .filter(|(a, b)| match left.get_mut(&(a.as_str(), b.as_str())) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        })
         .count();
     Some(found as f64 / wanted.len() as f64)
 }
@@ -114,9 +122,19 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_pair_counts_each_time_the_lyric_holds_it() {
-        let got = recall(&["la la la", "go home"], "la la");
-        assert_eq!(got, Some(2.0 / 3.0));
+    fn a_repeated_pair_counts_as_often_as_it_was_heard() {
+        assert_eq!(
+            recall(&["la la la", "go home"], "la la la"),
+            Some(2.0 / 3.0)
+        );
+        assert_eq!(recall(&["la la la", "go home"], "la la"), Some(1.0 / 3.0));
+    }
+
+    #[test]
+    fn a_pair_repeated_but_heard_once_cannot_stand_in_for_the_song() {
+        let repeated = vec!["grey gulls"; 30];
+        let got = recall(&repeated, "grey gulls wheel above the quay");
+        assert_eq!(got, Some(1.0 / 30.0));
     }
 
     #[test]
