@@ -5442,13 +5442,17 @@ impl VideoStore for DiskVideoStore {
     }
 
     fn used_bytes(&self, user: &str) -> u64 {
-        let video = lock(&self.inner.state)
+        self.video_bytes(user)
+            .saturating_add(self.inner.env.budget.other_used_bytes())
+    }
+
+    fn video_bytes(&self, user: &str) -> u64 {
+        lock(&self.inner.state)
             .list
             .iter()
             .filter(|v| v.user == user)
             .map(KeptVideo::bytes)
-            .sum::<u64>();
-        video.saturating_add(self.inner.env.budget.other_used_bytes())
+            .sum::<u64>()
     }
 
     fn free_bytes(&self) -> u64 {
@@ -6720,6 +6724,8 @@ pub(crate) mod tests {
         store.settled().await;
         assert!(matches!(only(&store).state, KeptState::Failed { .. }));
         assert_eq!(store.used_bytes("u1"), 4 * GIB - 10);
+        // The videos' own figure leaves the music out: none landed.
+        assert_eq!(store.video_bytes("u1"), 0, "music counted as video");
     }
 
     /// A music write the cache has approved, and not yet landed, is room a

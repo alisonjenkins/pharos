@@ -297,6 +297,11 @@ pub trait VideoStore: Send + Sync {
         ))
     }
     fn used_bytes(&self, user: &str) -> u64;
+    /// What `user`'s videos alone hold, leaving out what `used_bytes` adds
+    /// from the kinds the cap is shared with. The same by default.
+    fn video_bytes(&self, user: &str) -> u64 {
+        self.used_bytes(user)
+    }
     /// Free space as the host last measured it.
     fn free_bytes(&self) -> u64;
     /// The stored file for a request's [`request_key`] among `user`'s own

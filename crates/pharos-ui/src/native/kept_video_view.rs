@@ -180,13 +180,28 @@ pub fn VideoList(
     #[props(default)]
     leftover: usize,
     #[props(default)] on_discard: EventHandler<()>,
+    /// The videos' own bytes, when `used` also counts what they share the
+    /// cap with (the phone's music). `None`: `used` is the videos' alone.
+    #[props(default)]
+    videos_used: Option<u64>,
     /// A discard is running: its button is disabled until it ends.
     #[props(default)]
     discarding: bool,
 ) -> Element {
     rsx! {
-        p { class: "pharos-muted", id: "pharos-video-total",
-            "{format_bytes(used)} of {format_bytes(cap)} used by downloaded videos."
+        // Each figure says what it counts: the videos' own bytes, and, when
+        // the cap is shared, the total with the music beside it.
+        match videos_used.filter(|v| *v != used) {
+            Some(videos) => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "{format_bytes(videos)} used by downloaded videos. {format_bytes(used)} of {format_bytes(cap)} used with music."
+                }
+            },
+            None => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "{format_bytes(used)} of {format_bytes(cap)} used by downloaded videos."
+                }
+            },
         }
         if let Some(text) = problem {
             p { class: "pharos-notice", role: "alert", "{text}" }
@@ -558,6 +573,7 @@ pub fn VideoDownloads(
     let listing = use_listing(user.clone());
     let nav = use_context::<Nav>();
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
+    let videos_used = user.as_deref().map(|u| store.video_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
     // App-wide, not this view's: a discard outlives the page that started
@@ -595,6 +611,7 @@ pub fn VideoDownloads(
             VideoList {
                 videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
                 used,
+                videos_used,
                 cap: store.cap_bytes(),
                 problem: discard.problem,
                 unreadable,
@@ -1511,6 +1528,39 @@ mod tests {
                 on_remove: |_| {},
             }
         }
+    }
+
+    /// Review 5987743326 (kept_video_view.rs:189): with 1 GiB of music and no
+    /// videos, the head does not call the music video. The videos' own
+    /// figure is labelled as video, and the shared total says it includes
+    /// music.
+    #[test]
+    fn the_head_does_not_label_music_as_video() {
+        fn head() -> Element {
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 1024 * 1024 * 1024,
+                    videos_used: Some(0),
+                    cap: 4 * 1024 * 1024 * 1024,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(head);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            !html.contains("1 GiB of 4 GiB used by downloaded videos"),
+            "{html}"
+        );
+        assert!(html.contains("0 B used by downloaded videos"), "{html}");
+        assert!(html.contains("1 GiB of 4 GiB used with music"), "{html}");
+        // With nothing else in the cap the one line stays as it was.
+        let mut dom = VirtualDom::new(list);
+        dom.rebuild_in_place();
+        assert!(dioxus_ssr::render(&dom).contains("3 MiB of 4 GiB used by downloaded videos"));
     }
 
     /// The unreadable-downloads row shows only when some exist, in the slim
