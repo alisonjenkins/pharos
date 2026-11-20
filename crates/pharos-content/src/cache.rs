@@ -941,12 +941,12 @@ impl Cache {
     }
 
     /// Delete least-recently-played unpinned finished tracks until the cache
-    /// fits; skip the current and protected ones.
+    /// fits, then retained parts no job holds; skip the current and
+    /// protected ones.
     fn evict_locked(&self, s: &mut State) -> Vec<String> {
-        // Parts count against the cap (a cancelled download keeps its one)
-        // but are never victims: only finished tracks are evicted, so an
-        // active download's file is safe, and an eviction does not change
-        // the figure. They are read once, not per victim (this runs under
+        // Parts count against the cap (a cancelled download keeps its one).
+        // Finished tracks go first; only then a part no job holds, oldest
+        // first, so an active or pinned download's file is safe. They are read once, not per victim (this runs under
         // the shared admission lock), and once more before the cache is
         // declared within the cap, since a download may have written since:
         // that recheck runs on the first fit too, not only after an evict.
@@ -983,6 +983,16 @@ impl Cache {
                 continue;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
+                // Finished tracks first; then a part no job holds, oldest
+                // first: its bytes leave the parts figure.
+                if let Some((id, bytes)) = self.part_victim(s, None) {
+                    if !self.remove_part_locked(&id, bytes, "over_cap") {
+                        break;
+                    }
+                    parts = parts.saturating_sub(bytes);
+                    fresh = false;
+                    continue;
+                }
                 log::warn!(
                     "cache over cap used={used} music={music} outside={outside} parts={parts} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap()
@@ -1013,6 +1023,54 @@ impl Cache {
             })
             .min_by(|a, b| (a.1.last_played_ms, a.0).cmp(&(b.1.last_played_ms, b.0)))
             .map(|(id, e)| (id.clone(), e.size))
+    }
+
+    /// The oldest retained `.part` that may go, by when it was last
+    /// written: one no job holds (`active`), not pinned, queued, playing or
+    /// `keep`. Asked only once no finished track is left to evict. A part
+    /// whose name or metadata cannot be read is never a victim.
+    fn part_victim(&self, s: &State, keep: Option<&str>) -> Option<(String, u64)> {
+        let active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        let read = std::fs::read_dir(&self.dir).ok()?;
+        read.filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name();
+                let id = unescape(name.to_str()?.strip_suffix(PART_EXT)?)?;
+                let held = keep == Some(id.as_str())
+                    || active.contains(&id)
+                    || s.entries.get(&id).is_some_and(|e| e.pinned)
+                    || s.pins.values().any(|v| v.contains(&id))
+                    || s.protected.contains(&id)
+                    || s.current.as_deref() == Some(id.as_str());
+                if held {
+                    return None;
+                }
+                let meta = e.metadata().ok()?;
+                Some((meta.modified().ok()?, id, meta.len()))
+            })
+            .min_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
+            .map(|(_, id, len)| (id, len))
+    }
+
+    /// Delete the retained `.part` of `id` and name it for the downloader
+    /// to drop the state it kept to resume it. False when it would not go.
+    fn remove_part_locked(&self, id: &str, bytes: u64, why: &str) -> bool {
+        match std::fs::remove_file(self.part_path(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!(
+                    "cache evict id={id} bytes={bytes} verdict=kept kind=part reason=remove_failed error={e}"
+                );
+                return false;
+            }
+        }
+        self.evicted_parts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned());
+        log::info!("cache evict id={id} bytes={bytes} verdict=evicted kind=part reason={why}");
+        true
     }
 
     /// Delete `id`'s file and forget it. False when the file would not go.
@@ -1286,9 +1344,10 @@ impl Cache {
     /// that was cancelled or yielded keeps its `.part` to resume from but
     /// drops its reservation, so this reads the folder, not the reserved ids.
     /// Free space already lacks these bytes, so the free-space check never
-    /// adds them. Eviction never touches a `.part` (it trims finished tracks
-    /// only), so an active download's file is safe; a `.part` no job holds is
-    /// counted until its download resumes or the next `open` removes it.
+    /// adds them. Eviction never touches a `.part` a job holds or a pin
+    /// wants; a `.part` no job holds is counted until its download resumes,
+    /// an eviction that has no finished track left takes it, or the next
+    /// `open` removes it.
     /// Read the reservation first (under the admission lock), then this.
     /// None when the folder could not be read whole: the host refuses new
     /// downloads until a scan succeeds, never counts it as 0.
@@ -1429,6 +1488,16 @@ impl Cache {
             now = now.saturating_add(bytes);
             evicted = true;
             log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
+        }
+        // Finished tracks first; then parts no job holds, oldest first.
+        while now < want {
+            let Some((id, bytes)) = self.part_victim(&s, Some(downloading)) else {
+                break;
+            };
+            if !self.remove_part_locked(&id, bytes, "low_disk") {
+                break;
+            }
+            now = now.saturating_add(bytes);
         }
         if evicted {
             self.persist_locked(&s);
@@ -2565,5 +2634,82 @@ pub(crate) mod tests {
         let d = tmp("summary-err");
         let c = Cache::open_with_probe(&d, 1000, failing).unwrap();
         assert!(c.free_bytes().is_err());
+    }
+
+    /// A part of `n` bytes no job holds, last written `age_s` seconds ago.
+    fn retained(c: &Cache, id: &str, n: usize, age_s: u64) {
+        let p = c.part_path(id);
+        std::fs::write(&p, vec![7u8; n]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// CR 4638660907: retained parts no job holds fill the disk and a new
+    /// admission needs room. With no finished track to evict, the oldest
+    /// inactive, unpinned part goes (and is named for its deferred state to
+    /// be dropped), and the admission is approved. A pinned part and an
+    /// active one, both older, stay.
+    #[test]
+    fn an_admission_evicts_the_oldest_part_no_job_holds() {
+        let d = tmp("evict-part-admission");
+        let dir = d.to_path_buf();
+        // A disk of fixed size: free is what the parts leave of it.
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 2200).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        c.pin("album/a", &ids(&["pinned"]));
+        retained(&c, "pinned", 600, 400);
+        retained(&c, "active", 600, 300);
+        retained(&c, "old", 600, 200);
+        retained(&c, "new", 600, 100);
+        c.job_started("active");
+        crate::testlog::start();
+        let verdict = c.ensure_free("x", 300);
+        let lines = crate::testlog::lines();
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(!c.part_path("old").exists(), "the oldest free part stayed");
+        for kept in ["pinned", "active", "new"] {
+            assert!(c.part_path(kept).exists(), "{kept} was evicted");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("id=old") && l.contains("verdict=evicted kind=part")),
+            "{lines:?}"
+        );
+        assert_eq!(c.take_evicted_parts(), vec!["old".to_owned()]);
+        assert!(c.take_evicted_parts().is_empty(), "taken twice");
+        c.job_ended("active");
+    }
+
+    /// CR 4638660907: over the cap with nothing finished to evict, a part
+    /// no job holds goes, oldest first; a part a job holds never does.
+    #[test]
+    fn a_trim_over_the_cap_evicts_the_oldest_part_no_job_holds() {
+        let d = tmp("evict-part-cap");
+        let c = Cache::open(&d, 1000).unwrap();
+        retained(&c, "active", 300, 300);
+        retained(&c, "old", 300, 200);
+        retained(&c, "new", 300, 100);
+        c.job_started("active");
+        c.protect(&ids(&["t"]));
+        put(&c, "t", 300);
+        assert!(c.is_complete("t"));
+        assert!(!c.part_path("old").exists(), "the oldest free part stayed");
+        assert!(c.part_path("new").exists());
+        assert!(c.part_path("active").exists(), "a held part was evicted");
+        c.job_ended("active");
     }
 }

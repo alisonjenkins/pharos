@@ -339,6 +339,12 @@ impl Downloader {
         self.gate.online.load(Ordering::SeqCst)
     }
 
+    /// Whether state to resume `id`'s part is kept.
+    #[cfg(test)]
+    pub fn has_deferred(&self, id: &str) -> bool {
+        self.gate.lock().deferred.contains_key(id)
+    }
+
     /// Each backoff wait the jobs took, in order.
     #[cfg(test)]
     pub fn waits(&self) -> Vec<Duration> {
@@ -2400,6 +2406,8 @@ mod tests {
     /// A whole new body refused for low disk keeps the old part and its
     /// validator: the bytes are on disk and counted already, so a pin's
     /// job backs off and tries again, resuming them once there is room.
+    /// A pinned part is never evicted (CR 4638660907), and nothing else
+    /// asks for room here.
     #[test]
     fn a_replacement_refused_for_low_disk_keeps_the_part_and_its_validator() {
         let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
@@ -2429,6 +2437,10 @@ mod tests {
             std::fs::metadata(&part).map(|m| m.len()).ok(),
             Some(600),
             "the refused replacement deleted the part"
+        );
+        assert!(
+            r.cache.take_evicted_parts().is_empty(),
+            "a pinned part was evicted"
         );
         assert!(
             seen[1..]
@@ -2551,7 +2563,8 @@ mod tests {
     /// CR 4637705955: a retry whose free-space preflight is refused (the
     /// disk below the guard, nothing to evict) ends the job without
     /// deleting the part: its bytes are valid under their validator. A
-    /// later prefetch resumes them with that validator.
+    /// later prefetch resumes them with that validator. Nothing else needs
+    /// the room meanwhile, so no eviction takes the part (CR 4638660907).
     #[test]
     fn a_retry_refused_for_low_disk_keeps_the_part_and_its_validator() {
         let script = Script::default()
@@ -2596,6 +2609,7 @@ mod tests {
             Some(600),
             "the low-disk refusal deleted the part"
         );
+        assert!(r.dl.has_deferred("track/1"), "the part's state was dropped");
         // Room again: the part resumes under the validator it was fetched
         // with.
         starve.store(false, Ordering::SeqCst);
@@ -2608,6 +2622,83 @@ mod tests {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert_eq!(seen[1].range.as_deref(), Some("bytes=600-"), "{seen:?}");
         assert_eq!(seen[1].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// CR 4638660907: a read-ahead part kept for low disk, that playback
+    /// moved on from, no longer blocks the next admission. The next
+    /// track's preflight evicts it (no job holds it, nothing pins it), the
+    /// next track downloads, and the state kept to resume the part is
+    /// dropped: the track's next request starts from zero, with no range
+    /// and no `If-Range`.
+    #[test]
+    fn a_kept_part_playback_moved_on_from_is_evicted_and_starts_from_zero() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600)
+            .file("/audio/2", body(100, 2));
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let s2 = slot.clone();
+        // Below the guard while track 1's part holds its 600 bytes.
+        let r = rig_with_free(
+            "evict-kept-part",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let part = s2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                Ok(if part >= 600 {
+                    MIN_FREE_BYTES - 1
+                } else {
+                    MIN_FREE_BYTES + 5000
+                })
+            }),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the job never ended"
+        );
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        assert!(r.dl.has_deferred("track/1"), "the kept part lost its state");
+        // Playback moves on: the kept part is in the way of track 2.
+        r.dl.prefetch(&ids(&["track/2"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "track 2 never ended"
+        );
+        assert!(r.cache.is_complete("track/2"), "{:?}", r.srv.seen());
+        assert!(!part.exists(), "the kept part blocked the admission");
+        assert!(
+            !r.dl.has_deferred("track/1"),
+            "the evicted part's state was kept"
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "track 1 never ended"
+        );
+        let seen: Vec<_> = r
+            .srv
+            .seen()
+            .into_iter()
+            .filter(|s| s.path == "/audio/1")
+            .collect();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].range, None, "{seen:?}");
+        assert_eq!(
+            seen[1].if_range, None,
+            "the evicted part's state was kept: {seen:?}"
+        );
         assert!(r.cache.is_complete("track/1"));
     }
 
