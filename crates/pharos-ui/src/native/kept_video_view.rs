@@ -185,6 +185,10 @@ pub fn VideoList(
     /// the videos' alone.
     #[props(default)]
     videos_used: Option<u64>,
+    /// Whether `used` was read. False while no owner is authorized: the
+    /// shared figure is then not shown, never as zero.
+    #[props(default = true)]
+    used_known: bool,
     /// A discard is running: its button is disabled until it ends.
     #[props(default)]
     discarding: bool,
@@ -193,6 +197,11 @@ pub fn VideoList(
         // Each figure says what it counts: the user's videos' own bytes, and,
         // when the cap is shared, the device's total with everything else.
         match videos_used.filter(|v| *v != used) {
+            _ if !used_known => rsx! {
+                p { class: "pharos-muted", id: "pharos-video-total",
+                    "Space used on this device shows once your account is confirmed. The space allowance is {format_bytes(cap)}."
+                }
+            },
             Some(videos) => rsx! {
                 p { class: "pharos-muted", id: "pharos-video-total",
                     "{format_bytes(videos)} used by your downloaded videos. {format_bytes(used)} of {format_bytes(cap)} used on this device, with music and other downloads."
@@ -676,6 +685,7 @@ pub fn VideoDownloads(
                 videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows)),
                 used,
                 videos_used,
+                used_known: usage.is_some(),
                 cap,
                 problem: discard.problem,
                 unreadable,
@@ -1965,6 +1975,20 @@ mod tests {
         assert!(html.contains("3 MiB of 4 GiB used"), "{html}");
         assert!(html.contains("Medium (2 Mbps)"));
         assert!(html.contains("Downloading 25%"));
+    }
+
+    /// CR 4646280250: with no authorized owner the usage was not read: no
+    /// figure is shown, never 0 B. The control is the test above.
+    #[test]
+    fn an_unread_usage_shows_no_figure() {
+        let html = render(|| {
+            rsx! { VideoList { videos: vec![], used: 0, cap: 1024, used_known: false, on_play: |_| {}, on_remove: |_| {} } }
+        });
+        assert!(!html.contains("0 B"), "{html}");
+        assert!(
+            html.contains("shows once your account is confirmed"),
+            "{html}"
+        );
     }
 
     #[test]
