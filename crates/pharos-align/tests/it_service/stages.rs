@@ -224,11 +224,6 @@ fn with(
     run(&Engine::new(loader(sung), silent(), None).with_stages(Box::new(stages)))
 }
 
-/// The offset and line events, without the text check's.
-fn timed(events: &[serde_json::Value]) -> usize {
-    events.iter().filter(|e| e["event"] != "text_clear").count()
-}
-
 fn words(a: &Aligned) -> Vec<Vec<i64>> {
     a.answer
         .lines
@@ -318,14 +313,11 @@ fn a_placed_song_reports_each_moved_line_again_and_says_how_it_was_placed() {
         .iter()
         .map(|e| e["event"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        kinds,
-        ["offset", "line", "line", "text_clear", "line", "line"]
-    );
+    assert_eq!(kinds, ["offset", "line", "line", "line", "line"]);
     // Today's lines stream without a placement; the corrections carry one.
     assert!(events[1].get("placement").is_none());
     assert!(events[2].get("placement").is_none());
-    for (i, e) in events[4..].iter().enumerate() {
+    for (i, e) in events[3..].iter().enumerate() {
         assert_eq!(e["index"], i);
         assert_eq!(e["placement"], "refined");
         let streamed: Vec<i64> = e["words"]
@@ -402,7 +394,7 @@ fn each_failing_stage_keeps_todays_answer_and_names_why() {
         assert_eq!(words(&got), words(&before), "{why:?}");
         assert!(kept(&got), "{why:?}");
         assert_eq!(got.corrected, 0);
-        assert_eq!(timed(&events), 3, "{why:?}: no corrections");
+        assert_eq!(events.len(), 3, "{why:?}: no corrections");
     }
 }
 
@@ -422,7 +414,7 @@ fn a_song_the_recogniser_barely_heard_keeps_todays_answer() {
     assert!(got.fallback_reason.starts_with("low_anchor_share"));
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
-    assert_eq!(timed(&events), 3);
+    assert_eq!(events.len(), 3);
 }
 
 /// V1468: every song with a transcript says how much of its lyric text was
@@ -553,38 +545,6 @@ fn a_song_sung_to_other_words_is_a_mismatch_though_its_emission_failed() {
     assert_eq!(answer["check"]["heard_words"], 120);
 }
 
-/// V1468: once the recogniser heard the lyric's text, a song that cannot
-/// end a mismatch says so before it is done, after the lines it has timed;
-/// a song heard to other words, or one the recogniser failed, never does.
-#[test]
-fn a_song_heard_to_its_lyric_is_cleared_before_it_is_done() {
-    let clear = serde_json::json!({"event": "text_clear"});
-    let (_, events) = with(Step::Works, Step::Works, Some(song().0));
-    let at = events.iter().position(|e| *e == clear);
-    assert_eq!(at, Some(3), "{events:?}");
-
-    let other: Vec<Word> = (0..120)
-        .map(|k| Word {
-            text: format!(" lantern{}", k % 40),
-            start_s: 0.08 * k as f64,
-            end_s: 0.08 * k as f64 + 0.05,
-            prob: 0.9,
-            silent_lead: false,
-        })
-        .collect();
-    let stages = Scripted {
-        vocals: Step::Works,
-        recognise: Step::Works,
-        heard: transcript(other),
-        slow: Duration::ZERO,
-    };
-    let (_, wrong) =
-        run(&Engine::new(loader(Some(song().0)), silent(), None).with_stages(Box::new(stages)));
-    assert!(!wrong.contains(&clear), "{wrong:?}");
-    let (_, failed) = with(Step::Works, Step::Fails, None);
-    assert!(!failed.contains(&clear), "{failed:?}");
-}
-
 #[test]
 fn a_song_on_the_cpu_skips_the_stages_and_says_where_it_ran() {
     let (sung, _) = song();
@@ -709,7 +669,7 @@ fn an_emission_that_falls_back_to_the_cpu_fails_the_stage() {
     );
     assert_eq!(words(&got), words(&before));
     assert!(kept(&got));
-    assert_eq!(timed(&events), 3);
+    assert_eq!(events.len(), 3);
 }
 
 /// Today's windows work on the GPU; its emission meets a lost device.

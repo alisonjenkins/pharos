@@ -249,10 +249,6 @@ pub enum Progress<'a> {
         #[serde(flatten)]
         words: &'a LineWords,
     },
-    /// The recogniser heard enough of the lyric's text that the song cannot
-    /// end a lyrics mismatch (V1468), so its word times may be shown before
-    /// it is done.
-    TextClear,
 }
 
 /// The `/align` answer, fields in the Python service's order.
@@ -857,9 +853,6 @@ fn improve(
         check: Some(TextCheck::new(&today.request, &heard.words)),
         ..today
     };
-    if !today.check.as_ref().is_some_and(TextCheck::text_mismatch) {
-        on(Progress::TextClear);
-    }
 
     let t = Instant::now();
     let emission = tracing::info_span!("aligner.stage", stage = "emission").in_scope(|| {
