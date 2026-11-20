@@ -3949,7 +3949,9 @@ impl PlaybackEngine for HlsJs {
             let budget = Rc::clone(&budget);
             let (player, ceiling) = (player.clone(), Rc::clone(&self.ceiling));
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
-                budget.borrow_mut().progressed();
+                if let Some(sn) = main_fragment_sn(&data) {
+                    budget.borrow_mut().fragment_loaded(sn);
+                }
                 check_ceiling(&player, &ceiling);
                 if let Some(load) = fragment_load(&data) {
                     on_fragment(load);
@@ -3994,6 +3996,19 @@ fn js_number(from: &JsValue, path: &[&str]) -> f64 {
 
 /// The download an `hlsFragLoaded` event reports; `None` for audio and
 /// subtitle fragments and for ones with no usable timing.
+/// The sequence number of a loaded main fragment; `None` for audio or subtitles.
+fn main_fragment_sn(data: &JsValue) -> Option<u64> {
+    let frag = js_sys::Reflect::get(data, &"frag".into()).ok()?;
+    let kind = js_sys::Reflect::get(&frag, &"type".into())
+        .ok()?
+        .as_string();
+    if kind.as_deref() != Some("main") {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(js_number(data, &["frag", "sn"]).max(0.0) as u64)
+}
+
 fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
     let kind = js_sys::Reflect::get(data, &"frag".into())
         .ok()
