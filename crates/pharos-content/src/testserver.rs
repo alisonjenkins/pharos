@@ -38,6 +38,8 @@ pub struct Script {
     busy: Vec<String>,
     /// The `ETag` every reply carries; `"v1"` when unset.
     etag: Option<String>,
+    /// Replies carry no `ETag` at all.
+    no_etag: bool,
     /// Every request seen: path, `Range` header, status sent.
     pub log: Vec<Seen>,
 }
@@ -103,6 +105,12 @@ impl Script {
     /// Every reply carries this `ETag` (quoted), not `"v1"`.
     pub fn etag(mut self, tag: &str) -> Self {
         self.etag = Some(tag.to_owned());
+        self
+    }
+
+    /// Replies carry no `ETag`: a server with no validator to give.
+    pub fn no_etag(mut self) -> Self {
+        self.no_etag = true;
         self
     }
 
@@ -242,7 +250,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
         let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
         let piece = s.piece;
         let hold = s.hold.clone();
-        let etag = s.etag.clone().unwrap_or_else(|| "v1".to_owned());
+        let etag = (!s.no_etag).then(|| s.etag.clone().unwrap_or_else(|| "v1".to_owned()));
         let r = plan(&mut s, path, token.as_deref(), range.as_deref());
         s.log.push(Seen {
             path: path.to_owned(),
@@ -257,7 +265,9 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<Script>>) {
     if let Some(cr) = &reply.content_range {
         out.extend_from_slice(format!("Content-Range: {cr}\r\n").as_bytes());
     }
-    out.extend_from_slice(format!("ETag: \"{etag}\"\r\n").as_bytes());
+    if let Some(etag) = etag {
+        out.extend_from_slice(format!("ETag: \"{etag}\"\r\n").as_bytes());
+    }
     if reply.chunked {
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
     } else {
