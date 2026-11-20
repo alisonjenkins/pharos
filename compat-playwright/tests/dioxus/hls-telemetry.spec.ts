@@ -41,6 +41,21 @@ test("the Rust engine reports its start, a seek to playing and a closing summary
     };
   });
   const logged = (prefix: string) => lines.filter((l) => l.includes(`pharos: playback ${prefix} engine=rust`));
+  // A desktop buffers as far ahead as hls.js (up to 120 s by its byte
+  // budget), which is all of this clip, so hold every segment past the first
+  // few until the seek: its target is then time not yet fetched. The first
+  // segment asked for is not always 0 (a resume point, B1144).
+  const AHEAD = 4;
+  let release: () => void = () => {};
+  const seeked = new Promise<void>((r) => (release = r));
+  const segment = /\/videos\/[^?]*\/a?(\d+)\.(?:ts|m4s)(?:\?|$)/;
+  let first: number | undefined;
+  await page.route(segment, async (route) => {
+    const seg = Number(segment.exec(route.request().url())?.[1] ?? 0);
+    first ??= seg;
+    if (seg > first + AHEAD) await seeked;
+    await route.continue();
+  });
 
   try {
     const before = await settledClientEvents(request, PHAROS_URL);
@@ -58,12 +73,14 @@ test("the Rust engine reports its start, a seek to playing and a closing summary
       });
     await expect.poll(async () => (await video()).t, { timeout: 60_000 }).toBeGreaterThan(1);
     const { t: from, d } = await video();
-    // Past the 30 s forward target, so the seek has to fetch.
+    // Past the held segments, so the seek has to fetch.
     const target = Math.floor(Math.min(d - 10, from + 60));
     await page.evaluate((to) => {
       const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
       if (v) v.currentTime = to;
     }, target);
+    // Only once the seek is issued, so the target is still unfetched.
+    release();
     await expect.poll(() => logged("seek").length, { timeout: 60_000 }).toBe(1);
     const seekLine = logged("seek")[0];
     const seek = fields(seekLine);
