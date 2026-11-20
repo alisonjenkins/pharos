@@ -644,8 +644,13 @@ fn localize_ref<'a>(
             return Err(());
         }
         // Same origin: its path and query, under the base path as any
-        // absolute path is.
+        // absolute path is. A path that begins `//` is a path, never a
+        // second authority: no key under the base can name it.
         let path = request_key(r);
+        if path.starts_with("//") {
+            outside_base(r, &path);
+            return Err(());
+        }
         return localize_ref(&path, upstream, moved, server).map(|k| Cow::Owned(k.into_owned()));
     }
     if r.starts_with('/') {
@@ -1190,6 +1195,21 @@ mod tests {
                 "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
                     .to_owned()
             )
+        );
+    }
+
+    /// CR 4646280263: an absolute URL's path is checked as a path: one
+    /// that begins `//` is not read as a second authority, so it is not
+    /// local, and an ordinary same-origin URL under the base still is.
+    #[test]
+    fn an_absolute_urls_double_slash_path_is_not_a_second_authority() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        let r = "https://s.example//s.example/jf/videos/0.m4s";
+        assert_eq!(one(r), Localized::NotLocal(r.to_owned()));
+        assert_eq!(
+            one("https://s.example/jf/videos/0.m4s"),
+            Localized::Rewritten("/videos/0.m4s".to_owned())
         );
     }
 
