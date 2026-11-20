@@ -757,9 +757,16 @@ impl Gate {
                 );
             }
             Outcome::Cancelled => {
+                // The part stays, and so does the validator its bytes were
+                // fetched under: a later request resumes them with
+                // `If-Range`, never appends another version's suffix.
+                let kept = part_len();
+                if kept > 0 {
+                    self.lock().deferred.insert(id.to_owned(), st);
+                }
                 log::info!(
-                    "cache download id={id} bytes={} ms={ms} outcome=failed reason=cancelled (no longer wanted; partial kept)",
-                    part_len()
+                    "cache download id={id} bytes={kept} ms={ms} outcome=failed reason=cancelled (no longer wanted; partial kept) validator={}",
+                    if kept > 0 { "kept" } else { "none" }
                 );
             }
             Outcome::LowDisk(free) => {
@@ -2045,6 +2052,73 @@ mod tests {
         assert!(r.dl.wait_idle(Duration::from_secs(20)));
         assert!(r.cache.is_complete("track/1"));
         assert_eq!(read(&r.cache, "track/1"), body(size, 1));
+    }
+
+    /// CR 4638660904: a job cancelled by a newer prefetch while it waits
+    /// for accounting keeps the validator with its part: the next request
+    /// for the track resumes it with `If-Range`, so an origin's new
+    /// version cannot supply a suffix stitched onto the old bytes.
+    #[test]
+    fn a_job_cancelled_while_accounting_is_unknown_keeps_its_validator() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600)
+            .file("/audio/2", body(10, 2));
+        let r = rig("cancel-accounting", script, 1 << 20, &["t"], fast());
+        let part = r.cache.part_path("track/1");
+        // Unknown once the first attempt has left its part, until lifted.
+        let (lifted, asked) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (l2, a2, p2) = (lifted.clone(), asked.clone(), part.clone());
+        r.cache.set_outside_used(Arc::new(move || {
+            let held = std::fs::metadata(&p2).map_or(0, |m| m.len());
+            let unknown = !l2.load(Ordering::SeqCst) && held >= 600;
+            if unknown {
+                a2.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::cache::OutsideBytes {
+                held: 0,
+                outstanding: 0,
+                unknown,
+            }
+        }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        for _ in 0..5000 {
+            if asked.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(asked.load(Ordering::SeqCst) >= 1, "the job never waited");
+        // The newer prefetch cancels the waiting job: it is no longer
+        // wanted at its next check, whatever accounting says by then, so
+        // the wait is lifted for track 2's own admission.
+        r.dl.prefetch(&ids(&["track/2"]));
+        lifted.store(true, Ordering::SeqCst);
+        assert!(r.dl.wait_idle(Duration::from_secs(10)), "never idle");
+        assert_eq!(
+            std::fs::metadata(&part).map(|m| m.len()).ok(),
+            Some(600),
+            "the cancelled job's part went"
+        );
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the resume never ended"
+        );
+        let seen: Vec<_> = r
+            .srv
+            .seen()
+            .into_iter()
+            .filter(|s| s.path.starts_with("/audio/1"))
+            .collect();
+        let last = seen.last().expect("no request for track 1");
+        assert_eq!(last.range.as_deref(), Some("bytes=600-"), "{seen:?}");
+        assert_eq!(last.if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert!(r.cache.is_complete("track/1"));
     }
 
     /// A whole new version arriving for a resume, refused room before the
