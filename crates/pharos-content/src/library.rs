@@ -1178,7 +1178,13 @@ impl Worker {
                         Err(e) => return Err(e),
                     }
                 }
-                return Ok(l.clone());
+                // A sign-out may have fenced the token while a refresh was
+                // out: the link is not handed on.
+                let link = l.clone();
+                if self.fenced_after(&link.token, "refresh") {
+                    return Err(ContentError::NeedsSignIn);
+                }
+                return Ok(link);
             }
         }
         let Some(device_token) = self.load_token()? else {
@@ -1212,6 +1218,11 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
+        // A sign-out may have fenced the token while the resume was out:
+        // no link opens with it.
+        if self.fenced_after(&device_token, "resume") {
+            return Err(ContentError::NeedsSignIn);
+        }
         let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
         self.shared.set_auth(AuthState::SignedIn);
@@ -1263,8 +1274,8 @@ impl Worker {
         token::load(&self.token_path)
     }
 
-    /// Whether `token` is fenced now (`at`: where it was checked): a fenced
-    /// one drops the link and signs the service out.
+    /// Whether `token` is fenced now, checked again after a network await
+    /// (`at`): a fenced one drops the link and signs the service out.
     fn fenced_after(&mut self, token: &str, at: &str) -> bool {
         let fence = token::fence(&self.token_path);
         if !fence.refuses(token) {
@@ -2331,6 +2342,67 @@ mod tests {
             out.err()
         );
         assert!(w.link.is_none(), "the fenced link was kept");
+    }
+
+    /// CR 4638660884: a sign-out that fences the token while a media
+    /// token refresh is out is honored when the refresh returns: the link
+    /// is dropped and nothing is sent with the fenced token.
+    #[test]
+    fn a_fence_set_during_a_refresh_is_honored_after_it() {
+        thread_local! {
+            /// The token file to fence from inside the refresh, once armed.
+            static FENCE_AT: std::cell::RefCell<Option<PathBuf>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        struct Session;
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                if let Some(path) = FENCE_AT.with(|f| f.borrow_mut().take()) {
+                    token::set_fence(&path, token::Fence::for_token(Some("tokA")), "test");
+                }
+                let mut t = results.get().init_result().init_token();
+                t.set_token("media");
+                // Always due: every call refreshes.
+                t.set_expires_at_ms(0);
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("fence-during-refresh");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        FENCE_AT.with(|f| *f.borrow_mut() = Some(token_path.clone()));
+        crate::testlog::start();
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        assert!(
+            matches!(&out, Err(ContentError::NeedsSignIn)),
+            "{:?}",
+            out.err()
+        );
+        assert!(w.link.is_none(), "the fenced link was kept");
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("token read verdict=refused reason=service_fence at=refresh")),
+            "{lines:?}"
+        );
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
