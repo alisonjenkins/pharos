@@ -365,6 +365,10 @@ pub fn revoked_path(path: &Path, fingerprint: &str) -> PathBuf {
 pub struct Revoked {
     /// The user the revoked token was paired with, when it was.
     pub user: Option<String>,
+    /// Written by a store that installed its token but could not confirm
+    /// it (its folder would not sync), not by a sign-out or a session end:
+    /// a store of that same approved token may retry the install.
+    pub install_unconfirmed: bool,
 }
 
 /// The revocation marker of one token, as a read finds it. Markers are
@@ -402,14 +406,18 @@ pub fn marker(path: &Path, fingerprint: &str) -> Marker {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
         Err(e) => return Marker::Unreadable(e.to_string()),
     }
-    let user = std::fs::read_to_string(&at).ok().and_then(|raw| {
-        raw.lines()
-            .next()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(str::to_owned)
-    });
-    Marker::Present(Revoked { user })
+    let raw = std::fs::read_to_string(&at).unwrap_or_default();
+    let mut lines = raw.lines();
+    let user = lines
+        .next()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_owned);
+    let install_unconfirmed = lines.nth(1).map(str::trim) == Some(INSTALL_UNCONFIRMED);
+    Marker::Present(Revoked {
+        user,
+        install_unconfirmed,
+    })
 }
 
 /// A fingerprint of a token (64-bit FNV-1a, spelled out here so no
@@ -501,7 +509,20 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let same = previous
         .as_ref()
         .map_or(previous_unknown, |s| s.token == token);
-    if same && !matches!(marker(path, &new), Marker::Absent) {
+    let found = marker(path, &new);
+    // A marker this store's own unconfirmed install left is no revocation:
+    // the same approved token installs again once the folder syncs.
+    let retry = matches!(
+        &found,
+        Marker::Present(Revoked {
+            install_unconfirmed: true,
+            ..
+        })
+    );
+    if same && retry {
+        log::info!("token store verdict=retry reason=install_unconfirmed");
+    }
+    if same && !retry && !matches!(found, Marker::Absent) {
         log::warn!(
             "token store verdict=refused reason=same_token_revoked previous={}",
             if previous_unknown {
@@ -551,7 +572,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             // Added to the fence, never in its place: an older link's token
             // that it refused stays refused.
             add_fence_held(path, &Fence::token(&new), "store_not_durable");
-            let marked = write_marker(path, None, &new);
+            let marked = write_marker(path, None, &new, true);
             log::warn!(
                 "token store verdict=refused reason=folder_not_synced marker={} error={why}",
                 if marked.is_ok() {
@@ -854,7 +875,7 @@ fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ende
 /// that did not hold (`removal` says why): `Marked`, or `Unsafe` when the
 /// marker fails too.
 fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: String) -> Ended {
-    match write_marker(path, named, token_fingerprint) {
+    match write_marker(path, named, token_fingerprint, false) {
         Ok(()) => {
             changed("marked");
             log::warn!(
@@ -917,7 +938,15 @@ fn remove_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
 
 /// Writes the marker whole (temp file, fsync, rename, folder sync). The
 /// folder sync must succeed too: a marker a crash can lose is no marker.
-fn write_marker(path: &Path, user: Option<&str>, token: &str) -> std::io::Result<()> {
+/// The third line of a marker an unconfirmed install wrote.
+const INSTALL_UNCONFIRMED: &str = "install_unconfirmed";
+
+fn write_marker(
+    path: &Path,
+    user: Option<&str>,
+    token: &str,
+    install_unconfirmed: bool,
+) -> std::io::Result<()> {
     #[cfg(debug_assertions)]
     if faults::MARKER.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("marker write failed"));
@@ -943,7 +972,12 @@ fn write_marker(path: &Path, user: Option<&str>, token: &str) -> std::io::Result
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(format!("{user}\n{token}\n").as_bytes())?;
+        let kind = if install_unconfirmed {
+            INSTALL_UNCONFIRMED
+        } else {
+            "revoked"
+        };
+        f.write_all(format!("{user}\n{token}\n{kind}\n").as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, &target)?;
         sync_dir(dir)
@@ -1558,6 +1592,29 @@ pub(crate) mod tests {
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
     }
 
+    /// CR 4642574358: the marker a store's unconfirmed install left is not
+    /// a revocation. Once the folder syncs, the same approved token
+    /// installs; a genuine revocation of the token on file still refuses
+    /// it (`same_token_revoked`, tested above).
+    #[test]
+    fn an_unconfirmed_install_retries_with_the_same_token() {
+        let d = dir("dirsync-retry");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let stored = store(&path, "new");
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        assert!(stored.is_err(), "{stored:?}");
+        assert_eq!(load(&path).unwrap(), None);
+        assert!(revoked(&path, &fingerprint("new")).is_some_and(|r| r.install_unconfirmed));
+        crate::testlog::start();
+        store(&path, "new").expect("the retried install was refused");
+        assert_eq!(load(&path).unwrap().as_deref(), Some("new"));
+        assert!(crate::testlog::lines()
+            .iter()
+            .any(|l| l.contains("token store verdict=retry reason=install_unconfirmed")));
+    }
+
     /// A sign-out retried after an unlink whose folder sync failed is
     /// durable only once the folder syncs: the absence alone is not.
     #[test]
@@ -1868,7 +1925,7 @@ pub(crate) mod tests {
         let d = dir("token-marker-sync");
         let p = d.join("device-token");
         store(&p, "tokA").unwrap();
-        write_marker(&p, Some("A"), &fingerprint("tokN")).unwrap();
+        write_marker(&p, Some("A"), &fingerprint("tokN"), false).unwrap();
         crate::testlog::start();
         FAIL_MARKER_SYNC.with(|f| f.set(true));
         let stored = store(&p, "tokN");
