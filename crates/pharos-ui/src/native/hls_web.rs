@@ -398,7 +398,17 @@ async fn load(weak: Weak<RefCell<Session>>) {
             fallback(&weak, cause, &value).await;
             return;
         }
-        let video_text = match get_playlist(&weak, &variant.uri, playlist_policy).await {
+        // One round trip for both media playlists, not one each.
+        let audio_uri = pick_audio_uri(&master, variant);
+        let (video_text, audio_text) =
+            futures_util::future::join(get_playlist(&weak, &variant.uri, playlist_policy), async {
+                match audio_uri.as_deref() {
+                    Some(uri) => Some(get_playlist(&weak, uri, playlist_policy).await),
+                    None => None,
+                }
+            })
+            .await;
+        let video_text = match video_text {
             Ok(t) => t,
             Err((status, reason)) => {
                 fail_manifest(&weak, "levelLoadError", status, &reason, &variant.uri);
@@ -418,8 +428,8 @@ async fn load(weak: Weak<RefCell<Session>>) {
                 return;
             }
         };
-        let audio_pl = if let Some(audio_uri) = pick_audio_uri(&master, variant) {
-            let audio_text = match get_playlist(&weak, &audio_uri, playlist_policy).await {
+        let audio_pl = if let (Some(audio_uri), Some(audio_text)) = (audio_uri, audio_text) {
+            let audio_text = match audio_text {
                 Ok(t) => t,
                 Err((status, reason)) => {
                     fail_manifest(&weak, "audioTrackLoadError", status, &reason, &audio_uri);
