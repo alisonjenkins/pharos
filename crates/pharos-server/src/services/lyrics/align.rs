@@ -175,10 +175,8 @@ pub enum Lookup {
     Pending(Option<u32>),
     /// In flight with some lines already timed (ADR-0121): those lines'
     /// words and the song's offset, an empty line for each one still to
-    /// come, and the estimate as for [`Lookup::Pending`]. The flag is set
-    /// until the aligner clears the song's text (V1468): the words are then
-    /// held back, the lyrics' own included, and only the offset is shown.
-    Partial(Option<u32>, Aligned, bool),
+    /// come, and the estimate as for [`Lookup::Pending`].
+    Partial(Option<u32>, Aligned),
     /// Alignment cannot be performed or the queue is full.
     Unavailable,
     /// The song was aligned and found sung to other words (B1479, V1468):
@@ -472,9 +470,6 @@ struct Partial {
     lines: Vec<Option<Vec<WordStamp>>>,
     /// When its first line came, for the job's log line.
     first_line_at: Option<Instant>,
-    /// When the aligner said the song cannot end a lyrics mismatch; until
-    /// then its words may not be what was sung and are held back (V1468).
-    text_clear_at: Option<Instant>,
 }
 
 /// The streamed `/align` answer's type (ADR-0121).
@@ -498,9 +493,6 @@ enum Event {
         index: usize,
         words: Vec<ReplyWord>,
     },
-    /// pharos-align's `Progress::TextClear`: the song cannot end a lyrics
-    /// mismatch, so the words streamed may be shown.
-    TextClear,
     Done,
     Error {
         status: u16,
@@ -669,23 +661,18 @@ impl Aligner {
         self.partial.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// How many lines were timed before the answer, when the first came
-    /// after queueing, and when their words could first be shown, for the
-    /// job's log line.
-    fn streamed(&self, job: &Job) -> (usize, Option<u64>, Option<u64>) {
+    /// How many lines were timed before the answer, and when the first came
+    /// after queueing, for the job's log line.
+    fn streamed(&self, job: &Job) -> (usize, Option<u64>) {
         let partial = self.partial_lock();
         let Some(p) = partial.get(&job.id) else {
-            return (0, None, None);
+            return (0, None);
         };
-        let since_queued = |at: Instant| {
+        let first_ms = p.first_line_at.map(|at| {
             u64::try_from(at.saturating_duration_since(job.queued_at).as_millis())
                 .unwrap_or(u64::MAX)
-        };
-        (
-            p.lines.iter().flatten().count(),
-            p.first_line_at.map(since_queued),
-            p.text_clear_at.map(since_queued),
-        )
+        });
+        (p.lines.iter().flatten().count(), first_ms)
     }
 
     /// Applies one event of a streamed answer for item `id`: an offset or a
@@ -711,7 +698,6 @@ impl Aligner {
                             offset_ms,
                             lines: std::iter::repeat_with(|| None).take(n_lines).collect(),
                             first_line_at: None,
-                            text_clear_at: None,
                         },
                     );
                 }
@@ -724,11 +710,6 @@ impl Aligner {
                     }
                 }
             }
-            Event::TextClear => {
-                if let Some(p) = self.partial_lock().get_mut(&id) {
-                    p.text_clear_at.get_or_insert_with(Instant::now);
-                }
-            }
             Event::Done => return parse_answer(text, n_lines).map(Some),
             Event::Error { status, error } => return Err(format!("status {status}: {error}")),
             Event::Other => {}
@@ -738,28 +719,20 @@ impl Aligner {
 
     /// The lines timed so far for item `id` under cache `key`, as an answer
     /// with an empty line for each still to come; `None` before a line is
-    /// timed, or when the job in flight was for other lyrics. Until the
-    /// aligner clears the song's text every line is empty, so only the
-    /// offset moves the lines (V1468).
-    fn partial_for(&self, id: u64, key: &str) -> Option<(Aligned, bool)> {
+    /// timed, or when the job in flight was for other lyrics. Words stream
+    /// as they are timed, before the text check has run.
+    fn partial_for(&self, id: u64, key: &str) -> Option<Aligned> {
         let partial = self.partial_lock();
         let p = partial.get(&id).filter(|p| p.key == key)?;
-        let shown = p.text_clear_at.is_some();
-        p.lines.iter().any(Option::is_some).then(|| {
-            let aligned = Aligned {
-                lines: if shown {
-                    p.lines
-                        .iter()
-                        .map(|l| l.clone().unwrap_or_default())
-                        .collect()
-                } else {
-                    vec![Vec::new(); p.lines.len()]
-                },
-                offset_ms: p.offset_ms,
-                scores: Vec::new(),
-                mismatch: None,
-            };
-            (aligned, !shown)
+        p.lines.iter().any(Option::is_some).then(|| Aligned {
+            lines: p
+                .lines
+                .iter()
+                .map(|l| l.clone().unwrap_or_default())
+                .collect(),
+            offset_ms: p.offset_ms,
+            scores: Vec::new(),
+            mismatch: None,
         })
     }
 
@@ -775,7 +748,7 @@ impl Aligner {
     /// as the success path does, and hold it off until the retry time.
     fn job_failed(&self, job: &Job, error: &str) {
         let (predicted_ms, actual_ms) = job.observe_eta("failed");
-        let (lines_streamed, first_line_ms, text_clear_ms) = self.streamed(job);
+        let (lines_streamed, first_line_ms) = self.streamed(job);
         tracing::warn!(
             media.id = job.id,
             error = %error,
@@ -783,7 +756,6 @@ impl Aligner {
             eta.actual_ms = actual_ms,
             lines_streamed,
             first_line_ms,
-            text_clear_ms,
             "lyrics: alignment failed"
         );
         let retry = std::time::Instant::now() + RETRY_AFTER;
@@ -811,7 +783,7 @@ impl Aligner {
         // it and the estimator's own finish.
         let (predicted_ms, actual_ms) = job.observe_eta("aligned");
         // 0 lines streamed: an aligner from before ADR-0121 answered whole.
-        let (lines_streamed, first_line_ms, text_clear_ms) = self.streamed(job);
+        let (lines_streamed, first_line_ms) = self.streamed(job);
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
@@ -820,7 +792,6 @@ impl Aligner {
             eta.actual_ms = actual_ms,
             lines_streamed,
             first_line_ms,
-            text_clear_ms,
             lyrics_mismatch,
             "lyrics: aligned"
         );
@@ -1140,7 +1111,7 @@ impl Aligner {
                 .eta_ms(item.id, self.now_ms())
                 .map(clamp_u32);
             return match self.partial_for(item.id, &key) {
-                Some((partial, held)) => Lookup::Partial(left, partial, held),
+                Some(partial) => Lookup::Partial(left, partial),
                 None => Lookup::Pending(left),
             };
         }
@@ -2489,7 +2460,6 @@ pub(super) mod tests {
         let (logs, _log_guard) = capture_logs();
         let events = vec![
             r#"{"event":"offset","offset_ms":100,"aligner_version":5,"lines":2}"#.to_owned(),
-            r#"{"event":"text_clear"}"#.to_owned(),
             r#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1100}],"score":0.9}"#
                 .to_owned(),
             r#"{"event":"progress_from_a_newer_aligner"}"#.to_owned(),
@@ -2498,7 +2468,7 @@ pub(super) mod tests {
             DONE.to_owned(),
         ];
         let (open, gate) = tokio::sync::oneshot::channel();
-        let base = fake_stream(events, 4, gate, true).await;
+        let base = fake_stream(events, 3, gate, true).await;
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Arc::new(Aligner {
             base,
@@ -2513,7 +2483,7 @@ pub(super) mod tests {
 
         let mut partial = None;
         for _ in 0..200 {
-            partial = aligner.partial_for(job.id, &job.key).map(|(a, _)| a);
+            partial = aligner.partial_for(job.id, &job.key);
             if partial.is_some() {
                 break;
             }
@@ -2544,7 +2514,6 @@ pub(super) mod tests {
         let line = eta_line(&logs, "lyrics: aligned");
         assert!(line.contains("lines_streamed=2"), "{line}");
         assert!(line.contains("first_line_ms="), "{line}");
-        assert!(line.contains("text_clear_ms="), "{line}");
     }
 
     /// ADR-0124: aligner 6 streams today's lines, then sends a line again
@@ -2561,14 +2530,13 @@ pub(super) mod tests {
                 .to_owned(),
             r#"{"event":"line","index":1,"words":[{"at":0,"start_ms":3100}],"score":0.8}"#
                 .to_owned(),
-            r#"{"event":"text_clear"}"#.to_owned(),
             r#"{"event":"line","index":0,"words":[{"at":0,"start_ms":1500}],"score":0.95,"placement":"refined"}"#
                 .to_owned(),
             r#"{"event":"done","lines":[{"words":[{"at":0,"start_ms":1500}],"score":0.95,"placement":"refined"},{"words":[{"at":0,"start_ms":3100}],"score":0.8,"placement":"kept"}],"offset_ms":100,"aligner_version":6}"#
                 .to_owned(),
         ];
         let (open, gate) = tokio::sync::oneshot::channel();
-        let base = fake_stream(events, 5, gate, true).await;
+        let base = fake_stream(events, 4, gate, true).await;
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Arc::new(Aligner {
             base,
@@ -2588,7 +2556,6 @@ pub(super) mod tests {
         for _ in 0..200 {
             shown = aligner
                 .partial_for(job.id, &job.key)
-                .map(|(a, _)| a)
                 .filter(|p| p.lines.first() == Some(&corrected));
             if shown.is_some() {
                 break;
@@ -2655,9 +2622,8 @@ pub(super) mod tests {
 
     /// V1297: a song in flight with lines timed for its current lyrics is
     /// looked up as `Partial`, and with none yet, or only lines timed for
-    /// other lyrics, as `Pending`; its words are held back until the aligner
-    /// clears its text (V1468). Disarm check: with `partial_for` showing
-    /// words before `text_clear`, this fails.
+    /// other lyrics, as `Pending`. Its words stream as they are timed,
+    /// before the text check, and a mismatch found then unsyncs it (V1468).
     #[test]
     fn a_song_in_flight_is_partial_once_a_line_is_timed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2721,17 +2687,7 @@ pub(super) mod tests {
                 2,
             )
             .unwrap();
-        // V1468: until the aligner clears the song's text, its words may
-        // follow another song, so only the offset is shown.
-        let Lookup::Partial(None, held, true) = aligner.words_for(&item, &lyrics) else {
-            panic!("expected a partial answer");
-        };
-        assert_eq!(held.offset_ms, 50);
-        assert_eq!(held.lines, vec![Vec::<WordStamp>::new(); 2]);
-        aligner
-            .event((item.id, &key), br#"{"event":"text_clear"}"#, 2)
-            .unwrap();
-        let Lookup::Partial(None, partial, false) = aligner.words_for(&item, &lyrics) else {
+        let Lookup::Partial(None, partial) = aligner.words_for(&item, &lyrics) else {
             panic!("expected a partial answer");
         };
         assert_eq!(partial.offset_ms, 50);
@@ -2780,7 +2736,7 @@ pub(super) mod tests {
         let labels = [
             Lookup::Ready(aligned.clone()).label(),
             Lookup::Pending(None).label(),
-            Lookup::Partial(None, aligned, false).label(),
+            Lookup::Partial(None, aligned).label(),
             Lookup::Unavailable.label(),
             Lookup::Mismatch(Heard::default()).label(),
         ];
