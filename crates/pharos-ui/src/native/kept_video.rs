@@ -627,10 +627,14 @@ fn localize_ref<'a>(
         return Err(());
     }
     // Where the stored copy is read from is where it was fetched from
-    // unless a redirect moved it: kept as written then, rewritten to its
-    // key otherwise.
-    if moved {
-        local_key(rest).map(Cow::Owned)
+    // unless a redirect moved it: kept as written then, but only while it
+    // resolves to the same key from there (the offline playlist's URL is
+    // its key, under no base path). One that names the base path itself
+    // (`../../jf/videos/0.m4s` under `/jf`) would not: rewritten to its
+    // key, as when moved.
+    let key = local_key(rest)?;
+    if moved || request_key(&pharos_hls::uri::resolve(upstream, r)) != key {
+        Ok(Cow::Owned(key))
     } else {
         Ok(Cow::Borrowed(r))
     }
@@ -1010,6 +1014,35 @@ mod tests {
                 usize::MAX
             ),
             Localized::NotLocal(other.to_owned())
+        );
+    }
+
+    /// CR 4644634634: an unmoved playlist's relative reference that names
+    /// the base path itself resolves upstream to a key it would not reach
+    /// offline: it is rewritten to that key. A plain sibling stays as
+    /// written.
+    #[test]
+    fn a_relative_reference_through_the_base_path_is_rewritten_to_its_key() {
+        let server = "https://s.example/jf";
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n../../jf/videos/0.m4s\n#EXTINF:6.0,\n1.m4s\n",
+                "/videos/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/0.m4s\n#EXTINF:6.0,\n1.m4s\n".to_owned())
+        );
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\n0.m4s\n",
+                "/videos/main.m3u8",
+                false,
+                server,
+                usize::MAX
+            ),
+            Localized::Unchanged
         );
     }
 
