@@ -183,7 +183,11 @@ pub struct Planner {
     audio: Option<TrackState>,
     config: Config,
     forward_target_ms: u64,
+    /// The source is ended as far as the planner has asked: cleared by anything
+    /// that reopens it (a fetch, a trim, a seek back).
     eos_emitted: bool,
+    /// The end was noted for this run to the end; a seek back notes it again.
+    eos_noted: bool,
     notes: Vec<Note>,
 }
 
@@ -205,6 +209,7 @@ impl Planner {
             config,
             forward_target_ms,
             eos_emitted: false,
+            eos_noted: false,
             notes: Vec::new(),
         }
     }
@@ -274,19 +279,31 @@ impl Planner {
             );
         }
 
+        // An append or a remove reopens an ended MediaSource.
+        if actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::Fetch { .. } | Action::FetchInit { .. } | Action::Evict { .. }
+            )
+        }) {
+            self.eos_emitted = false;
+        }
         if !self.eos_emitted && self.ready_for_eos(play_ms, buffered) {
             self.eos_emitted = true;
-            let buffered_end_ms = buffered
-                .video
-                .iter()
-                .chain(&buffered.audio)
-                .map(|&(_, end)| end)
-                .max()
-                .unwrap_or(0);
-            self.notes.push(Note::EndOfStream {
-                play_ms,
-                buffered_end_ms,
-            });
+            if !self.eos_noted {
+                self.eos_noted = true;
+                let buffered_end_ms = buffered
+                    .video
+                    .iter()
+                    .chain(&buffered.audio)
+                    .map(|&(_, end)| end)
+                    .max()
+                    .unwrap_or(0);
+                self.notes.push(Note::EndOfStream {
+                    play_ms,
+                    buffered_end_ms,
+                });
+            }
             actions.push(Action::EndOfStream);
         }
 
@@ -306,6 +323,7 @@ impl Planner {
 
         if to_ms < stream_end || stream_end == 0 {
             self.eos_emitted = false;
+            self.eos_noted = false;
         }
 
         seek_track(
@@ -1133,6 +1151,72 @@ mod tests {
             }]
         );
         assert_eq!(planner.take_notes(), Vec::new());
+    }
+
+    // B1493: a back-buffer trim after EndOfStream reopens the MediaSource
+    // (`SourceBuffer.remove` on an ended source), and nothing ended it again:
+    // the video stalled at its last frame and never fired `ended`.
+    #[test]
+    fn a_trim_after_end_of_stream_ends_the_stream_again() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs.clone(), false)),
+            Config::default(),
+            0,
+        );
+        let mut buffered = Buffered::default();
+        let mut ended = false;
+        let mut trims_after_end = 0;
+        for play_ms in (0..120_000).step_by(250) {
+            let actions = planner.tick(play_ms, &buffered);
+            let trimmed = actions.iter().any(|a| matches!(a, Action::Evict { .. }));
+            let ends = actions.last() == Some(&Action::EndOfStream);
+            if ended && trimmed {
+                trims_after_end += 1;
+                assert!(
+                    ends,
+                    "trim at {play_ms} ms left the source open: {actions:?}"
+                );
+            }
+            ended |= ends;
+            for action in actions {
+                match action {
+                    Action::Fetch { track, index } => {
+                        let seg = &segs[index];
+                        let ranges = match track {
+                            Track::Video => &mut buffered.video,
+                            Track::Audio => &mut buffered.audio,
+                        };
+                        merge_range(ranges, seg.start_ms, seg.start_ms + seg.duration_ms);
+                        planner.appended(track);
+                    }
+                    Action::Evict {
+                        track,
+                        start_ms,
+                        end_ms,
+                    } => {
+                        let ranges = match track {
+                            Track::Video => &mut buffered.video,
+                            Track::Audio => &mut buffered.audio,
+                        };
+                        evict_range(ranges, start_ms, end_ms);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            trims_after_end > 0,
+            "the scenario never trimmed after the end"
+        );
+        let ends_noted = planner
+            .take_notes()
+            .iter()
+            .filter(|n| matches!(n, Note::EndOfStream { .. }))
+            .count();
+        assert_eq!(ends_noted, 1, "the end is noted once, not per trim");
     }
 
     #[test]
