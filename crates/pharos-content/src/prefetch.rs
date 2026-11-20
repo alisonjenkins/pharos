@@ -127,6 +127,10 @@ struct Gate {
     /// Test hook: runs as a refused pin is about to be parked.
     #[cfg(test)]
     before_park: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: runs once a replacement's first chunk has arrived,
+    /// before it is admitted.
+    #[cfg(test)]
+    after_first_chunk: Mutex<Option<Box<dyn FnMut() + Send>>>,
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
@@ -231,6 +235,8 @@ impl Downloader {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_park: Mutex::new(None),
+            #[cfg(test)]
+            after_first_chunk: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1176,6 +1182,26 @@ impl Gate {
                             "cache download id={id} reserve verdict=first_chunk reason=window_does_not_fit replacing=true window={} chunk={len} room={room}",
                             left(start)
                         );
+                        #[cfg(test)]
+                        if let Some(hook) = self
+                            .after_first_chunk
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .as_mut()
+                        {
+                            hook();
+                        }
+                        // The wait for the chunk may have outlived the job:
+                        // one no longer wanted leaves its part and its
+                        // validator as they are, and evicts nothing.
+                        if !self.still_wanted(id, generation) {
+                            log::info!(
+                                "cache download id={id} verdict=cancelled reason=not_wanted_after_first_chunk part=kept"
+                            );
+                            #[cfg(test)]
+                            self.event(format!("cancelled_after_first_chunk:{id}"));
+                            return Err(Fail::Cancelled);
+                        }
                         match self.cache.ensure_free_replacing_part(id, len, true) {
                             Ok(_) => {}
                             Err(NoRoom::LowDisk(free)) => {
@@ -1766,6 +1792,8 @@ mod tests {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_park: Mutex::new(None),
+            #[cfg(test)]
+            after_first_chunk: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1817,6 +1845,8 @@ mod tests {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_park: Mutex::new(None),
+            #[cfg(test)]
+            after_first_chunk: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1878,6 +1908,8 @@ mod tests {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_park: Mutex::new(None),
+            #[cfg(test)]
+            after_first_chunk: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1951,6 +1983,8 @@ mod tests {
             events: Mutex::new(Vec::new()),
             #[cfg(test)]
             before_park: Mutex::new(None),
+            #[cfg(test)]
+            after_first_chunk: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -3630,6 +3664,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Outside diff prefetch.rs:1156 (review 5997638687): a replacement
+    /// whose window did not fit waits for its first chunk; a playback
+    /// request that drops the track meanwhile cancels it before the
+    /// admission, so the old part is neither emptied nor overwritten.
+    #[test]
+    fn a_replacement_dropped_while_its_first_chunk_came_keeps_its_part() {
+        let script = Script::default()
+            .file("/audio/1", body(400, 2))
+            .chunked()
+            .chunk_bytes(400)
+            .no_etag();
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let r = rig_with_free(
+            "replace-dropped-first-chunk",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            starved_while_part(
+                slot.clone(),
+                Arc::new(AtomicBool::new(true)),
+                600,
+                MIN_FREE_BYTES - 100,
+            ),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        std::fs::write(&part, body(600, 1)).unwrap();
+        // A newer request that does not list the track.
+        let gate = r.dl.gate.clone();
+        *r.dl.gate.after_first_chunk.lock().unwrap() = Some(Box::new(move || {
+            gate.lock().generation += 1;
+        }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
+        assert!(!r.cache.is_complete("track/1"));
+        assert_eq!(
+            std::fs::read(&part).ok(),
+            Some(body(600, 1)),
+            "a dropped replacement changed its part"
+        );
+        assert!(
+            r.dl.events()
+                .iter()
+                .any(|e| e == "cancelled_after_first_chunk:track/1"),
+            "{:?}",
+            r.dl.events()
+        );
     }
 
     /// A whole new body that replaces a partial file is admitted with the
