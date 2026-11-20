@@ -62,10 +62,13 @@ app already keeps downloaded music under a configurable cap (default 4 GiB).
   and a store never touches a marker naming another token. It clears
   the new token's own marker durably before writing anything, and
   refuses the sign-in with nothing written when that fails. A marker is
-  never unlinked: it is cleared by renaming a fsynced temp file holding
-  `cleared` over it, between two folder syncs, and a reader takes a
-  cleared marker as none. The file on disk is then always the old marker
-  or the cleared one, so no failure leaves the token unguarded. A folder that can never be synced
+  never unlinked: a clearing first writes a guard, a copy of the marker
+  that a reader takes as the marker, and syncs the folder; then renames
+  a fsynced temp file holding `cleared` over the marker and syncs the
+  folder; and only then removes the guard. A reader takes a cleared
+  marker with no guard as none, so no failure before the guard goes
+  leaves the token unguarded, and a crash after it can only bring the
+  guard back. A folder that can never be synced
   (EINVAL or ENOTSUP on both attempts) is accepted and logged as not
   durable, since refusing would make sign-in impossible there.
 - Who may reach the downloads is one offline-owner state. A session end
