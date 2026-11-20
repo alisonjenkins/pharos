@@ -183,9 +183,11 @@ pub trait OnlineLyrics: Send + Sync {
         song: &'a Song,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Lyrics>, OnlineError>> + Send + 'a>>;
 
-    /// Every synced record the service holds under the song's title and
+    /// The synced records the service returns for the song's title and
     /// artist, in its own order, for picking another when the one found was
-    /// not what was sung (B1479). A service that cannot search has none.
+    /// not what was sung (B1479). A service may return only some of what it
+    /// holds (LRCLIB returns at most 20), so finding none usable is a verdict
+    /// on these records only. A service that cannot search has none.
     fn search<'a>(
         &'a self,
         _song: &'a Song,

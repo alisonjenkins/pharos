@@ -19,8 +19,10 @@ the lyric's word pairs found in that transcript tells a wrong lyric
 transcript). A song the recogniser barely heard also scores low, so the
 number of words heard has to be counted too.
 
-LRCLIB's `/api/search` returns every record it holds for a title and
-artist, with each record's length and synced text.
+LRCLIB's `/api/search` returns up to 20 records for a title and artist,
+with each record's length and synced text, and has no further pages. A
+search that finds nothing usable says so of the records returned, not of
+everything LRCLIB holds.
 
 ## Decision
 
