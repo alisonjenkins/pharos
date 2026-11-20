@@ -947,7 +947,12 @@ fn is_track_covered_from_playhead(
 fn track_ready_for_eos(state: &TrackState, play_ms: u64, track_buffered: &[(u64, u64)]) -> bool {
     !state.needs_init
         && state.in_flight.is_none()
-        && state.last_appended
+        // A last segment its neighbour's data already covers is never appended.
+        && (state.last_appended
+            || state
+                .segments
+                .last()
+                .is_some_and(|last| is_segment_covered(last, track_buffered)))
         && is_track_covered_from_playhead(state, play_ms, track_buffered)
 }
 
@@ -2071,7 +2076,7 @@ mod tests {
             video: vec![(0, 24_000)],
             audio: Vec::new(),
         };
-        assert_eq!(planner.tick(11_500, &whole), Vec::new());
+        assert_eq!(planner.tick(11_500, &whole), vec![Action::EndOfStream]);
     }
 
     #[test]
@@ -2104,6 +2109,21 @@ mod tests {
     }
 
     #[test]
+    fn a_sliver_last_segment_buffered_by_its_neighbour_still_ends_the_stream() {
+        let segs = make_segments(&[6_000, 6_000, 100]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let mut buf = Buffered::default();
+        for end_ms in [6_000, 12_080] {
+            assert!(matches!(planner.tick(0, &buf)[..], [Action::Fetch { .. }]));
+            planner.appended(Track::Video);
+            buf.video = vec![(0, end_ms)];
+        }
+        // The second segment's data runs past the sliver's midpoint, so the
+        // sliver is never requested.
+        assert_eq!(planner.tick(1_000, &buf), vec![Action::EndOfStream]);
+    }
+
+    #[test]
     fn a_gap_the_watchdog_can_jump_is_not_fetched_again() {
         let segs = make_segments(&[6_000; 4]);
         let mut planner = Planner::new(segs, false, None, Config::default(), 0);
@@ -2111,7 +2131,7 @@ mod tests {
             video: vec![(0, 12_070), (13_000, 24_000)],
             audio: Vec::new(),
         };
-        assert_eq!(planner.tick(11_000, &buf), Vec::new());
+        assert_eq!(planner.tick(11_000, &buf), vec![Action::EndOfStream]);
         // Nor is a gap behind the play head.
         let behind = Buffered {
             video: vec![(0, 6_000), (9_000, 24_000)],
@@ -2138,7 +2158,7 @@ mod tests {
             );
             planner.appended(Track::Video);
         }
-        assert_eq!(planner.tick(11_000, &holed), Vec::new());
+        assert_eq!(planner.tick(11_000, &holed), vec![Action::EndOfStream]);
         assert!(planner.take_notes().contains(&Note::GaveUp {
             track: Track::Video,
             index: 2,
