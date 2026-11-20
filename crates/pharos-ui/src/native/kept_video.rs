@@ -499,6 +499,57 @@ pub fn url_path(url: &str) -> &str {
     from_path.split(['?', '#']).next().unwrap_or("")
 }
 
+/// The request key `final_url` (where a request to the server at `base`
+/// ended up after its redirects) is for: its path and query with the
+/// base's own path taken off, as [`request_key`] spells keys. `None` when
+/// it is outside the base's path, where no key can name it.
+pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
+    let full = request_key(final_url);
+    let base_path = url_path(base).trim_end_matches('/');
+    let rest = full.strip_prefix(base_path)?;
+    (rest.starts_with('/') || rest.starts_with('?')).then(|| request_key(rest))
+}
+
+/// A playlist answered from `final_key` (after a redirect), with each
+/// reference it makes rewritten to the absolute path (and its own query)
+/// it resolves to against `final_key`, so the stored copy names its files
+/// wherever it is read from: a URI line, and every `URI="..."` attribute
+/// of a tag. A reference that is already absolute, or names a scheme, is
+/// left as it is; so are the line endings and every other line.
+pub fn rebase_playlist(text: &str, final_key: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            out.push_str(line);
+        } else if trimmed.starts_with('#') {
+            let mut rest = body;
+            while let Some(at) = rest.find("URI=\"") {
+                let (head, tail) = rest.split_at(at + 5);
+                out.push_str(head);
+                match tail.find('"') {
+                    Some(end) => {
+                        out.push_str(&pharos_hls::uri::resolve(final_key, &tail[..end]));
+                        rest = &tail[end..];
+                    }
+                    None => {
+                        rest = tail;
+                        break;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out.push_str(ending);
+        } else {
+            out.push_str(&pharos_hls::uri::resolve(final_key, trimmed));
+            out.push_str(ending);
+        }
+    }
+    out
+}
+
 /// Whether a download of `original` may follow a redirect to `next`
 /// without moving what its relative references resolve against. A
 /// playlist's references are planned and replayed against the key it was
@@ -693,6 +744,53 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_final_url_is_keyed_under_the_servers_base_path() {
+        let moved = "http://s:8096/videos/7/hls/master.m3u8?s=1";
+        assert_eq!(
+            key_under_base("http://s:8096", moved).as_deref(),
+            Some("/videos/7/hls/master.m3u8?s=1")
+        );
+        assert_eq!(
+            key_under_base("http://s:8096/jf", "http://s:8096/jf/videos/7/a.m3u8?s=1").as_deref(),
+            Some("/videos/7/a.m3u8?s=1")
+        );
+        assert_eq!(key_under_base("http://s:8096/jf", moved), None);
+        assert_eq!(
+            key_under_base("http://s:8096/jf", "http://s:8096/jfx/a.m3u8"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_redirected_playlist_names_its_files_by_absolute_path() {
+        let master = "#EXTM3U\r\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"../audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
+            main.m3u8?s=1\r\n\
+            \r\n\
+            /already/absolute.m3u8?s=1\r\n\
+            https://h/elsewhere.m3u8\r\n";
+        assert_eq!(
+            rebase_playlist(master, "/videos/7/hls/master.m3u8?s=1"),
+            "#EXTM3U\r\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"/videos/7/audio/a.m3u8?s=1\",NAME=\"x\"\r\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1\r\n\
+            /videos/7/hls/main.m3u8?s=1\r\n\
+            \r\n\
+            /already/absolute.m3u8?s=1\r\n\
+            https://h/elsewhere.m3u8\r\n"
+        );
+        // A media playlist's init and segments, no final newline.
+        assert_eq!(
+            rebase_playlist(
+                "#EXT-X-MAP:URI=\"init.mp4?s=1\"\n#EXTINF:6.0,\n./0.m4s?s=1",
+                "/videos/7/hls/main.m3u8?s=1"
+            ),
+            "#EXT-X-MAP:URI=\"/videos/7/hls/init.mp4?s=1\"\n#EXTINF:6.0,\n/videos/7/hls/0.m4s?s=1"
+        );
+    }
 
     #[test]
     fn a_playlist_redirected_into_another_folder_is_not_followed() {
