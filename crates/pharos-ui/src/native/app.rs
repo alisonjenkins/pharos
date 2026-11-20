@@ -2155,6 +2155,8 @@ fn NativeApp(route: Route) -> Element {
         machine,
         marks,
     });
+    // ADR 0148: one download at a time, tried again by itself.
+    super::download_driver::use_download_driver();
     // One manage token per connection, reused each time Manage opens (B920).
     let mut held_manage = use_signal(|| None);
     use_context_provider(|| super::manage::HeldManageToken(held_manage));
