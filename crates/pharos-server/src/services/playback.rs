@@ -1540,6 +1540,10 @@ pub struct GrantRequest<'a> {
     /// The device the session's token was issued to. With it, a negotiate may
     /// adopt a grant that device released without a stop (B1397).
     pub device: Option<&'a pharos_core::ClientDeviceId>,
+    /// The play session of the stream the player is still pulling, named by a
+    /// renewal; empty on a first negotiate. Kept when no release was adopted
+    /// and the session is provably this stream's (B1490).
+    pub resumes: &'a str,
 }
 
 /// A playback a native player may start: the stream capability and the
@@ -1833,7 +1837,10 @@ pub async fn grant(
             reported_ms: adopted.reported_ms,
         });
     }
-    let play_session_id = uuid::Uuid::new_v4().simple().to_string();
+    let resumed = resume_named(state, user, id, r, &item.probe, &negotiated).await;
+    let play_session_id = resumed
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let resume_ticks = if user_data.played {
         0
     } else {
@@ -1878,51 +1885,55 @@ pub async fn grant(
             )
         }
     };
-    let holder = pharos_core::SessionHolder {
-        user_id: user.id,
-        token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
-    };
-    register(
-        state,
-        &play_session_id,
-        id,
-        &negotiated,
-        &item.probe,
-        holder.clone(),
-    )
-    .await;
-    // The client will not ask for segment 0 until its player has loaded the
-    // master, so warm the opening segments now, off its critical path. The
-    // URL is the one handed back, so the prewarm derives the keys the same
-    // way the client's requests will.
-    let transcoding_url =
-        (!matches!(negotiated.decision, Decision::DirectPlay)).then_some(stream_url.as_str());
-    let renditions = delivery_renditions;
-    crate::api::jellyfin::hls::prewarm_negotiated(
-        state,
-        crate::api::jellyfin::hls::NegotiatedPrewarm {
-            route: crate::api::jellyfin::hls::PrewarmRoute::Native,
-            media_id: id,
-            negotiated: &negotiated,
-            transcoding_url,
-            renditions: &renditions,
-            probe: &item.probe,
-            holder,
-            play_session_id: &play_session_id,
-            resume_ticks,
-            // Native clients play through hls.js in a browser engine, so their
-            // media requests send a Mozilla user agent and `master_playlist`
-            // serves them the demuxed h264 CMAF master.
-            fetches_as_browser: true,
-            is_audio: !negotiated.is_video,
-            media_source_id: item.edition.is_some().then(|| {
-                format!(
-                    "{item_wire_id}-{}",
-                    item.edition.as_deref().unwrap_or_default()
-                )
-            }),
-        },
-    );
+    // A resumed session already has its transcode session and its opening
+    // segments: the player is part way through them.
+    if resumed.is_none() {
+        let holder = pharos_core::SessionHolder {
+            user_id: user.id,
+            token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
+        };
+        register(
+            state,
+            &play_session_id,
+            id,
+            &negotiated,
+            &item.probe,
+            holder.clone(),
+        )
+        .await;
+        // The client will not ask for segment 0 until its player has loaded the
+        // master, so warm the opening segments now, off its critical path. The
+        // URL is the one handed back, so the prewarm derives the keys the same
+        // way the client's requests will.
+        let transcoding_url =
+            (!matches!(negotiated.decision, Decision::DirectPlay)).then_some(stream_url.as_str());
+        let renditions = delivery_renditions;
+        crate::api::jellyfin::hls::prewarm_negotiated(
+            state,
+            crate::api::jellyfin::hls::NegotiatedPrewarm {
+                route: crate::api::jellyfin::hls::PrewarmRoute::Native,
+                media_id: id,
+                negotiated: &negotiated,
+                transcoding_url,
+                renditions: &renditions,
+                probe: &item.probe,
+                holder,
+                play_session_id: &play_session_id,
+                resume_ticks,
+                // Native clients play through hls.js in a browser engine, so their
+                // media requests send a Mozilla user agent and `master_playlist`
+                // serves them the demuxed h264 CMAF master.
+                fetches_as_browser: true,
+                is_audio: !negotiated.is_video,
+                media_source_id: item.edition.is_some().then(|| {
+                    format!(
+                        "{item_wire_id}-{}",
+                        item.edition.as_deref().unwrap_or_default()
+                    )
+                }),
+            },
+        );
+    }
     negotiated.record();
     tracing::info!(
         media.id = id,
@@ -1936,6 +1947,7 @@ pub async fn grant(
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
         edition = item.edition.as_deref().unwrap_or("primary"),
         stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
+        resumed = resumed.is_some(),
         "native playback negotiated"
     );
     Ok(Grant {
@@ -2018,6 +2030,145 @@ async fn adopt_released(
             None
         }
     }
+}
+
+/// What became of a play session a renewal named; the `outcome` of
+/// `pharos_play_session_resume_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    Resumed,
+    /// A live grant still holds it: that grant's own release decides it.
+    Live,
+    /// No transcode session has that id: it ended, or never existed.
+    Gone,
+    /// Another user holds it, or it plays another item.
+    NotHeld,
+    /// It plays another file, or another stream of this one.
+    OtherStream,
+    Failed,
+}
+
+impl ResumeOutcome {
+    pub const ALL: [Self; 6] = [
+        Self::Resumed,
+        Self::Live,
+        Self::Gone,
+        Self::NotHeld,
+        Self::OtherStream,
+        Self::Failed,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Resumed => "resumed",
+            Self::Live => "live",
+            Self::Gone => "gone",
+            Self::NotHeld => "not_held",
+            Self::OtherStream => "other_stream",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn record(self, play_session_id: &str, reason: &str) {
+        metrics::counter!("pharos_play_session_resume_total", "outcome" => self.label())
+            .increment(1);
+        tracing::info!(
+            play_session_id = %pharos_core::secret_prefix(play_session_id),
+            outcome = self.label(),
+            %reason,
+            "playback: renewal named its stream's session"
+        );
+    }
+}
+
+/// Keeps the play session a renewal names when no released grant was adopted:
+/// after a rollout the table of releases is gone, while the transcode session
+/// the player still pulls from is stored and outlives it (B1490). Kept only
+/// when no live grant holds it, this user holds it for this item, and it is
+/// the stream just negotiated: the same file, decision and burned subtitles.
+/// Anything else mints a session, as before; the named one is left to run.
+async fn resume_named(
+    state: &AppState,
+    user: &pharos_core::User,
+    item: u64,
+    r: &GrantRequest<'_>,
+    probe: &pharos_core::MediaProbe,
+    negotiated: &Negotiated,
+) -> Option<String> {
+    let named = r.resumes;
+    if named.is_empty() {
+        return None;
+    }
+    let psid = pharos_core::PlaySessionId::from(named);
+    let (outcome, reason) = match state.sessions.snapshot().await {
+        Err(e) => (
+            ResumeOutcome::Failed,
+            format!("listing live sessions failed: {e}"),
+        ),
+        Ok(live) if live.iter().any(|s| s.id == named) => (
+            ResumeOutcome::Live,
+            "a live grant still holds it".to_owned(),
+        ),
+        Ok(_) => match state.transcode_sessions.get(psid.clone()).await {
+            Err(e) => (
+                ResumeOutcome::Failed,
+                format!("transcode session lookup failed: {e}"),
+            ),
+            Ok(None) => (ResumeOutcome::Gone, "no transcode session".to_owned()),
+            Ok(Some(s)) if s.holder.user_id != user.id || s.media_id != item => (
+                ResumeOutcome::NotHeld,
+                format!(
+                    "held for item {} by another user or for another item",
+                    s.media_id
+                ),
+            ),
+            Ok(Some(s)) => match stream_mismatch(&s, probe, negotiated) {
+                Some(why) => (ResumeOutcome::OtherStream, why),
+                None => {
+                    // The stream now answers to the renewing token, as an
+                    // adopted release's does.
+                    let holder = pharos_core::SessionHolder {
+                        user_id: user.id,
+                        token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
+                    };
+                    match state.transcode_sessions.rebind_holder(&psid, holder).await {
+                        Ok(true) => (ResumeOutcome::Resumed, "the same stream".to_owned()),
+                        Ok(false) => (ResumeOutcome::Gone, "ended while resuming".to_owned()),
+                        Err(e) => (
+                            ResumeOutcome::Failed,
+                            format!("rebinding its holder failed: {e}"),
+                        ),
+                    }
+                }
+            },
+        },
+    };
+    outcome.record(named, &reason);
+    (outcome == ResumeOutcome::Resumed).then(|| named.to_owned())
+}
+
+/// The first way the stored session `s` is not the stream negotiated now.
+fn stream_mismatch(
+    s: &crate::transcode_sessions::TranscodeSession,
+    probe: &pharos_core::MediaProbe,
+    negotiated: &Negotiated,
+) -> Option<String> {
+    if s.source_probe != *probe {
+        return Some("it plays another file or an older probe of this one".to_owned());
+    }
+    if s.decision != negotiated.decision {
+        return Some(format!(
+            "decision: held {:?}, asked {:?}",
+            s.decision, negotiated.decision
+        ));
+    }
+    if s.burn_subtitle_indices != negotiated.burn_text_indices {
+        return Some(format!(
+            "burn_subtitle_indices: held {:?}, asked {:?}",
+            s.burn_subtitle_indices, negotiated.burn_text_indices
+        ));
+    }
+    None
 }
 
 /// Convert the boot-resolved server encode capabilities into the negotiator's
@@ -2821,5 +2972,19 @@ mod copy_opt_in_tests {
             with_copy_opt_in("/videos/9/master.m3u8".into(), true, true),
             "/videos/9/master.m3u8?copy=1"
         );
+    }
+}
+
+#[cfg(test)]
+mod resume_outcome_tests {
+    use super::ResumeOutcome;
+
+    /// `pharos_play_session_resume_total{outcome}` is a dashboard contract.
+    #[test]
+    fn resume_outcome_labels_are_distinct() {
+        let mut labels: Vec<_> = ResumeOutcome::ALL.iter().map(|o| o.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), ResumeOutcome::ALL.len());
     }
 }

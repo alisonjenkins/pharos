@@ -66,6 +66,17 @@ impl server::playback::Handler for Playback {
             .to_string()
             .unwrap_or_default();
         let version = params.get_version()?.to_str()?.trim().to_owned();
+        // An older client sends no session, which resumes nothing.
+        let resumes = if params.has_resumes() {
+            params
+                .get_resumes()?
+                .get_value()?
+                .to_str()?
+                .trim()
+                .to_owned()
+        } else {
+            String::new()
+        };
         let session = &self.session;
         let device = session.device_id().await;
         let granted = match (session.current_user().await, id, audio_stream_index) {
@@ -79,6 +90,7 @@ impl server::playback::Handler for Playback {
                     client_is_remote: session.client_is_remote(),
                     version: &version,
                     device: device.as_ref(),
+                    resumes: &resumes,
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
                     Ok(grant) => {
