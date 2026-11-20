@@ -34,6 +34,10 @@ const COLD_WINDOW: usize = 4;
 /// How often the stall watchdog samples the play head. Nothing else fires
 /// while it is stuck: `timeupdate` stops with it.
 const STALL_TICK_MS: i32 = 250;
+/// How long a refused append waits for the trim it asked for before it is
+/// tried again, and how many refusals of one append are a media error.
+const QUOTA_RETRY_MS: u32 = 500;
+const QUOTA_MAX_TRIES: u32 = 4;
 
 type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
@@ -94,6 +98,10 @@ struct TrackRunner {
     retries: Retries<SegRequest>,
     /// `updateend`s still to come from `SourceBuffer.abort()`, which belong to no queued op.
     aborted_updateends: u32,
+    /// An append the browser refused for room, held until the back buffer is trimmed.
+    parked: Option<Op>,
+    /// Refusals of the parked append so far.
+    quota_tries: u32,
     listeners: Vec<(&'static str, EventListener)>,
 }
 
@@ -115,6 +123,8 @@ impl TrackRunner {
             running: None,
             retries: Retries::new(policy),
             aborted_updateends: 0,
+            parked: None,
+            quota_tries: 0,
             listeners: Vec::new(),
         }
     }
@@ -1284,6 +1294,8 @@ fn abort_track(session: &Rc<RefCell<Session>>, track: Track) {
         };
         t.generation = t.generation.saturating_add(1);
         t.queue.retain(|op| !matches!(op, Op::Append { .. }));
+        t.parked = None;
+        t.quota_tries = 0;
         // SourceBuffer.abort() throws while a remove is running, so only an append is cut short.
         let aborting_append = open
             && matches!(t.running, Some(RunningOp::Append { .. }))
@@ -1680,9 +1692,9 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     };
 
     match op {
-        Op::Append { bytes, .. } => {
-            if let Err(err) = sb.append_buffer_with_array_buffer(&bytes) {
-                on_append_error(session, track, &err);
+        Op::Append { ref bytes, .. } => {
+            if let Err(err) = sb.append_buffer_with_array_buffer(bytes) {
+                on_append_error(session, track, &err, op);
             }
         }
         Op::Remove { start_s, end_s } => {
@@ -1700,51 +1712,94 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     }
 }
 
-fn on_append_error(session: &Rc<RefCell<Session>>, track: Track, err: &JsValue) {
+fn on_append_error(session: &Rc<RefCell<Session>>, track: Track, err: &JsValue, op: Op) {
     let is_quota = js_sys::Reflect::get(err, &JsValue::from_str("name"))
         .ok()
         .and_then(|v| v.as_string())
         .as_deref()
         == Some("QuotaExceededError");
 
-    if is_quota {
-        let new_target_ms = {
-            let mut s = session.borrow_mut();
-            if let Some(t) = s.track_mut(track) {
-                t.running = None;
-            }
-            s.planner.as_mut().map_or(0, |p| p.quota_exceeded(track))
-        };
-        warn(&format!(
-            "pharos: playback engine=rust quota_exceeded track={} forward_target_ms={new_target_ms}",
-            track.label()
-        ));
-        session.borrow_mut().trace.quota_exceeded();
-        report_event(ClientEvent {
-            kind: ClientEventKind::PlaybackError,
-            level: ClientLevel::Warn,
-            route: current_path(),
-            fields: vec![
-                ("engine", "rust".to_owned()),
-                ("type", "quotaExceeded".to_owned()),
-                ("track", track.label().to_owned()),
-                ("forward_target_ms", new_target_ms.to_string()),
-                ("action", "lower_target".to_owned()),
-            ],
-        });
-        run_queue(session, track);
-        pump(session);
+    if !is_quota {
+        if let Some(t) = session.borrow_mut().track_mut(track) {
+            t.running = None;
+        }
+        fail_media(
+            &Rc::downgrade(session),
+            "bufferAppendError",
+            &js_message(err),
+        );
         return;
     }
 
-    if let Some(t) = session.borrow_mut().track_mut(track) {
+    // Keep the bytes: the planner trims both tracks behind the play head on
+    // the next tick, and the same append is tried again once that has run.
+    let (tries, generation, new_target_ms) = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
+        let new_target_ms = s.planner.as_mut().map_or(0, Planner::quota_exceeded);
+        let Some(t) = s.track_mut(track) else {
+            return;
+        };
         t.running = None;
+        t.quota_tries = t.quota_tries.saturating_add(1);
+        let give_up = t.quota_tries > QUOTA_MAX_TRIES;
+        t.parked = (!give_up).then_some(op);
+        (t.quota_tries, t.generation, new_target_ms)
+    };
+    let give_up = tries > QUOTA_MAX_TRIES;
+    let action = if give_up { "rebuild" } else { "trim_and_retry" };
+    warn(&format!(
+        "pharos: playback engine=rust quota_exceeded track={} forward_target_ms={new_target_ms} attempt={tries} action={action}",
+        track.label()
+    ));
+    session.borrow_mut().trace.quota_exceeded();
+    report_event(ClientEvent {
+        kind: ClientEventKind::PlaybackError,
+        level: ClientLevel::Warn,
+        route: current_path(),
+        fields: vec![
+            ("engine", "rust".to_owned()),
+            ("type", "quotaExceeded".to_owned()),
+            ("track", track.label().to_owned()),
+            ("forward_target_ms", new_target_ms.to_string()),
+            ("attempt", tries.to_string()),
+            ("action", action.to_owned()),
+        ],
+    });
+    if give_up {
+        fail_media(
+            &Rc::downgrade(session),
+            "bufferFullError",
+            &format!("{} append refused for room {tries} times", track.label()),
+        );
+        return;
     }
-    fail_media(
-        &Rc::downgrade(session),
-        "bufferAppendError",
-        &js_message(err),
-    );
+    pump(session);
+
+    let weak = Rc::downgrade(session);
+    wasm_bindgen_futures::spawn_local(async move {
+        sleep_ms(QUOTA_RETRY_MS).await;
+        let Some(session) = weak.upgrade() else {
+            return;
+        };
+        {
+            let mut s = session.borrow_mut();
+            if s.dead {
+                return;
+            }
+            let Some(t) = s.track_mut(track) else {
+                return;
+            };
+            if t.generation != generation {
+                return;
+            }
+            let Some(op) = t.parked.take() else {
+                return;
+            };
+            t.queue.push_front(op);
+        }
+        run_queue(&session, track);
+    });
 }
 
 fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
@@ -1763,6 +1818,9 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
             }
         });
         if matches!(finished, Some(RunningOp::Append { .. })) {
+            if let Some(t) = s.track_mut(track) {
+                t.quota_tries = 0;
+            }
             if let Some(planner) = s.planner.as_mut() {
                 planner.appended(track);
             }
@@ -1816,7 +1874,10 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
         }
         let track_idle = |t: Option<&TrackRunner>| {
             t.map_or(true, |r| {
-                r.running.is_none() && r.queue.is_empty() && !r.source_buffer.updating()
+                r.running.is_none()
+                    && r.queue.is_empty()
+                    && r.parked.is_none()
+                    && !r.source_buffer.updating()
             })
         };
         if !track_idle(s.video_track.as_ref()) || !track_idle(s.audio_track.as_ref()) {
