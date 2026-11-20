@@ -315,12 +315,32 @@ pub struct ProxyGet<'a> {
     pub max_hops: usize,
 }
 
+/// Whether the request header `name` may go to another origin
+/// ([`CROSS_ORIGIN_HEADERS`]).
+fn crosses_origins(name: &str) -> bool {
+    CROSS_ORIGIN_HEADERS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(name))
+}
+
 /// The proxy's client from `build`: one that cannot be built is the error,
 /// naming the proxy, never a default client in its place
 /// ([`built_client_for`]).
 pub fn proxy_client<C>(build: impl FnOnce() -> Result<C, String>) -> Result<C, String> {
     built_client_for("proxy", build)
 }
+
+/// The caller's request headers that may go to another origin than the
+/// request's own: content negotiation and validators, nothing that can
+/// carry a credential. Any other header (`Authorization`, `Cookie`, ...)
+/// is sent only while the request is on its original origin.
+pub const CROSS_ORIGIN_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "if-modified-since",
+    "if-none-match",
+    "range",
+];
 
 /// Runs a proxied GET over `client`, following redirects by hand through
 /// [`redirect_hop`]: the token stays only on its own origin, and at most
@@ -359,12 +379,36 @@ pub async fn proxy_get<T: ProxyTransport>(
         }
     }
     let mut hops = 0usize;
+    // Once a redirect leaves the original origin, the caller's headers
+    // keep only those that may cross origins, for the rest of the request,
+    // as the token does.
+    let home = origin_of(&url);
+    let mut left_home = false;
     let resp = loop {
         let mut sent = Vec::with_capacity(headers.len() + 1);
         if let Some(token) = &token {
             sent.push(("X-Emby-Token".to_owned(), token.clone()));
         }
-        sent.extend(headers.iter().cloned());
+        left_home |= origin_of(&url) != home;
+        if left_home {
+            let dropped: Vec<&str> = headers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| !crosses_origins(n))
+                .collect();
+            if !dropped.is_empty() {
+                log(
+                    Level::Info,
+                    format!(
+                        "pharos: proxy redirect headers verdict=dropped reason=cross_origin names={}",
+                        dropped.join(",")
+                    ),
+                );
+            }
+            sent.extend(headers.iter().filter(|(n, _)| crosses_origins(n)).cloned());
+        } else {
+            sent.extend(headers.iter().cloned());
+        }
         let resp = client
             .get(&url, &sent)
             .await
@@ -1807,6 +1851,8 @@ mod tests {
     struct Scripted {
         redirects: std::sync::Mutex<std::collections::VecDeque<String>>,
         sent: std::sync::Mutex<Vec<(String, bool)>>,
+        /// The header names each request carried.
+        names: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl Scripted {
@@ -1816,6 +1862,7 @@ mod tests {
                     redirects.iter().map(|r| (*r).to_owned()).collect(),
                 ),
                 sent: std::sync::Mutex::new(Vec::new()),
+                names: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1851,6 +1898,10 @@ mod tests {
         ) -> Result<ScriptedAnswer, String> {
             let carries = headers.iter().any(|(n, _)| n == "X-Emby-Token");
             self.sent.lock().unwrap().push((url.to_owned(), carries));
+            self.names
+                .lock()
+                .unwrap()
+                .push(headers.iter().map(|(n, _)| n.clone()).collect());
             Ok(ScriptedAnswer(self.redirects.lock().unwrap().pop_front()))
         }
     }
@@ -1957,6 +2008,59 @@ mod tests {
             "the token went past its origin: {sent:?}"
         );
         assert_eq!(sent[3].0, "https://a.example.org/4");
+    }
+
+    /// CR 4644634678: a caller's credential headers stay on the original
+    /// origin. A redirect to another origin keeps only the headers that may
+    /// cross ([`CROSS_ORIGIN_HEADERS`]) for the rest of the request; a
+    /// same-origin hop keeps them all.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_callers_credential_headers_do_not_follow_a_redirect_off_origin() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| {
+            Ok(Scripted::new(&[
+                "https://a.example.org/2",
+                "https://b.example.net/3",
+                "https://a.example.org/4",
+            ]))
+        });
+        let headers = [
+            ("Authorization".to_owned(), "Bearer x".to_owned()),
+            ("Cookie".to_owned(), "s=1".to_owned()),
+            ("accept".to_owned(), "image/*".to_owned()),
+        ];
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "https://a.example.org/1".to_owned(),
+                token: None,
+                headers: &headers,
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        let full = ["Authorization", "Cookie", "accept"];
+        assert_eq!(names[0], full, "{names:?}");
+        assert_eq!(names[1], full, "a same-origin hop lost a header: {names:?}");
+        assert_eq!(
+            names[2],
+            ["accept"],
+            "credentials crossed origins: {names:?}"
+        );
+        assert_eq!(names[3], ["accept"], "credentials came back: {names:?}");
+        assert!(logged
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("verdict=dropped reason=cross_origin names=Authorization,Cookie")));
     }
 
     /// The control: redirects that stay on the token's origin keep it on
