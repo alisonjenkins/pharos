@@ -1679,6 +1679,10 @@ pub fn TitleView(
     /// video's Download control (where a video store is registered).
     #[props(default)]
     keep: Option<Element>,
+    /// The page shows the device's copy with no server (spec 049): only
+    /// what works without it is offered.
+    #[props(default)]
+    offline: bool,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
@@ -1728,7 +1732,8 @@ pub fn TitleView(
     });
     // A book's versions are its formats (V1391): picked the same way, named
     // by format, and its file facts already shown as the book's.
-    let pick_version = (item.kind.playable() || detail.book.is_some()) && detail.versions.len() > 1;
+    let pick_version =
+        !offline && (item.kind.playable() || detail.book.is_some()) && detail.versions.len() > 1;
     let version_list = version_list.filter(|_| detail.book.is_none());
     let pick_name = if detail.book.is_some() {
         "Format"
@@ -1804,11 +1809,13 @@ pub fn TitleView(
                                 p { class: "pharos-reader-locked", "{line}" }
                             },
                         }
-                        a {
-                            class: "pharos-button pharos-button-secondary",
-                            href: reader::version_href(item.id, &version),
-                            download: "",
-                            "Download"
+                        if !offline {
+                            a {
+                                class: "pharos-button pharos-button-secondary",
+                                href: reader::version_href(item.id, &version),
+                                download: "",
+                                "Download"
+                            }
                         }
                         if let Some(keep) = keep.clone() {
                             {keep}
@@ -1833,7 +1840,7 @@ pub fn TitleView(
                             }
                         }
                     }
-                    if can_watch_together(item.kind) {
+                    if can_watch_together(item.kind) && !offline {
                         for (label, from, class, key_action) in together_starts(item, in_group) {
                             {
                                 let id = item.id;
@@ -1853,7 +1860,7 @@ pub fn TitleView(
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
-                    if video_kind(item.kind) {
+                    if video_kind(item.kind) && !offline {
                         QueueButtons {
                             name: display_name(item),
                             tracks: vec![item.clone()],
@@ -1861,7 +1868,7 @@ pub fn TitleView(
                             kind: QueueTarget::VideoPage,
                         }
                     }
-                    if video_kind(item.kind) {
+                    if video_kind(item.kind) && !offline {
                         // B1474/V1456: the file itself, for a player like
                         // VLC when there will be no signal.
                         a {
@@ -1873,7 +1880,7 @@ pub fn TitleView(
                             span { class: "pharos-button-label", "Download file" }
                         }
                     }
-                    if item.kind.playable() {
+                    if item.kind.playable() && !offline {
                         WatchedToggle {
                             id: item.id,
                             played: item.played,
@@ -1882,7 +1889,7 @@ pub fn TitleView(
                             icon: video_kind(item.kind),
                         }
                     }
-                    if item.kind.playable() {
+                    if item.kind.playable() && !offline {
                         FavoriteToggle { id: item.id, favorite: item.favorite, name: display_name(item), icon: video_kind(item.kind) }
                     }
                 }
@@ -3643,6 +3650,30 @@ mod tests {
         assert!(actions.contains("keep-slot"), "{actions}");
         let html = with_video_queue(move || rsx! { TitleView { detail: bare.clone() } });
         assert!(!html.contains("keep-slot"), "{html}");
+    }
+
+    /// Spec 049 (V1486): offline, a film's page offers only what works with
+    /// no server: Play and its keep slot stay; Watch together, the queue,
+    /// the file download, the watched and favourite marks and the version
+    /// picker go. Disarm check: drop `offline` from any one of those
+    /// conditions and its label shows up again here.
+    #[test]
+    fn offline_a_films_page_offers_only_what_works_without_the_server() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            rsx! { TitleView { detail: detail.clone(), offline: true, keep: rsx! { span { id: "keep-slot" } } } }
+        });
+        assert!(html.contains(">Play<") && html.contains("keep-slot"), "{html}");
+        for gone in [
+            "Watch together",
+            "pharos-queue-button",
+            "Download file",
+            "pharos-watched",
+            "pharos-favorite",
+            r#"aria-label="Version""#,
+        ] {
+            assert!(!html.contains(gone), "{gone} offered offline: {html}");
+        }
     }
 
     /// B1353/V1324: a film's page has one row of actions, Play first, then
