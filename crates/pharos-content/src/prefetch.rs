@@ -613,6 +613,24 @@ impl Gate {
         let outcome = loop {
             match self.cache.ensure_free(id, 0) {
                 Ok(_) => {}
+                // A pin with a part on disk waits for room and resumes it;
+                // anything else stops here (its part, if any, is kept).
+                Err(NoRoom::LowDisk(free)) if part_len() > 0 && self.is_pin_work(id) => {
+                    log::info!(
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=preflight free_bytes={free} attempt={attempt} wait_ms={}",
+                        part_len(),
+                        started.elapsed().as_millis(),
+                        backoff.as_millis()
+                    );
+                    self.sleep_backoff(&mut backoff, &mut epoch).await;
+                    if self.yield_to_playback(id, &st) {
+                        break Outcome::Yielded;
+                    }
+                    if !self.pause_until_online(id, &mut generation).await {
+                        break Outcome::Cancelled;
+                    }
+                    continue;
+                }
                 Err(NoRoom::LowDisk(free)) => break Outcome::LowDisk(free),
                 Err(NoRoom::AccountingUnknown) => {
                     if self
@@ -668,6 +686,12 @@ impl Gate {
                 Ok(()) => break Outcome::Ok,
                 Err(Fail::Cancelled) => break Outcome::Cancelled,
                 Err(Fail::LowDisk(free)) => break Outcome::LowDisk(free),
+                // Read-ahead does not hold the worker for a replacement that
+                // cannot fit: it stops with the part and its validator kept,
+                // and the next request for the track resumes it.
+                Err(Fail::ReplacementLowDisk(free)) if !self.is_pin_work(id) => {
+                    break Outcome::LowDisk(free)
+                }
                 Err(Fail::ReplacementLowDisk(free)) => {
                     // The old bytes are on disk and counted already: deleting
                     // them frees nothing an eviction would not, and keeping
@@ -2243,6 +2267,86 @@ mod tests {
             waits.iter().any(|w| *w == fast().backoff_max),
             "the refusals never backed off past the minimum: {waits:?}"
         );
+    }
+
+    /// CR 4637783554: read-ahead does not hold the worker on a replacement
+    /// that cannot fit. The track stops with its part and validator kept,
+    /// and the next track downloads.
+    #[test]
+    fn a_read_ahead_replacement_that_cannot_fit_lets_the_next_track_go() {
+        let script = replacing_origin().file("/audio/2", body(100, 2));
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let r = rig_with_free(
+            "replacement-read-ahead",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            room_once_part_is_600(slot.clone(), 300),
+        );
+        *slot.lock().unwrap() = Some(r.cache.part_path("track/1"));
+        let part = r.cache.part_path("track/1");
+        r.dl.prefetch(&ids(&["track/1", "track/2"]));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the worker stayed on the replacement: {:?}",
+            r.srv.seen()
+        );
+        assert!(r.cache.is_complete("track/2"));
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+    }
+
+    /// CR 4637783552: a pin whose part is kept waits through a preflight
+    /// refused for low disk, rather than ending, and resumes the part once
+    /// there is room.
+    #[test]
+    fn a_pin_waits_through_a_low_disk_preflight_and_resumes() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let starve = Arc::new(AtomicBool::new(true));
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let (p2, s2) = (slot.clone(), starve.clone());
+        let r = rig_with_free(
+            "pin-preflight-low-disk",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| {
+                let len = p2
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                Ok(if s2.load(Ordering::SeqCst) && len >= 600 {
+                    MIN_FREE_BYTES - 1
+                } else {
+                    MIN_FREE_BYTES + 5000
+                })
+            }),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.prefetch(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.dl.waits().len() < 3 {
+            assert!(Instant::now() < until, "the pin did not wait for room");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(r.srv.seen().len(), 1, "{:?}", r.srv.seen());
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        starve.store(false, Ordering::SeqCst);
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the pin never resumed"
+        );
+        let seen = r.srv.seen();
+        assert_eq!(seen[1].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert!(r.cache.is_complete("track/1"));
     }
 
     /// CR 4637705955: a retry whose free-space preflight is refused (the
