@@ -859,10 +859,14 @@ impl LyricsFinder {
                     }
                 }
                 match lookup {
-                    align::Lookup::Ready(aligned) => with_words(&mut lyrics, &aligned),
+                    align::Lookup::Ready(aligned) | align::Lookup::Stale(aligned) => {
+                        with_words(&mut lyrics, &aligned);
+                    }
                     // The lines timed so far, the rest still guessed by the
-                    // client until the next answer (ADR-0121).
-                    align::Lookup::Partial(eta_ms, aligned) => {
+                    // client, or still an older generation's, until the next
+                    // answer (ADR-0121, ADR-0147).
+                    align::Lookup::Partial(eta_ms, aligned)
+                    | align::Lookup::Refreshing(eta_ms, aligned) => {
                         with_words(&mut lyrics, &aligned);
                         words_pending = Some(WordsPending { eta_ms });
                     }
@@ -2040,6 +2044,58 @@ mod tests {
         assert_eq!(words(&partial), [1, 1], "partial");
         assert_eq!(partial.lines[0].words[0].start_ms, 200);
         assert_eq!(partial.lines[1].words[0].start_ms, 4100);
+    }
+
+    /// V1470: a song timed by an older generation is served its old words,
+    /// pending while this generation times it, and settled on them when
+    /// this generation cannot.
+    #[test]
+    fn an_older_generation_s_words_are_served_until_this_one_s_replace_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = timed_item(dir.path());
+        std::fs::write(&item.path, b"audio").unwrap();
+        let lyrics = synced(
+            &[
+                "grey gulls wheel above the quay",
+                "the river keeps its time",
+            ],
+            Origin::Online,
+        );
+        let old = align::Aligned {
+            lines: vec![
+                vec![WordStamp {
+                    at: 0,
+                    start_ms: 1_100,
+                }],
+                vec![WordStamp {
+                    at: 0,
+                    start_ms: 4_200,
+                }],
+            ],
+            ..align::Aligned::default()
+        };
+        let (aligner, _queue) = align::tests::timed_before(dir.path(), &item, &lyrics, old);
+        let finder = LyricsFinder::default().with_aligner(Arc::clone(&aligner));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let serve = || rt.block_on(finder.served(&item, lyrics.clone(), true));
+        let starts = |l: &Lyrics| {
+            l.lines
+                .iter()
+                .map(|l| l.words.first().map(|w| w.start_ms))
+                .collect::<Vec<_>>()
+        };
+
+        let (refreshing, waiting) = serve();
+        assert!(waiting.is_some(), "the client asks again for the new words");
+        assert_eq!(starts(&refreshing), [Some(1_100), Some(4_200)]);
+
+        align::tests::failed_for_now(&aligner, item.id);
+        let (stale, waiting) = serve();
+        assert_eq!(waiting, None, "nothing more is coming until the retry");
+        assert_eq!(starts(&stale), [Some(1_100), Some(4_200)]);
     }
 
     #[test]
