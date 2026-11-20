@@ -599,10 +599,7 @@ impl Library {
         // published and applies itself, so the older one read here can never
         // land over it.
         {
-            let outside = self
-                .outside_used
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let outside = cache::lock_noting(&self.outside_used);
             between_read_and_apply();
             let hook = if let Some(outside) = outside.clone() {
                 cache.set_outside_used(outside);
@@ -647,10 +644,7 @@ impl Library {
     pub fn set_outside_used(&self, used: cache::OutsideUsed) {
         // Stored and applied under one hold, so two callers (or this and
         // `enable_cache`) cannot leave the cache with the older of two hooks.
-        let mut slot = self
-            .outside_used
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut slot = cache::lock_noting(&self.outside_used);
         *slot = Some(used.clone());
         if let Some(o) = self.offline.get() {
             o.cache.set_outside_used(used);
@@ -1590,25 +1584,21 @@ mod tests {
         let tok = root.join("token");
         let lib = Arc::new(Library::connect_with(&dead_server(), &tok, quick()).unwrap());
         lib.set_outside_used(hook(1));
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handle = None;
         lib.enable_cache_with(
             &root.join("cache"),
             1 << 20,
             || {},
             || {
-                // The older hook is read; a newer one is set now. It either
-                // waits for the enable to finish or is applied at once, and
-                // the enable would then put the older one over it.
-                let (l, d) = (lib.clone(), done.clone());
-                handle = Some(std::thread::spawn(move || {
-                    l.set_outside_used(hook(2));
-                    d.store(true, Ordering::SeqCst);
-                }));
-                let start = std::time::Instant::now();
-                while !done.load(Ordering::SeqCst) && start.elapsed() < Duration::from_millis(300) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                // The older hook is read; a newer one is set now. The test
+                // goes on only once the setter is blocked at the outside
+                // hook lock the enable holds (`lock_noting`), never on a
+                // timer: without that hold the setter is applied at once,
+                // and the enable then puts the older hook over it.
+                let l = lib.clone();
+                let setter = std::thread::spawn(move || l.set_outside_used(hook(2)));
+                cache::tests::wait_until_blocked(setter.thread().id());
+                handle = Some(setter);
             },
             || {},
         )
