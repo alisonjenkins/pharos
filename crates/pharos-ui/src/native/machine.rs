@@ -767,7 +767,12 @@ mod tests {
                 busy: false,
             }
         );
-        let mut m = Machine::new().with_session_end(count_end);
+        // A durable end: no warning, and no shared counter touched (the
+        // revoked-close test counts SESSIONS_ENDED).
+        fn durable_end() -> Option<String> {
+            None
+        }
+        let mut m = Machine::new().with_session_end(durable_end);
         m.apply(Event::Resumed { epoch: 0 });
         m.apply(Event::Closed {
             epoch: 0,
