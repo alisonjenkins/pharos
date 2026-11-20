@@ -18,8 +18,9 @@ pub(crate) static CONTENT_LOG: ContentLog = ContentLog;
 static OUTSIDE_USED: OnceLock<content::OutsideUsed> = OnceLock::new();
 
 /// Registers the app's count of other downloads' bytes against the music
-/// cache's cap. The cache counts them as used and evicts only music, so
-/// music and video together cannot pass the one cap. The hook runs under
+/// cache's cap. The cache counts them as used and evicts only unpinned
+/// music for them: pinned music is never evicted, so it can take the total
+/// over the one cap (the pin contract). The hook runs under
 /// the cache's lock and must not call back into the library. Set once;
 /// later calls are ignored.
 pub fn set_outside_used(used: content::OutsideUsed) {
