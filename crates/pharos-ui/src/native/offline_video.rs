@@ -957,6 +957,10 @@ pub fn session_ended() {
 /// under the identity lock by the fence.
 struct SessionEnded {
     user: Option<String>,
+    /// Who the session's token belongs to, when the identity says so: only
+    /// a signed-in user. A fenced user is not paired with a replacement's
+    /// token, so its owner comes from the token's pairing alone.
+    token_user: Option<String>,
     token: Option<TokenSeen>,
 }
 
@@ -967,9 +971,10 @@ struct SessionEnded {
 /// before it starts nothing after it ([`start_resume_if`]).
 fn fence_signed_out(take_token: bool) -> SessionEnded {
     let (end, now) = with_id(|st| {
-        let user = match &st.identity {
-            Identity::User(u) | Identity::Fenced(u) => Some(u.clone()),
-            _ => None,
+        let (user, token_user) = match &st.identity {
+            Identity::User(u) => (Some(u.clone()), Some(u.clone())),
+            Identity::Fenced(u) => (Some(u.clone()), None),
+            _ => (None, None),
         };
         let token = if take_token {
             st.session_token.take()
@@ -979,7 +984,14 @@ fn fence_signed_out(take_token: bool) -> SessionEnded {
         st.identity = Identity::SignedOut;
         st.refusal_logged = false;
         st.generation = st.generation.wrapping_add(1);
-        (SessionEnded { user, token }, st.generation)
+        (
+            SessionEnded {
+                user,
+                token_user,
+                token,
+            },
+            st.generation,
+        )
     });
     super::platform::info(&format!(
         "pharos: video user verdict=none reason=signed_out fence=first generation={now}"
@@ -1007,8 +1019,8 @@ fn tear_down_session(end: SessionEnded) {
         super::platform::info("pharos: token forget verdict=none reason=no_session_token");
         return;
     };
-    let outcome = forget_session_token(&token, end.user.as_deref());
-    note_session_token(&outcome, end.user.as_deref());
+    let outcome = forget_session_token(&token, end.token_user.as_deref());
+    note_session_token(&outcome, end.token_user.as_deref());
 }
 
 /// What a session's end did to its device token, on every platform (the
@@ -2281,6 +2293,49 @@ pub(crate) mod tests {
             ));
             set_identity(Identity::Unknown);
         }
+    }
+
+    /// CR outside-diff offline_video.rs:971: a replacement session that
+    /// ends before its `me` answers has A fenced, not signed in. Its token
+    /// (B's, unpaired) is marked revoked naming nobody, never A: A's
+    /// identity is not attributed to another user's token.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_replacement_session_ending_fenced_names_no_owner_for_its_token() {
+        use super::super::token_file;
+        use pharos_content::token::faults;
+        let d = TmpDir::new("session-end-fenced");
+        let path = d.path().join("device-token");
+        let p = pref();
+        *p.file.borrow_mut() = Some(path.clone());
+        token_file::store(&path, "tokA").unwrap();
+        run(async {
+            let resumer = FakeResumer::new(&path);
+            let Resumed::Opened(session_a) = resume_session(&resumer).await else {
+                panic!("A's token did not open A's session");
+            };
+            session_replaced(&session_a);
+            assert!(me_request(true, Some(session_a)).unwrap().answered("A"));
+        });
+        // B's sign-in replaces the token; its session opens before `me`.
+        token_file::store(&path, "tokB").unwrap();
+        session_replaced(&Session::opened((), Some("tokB".to_owned())));
+        assert_eq!(last_user(), None, "A was not fenced");
+        LOGGED.with(|l| l.borrow_mut().clear());
+        faults::REMOVE.with(|f| f.set(true));
+        session_ended();
+        faults::REMOVE.with(|f| f.set(false));
+        let marker =
+            pharos_content::token::revoked(&path, &pharos_content::token::fingerprint("tokB"))
+                .expect("B's token was not marked revoked");
+        assert_eq!(marker.user, None, "A was named as B's token's owner");
+        let lines = logged("pharos: token forget");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=marked_revoked") && !l.contains("user=A")),
+            "{lines:?}"
+        );
     }
 
     /// The late store, end to end on the host, through the code the phone
