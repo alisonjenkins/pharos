@@ -4222,6 +4222,8 @@ fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
     let dir = inner.item_dir(user, item);
     let (paths, mut clean) = part_paths(&dir, ".part");
     let mut dropped = 0usize;
+    // A live writer's file stays: the folder still holds staging bytes.
+    let mut kept_live = false;
     for path in paths {
         let st = lock(&inner.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
@@ -4235,6 +4237,7 @@ fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
             .keys()
             .any(|(u, i, r)| u == user && i == item && name.ends_with(&format!(".{r}.part")));
         if live {
+            kept_live = true;
             continue;
         }
         match remove_part(&path) {
@@ -4252,12 +4255,21 @@ fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
     if !clean && !st.leftover.contains(&dir) {
         st.leftover.push(dir.clone());
     }
+    // Every inherited file went and the listing was whole: what a
+    // settlement kept for them is on disk no longer. Otherwise the folder
+    // is a leftover, and its settlement measures what is left.
+    let retained = if clean && !kept_live {
+        st.retained_parts.remove(&dir)
+    } else {
+        None
+    };
     drop(st);
     if dropped > 0 || deferred || !clean {
         emit(
             !clean,
             format!(
-                "pharos: video keep old parts item={item} run={run} dropped={dropped} deferred={deferred} verdict={}",
+                "pharos: video keep old parts item={item} run={run} dropped={dropped} deferred={deferred} retained_cleared={} verdict={}",
+                retained.unwrap_or(0),
                 if clean { "settled" } else { "leftover_unknown" }
             ),
         );
@@ -12517,6 +12529,45 @@ pub(crate) mod tests {
             None,
             "a stale figure stayed"
         );
+    }
+
+    /// CR outside-diff kept_video_disk.rs:4231-4233: a retry that deletes
+    /// a staging file a settlement had kept reserved drops that figure, so
+    /// the next plan is not charged for bytes no longer on disk.
+    #[tokio::test]
+    async fn a_cleanup_that_deletes_a_kept_staging_file_drops_its_charge() {
+        let rig = Rig::new("cleanup-retained");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let part = dir.join("files").join("x.9.part");
+        std::fs::File::create(&part).unwrap().set_len(500).unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            Some(500)
+        );
+        // A retry's run deletes it.
+        lock(&store.inner.state)
+            .runs
+            .insert(("u1".to_owned(), "1".to_owned()), 42);
+        drop_old_runs_parts(&store.inner, "u1", "1", 42);
+        assert!(!part.exists());
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            None,
+            "a deleted staging file stayed charged"
+        );
+        assert!(lines("pharos: video keep old parts item=1 run=42")
+            .iter()
+            .any(|l| l.contains("retained_cleared=500") && l.contains("verdict=settled")));
+        lock(&store.inner.state)
+            .runs
+            .remove(&("u1".to_owned(), "1".to_owned()));
     }
 
     #[tokio::test]
