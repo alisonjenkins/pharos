@@ -1039,13 +1039,15 @@ impl PlannerNoteReport {
             ("planner", self.0.label().to_owned()),
         ];
         all.extend(fields);
+        // Only a note that is off nominal counts as a playback error.
+        let (kind, level) = if self.is_warn() {
+            (ClientEventKind::PlaybackError, ClientLevel::Warn)
+        } else {
+            (ClientEventKind::PlaybackDecision, ClientLevel::Info)
+        };
         ClientEvent {
-            kind: ClientEventKind::PlaybackError,
-            level: if self.is_warn() {
-                ClientLevel::Warn
-            } else {
-                ClientLevel::Info
-            },
+            kind,
+            level,
             route,
             fields: all,
         }
@@ -5013,6 +5015,13 @@ mod tests {
             "pharos: playback engine=rust planner=held track=audio lead_ms=6000 limit_ms=2000"
         );
         assert_eq!(held.event(String::new()).level, ClientLevel::Info);
+        // A nominal decision is not a playback error (B1502).
+        for nominal in [&held, &eos] {
+            assert_eq!(
+                nominal.event(String::new()).kind,
+                ClientEventKind::PlaybackDecision
+            );
+        }
         let skipped = PlannerNoteReport(Note::Skipped {
             track: Track::Video,
             index: 0,
@@ -5024,6 +5033,12 @@ mod tests {
             "pharos: playback engine=rust planner=skipped track=video index=0 from_ms=0 to_ms=6100"
         );
         assert_eq!(skipped.event(String::new()).level, ClientLevel::Warn);
+        for off_nominal in [&gave_up, &refill, &skipped] {
+            assert_eq!(
+                off_nominal.event(String::new()).kind,
+                ClientEventKind::PlaybackError
+            );
+        }
     }
 
     // V637: every failed segment request logs and reports its cause, the
