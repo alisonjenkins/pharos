@@ -879,21 +879,57 @@ impl Ended {
 /// operation and its fence, so the fence names what the operation saw.
 pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
     let _held = hold();
-    let ended = end_session_held(path, seen, user);
-    if let Ended::Unsafe { target, .. } = &ended {
-        // Added to what is already refused, never in its place: an earlier
-        // sign-out's token may still be held by a live link.
-        add_fence_held(
-            path,
-            &Fence::for_target(target.as_deref()),
-            "token_neither_removed_nor_marked",
-        );
+    let (ended, ended_token) = end_session_held(path, seen, user);
+    match &ended {
+        Ended::Unsafe { target, .. } => {
+            // Added to what is already refused, never in its place: an
+            // earlier sign-out's token may still be held by a live link.
+            add_fence_held(
+                path,
+                &Fence::for_target(target.as_deref()),
+                "token_neither_removed_nor_marked",
+            );
+        }
+        // A replacement is kept, and so is its use.
+        Ended::Changed => {}
+        // Removed or marked, the ended token is refused to fresh reads, but
+        // a live link already holding it checks the fence, not the file:
+        // fenced too. A later store of a new token lifts nothing here.
+        Ended::Forgotten(_) | Ended::Marked(_) => {
+            if let Some(fp) = ended_token {
+                add_fence_held(path, &Fence::token(&fp), "session_ended");
+                log::info!(
+                    "token fence verdict=added reason=session_ended outcome={}",
+                    ended.label()
+                );
+            }
+        }
     }
     ended
 }
 
-/// [`end_session`]'s work, under the lock its caller holds.
-fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
+/// [`end_session`]'s work, under the lock its caller holds, with the
+/// fingerprint of the token it ended, when one was named or read.
+fn end_session_held(
+    path: &Path,
+    seen: Option<&str>,
+    user: Option<&str>,
+) -> (Ended, Option<String>) {
+    let seen_fp = seen.map(|t| fingerprint(t.trim()));
+    let ended = end_session_inner(path, seen, user);
+    match ended {
+        (e @ Ended::Changed, _) => (e, None),
+        (e, read) => (e, read.or(seen_fp)),
+    }
+}
+
+/// [`end_session_held`]'s steps: the outcome, and the fingerprint of the
+/// token read from the file, when one was.
+fn end_session_inner(
+    path: &Path,
+    seen: Option<&str>,
+    user: Option<&str>,
+) -> (Ended, Option<String>) {
     let read = {
         #[cfg(debug_assertions)]
         let failed = faults::TOKEN_READ.with(std::cell::Cell::get);
@@ -906,9 +942,11 @@ fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ende
         }
     };
     let stored = match read {
-        Ok(Some(s)) if seen.is_some_and(|seen| s.token != seen.trim()) => return Ended::Changed,
+        Ok(Some(s)) if seen.is_some_and(|seen| s.token != seen.trim()) => {
+            return (Ended::Changed, None)
+        }
         Ok(None) => {
-            return match absent(path) {
+            let ended = match absent(path) {
                 Forgotten::Durable => Ended::Forgotten(Forgotten::Durable),
                 // Gone, but its absence may not be on disk yet (an earlier
                 // unlink whose sync failed): the token the session ended
@@ -923,6 +961,7 @@ fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ende
                     None => Ended::Forgotten(Forgotten::NotDurable(why)),
                 },
             };
+            return (ended, None);
         }
         Ok(Some(s)) => s,
         // Unreadable: the compare cannot be made, so nothing is removed (it
@@ -932,27 +971,32 @@ fn end_session_held(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ende
             let removal = format!("not attempted: the token could not be read to compare ({e})");
             let Some(seen) = seen else {
                 log::warn!("token revocation marker verdict=not_written reason=token_unreadable_no_token_named error={e}");
-                return Ended::Unsafe {
+                let ended = Ended::Unsafe {
                     removal,
                     marker: "no token named to fingerprint".to_owned(),
                     target: None,
                 };
+                return (ended, None);
             };
             // Markers are one per token: the ended token's goes beside any
             // other's, which stays.
             let target = fingerprint(seen);
-            return mark(path, user, &target, removal);
+            return (mark(path, user, &target, removal), None);
         }
     };
+    let read_fp = Some(fingerprint(&stored.token));
     let removal = match remove(path) {
-        Ok(Forgotten::Durable) => return Ended::Forgotten(Forgotten::Durable),
+        Ok(Forgotten::Durable) => return (Ended::Forgotten(Forgotten::Durable), read_fp),
         // Gone, but a crash may bring it back: marked too, so it never
         // resumes; only when the marker fails as well is it unsafe.
         Ok(Forgotten::NotDurable(why)) => format!("removal not durable: {why}"),
         Err(e) => e.to_string(),
     };
     let named = user.map(str::to_owned).or(stored.user.clone());
-    mark(path, named.as_deref(), &fingerprint(&stored.token), removal)
+    (
+        mark(path, named.as_deref(), &fingerprint(&stored.token), removal),
+        read_fp,
+    )
 }
 
 /// Writes the marker for `user` and `token_fingerprint` after a removal
@@ -1820,7 +1864,10 @@ pub(crate) mod tests {
             std::fs::remove_file(revoked_path(&p, &fingerprint("tokA"))).unwrap();
         }
         assert_eq!(reader.join().unwrap(), None, "the revoked token was read");
-        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
+        // The ended session's token stays fenced in this process; with the
+        // marker gone by hand, a restart reads it again.
+        assert_eq!(load(&p).unwrap(), None);
+        assert_eq!(after_restart(&p).as_deref(), Some("tokA"));
     }
 
     /// CR 4642574358: the marker a store's unconfirmed install left is not
@@ -1959,6 +2006,49 @@ pub(crate) mod tests {
         let e = retried.unwrap_err();
         assert!(is_store_incomplete(&e), "{e:?}");
         assert!(!is_store_incomplete(&store(&path, "").unwrap_err()));
+    }
+
+    /// Outside diff token.rs:862 (review 5997638687): a session ended by
+    /// removal or by a marker fences its token in this process too, since
+    /// a live link checks the fence, not the file. A replacement kept as
+    /// Changed is not fenced, and a later store of a new token is not
+    /// refused.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_ended_session_fences_its_token_however_it_ended() {
+        let d = dir("end-fences");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        crate::testlog::start();
+        assert!(matches!(
+            end_session(&p, Some("tokA"), None),
+            Ended::Forgotten(Forgotten::Durable)
+        ));
+        assert!(
+            fence(&p).refuses("tokA"),
+            "a removed session's token was not fenced"
+        );
+        assert!(crate::testlog::lines().iter().any(
+            |l| l.contains("token fence verdict=added reason=session_ended outcome=forgotten")
+        ));
+        store(&p, "tokB").unwrap();
+        assert!(!fence(&p).refuses("tokB"));
+        faults::REMOVE.with(|f| f.set(true));
+        let marked = end_session(&p, None, None);
+        faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(marked, Ended::Marked(_)), "{marked:?}");
+        assert!(
+            fence(&p).refuses("tokB"),
+            "a marked session's token was not fenced"
+        );
+        store(&p, "tokC").unwrap();
+        assert!(matches!(
+            end_session(&p, Some("tokB"), None),
+            Ended::Changed
+        ));
+        assert!(!fence(&p).refuses("tokC"), "a kept replacement was fenced");
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
     }
 
     /// CR 4646025360: a marker is never unlinked, so no failure while it is
