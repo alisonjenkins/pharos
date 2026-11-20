@@ -1155,9 +1155,31 @@ impl Inner {
             let tomb = st.tombstones.iter().position(|(d, _)| d == dir);
             let mut ident = None;
             if let Some(i) = record {
+                let (user, item) = (st.list[i].user.clone(), st.list[i].item.clone());
+                let running = st.runs.contains_key(&(user.clone(), item.clone()));
                 let v = &mut st.list[i];
-                v.estimated_bytes = v.estimated_bytes.max(measured);
-                ident = Some((v.user.clone(), v.item.clone()));
+                // A terminal record with no run is charged what the whole
+                // measure found: staging files the sweep deleted go back to
+                // the budget. An interrupted plan (Downloading, no run) keeps
+                // its reservation for what it will fetch.
+                let terminal = !running && !matches!(v.state, KeptState::Downloading { .. });
+                let charge = if terminal {
+                    measured
+                } else {
+                    v.estimated_bytes.max(measured)
+                };
+                if charge != v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep charge verdict={} item={item} from={} to={charge} measured={measured}",
+                            if terminal { "measured" } else { "raised" },
+                            v.estimated_bytes
+                        ),
+                    );
+                }
+                v.estimated_bytes = charge;
+                ident = Some((user, item));
             }
             if let Some(i) = tomb {
                 st.tombstones[i].1 = st.tombstones[i].1.max(measured);
@@ -11282,12 +11304,75 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
         store.inner.sweep_tombstones();
         assert!(!store.size_unknown(), "the sweep did not resolve it");
+        // The sweep deleted the file and measured the folder whole: the
+        // terminal record is charged that measure, so the file's bytes go
+        // back to the budget (outside-diff item kept_video_disk.rs:1155).
+        assert_eq!(parts(), 0, "the sweep kept the staging file");
         assert!(
-            store.kept_bytes() >= big,
-            "the bytes dropped out of the figure"
+            store.kept_bytes() < big,
+            "the deleted file stayed charged: kept {}",
+            store.kept_bytes()
         );
-        // (The file itself is deleted at the next open, which clears staging
-        // files; the figure keeps what it held.)
+    }
+
+    /// Outside-diff item kept_video_disk.rs:1155: a terminal record with
+    /// no run, whose folder a sweep measures whole after deleting its
+    /// staging files, is charged what was measured, so the deleted bytes go
+    /// back to the budget. A larger saved charge does not stay.
+    #[tokio::test]
+    async fn a_terminal_records_charge_follows_a_whole_measure() {
+        let rig = Rig::new("terminal-charge");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let stale = dir.join("files").join("stale.9.part");
+        std::fs::write(&stale, vec![0u8; 50_000]).unwrap();
+        {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.iter_mut().find(|v| v.item == "1").unwrap();
+            v.state = KeptState::Failed {
+                reason: "test".to_owned(),
+            };
+            // As an earlier measure that counted the staging file left it.
+            v.estimated_bytes = v.estimated_bytes.saturating_add(50_000);
+            st.leftover.push(dir.clone());
+        }
+        store.inner.sweep_tombstones();
+        assert!(!stale.exists(), "the sweep kept the staging file");
+        // The sweep's measure (the manifest it saves after may differ by a
+        // few bytes).
+        let charged = only(&store).estimated_bytes;
+        let measured = dir_size(&dir).whole().unwrap();
+        assert!(
+            charged < 50_000 && charged.abs_diff(measured) < 100,
+            "the deleted staging bytes stayed charged: {charged} (measured {measured})"
+        );
+    }
+
+    /// An interrupted plan (a Downloading record with no run) keeps its
+    /// reservation through the same sweep: it will fetch the rest.
+    #[tokio::test]
+    async fn an_interrupted_plans_charge_survives_a_whole_measure() {
+        let rig = Rig::new("interrupted-charge");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let before = {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.iter_mut().find(|v| v.item == "1").unwrap();
+            v.state = KeptState::Downloading {
+                done: 1,
+                total: 5,
+                bytes: 10,
+            };
+            v.estimated_bytes = 90_000;
+            st.leftover.push(dir.clone());
+            90_000
+        };
+        store.inner.sweep_tombstones();
+        assert_eq!(only(&store).estimated_bytes, before);
     }
 
     /// A tombstoned folder with a leftover and a big file in it, for the
