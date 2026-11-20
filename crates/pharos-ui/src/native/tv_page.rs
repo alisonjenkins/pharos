@@ -145,7 +145,7 @@ pub fn proxied(segment: &str) -> bool {
 /// port defaulted by scheme, and an IPv6 literal in its one canonical
 /// spelling (`[2001:db8::1]` however it was written), so two spellings of
 /// one address are one origin. None for anything else.
-fn origin_of(url: &str) -> Option<(String, String, u16)> {
+pub(crate) fn origin_of(url: &str) -> Option<(String, String, u16)> {
     // The same parser the HTTP client sends with (reqwest's `Url`), so an
     // origin compares as the request will reach it: IDNA, percent-encoding,
     // IPv4 shorthands and IPv6 spellings all canonical.

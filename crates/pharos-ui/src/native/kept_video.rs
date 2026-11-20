@@ -559,10 +559,16 @@ fn localize_ref<'a>(
         return localize_ref(&full, final_key, server).map(|k| Cow::Owned(k.into_owned()));
     }
     if after_scheme(r).is_some() {
-        if origin_of(r) != origin_of(server) {
+        // Scheme, host and effective port, parsed as the client sends: an
+        // explicit default port is the origin without one.
+        let parsed = super::tv_page::origin_of;
+        if parsed(r).is_none() || parsed(r) != parsed(server) {
             return Err(());
         }
-        return key_under_base(server, r).map(Cow::Owned).ok_or(());
+        // Same origin: its path and query, under the base path as any
+        // absolute path is.
+        let path = request_key(r);
+        return localize_ref(&path, final_key, server).map(|k| Cow::Owned(k.into_owned()));
     }
     if r.starts_with('/') {
         let base_path = url_path(server).trim_end_matches('/');
@@ -860,6 +866,32 @@ mod tests {
         assert_eq!(
             key_under_base("http://s:8096/jf", "http://s:8096/jfx/a.m3u8"),
             None
+        );
+    }
+
+    /// CR 4638660953: an explicit default port is the same origin as none;
+    /// another port is not.
+    #[test]
+    fn an_explicit_default_port_is_the_same_origin() {
+        let server = "https://s.example/jf";
+        assert_eq!(
+            localize_playlist(
+                "#EXTINF:6.0,\nhttps://s.example:443/jf/videos/1/0.m4s\n",
+                None,
+                server,
+                usize::MAX
+            ),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/1/0.m4s\n".to_owned())
+        );
+        let other = "https://s.example:8443/jf/videos/1/0.m4s";
+        assert_eq!(
+            localize_playlist(
+                &format!("#EXTINF:6.0,\n{other}\n"),
+                None,
+                server,
+                usize::MAX
+            ),
+            Localized::NotLocal(other.to_owned())
         );
     }
 
