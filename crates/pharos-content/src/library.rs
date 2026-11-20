@@ -2110,6 +2110,8 @@ mod tests {
     /// A sign-out whose token is readable but cannot be removed leaves the
     /// service signed out: the token is marked revoked, and the reload the
     /// credentials change asks for finds no token.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_sign_out_whose_token_will_not_go_leaves_the_service_signed_out() {
         let root = test_root("signout-kept");
@@ -2149,6 +2151,8 @@ mod tests {
     /// A sign-out whose token can be neither removed nor marked keeps the
     /// service signed out all the same: the reload the credentials change
     /// asks for refuses that token. A different token lifts the fence.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_sign_out_whose_token_neither_goes_nor_is_marked_leaves_the_service_signed_out() {
         let root = test_root("signout-unsafe");

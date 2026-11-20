@@ -873,6 +873,8 @@ pub(crate) mod tests {
     /// A session's token that cannot be removed is marked revoked: no read
     /// returns it, the marker names its user, a replacement is kept, and a
     /// new sign-in's token is read again (the marker cleared).
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_token_that_will_not_go_is_marked_and_never_read_again() {
         let d = dir("marked");
@@ -898,6 +900,8 @@ pub(crate) mod tests {
     /// a revoked token (and clears its marker) between the two reads waits
     /// for the read, which refuses the revoked token rather than pairing it
     /// with the cleared marker.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_read_never_pairs_an_old_token_with_a_new_marker_state() {
         let d = dir("read-locked");
@@ -945,6 +949,8 @@ pub(crate) mod tests {
     /// (a) A marker that is there but cannot be read, or holds no
     /// fingerprint, refuses every token (fail closed); a missing one
     /// refuses nothing.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn an_unreadable_marker_fails_closed_and_a_missing_one_is_absent() {
         let d = dir("marker-unreadable");
@@ -979,6 +985,8 @@ pub(crate) mod tests {
     /// (b) A token that cannot be read to compare is not removed (it may
     /// be a replacement); the token the session ended with is marked for
     /// its user, and with no token named the end is unsafe.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn an_unreadable_token_is_not_removed_and_the_ended_one_is_marked() {
         let d = dir("token-unreadable");
@@ -1001,6 +1009,8 @@ pub(crate) mod tests {
 
     /// (c) A removal that is not durable is marked too; only when the
     /// marker fails as well is it unsafe.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_removal_that_is_not_durable_is_marked_too() {
         use std::io::ErrorKind::Other;
@@ -1027,6 +1037,8 @@ pub(crate) mod tests {
     /// With neither the removal nor the marker written, the session's end
     /// says a restart is not safe, and the token is still read (nothing on
     /// disk refuses it).
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_token_neither_removed_nor_marked_is_reported_unsafe() {
         let d = dir("unsafe");

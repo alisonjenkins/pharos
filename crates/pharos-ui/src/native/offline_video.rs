@@ -2137,6 +2137,8 @@ pub(crate) mod tests {
     /// an offline restart (with the preference still naming A) restores
     /// nobody. With the marker unwritable too, the end says a restart is not
     /// safe.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_session_end_whose_token_will_not_go_marks_it_and_restores_nobody() {
         use super::super::token_file;
