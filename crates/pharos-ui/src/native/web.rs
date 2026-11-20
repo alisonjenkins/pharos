@@ -4029,8 +4029,10 @@ impl Drop for HlsJs {
     }
 }
 
+/// Console lines carry URLs; their credentials stay out of the console, which
+/// ends up in screenshots and pasted logs.
 pub fn warn(message: &str) {
-    web_sys::console::warn_1(&message.into());
+    web_sys::console::warn_1(&super::report::redact(message).into());
 }
 
 pub use super::diagnostics::{forget_opt_in, load_opted_in, opted_in, set_opted_in};
@@ -4105,7 +4107,7 @@ fn hls_event(
 }
 
 pub fn info(message: &str) {
-    web_sys::console::info_1(&message.into());
+    web_sys::console::info_1(&super::report::redact(message).into());
 }
 
 /// The theme name stored under `key`. `Err` carries the browser's reason
