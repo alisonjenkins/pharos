@@ -50,7 +50,9 @@ serve a lyric that was not sung as synced karaoke (V1468).
 ## Consequences
 
 - A wrong online lyric is fixed without anyone editing a file, when the
-  provider holds the right one.
+  provider's search returns a record that passes the selection above. A
+  right record the search leaves out of its 20, or one that misses a
+  threshold, is not found, and the song is served without times.
 - One provider search per affected song, ever; the disk record's mark
   survives restarts, and a retag searches again.
 - A song the listener gave a wrong local lyric shows plain text rather
