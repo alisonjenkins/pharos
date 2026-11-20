@@ -280,6 +280,11 @@ struct State {
     /// that landed counted, and only on the record it was taken from (the
     /// record's generation, `record_gen`, beside it).
     playlists_base: HashMap<(String, String, u64), (u64, u64)>,
+    /// Parked runs whose playlist allowance a claim kept because their
+    /// writer was still going, by the run the record was handed to: that
+    /// run's exit gives the unused allowance back on the replacement's
+    /// record, while the replacement has reserved no playlist of its own.
+    handed_over: HashMap<(String, String, u64), u64>,
     /// Which run last took an item's record, by the run id every claim sets
     /// ([`State::claim_run`]): a new start, a resume or a handoff moves it,
     /// and a stale run's exit must not change the new run's reservation.
@@ -706,7 +711,9 @@ impl State {
     /// with no run in `runs`: a parked run's allowances are settled while
     /// the record is still its own, and its late exit cannot touch the
     /// replacement's reservation.
-    fn release_preplan_allowances(&mut self, user: &str, item: &str) {
+    /// Returns the runs whose allowance it kept for a running writer.
+    fn release_preplan_allowances(&mut self, user: &str, item: &str) -> Vec<u64> {
+        let mut kept = Vec::new();
         let stale: Vec<u64> = self
             .playlists_taken
             .keys()
@@ -730,6 +737,7 @@ impl State {
                         "pharos: video playlist allowance kept item={item} run={run} reason=writer_running"
                     ),
                 );
+                kept.push(run);
                 continue;
             }
             self.playlists_taken.remove(&who);
@@ -762,6 +770,28 @@ impl State {
                 }
             }
         }
+        kept
+    }
+
+    /// Settles a parked download's earlier runs' playlist allowances
+    /// ([`State::release_preplan_allowances`]) and claims a new run for
+    /// it, in one hold. An allowance kept for a running writer is handed
+    /// over to the new run's record: the parked run's exit gives back what
+    /// it did not use there, until the new run reserves a playlist.
+    fn claim_parked(&mut self, user: &str, item: &str) -> u64 {
+        let kept = self.release_preplan_allowances(user, item);
+        let id = self.claim_run(user, item);
+        for run in kept {
+            self.handed_over
+                .insert((user.to_owned(), item.to_owned(), run), id);
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance handed_over item={item} run={run} to_run={id}"
+                ),
+            );
+        }
+        id
     }
 
     fn claim_run(&mut self, user: &str, item: &str) -> u64 {
@@ -4165,10 +4195,33 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
         // A run that ends before its plan is admitted (it parked, or
         // failed) gives back the playlist allowances it did not use: what
         // the record reserved before them, and the playlists that landed.
-        // Never under another run, whose reservation it is now.
-        let same_record =
-            base.is_some_and(|(_, gen)| st.record_gen.get(&key).copied().unwrap_or(0) == gen);
-        if pre_plan && base.is_some() && !same_record {
+        // Never under another run, whose reservation it is now, except a
+        // parked run whose allowance a claim kept for its writer and handed
+        // to the record's run now, which has reserved no playlist since:
+        // what it did not use is given back on that record.
+        let gen_now = st.record_gen.get(&key).copied().unwrap_or(0);
+        let handed_to = st.handed_over.remove(&who);
+        let replacement_reserved = st
+            .playlists_taken
+            .keys()
+            .any(|(u, i, _)| *u == user && *i == item);
+        let writing = st.writers.contains_key(&who);
+        let handed = pre_plan && handed_to == Some(gen_now) && !replacement_reserved && !writing;
+        if pre_plan && handed_to == Some(gen_now) && !handed {
+            let why = if writing {
+                "writer_running"
+            } else {
+                "replacement_reserved"
+            };
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance kept item={item} run={run} to_run={gen_now} reason={why}"
+                ),
+            );
+        }
+        let same_record = handed || base.is_some_and(|(_, gen)| gen_now == gen);
+        if pre_plan && base.is_some() && !same_record && handed_to != Some(gen_now) {
             emit(
                 false,
                 format!(
@@ -4177,7 +4230,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
             );
         }
         let base = base.filter(|_| same_record).map(|(b, _)| b);
-        if let (true, Some(base), false) = (pre_plan, base, st.runs.contains_key(&key)) {
+        if let (true, Some(base), false) = (pre_plan, base, st.runs.contains_key(&key) && !handed) {
             if let Some(v) = st
                 .list
                 .iter_mut()
@@ -4188,8 +4241,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                     emit(
                         false,
                         format!(
-                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed}",
-                            v.estimated_bytes
+                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed} reason={}",
+                            v.estimated_bytes,
+                            if handed { "writer_stopped_after_handover" } else { "run_ended" }
                         ),
                     );
                     v.estimated_bytes = to;
@@ -5266,8 +5320,7 @@ impl VideoStore for DiskVideoStore {
                     // A run parked by a session end may still hold playlist
                     // allowances on this record: settled here, in this hold,
                     // before the claim moves the record to the new run.
-                    st.release_preplan_allowances(&v.user, &v.item);
-                    let id = st.claim_run(&v.user, &v.item);
+                    let id = st.claim_parked(&v.user, &v.item);
                     resume.push((v.item, id));
                     continue;
                 };
@@ -10308,6 +10361,63 @@ pub(crate) mod tests {
         later.store(true, Ordering::SeqCst);
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// Outside diff kvd:726-733 (review 5995575621): a parked run's
+    /// allowance kept for its running writer is handed to the new run's
+    /// record by the claim. Once that writer stops and the parked run
+    /// ends, before the new run reserves a playlist, what it did not use
+    /// is given back on that record. The control: a new run that has
+    /// reserved one keeps the record as it is.
+    #[tokio::test]
+    async fn a_handed_over_allowance_is_released_once_its_writer_stops() {
+        for reserved in [false, true] {
+            let rig = Rig::new(if reserved {
+                "handover-replacement-reserved"
+            } else {
+                "handover-release"
+            });
+            rig.server.sign_in("u1");
+            let later = rig.server.slow_first_open(MEDIA_KEY);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            rig.server.asked_times(MEDIA_KEY, 1).await;
+            let key = ("u1".to_owned(), "1".to_owned());
+            let old = lock(&store.inner.state).runs.get(&key).copied().unwrap();
+            let who = ("u1".to_owned(), "1".to_owned(), old);
+            let base = lock(&store.inner.state).playlists_base.get(&who).unwrap().0;
+            let inflated = only(&store).estimated_bytes;
+            assert!(inflated > base, "the old run took no allowance");
+            *lock(&store.inner.state)
+                .writers
+                .entry(who.clone())
+                .or_default() += 1;
+            store.park_runs(Some("u1"));
+            // The claim a sign-in's resume makes, without starting the run.
+            let new = lock(&store.inner.state).claim_parked("u1", "1");
+            assert_eq!(only(&store).estimated_bytes, inflated);
+            if reserved {
+                lock(&store.inner.state)
+                    .playlists_taken
+                    .insert(("u1".to_owned(), "1".to_owned(), new), (0, 1));
+            }
+            lock(&store.inner.state).writers.remove(&who);
+            later.store(true, Ordering::SeqCst);
+            store.settled().await;
+            let now = only(&store).estimated_bytes;
+            if reserved {
+                assert_eq!(now, inflated, "the replacement's reservation was cut");
+                assert!(lines("pharos: video playlist allowance kept item=1")
+                    .iter()
+                    .any(|l| l.contains("reason=replacement_reserved")));
+            } else {
+                assert!(now < inflated, "the handed-over allowance stayed reserved");
+                assert!(now >= base);
+                assert!(lines("pharos: video playlist allowance released item=1")
+                    .iter()
+                    .any(|l| l.contains("reason=writer_stopped_after_handover")));
+            }
+        }
     }
 
     /// A download removed and started again between a sign-in's pick and
