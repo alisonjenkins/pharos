@@ -181,31 +181,27 @@ fn token_lock() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The sign-out fence ([`token_file::SignOutFence`]): set when a sign-out
-/// left its token on file, so that token is not loaded again in this
-/// process. Another token on file, whoever stored it, is read.
-static FENCE: std::sync::Mutex<token_file::SignOutFence> =
-    std::sync::Mutex::new(token_file::SignOutFence::Open);
-
+/// The sign-out fence is this process's [`token_file::fence`]: set when a
+/// sign-out left its token on file, so that token is not loaded again here.
+/// Every token store replaces it ([`token_file::SignOutFence::after_store`]),
+/// the car's QuickConnect included.
 fn fence() -> token_file::SignOutFence {
-    FENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    token_file::fence()
 }
 
 fn set_fence(fence: token_file::SignOutFence) {
-    log::info!("pharos: token fence verdict={}", fence.label());
-    *FENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = fence;
+    token_file::set_fence(fence);
 }
 
 /// `load_token`, read from disk only the first time. Never log the value.
 pub fn token() -> Option<String> {
     let mut cached = token_lock();
+    // A store since (the car's QuickConnect writes the file itself) may
+    // have put another token there: read it again.
     if let Some(token) = &*cached {
-        return token.clone();
+        if !token_file::take_stale() {
+            return token.clone();
+        }
     }
     load_locked(&mut cached)
 }
@@ -260,8 +256,8 @@ pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
     {
         let mut cached = token_lock();
+        // The store replaces the fence, as every token store does.
         token_file::store(&path, token)?;
-        set_fence(token_file::SignOutFence::Open);
         *cached = Some(Some(token.to_owned()));
     }
     drop_legacy_user(&path);

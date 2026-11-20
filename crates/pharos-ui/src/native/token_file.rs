@@ -104,6 +104,93 @@ impl SignOutFence {
             Self::Every => "every",
         }
     }
+    /// The fence once a store installed the token fingerprinted `stored`
+    /// over the one fingerprinted `replaced` (when that could be read).
+    /// A fence naming another token stays: it refuses only that token. One
+    /// naming the stored token, or none, opens. An unnamed one names the
+    /// token the store overwrote, if it could be read and differs, and
+    /// opens otherwise: the token it could not name is no longer on file.
+    pub fn after_store(&self, stored: &str, replaced: Option<&str>) -> Self {
+        match self {
+            Self::Open => Self::Open,
+            Self::Token(fp) if fp != stored => self.clone(),
+            Self::Token(_) => Self::Open,
+            Self::Every => match replaced {
+                Some(old) if old != stored => Self::Token(old.to_owned()),
+                _ => Self::Open,
+            },
+        }
+    }
+}
+
+#[cfg(not(test))]
+static FENCE: std::sync::Mutex<SignOutFence> = std::sync::Mutex::new(SignOutFence::Open);
+
+#[cfg(test)]
+thread_local! {
+    /// Per test thread: the store hook runs on the thread that stores.
+    static FENCE: std::cell::RefCell<SignOutFence> =
+        const { std::cell::RefCell::new(SignOutFence::Open) };
+}
+
+fn with_fence<T>(f: impl FnOnce(&mut SignOutFence) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut FENCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        FENCE.with(|c| f(&mut c.borrow_mut()))
+    }
+}
+
+/// This process's sign-out fence ([`SignOutFence`]). Its first read
+/// registers the store hook too, so a token cached from it is marked
+/// stale by any later store.
+pub fn fence() -> SignOutFence {
+    watch_stores();
+    with_fence(|f| f.clone())
+}
+
+/// Sets this process's sign-out fence, and makes sure every later token
+/// store, the car's QuickConnect included, replaces it ([`after_store`]).
+pub fn set_fence(next: SignOutFence) {
+    watch_stores();
+    log::info!("pharos: token fence verdict={}", next.label());
+    with_fence(|f| *f = next);
+}
+
+/// Set by every token store: the token a cache holds may be another now.
+static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a token store ran since the last call.
+pub fn take_stale() -> bool {
+    STALE.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// Registers [`after_store`] with `pharos_content::token`, once.
+fn watch_stores() {
+    pharos_content::token::on_stored(after_store);
+}
+
+/// The store hook: replaces the fence as [`SignOutFence::after_store`]
+/// says, and marks a cached token stale. Takes only the fence's lock.
+fn after_store(stored: &str, replaced: Option<&str>) {
+    let (was, now) = with_fence(|f| {
+        let was = f.clone();
+        *f = f.after_store(stored, replaced);
+        (was, f.clone())
+    });
+    if was != now {
+        log::info!(
+            "pharos: token fence verdict={} reason=token_stored was={}",
+            now.label(),
+            was.label()
+        );
+    }
+    STALE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Removes the token and its user, under the file's lock; absent is fine.
@@ -244,5 +331,36 @@ mod sign_out_tests {
         assert_eq!(run_token(&path, "u1", &fence), Ok("tokB".to_owned()));
         assert!(SignOutFence::for_token(None).refuses("tokB"));
         assert!(!SignOutFence::Open.refuses("tokB"));
+    }
+
+    /// CR 4638522305: a sign-out that could not read its token fences every
+    /// token. The car's QuickConnect then stores B straight through
+    /// `pharos_content::token::store`: that store replaces the fence, so B
+    /// loads, while the token it overwrote (A) stays refused.
+    #[test]
+    fn a_quickconnect_store_replaces_an_unnamed_fence() {
+        let d = super::super::test_dir::TmpDir::new("run-fence-every");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        pair(&path, Some("tokA"), "u1").unwrap();
+        // forget_token could not read the token: no name for the fence.
+        set_fence(SignOutFence::for_token(None));
+        assert_eq!(fence(), SignOutFence::Every);
+        pharos_content::token::store(&path, "tokB").unwrap();
+        pair(&path, Some("tokB"), "u1").unwrap();
+        assert_eq!(
+            run_token(&path, "u1", &fence()),
+            Ok("tokB".to_owned()),
+            "the QuickConnect token stayed refused"
+        );
+        assert!(
+            fence().refuses("tokA"),
+            "the overwritten token was let back"
+        );
+        assert!(take_stale(), "the cached token was not marked stale");
+        // A fence naming another token stays when a third is stored.
+        pharos_content::token::store(&path, "tokC").unwrap();
+        assert!(fence().refuses("tokA"));
+        assert!(!fence().refuses("tokC"));
     }
 }
