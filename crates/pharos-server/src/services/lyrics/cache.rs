@@ -48,10 +48,11 @@ struct Record {
 struct Repick {
     /// The provider's id for the record picked; `None` when none was.
     picked: Option<u64>,
-    /// Unix milliseconds when the search began, so a search for the
-    /// song's old tags that ends late does not replace one for its new.
+    /// Unix milliseconds when the item the search was for was read, so a
+    /// search for the song's old tags that ends late does not replace one
+    /// for its new.
     #[serde(default)]
-    started_ms: u64,
+    asked_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,9 +120,9 @@ impl DiskCache {
 
     /// Keep `lyrics` as the song's answer once the provider was searched
     /// for another, with the id of the record picked or `None` when the
-    /// search found none and `lyrics` is the one that failed. The search
-    /// began at `started_ms`, Unix milliseconds; one for other tags that
-    /// began later stands. Blocking.
+    /// search found none and `lyrics` is the one that failed. The item was
+    /// read at `asked_ms`, Unix milliseconds; a repick for other tags read
+    /// no earlier stands, a tie keeping the one stored. Blocking.
     pub fn put_repicked(
         &self,
         id: u64,
@@ -129,7 +130,7 @@ impl DiskCache {
         song: &Song,
         lyrics: &Lyrics,
         picked: Option<u64>,
-        started_ms: u64,
+        asked_ms: u64,
     ) {
         self.write_at(
             id,
@@ -137,7 +138,7 @@ impl DiskCache {
             song,
             Some(lyrics),
             now_secs(),
-            Some(Repick { picked, started_ms }),
+            Some(Repick { picked, asked_ms }),
         );
     }
 
@@ -212,14 +213,14 @@ impl DiskCache {
                 r.key != key(provider, song)
                     && r.repick
                         .as_ref()
-                        .is_some_and(|theirs| theirs.started_ms > ours.started_ms)
+                        .is_some_and(|theirs| theirs.asked_ms >= ours.asked_ms)
             })
         });
         if later_repick {
             tracing::debug!(
                 media.id = id,
                 provider,
-                "lyrics: repick not cached, one for the song's newer tags began later"
+                "lyrics: repick not cached, one for tags read no earlier is stored"
             );
             return;
         }
@@ -494,9 +495,10 @@ mod tests {
     }
 
     /// Two repicks of one song, for its old tags and its new, ending in
-    /// reverse order: the one begun later, for the new tags, still stands
-    /// once the cache is opened again. Disarm check: without the start
-    /// comparison in `write_at`, this fails.
+    /// reverse order: the one for the tags read later, or in the same
+    /// millisecond, still stands once the cache is opened again. Disarm
+    /// check: without the comparison in `write_at`, or with a tie letting
+    /// the later write through, this fails.
     #[test]
     fn a_repick_for_old_tags_ending_late_leaves_the_newer_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,9 +510,15 @@ mod tests {
         older.lines[0].text = "the lanterns swing".into();
         cache.put_repicked(7, "lrclib", &retagged, &newer, Some(43), 2_000);
         cache.put_repicked(7, "lrclib", &song(), &older, Some(42), 1_000);
+        cache.put_repicked(9, "lrclib", &retagged, &newer, Some(43), 1_000);
+        cache.put_repicked(9, "lrclib", &song(), &older, Some(42), 1_000);
         drop(cache);
 
         let reopened = DiskCache::new(dir.path().to_path_buf());
+        assert!(
+            reopened.repicked(9, "lrclib", &retagged),
+            "a tie keeps the stored"
+        );
         assert!(reopened.repicked(7, "lrclib", &retagged));
         assert_eq!(
             reopened.get(7, "lrclib", &retagged),
