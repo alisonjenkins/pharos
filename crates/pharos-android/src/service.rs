@@ -63,6 +63,79 @@ pub(crate) fn retry_init(when: &str) {
     }
 }
 
+/// Whether a background `retry_init` is running now.
+static RETRY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// `retry_init` on a thread of its own, at most one at a time, for a caller
+/// that must not wait: opening the video store walks its folder, and the
+/// playback path would hold the track for it. Music stays refused while it
+/// runs, as the accounting reads not installed until it is done.
+pub(crate) fn retry_init_in_background(when: &'static str) {
+    if INIT_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let verdict = spawn_once(&RETRY_RUNNING, move || retry_init(when));
+    if verdict != Background::Started {
+        log(&format!(
+            "video accounting retry when={when} verdict={}",
+            verdict.label()
+        ));
+    }
+}
+
+/// What `spawn_once` did.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Background {
+    /// The work runs on a new thread.
+    Started,
+    /// One already runs: not started again.
+    AlreadyRunning,
+    /// No thread could be made: not run, and a later caller tries again.
+    SpawnFailed,
+}
+
+impl Background {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::AlreadyRunning => "already_running",
+            Self::SpawnFailed => "spawn_failed",
+        }
+    }
+}
+
+/// Runs `work` on a thread of its own unless `running` says one runs, and
+/// clears `running` when it ends, however it ends.
+pub(crate) fn spawn_once(
+    running: &'static AtomicBool,
+    work: impl FnOnce() + Send + 'static,
+) -> Background {
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Background::AlreadyRunning;
+    }
+    struct Clear(&'static AtomicBool);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("pharos-video-init".to_owned())
+        .spawn(move || {
+            let _clear = Clear(running);
+            work();
+        });
+    if spawned.is_ok() {
+        Background::Started
+    } else {
+        running.store(false, Ordering::Release);
+        Background::SpawnFailed
+    }
+}
+
 /// What `rerun_init` did.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum InitRetry {
@@ -599,9 +672,55 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 
 #[cfg(test)]
 mod tests {
-    use super::{access, outside_bytes, rerun_init, Caller, InitRetry};
+    use super::{access, outside_bytes, rerun_init, spawn_once, Background, Caller, InitRetry};
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The playback path's retry returns at once while the store opens, and
+    /// a second caller meanwhile does not start another open; once it ends
+    /// the next caller can.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_background_retry_does_not_hold_the_caller_and_runs_once_at_a_time() {
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (done, ended) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let first = spawn_once(&RUNNING, move || {
+            wait.recv().unwrap();
+            done.send(()).unwrap();
+        });
+        assert_eq!(first, Background::Started);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the caller waited for the open"
+        );
+        assert_eq!(
+            spawn_once(&RUNNING, || unreachable!("a second open ran")),
+            Background::AlreadyRunning
+        );
+        release.send(()).unwrap();
+        ended.recv().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while RUNNING.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "never cleared");
+            std::thread::yield_now();
+        }
+        let (again, ran) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            spawn_once(&RUNNING, move || again.send(()).unwrap()),
+            Background::Started
+        );
+        ran.recv().unwrap();
+        assert_ne!(
+            Background::Started.label(),
+            Background::AlreadyRunning.label()
+        );
+        assert_ne!(
+            Background::AlreadyRunning.label(),
+            Background::SpawnFailed.label()
+        );
+    }
 
     /// A music cache that could not be enabled is tried again by the next
     /// connect, and an enabled one is left alone.
