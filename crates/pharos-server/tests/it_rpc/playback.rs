@@ -2177,6 +2177,54 @@ async fn an_adopting_reconnect_reports_the_subtitle_it_named() {
     assert_eq!(again.subtitle, Some(3), "{again:?}");
 }
 
+/// B1490: a renewal from another of the user's device tokens keeps the
+/// session and becomes its holder: the old token's revocation leaves the
+/// stream open and the renewing token's ends it.
+/// Disarm check: with the holder left as stored, revoking the old token
+/// closes the stream and revoking the new one does not.
+#[actix_web::test]
+async fn a_renewal_from_another_token_holds_the_stream() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let old = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let new_token = fx.state.stores.issue(fx.user_id, "test").await.unwrap();
+    let new_token = new_token.0.expose().to_string();
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let new = crate::revocation::signed_in(&client2, &new_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = play_on(&old, &direct).await.unwrap();
+    as_after_a_rollout(&fx, grant, &first.psid).await;
+    let (_grant, renewed) = renew_naming(&new, &direct, &first.psid).await.unwrap();
+    assert_eq!(renewed.psid, first.psid, "the control: it was kept");
+
+    let status = || async {
+        test::call_service(&app, test::TestRequest::get().uri(&first.url).to_request())
+            .await
+            .status()
+    };
+    let unauthorized = actix_web::http::StatusCode::UNAUTHORIZED;
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the control: the stream is open"
+    );
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the old token's revocation leaves the kept stream open"
+    );
+    fx.state.stores.revoke(&new_token).await.unwrap();
+    assert_eq!(
+        status().await,
+        unauthorized,
+        "the renewing token's revocation ends it"
+    );
+}
+
 /// B1490: two renewals naming one session at once keep it for one of them
 /// only; the other gets its own, so no two grants share a stream. The RPC
 /// may run them one after the other; the claim's exclusion itself is pinned
