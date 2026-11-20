@@ -675,7 +675,7 @@ fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Ca
     let chosen = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
     // The Rust engine picks the quality itself: a cap auto quality settled on
     // under hls.js would otherwise hold the server's ladder down for good.
-    let auto = if hls_engine_adapts() { 0 } else { auto };
+    let auto = quality::auto_in_force(auto, hls_engine_adapts());
     let caps = with_max_bitrate(
         platform::capabilities(),
         kind,
@@ -6188,7 +6188,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         },
                         notice: notice(),
                         manual_cap: manual_cap(),
-                        auto_cap: auto_cap(),
+                        auto_cap: quality::auto_in_force(auto_cap(), hls_engine_adapts()),
                         suspect_marks,
                         on_quality_pick: {
                             let (watch, notify) = (watch.clone(), Rc::clone(&notify));
