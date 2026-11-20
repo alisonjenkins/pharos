@@ -371,6 +371,7 @@ async fn native_negotiation_agrees_with_playback_info() {
                 stereo_mode: None,
                 client_is_remote: false,
                 is_web_client: false,
+                draws_images: false,
             },
         );
         assert_eq!(
@@ -1334,6 +1335,7 @@ async fn an_sdr_only_player_is_not_offered_an_hdr_source_to_direct_play() {
             stereo_mode: None,
             client_is_remote: false,
             is_web_client: false,
+            draws_images: false,
         },
     );
     negotiated.record();
@@ -1391,6 +1393,7 @@ async fn video_range_unenforced_plays_on_and_counts_the_would_block() {
                 stereo_mode: None,
                 client_is_remote: false,
                 is_web_client: false,
+                draws_images: false,
             },
         );
         negotiated.record();
