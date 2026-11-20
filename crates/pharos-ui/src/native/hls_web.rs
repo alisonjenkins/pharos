@@ -16,8 +16,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::platform::{
-    current_path, get_text, info, js_message, load_script, now_ms, report_event, seconds_to_ms,
-    sleep_ms, video_element, warn, HlsJs, HLSJS_SRC,
+    current_path, info, js_message, load_script, now_ms, report_event, seconds_to_ms, sleep_ms,
+    video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, playlist_retry_policy,
@@ -604,7 +604,14 @@ async fn prepare_abr(
         let playlist = if entry.uri == playing_uri {
             Ok(None)
         } else {
-            match get_text(&entry.uri).await {
+            // The player may have closed, or rebuilt, while the last rung loaded.
+            let Some(deadlines) = weak.upgrade().and_then(|s| {
+                let s = s.borrow();
+                (!s.dead && s.recovery.epoch() == epoch).then_some(s.deadlines)
+            }) else {
+                return;
+            };
+            match get_text_within(&entry.uri, deadlines).await {
                 Ok(text) => parse_media(&text, &entry.uri)
                     .map(Some)
                     .map_err(|e| e.to_string()),
@@ -1894,6 +1901,32 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
     }
 }
 
+/// A playlist's text, or a failure once its headers or its body take longer
+/// than `deadlines` allow: a connection that hangs would otherwise leave the
+/// player loading for good (B1496).
+async fn get_text_within(url: &str, deadlines: Deadlines) -> Result<String, (Option<u16>, String)> {
+    let controller = web_sys::AbortController::new().ok();
+    let signal = controller.as_ref().map(web_sys::AbortController::signal);
+    let timed_out = |what: &str, ms: u64| {
+        if let Some(c) = &controller {
+            c.abort();
+        }
+        (None, format!("no {what} within {ms} ms"))
+    };
+    let send = Request::get(url).abort_signal(signal.as_ref()).send();
+    let resp = within(send, deadlines.first_byte_ms)
+        .await
+        .ok_or_else(|| timed_out("response", deadlines.first_byte_ms))?
+        .map_err(|e| (None, e.to_string()))?;
+    if !resp.ok() {
+        return Err((Some(resp.status()), resp.status_text()));
+    }
+    within(resp.text(), deadlines.load_ms)
+        .await
+        .ok_or_else(|| timed_out("body", deadlines.load_ms))?
+        .map_err(|e| (None, e.to_string()))
+}
+
 /// Fetch a playlist the start needs, trying again after a network failure or
 /// a 5xx under `policy` (B1491). Stops once the session is torn down.
 async fn get_playlist(
@@ -1903,7 +1936,7 @@ async fn get_playlist(
 ) -> Result<String, (Option<u16>, String)> {
     let mut retries = Retries::new(policy);
     loop {
-        let (status, reason) = match get_text(url).await {
+        let (status, reason) = match get_text_within(url, policy.deadlines).await {
             Ok(text) => return Ok(text),
             Err(e) => e,
         };
