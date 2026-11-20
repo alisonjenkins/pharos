@@ -2170,9 +2170,22 @@ async fn fetch_file(
                 );
                 #[cfg(test)]
                 tests::before_park_mark();
-                lock(&inner.state)
-                    .parking
-                    .insert((user.to_owned(), item.to_owned()), run);
+                // Marked parking only while this run still owns the item, in
+                // the hold that checks it: a run that lost it (removed, or
+                // replaced by another run) stops as gone and marks nothing.
+                let mut st = lock(&inner.state);
+                let ident = (user.to_owned(), item.to_owned());
+                if st.runs.get(&ident) != Some(&run) {
+                    drop(st);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep park verdict=gone item={item} run={run} reason=run_lost_item"
+                        ),
+                    );
+                    return Err(Stop::Gone);
+                }
+                st.parking.insert(ident, run);
                 return Err(Stop::Parked(why));
             }
             FetchOnce::TooLarge(limit) => {
@@ -9589,6 +9602,36 @@ pub(crate) mod tests {
         store.settled().await;
         clear_hook(&BEFORE_PARK_MARK);
         until_within(|| only(&store).state == KeptState::Ready).await;
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:2137): a run that lost its item
+    /// between the refusal and the parking mark (removed meanwhile) marks
+    /// nothing parking: it stops as gone, and no stale mark is left.
+    #[tokio::test]
+    async fn a_run_that_lost_its_item_before_the_park_mark_marks_nothing() {
+        let rig = Rig::new("park-mark-gone");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        rig.server.sign_in("u2");
+        let (s1, once) = (store.clone(), std::rc::Rc::new(std::cell::Cell::new(false)));
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                s1.remove("u1", "1");
+            }
+        });
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        assert!(
+            !lock(&store.inner.state)
+                .parking
+                .contains_key(&("u1".to_owned(), "1".to_owned())),
+            "a run that no longer owns the item marked it parking"
+        );
+        assert!(!lines("pharos: video keep park verdict=gone item=1").is_empty());
     }
 
     /// The same for a refusal at promotion: a segment fetched whole under
