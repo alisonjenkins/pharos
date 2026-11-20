@@ -481,9 +481,26 @@ impl Gate {
             }
             let earliest = {
                 let mut q = self.lock();
+                let now = Instant::now();
+                let epoch = self.online_epoch.load(Ordering::SeqCst);
                 while let Some(id) = q.wanted.pop_front() {
                     if self.cache.is_complete(&id) {
                         continue;
+                    }
+                    // A parked pin waits out its park here too: its retry
+                    // stays scheduled in `pinned`, and other playback
+                    // tracks go meanwhile.
+                    if let Some(p) = q.parked.get(&id) {
+                        if p.epoch == epoch && p.until > now {
+                            log::info!(
+                                "cache download id={id} verdict=skipped reason=parked_not_due queue=wanted left_ms={}",
+                                p.until.saturating_duration_since(now).as_millis()
+                            );
+                            if !q.pinned.iter().any(|x| *x == id) {
+                                q.pinned.push_back(id);
+                            }
+                            continue;
+                        }
                     }
                     q.busy = true;
                     q.current = Some(id.clone());
@@ -491,7 +508,6 @@ impl Gate {
                 }
                 // A parked pin waits out its backoff at the back of the
                 // queue; the others go meanwhile.
-                let now = Instant::now();
                 let mut earliest: Option<Instant> = None;
                 for _ in 0..q.pinned.len() {
                     let Some(id) = q.pinned.pop_front() else {
@@ -502,7 +518,6 @@ impl Gate {
                         continue;
                     }
                     // A reconnect since the park makes it due at once.
-                    let epoch = self.online_epoch.load(Ordering::SeqCst);
                     let parked = q.parked.get(&id).map(|p| (p.until, p.epoch));
                     if let Some((until, at)) = parked.filter(|&(u, at)| at != epoch && u > now) {
                         log::info!(
@@ -2741,6 +2756,67 @@ mod tests {
         assert!(!r.cache.is_complete("track/1"));
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
         assert!(r.dl.has_deferred("track/1"), "the part's validator went");
+    }
+
+    /// A pin parked for room, 30 s out, set up for the park tests below:
+    /// its first body drops, a reconnect cuts the retry's wait, and the
+    /// retry is refused for room and parked.
+    fn parked_pin(tag: &str, starve: Arc<AtomicBool>) -> Rig {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let r = rig_with_free(
+            tag,
+            script,
+            1 << 20,
+            &["t"],
+            Tuning {
+                backoff_min: Duration::from_secs(30),
+                backoff_max: Duration::from_secs(30),
+                ..fast()
+            },
+            starved_while_part(slot.clone(), starve, 600, MIN_FREE_BYTES + 100),
+        );
+        *slot.lock().unwrap() = Some(r.cache.part_path("track/1"));
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.srv.seen().is_empty() {
+            assert!(Instant::now() < until, "the pin never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        while !r.dl.events().iter().any(|e| e == "parked:track/1") {
+            assert!(Instant::now() < until, "the pin was not parked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        r
+    }
+
+    /// CR review 5995575621 (prefetch.rs:464): playback asking for a pin
+    /// that is parked does not run it before its park is due: no request
+    /// goes out, and its retry stays scheduled.
+    #[test]
+    fn a_parked_pin_asked_for_by_playback_waits_out_its_park() {
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = parked_pin("park-wanted", starve.clone());
+        let sent = r.srv.seen().len();
+        r.dl.prefetch(&ids(&["track/1"]));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            r.srv.seen().len(),
+            sent,
+            "the parked pin ran before its park was due: {:?}",
+            r.srv.seen()
+        );
+        starve.store(false, Ordering::SeqCst);
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        assert!(r.dl.wait_idle(Duration::from_secs(5)), "the pin was lost");
+        assert!(r.cache.is_complete("track/1"));
     }
 
     /// A whole new body refused for low disk keeps the old part and its
