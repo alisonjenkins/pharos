@@ -643,9 +643,10 @@ fn localize_ref<'a>(
         return localize_ref(&path, upstream, moved, server).map(|k| Cow::Owned(k.into_owned()));
     }
     if r.starts_with('/') {
-        // Its dot segments resolved first: `/jf/../media/0.m4s` is
+        // Its dot segments resolved first, percent-encoded ones included:
+        // `/jf/../media/0.m4s` and `/jf/%2e%2e/media/0.m4s` are both
         // `/media/0.m4s`, outside a `/jf` base, whatever its prefix says.
-        let resolved = without_dot_segments(r);
+        let resolved = normalized(r);
         let base_path = url_path(server).trim_end_matches('/');
         if base_path.is_empty() {
             local_key(&resolved)?;
@@ -655,22 +656,26 @@ fn localize_ref<'a>(
                 Cow::Owned(resolved)
             });
         }
-        let rest = resolved.strip_prefix(base_path).ok_or(())?;
-        return if rest.starts_with('/') || rest.starts_with('?') {
-            local_key(rest).map(Cow::Owned)
-        } else {
-            Err(())
+        return match under_base(&resolved, base_path) {
+            Some(rest) => local_key(rest).map(Cow::Owned),
+            None => {
+                outside_base(r, &resolved);
+                Err(())
+            }
         };
     }
     // Resolved against the URL the playlist was fetched from (the final
     // one after a redirect), base path and all, so a reference that climbs
     // out of the base path is seen to; the key is what is left under it.
     let base_path = url_path(server).trim_end_matches('/');
-    let resolved = pharos_hls::uri::resolve(&format!("{base_path}{upstream}"), r);
-    let rest = resolved.strip_prefix(base_path).ok_or(())?;
-    if !(rest.starts_with('/') || rest.starts_with('?')) {
+    let resolved = normalized(&pharos_hls::uri::resolve(
+        &format!("{base_path}{upstream}"),
+        r,
+    ));
+    let Some(rest) = under_base(&resolved, base_path) else {
+        outside_base(r, &resolved);
         return Err(());
-    }
+    };
     // Where the stored copy is read from is where it was fetched from
     // unless a redirect moved it: kept as written then, but only while it
     // resolves to the same key from there (the offline playlist's URL is
@@ -683,6 +688,30 @@ fn localize_ref<'a>(
     } else {
         Ok(Cow::Borrowed(r))
     }
+}
+
+/// A root-relative path with every dot segment removed, a percent-encoded
+/// one (`%2e%2e`, either case) as the WebView reads it included, its query
+/// kept: what a base path is checked against.
+fn normalized(r: &str) -> String {
+    without_encoded_dots(without_dot_segments(r))
+}
+
+/// What is left of the normalized path `resolved` under `base_path`: None
+/// when it is outside it.
+fn under_base<'r>(resolved: &'r str, base_path: &str) -> Option<&'r str> {
+    let rest = resolved.strip_prefix(base_path)?;
+    (rest.starts_with('/') || rest.starts_with('?')).then_some(rest)
+}
+
+/// Logs a playlist reference that resolves outside the base path, by its
+/// paths (a query may carry the play session).
+fn outside_base(r: &str, resolved: &str) {
+    super::platform::info(&format!(
+        "pharos: video playlist reference verdict=refused reason=outside_base_path reference_path={} resolved_path={}",
+        url_path(r),
+        url_path(resolved)
+    ));
 }
 
 /// A root-relative reference with its dot segments removed (RFC 3986
@@ -1156,6 +1185,40 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    /// CR 4646045317: a percent-encoded `..` is resolved before the base
+    /// path is checked, in a root-relative reference (either case) and in
+    /// a relative one: one that climbs out of the base is refused and
+    /// logged by its paths. An encoded `..` that stays inside the base is
+    /// still accepted.
+    #[test]
+    fn an_encoded_dot_dot_out_of_the_base_is_not_local() {
+        let server = "https://s.example/jf";
+        let one = |r: &str| localize_playlist(r, "/videos/1/main.m3u8", false, server, usize::MAX);
+        for r in [
+            "/jf/%2e%2e/media/0.m4s",
+            "/jf/%2E%2E/media/0.m4s",
+            "../../../media/0.m4s",
+            "%2e%2e/%2e%2e/%2E%2E/media/0.m4s",
+        ] {
+            super::super::platform::take_info_lines();
+            assert_eq!(one(r), Localized::NotLocal(r.to_owned()), "{r}");
+            assert!(
+                super::super::platform::take_info_lines()
+                    .iter()
+                    .any(|l| l.contains(
+                        "pharos: video playlist reference verdict=refused reason=outside_base_path"
+                    ) && l.contains("resolved_path=/media/0.m4s")),
+                "{r}: the refusal was not logged"
+            );
+        }
+        assert_eq!(
+            one("/jf/videos/x/%2e%2e/1/0.m4s"),
+            Localized::Rewritten("/videos/1/0.m4s".to_owned())
+        );
+        // Relative and unmoved, it resolves to the same key: kept as written.
+        assert_eq!(one("x/%2E%2E/0.m4s"), Localized::Unchanged);
     }
 
     /// CR 4640611394: a root-relative reference is resolved before the
