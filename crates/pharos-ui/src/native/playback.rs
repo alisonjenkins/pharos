@@ -727,6 +727,22 @@ impl AbrSwitchReport {
     }
 }
 
+/// Retries of a playlist fetch after its first failure, as hls.js
+/// `playlistLoadPolicy.errorRetry.maxNumRetry`: without them one blip on the
+/// master or a media playlist fails the start (B1491).
+pub const PLAYLIST_RETRIES: u32 = 2;
+
+/// The backoff for the Rust engine's playlist fetches: the segment backoff,
+/// fewer times. A refusal (4xx other than 408 and 429) is not retried.
+pub fn playlist_retry_policy(
+    deadlines: pharos_hls::retry::Deadlines,
+) -> pharos_hls::retry::RetryPolicy {
+    pharos_hls::retry::RetryPolicy {
+        max_retries: PLAYLIST_RETRIES,
+        ..pharos_hls::retry::RetryPolicy::with_deadlines(deadlines)
+    }
+}
+
 /// Segment deadlines for the Rust engine on `device` (FR-005). Provisional,
 /// not measured: hls.js's ten-second first byte on a desktop, longer on a
 /// TV or phone whose Wi-Fi and CPU answer slower; the slice 0 baseline
@@ -5999,5 +6015,43 @@ mod tests {
         for bad in ["tv@", "tv@soon", "ultra@1000000000000", "@5", ""] {
             assert_eq!(parse_tier_drop(bad, set), None, "{bad:?}");
         }
+    }
+
+    /// A playlist fetch that fails on the network or a 5xx is tried again,
+    /// twice; a refusal fails at once (B1491).
+    #[test]
+    fn a_playlist_blip_is_retried_and_a_refusal_is_not() {
+        use pharos_hls::retry::{Cause, GiveUp, Retries, Verdict};
+        let policy = playlist_retry_policy(segment_deadlines(DeviceClass::Desktop));
+        let mut blips = Retries::new(policy);
+        assert!(matches!(
+            blips.on_failure((), Cause::Http(503)),
+            Verdict::Retry {
+                attempt: 1,
+                after_ms: 1_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Retry {
+                attempt: 2,
+                after_ms: 2_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Fail {
+                why: GiveUp::Exhausted,
+                ..
+            }
+        ));
+        let mut refused = Retries::new(policy);
+        assert!(matches!(
+            refused.on_failure((), Cause::Http(401)),
+            Verdict::Fail {
+                why: GiveUp::NotRetryable,
+                ..
+            }
+        ));
     }
 }
