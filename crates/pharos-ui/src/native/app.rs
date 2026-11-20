@@ -5973,7 +5973,16 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api
+                    .play(
+                        &info,
+                        id,
+                        &p.0.version,
+                        &negotiation_capabilities(kind, *auto_cap.peek()),
+                        asked,
+                    )
+                    .await
+                {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
@@ -5987,9 +5996,13 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     }
                     Ok(_) => return,
                     Err(_) if *api_gen.peek() != gen => return,
-                    Err(e) if attempt == RENEW_ATTEMPTS => platform::warn(&format!(
-                        "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
-                    )),
+                    Err(e) if attempt == RENEW_ATTEMPTS => {
+                        // No grant holds the stream's session now: it ends with the grace.
+                        p.0.session_suspect.set(true);
+                        platform::warn(&format!(
+                            "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
+                        ));
+                    }
                     Err(e) => {
                         platform::warn(&format!(
                             "pharos: playback grant renewal retry attempt={attempt}: {e}"
@@ -7255,7 +7268,9 @@ fn Player(
                     stop();
                     let kind = fatal.kind;
                     let reason = fatal.reason;
-                    if renegotiates_quietly(kind, p.session_suspect.replace(false)) {
+                    // Only a failure the renegotiate can cure spends the mark.
+                    if renegotiates_quietly(kind, p.session_suspect.get()) {
+                        p.session_suspect.set(false);
                         platform::warn(&format!(
                             "pharos: playback stream session gone after reconnect, renegotiating item={playing_id} at_ms={} reason={reason}",
                             last_ms.get()
