@@ -1308,8 +1308,10 @@ impl Inner {
         // The record comes back and the removal's tombstone, mark and
         // in-removal entry go in this one hold: no admission sees neither.
         st.drop_tombstone(dir);
+        let mut indexed = 0usize;
         for key in &record.files {
             if let Some(len) = names.get(&file_name(key)) {
+                indexed += 1;
                 st.index.insert(
                     (record.user.clone(), key.clone()),
                     (self.file_path(&record.user, &record.item, key), *len),
@@ -1317,8 +1319,10 @@ impl Inner {
             }
         }
         // Nothing runs it any more; and a Ready one whose files could not
-        // all be indexed is no longer whole to the proxy.
-        let short_ready = !whole && record.ready();
+        // all be indexed, by a short walk or a file gone from a whole one,
+        // is no longer whole to the proxy.
+        let missing = indexed < record.files.len();
+        let short_ready = record.ready() && (!whole || missing);
         if matches!(record.state, KeptState::Downloading { .. }) || short_ready {
             // A Failed record reports its estimate as its bytes: what the
             // download had written, or the folder holds, must not drop out
@@ -1342,7 +1346,13 @@ impl Inner {
             format!(
                 "pharos: video keep remove item={} verdict=not_removed index={} manifest={} error={e}",
                 record.item,
-                if whole { "whole" } else { "short" },
+                if !whole {
+                    "short"
+                } else if missing {
+                    "missing"
+                } else {
+                    "whole"
+                },
                 dir.join("manifest.json").display()
             ),
         );
@@ -10989,6 +10999,33 @@ pub(crate) mod tests {
         store.remove("u1", "1");
         assert!(only(&store).ready());
         assert!(store.stored_file("u1", SEG0).is_some());
+    }
+
+    /// A whole inventory that lacks one of a Ready download's files does not
+    /// bring it back Ready: the proxy would 404 the missing file.
+    #[tokio::test]
+    async fn a_failed_unlink_over_an_inventory_missing_a_file_does_not_stay_ready() {
+        let rig = Rig::new("unlink-fails-missing");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(store.inner.file_path("u1", "1", SEG0)).unwrap();
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        let back = only(&store);
+        assert!(
+            matches!(back.state, KeptState::Failed { .. }),
+            "Ready with a file missing: {:?}",
+            back.state
+        );
+        assert!(store.stored_file("u1", SEG0).is_none());
+        assert!(
+            !lines("pharos: video keep remove item=1 verdict=not_removed index=missing").is_empty()
+        );
     }
 
     /// A run that a removal has revoked cannot recreate its folder or its
