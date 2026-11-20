@@ -576,9 +576,21 @@ pub trait Resumer {
         token: &'a str,
     ) -> futures_util::future::LocalBoxFuture<'a, Result<Self::Api, ResumeError<Self::Error>>>;
     /// Drops the token on file while it is still `refused` (the server
-    /// refused it), as one step under the file's lock. False when a sign-in
-    /// replaced it since: the replacement is kept.
-    fn forget_token(&self, refused: &str) -> bool;
+    /// refused it), as one step under the file's lock, and says how that
+    /// ended ([`TokenDropped`]).
+    fn forget_token(&self, refused: &str) -> TokenDropped;
+}
+
+/// How dropping a refused token ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenDropped {
+    /// Removed, or marked revoked on disk: it never resumes again.
+    Gone,
+    /// A sign-in replaced it since: the replacement is kept, and resumed.
+    Replaced,
+    /// Neither removed nor marked: this process refuses it (fenced), but
+    /// a restart may resume its account from the file.
+    Unsafe,
 }
 
 /// What [`resume_session`] gave.
@@ -590,6 +602,10 @@ pub enum Resumed<A, E> {
     NoToken,
     /// The server refused the token, which is dropped.
     Refused,
+    /// The server refused the token, and it could be neither removed nor
+    /// marked revoked: signed out in this process, but a restart may
+    /// resume the account. Never retried.
+    RefusedNotForgotten,
     /// Each token read was replaced by a sign-in before its refusal came
     /// back, [`RESUME_TRIES`] times: the latest is kept, for the next
     /// attempt.
@@ -612,14 +628,18 @@ pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
         };
         match r.resume(&token).await {
             Ok(api) => return Resumed::Opened(Session::opened(api, Some(token))),
-            Err(ResumeError::Refused) => {
-                if r.forget_token(&token) {
-                    return Resumed::Refused;
+            Err(ResumeError::Refused) => match r.forget_token(&token) {
+                TokenDropped::Gone => return Resumed::Refused,
+                TokenDropped::Unsafe => {
+                    super::platform::warn(&format!(
+                        "pharos: resume verdict=refused_not_forgotten reason=token_neither_removed_nor_marked attempt={attempt}"
+                    ));
+                    return Resumed::RefusedNotForgotten;
                 }
-                super::platform::info(&format!(
+                TokenDropped::Replaced => super::platform::info(&format!(
                     "pharos: resume verdict=superseded reason=token_changed_since_read attempt={attempt} of={RESUME_TRIES}"
-                ));
-            }
+                )),
+            },
             Err(ResumeError::Failed(e)) => return Resumed::Failed(e),
         }
     }
@@ -2488,6 +2508,8 @@ pub(crate) mod tests {
         /// Runs once, as a refused token is about to be dropped: a sign-in
         /// landing between the refusal and the drop.
         before_forget: RefCell<Option<Box<dyn FnOnce()>>>,
+        /// How every drop ends, when set, instead of the file's answer.
+        forget_ends: std::cell::Cell<Option<TokenDropped>>,
     }
 
     impl FakeResumer {
@@ -2497,6 +2519,7 @@ pub(crate) mod tests {
                 users: vec![("tokA", "A"), ("tokB", "B")],
                 sent: RefCell::default(),
                 before_forget: RefCell::default(),
+                forget_ends: std::cell::Cell::default(),
             }
         }
     }
@@ -2522,14 +2545,17 @@ pub(crate) mod tests {
                 .map(|(_, u)| u.to_string());
             Box::pin(async move { user.ok_or(ResumeError::Refused) })
         }
-        fn forget_token(&self, refused: &str) -> bool {
+        fn forget_token(&self, refused: &str) -> TokenDropped {
             if let Some(f) = self.before_forget.borrow_mut().take() {
                 f();
             }
-            !matches!(
-                super::super::token_file::forget_if(&self.file, refused),
-                Ok(super::super::token_file::ForgetIf::Changed)
-            )
+            if let Some(end) = self.forget_ends.get() {
+                return end;
+            }
+            match super::super::token_file::forget_if(&self.file, refused) {
+                Ok(super::super::token_file::ForgetIf::Changed) => TokenDropped::Replaced,
+                _ => TokenDropped::Gone,
+            }
         }
     }
 
@@ -2573,6 +2599,24 @@ pub(crate) mod tests {
             None,
             "a refused token was kept"
         );
+    }
+
+    /// CR 4640611359: a refused token that can be neither removed nor
+    /// marked is its own outcome, not a plain refusal, and is never
+    /// retried: the caller can warn that a restart may resume it.
+    #[test]
+    fn a_refused_token_that_will_not_go_is_its_own_outcome() {
+        use super::super::token_file;
+        let d = TmpDir::new("resume-unsafe");
+        let path = d.path().join("device-token");
+        let r = FakeResumer::new(&path);
+        token_file::store(&path, "tokX").unwrap();
+        r.forget_ends.set(Some(TokenDropped::Unsafe));
+        assert!(matches!(
+            run(resume_session(&r)),
+            Resumed::RefusedNotForgotten
+        ));
+        assert_eq!(*r.sent.borrow(), ["tokX"], "an unsafe end was retried");
     }
 
     /// A sign-in that stores B's token while a refusal of the old token is

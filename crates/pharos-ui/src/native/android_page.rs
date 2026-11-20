@@ -67,6 +67,9 @@ pub struct Open {
 pub enum OpenError {
     NotOpened(Probe),
     NotSignedIn,
+    /// The server refused the token, which could be neither removed nor
+    /// marked revoked: signed out here, but a restart may resume it.
+    NotSignedInTokenKept,
     Resume(String),
 }
 
@@ -174,6 +177,12 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
             Err(OpenError::NotSignedIn)
         }
+        Resumed::RefusedNotForgotten => {
+            log::warn!(
+                "pharos: open server={base} signed_in=false reason=token_refused_not_forgotten {timing}"
+            );
+            Err(OpenError::NotSignedInTokenKept)
+        }
         Resumed::Superseded => {
             log::info!(
                 "pharos: open server={base} signed_in=unknown reason=token_replaced_during_resume {timing}"
@@ -218,8 +227,13 @@ impl offline_video::Resumer for PhoneResumer<'_> {
         })
     }
 
-    fn forget_token(&self, refused: &str) -> bool {
-        android::forget_refused_token(refused, None) != super::token_file::Ended::Changed
+    fn forget_token(&self, refused: &str) -> offline_video::TokenDropped {
+        use super::token_file::Ended;
+        match android::forget_refused_token(refused, None) {
+            Ended::Changed => offline_video::TokenDropped::Replaced,
+            Ended::Unsafe { .. } => offline_video::TokenDropped::Unsafe,
+            Ended::Forgotten(_) | Ended::Marked(_) => offline_video::TokenDropped::Gone,
+        }
     }
 }
 

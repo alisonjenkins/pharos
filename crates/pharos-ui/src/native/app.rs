@@ -2583,6 +2583,12 @@ async fn connect(
             let _cleaned = forget_user_on_refused_resume(&machine.peek(), epoch);
             Event::ResumeRefused { epoch }
         }
+        // Signed out here all the same; the sign-in screen warns that the
+        // account may come back after a restart.
+        Err(OpenError::NotSignedInTokenKept) => {
+            let _cleaned = forget_user_on_refused_resume(&machine.peek(), epoch);
+            Event::ResumeRefusedTokenKept { epoch }
+        }
         Err(OpenError::Resume(error)) => Event::ResumeFailed { epoch, error },
     };
     machine.write().apply(event);

@@ -67,6 +67,12 @@ pub enum Event {
     ResumeRefused {
         epoch: u32,
     },
+    /// As `ResumeRefused`, but the refused token could be neither removed
+    /// nor marked revoked: a restart may resume its account, and the
+    /// sign-in screen says so.
+    ResumeRefusedTokenKept {
+        epoch: u32,
+    },
     /// The socket opened but `resume` failed for another reason.
     ResumeFailed {
         epoch: u32,
@@ -96,6 +102,10 @@ pub enum Event {
     SignOutAnswered(SignOutReply),
     Retry,
 }
+
+/// The sign-in screen's warning when a refused token could not be dropped.
+pub const TOKEN_KEPT: &str = "Signed out, but this device could not forget the old sign-in. \
+     It may come back when the app restarts: sign in and sign out again to retry.";
 
 /// The close reason the server sends when the session's token is revoked.
 const REVOKED: &str = "revoked";
@@ -304,6 +314,9 @@ impl Machine {
                 self.had_session = true;
             }
             Event::ResumeRefused { epoch } if open(epoch) => self.sign_in(None),
+            Event::ResumeRefusedTokenKept { epoch } if open(epoch) => {
+                self.sign_in(Some(TOKEN_KEPT.to_owned()));
+            }
             // The server is up but could not answer (its database may be
             // down): treat it like an outage.
             Event::ResumeFailed { epoch, error } if open(epoch) => {
@@ -1013,6 +1026,22 @@ mod tests {
             "{error}"
         );
         assert!(!m.signing_out());
+    }
+
+    /// CR 4640611359: a refused token the device could not drop signs in
+    /// with a warning that the account may come back after a restart, not
+    /// as a plain refusal; a stale attempt's changes nothing.
+    #[test]
+    fn a_refused_token_that_stayed_signs_in_with_a_warning() {
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefusedTokenKept { epoch: 0 });
+        assert_eq!(sign_in_error_of(&m), Some(TOKEN_KEPT));
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefused { epoch: 0 });
+        assert_eq!(sign_in_error_of(&m), None);
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefusedTokenKept { epoch: 7 });
+        assert_eq!(m.phase(), &Phase::Connecting);
     }
 
     #[test]

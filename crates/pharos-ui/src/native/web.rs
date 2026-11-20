@@ -39,6 +39,10 @@ pub enum OpenError {
     NotOpened(Probe),
     /// The server knows no session for this browser.
     NotSignedIn,
+    /// The phone's: a refused token that could not be dropped. Never made
+    /// here; the app's match is shared.
+    #[allow(dead_code)]
+    NotSignedInTokenKept,
     Resume(String),
 }
 
