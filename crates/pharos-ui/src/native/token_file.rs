@@ -153,6 +153,20 @@ pub enum SignedOut {
     NotSaved(String),
 }
 
+impl SignedOut {
+    /// The sign-in screen's answer for this verdict: 204 only for a
+    /// removal or a revocation that is on disk; one whose folder would not
+    /// sync warns that the sign-in may come back after a restart.
+    pub fn reply(self) -> super::machine::SignOutReply {
+        use super::machine::SignOutReply;
+        match self {
+            Self::Saved | Self::Marked(_) => SignOutReply::Status(204),
+            Self::SavedNotDurable(why) => SignOutReply::NotDurable(why),
+            Self::NotSaved(why) => SignOutReply::NotSaved(why),
+        }
+    }
+}
+
 /// A sign-out's removal of the token ([`forget`]), as the verdict the app
 /// reports: an unlink that failed is kept apart from an unlink whose
 /// folder sync failed.
@@ -264,6 +278,27 @@ mod sign_out_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// CR 4644634569: a sign-out whose folder would not sync is not
+    /// answered as a plain 204: the sign-in screen is told it may come
+    /// back after a restart. Durable removals and revocations stay 204.
+    #[test]
+    fn a_sign_out_not_durable_is_not_answered_as_done() {
+        use super::super::machine::SignOutReply;
+        assert_eq!(SignedOut::Saved.reply(), SignOutReply::Status(204));
+        assert_eq!(
+            SignedOut::Marked("x".into()).reply(),
+            SignOutReply::Status(204)
+        );
+        assert_eq!(
+            SignedOut::SavedNotDurable("sync".into()).reply(),
+            SignOutReply::NotDurable("sync".into())
+        );
+        assert_eq!(
+            SignedOut::NotSaved("rm".into()).reply(),
+            SignOutReply::NotSaved("rm".into())
+        );
+    }
 
     /// A token that cannot be removed is a sign-out not saved, apart from
     /// one removed whose folder could not be synced; a removed one is

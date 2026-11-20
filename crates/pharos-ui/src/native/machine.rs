@@ -55,6 +55,10 @@ pub enum SignOutReply {
     /// Signed out in this process, but the device could not forget the
     /// sign-in (its token file stayed), for the reason given.
     NotSaved(String),
+    /// Signed out, the token file gone, but its folder could not be synced
+    /// (why): a crash before the disk catches up may bring the sign-in
+    /// back after a restart.
+    NotDurable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +392,14 @@ impl Machine {
                      It may come back when the app restarts: sign in and sign out again to retry."
                 )));
             }
+            Event::SignOutAnswered(SignOutReply::NotDurable(why)) => {
+                // Signed out, but not yet for certain on disk: the sign-in
+                // screen says it may come back after a restart.
+                self.sign_in(Some(format!(
+                    "Signed out, but this device could not confirm it on disk ({why}). \
+                     The sign-in may come back if the phone restarts: sign in and sign out again to make sure."
+                )));
+            }
             Event::SignOutAnswered(reply) => {
                 self.signing_out = false;
                 match sign_out_error(&reply) {
@@ -509,7 +521,7 @@ fn sign_out_error(reply: &SignOutReply) -> Option<String> {
             Some(format!("Could not sign out (HTTP {status}). Try again."))
         }
         SignOutReply::Failed(error) => Some(format!("Could not sign out: {error}")),
-        SignOutReply::NotSaved(_) => None,
+        SignOutReply::NotSaved(_) | SignOutReply::NotDurable(_) => None,
     }
 }
 
@@ -1023,6 +1035,24 @@ mod tests {
         assert!(
             error.contains("could not forget the sign-in (permission denied)")
                 && error.contains("sign out again"),
+            "{error}"
+        );
+        assert!(!m.signing_out());
+    }
+
+    /// CR 4644634569: a sign-out whose removal is not durable signs out
+    /// with a warning that the sign-in may come back after a restart.
+    #[test]
+    fn a_sign_out_not_durable_signs_out_and_warns_of_a_restart() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotDurable(
+            "sync failed".into(),
+        )));
+        assert!(matches!(m.phase(), Phase::SignIn { .. }));
+        let error = sign_in_error_of(&m).unwrap_or_default();
+        assert!(
+            error.contains("(sync failed)") && error.contains("restarts"),
             "{error}"
         );
         assert!(!m.signing_out());
