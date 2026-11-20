@@ -498,6 +498,9 @@ struct Ask {
     audio_stream: Option<u32>,
 }
 
+#[cfg(test)]
+type BeforeQueue = Box<dyn FnOnce(&Aligner) + Send>;
+
 /// Client and background worker for lyric forced alignment.
 pub struct Aligner {
     http: Client,
@@ -516,6 +519,9 @@ pub struct Aligner {
     tx: mpsc::Sender<Job>,
     /// Spec 039, R21: sent each stored song for a comparison, when set.
     shadow: Option<Shadow>,
+    /// Run by `words_for` between its cache miss and the `pending` lock.
+    #[cfg(test)]
+    before_queue: Mutex<Option<BeforeQueue>>,
 }
 
 impl Aligner {
@@ -535,6 +541,7 @@ impl Aligner {
             partial: Mutex::default(),
             tx: mpsc::channel(1).0,
             shadow: None,
+            before_queue: Mutex::default(),
         }
     }
 
@@ -566,6 +573,8 @@ impl Aligner {
         });
         let aligner = Arc::new(Self {
             shadow,
+            #[cfg(test)]
+            before_queue: Mutex::default(),
             http,
             base,
             media_root,
@@ -1033,6 +1042,16 @@ impl Aligner {
         })
     }
 
+    /// What the cache already says of `lyrics` under `key`: its mismatch
+    /// verdict, or its words when they fit the `lines` it would be sent.
+    fn cached(&self, id: u64, key: &str, lyrics: &Lyrics, lines: usize) -> Option<Lookup> {
+        let aligned = self.cache.get(id, key)?;
+        if let Some(heard) = aligned.mismatch {
+            return Some(Lookup::Mismatch(heard));
+        }
+        (alignable(lyrics) && aligned.lines.len() == lines).then_some(Lookup::Ready(aligned))
+    }
+
     /// Check if word timestamps are ready for `lyrics`, or queue a background job.
     pub fn words_for(&self, item: &MediaItem, lyrics: &Lyrics) -> Lookup {
         let Some(Keyed {
@@ -1044,22 +1063,28 @@ impl Aligner {
             return Lookup::Unavailable;
         };
 
-        if let Some(aligned) = self.cache.get(item.id, &key) {
-            if let Some(heard) = aligned.mismatch {
-                return Lookup::Mismatch(heard);
-            }
-            if alignable(lyrics) && aligned.lines.len() == job_lines.len() {
-                return Lookup::Ready(aligned);
-            }
+        if let Some(found) = self.cached(item.id, &key, lyrics, job_lines.len()) {
+            return found;
         }
         if !alignable(lyrics) {
             return Lookup::Unavailable;
+        }
+        #[cfg(test)]
+        if let Some(run) = self.before_queue.lock().ok().and_then(|mut f| f.take()) {
+            run(self);
         }
 
         let mut pending = match self.pending.lock() {
             Ok(p) => p,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // The worker stores its answer before it leaves `pending`, so one
+        // stored since the miss above is seen here.
+        if !pending.contains(&item.id) {
+            if let Some(found) = self.cached(item.id, &key, lyrics, job_lines.len()) {
+                return found;
+            }
+        }
 
         if pending.contains(&item.id) {
             let left = self
@@ -1252,6 +1277,7 @@ pub(super) mod tests {
             partial: Mutex::default(),
             tx,
             shadow: None,
+            before_queue: Mutex::default(),
         }
     }
 
@@ -2838,6 +2864,49 @@ pub(super) mod tests {
         assert_eq!(aligner.words_for(&item, &other), Lookup::Unavailable);
         assert_eq!(aligner.mismatched(&item, &other), None);
         assert!(rx.try_recv().is_err(), "nothing queued");
+    }
+
+    /// A verdict the worker stores after `words_for` missed the cache, but
+    /// before it took the `pending` lock, is still honoured: the song is
+    /// not queued again. Disarm check: without the recheck under the lock,
+    /// this queues a second job.
+    #[test]
+    fn a_verdict_stored_between_the_miss_and_the_queue_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let song_path = media_root.join("song.mp3");
+        std::fs::write(&song_path, b"audio").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        let item = sample_item(song_path);
+        let lyrics = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1000),
+                text: "grey gulls wheel".into(),
+                words: Vec::new(),
+            }],
+            Origin::Online,
+        )
+        .unwrap();
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Pending(None));
+        let job = rx.try_recv().unwrap();
+        let aligned = parse_answer(&answer_with_check("lyrics_mismatch"), 1).unwrap();
+        let heard = aligned.mismatch.clone().unwrap();
+
+        // The worker stores its verdict and leaves `pending` while this
+        // lookup sits between its cache miss and the `pending` lock.
+        let (id, key) = (item.id, job.key);
+        *aligner.before_queue.lock().unwrap() = Some(Box::new(move |a: &Aligner| {
+            a.cache.put(id, key, aligned);
+            a.pending.lock().unwrap().remove(&id);
+        }));
+        assert_eq!(
+            aligner.words_for(&item, &lyrics),
+            Lookup::Mismatch(heard.clone())
+        );
+        assert!(rx.try_recv().is_err(), "nothing queued again");
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Mismatch(heard));
     }
 
     /// V1468: words aligned to lyrics that were not what was sung are never
