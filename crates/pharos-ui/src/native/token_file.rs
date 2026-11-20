@@ -194,8 +194,11 @@ pub enum ServiceNotice {
 /// caller cached (with the path, when there is one), and `notifier` tells
 /// the media service. Every exit publishes a fence first, so no early
 /// return can skip it: every token at the file's path, or at every path
-/// when the path cannot be found. The sign-out operation then narrows it to
-/// the token it left, or a store replaces it. A `NotSaved`, the failed
+/// when the path cannot be found. The sign-out itself never narrows that
+/// fence: when the token can be neither removed nor marked, `end_session`
+/// unions a fence naming it into this one, and the union of `Every` with
+/// anything is still `Every`. Only a later confirmed store changes it
+/// (`after_store` lifts the stored token's name). A `NotSaved`, the failed
 /// lookup included, asks the service to stay signed out.
 pub fn forget_token_with(
     path_lookup: impl FnOnce() -> Result<PathBuf, String>,
