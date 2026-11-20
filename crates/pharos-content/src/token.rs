@@ -436,8 +436,19 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         }
     }
     // The hook hears of the store only once the file is read back holding
-    // the new token: a fence it lifts is for a token really gone.
-    match read_raw(path) {
+    // the new token: a fence it lifts is for a token really gone. A store
+    // that cannot confirm it is not a success: the file may have changed,
+    // but the fence and the hook have not followed, so the caller is told
+    // the sign-in is incomplete ([`is_store_incomplete`]).
+    #[cfg(test)]
+    let back = if tests::FAIL_READ_BACK.with(std::cell::Cell::get) {
+        Err(err(path, "read back failed"))
+    } else {
+        read_raw(path)
+    };
+    #[cfg(not(test))]
+    let back = read_raw(path);
+    match back {
         Ok(Some(s)) if s.token == token => {
             let stored = fingerprint(token);
             let next = fence_held(path).after_store(&stored, replaced.as_deref());
@@ -449,20 +460,41 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 hook(&fingerprint(token), replaced.as_deref());
             }
         }
-        Ok(other) => log::warn!(
-            "token store verdict=not_replaced reason=read_back_differs found={}",
-            if other.is_some() {
+        Ok(other) => {
+            let found = if other.is_some() {
                 "another_token"
             } else {
                 "none"
-            }
-        ),
-        Err(e) => log::warn!(
-            "token store verdict=not_replaced reason=read_back_failed error={}",
-            e.redacted()
-        ),
+            };
+            log::warn!("token store verdict=incomplete reason=read_back_differs found={found}");
+            return Err(err(
+                path,
+                format!("{STORE_INCOMPLETE}: the file read back holds {found}"),
+            ));
+        }
+        Err(e) => {
+            log::warn!(
+                "token store verdict=incomplete reason=read_back_failed error={}",
+                e.redacted()
+            );
+            return Err(err(
+                path,
+                format!("{STORE_INCOMPLETE}: the file could not be read back"),
+            ));
+        }
     }
     Ok(())
+}
+
+/// How [`store`] names a store whose file may have changed but could not be
+/// confirmed: the sign-in is not complete.
+const STORE_INCOMPLETE: &str = "token store incomplete";
+
+/// Whether `e` is a [`store`] that wrote but could not confirm the token:
+/// the file may hold it, but this process has not taken it up, so a
+/// sign-in must stop rather than go on with it.
+pub fn is_store_incomplete(e: &ContentError) -> bool {
+    matches!(e, ContentError::TokenFile { why, .. } if why.starts_with(STORE_INCOMPLETE))
 }
 
 /// Pairs `user` with the token on file, read and written under the lock.
@@ -954,6 +986,8 @@ pub(crate) mod tests {
         pub(super) static FAIL_PREVIOUS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, a store's marker removal reports its folder sync failed.
         pub(super) static FAIL_MARKER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// While set, a store cannot read back the token it wrote.
+        pub(crate) static FAIL_READ_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, writing the token file fails before anything changes.
         pub(super) static FAIL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, syncing the directory after a rename fails.
@@ -1754,5 +1788,28 @@ pub(crate) mod tests {
             store(&p, "tokB").unwrap();
             assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"), "{name}");
         }
+    }
+
+    /// CR 4640611326: a store that installs its token but cannot read it
+    /// back is not a success: it says the sign-in is incomplete, and the
+    /// fence it could not confirm is left as it was.
+    #[test]
+    fn a_store_that_cannot_read_back_is_incomplete() {
+        let d = dir("read-back");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        set_fence(&p, Fence::Every, "test");
+        FAIL_READ_BACK.with(|f| f.set(true));
+        let stored = store(&p, "tokB");
+        FAIL_READ_BACK.with(|f| f.set(false));
+        let e = stored.expect_err("an unconfirmed store succeeded");
+        assert!(is_store_incomplete(&e), "{e:?}");
+        assert_eq!(
+            fence(&p),
+            Fence::Every,
+            "the fence followed an unconfirmed store"
+        );
+        assert!(!is_store_incomplete(&store(&p, "").unwrap_err()));
+        set_fence(&p, Fence::Open, "test");
     }
 }

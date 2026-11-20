@@ -1060,11 +1060,22 @@ impl Worker {
             } => {
                 self.qc = None;
                 self.qc_approved.store(false, Ordering::SeqCst);
-                if let Err(e) = token::store(&self.token_path, &token) {
-                    log::warn!(
+                match token::store(&self.token_path, &token) {
+                    Ok(()) => {}
+                    // The file may hold the token, but this process has not
+                    // taken it up (fence, hooks): the sign-in stops here.
+                    Err(e) if token::is_store_incomplete(&e) => {
+                        log::warn!(
+                            "quickconnect sign-in verdict=stopped reason=token_store_incomplete error={}",
+                            e.redacted()
+                        );
+                        self.shared.set_error(e.redacted());
+                        return;
+                    }
+                    Err(e) => log::warn!(
                         "device token not kept, signing in again next start: {}",
                         e.redacted()
-                    );
+                    ),
                 }
                 let cat = NativeCatalogue::new(bootstrap, closed, &session);
                 match cat.media_token().await {
@@ -2403,6 +2414,56 @@ mod tests {
                 .any(|l| l.contains("token read verdict=refused reason=service_fence at=refresh")),
             "{lines:?}"
         );
+    }
+
+    /// A session whose media token call runs `on_call` first.
+    struct HookSession(fn());
+    impl session::Server for HookSession {
+        fn media_token(
+            self: capnp::capability::Rc<Self>,
+            _: session::MediaTokenParams,
+            mut results: session::MediaTokenResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            (self.0)();
+            let mut t = results.get().init_result().init_token();
+            t.set_token("media");
+            t.set_expires_at_ms(u64::MAX);
+            std::future::ready(Ok(()))
+        }
+    }
+    struct HookBoot;
+    impl bootstrap::Server for HookBoot {}
+
+    fn approve(
+        w: &mut Worker,
+        rt: &tokio::runtime::Runtime,
+        local: &tokio::task::LocalSet,
+        on_call: fn(),
+        token: &str,
+    ) {
+        local.block_on(rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(HookBoot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(on_call)),
+                token: token.to_owned(),
+            })
+            .await;
+        });
+    }
+
+    /// CR 4640611326: an approval whose token store cannot be confirmed
+    /// does not sign in.
+    #[test]
+    fn a_quickconnect_approval_whose_store_is_incomplete_stops() {
+        let root = test_root("qc-store-incomplete");
+        let (mut w, shared, _) = worker(&root);
+        let (rt, local) = local_rt();
+        token::tests::FAIL_READ_BACK.with(|f| f.set(true));
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        token::tests::FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(w.link.is_none(), "an unconfirmed store signed in");
+        assert_ne!(shared.lock().auth, AuthState::SignedIn);
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
