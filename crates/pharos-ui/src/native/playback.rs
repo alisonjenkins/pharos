@@ -54,6 +54,16 @@ impl FailureKind {
         }
     }
 
+    /// The kind [`label`](Self::label) names; anything else is the network's.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "server" => Self::Server,
+            "unplayable" => Self::Unplayable,
+            "damaged" => Self::Damaged,
+            _ => Self::Network,
+        }
+    }
+
     /// An HTTP status that ended a fetch: the server's (4xx, 5xx), else the
     /// network's.
     pub fn of_status(status: u16) -> Self {
@@ -1830,6 +1840,13 @@ impl DeviceClass {
             DeviceClass::Desktop => "desktop",
         }
     }
+
+    /// The class [`label`](Self::label) names.
+    pub fn from_label(label: &str) -> Option<Self> {
+        [Self::Tv, Self::Phone, Self::Desktop]
+            .into_iter()
+            .find(|class| class.label() == label)
+    }
 }
 
 /// User agent tokens that mark a TV browser (spec 028 plan, Client tier choice).
@@ -2789,6 +2806,18 @@ pub const HLS_FORWARD_BYTES: f64 = 60_000_000.0;
 /// keyed per URL (B1399, V1369).
 pub const HLS_XHR_SETUP: &str = "(xhr, url) => { if (token && !/[?&]PlaySessionId=/i.test(url)) xhr.setRequestHeader('X-Emby-Token', token); }";
 
+/// Whether a stream request to `url` carries the token in a header: every
+/// one whose address names no play session, the rule [`HLS_XHR_SETUP`] gives
+/// hls.js.
+pub fn wants_token_header(url: &str) -> bool {
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    !query.split('&').any(|pair| {
+        pair.split('=')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("PlaySessionId"))
+    })
+}
+
 /// The buffer settings handed to hls.js, as `(config key, value)`.
 pub fn hls_buffer_config() -> [(&'static str, f64); 4] {
     [
@@ -3475,6 +3504,32 @@ mod tests {
             "(xhr, url) => { if (token && !/[?&]PlaySessionId=/i.test(url)) \
              xhr.setRequestHeader('X-Emby-Token', token); }"
         );
+    }
+
+    #[test]
+    fn the_token_header_goes_on_requests_that_name_no_play_session() {
+        assert!(wants_token_header("http://tv.test/videos/1/master.m3u8"));
+        assert!(wants_token_header("/videos/1/master.m3u8?static=true"));
+        assert!(wants_token_header("/videos/1/PlaySessionId=x/main.m3u8"));
+        assert!(!wants_token_header("/videos/1/main.m3u8?PlaySessionId=p1"));
+        assert!(!wants_token_header("/videos/1/0.m4s?a=b&playsessionid=p1"));
+    }
+
+    #[test]
+    fn labels_read_back_as_the_kind_and_class_they_name() {
+        for kind in [
+            FailureKind::Network,
+            FailureKind::Server,
+            FailureKind::Unplayable,
+            FailureKind::Damaged,
+        ] {
+            assert_eq!(FailureKind::from_label(kind.label()), kind);
+        }
+        assert_eq!(FailureKind::from_label("new"), FailureKind::Network);
+        for class in [DeviceClass::Tv, DeviceClass::Phone, DeviceClass::Desktop] {
+            assert_eq!(DeviceClass::from_label(class.label()), Some(class));
+        }
+        assert_eq!(DeviceClass::from_label("fridge"), None);
     }
 
     #[test]
