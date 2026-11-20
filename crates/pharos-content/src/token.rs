@@ -1230,6 +1230,9 @@ pub(crate) mod tests {
     /// A sign-in that lands while a user id is being paired with the old
     /// token waits for the pairing: the new token survives, with no user
     /// (its own is not known yet), never the old token or the old user.
+    /// The competing sign-in then pairs B with its token, and that pairing
+    /// is what a read finds (CR 4642574379): an unlocked pairing of A
+    /// landing after it would lose it.
     #[test]
     fn a_sign_in_during_a_user_pairing_keeps_the_new_token() {
         let d = dir("interleave");
@@ -1242,7 +1245,10 @@ pub(crate) mod tests {
             BETWEEN.with(|b| {
                 *b.borrow_mut() = Some(Box::new(move || {
                     let p = p.clone();
-                    let t = std::thread::spawn(move || store(&p, "tokB").unwrap());
+                    let t = std::thread::spawn(move || {
+                        store(&p, "tokB").unwrap();
+                        assert_eq!(store_user_if(&p, "tokB", "B").unwrap(), Pairing::Paired);
+                    });
                     // Long enough for an unlocked sign-in to finish first.
                     std::thread::sleep(std::time::Duration::from_millis(150));
                     *sign_in.lock().unwrap() = Some(t);
@@ -1256,9 +1262,9 @@ pub(crate) mod tests {
             read(&p).unwrap(),
             Some(Stored {
                 token: "tokB".into(),
-                user: None
+                user: Some("B".into())
             }),
-            "the sign-in was overwritten by the pairing"
+            "the sign-in or its pairing was overwritten by A's pairing"
         );
     }
 
