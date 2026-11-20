@@ -1974,8 +1974,7 @@ fn mark_handler(
                     // Kept only for the session that sent it: a mark that
                     // lands after a sign-out or another sign-in is not this
                     // session's to show.
-                    if matches!(mark, Mark::Played)
-                        && mark_is_current(machine.peek().session(), session, id)
+                    if matches!(mark, Mark::Played) && mark_is_current(&machine.peek(), session, id)
                     {
                         stored.set(Some((id, now)));
                     }
@@ -2746,14 +2745,21 @@ fn settle_start<T>(
     })
 }
 
-/// Whether a mark sent in session `sent_in` still belongs to the session
-/// signed in now (`current`); logs the skip when it does not.
-fn mark_is_current(current: u32, sent_in: u32, id: ItemRef) -> bool {
-    if current == sent_in {
+/// Whether a mark sent in session `sent_in` still belongs to a session
+/// signed in now: one is (`had_session`, which a sign-out clears and an
+/// outage keeps), and it is the one the mark was sent in. Logs the skip
+/// when it does not.
+fn mark_is_current(machine: &Machine, sent_in: u32, id: ItemRef) -> bool {
+    let current = machine.session();
+    let reason = if !machine.had_session() {
+        "no_session"
+    } else if current != sent_in {
+        "stale_session"
+    } else {
         return true;
-    }
+    };
     platform::info(&format!(
-        "pharos: mark {id} stored verdict=skipped reason=stale_session sent_in={sent_in} current={current}"
+        "pharos: mark {id} stored verdict=skipped reason={reason} sent_in={sent_in} current={current}"
     ));
     false
 }
@@ -10277,8 +10283,27 @@ mod tests {
     #[test]
     fn a_mark_from_an_ended_session_is_not_stored() {
         let id: ItemRef = "1".parse().unwrap();
-        assert!(mark_is_current(3, 3, id));
-        assert!(!mark_is_current(4, 3, id), "a stale mark was stored");
+        let mut m = app_machine();
+        m.apply(Event::Resumed { epoch: 0 });
+        let sent_in = m.session();
+        assert!(mark_is_current(&m, sent_in, id));
+        assert!(
+            !mark_is_current(&m, sent_in.wrapping_sub(1), id),
+            "a stale mark was stored"
+        );
+        // CR 4644634657: a sign-out keeps the session counter; the mark
+        // sent before it is not stored once no session is signed in.
+        m.apply(Event::NeedsSignIn);
+        assert_eq!(m.session(), sent_in);
+        platform::take_info_lines();
+        assert!(
+            !mark_is_current(&m, sent_in, id),
+            "a mark was stored after its session ended"
+        );
+        assert!(platform::take_info_lines()
+            .iter()
+            .any(|l| l.contains("verdict=skipped reason=no_session")));
+        offline_video::forget_user();
     }
 
     /// CR 4638660942: only an accepted resume notes a newer server's
