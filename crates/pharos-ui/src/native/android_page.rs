@@ -3379,7 +3379,7 @@ fn download_http() -> &'static Result<reqwest::Client, String> {
                 .previous()
                 .first()
                 .map_or_else(String::new, |u| u.to_string());
-            if attempt.previous().len() >= 10 {
+            if tv_page::redirects_exceeded(attempt.previous().len()) {
                 return attempt.error("too many redirects");
             }
             // Same origin only. A playlist may move: the store rebases its

@@ -159,6 +159,17 @@ pub(crate) fn origin_of(url: &str) -> Option<(String, String, u16)> {
     Some((scheme, host, port))
 }
 
+/// The redirects a download follows: the tenth is followed, an eleventh is
+/// not (as reqwest's default limit).
+pub const DOWNLOAD_REDIRECTS: usize = 10;
+
+/// Whether a redirect with `previous` URLs already requested in its chain
+/// (the original among them, as reqwest's `Attempt::previous` counts) is
+/// past [`DOWNLOAD_REDIRECTS`].
+pub fn redirects_exceeded(previous: usize) -> bool {
+    previous > DOWNLOAD_REDIRECTS
+}
+
 /// Whether a download's request to `original` may follow a redirect to
 /// `next`: only when scheme, host and port all match. The download sends the
 /// device token in a header, so a redirect to another host would hand it
@@ -1545,6 +1556,16 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CR 4642574391: `previous` holds the original and each redirect
+    /// before this one, so the tenth redirect sees ten and is followed;
+    /// only an eleventh is refused.
+    #[test]
+    fn the_tenth_download_redirect_is_followed() {
+        assert!(!redirects_exceeded(1), "the first redirect");
+        assert!(!redirects_exceeded(10), "the tenth redirect");
+        assert!(redirects_exceeded(11), "an eleventh redirect");
+    }
 
     /// The device token goes only over https, or to the build's own server
     /// at its own origin; any other plain-http URL is refused with the
