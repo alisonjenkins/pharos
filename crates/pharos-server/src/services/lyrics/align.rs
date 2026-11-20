@@ -702,11 +702,14 @@ impl Aligner {
         let shown = p.text_clear_at.is_some();
         p.lines.iter().any(Option::is_some).then(|| {
             let aligned = Aligned {
-                lines: p
-                    .lines
-                    .iter()
-                    .map(|l| l.clone().filter(|_| shown).unwrap_or_default())
-                    .collect(),
+                lines: if shown {
+                    p.lines
+                        .iter()
+                        .map(|l| l.clone().unwrap_or_default())
+                        .collect()
+                } else {
+                    vec![Vec::new(); p.lines.len()]
+                },
                 offset_ms: p.offset_ms,
                 scores: Vec::new(),
                 mismatch: None,
