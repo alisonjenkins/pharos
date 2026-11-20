@@ -5375,8 +5375,11 @@ fn offline_playing(
         from_start: start_ms == 0 && from_start,
         engine,
         session,
+        // Try again keys a downloaded copy by its session.
+        renegotiation: 0,
         grant: RefCell::new(None),
         grant_gen: Cell::new(grant_gen),
+        session_suspect: Cell::new(false),
         track_map,
         audio: copy.audio,
         subtitle: None,
@@ -5402,6 +5405,10 @@ struct Playing {
     engine: Engine,
     /// The server's play session; a new one remounts the player.
     session: String,
+    /// The player's renegotiations before this one. A recovery the server
+    /// answers with the same session is still a new stream, so it
+    /// remounts the player too.
+    renegotiation: u32,
     /// Reports and the stop go through this. It dies with the connection,
     /// so a reconnect swaps in a fresh one under the same player.
     /// `None` for a downloaded copy, which has no session on the server.
@@ -5410,6 +5417,11 @@ struct Playing {
     offline: Option<OfflineSave>,
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
+    /// A renewal was not adopted, so `session` may have ended. A fragment
+    /// that loads proves nothing: a released session still serves segments
+    /// until its grace runs out. Cleared by a renewal that adopts the
+    /// session, or spent by the failure it renegotiates.
+    session_suspect: Cell<bool>,
     detail: Detail,
     /// The version playing, so a renewed grant stays on that file (empty: the primary).
     version: String,
@@ -5446,6 +5458,11 @@ impl Playing {
         true
     }
 
+    /// Mounts the player afresh: a new session, or a renegotiation.
+    fn mount_key(&self) -> String {
+        player_key(&self.session, self.renegotiation)
+    }
+
     /// The tracks this playback was negotiated with, for negotiating it again.
     fn asked(&self) -> TrackPicks {
         TrackPicks {
@@ -5465,6 +5482,12 @@ impl Playing {
                 .any(|t| t.index == i && t.vtt_url.is_none() && t.images_url.is_none())
         })
     }
+}
+
+/// The player's mount key: its play session, and the renegotiations
+/// before it.
+fn player_key(session: &str, renegotiation: u32) -> String {
+    format!("{session}#{renegotiation}")
 }
 
 /// The playback props, compared by identity: a new negotiation is a new
@@ -5650,12 +5673,17 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The API generation the latest negotiation started on.
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
+    // Bumped when a renewal marks the session suspect, so a failure the
+    // player showed before the renewal answered is looked at again.
+    let mut suspect_marks = use_signal(|| 0u32);
     let negotiated_at = Rc::clone(&negotiated_gen);
     let gap_notify = Rc::clone(&notify);
     let carry_flag = Rc::clone(&picks_in_primary);
     let account = try_use_context::<AccountMe>();
     let offline_key = use_hook(|| Rc::new(Cell::new((0u32, false))));
     let retry_key = Rc::clone(&offline_key);
+    let renegotiations = use_hook(|| Rc::new(Cell::new(0u32)));
+    let renegotiated = Rc::clone(&renegotiations);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -5669,6 +5697,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let asked = picks();
         let picked_here = version_pick();
         let auto = auto_cap();
+        let renegotiation = renegotiated.get();
         // A song Previous went back to starts over (B464/V406), as does an
         // item Play from start was pressed on (B500). The press is spent only
         // by a negotiation that runs, so a load before sign-in keeps it; this
@@ -5855,9 +5884,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         from_start: start_ms == 0 && from_start,
                         engine,
                         session: decision.play_session,
+                        renegotiation,
                         grant: RefCell::new(Some(grant)),
                         offline: None,
                         grant_gen: Cell::new(grant_gen),
+                        session_suspect: Cell::new(false),
                         detail,
                         version,
                         track_map,
@@ -5933,7 +5964,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // When the grant is from an older API (a reconnect, even one during the
     // first negotiation), the stream keeps going and only the grant is
-    // negotiated again.
+    // negotiated again. A renewal the server did not adopt has a new play
+    // session: the stream's own may have ended with the grace, so its next
+    // network failure renegotiates instead of failing (B1482).
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -5966,21 +5999,40 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api
+                    .play(
+                        &info,
+                        id,
+                        &p.0.version,
+                        &negotiation_capabilities(kind, *auto_cap.peek()),
+                        asked,
+                    )
+                    .await
+                {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
+                        let adopted = decision.play_session == p.0.session;
+                        p.0.session_suspect.set(!adopted);
+                        if !adopted {
+                            suspect_marks += 1;
+                        }
                         platform::info(&format!(
-                            "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
+                            "pharos: playback grant renewed after reconnect method={} attempt={attempt} adopted={adopted}",
                             decision.method
                         ));
                         return;
                     }
                     Ok(_) => return,
                     Err(_) if *api_gen.peek() != gen => return,
-                    Err(e) if attempt == RENEW_ATTEMPTS => platform::warn(&format!(
-                        "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
-                    )),
+                    Err(e) if attempt == RENEW_ATTEMPTS => {
+                        // No grant holds the stream's session now: it ends with the grace.
+                        p.0.session_suspect.set(true);
+                        suspect_marks += 1;
+                        platform::warn(&format!(
+                            "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
+                        ));
+                    }
                     Err(e) => {
                         platform::warn(&format!(
                             "pharos: playback grant renewal retry attempt={attempt}: {e}"
@@ -6068,7 +6120,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         },
         None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
             remount_on(
-                &p.0.session,
+                &p.0.mount_key(),
                 rsx! {
                     Player {
                         playing: p.clone(),
@@ -6082,7 +6134,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         upcoming: upcoming.read().clone().flatten(),
                         on_renegotiate: {
                             let offline_key = Rc::clone(&retry_key);
+                            let renegotiations = Rc::clone(&renegotiations);
                             move |next| {
+                                renegotiations.set(renegotiations.get().wrapping_add(1));
                                 // Try again on a downloaded copy mounts a new
                                 // player: the failed one keeps its error.
                                 let offline = matches!(
@@ -6135,6 +6189,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         notice: notice(),
                         manual_cap: manual_cap(),
                         auto_cap: auto_cap(),
+                        suspect_marks,
                         on_quality_pick: {
                             let (watch, notify) = (watch.clone(), Rc::clone(&notify));
                             move |pick: Option<u64>| {
@@ -6286,6 +6341,21 @@ fn track_notice(audio: bool) -> String {
         "Switching subtitles…"
     }
     .to_owned()
+}
+
+/// A network or server failure on a stream whose session may have ended over a
+/// reconnect negotiates a new one, where the viewer would otherwise be shown
+/// the failure.
+fn renegotiates_quietly(kind: FailureKind, session_suspect: bool) -> bool {
+    // The Rust engine names an HTTP refusal (the ended session's 401) a
+    // server failure; hls.js names it a network one.
+    session_suspect && matches!(kind, FailureKind::Network | FailureKind::Server)
+}
+
+/// A failure already on screen when the session turns suspect is one
+/// [`renegotiates_quietly`] would have cured had the mark come first.
+fn shown_failure_renegotiates(shown: Option<&PlayFailure>, session_suspect: bool) -> bool {
+    shown.is_some_and(|f| renegotiates_quietly(f.kind, session_suspect))
 }
 
 /// The line shown while the quality step renegotiates from `from` to `to` bps.
@@ -6474,6 +6544,8 @@ fn Player(
     on_advance: EventHandler<ItemRef>,
     watch: QualityWatch,
     on_quality: EventHandler<u64>,
+    /// Bumped each time a renewal marks this playback's session suspect.
+    suspect_marks: Signal<u32>,
     slot: Slot,
     fade_in: FadeIn,
 ) -> Element {
@@ -7237,6 +7309,19 @@ fn Player(
                     stop();
                     let kind = fatal.kind;
                     let reason = fatal.reason;
+                    // Only a failure the renegotiate can cure spends the mark.
+                    if renegotiates_quietly(kind, p.session_suspect.get()) {
+                        p.session_suspect.set(false);
+                        platform::warn(&format!(
+                            "pharos: playback stream session gone after reconnect, renegotiating item={playing_id} at_ms={} reason={reason}",
+                            last_ms.get()
+                        ));
+                        on_renegotiate.call(TrackPicks {
+                            audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                            subtitle: choice(*subtitle.peek()),
+                        });
+                        continue;
+                    }
                     // Music keeps its own screen, and a group plays one
                     // timeline for all: neither is offered a skip.
                     let skippable = kind == FailureKind::Damaged
@@ -7277,6 +7362,27 @@ fn Player(
                     }));
                 }
             }
+        }
+    });
+    // A failure shown before the renewal marked the session suspect gets
+    // the renegotiation it would have had (B1482).
+    use_effect({
+        let (p, last_ms) = (Rc::clone(&p), Rc::clone(&last_ms.0));
+        move || {
+            suspect_marks.read();
+            if !shown_failure_renegotiates(failed.peek().as_ref(), p.session_suspect.get()) {
+                return;
+            }
+            p.session_suspect.set(false);
+            failed.set(None);
+            platform::warn(&format!(
+                "pharos: playback stream session gone after reconnect, renegotiating shown failure item={playing_id} at_ms={}",
+                last_ms.get()
+            ));
+            on_renegotiate.call(TrackPicks {
+                audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                subtitle: choice(*subtitle.peek()),
+            });
         }
     });
     // Before the stream attaches, so autoplay never starts at full volume.
@@ -9032,6 +9138,29 @@ mod tests {
         );
     }
 
+    /// Only a network failure after an unadopted renewal renegotiates without
+    /// showing the failure (B1482).
+    #[test]
+    fn only_a_network_failure_on_a_suspect_session_renegotiates_quietly() {
+        assert!(renegotiates_quietly(FailureKind::Network, true));
+        assert!(renegotiates_quietly(FailureKind::Server, true));
+        assert!(!renegotiates_quietly(FailureKind::Server, false));
+        assert!(!renegotiates_quietly(FailureKind::Network, false));
+        assert!(!renegotiates_quietly(FailureKind::Damaged, true));
+    }
+
+    /// A network failure shown before the renewal marked the session
+    /// suspect is renegotiated once the mark lands; nothing else is (B1482).
+    #[test]
+    fn a_failure_shown_before_the_mark_renegotiates_once_marked() {
+        let network = PlayFailure::stream(FailureKind::Network, "HTTP 401");
+        let damaged = PlayFailure::damaged("decode", None);
+        assert!(shown_failure_renegotiates(Some(&network), true));
+        assert!(!shown_failure_renegotiates(Some(&network), false));
+        assert!(!shown_failure_renegotiates(Some(&damaged), true));
+        assert!(!shown_failure_renegotiates(None, true));
+    }
+
     /// Auto quality uses a cap of 0 for "no cap", in both directions (B1481).
     #[test]
     fn a_quality_notice_reads_a_zero_cap_as_no_cap() {
@@ -9247,6 +9376,19 @@ mod tests {
     #[test]
     fn the_same_play_session_keeps_its_player() {
         assert_eq!(mounts_across(&["a", "a"]), 1);
+    }
+
+    /// A recovery the server adopts hands back the session the failed
+    /// player had; the player still mounts afresh. A grant-only renewal
+    /// keeps it (V392).
+    #[test]
+    fn a_recovery_that_keeps_its_session_mounts_a_new_player() {
+        let renewed = [player_key("a", 0), player_key("a", 0)];
+        let renewed: Vec<_> = renewed.iter().map(String::as_str).collect();
+        assert_eq!(mounts_across(&renewed), 1);
+        let recovered = [player_key("a", 0), player_key("a", 1)];
+        let recovered: Vec<_> = recovered.iter().map(String::as_str).collect();
+        assert_eq!(mounts_across(&recovered), 2);
     }
 
     /// Spec 020 FR-001 (V400): the stage beside the screen draws the player,
