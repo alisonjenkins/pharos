@@ -51,16 +51,59 @@ pub fn pair(path: &Path, seen: Option<&str>, user: &str) -> Result<(), String> {
 /// its user from one read of the file, the token only while that user is
 /// `owner` ([`token_for_owner`](super::kept_video::token_for_owner)). Err
 /// names the refusal; nothing is sent. The phone's fetcher and its host
-/// tests decide through this one function. `signed_out` is the process's
-/// sign-out fence: set while a sign-out left the token on file, it refuses
-/// every request before the file is read, until a new sign-in lifts it.
-pub fn run_token(path: &Path, owner: &str, signed_out: bool) -> Result<String, String> {
-    if signed_out {
+/// tests decide through this one function. `fence` is the process's
+/// sign-out fence ([`SignOutFence`]): the token it names is refused, and
+/// one that names none refuses every request before the file is read.
+pub fn run_token(path: &Path, owner: &str, fence: &SignOutFence) -> Result<String, String> {
+    if *fence == SignOutFence::Every {
         return Err(format!("signed_out_token_not_removed owner={owner}"));
     }
     let stored = read(path).map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
     let (token, user) = stored.map_or((None, None), |s| (Some(s.token), s.user));
+    if token.as_deref().is_some_and(|t| fence.refuses(t)) {
+        return Err(format!("signed_out_token_not_removed owner={owner}"));
+    }
     super::kept_video::token_for_owner(token.as_deref(), user.as_deref(), owner)
+}
+
+/// The phone's sign-out fence: set when a sign-out left its token on file
+/// (neither removed nor saved). It names that token by fingerprint, so any
+/// other token on file, whoever stored it, is read; with no token to name
+/// it refuses every token until the phone stores one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SignOutFence {
+    /// No sign-out left a token behind.
+    #[default]
+    Open,
+    /// The token with this fingerprint is refused.
+    Token(String),
+    /// The token left behind could not be named: every token is refused.
+    Every,
+}
+
+impl SignOutFence {
+    /// The fence for a sign-out that left `held` on file.
+    pub fn for_token(held: Option<&str>) -> Self {
+        held.map_or(Self::Every, |t| Self::Token(fingerprint(t)))
+    }
+
+    /// Whether `token` is refused.
+    pub fn refuses(&self, token: &str) -> bool {
+        match self {
+            Self::Open => false,
+            Self::Token(fp) => fingerprint(token) == *fp,
+            Self::Every => true,
+        }
+    }
+
+    /// The verdict word for logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Token(_) => "token",
+            Self::Every => "every",
+        }
+    }
 }
 
 /// Removes the token and its user, under the file's lock; absent is fine.
@@ -166,11 +209,40 @@ mod sign_out_tests {
         let path = d.path().join("device-token");
         store(&path, "tok").unwrap();
         pair(&path, Some("tok"), "u1").unwrap();
+        let fenced = SignOutFence::for_token(Some("tok"));
         assert_eq!(
-            run_token(&path, "u1", true),
+            run_token(&path, "u1", &fenced),
             Err("signed_out_token_not_removed owner=u1".to_owned()),
             "a fenced process sent the signed-out token"
         );
-        assert_eq!(run_token(&path, "u1", false), Ok("tok".to_owned()));
+        assert_eq!(
+            run_token(&path, "u1", &SignOutFence::Open),
+            Ok("tok".to_owned())
+        );
+        assert_eq!(
+            run_token(&path, "u1", &SignOutFence::Every),
+            Err("signed_out_token_not_removed owner=u1".to_owned())
+        );
+    }
+
+    /// CR 4637783579: the fence names the token the sign-out left, so a
+    /// token stored by any sign-in (the car's QuickConnect writes the file
+    /// itself) is read; the left token stays refused. With no token to
+    /// name, every token is refused until the phone stores one.
+    #[test]
+    fn the_sign_out_fence_refuses_only_the_token_it_names() {
+        let d = super::super::test_dir::TmpDir::new("run-fence-identity");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        pair(&path, Some("tokA"), "u1").unwrap();
+        let fence = SignOutFence::for_token(Some("tokA"));
+        assert!(fence.refuses("tokA"));
+        // Another sign-in's token, stored past the phone's own path.
+        pharos_content::token::store(&path, "tokB").unwrap();
+        pair(&path, Some("tokB"), "u1").unwrap();
+        assert!(!fence.refuses("tokB"));
+        assert_eq!(run_token(&path, "u1", &fence), Ok("tokB".to_owned()));
+        assert!(SignOutFence::for_token(None).refuses("tokB"));
+        assert!(!SignOutFence::Open.refuses("tokB"));
     }
 }

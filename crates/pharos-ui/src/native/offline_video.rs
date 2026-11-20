@@ -1950,7 +1950,11 @@ pub(crate) mod tests {
             })
         }
         fn decide(&self, owner: &str) -> Result<String, String> {
-            let decided = super::super::token_file::run_token(&self.file, owner, false);
+            let decided = super::super::token_file::run_token(
+                &self.file,
+                owner,
+                &super::super::token_file::SignOutFence::Open,
+            );
             if let Err(e) = &decided {
                 self.refused
                     .lock()

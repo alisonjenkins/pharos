@@ -169,35 +169,71 @@ fn drop_legacy_user(path: &std::path::Path) {
 }
 
 /// The device token as last loaded, stored or forgotten, kept in memory for
-/// the server proxy, which sends it on every image request.
+/// the server proxy, which sends it on every image request. Its lock is
+/// held across each file operation and the cache update that follows it,
+/// so a sign-out that completes is never followed by publishing the token
+/// it removed.
 static TOKEN: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
-fn set_cached(token: Option<String>) {
-    if let Ok(mut t) = TOKEN.lock() {
-        *t = Some(token);
-    }
+fn token_lock() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
+    TOKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The sign-out fence ([`token_file::SignOutFence`]): set when a sign-out
+/// left its token on file, so that token is not loaded again in this
+/// process. Another token on file, whoever stored it, is read.
+static FENCE: std::sync::Mutex<token_file::SignOutFence> =
+    std::sync::Mutex::new(token_file::SignOutFence::Open);
+
+fn fence() -> token_file::SignOutFence {
+    FENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn set_fence(fence: token_file::SignOutFence) {
+    log::info!("pharos: token fence verdict={}", fence.label());
+    *FENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = fence;
 }
 
 /// `load_token`, read from disk only the first time. Never log the value.
 pub fn token() -> Option<String> {
-    if let Ok(t) = TOKEN.lock() {
-        if let Some(token) = &*t {
-            return token.clone();
-        }
+    let mut cached = token_lock();
+    if let Some(token) = &*cached {
+        return token.clone();
     }
-    load_token()
+    load_locked(&mut cached)
 }
 
 /// The stored device token, if any. Never log the value.
 pub fn load_token() -> Option<String> {
-    if KEPT_AFTER_SIGN_OUT.load(std::sync::atomic::Ordering::SeqCst) {
+    load_locked(&mut token_lock())
+}
+
+/// Reads the token behind the fence and caches it, under the cache's lock.
+fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
+    let fence = fence();
+    let token = if fence == token_file::SignOutFence::Every {
+        None
+    } else {
+        token_path()
+            .ok()
+            .and_then(|path| token_file::read(&path).ok().flatten())
+            .map(|s| s.token)
+    };
+    let token = match token {
+        Some(t) if fence.refuses(&t) => None,
+        other => other,
+    };
+    if token.is_none() && fence != token_file::SignOutFence::Open {
         log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
-        set_cached(None);
-        return None;
     }
-    let path = token_path().ok()?;
-    let token = token_file::read(&path).ok().flatten().map(|s| s.token);
-    set_cached(token.clone());
+    *cached = Some(token.clone());
     token
 }
 
@@ -206,9 +242,11 @@ pub fn load_token() -> Option<String> {
 /// sign-out fence as `load_token`. Never log the token.
 pub fn run_token(owner: &str) -> Result<String, String> {
     let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
-    let fenced = KEPT_AFTER_SIGN_OUT.load(std::sync::atomic::Ordering::SeqCst);
-    let decided = token_file::run_token(&path, owner, fenced);
-    if fenced {
+    let decided = token_file::run_token(&path, owner, &fence());
+    if decided
+        .as_ref()
+        .is_err_and(|e| e.starts_with("signed_out_token_not_removed"))
+    {
         log::info!(
             "pharos: run token verdict=refused reason=signed_out_token_not_removed owner={owner}"
         );
@@ -220,12 +258,15 @@ pub fn run_token(owner: &str) -> Result<String, String> {
 /// is unknown until `pair_token_user`, never the previous sign-in's.
 pub fn store_token(token: &str) -> Result<(), String> {
     let path = token_path()?;
-    token_file::store(&path, token).map(|()| {
-        KEPT_AFTER_SIGN_OUT.store(false, std::sync::atomic::Ordering::SeqCst);
-        drop_legacy_user(&path);
-        set_cached(Some(token.to_owned()));
-        note_credentials_changed("stored");
-    })
+    {
+        let mut cached = token_lock();
+        token_file::store(&path, token)?;
+        set_fence(token_file::SignOutFence::Open);
+        *cached = Some(Some(token.to_owned()));
+    }
+    drop_legacy_user(&path);
+    note_credentials_changed("stored");
+    Ok(())
 }
 
 /// Signs out on the device: the token and its user go (one file). What
@@ -233,23 +274,28 @@ pub fn store_token(token: &str) -> Result<(), String> {
 /// `NotSaved`, and this process stays signed out all the same: the token
 /// is not read again until a new sign-in stores one.
 pub fn forget_token() -> token_file::SignedOut {
-    set_cached(None);
-    let path = match token_path() {
-        Ok(path) => path,
-        Err(e) => return token_file::SignedOut::NotSaved(e),
-    };
-    drop_legacy_user(&path);
-    // The token as it stood, so a sign-out that can neither remove nor
-    // mark it can still name it to the media service's fence.
-    let held = token_file::read(&path).ok().flatten().map(|s| s.token);
-    let verdict = token_file::sign_out(&path);
-    KEPT_AFTER_SIGN_OUT.store(
-        matches!(
+    let (verdict, held) = {
+        let mut cached = token_lock();
+        *cached = Some(None);
+        let path = match token_path() {
+            Ok(path) => path,
+            Err(e) => return token_file::SignedOut::NotSaved(e),
+        };
+        drop_legacy_user(&path);
+        // The token as it stood, so a sign-out that can neither remove nor
+        // mark it can still name it to the fences.
+        let held = token_file::read(&path).ok().flatten().map(|s| s.token);
+        let verdict = token_file::sign_out(&path);
+        if matches!(
             verdict,
             token_file::SignedOut::NotSaved(_) | token_file::SignedOut::Marked(_)
-        ),
-        std::sync::atomic::Ordering::SeqCst,
-    );
+        ) {
+            set_fence(token_file::SignOutFence::for_token(held.as_deref()));
+        } else {
+            set_fence(token_file::SignOutFence::Open);
+        }
+        (verdict, held)
+    };
     match (&verdict, held) {
         (token_file::SignedOut::NotSaved(_), Some(token)) => note_credentials_kept(&token),
         _ => note_credentials_changed("forgotten"),
@@ -257,40 +303,43 @@ pub fn forget_token() -> token_file::SignedOut {
     verdict
 }
 
-/// Set while a sign-out could not remove the token file: the token on file
-/// is not loaded again in this process (the user signed out), until a new
-/// sign-in stores one.
-static KEPT_AFTER_SIGN_OUT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Drops the token a session ended (or a resume was refused) with, only
 /// while it is still the one on file, and says what happened
 /// (`token_file::end_session`): `Changed` when a sign-in replaced it since
 /// (kept, for the caller to resume with), `Marked` when it would not go but
 /// is marked revoked for `user`, `Unsafe` when neither could be written.
 pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::Ended {
-    let path = match token_path() {
-        Ok(path) => path,
-        Err(e) => {
-            set_cached(None);
-            return token_file::Ended::Unsafe {
-                removal: e,
-                marker: "no token path".to_owned(),
-                target: None,
-            };
+    let ended = {
+        let mut cached = token_lock();
+        let path = match token_path() {
+            Ok(path) => path,
+            Err(e) => {
+                *cached = Some(None);
+                return token_file::Ended::Unsafe {
+                    removal: e,
+                    marker: "no token path".to_owned(),
+                    target: None,
+                };
+            }
+        };
+        let ended = token_file::end_session(&path, Some(refused), user);
+        if ended == token_file::Ended::Changed {
+            log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
+            return ended;
         }
+        *cached = Some(None);
+        drop_legacy_user(&path);
+        if let token_file::Ended::Unsafe { target, .. } = &ended {
+            // Still on file and readable: fence it in this process, the
+            // media service's reads included, rather than ask it to reload.
+            set_fence(target.clone().map_or(
+                token_file::SignOutFence::Every,
+                token_file::SignOutFence::Token,
+            ));
+        }
+        ended
     };
-    let ended = token_file::end_session(&path, Some(refused), user);
-    if ended == token_file::Ended::Changed {
-        log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
-        return ended;
-    }
-    set_cached(None);
-    drop_legacy_user(&path);
     if matches!(ended, token_file::Ended::Unsafe { .. }) {
-        // Still on file and readable: fence it in this process, the media
-        // service's reads included, rather than ask it to reload.
-        KEPT_AFTER_SIGN_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
         log::warn!("pharos: token forget verdict=fenced reason=token_neither_removed_nor_marked");
         note_credentials_kept(refused);
     } else {
