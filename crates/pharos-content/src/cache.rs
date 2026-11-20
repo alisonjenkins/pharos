@@ -50,6 +50,8 @@ thread_local! {
     static AFTER_PART_LEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     /// Runs in a trim once its first part scan is read.
     static AFTER_TRIM_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Makes `truncate_part` fail.
+    static TRUNCATE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +269,10 @@ pub enum NoRoom {
     /// folder that could not be read), so the cap cannot be checked yet.
     /// Retryable: it clears once their size can be read again.
     AccountingUnknown,
+    /// A replacement's old `.part` could not be emptied: approving it would
+    /// count the old part and the whole new body. Retryable: the part and
+    /// its validator stay.
+    PartNotTruncated,
 }
 
 pub struct Cache {
@@ -1070,7 +1076,7 @@ impl Cache {
         } else {
             0
         };
-        let verdict = self.check_free(downloading, need, evict, reclaim);
+        let mut verdict = self.check_free(downloading, need, evict, reclaim);
         if replacing {
             log::info!(
                 "cache admission id={downloading} need={need} reclaim={reclaim} verdict={} reason=whole_body_replaces_part",
@@ -1080,14 +1086,18 @@ impl Cache {
         match verdict {
             // The old part goes and the new body's reservation is published
             // in this one step under the admission lock: no other admission
-            // sees both. Owed is counted from the empty file.
+            // sees both. Owed is counted from the empty file. A part that
+            // will not empty refuses the replacement: its room was counted
+            // as reclaimed, and approving would count the old part and the
+            // whole new body. The part and its validator stay for a retry.
             Ok(_) if replacing => match self.truncate_part(downloading) {
                 Ok(()) => self.reserve_from(downloading, need, Some(0)),
                 Err(e) => {
                     log::warn!(
-                        "cache admission id={downloading} verdict=approved reason=part_not_truncated error={e}"
+                        "cache admission id={downloading} verdict=refused reason=truncate_failed error={e}"
                     );
-                    self.reserve(downloading, need);
+                    self.unreserve(downloading);
+                    verdict = Err(NoRoom::PartNotTruncated);
                 }
             },
             Ok(_) => self.reserve(downloading, need),
@@ -1101,6 +1111,10 @@ impl Cache {
     fn truncate_part(&self, id: &str) -> std::io::Result<()> {
         let p = self.part_path(id);
         let _s = self.lock();
+        #[cfg(test)]
+        if TRUNCATE_FAULT.with(std::cell::Cell::get) {
+            return Err(std::io::Error::other("truncate refused for the test"));
+        }
         match std::fs::OpenOptions::new().write(true).open(&p) {
             Ok(f) => f.set_len(0),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1678,6 +1692,36 @@ pub(crate) mod tests {
             (Some(0), 1000),
             "the old part and the new body were both counted"
         );
+    }
+
+    /// CR 4638524306: a replacement whose old part will not truncate is
+    /// refused. The old part stays, counted once, and nothing is reserved
+    /// for the new body.
+    #[test]
+    fn a_replacement_whose_part_will_not_truncate_is_refused() {
+        let d = tmp("replace-truncate-fails");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        TRUNCATE_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1000, true);
+        TRUNCATE_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            (c.in_progress_bytes(), c.reserved_bytes()),
+            (Some(600), 0),
+            "the old part and the new body were both counted"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "cache admission id=track/x verdict=refused reason=truncate_failed error=truncate refused for the test"
+            )),
+            "{:?}",
+            crate::testlog::lines()
+        );
+        // With the truncation back, the same replacement is approved.
+        assert!(c.ensure_free_replacing_part("track/x", 1000, true).is_ok());
+        assert_eq!((c.in_progress_bytes(), c.reserved_bytes()), (Some(0), 1000));
     }
 
     /// A host's cap needs the whole claim of an in-flight download: what its

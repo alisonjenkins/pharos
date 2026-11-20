@@ -145,6 +145,7 @@ impl Fail {
         match no {
             NoRoom::LowDisk(room) => Self::LowDisk(room),
             NoRoom::AccountingUnknown => Self::AccountingUnknown,
+            NoRoom::PartNotTruncated => Self::Transient("part_not_truncated".to_owned()),
         }
     }
 }
@@ -612,7 +613,8 @@ impl Gate {
         };
         let outcome = loop {
             match self.cache.ensure_free(id, 0) {
-                Ok(_) => {}
+                // A preflight replaces no part, so it never truncates one.
+                Ok(_) | Err(NoRoom::PartNotTruncated) => {}
                 // A pin with a part on disk waits for room and resumes it;
                 // anything else stops here (its part, if any, is kept).
                 Err(NoRoom::LowDisk(free)) if part_len() > 0 && self.is_pin_work(id) => {
