@@ -5,7 +5,7 @@
 //! page's script sends into Rust.
 
 use pharos_hls::planner::Track;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::hls_trace::{Appended, Clip, Signal};
 use super::shell::Shell;
@@ -388,6 +388,97 @@ pub fn visualiser_stop_js(id: u64) -> String {
         r#"const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
 const run = all[{id}];
 if (run && run.stop) {{ run.stop(); run.free(); delete all[{id}]; }} else {{ all[{id}] = "gone"; }}"#
+    )
+}
+
+/// The script that loads the Rust HLS engine's module into the page once and
+/// answers whether it is there: the wasm-bindgen glue, then the module's bytes.
+///
+/// The glue declares a top-level `let wasm_bindgen`, as the visualiser's does;
+/// it runs inside a function here so the two modules do not collide.
+pub fn engine_load_js(glue: &str, wasm_b64: &str) -> String {
+    let script = serde_json::Value::String(format!(
+        "(function () {{\n{glue}\nwindow.__pharosEngineInit = wasm_bindgen;\n}})();"
+    ));
+    let wasm = serde_json::Value::String(wasm_b64.to_owned());
+    format!(
+        r#"if (!window.__pharosEngineLoad) {{
+  window.__pharosEngineLoad = (async () => {{
+    const s = document.createElement("script");
+    s.textContent = {script};
+    document.head.append(s);
+    if (!window.__pharosEngineInit) throw new Error("the engine glue defined no wasm_bindgen");
+    const b = atob({wasm});
+    const bytes = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+    await window.__pharosEngineInit({{ module_or_path: bytes }});
+    window.__pharosEngine = window.__pharosEngineInit;
+    return true;
+  }})();
+  window.__pharosEngineLoad.catch(() => {{ window.__pharosEngineLoad = null; }});
+}}
+return await window.__pharosEngineLoad;"#
+    )
+}
+
+/// One play for the page's Rust HLS engine to start.
+pub struct EngineStart<'a> {
+    pub video_id: &'a str,
+    /// Which attach this is: a stop names it, so a late one cannot end a
+    /// newer play on the same element.
+    pub generation: u64,
+    pub url: &'a str,
+    pub start_ms: u64,
+    /// The device class's label, which picks the buffer sizes.
+    pub device: &'a str,
+    /// Sent as `X-Emby-Token` on requests whose address carries no session.
+    pub token: Option<&'a str>,
+}
+
+/// The script that starts the engine on `<video id=video_id>`. It reports
+/// `started` (with the error when it could not), then the engine's own events.
+/// A stop that ran first wins.
+pub fn engine_start_js(start: &EngineStart<'_>) -> String {
+    let id = serde_json::Value::String(start.video_id.to_owned());
+    let url = serde_json::Value::String(start.url.to_owned());
+    let device = serde_json::Value::String(start.device.to_owned());
+    let token = start.token.map_or(serde_json::Value::Null, |t| {
+        serde_json::Value::String(t.to_owned())
+    });
+    let (generation, start_ms) = (start.generation, start.start_ms);
+    format!(
+        r#"const id = {id};
+const all = window.__pharosEngines = window.__pharosEngines || {{}};
+const stopped = window.__pharosEngineStopped = window.__pharosEngineStopped || {{}};
+const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "engine", id }}, m));
+(async () => {{
+  try {{
+    if (!window.__pharosEngine && window.__pharosEngineLoad) await window.__pharosEngineLoad;
+    if (!window.__pharosEngine) throw new Error("the engine module is not loaded");
+    if ((stopped[id] || 0) >= {generation}) return;
+    if (all[id]) {{ all[id].run.free(); delete all[id]; }}
+    const run = window.__pharosEngine.start(id, {url}, {start_ms}, {device}, {token},
+      (json) => send(JSON.parse(json)));
+    all[id] = {{ gen: {generation}, run }};
+    send({{ ev: "started", error: "" }});
+  }} catch (e) {{
+    send({{ ev: "started", error: String(e && e.message ? e.message : e) }});
+  }}
+}})();"#
+    )
+}
+
+/// The script that stops attach `generation` of the engine on `video_id`,
+/// whether or not it has started yet.
+pub fn engine_stop_js(video_id: &str, generation: u64) -> String {
+    let id = serde_json::Value::String(video_id.to_owned());
+    format!(
+        r#"const id = {id};
+const all = window.__pharosEngines = window.__pharosEngines || {{}};
+const stopped = window.__pharosEngineStopped = window.__pharosEngineStopped || {{}};
+stopped[id] = Math.max(stopped[id] || 0, {generation});
+const e = all[id];
+if (e && e.gen === {generation}) {{ e.run.free(); delete all[id]; }}"#
     )
 }
 
@@ -888,6 +979,12 @@ pub enum Bridge {
         #[serde(flatten)]
         event: HlsEvent,
     },
+    /// What the page's Rust HLS engine reports for the player on `id`.
+    Engine {
+        id: String,
+        #[serde(flatten)]
+        event: EngineEvent,
+    },
     /// The page's visualiser run `id`: `started`, `stopped_first`, or the
     /// `render::Fallback` label why it could not draw, with the error.
     Visualiser {
@@ -1090,6 +1187,119 @@ pub enum HlsEvent {
         #[serde(default)]
         track: FragTrack,
     },
+}
+
+/// What the page's Rust HLS engine (`hls_page`, the `pharos-tv-hls` module)
+/// reports to the app, which owns the log, the telemetry and the player's
+/// state. The engine writes it as JSON; the bridge reads it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ev", rename_all = "lowercase")]
+pub enum EngineEvent {
+    /// The start script ran: the engine attached, or `error` says why not.
+    Started {
+        #[serde(default)]
+        error: String,
+    },
+    /// Playback failed for good: a [`FailureKind`] label and the reason.
+    Fatal { kind: String, reason: String },
+    /// A video segment's download, for the app's bandwidth view.
+    Frag {
+        bytes: u64,
+        load_ms: u64,
+        media_ms: u64,
+    },
+    /// A video segment's fetch failed, or (`timed_out`) got no answer in time.
+    #[serde(rename = "fragfailed")]
+    FragFailed { timed_out: bool },
+    /// One of the engine's log lines.
+    Line { warn: bool, text: String },
+    /// One of the engine's client events: the kind and level as their wire
+    /// numbers, and the fields.
+    Event {
+        kind: u16,
+        level: u16,
+        fields: Vec<(String, String)>,
+    },
+}
+
+impl EngineEvent {
+    /// The JSON the page hands to the bridge.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|e| {
+            serde_json::json!({
+                "ev": "line",
+                "warn": true,
+                "text": format!("pharos: engine event not sent error={e}"),
+            })
+            .to_string()
+        })
+    }
+
+    pub fn of_client_event(event: &pharos_client::api::ClientEvent) -> Self {
+        Self::Event {
+            kind: event.kind as u16,
+            level: event.level as u16,
+            fields: event
+                .fields
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// How many distinct field names the engine's events may carry. The engine
+/// names a few dozen; the cap bounds what a broken page could make the app keep.
+const ENGINE_FIELD_NAMES: usize = 256;
+
+/// `name` as the `&'static str` a client event's field needs. Each distinct
+/// name is kept once for the life of the app; past the cap, `None`.
+fn engine_field_name(name: &str) -> Option<&'static str> {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(known) = names.iter().find(|known| **known == name) {
+        return Some(known);
+    }
+    if names.len() >= ENGINE_FIELD_NAMES {
+        return None;
+    }
+    let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.push(kept);
+    Some(kept)
+}
+
+/// The client event an [`EngineEvent::Event`] carried, on `route`. `Err`
+/// names the number that is no kind or level.
+pub fn engine_client_event(
+    kind: u16,
+    level: u16,
+    fields: &[(String, String)],
+    route: String,
+) -> Result<pharos_client::api::ClientEvent, String> {
+    use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+    let kind = ClientEventKind::try_from(kind).map_err(|_| format!("kind={kind}"))?;
+    let level = ClientLevel::try_from(level).map_err(|_| format!("level={level}"))?;
+    Ok(ClientEvent {
+        kind,
+        level,
+        route,
+        fields: fields
+            .iter()
+            .filter_map(|(k, v)| Some((engine_field_name(k)?, v.clone())))
+            .collect(),
+    })
+}
+
+/// Which engine the Android app really plays for a pick, and why, when it is
+/// another one. The Rust engine runs in the page; the WebView does not play
+/// HLS itself, so hls.js stands in for that (B1366, V1336).
+pub fn hls_engine_used(
+    picked: super::playback::Engine,
+) -> Option<(super::playback::Engine, &'static str)> {
+    use super::playback::Engine;
+    matches!(picked, Engine::NativeHls).then_some((Engine::HlsJs, "android"))
 }
 
 /// Which rendition a loaded fragment belongs to (hls.js's `frag.type`).
@@ -2555,5 +2765,151 @@ process.stdout.write(JSON.stringify(out));
     #[test]
     fn the_user_agent_reads_as_a_tv() {
         assert!(USER_AGENT.contains("Android TV"));
+    }
+
+    #[test]
+    fn engine_events_survive_the_bridge() {
+        let events = [
+            EngineEvent::Started {
+                error: String::new(),
+            },
+            EngineEvent::Fatal {
+                kind: "server".into(),
+                reason: "the stream failed".into(),
+            },
+            EngineEvent::Frag {
+                bytes: 10,
+                load_ms: 2,
+                media_ms: 4000,
+            },
+            EngineEvent::FragFailed { timed_out: true },
+            EngineEvent::Line {
+                warn: true,
+                text: "pharos: \"quoted\"\nline".into(),
+            },
+            EngineEvent::Event {
+                kind: 1,
+                level: 2,
+                fields: vec![("action".into(), "retry".into())],
+            },
+        ];
+        for event in events {
+            // As the start script sends it: the engine's JSON, with the tag and id.
+            let Ok(mut sent) = serde_json::from_str::<serde_json::Value>(&event.to_json()) else {
+                panic!("the engine writes JSON: {event:?}");
+            };
+            sent["t"] = "engine".into();
+            sent["id"] = "v".into();
+            assert_eq!(
+                parse_bridge(&sent),
+                Some(Bridge::Engine {
+                    id: "v".into(),
+                    event
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_engine_client_event_keeps_its_kind_level_and_fields() {
+        use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+        let sent = ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: ClientLevel::Warn,
+            route: "/page".into(),
+            fields: vec![("action", "retry".into()), ("attempt", "2".into())],
+        };
+        let EngineEvent::Event {
+            kind,
+            level,
+            fields,
+        } = EngineEvent::of_client_event(&sent)
+        else {
+            panic!("a client event travels as Event");
+        };
+        let Ok(got) = engine_client_event(kind, level, &fields, "/watch".into()) else {
+            panic!("known numbers");
+        };
+        assert_eq!(got.kind, sent.kind);
+        assert_eq!(got.level, sent.level);
+        assert_eq!(got.route, "/watch");
+        assert_eq!(got.fields, sent.fields);
+        // The same name twice is one kept string.
+        let Ok(again) = engine_client_event(kind, level, &fields, "/watch".into()) else {
+            panic!("known numbers");
+        };
+        assert!(std::ptr::eq(got.fields[0].0, again.fields[0].0));
+    }
+
+    #[test]
+    fn an_engine_client_event_with_an_unknown_number_names_it() {
+        assert_eq!(
+            engine_client_event(60_000, 0, &[], "/".into()).map(|_| ()),
+            Err("kind=60000".into())
+        );
+        assert_eq!(
+            engine_client_event(0, 60_000, &[], "/".into()).map(|_| ()),
+            Err("level=60000".into())
+        );
+    }
+
+    #[test]
+    fn the_android_app_plays_the_rust_engine_and_swaps_only_native_hls() {
+        use crate::native::playback::Engine;
+        assert_eq!(hls_engine_used(Engine::RustHls), None);
+        assert_eq!(hls_engine_used(Engine::HlsJs), None);
+        assert_eq!(hls_engine_used(Engine::Direct), None);
+        assert_eq!(
+            hls_engine_used(Engine::NativeHls),
+            Some((Engine::HlsJs, "android"))
+        );
+    }
+
+    #[test]
+    fn the_engine_glue_runs_inside_a_function() {
+        let script = engine_load_js("let wasm_bindgen;\n// \"glue\"", "QUJD");
+        // One string literal holds the wrapped glue: no raw line break.
+        assert!(script.contains(
+            r#"s.textContent = "(function () {\nlet wasm_bindgen;\n// \"glue\"\nwindow.__pharosEngineInit = wasm_bindgen;\n})();";"#
+        ), "{script}");
+        assert!(script.contains(r#"atob("QUJD")"#), "{script}");
+    }
+
+    #[test]
+    fn the_engine_start_script_quotes_what_it_is_given() {
+        let script = engine_start_js(&EngineStart {
+            video_id: "v\"1",
+            generation: 7,
+            url: "http://tv.test/master.m3u8?a=\"b\"",
+            start_ms: 1500,
+            device: "tv",
+            token: None,
+        });
+        assert!(script.contains(r#"const id = "v\"1";"#), "{script}");
+        assert!(
+            script.contains(r#"start(id, "http://tv.test/master.m3u8?a=\"b\"", 1500, "tv", null,"#),
+            "{script}"
+        );
+        assert!(script.contains("(stopped[id] || 0) >= 7"), "{script}");
+        assert!(script.contains("all[id] = { gen: 7, run };"), "{script}");
+        let with_token = engine_start_js(&EngineStart {
+            video_id: "v",
+            generation: 1,
+            url: "/m",
+            start_ms: 0,
+            device: "phone",
+            token: Some("t0k"),
+        });
+        assert!(with_token.contains(r#""phone", "t0k","#), "{with_token}");
+    }
+
+    #[test]
+    fn the_engine_stop_script_names_its_attach() {
+        let script = engine_stop_js("v", 7);
+        assert!(
+            script.contains("stopped[id] = Math.max(stopped[id] || 0, 7);"),
+            "{script}"
+        );
+        assert!(script.contains("e.gen === 7"), "{script}");
     }
 }
