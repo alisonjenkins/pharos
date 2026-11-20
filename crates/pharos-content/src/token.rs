@@ -1023,6 +1023,20 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
 /// What a cleared marker holds: a reader takes it as no marker.
 const CLEARED: &str = "cleared";
 
+/// Writes `original` back over the marker at `at` through `tmp`: written
+/// and fsynced, then renamed over it.
+fn put_back(at: &Path, tmp: &Path, original: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    f.write_all(original)?;
+    f.sync_all()?;
+    std::fs::rename(tmp, at)
+}
+
 /// Clears the revocation marker naming `fingerprint` beside `path` (absent
 /// is fine), so the store may write the token it named. A marker is never
 /// unlinked: its state changes only by an atomic rename over it. The
@@ -1051,6 +1065,8 @@ fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
     if is_cleared(&at) {
         return Ok(());
     }
+    // What the marker says now, to put back should its clearing not sync.
+    let original = std::fs::read(&at)?;
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("no directory"))?;
@@ -1083,6 +1099,15 @@ fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
         return Err(kept(&e.to_string(), "temp_not_written"));
     }
     let unsupported = |why: &str| why.starts_with(DIR_SYNC_UNSUPPORTED);
+    #[cfg(test)]
+    let after_rename = || -> Result<(), String> {
+        if tests::FAIL_MARKER_SYNC_AFTER_RENAME.with(std::cell::Cell::get) {
+            return Err("directory sync failed after the rename".to_owned());
+        }
+        sync()
+    };
+    #[cfg(not(test))]
+    let after_rename = sync;
     match sync() {
         Ok(()) => {}
         Err(why) if unsupported(&why) => {}
@@ -1099,7 +1124,7 @@ fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
     if let Err(e) = renamed {
         return Err(kept(&e.to_string(), "rename_failed"));
     }
-    match sync() {
+    match after_rename() {
         Ok(()) => {
             log::info!("token revocation marker verdict=cleared reason=signed_in");
             Ok(())
@@ -1111,8 +1136,14 @@ fn clear_marker(path: &Path, fingerprint: &str) -> std::io::Result<()> {
             Ok(())
         }
         Err(why) => {
+            // Not durable, so not cleared: the marker is put back as it
+            // was (renamed over, never unlinked), so a restart still
+            // refuses the token.
+            let restored = put_back(&at, &tmp, &original);
+            let _ = sync();
             log::warn!(
-                "token revocation marker verdict=cleared_not_synced reason=folder_not_synced error={why}"
+                "token revocation marker verdict=kept reason=clearing_not_synced restored={} error={why}",
+                if restored.is_ok() { "yes" } else { "no" }
             );
             Err(std::io::Error::other(format!(
                 "the marker's clearing could not be synced: {why}"
@@ -1424,6 +1455,8 @@ pub(crate) mod tests {
         /// While set, store cannot read the token it replaces.
         pub(super) static FAIL_PREVIOUS_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, a store's marker clearing reports its folder sync failed.
+        /// Only the folder sync after a marker's clearing rename fails.
+        pub(super) static FAIL_MARKER_SYNC_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(super) static FAIL_MARKER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// While set, a store cannot read back the token it wrote.
         pub(crate) static FAIL_READ_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2049,6 +2082,33 @@ pub(crate) mod tests {
         ));
         assert!(!fence(&p).refuses("tokC"), "a kept replacement was fenced");
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
+    }
+
+    /// CR 4647363784: a retry whose marker clearing renamed, but whose
+    /// folder sync after the rename failed, is not cleared: the marker is
+    /// put back, so after a restart (the fence reset) the token is still
+    /// refused.
+    #[test]
+    fn a_clearing_whose_sync_after_the_rename_fails_keeps_the_token_refused() {
+        let d = dir("retry-marker-sync-after");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        crate::testlog::start();
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(true));
+        let retried = store(&path, "new");
+        FAIL_MARKER_SYNC_AFTER_RENAME.with(|f| f.set(false));
+        assert!(retried.is_err(), "{retried:?}");
+        assert!(
+            revoked(&path, &fingerprint("new")).is_some_and(|r| r.install_unconfirmed),
+            "the marker was not put back"
+        );
+        assert_eq!(after_restart(&path), None, "the token became readable");
+        assert!(crate::testlog::lines().iter().any(|l| l.contains(
+            "token revocation marker verdict=kept reason=clearing_not_synced restored=yes"
+        )));
     }
 
     /// CR 4646025360: a marker is never unlinked, so no failure while it is
