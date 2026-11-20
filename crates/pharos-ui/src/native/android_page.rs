@@ -1552,13 +1552,14 @@ impl PlaybackEngine for HlsJs {
                     bytes,
                     load_ms,
                     media_ms,
+                    sn,
                     track,
                     ..
                 } => {
                     if track == tv_page::FragTrack::Audio {
                         return;
                     }
-                    budget.borrow_mut().progressed();
+                    budget.borrow_mut().fragment_loaded(sn);
                     if bytes > 0 && load_ms > 0 && media_ms > 0 {
                         on_fragment(super::playback::FragmentLoad {
                             bytes,
