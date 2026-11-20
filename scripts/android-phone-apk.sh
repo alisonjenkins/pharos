@@ -53,6 +53,8 @@ main_dir=$gradle_root/app/src/main
 # the TV; without this step a clean tree fails to build or ships a stale one.
 echo "android-phone-apk: building the page visualiser" >&2
 nix develop -c sh scripts/tv-visualiser.sh
+echo "android-phone-apk: building the page HLS engine" >&2
+nix develop -c sh scripts/tv-hls.sh
 
 # shellcheck disable=SC2016 # expanded by the dev shell, not here
 android_home=$(nix develop .#android -c sh -c 'echo "$ANDROID_HOME"')
