@@ -486,6 +486,17 @@ impl LyricsFinder {
         }
         let online = self.online.as_ref()?;
         let song = Song::of(item)?;
+        // Records are judged by their length against the song's; without
+        // one no search could be judged, so none is made or marked done.
+        let Some(duration_ms) = item.probe.duration_ms.filter(|&ms| ms > 0) else {
+            tracing::warn!(
+                media.id = item.id,
+                duration_ms = ?item.probe.duration_ms,
+                text_recall,
+                "lyrics: not what was sung, but the song has no length, so not searched for another"
+            );
+            return None;
+        };
         let Some(reserved) =
             Reserved::take(&self.repicked, (item.id, cache::key(online.name(), &song)))
         else {
@@ -528,11 +539,7 @@ impl LyricsFinder {
                 }
             }
         };
-        let choose = |candidates| {
-            item.probe
-                .duration_ms
-                .and_then(|ms| repick::choose(candidates, current, ms, &heard.text))
-        };
+        let choose = |candidates| repick::choose(candidates, current, duration_ms, &heard.text);
         let candidates = search(song.clone()).await?;
         let mut searched = candidates.len();
         let mut pick = choose(candidates);
@@ -1885,6 +1892,26 @@ mod tests {
             "the newer repick was replaced"
         );
         assert!(disk.repicked(item.id, online.name(), &Song::of(&item).unwrap()));
+    }
+
+    #[test]
+    fn a_song_with_no_length_is_not_searched_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let online = searching(Ok(records(sung())));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(dir.path().join("c"));
+        for duration_ms in [None, Some(0)] {
+            let mut item = timed_item(dir.path());
+            item.probe.duration_ms = duration_ms;
+            let (picked, _) = with_outcomes(finder.repick(&item, &wrong(), &heard()));
+            assert_eq!(picked, None, "{duration_ms:?}");
+            let disk = finder.disk.as_ref().unwrap();
+            assert!(
+                !disk.repicked(item.id, online.name(), &Song::of(&item).unwrap()),
+                "{duration_ms:?}"
+            );
+        }
+        assert_eq!(searches(&online), 0);
+        assert!(finder.repicked.lock().unwrap().is_empty());
     }
 
     #[test]
