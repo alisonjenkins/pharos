@@ -2974,6 +2974,8 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+        // Track 2 finished while track 1 stayed refused, its part kept.
+        assert!(!r.cache.is_complete("track/1"), "track 1 was not refused");
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
         starve.store(false, Ordering::SeqCst);
         assert!(
@@ -2986,9 +2988,11 @@ mod tests {
             .into_iter()
             .filter(|s| s.path == "/audio/1")
             .collect();
-        // The refused retry's 206 was inspected before the park (CR
-        // 4640691884), so the resume is the third request.
-        assert_eq!(one.len(), 3, "{one:?}");
+        // The first request, then each refused retry (its 206 inspected
+        // before the park, CR 4640691884) and the resume. How many refused
+        // retries fit in the backoff is timing, so only their shape is
+        // checked: every request after the first resumes with If-Range.
+        assert!(one.len() >= 2, "track 1 never resumed: {one:?}");
         assert!(
             one[1..]
                 .iter()
