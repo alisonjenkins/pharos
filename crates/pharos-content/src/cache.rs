@@ -1073,7 +1073,9 @@ impl Cache {
                 if held {
                     return None;
                 }
-                let meta = e.metadata().ok()?;
+                // Only a regular file can go: a folder or a link would not,
+                // and its failed removal would end the eviction there.
+                let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
                 Some((meta.modified().ok()?, id, meta.len()))
             })
             .min_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
@@ -2793,5 +2795,39 @@ pub(crate) mod tests {
         assert!(c.part_path("new").exists());
         assert!(c.part_path("active").exists(), "a held part was evicted");
         c.job_ended("active");
+    }
+
+    /// CR 4640611246: a part-named entry that is not a regular file (a
+    /// folder) is never chosen: it would not go, and the eviction would
+    /// stop there. The newer regular part is evicted and the admission is
+    /// approved.
+    #[test]
+    fn an_admission_skips_a_part_named_folder() {
+        let d = tmp("evict-part-folder");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file()))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 700).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        let folder = c.part_path("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("x"), b"x").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(900);
+        std::fs::File::open(&folder)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        retained(&c, "file", 600, 100);
+        let verdict = c.ensure_free("x", 300);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(folder.exists());
+        assert!(!c.part_path("file").exists(), "the regular part stayed");
     }
 }
