@@ -1924,8 +1924,25 @@ fn app_machine() -> Machine {
 /// Applies a sign-out's answer to the machine: true when it signed out.
 /// The machine's session-end hook has then parked the user's downloads and
 /// forgotten them; nothing here runs it again (a second run, with no user
-/// left, would park every user's downloads).
-fn sign_out_answered(machine: &mut Machine, reply: super::machine::SignOutReply) -> bool {
+/// left, would park every user's downloads). `sent_at` is
+/// [`Machine::sign_ins`] when the sign-out was sent: a reply a newer
+/// sign-in overtook is ignored before it changes the phase, runs the hook
+/// or lets the caller delete kept books.
+fn sign_out_answered(
+    machine: &mut Machine,
+    reply: super::machine::SignOutReply,
+    sent_at: u32,
+) -> bool {
+    if !machine.sign_out_reply_is_current(sent_at) {
+        platform::info(&format!(
+            "pharos: sign-out reply verdict=ignored reason=newer_sign_in sent_at={sent_at} sign_ins={} reply={reply:?}",
+            machine.sign_ins()
+        ));
+        return false;
+    }
+    platform::info(&format!(
+        "pharos: sign-out reply verdict=applied sent_at={sent_at} reply={reply:?}"
+    ));
     machine.apply(Event::SignOutAnswered(reply));
     matches!(machine.phase(), Phase::SignIn { .. })
 }
@@ -2379,11 +2396,12 @@ fn NativeApp(route: Route) -> Element {
                             if machine.peek().signing_out() {
                                 return;
                             }
+                            let sent_at = machine.peek().sign_ins();
                             machine.write().apply(Event::SignOutSubmitted);
                             report::forget();
                             spawn(async move {
                                 let reply = platform::sign_out().await;
-                                let out = sign_out_answered(&mut machine.write(), reply);
+                                let out = sign_out_answered(&mut machine.write(), reply, sent_at);
                                 // Signed out: no kept book stays on the device.
                                 // The queue is emptied by the sign-in effect.
                                 if out {
@@ -9233,6 +9251,66 @@ fn Player(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// CR 4640611420: A's revoked socket shows sign-in before A's sign-out
+    /// reply lands. If B has started signing in since, or is Ready, A's
+    /// late reply is ignored: it neither changes the phase nor runs the
+    /// session-end hook, and reports no sign-out (so no kept book is
+    /// deleted). With no newer sign-in, the reply is taken as before.
+    #[test]
+    fn a_sign_out_reply_overtaken_by_a_newer_sign_in_is_ignored() {
+        use super::super::machine::{SignInReply, SignOutReply};
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() {
+            ENDED.with(|n| n.set(n.get() + 1));
+        }
+        let ended = || ENDED.with(std::cell::Cell::get);
+        let a_signed_out = || {
+            let mut m = Machine::new().with_session_end(hook);
+            m.apply(Event::Resumed { epoch: 0 });
+            let sent_at = m.sign_ins();
+            m.apply(Event::SignOutSubmitted);
+            m.apply(Event::Closed {
+                epoch: 0,
+                reason: "revoked".into(),
+            });
+            (m, sent_at)
+        };
+        // B is Ready before A's reply.
+        let (mut m, sent_at) = a_signed_out();
+        let after_a = ended();
+        m.apply(Event::SignInSubmitted);
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 204,
+            retry_after: None,
+        }));
+        let epoch = m.epoch();
+        m.apply(Event::Resumed { epoch });
+        assert_eq!(m.phase(), &Phase::Ready);
+        assert!(
+            !sign_out_answered(&mut m, SignOutReply::Status(204), sent_at),
+            "A's late reply signed B out"
+        );
+        assert_eq!(m.phase(), &Phase::Ready, "A's late reply ended B's session");
+        assert_eq!(ended(), after_a, "the session-end hook ran for B");
+        // B is still signing in: A's reply reports no sign-out either.
+        let (mut m, sent_at) = a_signed_out();
+        m.apply(Event::SignInSubmitted);
+        assert!(!sign_out_answered(
+            &mut m,
+            SignOutReply::Status(204),
+            sent_at
+        ));
+        // The control: nobody signed in since, so A's reply is taken.
+        let (mut m, sent_at) = a_signed_out();
+        assert!(sign_out_answered(
+            &mut m,
+            SignOutReply::Status(204),
+            sent_at
+        ));
+    }
+
     /// A sign-out from Ready parks the signed-out user's downloads once,
     /// through the machine's session-end hook, and never every user's.
     #[test]
@@ -9274,8 +9352,9 @@ mod tests {
         offline_video::remember_user("A");
         let mut m = app_machine();
         m.apply(Event::Resumed { epoch: 0 });
+        let sent_at = m.sign_ins();
         m.apply(Event::SignOutSubmitted);
-        let out = sign_out_answered(&mut m, SignOutReply::Status(204));
+        let out = sign_out_answered(&mut m, SignOutReply::Status(204), sent_at);
         use_test_video_slot(None);
         assert!(out);
         assert_eq!(*parks.0.lock().unwrap(), ["park A"], "parked more than A's");

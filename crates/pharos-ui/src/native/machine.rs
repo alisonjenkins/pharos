@@ -154,6 +154,10 @@ pub struct Machine {
     /// app Ready, a reconnect's included, so a refusal names the one its
     /// call was sent in.
     session: u32,
+    /// Counts the sign-ins started (submitted or answered): a sign-out's
+    /// reply carries the count from when it was sent, and one that a newer
+    /// sign-in overtook is ignored ([`Machine::sign_out_reply_is_current`]).
+    sign_ins: u32,
     on_session_end: SessionEnd,
 }
 
@@ -175,6 +179,7 @@ impl Machine {
             notice: None,
             waiting: None,
             session: 0,
+            sign_ins: 0,
             on_session_end: SessionEnd(None),
         }
     }
@@ -201,6 +206,19 @@ impl Machine {
     /// sent, so its refusal ends only that session.
     pub fn session(&self) -> u32 {
         self.session
+    }
+
+    /// The sign-ins started so far: a sign-out captures it when it is sent.
+    pub fn sign_ins(&self) -> u32 {
+        self.sign_ins
+    }
+
+    /// Whether a sign-out's reply, sent when [`Machine::sign_ins`] was
+    /// `sent_at`, still answers for the session it ended: no sign-in has
+    /// started since. One a newer sign-in overtook (B signed in after A's
+    /// revoked socket showed sign-in) must not end B's session.
+    pub fn sign_out_reply_is_current(&self, sent_at: u32) -> bool {
+        self.sign_ins == sent_at
     }
 
     /// Whether attempt `epoch`'s resume would make the app Ready: it is the
@@ -325,6 +343,9 @@ impl Machine {
                 self.sign_in(Some("Your session ended. Sign in again.".into()));
             }
             Event::SignInSubmitted => {
+                if matches!(self.phase, Phase::SignIn { .. }) {
+                    self.sign_ins = self.sign_ins.wrapping_add(1);
+                }
                 if let Phase::SignIn { busy, error } = &mut self.phase {
                     *busy = true;
                     *error = None;
@@ -332,6 +353,7 @@ impl Machine {
             }
             Event::SignInAnswered(reply) => {
                 if matches!(self.phase, Phase::SignIn { .. }) {
+                    self.sign_ins = self.sign_ins.wrapping_add(1);
                     match sign_in_error(&reply) {
                         None => {
                             self.attempt = 0;
