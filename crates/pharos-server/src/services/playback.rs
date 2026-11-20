@@ -1941,6 +1941,7 @@ pub async fn grant(
         client_is_remote = r.client_is_remote,
         audio_index = audio.index.map(i64::from).unwrap_or(-1),
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
+        subtitle_burned = negotiated.burned_subtitle().map(i64::from).unwrap_or(-1),
         edition = item.edition.as_deref().unwrap_or("primary"),
         stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
         "native playback negotiated"
