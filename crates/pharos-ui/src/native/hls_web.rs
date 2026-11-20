@@ -220,6 +220,40 @@ impl Session {
 #[derive(Default)]
 pub(super) struct RustHls {
     session: Option<Rc<RefCell<Session>>>,
+    /// The device class when the page cannot tell it: the Android app's page.
+    device: Option<super::playback::DeviceClass>,
+}
+
+impl RustHls {
+    pub(super) fn for_device(device: super::playback::DeviceClass) -> Self {
+        Self {
+            session: None,
+            device: Some(device),
+        }
+    }
+}
+
+thread_local! {
+    static STREAM_TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The token every stream request without a play session in its address
+/// carries from now on. The browser sends its cookie instead and sets none;
+/// the Android app's page has no cookie for the server.
+pub(super) fn set_stream_token(token: Option<String>) {
+    STREAM_TOKEN.with(|slot| *slot.borrow_mut() = token);
+}
+
+/// A GET for a playlist or a segment, with the token when one is set.
+fn stream_request(uri: &str) -> gloo_net::http::RequestBuilder {
+    let request = Request::get(uri);
+    let token = STREAM_TOKEN.with(|slot| slot.borrow().clone());
+    match token {
+        Some(token) if super::playback::wants_token_header(uri) => {
+            request.header("X-Emby-Token", &token)
+        }
+        _ => request,
+    }
 }
 
 impl PlaybackEngine for RustHls {
@@ -237,7 +271,7 @@ impl PlaybackEngine for RustHls {
         let object_url = web_sys::Url::create_object_url_with_source(&media_source)
             .map_err(|e| format!("createObjectURL: {e:?}"))?;
 
-        let device = super::app::this_device();
+        let device = self.device.unwrap_or_else(super::app::this_device);
         let deadlines = segment_deadlines(device);
         let session = Rc::new(RefCell::new(Session {
             video_id: video_id.to_owned(),
@@ -1641,7 +1675,7 @@ async fn fetch_segment(
 ) -> Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure> {
     let sent_at = now_ms();
     let mut watch = Watch::new(deadlines, now_ms_u64());
-    let send = Request::get(uri).abort_signal(Some(signal)).send();
+    let send = stream_request(uri).abort_signal(Some(signal)).send();
     let resp = within(send, watch.remaining_ms(now_ms_u64()))
         .await
         .ok_or_else(|| FetchFailure::timeout(&watch))?
@@ -2149,7 +2183,7 @@ async fn get_text_within(url: &str, deadlines: Deadlines) -> Result<String, (Opt
         }
         (None, format!("no {what} within {ms} ms"))
     };
-    let send = Request::get(url).abort_signal(signal.as_ref()).send();
+    let send = stream_request(url).abort_signal(signal.as_ref()).send();
     let resp = within(send, deadlines.first_byte_ms)
         .await
         .ok_or_else(|| timed_out("response", deadlines.first_byte_ms))?
