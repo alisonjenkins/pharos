@@ -1168,10 +1168,12 @@ impl Worker {
             });
         }
         // An open link whose token has been fenced since is not reused: the
-        // fence holds for every call, not just for the next token read.
+        // fence holds for every call, not just for the next token read. It
+        // is dropped, and the stored token is looked up as for no link: a
+        // usable replacement resumes, and none starts QuickConnect.
         let open = self.link.as_ref().map(|l| l.token.clone());
         if open.is_some_and(|t| self.fenced_after(&t, "open_link")) {
-            return Err(ContentError::NeedsSignIn);
+            log::info!("token link verdict=dropped reason=fenced next=stored_token");
         }
         if let Some(l) = self.link.as_mut() {
             if l.cat.is_closed() {
@@ -2505,6 +2507,29 @@ mod tests {
         token::tests::FAIL_READ_BACK.with(|f| f.set(false));
         assert!(w.link.is_none(), "an unconfirmed store signed in");
         assert_ne!(shared.lock().auth, AuthState::SignedIn);
+    }
+
+    /// CR 4640611278: an open link whose token is fenced is dropped, and the
+    /// stored token is looked up as for no link: a usable replacement is
+    /// resumed (here the server is unreachable, so the resume is what
+    /// fails), not a bare NeedsSignIn.
+    #[test]
+    fn a_fenced_link_falls_through_to_the_stored_token() {
+        let root = test_root("fenced-link-falls-through");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        assert!(w.link.is_some());
+        token::store(&token_path, "tokB").unwrap();
+        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
+        let out = local.block_on(&rt, w.link(&events));
+        assert!(
+            matches!(&out, Err(ContentError::Connect { .. })),
+            "the replacement was not resumed: {:?}",
+            out.err()
+        );
+        token::set_fence(&token_path, token::Fence::Open, "test");
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
