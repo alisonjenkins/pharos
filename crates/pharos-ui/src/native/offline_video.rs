@@ -2209,7 +2209,10 @@ pub(crate) mod tests {
             }
             p.fail_write.set(false);
             let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(pharos_content::token::revoked_path(&path));
+            let _ = std::fs::remove_file(pharos_content::token::revoked_path(
+                &path,
+                &pharos_content::token::fingerprint("tokA"),
+            ));
             set_identity(Identity::Unknown);
         }
     }
