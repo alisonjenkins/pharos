@@ -961,11 +961,13 @@ fn note_token_user(user: &str, seen: &TokenSeen) -> Result<(), String> {
 /// replacement a new sign-in stored is kept. Without that, a revoked user's
 /// token and a preference whose clearing failed would both still name
 /// them, and an offline restart would show their downloads again. An
-/// outage never comes here (the machine keeps the session).
-pub fn session_ended() {
+/// outage never comes here (the machine keeps the session). Returns the
+/// warning for the sign-in screen when the token could be neither removed
+/// nor marked ([`restart_warning`]).
+pub fn session_ended() -> Option<String> {
     let end = fence_signed_out(true);
     park_ended(&end);
-    tear_down_session(end);
+    tear_down_session(end)
 }
 
 /// Who a session end or sign-out ended, and the session's token, taken
@@ -1028,14 +1030,30 @@ fn park_ended(end: &SessionEnded) {
 
 /// The last step of a session end: the preference is cleared and the
 /// session's token dropped, only while it is still the one on file.
-fn tear_down_session(end: SessionEnded) {
+/// Returns [`restart_warning`] for what happened to the token.
+fn tear_down_session(end: SessionEnded) -> Option<String> {
     forget_pref();
     let Some(token) = end.token.and_then(|t| t.0) else {
         super::platform::info("pharos: token forget verdict=none reason=no_session_token");
-        return;
+        return None;
     };
     let outcome = forget_session_token(&token, end.token_user.as_deref());
     note_session_token(&outcome, end.token_user.as_deref());
+    restart_warning(&outcome)
+}
+
+/// What the sign-in screen says when a session end's cleanup was not
+/// saved: the token was neither removed nor marked revoked, so a restart
+/// may sign its account back in to its downloads. The in-process sign-out
+/// and the parked downloads stand; the warning says the cleanup did not.
+/// None for any other end: the ordinary message stays as it is.
+fn restart_warning(outcome: &TokenEnd) -> Option<String> {
+    let TokenEnd::Unsafe { removal, .. } = outcome else {
+        return None;
+    };
+    Some(format!(
+        "This device could not save the sign-out ({removal}), so a restart may sign the account back in to its downloads. Sign in and sign out again to retry."
+    ))
 }
 
 /// What a session's end did to its device token, on every platform (the
@@ -1820,7 +1838,10 @@ pub(crate) mod tests {
         ANSWER.with(|a| *a.borrow_mut() = Some(rx));
         fn probe() -> Element {
             let machine = use_signal(|| {
-                let mut m = Machine::new().with_session_end(forget_user);
+                let mut m = Machine::new().with_session_end(|| {
+                    forget_user();
+                    None
+                });
                 m.apply(Event::Resumed { epoch: 0 });
                 m
             });
@@ -2268,10 +2289,19 @@ pub(crate) mod tests {
             LOGGED.with(|l| l.borrow_mut().clear());
             faults::REMOVE.with(|f| f.set(true));
             faults::MARKER.with(|f| f.set(both_fail));
-            session_ended();
+            let warned = session_ended();
             faults::REMOVE.with(|f| f.set(false));
             faults::MARKER.with(|f| f.set(false));
             assert!(path.exists(), "the fault removed the token");
+            // Offline_video 1037: the sign-in screen is told when, and only
+            // when, the cleanup was not saved.
+            assert_eq!(
+                warned
+                    .as_deref()
+                    .is_some_and(|w| w.contains("a restart may sign the account back in")),
+                both_fail,
+                "{warned:?}"
+            );
             let lines = logged("pharos: token forget");
             if both_fail {
                 assert!(

@@ -9452,8 +9452,9 @@ mod tests {
         thread_local! {
             static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        fn hook() {
+        fn hook() -> Option<String> {
             ENDED.with(|n| n.set(n.get() + 1));
+            None
         }
         let ended = || ENDED.with(std::cell::Cell::get);
         let a_signed_out = || {
@@ -10229,8 +10230,9 @@ mod tests {
     fn a_refused_reconnect_after_ready_cleans_up_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static ENDED: AtomicUsize = AtomicUsize::new(0);
-        fn count_end() {
+        fn count_end() -> Option<String> {
             ENDED.fetch_add(1, Ordering::SeqCst);
+            None
         }
         offline_video::remember_user("alice");
         let mut m = Machine::new().with_session_end(count_end);

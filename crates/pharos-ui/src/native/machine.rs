@@ -120,10 +120,11 @@ const BACKOFF_BASE_MS: u32 = 500;
 const BACKOFF_MAX_MS: u32 = 30_000;
 
 /// What the host runs when a signed-in session ends (the app leaves Ready
-/// for sign-in), whichever event caused it. Compares equal to any other, so
-/// it does not take part in the machine's equality.
+/// for sign-in), whichever event caused it, and the warning it returns for
+/// the sign-in screen (a cleanup that could not be saved). Compares equal
+/// to any other, so it does not take part in the machine's equality.
 #[derive(Clone, Copy, Default)]
-struct SessionEnd(Option<fn()>);
+struct SessionEnd(Option<fn() -> Option<String>>);
 
 impl std::fmt::Debug for SessionEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -200,9 +201,10 @@ impl Machine {
 
     /// Runs `hook` whenever a signed-in session ends: the app leaves Ready
     /// for sign-in, by a rejected request, a revoked socket or a sign-out.
-    /// The one place that happens, so no caller can skip it.
+    /// The one place that happens, so no caller can skip it. A warning it
+    /// returns is shown on the sign-in screen, after any message there.
     #[must_use]
-    pub fn with_session_end(mut self, hook: fn()) -> Self {
+    pub fn with_session_end(mut self, hook: fn() -> Option<String>) -> Self {
         self.on_session_end = SessionEnd(Some(hook));
         self
     }
@@ -293,8 +295,13 @@ impl Machine {
         let was_ready = self.had_session;
         self.step(event);
         if was_ready && matches!(self.phase, Phase::SignIn { .. }) {
-            if let Some(hook) = self.on_session_end.0 {
-                hook();
+            if let Some(warning) = self.on_session_end.0.and_then(|hook| hook()) {
+                if let Phase::SignIn { error, .. } = &mut self.phase {
+                    *error = Some(match error.take() {
+                        Some(said) => format!("{said} {warning}"),
+                        None => warning,
+                    });
+                }
             }
         }
     }
@@ -648,14 +655,16 @@ mod tests {
 
     static SESSIONS_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    fn count_end() {
+    fn count_end() -> Option<String> {
         SESSIONS_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
     }
 
     static DETOUR_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    fn count_detour_end() {
+    fn count_detour_end() -> Option<String> {
         DETOUR_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
     }
 
     /// A drop, a failed open that does not clear by itself (405), a retry,
@@ -733,6 +742,45 @@ mod tests {
         });
         assert!(matches!(m.phase, Phase::SignIn { .. }), "{:?}", m.phase);
         assert_eq!(count(), start + 1, "the revoked session's hook did not run");
+    }
+
+    /// Offline_video 1037 (review 5995569325): a session end whose cleanup
+    /// could not be saved shows its warning on the sign-in screen, after
+    /// the ordinary message, which stays as it was.
+    #[test]
+    fn a_session_ends_cleanup_warning_shows_on_sign_in() {
+        fn unsafe_end() -> Option<String> {
+            Some("A restart may sign it back in.".to_owned())
+        }
+        let mut m = Machine::new().with_session_end(unsafe_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            m.phase,
+            Phase::SignIn {
+                error: Some(
+                    "Your session ended. Sign in again. A restart may sign it back in.".into()
+                ),
+                busy: false,
+            }
+        );
+        let mut m = Machine::new().with_session_end(count_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            m.phase,
+            Phase::SignIn {
+                error: Some("Your session ended. Sign in again.".into()),
+                busy: false,
+            },
+            "a durable cleanup changed the message"
+        );
     }
 
     #[test]
@@ -848,8 +896,9 @@ mod tests {
         thread_local! {
             static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        fn hook() {
+        fn hook() -> Option<String> {
             ENDED.with(|n| n.set(n.get() + 1));
+            None
         }
         let mut m = Machine::new().with_session_end(hook);
         m.apply(Event::Resumed { epoch: 0 });
@@ -888,8 +937,9 @@ mod tests {
         thread_local! {
             static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        fn hook() {
+        fn hook() -> Option<String> {
             ENDED.with(|n| n.set(n.get() + 1));
+            None
         }
         let mut m = Machine::new().with_session_end(hook);
         m.apply(Event::Resumed { epoch: 0 });
@@ -949,8 +999,9 @@ mod tests {
         thread_local! {
             static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        fn hook() {
+        fn hook() -> Option<String> {
             ENDED.with(|n| n.set(n.get() + 1));
+            None
         }
         let mut m = Machine::new().with_session_end(hook);
         m.apply(Event::Resumed { epoch: 0 });
