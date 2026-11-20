@@ -1944,12 +1944,47 @@ fn mark_handler(
     api: Signal<Option<NativeApi>>,
     machine: Signal<Machine>,
     flash: Flash,
+    marks: Signal<u32>,
+    stored: Signal<Option<(ItemRef, bool)>>,
+) -> EventHandler<(ItemRef, bool, String)> {
+    let send: SendMark = Rc::new(move |mark, id, on| {
+        let api = api.peek().clone()?;
+        Some(Box::pin(async move {
+            let call = call("mark", mark.label());
+            match mark {
+                Mark::Played => api.set_played(&call, id, on).await,
+                Mark::Favorite => api.set_favorite(&call, id, on).await,
+            }
+        }))
+    });
+    mark_handler_with(mark, send, machine, flash, marks, stored)
+}
+
+/// What a mark handler sends for a mark on an item: the call's future,
+/// or None with no API to send it on.
+type SendMark = Rc<
+    dyn Fn(
+        Mark,
+        ItemRef,
+        bool,
+    ) -> Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, ClientError>>>>,
+    >,
+>;
+
+/// [`mark_handler`] with the call it sends given, so a test drives the
+/// real handler with a call it completes when it chooses.
+fn mark_handler_with(
+    mark: Mark,
+    send: SendMark,
+    machine: Signal<Machine>,
+    flash: Flash,
     mut marks: Signal<u32>,
     mut stored: Signal<Option<(ItemRef, bool)>>,
 ) -> EventHandler<(ItemRef, bool, String)> {
     let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
     EventHandler::new(move |(id, on, name): (ItemRef, bool, String)| {
-        let Some(api) = api.peek().clone() else {
+        let Some(sent) = send(mark, id, on) else {
             return;
         };
         let what = mark.label();
@@ -1964,11 +1999,7 @@ fn mark_handler(
         // never a session signed in while the call was out.
         let session = machine.peek().session();
         spawn(async move {
-            let call = call("mark", what);
-            let result = match mark {
-                Mark::Played => api.set_played(&call, id, on).await,
-                Mark::Favorite => api.set_favorite(&call, id, on).await,
-            };
+            let result = sent.await;
             match settle_session(machine, session, result) {
                 Ok(now) => {
                     // Kept only for the session that sent it: a mark that
@@ -10345,6 +10376,90 @@ mod tests {
             .iter()
             .any(|l| l.contains("verdict=skipped reason=no_session")));
         offline_video::forget_user();
+    }
+
+    /// CR 4646041689: a played mark whose call completes after a sign-out,
+    /// through the real mark handler, stores nothing.
+    #[test]
+    fn a_mark_completed_after_sign_out_is_not_stored_by_the_handler() {
+        assert_eq!(mark_through_the_handler(true), None);
+    }
+
+    /// CR 4646041689: the control. One that completes while its session is
+    /// signed in is stored.
+    #[test]
+    fn a_mark_completed_in_its_session_is_stored_by_the_handler() {
+        let id: ItemRef = "1".parse().unwrap();
+        assert_eq!(mark_through_the_handler(false), Some((id, true)));
+    }
+
+    /// Drives the real mark handler for a played mark on item 1, its call
+    /// completed by the test once the session is signed out (or not), and
+    /// returns what it stored.
+    fn mark_through_the_handler(signed_out: bool) -> Option<(ItemRef, bool)> {
+        type Stored = Signal<Option<(ItemRef, bool)>>;
+        type Parts = (
+            EventHandler<(ItemRef, bool, String)>,
+            Signal<Machine>,
+            Stored,
+        );
+        thread_local! {
+            static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<bool>>> = const { RefCell::new(None) };
+            static PARTS: RefCell<Option<Parts>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let machine = use_signal(|| {
+                let mut m = app_machine();
+                m.apply(Event::Resumed { epoch: 0 });
+                m
+            });
+            let stored: Stored = use_signal(|| None);
+            let marks = use_signal(|| 0u32);
+            let flash = Flash {
+                line: use_signal(|| None),
+                generation: use_signal(|| 0),
+            };
+            let handler = use_hook(|| {
+                let send: SendMark = Rc::new(|_, _, _| {
+                    let answer = ANSWER.with(|a| a.borrow_mut().take())?;
+                    Some(Box::pin(async move { Ok(answer.await.unwrap_or(false)) }))
+                });
+                mark_handler_with(Mark::Played, send, machine, flash, marks, stored)
+            });
+            PARTS.with(|p| p.replace(Some((handler, machine, stored))));
+            rsx! { div {} }
+        }
+        let id: ItemRef = "1".parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            offline_video::remember_user("alice");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ANSWER.with(|a| a.replace(Some(rx)));
+            let mut dom = VirtualDom::new(root);
+            dom.rebuild_in_place();
+            let (handler, mut machine, stored) = PARTS.with(|p| p.borrow_mut().take()).unwrap();
+            dom.in_runtime(|| handler.call((id, true, "Item".to_owned())));
+            if signed_out {
+                dom.in_runtime(|| machine.write().apply(Event::NeedsSignIn));
+            }
+            tx.send(true).unwrap();
+            rt.block_on(async {
+                for _ in 0..5 {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        dom.wait_for_work(),
+                    )
+                    .await;
+                    dom.render_immediate_to_vec();
+                }
+            });
+            let now = dom.in_runtime(|| *stored.peek());
+            offline_video::forget_user();
+            now
+        }
     }
 
     /// CR 4638660942: only an accepted resume notes a newer server's
