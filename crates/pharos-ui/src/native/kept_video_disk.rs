@@ -851,14 +851,23 @@ impl State {
             .saturating_add(self.draining())
     }
 
+    /// A download parked with no run (a session end) writes nothing until
+    /// it resumes, which admits its plan against the free space again: its
+    /// reservation stays in [`State::kept`], but none of it is owed here.
+    /// One whose revoked writer is still going is owed still, since that
+    /// write may yet land.
     fn outstanding(&self, user: &str, item: &str) -> u64 {
         self.list
             .iter()
             .filter(|v| !(v.user == user && v.item == item))
             .filter(|v| matches!(v.state, KeptState::Downloading { .. }))
-            .map(|v| {
+            .filter_map(|v| {
                 let run = self.runs.get(&(v.user.clone(), v.item.clone())).copied();
-                self.owed(v, run)
+                let writing = self
+                    .writers
+                    .keys()
+                    .any(|(u, i, _)| *u == v.user && *i == v.item);
+                (run.is_some() || writing).then(|| self.owed(v, run))
             })
             .fold(0u64, u64::saturating_add)
     }
@@ -9854,6 +9863,34 @@ pub(crate) mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// Outside diff kvd:858 (review 5995575621): a download parked by a
+    /// session end, with no run and no writer, owes no pending write: its
+    /// reservation stays kept, but it does not take free space from another
+    /// user's admission.
+    #[tokio::test]
+    async fn a_parked_download_owes_no_pending_write() {
+        let rig = Rig::new("parked-not-owed");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        assert!(
+            store.outstanding_bytes() > 0,
+            "a running download owed nothing"
+        );
+        let kept = store.kept_bytes();
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Downloading { .. }));
+        assert_eq!(store.outstanding_bytes(), 0, "a parked download was owed");
+        assert_eq!(
+            store.kept_bytes(),
+            kept,
+            "the parked reservation left the cap"
+        );
     }
 
     /// A session end parks the ended user's running download (another
