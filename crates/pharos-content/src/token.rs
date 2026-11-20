@@ -571,7 +571,16 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             "a revocation marker refuses this token, and it is the one on file",
         ));
     }
-    if let Err(e) = remove_marker(path, &new) {
+    // A retry's marker names the token already on file: removed only once
+    // this write, its fsync and rename and the folder's sync have all held
+    // (below), so a write that fails leaves that token refused after a
+    // restart. Any other marker naming this token names one not on file:
+    // removed first, durably, so a write that fails leaves nothing
+    // readable and the old token as it was.
+    let clear_after = same && retry;
+    if clear_after {
+        // Nothing to remove before the write.
+    } else if let Err(e) = remove_marker(path, &new) {
         log::warn!(
             "token store verdict=refused reason=revocation_marker_blocks_token step=before_write error={e}"
         );
@@ -621,6 +630,22 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 format!("the token's folder could not be synced: {why}"),
             ));
         }
+    }
+    // The retry's token is on disk, durably: its marker goes last. One
+    // that will not go keeps the token refused, here by the fence and
+    // after a restart by the marker; a later retry clears it.
+    if clear_after {
+        if let Err(e) = remove_marker(path, &new) {
+            add_fence_held(path, &Fence::token(&new), "store_marker_not_cleared");
+            log::warn!(
+                "token store verdict=refused reason=revocation_marker_blocks_token step=after_write error={e}"
+            );
+            return Err(err(
+                path,
+                format!("the token is written but its unconfirmed-install marker cannot be removed: {e}"),
+            ));
+        }
+        log::info!("token store verdict=retried reason=install_unconfirmed marker=cleared");
     }
     // The hook hears of the store only once the file is read back holding
     // the new token: a fence it lifts is for a token really gone. A store
@@ -1696,6 +1721,40 @@ pub(crate) mod tests {
         assert!(crate::testlog::lines()
             .iter()
             .any(|l| l.contains("token store verdict=retry reason=install_unconfirmed")));
+    }
+
+    /// CR 4644224038: a retry whose write fails keeps its unconfirmed
+    /// install's marker, so after a restart (the fence reset) the token on
+    /// file is still refused. The marker goes only once a retry's write and
+    /// folder sync hold.
+    #[test]
+    fn a_failed_retry_keeps_the_token_refused_after_a_restart() {
+        let d = dir("retry-write-fails");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        assert!(store(&path, "new").is_err());
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        FAIL_WRITE.with(|f| f.set(true));
+        let retried = store(&path, "new");
+        FAIL_WRITE.with(|f| f.set(false));
+        assert!(retried.is_err(), "{retried:?}");
+        assert!(
+            revoked(&path, &fingerprint("new")).is_some(),
+            "the failed retry removed the marker"
+        );
+        assert_eq!(
+            after_restart(&path),
+            None,
+            "the unconfirmed token became readable"
+        );
+        crate::testlog::start();
+        store(&path, "new").unwrap();
+        assert!(revoked(&path, &fingerprint("new")).is_none());
+        assert_eq!(load(&path).unwrap().as_deref(), Some("new"));
+        assert!(crate::testlog::lines()
+            .iter()
+            .any(|l| l.contains("verdict=retried reason=install_unconfirmed marker=cleared")));
     }
 
     /// A sign-out retried after an unlink whose folder sync failed is
