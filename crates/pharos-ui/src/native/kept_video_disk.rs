@@ -3519,6 +3519,9 @@ async fn plan_and_admit(
     let mut files: Vec<String> = Vec::new();
     let mut duration_ms = 0u64;
     let mut short_tails: HashSet<String> = HashSet::new();
+    // How many times the planned playlists list each key, all of them
+    // together: a short tail is excused only when it is listed once.
+    let mut listed: HashMap<String, usize> = HashMap::new();
     for url in &plan.media_playlists {
         let key = request_key(url);
         let text = playlist(inner, user, item, run, &key, &mut playlists.fetched).await?;
@@ -3527,8 +3530,26 @@ async fn plan_and_admit(
         playlists.read.push(key);
         duration_ms = duration_ms.max(media.duration_ms);
         short_tails.extend(media.short_tail.iter().map(|u| request_key(u)));
+        for u in &media.files {
+            *listed.entry(request_key(u)).or_default() += 1;
+        }
         files.extend(media.files.iter().map(|u| request_key(u)));
     }
+    // A sliver one playlist may go without is a file another one needs
+    // whole: its failed fetch is never excused.
+    short_tails.retain(|key| {
+        let n = listed.get(key).copied().unwrap_or(0);
+        if n != 1 {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep short tail verdict=not_excused item={item} reason=listed_elsewhere listed={n} url_path={}",
+                    url_path(key)
+                ),
+            );
+        }
+        n == 1
+    });
     let mut all = playlists.read.clone();
     all.extend(files);
     all.extend(record.subtitles.iter().map(|s| request_key(&s.url)));
@@ -13968,6 +13989,43 @@ pub(crate) mod tests {
         ];
         assert!(last_rename < files_dir, "{steps:?}");
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+    }
+
+    /// CR 4646280204: a short tail of one playlist that another planned
+    /// playlist lists too is needed whole: its failed fetch fails the
+    /// download. The control is the test below.
+    #[tokio::test]
+    async fn a_short_tail_another_playlist_lists_is_not_skipped() {
+        const AUDIO_KEY: &str = "/videos/1/h264cmaf/audio.m3u8?PlaySessionId=p";
+        let rig = Rig::new("tail-shared");
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Main\",DEFAULT=YES,URI=\"/videos/1/h264cmaf/audio.m3u8?PlaySessionId=p\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\",AUDIO=\"a\"\n\
+            /videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n";
+        let audio = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
+            #EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6.0,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n";
+        let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            files.insert(MASTER_KEY.into(), master.as_bytes().to_vec());
+            files.insert(AUDIO_KEY.into(), audio.as_bytes().to_vec());
+            files.insert(MEDIA_KEY.into(), media.into_bytes());
+        }
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_ne!(
+            only(&store).state,
+            KeptState::Ready,
+            "a needed file was skipped"
+        );
+        assert!(lines("pharos: video keep skipped short tail").is_empty());
+        assert!(
+            lines("pharos: video keep short tail verdict=not_excused item=1")
+                .iter()
+                .any(|l| l.contains("reason=listed_elsewhere listed=2"))
+        );
     }
 
     #[tokio::test]
