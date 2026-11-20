@@ -3687,7 +3687,10 @@ mod tests {
         let html = with_video_queue(move || {
             rsx! { TitleView { detail: detail.clone(), offline: true, keep: rsx! { span { id: "keep-slot" } } } }
         });
-        assert!(html.contains(">Play<") && html.contains("keep-slot"), "{html}");
+        assert!(
+            html.contains(">Play<") && html.contains("keep-slot"),
+            "{html}"
+        );
         for gone in [
             "Watch together",
             "pharos-queue-button",

@@ -4000,11 +4000,7 @@ pub fn QueueButtons(
     let put = move |place: Place| {
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
-            let found = match (
-                tracks.is_empty(),
-                album,
-                ctx.and_then(|c| c.peek_library()),
-            ) {
+            let found = match (tracks.is_empty(), album, ctx.and_then(|c| c.peek_library())) {
                 (false, _, _) | (true, None, _) => Ok(tracks),
                 (true, Some(album), Some(api)) => {
                     list_all(&api, &call("queue", "album"), album, None, INDEX_ORDER)

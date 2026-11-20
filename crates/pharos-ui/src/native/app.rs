@@ -24,8 +24,6 @@ use super::appearance::{
 use super::approve_device;
 use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
-use super::offline_library::{device_verdict, OfflineLibrary, Standing, LOST_GRACE_MS};
-use super::source::Library;
 use super::damage;
 use super::diagnostics;
 use super::favourites::{self, Favourites, FavouritesView};
@@ -36,6 +34,7 @@ use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::music_bridge::{self, Follow, MediaIo, Step};
+use super::offline_library::{device_verdict, OfflineLibrary, Standing, LOST_GRACE_MS};
 use super::offline_video;
 use super::palette::{self, Row};
 use super::person::PersonView;
@@ -70,6 +69,7 @@ use super::seek_wait::SeekWait;
 use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
 use super::show_tracks;
+use super::source::Library;
 use super::stage::{
     Handoff, QueueButton, QueueDock, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip,
     View, STAGE_ID,
@@ -2385,12 +2385,9 @@ fn NativeApp(route: Route) -> Element {
                         let (api, user) = (api.clone(), me.id.clone());
                         spawn(async move {
                             let began = platform::now_ms();
-                            let filled = super::offline_device::fill_notes(
-                                &api,
-                                &user,
-                                platform::unix_ms(),
-                            )
-                            .await;
+                            let filled =
+                                super::offline_device::fill_notes(&api, &user, platform::unix_ms())
+                                    .await;
                             if filled.kept > 0 {
                                 platform::info(&filled.log_line(platform::now_ms() - began));
                             }
