@@ -847,6 +847,7 @@ fn empty_media_playlist() -> MediaPlaylist {
         init_uri: None,
         start_offset_ms: None,
         segments: Vec::new(),
+        parts: Vec::new(),
         unsupported: Vec::new(),
     }
 }
