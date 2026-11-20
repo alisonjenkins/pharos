@@ -9436,19 +9436,36 @@ mod tests {
         thread_local! {
             static KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
             static SLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// Every answer the timer's `kept` read got.
+            static SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         KEPT.with(|k| k.set(false));
         SLOW.with(|s| s.set(false));
+        SEEN.with(|s| s.borrow_mut().clear());
         fn root() -> Element {
             let slow = use_signal(|| false);
-            use_hook(|| start_slow_connect(10, || true, || KEPT.with(std::cell::Cell::get), slow));
+            use_hook(|| {
+                start_slow_connect(
+                    10,
+                    // Runs once the sleep is over (the host's sleep is
+                    // instant): the store lands while the timer waited.
+                    || {
+                        KEPT.with(|k| k.set(true));
+                        true
+                    },
+                    || {
+                        let kept = KEPT.with(std::cell::Cell::get);
+                        SEEN.with(|s| s.borrow_mut().push(kept));
+                        kept
+                    },
+                    slow,
+                )
+            });
             SLOW.with(|s| s.set(slow()));
             rsx! {}
         }
         let mut dom = VirtualDom::new(root);
         dom.rebuild_in_place();
-        // The attempt has started with nothing kept; the store lands now.
-        KEPT.with(|k| k.set(true));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -9468,6 +9485,11 @@ mod tests {
         assert!(
             SLOW.with(std::cell::Cell::get),
             "the slow connect never came"
+        );
+        assert_eq!(
+            SEEN.with(|s| s.borrow().clone()),
+            vec![true],
+            "kept was not read when the timer fired"
         );
     }
 
