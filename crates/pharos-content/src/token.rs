@@ -647,9 +647,11 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                     "attempted"
                 }
             );
+            // The rename landed: the sign-in is incomplete, not failed
+            // before anything was written.
             return Err(err(
                 path,
-                format!("the token's folder could not be synced: {why}"),
+                format!("{STORE_INCOMPLETE}: the token's folder could not be synced: {why}"),
             ));
         }
     }
@@ -664,7 +666,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             );
             return Err(err(
                 path,
-                format!("the token is written but its unconfirmed-install marker cannot be removed: {e}"),
+                format!("{STORE_INCOMPLETE}: the token is written but its unconfirmed-install marker cannot be removed: {e}"),
             ));
         }
         log::info!("token store verdict=retried reason=install_unconfirmed marker=cleared");
@@ -1934,6 +1936,29 @@ pub(crate) mod tests {
         let back = read(&path).unwrap().unwrap();
         assert_eq!(back.token, "tokA");
         assert_eq!(back.user, None, "an earlier install's user came back");
+    }
+
+    /// Outside diff token.rs:631-634 (review 5997638687): a store whose
+    /// rename landed but whose folder would not sync, and a retry whose
+    /// marker would not clear after its write, are incomplete stores, so a
+    /// sign-in stops on them. A store refused before anything was written
+    /// is not.
+    #[test]
+    fn a_store_refused_after_its_rename_is_incomplete() {
+        let d = dir("incomplete-after-rename");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let unsynced = store(&path, "new");
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        let e = unsynced.unwrap_err();
+        assert!(is_store_incomplete(&e), "{e:?}");
+        FAIL_MARKER_SYNC.with(|f| f.set(true));
+        let retried = store(&path, "new");
+        FAIL_MARKER_SYNC.with(|f| f.set(false));
+        let e = retried.unwrap_err();
+        assert!(is_store_incomplete(&e), "{e:?}");
+        assert!(!is_store_incomplete(&store(&path, "").unwrap_err()));
     }
 
     /// CR 4646025360: a marker is never unlinked, so no failure while it is
