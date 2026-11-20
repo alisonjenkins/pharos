@@ -496,7 +496,8 @@ fn check_media_playlist(
     {
         return Err((HlsFallbackCause::Live, "live".to_owned()));
     }
-    if media.init_uri.is_none() {
+    // Every part of a split film needs its own init.
+    if part_layout(media).is_none() {
         return Err((HlsFallbackCause::NotFmp4, "none".to_owned()));
     }
     Ok(())
@@ -562,6 +563,49 @@ pub fn plan_hls(
         video_mime,
         audio_mime,
     })
+}
+
+/// A track's parts for the Rust engine: one init per part and each part's
+/// first segment (a split film has a part per file, after a discontinuity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartLayout {
+    pub inits: Vec<String>,
+    pub starts: Vec<usize>,
+}
+
+/// The parts of `media`, when it has segments and every part has an init.
+pub fn part_layout(media: &pharos_hls::playlist::MediaPlaylist) -> Option<PartLayout> {
+    let inits = media
+        .parts
+        .iter()
+        .map(|p| p.init_uri.clone())
+        .collect::<Option<Vec<_>>>()?;
+    if inits.is_empty() {
+        // No segments: the one init still opens the track.
+        return media.init_uri.clone().map(|init| PartLayout {
+            inits: vec![init],
+            starts: vec![0],
+        });
+    }
+    Some(PartLayout {
+        inits,
+        starts: media.parts.iter().map(|p| p.first_segment).collect(),
+    })
+}
+
+/// Where segment `idx`'s own timeline starts on the stream's: the start of
+/// its part, whose timestamps begin at zero. Zero for a one-part stream.
+pub fn part_offset_ms(
+    part_starts: &[usize],
+    segments: &[pharos_hls::playlist::Segment],
+    idx: usize,
+) -> u64 {
+    part_starts
+        .iter()
+        .rev()
+        .find(|&&start| start <= idx)
+        .and_then(|&start| segments.get(start))
+        .map_or(0, |seg| seg.start_ms)
 }
 
 /// The `SourceBuffer.remove` range, in seconds, for the planner's evict up to
@@ -5497,6 +5541,62 @@ mod tests {
         .unwrap();
         assert_eq!(
             plan_hls(&ts_audio_master, &ts_media, None, |_| true).map_err(|(c, _)| c),
+            Err(HlsFallbackCause::NotFmp4)
+        );
+
+        // A split film: a part per file, each after a discontinuity with its
+        // own init (spec 037).
+        let split_media = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MAP:URI=\"init-a.mp4\"\n\
+             #EXTINF:6.000,\n\
+             a0.m4s\n\
+             #EXTINF:4.000,\n\
+             a1.m4s\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXT-X-MAP:URI=\"init-b.mp4\"\n\
+             #EXTINF:6.000,\n\
+             b0.m4s\n\
+             #EXT-X-ENDLIST\n",
+            "http://pharos.local/videos/42/main.m3u8",
+        )
+        .unwrap();
+        assert!(plan_hls(&avc_master, &split_media, Some(&split_media), |_| true).is_ok());
+        assert_eq!(
+            part_layout(&split_media),
+            Some(PartLayout {
+                inits: vec![
+                    "http://pharos.local/videos/42/init-a.mp4".to_owned(),
+                    "http://pharos.local/videos/42/init-b.mp4".to_owned(),
+                ],
+                starts: vec![0, 2],
+            })
+        );
+        // The second part's segments are stamped from zero: they sit 10 s in.
+        let offsets: Vec<u64> = (0..3)
+            .map(|idx| part_offset_ms(&[0, 2], &split_media.segments, idx))
+            .collect();
+        assert_eq!(offsets, [0, 0, 10_000]);
+        assert_eq!(part_offset_ms(&[0], &fmp4_media.segments, 0), 0);
+        // A part with no init of its own or before it cannot be read.
+        let headless = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXTINF:6.000,\n\
+             a0.m4s\n\
+             #EXT-X-DISCONTINUITY\n\
+             #EXT-X-MAP:URI=\"init-b.mp4\"\n\
+             #EXTINF:6.000,\n\
+             b0.m4s\n\
+             #EXT-X-ENDLIST\n",
+            "http://pharos.local/videos/42/main.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&avc_master, &headless, None, |_| true).map_err(|(c, _)| c),
             Err(HlsFallbackCause::NotFmp4)
         );
 
