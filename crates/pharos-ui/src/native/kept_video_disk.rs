@@ -1341,8 +1341,32 @@ impl Inner {
             // of what it reserves in the change.
             // The whole folder, staging files included.
             // A short walk is a lower bound, and only raises the figure.
-            let on_disk = dir_size(dir).counted(0);
+            // It is no figure for what the folder holds, so the folder is
+            // unknown, in this same hold, until a sweep measures it whole:
+            // no admission sees it known meanwhile.
+            let m = dir_size(dir);
+            let on_disk = m.counted(0);
             record.estimated_bytes = reserved(&record).max(on_disk);
+            if !m.is_whole() {
+                let at = dir.to_path_buf();
+                if !st.unmeasured.iter().any(|(d, _)| *d == at) {
+                    st.unmeasured.push((
+                        at.clone(),
+                        "folder not measured whole when a failed removal put its record back"
+                            .to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&at) {
+                    st.remeasure.push(at);
+                }
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep remove item={} measure=short found={on_disk} verdict=folder_unknown",
+                        record.item
+                    ),
+                );
+            }
             record.state = KeptState::Failed {
                 reason: if short_ready {
                     format!(
@@ -11317,6 +11341,39 @@ pub(crate) mod tests {
         assert!(
             !lines("pharos: video keep remove item=1 verdict=not_removed index=short").is_empty()
         );
+    }
+
+    /// CR 4640624134: a failed removal whose folder walk falls short puts
+    /// the record back with the folder unknown, in the same hold, so no
+    /// admission counts it known; the reservation floor stays. A whole
+    /// remeasure lifts the block.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_short_measure_keeps_admission_blocked() {
+        let rig = Rig::new("unlink-short-unknown");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(!store.size_unknown());
+        let kept = store.kept_bytes();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.remove("u1", "1");
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        // What admission reads, before any sweep can measure the folder.
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "a short measure was counted as known"
+        );
+        assert!(store.size_unknown(), "the folder still reads short");
+        assert!(store.kept_bytes() >= kept, "the reservation floor dropped");
+        assert!(!lines("pharos: video keep remove item=1 measure=short").is_empty());
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        store.inner.sweep_remeasure();
+        assert!(!store.size_unknown(), "a whole remeasure kept the block");
     }
 
     /// The control: a whole inventory keeps a restored Ready download Ready.
