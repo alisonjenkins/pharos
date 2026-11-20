@@ -1865,11 +1865,19 @@ impl Inner {
                     cap,
                     ready,
                     unknown,
-                } if retained > 0 && plan.wants() > held => {
+                } if plan.wants() > held => {
+                    // Over the live reservation, whatever raised it: kept
+                    // staging files, or a handed-over allowance given back
+                    // while this run waited.
+                    let reason = if retained > 0 {
+                        "retained_parts_raised_estimate"
+                    } else {
+                        "plan_exceeds_reservation"
+                    };
                     emit(
                         false,
                         format!(
-                            "pharos: video resume replanned item={item} run={run} reason=retained_parts_raised_estimate estimated={held} wants={} retained_parts={retained}",
+                            "pharos: video resume replanned item={item} run={run} reason={reason} estimated={held} wants={} retained_parts={retained}",
                             plan.wants()
                         ),
                     );
@@ -13018,6 +13026,61 @@ pub(crate) mod tests {
         lock(&store.inner.state)
             .runs
             .remove(&("u1".to_owned(), "1".to_owned()));
+    }
+
+    /// Outside diff kept_video_disk.rs:1868 (review 5997638687): a resume
+    /// whose plan is over the reservation it holds now, with no staging
+    /// file kept, is checked against the shared cap as a fresh download:
+    /// the other kinds took the cap, so it is refused. The control: a plan
+    /// within its reservation resumes on free space alone.
+    #[tokio::test]
+    async fn a_resume_over_its_live_reservation_is_checked_against_the_cap() {
+        let rig = Rig::new("resume-over-reservation");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let key = ("u1".to_owned(), "1".to_owned());
+        for over in [true, false] {
+            lock(&store.inner.state).runs.insert(key.clone(), 42);
+            let held = 12_000_000u64;
+            if let Some(v) = lock(&store.inner.state)
+                .list
+                .iter_mut()
+                .find(|v| v.item == "1")
+            {
+                v.estimated_bytes = held;
+            }
+            let plan = Plan {
+                files: Vec::new(),
+                estimate: if over { 15_000_000 } else { held },
+                total: 0,
+                stored: 0,
+                stale: 0,
+            };
+            // The other kinds hold all of the cap.
+            let check = Check::Resume {
+                other: 100_000_000,
+                cap: 100_000_000,
+                ready: true,
+                unknown: false,
+            };
+            let verdict = store.inner.admit("u1", "1", 42, &plan, check, 0);
+            lock(&store.inner.state).runs.remove(&key);
+            if over {
+                assert!(
+                    matches!(verdict, Err(Admission::Refused { .. })),
+                    "a resume over its reservation passed on free space alone"
+                );
+                assert!(lines("pharos: video resume replanned item=1 run=42")
+                    .iter()
+                    .any(|l| l.contains("reason=plan_exceeds_reservation")));
+            } else {
+                assert!(
+                    verdict.is_ok(),
+                    "a resume within its reservation was refused"
+                );
+            }
+        }
     }
 
     #[tokio::test]
