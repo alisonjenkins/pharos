@@ -591,6 +591,45 @@ pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
     under_base(&full, base_path).map(request_key)
 }
 
+/// Where a download's response landed against the URL it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// The same URL, however each spells it, or one naming the same key.
+    Asked,
+    /// A redirect to another key under the server's base path.
+    Moved(String),
+    /// A redirect out of the server's base path.
+    OutsideBase,
+}
+
+/// Where `final_url` (the response's) leaves a download of `key` that asked
+/// for `asked`, under the server at `base`. URLs are compared parsed, so a
+/// path the client percent-encoded (`/café` sent, `/caf%C3%A9` answered) is
+/// no redirect; the base is held to its parsed path, the response's form.
+pub fn landed(base: &str, asked: &str, final_url: &str, key: &str) -> Landed {
+    let parsed = |u: &str| url::Url::parse(u).ok();
+    let (asked_url, final_parsed) = (parsed(asked), parsed(final_url));
+    if asked_url.is_some() && asked_url == final_parsed {
+        if asked != final_url {
+            super::platform::info(&format!(
+                "pharos: video download url verdict=same reason=spelled_differently url_path={}",
+                url_path(final_url)
+            ));
+        }
+        return Landed::Asked;
+    }
+    // The base as the response spells it: `Url` encodes its path.
+    let base = parsed(base).map_or_else(|| base.to_owned(), |u| u.to_string());
+    match key_under_base(
+        &base,
+        final_parsed.as_ref().map_or(final_url, url::Url::as_str),
+    ) {
+        Some(final_key) if final_key == key => Landed::Asked,
+        Some(final_key) => Landed::Moved(final_key),
+        None => Landed::OutsideBase,
+    }
+}
+
 /// What [`localize_playlist`] made of a playlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Localized {
@@ -1220,6 +1259,48 @@ mod tests {
         assert_eq!(url_path("0.m4s?session=a/b"), "");
         assert_eq!(url_path("x/0.m4s?session=a/b#f/g"), "/0.m4s");
         assert_eq!(url_path("/videos/0.m4s?session=a/b"), "/videos/0.m4s");
+    }
+
+    /// CR 4646280242: a response URL is compared with the one asked for
+    /// parsed: a path the client percent-encoded is no redirect, under a
+    /// base whose path needs encoding too. A redirect inside the base still
+    /// moves the key, and one out of it is refused.
+    #[test]
+    fn a_percent_encoded_response_url_is_not_a_redirect() {
+        let base = "https://media.example/caf\u{e9}";
+        let key = "/videos/1/main.m3u8?s=1";
+        let asked = format!("{base}{key}");
+        super::super::platform::take_info_lines();
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/caf%C3%A9/videos/1/main.m3u8?s=1",
+                key
+            ),
+            Landed::Asked
+        );
+        assert!(super::super::platform::take_info_lines()
+            .iter()
+            .any(|l| l.contains("verdict=same reason=spelled_differently")));
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/caf%C3%A9/videos/2/main.m3u8?s=1",
+                key
+            ),
+            Landed::Moved("/videos/2/main.m3u8?s=1".to_owned())
+        );
+        assert_eq!(
+            landed(
+                base,
+                &asked,
+                "https://media.example/other/videos/1/main.m3u8?s=1",
+                key
+            ),
+            Landed::OutsideBase
+        );
     }
 
     /// CR 4646045317: a redirect's final URL is normalized before its base

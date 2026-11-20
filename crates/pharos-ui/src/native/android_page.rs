@@ -30,7 +30,7 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::kept_video::{
-    key_under_base, loudness, request_class, request_key, request_line, url_path, Loudness,
+    landed, loudness, request_class, request_key, request_line, url_path, Landed, Loudness,
     StoredFile, Verdict,
 };
 use super::kept_video_disk::{
@@ -3486,21 +3486,18 @@ impl Fetcher for ServerFetcher {
             let status = resp.status();
             // Where a followed redirect left the request: a playlist's
             // references resolve against it, so the store rebases them.
-            let moved = if resp.url().as_str() == url {
-                None
-            } else {
-                match key_under_base(&base, resp.url().as_str()) {
-                    Some(final_key) => (final_key != key).then_some(final_key),
-                    None => {
-                        log::warn!(
-                            "pharos: video download redirect refused reason=outside_base_path url_path={} final_path={}",
-                            url_path(key),
-                            url_path(resp.url().as_str())
-                        );
-                        return Err(OpenFailed::Refused(
-                            "redirected outside the server's base path".to_owned(),
-                        ));
-                    }
+            let moved = match landed(&base, &url, resp.url().as_str(), key) {
+                Landed::Asked => None,
+                Landed::Moved(final_key) => Some(final_key),
+                Landed::OutsideBase => {
+                    log::warn!(
+                        "pharos: video download redirect refused reason=outside_base_path url_path={} final_path={}",
+                        url_path(key),
+                        url_path(resp.url().as_str())
+                    );
+                    return Err(OpenFailed::Refused(
+                        "redirected outside the server's base path".to_owned(),
+                    ));
                 }
             };
             if status.is_success() {
