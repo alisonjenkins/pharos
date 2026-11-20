@@ -191,13 +191,34 @@ pub fn load(path: &Path) -> Result<Option<String>, ContentError> {
 /// Surrounding whitespace is not part of a token.
 pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let _held = hold();
-    write(path, token.trim(), None).map_err(|e| err(path, e))?;
+    let token = token.trim();
+    write(path, token, None).map_err(|e| err(path, e))?;
     // A new sign-in: a marker of an older session no longer has anything to
-    // refuse (it names that token only), so it goes, best effort.
+    // refuse (it names that token only), so it goes. One that will not go
+    // may stay only while it cannot refuse the new token: a readable marker
+    // for another token. One naming this token, or one that cannot be read
+    // (it refuses every token), fails the install, since no read would
+    // return the token.
     match std::fs::remove_file(revoked_path(path)) {
         Ok(()) => log::info!("token revocation marker verdict=cleared reason=signed_in"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("token revocation marker verdict=kept reason=signed_in error={e}"),
+        Err(e) => match marker(path) {
+            Marker::Present(r) if r.token != fingerprint(token) => {
+                log::warn!(
+                    "token revocation marker verdict=kept reason=marks_another_token error={e}"
+                );
+            }
+            Marker::Absent => {}
+            Marker::Present(_) | Marker::Unreadable(_) => {
+                log::warn!(
+                    "token store verdict=refused reason=revocation_marker_blocks_token error={e}"
+                );
+                return Err(err(
+                    path,
+                    format!("the revocation marker would refuse the new token and cannot be removed: {e}"),
+                ));
+            }
+        },
     }
     Ok(())
 }
@@ -1055,6 +1076,23 @@ pub(crate) mod tests {
         );
         assert_eq!(revoked(&p).map(|r| r.user), Some(Some("B".to_owned())));
         assert_eq!(load(&p).unwrap(), None, "B was read after its marker went");
+    }
+
+    /// CR 4637783563: a sign-in whose old marker cannot be removed and
+    /// would refuse the new token (here it cannot be read: a folder in
+    /// its place) fails, rather than report a token no read returns.
+    #[test]
+    fn a_store_fails_while_an_unremovable_marker_blocks_the_token() {
+        let d = dir("token-store-blocked");
+        let p = d.join("device-token");
+        let marker = revoked_path(&p);
+        std::fs::create_dir_all(marker.join("held")).unwrap();
+        let stored = store(&p, "tokN");
+        assert!(stored.is_err(), "{stored:?}");
+        assert_eq!(load(&p).unwrap(), None);
+        std::fs::remove_dir_all(&marker).unwrap();
+        store(&p, "tokN").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokN"));
     }
 
     /// (c) A removal that is not durable is marked too; only when the
