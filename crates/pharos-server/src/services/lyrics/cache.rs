@@ -48,6 +48,10 @@ struct Record {
 struct Repick {
     /// The provider's id for the record picked; `None` when none was.
     picked: Option<u64>,
+    /// Unix milliseconds when the search began, so a search for the
+    /// song's old tags that ends late does not replace one for its new.
+    #[serde(default)]
+    started_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,7 +119,9 @@ impl DiskCache {
 
     /// Keep `lyrics` as the song's answer once the provider was searched
     /// for another, with the id of the record picked or `None` when the
-    /// search found none and `lyrics` is the one that failed. Blocking.
+    /// search found none and `lyrics` is the one that failed. The search
+    /// began at `started_ms`, Unix milliseconds; one for other tags that
+    /// began later stands. Blocking.
     pub fn put_repicked(
         &self,
         id: u64,
@@ -123,6 +129,7 @@ impl DiskCache {
         song: &Song,
         lyrics: &Lyrics,
         picked: Option<u64>,
+        started_ms: u64,
     ) {
         self.write_at(
             id,
@@ -130,7 +137,7 @@ impl DiskCache {
             song,
             Some(lyrics),
             now_secs(),
-            Some(Repick { picked }),
+            Some(Repick { picked, started_ms }),
         );
     }
 
@@ -199,8 +206,25 @@ impl DiskCache {
             .writing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let standing = self.read(id);
+        let later_repick = repick.as_ref().is_some_and(|ours| {
+            standing.as_ref().is_some_and(|r| {
+                r.key != key(provider, song)
+                    && r.repick
+                        .as_ref()
+                        .is_some_and(|theirs| theirs.started_ms > ours.started_ms)
+            })
+        });
+        if later_repick {
+            tracing::debug!(
+                media.id = id,
+                provider,
+                "lyrics: repick not cached, one for the song's newer tags began later"
+            );
+            return;
+        }
         let standing_repick = repick.is_none()
-            && self.read(id).is_some_and(|r| {
+            && standing.is_some_and(|r| {
                 r.repick.is_some() && (r.key == key(provider, song) || r.fetched_at >= at)
             });
         if standing_repick {
@@ -268,6 +292,12 @@ pub(super) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+pub(super) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -412,7 +442,7 @@ mod tests {
         let cache = DiskCache::new(dir.path().to_path_buf());
         cache.put(7, "lrclib", &song(), Some(&words()));
         assert!(!cache.repicked(7, "lrclib", &song()));
-        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42));
+        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42), 1);
         assert!(cache.repicked(7, "lrclib", &song()));
         assert_eq!(
             cache.get(7, "lrclib", &song()),
@@ -421,7 +451,7 @@ mod tests {
         let mut retagged = song();
         retagged.title = "Song (Live)".into();
         assert!(!cache.repicked(7, "lrclib", &retagged));
-        cache.put_repicked(8, "lrclib", &song(), &words(), None);
+        cache.put_repicked(8, "lrclib", &song(), &words(), None, 1);
         assert!(cache.repicked(8, "lrclib", &song()));
     }
 
@@ -432,7 +462,7 @@ mod tests {
     fn a_lookup_answer_does_not_replace_a_repick() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::new(dir.path().to_path_buf());
-        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42));
+        cache.put_repicked(7, "lrclib", &song(), &words(), Some(42), 1);
         cache.put(7, "lrclib", &song(), None);
         assert!(cache.repicked(7, "lrclib", &song()));
         assert_eq!(
@@ -457,9 +487,40 @@ mod tests {
         let asked = now_secs() - 5;
         let mut retagged = song();
         retagged.title = "Song (Live)".into();
-        cache.put_repicked(7, "lrclib", &retagged, &words(), Some(42));
+        cache.put_repicked(7, "lrclib", &retagged, &words(), Some(42), 1);
         cache.put_at(7, "lrclib", &song(), None, asked);
         assert!(cache.repicked(7, "lrclib", &retagged));
         assert_eq!(cache.get(7, "lrclib", &song()), None);
+    }
+
+    /// Two repicks of one song, for its old tags and its new, ending in
+    /// reverse order: the one begun later, for the new tags, still stands
+    /// once the cache is opened again. Disarm check: without the start
+    /// comparison in `write_at`, this fails.
+    #[test]
+    fn a_repick_for_old_tags_ending_late_leaves_the_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        let mut retagged = song();
+        retagged.title = "Song (Live)".into();
+        let newer = words();
+        let mut older = words();
+        older.lines[0].text = "the lanterns swing".into();
+        cache.put_repicked(7, "lrclib", &retagged, &newer, Some(43), 2_000);
+        cache.put_repicked(7, "lrclib", &song(), &older, Some(42), 1_000);
+        drop(cache);
+
+        let reopened = DiskCache::new(dir.path().to_path_buf());
+        assert!(reopened.repicked(7, "lrclib", &retagged));
+        assert_eq!(
+            reopened.get(7, "lrclib", &retagged),
+            Some(Cached::Found(newer))
+        );
+        assert!(!reopened.repicked(7, "lrclib", &song()));
+
+        // In order, the later search replaces the earlier as before.
+        reopened.put_repicked(8, "lrclib", &song(), &older, Some(42), 1_000);
+        reopened.put_repicked(8, "lrclib", &retagged, &words(), Some(43), 2_000);
+        assert!(reopened.repicked(8, "lrclib", &retagged));
     }
 }
