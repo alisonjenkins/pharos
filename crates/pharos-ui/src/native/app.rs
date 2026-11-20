@@ -5586,6 +5586,54 @@ fn offline_owner_lost(owner: &str, authorized: Option<&str>) -> bool {
     authorized != Some(owner)
 }
 
+/// What the watch screen may show of a negotiation's `state`: a downloaded
+/// copy only while the owner it was negotiated for is still the authorized
+/// offline user; otherwise nothing, the pending state. A restarted
+/// negotiation keeps its last value until the new one completes, so without
+/// this A's player would stay mounted while B's start is pending. `seen`
+/// keeps the last verdict, which is logged when it changes.
+fn shown_playback<'a>(
+    id: ItemRef,
+    state: Option<&'a Result<PlayingRef, StartFailure>>,
+    seen: &Cell<Option<bool>>,
+) -> Option<&'a Result<PlayingRef, StartFailure>> {
+    let Some(Ok(p)) = state else {
+        return state;
+    };
+    let Some(save) = &p.0.offline else {
+        return state;
+    };
+    let authorized = offline_video::last_user();
+    let lost = offline_owner_lost(&save.user, authorized.as_deref());
+    if seen.replace(Some(lost)) != Some(lost) {
+        if lost {
+            platform::info(&format!(
+                "pharos: playback offline render item={id} verdict=hidden reason=owner_not_authorized authorized_user={}",
+                authorized.is_some()
+            ));
+        } else {
+            platform::info(&format!(
+                "pharos: playback offline render item={id} verdict=shown reason=owner_authorized"
+            ));
+        }
+    }
+    state.filter(|_| !lost)
+}
+
+/// The watch screen's negotiation as it may be shown: [`shown_playback`]
+/// over `playing`, for the caller to render the player from. It subscribes
+/// to the resource's state as well as its value: a restart keeps the value,
+/// so only the state re-renders the screen for the gate while it is held.
+fn use_gated_playback(
+    id: ItemRef,
+    playing: Resource<Option<Result<PlayingRef, StartFailure>>>,
+) -> Option<Result<PlayingRef, StartFailure>> {
+    let seen = use_hook(|| Rc::new(Cell::new(None::<bool>)));
+    let _ = playing.state().cloned();
+    let state = playing.read();
+    shown_playback(id, state.as_ref().and_then(Option::as_ref), &seen).cloned()
+}
+
 /// A playback of a downloaded copy: the stored master playlist as it was
 /// negotiated, the stored position, and no call to the server.
 fn offline_playing(
@@ -6317,22 +6365,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         }
     });
     use_drop(move || platform::turn_cancel(&id.to_string(), "left"));
-    let state = playing.read();
+    // The owner gate reads an identity no signal carries: a new API
+    // re-renders it, as a restart does through the gate's own subscription.
+    api_gen();
+    let gated = use_gated_playback(id, playing);
+    let shown = gated.as_ref();
     // The song handing over is not the page's.
-    let name = state
-        .as_ref()
-        .and_then(Option::as_ref)
+    let name = shown
         .and_then(|r| r.as_ref().ok())
         .filter(|_| matches!(slot, Slot::Current { .. }))
         .map(|p| super::views::page_name(&p.0.detail.item));
     use_page_name(id, name);
     // The stage bar, and its Close, comes with a loaded player; a compact
     // window still loading or failed needs a way out of its own.
-    let stranded = ctx_stage.read().view != View::Full
-        && !matches!(state.as_ref().and_then(Option::as_ref), Some(Ok(_)));
+    let stranded = ctx_stage.read().view != View::Full && !matches!(shown, Some(Ok(_)));
     // A negotiation that failed in the full view has no player and no shell
     // to leave by, so it gets the failure panel (B806).
-    let start_failure = match state.as_ref().and_then(Option::as_ref) {
+    let start_failure = match shown {
         Some(Err(reason)) if ctx_stage.read().view == View::Full => Some(reason.clone()),
         _ => None,
     };
@@ -6349,8 +6398,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The full view's first load has no player chrome yet, so it carries its
     // own way out (038 FR-408, V1220).
-    let first_load =
-        ctx_stage.read().view == View::Full && state.as_ref().and_then(Option::as_ref).is_none();
+    let first_load = ctx_stage.read().view == View::Full && shown.is_none();
     let body = match start_failure {
         None if first_load => rsx! {
             FirstLoad { on_back: move |()| leave_player(nav) }
@@ -6363,7 +6411,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 on_report: move |()| report_failure(&PlayFailure::start(reason.clone())),
             }
         },
-        None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+        None => loaded(shown, |p: &PlayingRef| {
             remount_on(
                 &p.0.session,
                 rsx! {
@@ -9445,6 +9493,182 @@ mod tests {
         let copy = downloaded_copy(id, None, Some("A".into()));
         use_test_video_slot(None);
         assert!(copy.is_none(), "a fenced user's copy was selected");
+    }
+
+    /// A downloaded copy's player as [`offline_playing`] builds it for
+    /// `user`, whatever engine the host has.
+    fn offline_player_for(user: &str) -> PlayingRef {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        struct NoStore;
+        impl VideoStore for NoStore {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let mut copy = offline_video::tests::video("7", "", KeptState::Ready);
+        copy.user = user.into();
+        let detail = offline_video::offline_detail(&copy).unwrap();
+        let tracks = (&detail.audio_tracks[..], &detail.subtitle_tracks[..]);
+        let track_map = track_follow::TrackMap::new(tracks, tracks);
+        PlayingRef(Rc::new(Playing {
+            title: copy.title.clone(),
+            kind: detail.item.kind,
+            image: None,
+            url: copy.master_url.clone(),
+            start_ms: 0,
+            from_start: false,
+            engine: Engine::HlsJs,
+            session: format!("{}-0", offline_video::OFFLINE_SESSION),
+            grant: RefCell::new(None),
+            grant_gen: Cell::new(1),
+            track_map,
+            audio: copy.audio,
+            subtitle: None,
+            asked_audio: None,
+            method: offline_video::OFFLINE_METHOD.to_owned(),
+            asked_subtitle: TrackChoice::default(),
+            version: String::new(),
+            offline: Some(OfflineSave {
+                store: std::sync::Arc::new(NoStore),
+                user: user.into(),
+            }),
+            detail,
+        }))
+    }
+
+    /// Mounts A's downloaded copy behind a negotiation as the watch screen
+    /// holds it, then reconnects: `replaced` runs (the session swap), and
+    /// the negotiation restarts and stays pending, as a slow server start
+    /// for the new owner does. The screen's [`use_gated_playback`] decides
+    /// what shows. Returns what renders while it is pending.
+    fn render_during_a_pending_renegotiation(replaced: impl FnOnce()) -> String {
+        type Negotiated = Option<Result<PlayingRef, StartFailure>>;
+        thread_local! {
+            static RUNS: Cell<u32> = const { Cell::new(0) };
+            static HANDLE: RefCell<Option<Resource<Negotiated>>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let playing = use_resource(|| {
+                let run = RUNS.with(|r| r.replace(r.get() + 1));
+                async move {
+                    if run == 0 {
+                        Some(Ok(offline_player_for("A")))
+                    } else {
+                        std::future::pending::<Negotiated>().await
+                    }
+                }
+            });
+            HANDLE.with(|h| h.replace(Some(playing)));
+            let id: ItemRef = "7".parse().unwrap();
+            // The screen's own gate; the player is this marker.
+            match use_gated_playback(id, playing) {
+                Some(Ok(p)) => rsx! { div { "player {p.0.session}" } },
+                Some(Err(_)) => rsx! { div { "failed" } },
+                None => rsx! { div { "pending" } },
+            }
+        }
+        RUNS.with(|r| r.set(0));
+        offline_video::remember_user("A");
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let settle = |dom: &mut VirtualDom, want: &'static str| {
+                let html = dioxus_ssr::render(dom);
+                (html.contains(want), html)
+            };
+            let start = std::time::Instant::now();
+            loop {
+                let (done, html) = settle(&mut dom, "player");
+                if done {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(3),
+                    "A's player never mounted: {html}"
+                );
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            platform::take_info_lines();
+            replaced();
+            let mut playing = HANDLE.with(|h| h.borrow().unwrap());
+            dom.in_runtime(|| playing.restart());
+            for _ in 0..5 {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            assert!(RUNS.with(Cell::get) >= 2, "the negotiation did not restart");
+            dioxus_ssr::render(&dom)
+        })
+    }
+
+    /// CR 4640611367: a reconnect that fences A restarts the negotiation,
+    /// whose last value (A's player) stays until the new one completes.
+    /// While B's start is pending, A's player is not rendered.
+    #[test]
+    fn a_fenced_owners_player_unmounts_while_the_next_start_is_pending() {
+        let html = render_during_a_pending_renegotiation(|| {
+            offline_video::session_replaced(&offline_video::Session::opened(
+                (),
+                Some("tokB".to_owned()),
+            ));
+        });
+        let lines = platform::take_info_lines();
+        offline_video::forget_user();
+        assert!(
+            !html.contains("player"),
+            "A's player stayed mounted: {html}"
+        );
+        assert!(html.contains("pending"), "{html}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(
+                "pharos: playback offline render item=7 verdict=hidden reason=owner_not_authorized"
+            )),
+            "{lines:?}"
+        );
+    }
+
+    /// A reconnect that keeps A authorized leaves A's player mounted while
+    /// the restarted negotiation is pending.
+    #[test]
+    fn a_same_owner_reconnect_keeps_the_player_mounted() {
+        offline_video::tests::use_pref_seam();
+        let html = render_during_a_pending_renegotiation(|| {
+            // The new session's token is the one A is paired with.
+            offline_video::session_replaced(&offline_video::tests::seam_session());
+            assert_eq!(offline_video::last_user().as_deref(), Some("A"));
+        });
+        let lines = platform::take_info_lines();
+        offline_video::forget_user();
+        assert!(html.contains("player offline-0"), "A's player went: {html}");
+        assert!(
+            !lines.iter().any(|l| l.contains("verdict=hidden")),
+            "{lines:?}"
+        );
     }
 
     /// End to end, through the app's own timer, screen and store watch: an

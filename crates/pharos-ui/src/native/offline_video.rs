@@ -1366,6 +1366,17 @@ pub(crate) mod tests {
         p
     }
 
+    /// Installs the stored-preference seam, whose token the next
+    /// `remember_user` pairs its user with, for another module's test.
+    pub(crate) fn use_pref_seam() {
+        let _ = pref();
+    }
+
+    /// A session opened with the seam's token, for another module's test.
+    pub(crate) fn seam_session() -> Session<()> {
+        session(())
+    }
+
     /// A store whose `A` has a file for the key and nobody else does.
     struct Files;
 
