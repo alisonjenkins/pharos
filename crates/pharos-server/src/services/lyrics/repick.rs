@@ -3,7 +3,7 @@
 //! against what the aligner heard by the measure the aligner judged the
 //! first one with.
 
-use pharos_core::lyrics_text::{bigram_recall, words};
+use pharos_core::lyrics_text::{bigram_recall, text_mismatch, words};
 
 use super::{align, Lyrics};
 
@@ -75,7 +75,9 @@ pub struct Pick {
 /// one with word pairs for [`MIN_PAIRS_OF_HEARD`] of the words heard and
 /// recall reaching [`MIN_RECALL`]. The higher recall wins, and on a tie the
 /// record closer in length. A record is scored as one text, pairs running
-/// across its line breaks, so every word it holds is in the measure.
+/// across its line breaks, so every word it holds is in the measure; it
+/// must also pass the aligner's own check, pairs within each line, so the
+/// aligner does not refuse the pick on the same transcript.
 pub fn choose(
     candidates: Vec<Candidate>,
     current: &Lyrics,
@@ -90,7 +92,8 @@ pub fn choose(
         .collect();
     near.sort_by_key(|c| c.duration_ms.abs_diff(duration_ms));
     near.truncate(MAX_CANDIDATES);
-    let fewest_pairs = words(heard).len() as f64 * MIN_PAIRS_OF_HEARD;
+    let heard_words = words(heard).len();
+    let fewest_pairs = heard_words as f64 * MIN_PAIRS_OF_HEARD;
     let mut best: Option<Pick> = None;
     for candidate in near {
         let text = candidate
@@ -107,6 +110,13 @@ pub fn choose(
         let Some(recall) = bigram_recall([text.as_str()], heard) else {
             continue;
         };
+        let by_line = bigram_recall(
+            candidate.lyrics.lines.iter().map(|l| l.text.as_str()),
+            heard,
+        );
+        if text_mismatch(by_line, heard_words) {
+            continue;
+        }
         if recall >= MIN_RECALL && best.as_ref().map_or(true, |b| recall > b.recall) {
             best = Some(Pick { candidate, recall });
         }
@@ -365,6 +375,42 @@ mod tests {
             HEARD,
         );
         assert_eq!(got.map(|p| p.candidate.id), Some(6));
+    }
+
+    #[test]
+    fn a_record_the_aligner_would_call_another_song_is_not_picked() {
+        // Each heard word on a line of its own and one unrelated pair: as
+        // one text nearly all of it was heard, line by line none of it.
+        let heard = heard_times(10);
+        let mut lines: Vec<String> = words(&heard);
+        lines.push("orchard lanterns".into());
+        let split = many_lines_of(&lines);
+        let got = choose(
+            vec![candidate(11, SONG_MS, split)],
+            &wrong(),
+            SONG_MS,
+            &heard,
+        );
+        assert_eq!(got, None);
+        // The same song in ordinary lines, one word heard wrong, is picked.
+        let slipped = heard.replacen("quay", "key", 1);
+        let got = choose(
+            vec![candidate(12, SONG_MS, many_lines(10))],
+            &wrong(),
+            SONG_MS,
+            &slipped,
+        );
+        assert_eq!(got.map(|p| p.candidate.id), Some(12));
+    }
+
+    /// `lines` timed evenly inside the song.
+    fn many_lines_of(lines: &[String]) -> Lyrics {
+        let mut out = lyrics(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let step = SONG_MS / (lines.len() as u64 + 1);
+        for (i, line) in out.lines.iter_mut().enumerate() {
+            line.start_ms = Some(i as u64 * step);
+        }
+        out
     }
 
     #[test]
