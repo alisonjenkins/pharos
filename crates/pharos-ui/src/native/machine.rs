@@ -150,8 +150,9 @@ pub struct Machine {
     /// Why the last attempt failed, while connecting again after a failure
     /// that may clear by itself (server down, network gone).
     waiting: Option<String>,
-    /// Counts the sessions begun: bumped when a resume makes a session
-    /// Ready after the sign-in screen (or at start), not on a reconnect's.
+    /// Counts the sessions published: bumped on every resume that makes the
+    /// app Ready, a reconnect's included, so a refusal names the one its
+    /// call was sent in.
     session: u32,
     on_session_end: SessionEnd,
 }
@@ -277,9 +278,11 @@ impl Machine {
                 self.attempt = 0;
                 self.waiting = None;
                 self.phase = Phase::Ready;
-                if !self.had_session {
-                    self.session = self.session.wrapping_add(1);
-                }
+                // Every published session gets its own refusal id, a
+                // reconnect's too: it may carry another token than the one
+                // a pending call was sent with, and that call's refusal must
+                // not end it. `had_session` alone spans the outage.
+                self.session = self.session.wrapping_add(1);
                 self.had_session = true;
             }
             Event::ResumeRefused { epoch } if open(epoch) => self.sign_in(None),
@@ -817,16 +820,44 @@ mod tests {
             "an old call ended the new session"
         );
         assert_eq!(ENDED.with(std::cell::Cell::get), 0);
-        // A reconnect keeps the session; its own refusal ends it.
+        // The current session's own refusal ends it.
+        let now = m.session();
+        m.apply(Event::SessionNeedsSignIn { session: now });
+        assert!(sign_in_error_of(&m).is_some());
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
+    /// A reconnect may publish another token (B) than the one a pending
+    /// call was sent with (A): A's delayed refusal leaves B's session and
+    /// its token alone, and B's own refusal still ends it.
+    #[test]
+    fn a_refusal_sent_before_a_reconnect_leaves_the_replacement_session() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() {
+            ENDED.with(|n| n.set(n.get() + 1));
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let a = m.session();
         m.apply(Event::Closed {
-            epoch,
+            epoch: 0,
             reason: "gone".into(),
         });
+        assert!(m.had_session(), "the outage forgot the session");
         let epoch = m.epoch();
-        let now = m.session();
         m.apply(Event::Resumed { epoch });
-        assert_eq!(m.session(), now, "a reconnect started a new session");
-        m.apply(Event::SessionNeedsSignIn { session: now });
+        let b = m.session();
+        assert_ne!(b, a, "the replacement reused the refusal id");
+        m.apply(Event::SessionNeedsSignIn { session: a });
+        assert_eq!(m.phase(), &Phase::Ready, "A's refusal ended B's session");
+        assert_eq!(
+            ENDED.with(std::cell::Cell::get),
+            0,
+            "B's token was cleaned up"
+        );
+        m.apply(Event::SessionNeedsSignIn { session: b });
         assert!(sign_in_error_of(&m).is_some());
         assert_eq!(ENDED.with(std::cell::Cell::get), 1);
     }
