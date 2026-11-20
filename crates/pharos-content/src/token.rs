@@ -617,6 +617,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             // that it refused stays refused.
             add_fence_held(path, &Fence::token(&new), "store_not_durable");
             let marked = write_marker(path, None, &new, true);
+            // The rename landed: a cached token is stale, whether or not the
+            // fence moved (it may name this token already).
+            changed("store_not_durable");
             log::warn!(
                 "token store verdict=refused reason=folder_not_synced marker={} error={why}",
                 if marked.is_ok() {
@@ -1061,6 +1064,8 @@ pub mod faults {
         pub static TOKEN_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// A store cannot read its token back.
         pub static READ_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The token file's folder cannot be synced.
+        pub static DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
 
@@ -1233,6 +1238,10 @@ fn install(path: &Path, value: &str, contents: &str) -> std::io::Result<()> {
 
 /// Flushes the directory entry of a rename to disk.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if faults::DIR_SYNC.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("directory sync failed"));
+    }
     #[cfg(test)]
     if tests::FAIL_DIR_SYNC.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("directory sync failed"));

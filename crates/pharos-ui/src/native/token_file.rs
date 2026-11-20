@@ -588,6 +588,17 @@ mod sign_out_tests {
                 read(&path).unwrap().is_none(),
                 "the unconfirmed token loads"
             );
+            // CR review 5995575621 (token.rs:609): a store whose rename
+            // landed but whose folder would not sync marks the cache stale,
+            // though its fence (every token) does not move.
+            pharos_content::token::faults::DIR_SYNC.with(|f| f.set(true));
+            let stored = pharos_content::token::store(&path, "tokE");
+            pharos_content::token::faults::DIR_SYNC.with(|f| f.set(false));
+            assert!(stored.is_err());
+            assert!(
+                take_stale(),
+                "a store that could not sync its folder did not mark the cache stale"
+            );
         }
     }
 }
