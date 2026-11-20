@@ -37,6 +37,17 @@ pub fn effective_cap(manual: u64, auto: u64) -> u64 {
     }
 }
 
+/// The automatic cap in force: none where the HLS engine picks its own
+/// quality, since the cap auto quality settled on under hls.js is then not
+/// negotiated (B1485).
+pub fn auto_in_force(auto: u64, engine_adapts: bool) -> u64 {
+    if engine_adapts {
+        0
+    } else {
+        auto
+    }
+}
+
 /// What the player's quality control shows: the viewer's manual maximum
 /// (0 is Auto), the cap auto quality settled on (0 is none) and how the
 /// server is playing the video.
@@ -876,6 +887,23 @@ mod tests {
         assert_eq!(effective_cap(0, 2_000_000), 2_000_000);
         assert_eq!(effective_cap(2_000_000, 4_000_000), 2_000_000);
         assert_eq!(effective_cap(4_000_000, 1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn an_engine_that_adapts_has_no_auto_cap_in_force() {
+        // V1476: the menu shows the cap negotiation sends, not the stored rung.
+        assert_eq!(auto_in_force(2_000_000, true), 0);
+        assert_eq!(auto_in_force(2_000_000, false), 2_000_000);
+        let shown = QualityView {
+            manual: 0,
+            auto: auto_in_force(2_000_000, true),
+            method: String::new(),
+        };
+        assert_eq!(shown.title(), "Quality: Auto, no limit");
+        assert!(shown
+            .options(0)
+            .iter()
+            .all(|(value, _)| value != RESET_AUTO));
     }
 
     #[test]
