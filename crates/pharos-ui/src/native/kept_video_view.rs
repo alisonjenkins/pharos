@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, ItemRef, PharosApi, TrackPicks};
 
@@ -527,11 +528,12 @@ pub fn VideoDownloads(
     let used = user.as_deref().map_or(0, |u| store.used_bytes(u));
     let remove_user = user.clone();
     let remove_store = store.clone();
-    let problem = use_signal(|| None::<String>);
-    let discarding = use_signal(|| false);
+    // App-wide, not this view's: a discard outlives the page that started
+    // it, and a page mounted again shows the one still running.
+    let discard = DISCARD.read().clone();
     // Read at each render. The listing polls it with the videos, so a change
     // a sweep makes renders again even when the list is the same; a discard
-    // sets `problem`, which renders again too.
+    // sets its result, which renders again too.
     let unreadable = store.unreadable_count();
     let leftover = store.leftover_count();
     let discard_store = store.clone();
@@ -562,11 +564,11 @@ pub fn VideoDownloads(
                 videos: rows_for(&listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
                 used,
                 cap: store.cap_bytes(),
-                problem: problem(),
+                problem: discard.problem,
                 unreadable,
                 leftover,
-                discarding: discarding(),
-                on_discard: move |()| start_discard(discard_store.clone(), discarding, problem),
+                discarding: discard.running,
+                on_discard: move |()| start_discard(discard_store.clone()),
                 on_play: move |item: String| match item.parse::<ItemRef>() {
                     Ok(id) => nav.0.call(Route::Watch(id)),
                     Err(e) => platform::warn(&format!("pharos: video play failed item={item} error={e}")),
@@ -579,26 +581,40 @@ pub fn VideoDownloads(
     }
 }
 
+/// The discard of unreadable folders: whether one runs, and what the last
+/// one left to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Discard {
+    running: bool,
+    problem: Option<String>,
+}
+
+/// Held for the whole app, not by the Downloads page: a page left while
+/// the folders are deleting would otherwise come back with the button
+/// enabled (a second discard beside the first) and lose the result.
+static DISCARD: GlobalSignal<Discard> = Signal::global(Discard::default);
+
 /// Discards the folders whose record cannot be read (`discard_unreadable`
 /// deletes folders, so it can take a while). The deleting runs on its own
-/// thread, off the UI executor; `discarding` is set until it ends (the
-/// button is disabled meanwhile) and `problem` is set back on the UI.
-/// Runs once at a time.
-fn start_discard(
-    store: std::sync::Arc<dyn super::kept_video::VideoStore>,
-    mut discarding: Signal<bool>,
-    mut problem: Signal<Option<String>>,
-) {
-    if *discarding.peek() {
+/// thread, off the UI executor, and its task is the app's, not the page's:
+/// `DISCARD` says it runs until it ends (the button is disabled meanwhile)
+/// and then holds its result. Runs once at a time, whatever page asks.
+fn start_discard(store: std::sync::Arc<dyn super::kept_video::VideoStore>) {
+    if DISCARD.peek().running {
+        platform::info("pharos: video discard unreadable verdict=skipped reason=already_running");
         return;
     }
-    discarding.set(true);
-    spawn(async move {
+    {
+        let mut d = DISCARD.write();
+        d.running = true;
+        d.problem = None;
+    }
+    spawn_forever(async move {
         let outcome = off_ui(move || store.discard_unreadable()).await;
         platform::info(&format!(
             "pharos: video discard unreadable result={outcome:?}"
         ));
-        problem.set(match outcome {
+        let problem = match outcome {
             Ok(Ok(_)) => None,
             Ok(Err(e)) => Some(format!("Some downloads could not be removed: {e}")),
             Err(OffUi::Stopped) => {
@@ -607,8 +623,11 @@ fn start_discard(
             Err(OffUi::NotStarted(e)) => Some(format!(
                 "Some downloads could not be removed: the removal could not start ({e}). Try again."
             )),
-        });
-        discarding.set(false);
+        };
+        *DISCARD.write() = Discard {
+            running: false,
+            problem,
+        };
     });
 }
 
@@ -844,12 +863,11 @@ mod tests {
             static STORE: RefCell<Option<Arc<dyn VideoStore>>> = const { RefCell::new(None) };
         }
         fn root() -> Element {
-            let discarding = use_signal(|| false);
-            let problem = use_signal(|| None::<String>);
             use_hook(|| {
                 let store = STORE.with(|s| s.borrow().clone()).unwrap();
-                start_discard(store, discarding, problem);
+                start_discard(store);
             });
+            let discard = DISCARD.read().clone();
             rsx! {
                 VideoList {
                     videos: vec![],
@@ -857,9 +875,9 @@ mod tests {
                     cap: 0,
                     on_play: |_| {},
                     on_remove: |_| {},
-                    problem: problem(),
+                    problem: discard.problem,
                     unreadable: 1,
-                    discarding: discarding(),
+                    discarding: discard.running,
                 }
             }
         }
@@ -947,6 +965,134 @@ mod tests {
             !html.contains("disabled"),
             "the button stayed disabled: {html}"
         );
+    }
+
+    /// A discard outlives the page that started it: the page mounted again
+    /// while the folders are deleting shows it running (no second discard
+    /// starts), and its result reaches the page shown when it ends.
+    #[test]
+    fn a_discard_survives_its_page_unmounting() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        struct Slow {
+            held: Mutex<std::sync::mpsc::Receiver<()>>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl VideoStore for Slow {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn unreadable_count(&self) -> usize {
+                1
+            }
+            fn discard_unreadable(&self) -> Result<u64, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self.held.lock().unwrap().recv();
+                Err("one folder stayed".to_owned())
+            }
+        }
+        thread_local! {
+            static STORE: RefCell<Option<Arc<dyn VideoStore>>> = const { RefCell::new(None) };
+            static SHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        }
+        #[component]
+        fn Page() -> Element {
+            // Each mount presses the button.
+            use_hook(|| start_discard(STORE.with(|s| s.borrow().clone()).unwrap()));
+            let discard = DISCARD.read().clone();
+            rsx! {
+                VideoList {
+                    videos: vec![],
+                    used: 0,
+                    cap: 0,
+                    on_play: |_| {},
+                    on_remove: |_| {},
+                    problem: discard.problem,
+                    unreadable: 1,
+                    discarding: discard.running,
+                }
+            }
+        }
+        fn root() -> Element {
+            rsx! {
+                if SHOWN.with(std::cell::Cell::get) {
+                    Page {}
+                }
+            }
+        }
+        let (release, held) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        STORE.with(|s| {
+            *s.borrow_mut() = Some(Arc::new(Slow {
+                held: Mutex::new(held),
+                calls: calls.clone(),
+            }))
+        });
+        let watchdog = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = watchdog.send(());
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let drive = |dom: &mut VirtualDom, until: &dyn Fn(&VirtualDom) -> bool| {
+            rt.block_on(async {
+                let start = std::time::Instant::now();
+                while !until(dom) && start.elapsed() < std::time::Duration::from_secs(3) {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        dom.wait_for_work(),
+                    )
+                    .await;
+                    dom.render_immediate_to_vec();
+                }
+            });
+        };
+        drive(&mut dom, &|_| calls.load(Ordering::SeqCst) == 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the removal never started");
+        // Leave the page, then come back while the folders are deleting.
+        SHOWN.with(|s| s.set(false));
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        assert!(!dioxus_ssr::render(&dom).contains("Remove them"));
+        SHOWN.with(|s| s.set(true));
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("disabled"),
+            "the page came back enabled: {html}"
+        );
+        release.send(()).unwrap();
+        drive(&mut dom, &|dom| {
+            dioxus_ssr::render(dom).contains("one folder stayed")
+        });
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("Some downloads could not be removed: one folder stayed"),
+            "the result was lost with the page: {html}"
+        );
+        assert!(!html.contains("disabled"), "a retry is not offered: {html}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a second discard ran");
     }
 
     /// A poll refreshes the screen when only the unreadable count changed:
@@ -1059,12 +1205,11 @@ mod tests {
             }
         }
         fn root() -> Element {
-            let discarding = use_signal(|| false);
-            let problem = use_signal(|| None::<String>);
             use_hook(|| {
                 OFF_UI_SPAWN_FAULT.with(|f| f.set(true));
-                start_discard(Arc::new(Never), discarding, problem);
+                start_discard(Arc::new(Never));
             });
+            let discard = DISCARD.read().clone();
             rsx! {
                 VideoList {
                     videos: vec![],
@@ -1072,9 +1217,9 @@ mod tests {
                     cap: 0,
                     on_play: |_| {},
                     on_remove: |_| {},
-                    problem: problem(),
+                    problem: discard.problem,
                     unreadable: 1,
-                    discarding: discarding(),
+                    discarding: discard.running,
                 }
             }
         }
