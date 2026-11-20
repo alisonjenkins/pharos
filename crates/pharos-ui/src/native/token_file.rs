@@ -84,11 +84,11 @@ pub fn fence(path: &Path) -> SignOutFence {
     pharos_content::token::fence(path)
 }
 
-/// Sets the sign-out fence of the token file at `path` (`reason` for the
-/// log), under the file's lock.
-pub fn set_fence(path: &Path, next: SignOutFence, reason: &str) {
+/// Adds `more` to the sign-out fence of the token file at `path`
+/// (`reason` for the log), under the file's lock; it never lifts a refusal.
+pub fn add_fence(path: &Path, more: &SignOutFence, reason: &str) {
     watch_stores();
-    pharos_content::token::set_fence(path, next, reason);
+    pharos_content::token::add_fence(path, more, reason);
 }
 
 /// Fences every token at every path in this process
@@ -201,7 +201,7 @@ pub fn forget_token_with(
 ) -> SignedOut {
     let path = path_lookup();
     match &path {
-        Ok(path) => set_fence(path, SignOutFence::Every, "sign_out_started"),
+        Ok(path) => add_fence(path, &SignOutFence::Every, "sign_out_started"),
         Err(_) => fence_every_file("token_path_unknown"),
     }
     let verdict = match path {
@@ -430,7 +430,7 @@ mod sign_out_tests {
         store(&path, "tokA").unwrap();
         pair(&path, Some("tokA"), "u1").unwrap();
         // forget_token could not read the token: no name for the fence.
-        set_fence(&path, SignOutFence::for_token(None), "test");
+        add_fence(&path, &SignOutFence::for_token(None), "test");
         assert_eq!(fence(&path), SignOutFence::Every);
         pharos_content::token::store(&path, "tokB").unwrap();
         pair(&path, Some("tokB"), "u1").unwrap();
@@ -514,7 +514,7 @@ mod sign_out_tests {
             take_stale(),
             "a revocation marker did not mark the cache stale"
         );
-        pharos_content::token::set_fence(&path, SignOutFence::Every, "test");
+        pharos_content::token::add_fence(&path, &SignOutFence::Every, "test");
         assert!(take_stale(), "a fence did not mark the cache stale");
     }
 }

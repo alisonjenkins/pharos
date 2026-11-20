@@ -167,8 +167,24 @@ fn fence_held(path: &Path) -> Fence {
         .unwrap_or_default()
 }
 
-/// Replaces the fence of `path`; the caller holds the file's lock.
-fn set_fence_held(path: &Path, next: Fence, reason: &str) {
+/// Adds `more` to the fence of `path` ([`Fence::union`]): it refuses what
+/// it refused before and what `more` refuses. Every fence change but a
+/// confirmed store's goes through it, so a failure never narrows a fence.
+/// The caller holds the file's lock.
+fn add_fence_held(path: &Path, more: &Fence, reason: &str) {
+    let was = FENCES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(path)
+        .cloned()
+        .unwrap_or_default();
+    replace_fence_held(path, was.union(more), reason);
+}
+
+/// Replaces the fence of `path`: only for a store confirmed on disk
+/// ([`Fence::after_store`]), and for tests. The caller holds the file's
+/// lock.
+fn replace_fence_held(path: &Path, next: Fence, reason: &str) {
     let was = {
         let mut all = FENCES.lock().unwrap_or_else(PoisonError::into_inner);
         let was = all.get(path).cloned().unwrap_or_default();
@@ -195,12 +211,20 @@ pub fn fence(path: &Path) -> Fence {
     fence_held(path)
 }
 
-/// Sets the fence of the token file at `path`, under the file's lock: for a
-/// caller that decided it from a read of its own (a test, or a host whose
-/// sign-out was refused before it reached the file).
-pub fn set_fence(path: &Path, next: Fence, reason: &str) {
+/// Adds `more` to the fence of the token file at `path`, under the file's
+/// lock: for a caller that decided it from a read of its own (a test, or
+/// a host whose sign-out was refused before it reached the file). It
+/// never lifts what the fence already refuses; only a store does.
+pub fn add_fence(path: &Path, more: &Fence, reason: &str) {
     let _held = hold();
-    set_fence_held(path, next, reason);
+    add_fence_held(path, more, reason);
+}
+
+/// Clears the fence of `path`, as a restart does.
+#[cfg(test)]
+pub(crate) fn clear_fence(path: &Path) {
+    let _held = hold();
+    replace_fence_held(path, Fence::Open, "test_clear");
 }
 
 fn err(path: &Path, e: impl std::fmt::Display) -> ContentError {
@@ -512,7 +536,9 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         Err(why) => {
             // Installed, but a crash may undo or keep the rename: the new token
             // is refused here, and by a marker of its own after a restart.
-            set_fence_held(path, Fence::token(&new), "store_not_durable");
+            // Added to the fence, never in its place: an older link's token
+            // that it refused stays refused.
+            add_fence_held(path, &Fence::token(&new), "store_not_durable");
             let marked = write_marker(path, None, &new);
             log::warn!(
                 "token store verdict=refused reason=folder_not_synced marker={} error={why}",
@@ -545,7 +571,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         Ok(Some(s)) if s.token == token => {
             let stored = fingerprint(token);
             let next = fence_held(path).after_store(&stored, replaced.as_deref());
-            set_fence_held(path, next, "token_stored");
+            replace_fence_held(path, next, "token_stored");
             if EVERY_FILE.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 log::info!("token fence verdict=open scope=process reason=token_stored");
             }
@@ -726,8 +752,11 @@ pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended
     if let Ended::Unsafe { target, .. } = &ended {
         // Added to what is already refused, never in its place: an earlier
         // sign-out's token may still be held by a live link.
-        let next = fence_held(path).union(&Fence::for_target(target.as_deref()));
-        set_fence_held(path, next, "token_neither_removed_nor_marked");
+        add_fence_held(
+            path,
+            &Fence::for_target(target.as_deref()),
+            "token_neither_removed_nor_marked",
+        );
     }
     ended
 }
@@ -1660,7 +1689,7 @@ pub(crate) mod tests {
 
     /// What a restart reads: the in-process fence is gone, the disk stays.
     fn after_restart(p: &Path) -> Option<String> {
-        set_fence(p, Fence::Open, "test_restart");
+        clear_fence(p);
         EVERY_FILE.store(false, std::sync::atomic::Ordering::SeqCst);
         load(p).unwrap()
     }
@@ -1927,7 +1956,7 @@ pub(crate) mod tests {
         let d = dir("read-back");
         let p = d.join("device-token");
         store(&p, "tokA").unwrap();
-        set_fence(&p, Fence::Every, "test");
+        add_fence(&p, &Fence::Every, "test");
         FAIL_READ_BACK.with(|f| f.set(true));
         let stored = store(&p, "tokB");
         FAIL_READ_BACK.with(|f| f.set(false));
@@ -1939,7 +1968,7 @@ pub(crate) mod tests {
             "the fence followed an unconfirmed store"
         );
         assert!(!is_store_incomplete(&store(&p, "").unwrap_err()));
-        set_fence(&p, Fence::Open, "test");
+        clear_fence(&p);
     }
 
     /// CR 4640611307: a store over an unnamed fence that cannot read the
@@ -1951,7 +1980,7 @@ pub(crate) mod tests {
         let d = dir("fence-all-but");
         let p = d.join("device-token");
         store(&p, "tokA").unwrap();
-        set_fence(&p, Fence::Every, "test");
+        add_fence(&p, &Fence::Every, "test");
         FAIL_PREVIOUS_READ.with(|f| f.set(true));
         store(&p, "tokB").unwrap();
         FAIL_PREVIOUS_READ.with(|f| f.set(false));
@@ -1962,7 +1991,35 @@ pub(crate) mod tests {
         );
         assert!(!f.refuses("tokB"));
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
-        set_fence(&p, Fence::Open, "test");
+        clear_fence(&p);
+    }
+
+    /// CR 4641125283, 4641128622: a store whose folder will not sync adds
+    /// its token to the fence and narrows nothing. An older link's token,
+    /// refused by an unnamed fence or by name, stays refused beside the
+    /// new one.
+    #[test]
+    fn a_store_whose_folder_will_not_sync_keeps_the_fence_it_found() {
+        for (case, held) in [
+            ("every", Fence::Every),
+            ("token", Fence::token(&fingerprint("tokA"))),
+        ] {
+            let d = dir(&format!("fence-sync-{case}"));
+            let p = d.join("device-token");
+            store(&p, "tokA").unwrap();
+            add_fence(&p, &held, "test");
+            FAIL_DIR_SYNC.with(|f| f.set(true));
+            let stored = store(&p, "tokB");
+            FAIL_DIR_SYNC.with(|f| f.set(false));
+            assert!(stored.is_err(), "{case}: {stored:?}");
+            let f = fence(&p);
+            assert!(f.refuses("tokA"), "{case}: A's refusal was lost: {f:?}");
+            assert!(
+                f.refuses("tokB"),
+                "{case}: the unsynced B is allowed: {f:?}"
+            );
+            clear_fence(&p);
+        }
     }
 
     /// CR 4640611335: an unsafe sign-out of B after an unsafe sign-out of A
@@ -1990,7 +2047,7 @@ pub(crate) mod tests {
         assert!(f.refuses("tokB"), "{f:?}");
         store(&p, "tokC").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokC"));
-        set_fence(&p, Fence::Open, "test");
+        clear_fence(&p);
     }
 
     /// Named fences join into one set: each name stays refused, and a

@@ -35,7 +35,9 @@ fn a_token_fenced_on_the_app_thread_is_refused_by_the_worker_thread() {
     let at = token_path.clone();
     std::thread::Builder::new()
         .name("app-sign-out".into())
-        .spawn(move || token::set_fence(&at, token::Fence::for_token(Some("fenced-token")), "test"))
+        .spawn(move || {
+            token::add_fence(&at, &token::Fence::for_token(Some("fenced-token")), "test")
+        })
         .unwrap()
         .join()
         .unwrap();

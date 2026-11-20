@@ -2163,7 +2163,7 @@ mod tests {
         shared.set_auth(AuthState::SignedIn);
         crate::testlog::start();
         // The app's sign-out fenced the token it could not end.
-        token::set_fence(&token_path, token::Fence::for_token(Some("tok")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
         local.block_on(&rt, async {
             w.execute(&Op::StaySignedOut, &events).await.unwrap();
             w.execute(&Op::Reload, &events).await.unwrap();
@@ -2291,14 +2291,14 @@ mod tests {
         let root = test_root("fence-not-lifted");
         let (mut w, _shared, token_path) = worker(&root);
         token::store(&token_path, "tokB").unwrap();
-        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
         assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
         assert_eq!(
             token::fence(&token_path),
             token::Fence::for_token(Some("tokA")),
             "a read lifted the fence"
         );
-        token::set_fence(&token_path, token::Fence::for_token(Some("tokB")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokB")), "test");
         assert_eq!(
             w.load_token().unwrap(),
             None,
@@ -2340,7 +2340,7 @@ mod tests {
             .await;
         });
         assert!(w.link.is_some(), "the approval opened no link");
-        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
         let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
         assert!(
             matches!(&out, Err(ContentError::NeedsSignIn)),
@@ -2368,7 +2368,7 @@ mod tests {
                 mut results: session::MediaTokenResults,
             ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
                 if let Some(path) = FENCE_AT.with(|f| f.borrow_mut().take()) {
-                    token::set_fence(&path, token::Fence::for_token(Some("tokA")), "test");
+                    token::add_fence(&path, &token::Fence::for_token(Some("tokA")), "test");
                 }
                 let mut t = results.get().init_result().init_token();
                 t.set_token("media");
@@ -2469,7 +2469,7 @@ mod tests {
             &local,
             || {
                 if let Some(path) = HOOK_PATH.with(|p| p.borrow_mut().take()) {
-                    token::set_fence(&path, token::Fence::for_token(Some("tokA")), "test");
+                    token::add_fence(&path, &token::Fence::for_token(Some("tokA")), "test");
                 }
             },
             "tokA",
@@ -2512,14 +2512,14 @@ mod tests {
         approve(&mut w, &rt, &local, || {}, "tokA");
         assert!(w.link.is_some());
         token::store(&token_path, "tokB").unwrap();
-        token::set_fence(&token_path, token::Fence::for_token(Some("tokA")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
         let out = local.block_on(&rt, w.link(&events));
         assert!(
             matches!(&out, Err(ContentError::Connect { .. })),
             "the replacement was not resumed: {:?}",
             out.err()
         );
-        token::set_fence(&token_path, token::Fence::Open, "test");
+        token::clear_fence(&token_path);
     }
 
     /// CR 4637783547: a sign-out fences the token `end_session` targeted
@@ -2560,7 +2560,7 @@ mod tests {
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         token::store(&token_path, "tok").unwrap();
-        token::set_fence(&token_path, token::Fence::for_token(Some("tok")), "test");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
         local.block_on(&rt, async {
             w.execute(&Op::Reload, &events).await.unwrap();
         });
