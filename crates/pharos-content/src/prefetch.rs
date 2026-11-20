@@ -603,7 +603,14 @@ impl Gate {
         let mut epoch = self.online_epoch.load(Ordering::SeqCst);
         let mut refreshed = false;
         let mut attempt = 0u32;
-        let mut st = self.lock().deferred.remove(id).unwrap_or_default();
+        // Held before the deferred state is read: from here no eviction
+        // takes this track's part, and one that took it before is named.
+        let _active = Active::start(&self.cache, id);
+        let mut st = {
+            let mut q = self.lock();
+            self.drop_evicted_states(&mut q);
+            q.deferred.remove(id).unwrap_or_default()
+        };
         let part_len = || std::fs::metadata(self.cache.part_path(id)).map_or(0, |m| m.len());
         self.cache.clear_failed(id);
         // Whatever the job reserved is released however it ends.
@@ -784,6 +791,19 @@ impl Gate {
                     part_len()
                 );
                 self.give_up(id, PartFate::Discard);
+            }
+        }
+        // What this job's admissions evicted goes now, not at the next job.
+        self.drop_evicted_states(&mut self.lock());
+    }
+
+    /// A part an eviction took cannot be resumed: the state kept for it
+    /// goes, and the track starts again from zero. Run as each job starts
+    /// and ends, under the queue lock.
+    fn drop_evicted_states(&self, q: &mut Queue) {
+        for gone in self.cache.take_evicted_parts() {
+            if q.deferred.remove(&gone).is_some() {
+                log::info!("cache download id={gone} verdict=dropped_state reason=part_evicted");
             }
         }
     }
@@ -1057,6 +1077,26 @@ impl Gate {
 }
 
 /// Releases a track's reserved free space when its job ends.
+/// Marks a job's track active in the cache, so eviction leaves its
+/// `.part` alone, until dropped.
+struct Active<'a> {
+    cache: &'a Cache,
+    id: &'a str,
+}
+
+impl<'a> Active<'a> {
+    fn start(cache: &'a Cache, id: &'a str) -> Self {
+        cache.job_started(id);
+        Self { cache, id }
+    }
+}
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.cache.job_ended(self.id);
+    }
+}
+
 struct Reserved<'a> {
     cache: &'a Cache,
     id: &'a str,

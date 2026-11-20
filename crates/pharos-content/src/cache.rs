@@ -291,6 +291,13 @@ pub struct Cache {
     /// when it was made: the bytes written since come off what is still
     /// owed, so a host never counts them both on disk and as owed.
     reserved: Mutex<std::collections::HashMap<String, Reservation>>,
+    /// Tracks a download job is running for: their `.part` is never
+    /// evicted. A leaf lock, taken under the cache's lock or alone.
+    active: Mutex<HashSet<String>>,
+    /// Tracks whose retained `.part` an eviction removed since the
+    /// downloader last asked: it drops the state it kept to resume them.
+    /// A leaf lock, as `active`.
+    evicted_parts: Mutex<HashSet<String>>,
 }
 
 impl Reservation {
@@ -526,6 +533,8 @@ impl Cache {
             free,
             outside: Mutex::new(None),
             reserved: Mutex::default(),
+            active: Mutex::default(),
+            evicted_parts: Mutex::default(),
         };
         {
             let mut s = cache.lock();
@@ -1181,6 +1190,38 @@ impl Cache {
                 None
             }
         }
+    }
+
+    /// A download job for `id` is running: its `.part` is not evicted
+    /// until [`Cache::job_ended`].
+    pub fn job_started(&self, id: &str) {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned());
+    }
+
+    /// The job for `id` is over: a `.part` it left may be evicted.
+    pub fn job_ended(&self, id: &str) {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// The tracks whose retained `.part` was evicted since the last call,
+    /// sorted. Each is named once.
+    pub fn take_evicted_parts(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::mem::take(
+            &mut *self
+                .evicted_parts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect();
+        v.sort();
+        v
     }
 
     /// Drops what was reserved for `id`: its write landed, failed or was
