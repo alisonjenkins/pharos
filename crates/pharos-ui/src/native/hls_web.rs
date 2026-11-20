@@ -173,6 +173,9 @@ struct Session {
     video_listeners: Vec<(&'static str, EventListener)>,
     planner: Option<Planner>,
     deadlines: Deadlines,
+    /// The token this play's stream requests carry (see [`stream_request`]):
+    /// held per play, so a play never sends another's.
+    token: Option<Rc<str>>,
     device: &'static str,
     buffer: Config,
     abr: Option<AbrState>,
@@ -220,6 +223,49 @@ impl Session {
 #[derive(Default)]
 pub(super) struct RustHls {
     session: Option<Rc<RefCell<Session>>>,
+    /// The device class when the page cannot tell it: the Android app's page.
+    device: Option<super::playback::DeviceClass>,
+    /// The token stream requests carry. The browser sends its cookie instead
+    /// and sets none; the Android app's page has no cookie for the server.
+    token: Option<Rc<str>>,
+}
+
+impl RustHls {
+    pub(super) fn for_device(device: super::playback::DeviceClass) -> Self {
+        Self {
+            session: None,
+            device: Some(device),
+            token: None,
+        }
+    }
+
+    /// Every stream request of the plays this engine attaches carries `token`
+    /// when its address names no play session.
+    pub(super) fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token.map(Rc::from);
+        self
+    }
+}
+
+/// A GET for a playlist or a segment, with its play's `token` when the
+/// address names no play session.
+fn stream_request(uri: &str, token: Option<&str>) -> gloo_net::http::RequestBuilder {
+    let request = Request::get(uri);
+    match token {
+        Some(token) if super::playback::wants_token_header(uri) => {
+            request.header("X-Emby-Token", token)
+        }
+        _ => request,
+    }
+}
+
+/// The token of the play `weak` names (`Some(None)` for a play with none),
+/// or `None` once the play is gone or stopped: a request after an await
+/// asks first.
+fn live_token(weak: &Weak<RefCell<Session>>) -> Option<Option<Rc<str>>> {
+    let session = weak.upgrade()?;
+    let s = session.borrow();
+    (!s.dead).then(|| s.token.clone())
 }
 
 impl PlaybackEngine for RustHls {
@@ -237,7 +283,7 @@ impl PlaybackEngine for RustHls {
         let object_url = web_sys::Url::create_object_url_with_source(&media_source)
             .map_err(|e| format!("createObjectURL: {e:?}"))?;
 
-        let device = super::app::this_device();
+        let device = self.device.unwrap_or_else(super::app::this_device);
         let deadlines = segment_deadlines(device);
         let session = Rc::new(RefCell::new(Session {
             video_id: video_id.to_owned(),
@@ -250,6 +296,7 @@ impl PlaybackEngine for RustHls {
             video_listeners: Vec::new(),
             planner: None,
             deadlines,
+            token: self.token.clone(),
             device: device.label(),
             buffer: engine_buffer_config(device),
             abr: None,
@@ -669,13 +716,13 @@ async fn prepare_abr(
             Ok(None)
         } else {
             // The player may have closed, or rebuilt, while the last rung loaded.
-            let Some(deadlines) = weak.upgrade().and_then(|s| {
+            let Some((deadlines, token)) = weak.upgrade().and_then(|s| {
                 let s = s.borrow();
-                (!s.dead && s.recovery.epoch() == epoch).then_some(s.deadlines)
+                (!s.dead && s.recovery.epoch() == epoch).then(|| (s.deadlines, s.token.clone()))
             }) else {
                 return;
             };
-            match get_text_within(&entry.uri, deadlines).await {
+            match get_text_within(&entry.uri, token.as_deref(), deadlines).await {
                 Ok(text) => parse_media(&text, &entry.uri)
                     .map(Some)
                     .map_err(|e| e.to_string()),
@@ -884,7 +931,7 @@ fn empty_media_playlist() -> MediaPlaylist {
 }
 
 async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value: &str) {
-    let Some((video, object_url, video_id, url, start_ms, on_fatal, on_fragment)) =
+    let Some((video, object_url, video_id, url, start_ms, on_fatal, on_fragment, token)) =
         weak.upgrade().and_then(|s| {
             let mut s = s.borrow_mut();
             (!s.dead).then(|| {
@@ -896,6 +943,7 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
                     s.start_ms,
                     Rc::clone(&s.on_fatal),
                     Rc::clone(&s.on_fragment),
+                    s.token.clone(),
                 )
             })
         })
@@ -928,19 +976,22 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
         ],
     });
 
-    if let Err(e) = load_script(HLSJS_SRC, "Hls").await {
-        on_fatal(Fatal::other(e));
-        return;
-    }
+    let loaded = load_script(HLSJS_SRC, "Hls").await;
 
+    // A play stopped while hls.js loaded is over: its failure must not reach
+    // a replacement play of the same `<video>`.
     let Some(session) = weak.upgrade() else {
         return;
     };
     if session.borrow().dead {
         return;
     }
+    if let Err(e) = loaded {
+        on_fatal(Fatal::other(e));
+        return;
+    }
 
-    let mut hls = HlsJs::default();
+    let mut hls = HlsJs::with_token(token);
     match hls.attach(&video_id, &url, start_ms, Rc::clone(&on_fatal), on_fragment) {
         Ok(()) => {
             session.borrow_mut().fallback = Some(hls);
@@ -1408,12 +1459,22 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         }
     };
 
-    let (uri, media_ms, offset_s, generation, old_controller, deadlines, signal, prefetched) = {
+    let (
+        uri,
+        media_ms,
+        offset_s,
+        generation,
+        old_controller,
+        (deadlines, token),
+        signal,
+        prefetched,
+    ) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
         }
         let deadlines = s.deadlines;
+        let token = s.token.clone();
         let first_media = s.planner.as_ref().and_then(|p| p.first_media(track));
         let init_part = s.planner.as_ref().map_or(0, |p| p.init_part(track));
         let Some(t) = s.track_mut(track) else {
@@ -1459,7 +1520,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         if request == SegRequest::Init && read_time_ranges(&t.source_buffer).is_empty() {
             t.prefetch = first_media.and_then(|index| {
                 let seg_uri = t.segments.get(index)?.uri.clone();
-                start_prefetch(track, index, seg_uri, deadlines)
+                start_prefetch(track, index, seg_uri, deadlines, token.clone())
             });
         }
         let (controller, outcome) = match prefetched {
@@ -1471,7 +1532,14 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         let gen = t.generation;
         let old = t.controller.replace(controller);
         (
-            uri, media_ms, offset_s, gen, old, deadlines, signal, outcome,
+            uri,
+            media_ms,
+            offset_s,
+            gen,
+            old,
+            (deadlines, token),
+            signal,
+            outcome,
         )
     };
 
@@ -1491,7 +1559,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                             should_abandon(&session, since_headers_ms, media_ms)
                         })
                 };
-                fetch_segment(&uri, &signal, deadlines, abandon).await
+                fetch_segment(&uri, token.as_deref(), &signal, deadlines, abandon).await
             }
         };
         if signal.aborted() {
@@ -1569,6 +1637,7 @@ fn start_prefetch(
     index: usize,
     uri: String,
     deadlines: Deadlines,
+    token: Option<Rc<str>>,
 ) -> Option<Prefetch> {
     use futures_util::FutureExt;
     let controller = web_sys::AbortController::new().ok()?;
@@ -1578,10 +1647,11 @@ fn start_prefetch(
         track.label()
     ));
     let fetch_uri = uri.clone();
-    let outcome =
-        async move { Rc::new(fetch_segment(&fetch_uri, &signal, deadlines, |_| false).await) }
-            .boxed_local()
-            .shared();
+    let outcome = async move {
+        Rc::new(fetch_segment(&fetch_uri, token.as_deref(), &signal, deadlines, |_| false).await)
+    }
+    .boxed_local()
+    .shared();
     // Polled here so the request runs before anything waits on it.
     wasm_bindgen_futures::spawn_local(outcome.clone().map(drop));
     Some(Prefetch {
@@ -1635,13 +1705,14 @@ async fn body_buffer(resp: web_sys::Response) -> Result<js_sys::ArrayBuffer, JsV
 /// whether to give the download up, with the time since the headers.
 async fn fetch_segment(
     uri: &str,
+    token: Option<&str>,
     signal: &web_sys::AbortSignal,
     deadlines: Deadlines,
     abandon: impl Fn(u64) -> bool,
 ) -> Result<(js_sys::ArrayBuffer, u64, u64), FetchFailure> {
     let sent_at = now_ms();
     let mut watch = Watch::new(deadlines, now_ms_u64());
-    let send = Request::get(uri).abort_signal(Some(signal)).send();
+    let send = stream_request(uri, token).abort_signal(Some(signal)).send();
     let resp = within(send, watch.remaining_ms(now_ms_u64()))
         .await
         .ok_or_else(|| FetchFailure::timeout(&watch))?
@@ -1766,13 +1837,14 @@ fn on_fetch_failed(
     } else {
         0
     };
-    let (report, stepped, on_fatal) = {
+    let (report, stepped, on_fatal, on_fragment) = {
         let mut guard = session.borrow_mut();
         let s = &mut *guard;
         if s.dead {
             return;
         }
         let on_fatal = Rc::clone(&s.on_fatal);
+        let on_fragment = Rc::clone(&s.on_fragment);
         let rung = current_rung(s, track);
         let Some(t) = s.track_mut(track) else {
             return;
@@ -1806,9 +1878,13 @@ fn on_fetch_failed(
         if report.fatal() {
             s.dead = true;
         }
-        (report, stepped, on_fatal)
+        (report, stepped, on_fatal, on_fragment)
     };
 
+    // Every failed attempt is told, as hls.js tells each `fragLoadError` and
+    // `fragLoadTimeOut`: the quality watch must know a stall that follows is
+    // the server's failure, not the link's speed.
+    on_fragment(super::playback::segment_failure_event(report.cause));
     warn(&report.line());
     report_event(report.event(current_path()));
 
@@ -2140,7 +2216,11 @@ fn maybe_end_of_stream(session: &Rc<RefCell<Session>>) {
 /// A playlist's text, or a failure once its headers or its body take longer
 /// than `deadlines` allow: a connection that hangs would otherwise leave the
 /// player loading for good (B1496).
-async fn get_text_within(url: &str, deadlines: Deadlines) -> Result<String, (Option<u16>, String)> {
+async fn get_text_within(
+    url: &str,
+    token: Option<&str>,
+    deadlines: Deadlines,
+) -> Result<String, (Option<u16>, String)> {
     let controller = web_sys::AbortController::new().ok();
     let signal = controller.as_ref().map(web_sys::AbortController::signal);
     let timed_out = |what: &str, ms: u64| {
@@ -2149,7 +2229,9 @@ async fn get_text_within(url: &str, deadlines: Deadlines) -> Result<String, (Opt
         }
         (None, format!("no {what} within {ms} ms"))
     };
-    let send = Request::get(url).abort_signal(signal.as_ref()).send();
+    let send = stream_request(url, token)
+        .abort_signal(signal.as_ref())
+        .send();
     let resp = within(send, deadlines.first_byte_ms)
         .await
         .ok_or_else(|| timed_out("response", deadlines.first_byte_ms))?
@@ -2172,7 +2254,12 @@ async fn get_playlist(
 ) -> Result<String, (Option<u16>, String)> {
     let mut retries = Retries::new(policy);
     loop {
-        let (status, reason) = match get_text_within(url, policy.deadlines).await {
+        // A play stopped while an earlier playlist loaded asks for nothing more.
+        let Some(token) = live_token(weak) else {
+            return Err((None, "the play has ended".to_owned()));
+        };
+        let (status, reason) = match get_text_within(url, token.as_deref(), policy.deadlines).await
+        {
             Ok(text) => return Ok(text),
             Err(e) => e,
         };

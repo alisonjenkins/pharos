@@ -212,6 +212,17 @@ pub fn fragment_load_event(kind: &str, details: &str) -> Option<FragmentEvent> {
     }
 }
 
+/// The [`FragmentEvent`] the Rust engine tells the app for a failed segment
+/// fetch, as [`fragment_load_event`] reads hls.js's: a missed deadline is a
+/// timeout, an error status or a lost connection a failure.
+pub fn segment_failure_event(cause: pharos_hls::retry::Cause) -> FragmentEvent {
+    use pharos_hls::retry::Cause;
+    match cause {
+        Cause::TimeoutFirstByte | Cause::TimeoutLoad => FragmentEvent::TimedOut,
+        Cause::Http(_) | Cause::Network => FragmentEvent::Failed,
+    }
+}
+
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
@@ -3504,6 +3515,27 @@ mod tests {
             "(xhr, url) => { if (token && !/[?&]PlaySessionId=/i.test(url)) \
              xhr.setRequestHeader('X-Emby-Token', token); }"
         );
+    }
+
+    #[test]
+    fn a_failed_segment_fetch_tells_a_failure_or_a_timeout() {
+        use pharos_hls::retry::Cause;
+        for (cause, timed_out) in [
+            (Cause::Http(503), false),
+            (Cause::Network, false),
+            (Cause::TimeoutFirstByte, true),
+            (Cause::TimeoutLoad, true),
+        ] {
+            let event = segment_failure_event(cause);
+            assert!(
+                matches!(
+                    (&event, timed_out),
+                    (FragmentEvent::TimedOut, true) | (FragmentEvent::Failed, false)
+                ),
+                "{} gave {event:?}",
+                cause.label()
+            );
+        }
     }
 
     #[test]
