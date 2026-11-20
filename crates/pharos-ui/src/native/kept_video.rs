@@ -579,10 +579,11 @@ pub fn url_path(url: &str) -> &str {
 /// base's own path taken off, as [`request_key`] spells keys. `None` when
 /// it is outside the base's path, where no key can name it.
 pub fn key_under_base(base: &str, final_url: &str) -> Option<String> {
-    let full = request_key(final_url);
+    // Normalized before the base is checked: a plain `..` would climb
+    // out of it as an encoded one would.
+    let full = normalized(&request_key(final_url));
     let base_path = url_path(base).trim_end_matches('/');
-    let rest = full.strip_prefix(base_path)?;
-    (rest.starts_with('/') || rest.starts_with('?')).then(|| request_key(rest))
+    under_base(&full, base_path).map(request_key)
 }
 
 /// What [`localize_playlist`] made of a playlist.
@@ -1184,6 +1185,26 @@ mod tests {
                 "# see URI=\"https://elsewhere.example/x\"\n#EXT-X-MAP:URI=\"/videos/1/init.mp4\"\n"
                     .to_owned()
             )
+        );
+    }
+
+    /// CR 4646045317: a redirect's final URL is normalized before its base
+    /// is checked: a plain or encoded `..` that climbs out names no key,
+    /// and one that stays inside names the key it resolves to.
+    #[test]
+    fn a_final_url_climbing_out_of_the_base_names_no_key() {
+        let base = "https://s.example/jf";
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/../media/0.m4s"),
+            None
+        );
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/%2E%2E/media/0.m4s"),
+            None
+        );
+        assert_eq!(
+            key_under_base(base, "https://s.example/jf/videos/x/../0.m4s?s=1").as_deref(),
+            Some("/videos/0.m4s?s=1")
         );
     }
 
