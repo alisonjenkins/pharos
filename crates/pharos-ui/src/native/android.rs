@@ -276,6 +276,7 @@ pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::En
             return token_file::Ended::Unsafe {
                 removal: e,
                 marker: "no token path".to_owned(),
+                target: None,
             };
         }
     };

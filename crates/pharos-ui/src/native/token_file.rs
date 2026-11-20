@@ -102,7 +102,9 @@ pub fn sign_out(path: &Path) -> SignedOut {
             );
             SignedOut::Marked(why)
         }
-        Ended::Unsafe { removal, marker } => {
+        Ended::Unsafe {
+            removal, marker, ..
+        } => {
             log::warn!(
                 "pharos: token forget verdict=not_removed reason={removal} marker_error={marker}"
             );

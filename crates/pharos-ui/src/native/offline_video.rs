@@ -1028,7 +1028,9 @@ impl From<super::token_file::Ended> for TokenEnd {
             Ended::Forgotten(Forgotten::NotDurable(why)) => Self::ForgottenNotDurable(why),
             Ended::Changed => Self::KeptReplacement,
             Ended::Marked(why) => Self::Marked(why),
-            Ended::Unsafe { removal, marker } => Self::Unsafe { removal, marker },
+            Ended::Unsafe {
+                removal, marker, ..
+            } => Self::Unsafe { removal, marker },
         }
     }
 }

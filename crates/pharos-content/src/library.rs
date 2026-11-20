@@ -1009,7 +1009,9 @@ fn note_forgotten(at: &str, ended: token::Ended) -> Result<(), String> {
         token::Ended::Marked(why) => log::warn!(
             "pharos: token forget verdict=marked_revoked at={at} reason=token_not_removed error={why}"
         ),
-        token::Ended::Unsafe { removal, marker } => {
+        token::Ended::Unsafe {
+            removal, marker, ..
+        } => {
             log::warn!(
                 "pharos: token forget verdict=restart_unsafe at={at} removal_error={removal} marker_error={marker}"
             );
@@ -1327,14 +1329,24 @@ impl Worker {
     /// removed nor marked is fenced in this process, so nothing here
     /// resumes from it.
     fn end_session(&mut self, at: &str, seen: Option<&str>) -> Result<(), String> {
-        let held = token::load(&self.token_path).ok().flatten();
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_END_SESSION.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         let ended = token::end_session(&self.token_path, seen, None);
-        if matches!(ended, token::Ended::Unsafe { .. }) {
-            if let Some(t) = seen.or(held.as_deref()) {
-                set_fenced(Some(token::fingerprint(t)));
-                log::warn!(
-                    "token fence verdict=fenced reason=token_neither_removed_nor_marked at={at}"
-                );
+        // The fence names the token `end_session` targeted under the file's
+        // lock: a replacement stored after an earlier read is the one left.
+        if let token::Ended::Unsafe { target, .. } = &ended {
+            match target {
+                Some(fp) => {
+                    set_fenced(Some(fp.clone()));
+                    log::warn!(
+                        "token fence verdict=fenced reason=token_neither_removed_nor_marked at={at}"
+                    );
+                }
+                None => {
+                    log::warn!("token fence verdict=not_fenced reason=no_token_targeted at={at}")
+                }
             }
         }
         note_forgotten(at, ended)
@@ -1472,6 +1484,12 @@ mod tests {
 
     use super::*;
     use crate::testdir::TmpDir;
+
+    thread_local! {
+        /// Runs once in `end_session` before the token file is ended.
+        pub(super) static BEFORE_END_SESSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
 
     fn dead_server() -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2287,6 +2305,32 @@ mod tests {
             Some("tokB"),
             "the refusal of A's QuickConnect session removed B's token"
         );
+    }
+
+    /// CR 4637783547: a sign-out fences the token `end_session` targeted
+    /// under the file lock, not one read before it. A replaces nothing
+    /// here: B is stored in between, cannot be removed or marked, and B is
+    /// what the fence names.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_out_fences_the_token_it_targeted() {
+        let root = test_root("fence-targeted");
+        let (mut w, _shared, token_path) = worker(&root);
+        token::store(&token_path, "tokA").unwrap();
+        let swap = token_path.clone();
+        BEFORE_END_SESSION.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                token::store(&swap, "tokB").unwrap();
+                token::faults::REMOVE.with(|f| f.set(true));
+                token::faults::MARKER.with(|f| f.set(true));
+            }));
+        });
+        let out = w.end_session("sign_out", None);
+        token::faults::REMOVE.with(|f| f.set(false));
+        token::faults::MARKER.with(|f| f.set(false));
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(fenced(), Some(token::fingerprint("tokB")));
+        set_fenced(None);
     }
 
     /// A fence set before any library is connected (the app signed out and

@@ -296,8 +296,15 @@ pub enum Ended {
     /// it: no read returns it, here or after a restart.
     Marked(String),
     /// Neither the removal nor the marker could be written: a restart may
-    /// resume the ended session's account from the token on file.
-    Unsafe { removal: String, marker: String },
+    /// resume the ended session's account from the token on file. `target`
+    /// is the fingerprint of the token this call tried to end, read under
+    /// the file's lock (`None` when none could be named), for an in-process
+    /// fence to name.
+    Unsafe {
+        removal: String,
+        marker: String,
+        target: Option<String>,
+    },
 }
 
 impl Ended {
@@ -362,6 +369,7 @@ pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended
                 return Ended::Unsafe {
                     removal,
                     marker: "no token named to fingerprint".to_owned(),
+                    target: None,
                 };
             };
             return mark(path, user, &fingerprint(seen), removal);
@@ -393,6 +401,7 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
         Err(marker) => Ended::Unsafe {
             removal,
             marker: marker.to_string(),
+            target: Some(token_fingerprint.to_owned()),
         },
     }
 }
