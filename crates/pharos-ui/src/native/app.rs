@@ -10402,6 +10402,7 @@ mod tests {
             EventHandler<(ItemRef, bool, String)>,
             Signal<Machine>,
             Stored,
+            Signal<u32>,
         );
         thread_local! {
             static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<bool>>> = const { RefCell::new(None) };
@@ -10426,7 +10427,7 @@ mod tests {
                 });
                 mark_handler_with(Mark::Played, send, machine, flash, marks, stored)
             });
-            PARTS.with(|p| p.replace(Some((handler, machine, stored))));
+            PARTS.with(|p| p.replace(Some((handler, machine, stored, marks))));
             rsx! { div {} }
         }
         let id: ItemRef = "1".parse().unwrap();
@@ -10440,14 +10441,31 @@ mod tests {
             ANSWER.with(|a| a.replace(Some(rx)));
             let mut dom = VirtualDom::new(root);
             dom.rebuild_in_place();
-            let (handler, mut machine, stored) = PARTS.with(|p| p.borrow_mut().take()).unwrap();
+            let (handler, mut machine, stored, marks) =
+                PARTS.with(|p| p.borrow_mut().take()).unwrap();
+            let sent_in = dom.in_runtime(|| machine.peek().session());
             dom.in_runtime(|| handler.call((id, true, "Item".to_owned())));
             if signed_out {
-                dom.in_runtime(|| machine.write().apply(Event::NeedsSignIn));
+                // The user's sign-out, as the app applies it.
+                dom.in_runtime(|| {
+                    let mut m = machine.write();
+                    m.apply(Event::SignOutSubmitted);
+                    m.apply(Event::SignOutAnswered(
+                        super::super::machine::SignOutReply::Status(204),
+                    ));
+                });
+                let m = dom.in_runtime(|| machine.peek().clone());
+                assert!(matches!(m.phase(), Phase::SignIn { .. }), "not signed out");
+                assert_eq!(m.session(), sent_in, "the sign-out moved the session");
             }
             tx.send(true).unwrap();
+            // The handler has run to its end once `marks` moves: only then
+            // does `stored` say what it did.
             rt.block_on(async {
-                for _ in 0..5 {
+                for _ in 0..200 {
+                    if dom.in_runtime(|| *marks.peek()) > 0 {
+                        break;
+                    }
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(20),
                         dom.wait_for_work(),
@@ -10456,6 +10474,11 @@ mod tests {
                     dom.render_immediate_to_vec();
                 }
             });
+            assert_eq!(
+                dom.in_runtime(|| *marks.peek()),
+                1,
+                "the mark never completed"
+            );
             let now = dom.in_runtime(|| *stored.peek());
             offline_video::forget_user();
             now
