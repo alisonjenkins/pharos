@@ -112,6 +112,9 @@ struct Gate {
     /// Test signal: pins that yielded to playback.
     #[cfg(test)]
     yields: AtomicU64,
+    /// Test signal: each backoff wait, in order.
+    #[cfg(test)]
+    waits: Mutex<Vec<Duration>>,
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
@@ -152,6 +155,10 @@ struct JobState {
     total: Option<u64>,
     /// A 2xx arrived since the last reset: the URL's token was good.
     got_ok: bool,
+    /// The body was admitted and its part opened since the last reset:
+    /// progress, so the retry delay starts again from the minimum. A 2xx
+    /// that is then refused for space is not.
+    progressed: bool,
 }
 
 /// What a job that gave up does with its partial file.
@@ -189,6 +196,8 @@ impl Downloader {
             closed: AtomicBool::new(false),
             #[cfg(test)]
             yields: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -327,6 +336,16 @@ impl Downloader {
     #[cfg(test)]
     pub fn is_online(&self) -> bool {
         self.gate.online.load(Ordering::SeqCst)
+    }
+
+    /// Each backoff wait the jobs took, in order.
+    #[cfg(test)]
+    pub fn waits(&self) -> Vec<Duration> {
+        self.gate
+            .waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// How many times a pin has yielded to playback.
@@ -524,6 +543,11 @@ impl Gate {
     }
 
     async fn sleep_backoff(&self, backoff: &mut Duration, epoch: &mut u64) {
+        #[cfg(test)]
+        self.waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(*backoff);
         let wait = self.wake.notified();
         tokio::pin!(wait);
         wait.as_mut().enable();
@@ -635,6 +659,9 @@ impl Gate {
             if st.got_ok {
                 st.got_ok = false;
                 refreshed = false;
+            }
+            if st.progressed {
+                st.progressed = false;
                 backoff = self.tuning.backoff_min;
             }
             match res {
@@ -860,6 +887,7 @@ impl Gate {
                 .cache
                 .open_part(id, append)
                 .map_err(|e| Fail::Permanent(format!("open part: {e}")))?;
+            st.progressed = true;
             if !append && pos > 0 {
                 // The room was approved with the old bytes still on disk, so
                 // a refusal kept them; now they are gone, and what the
@@ -1347,6 +1375,8 @@ mod tests {
             online_epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             yields: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1391,6 +1421,8 @@ mod tests {
             online_epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             yields: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1437,6 +1469,8 @@ mod tests {
             online_epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             yields: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1490,6 +1524,8 @@ mod tests {
             online_epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             yields: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -2153,6 +2189,46 @@ mod tests {
             "a retry lost the part's validator: {seen:?}"
         );
         assert!(!r.cache.is_complete("track/1"));
+    }
+
+    /// CR 4637783558: a 200 that is then refused for space is no progress:
+    /// consecutive refusals back off further, up to the maximum, instead
+    /// of starting again at the minimum on every 200.
+    #[test]
+    fn storage_refusals_back_off_despite_each_200() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let room = Arc::new(AtomicU64::new(MIN_FREE_BYTES + 5000));
+        let r2 = room.clone();
+        let r = rig_with_free(
+            "replacement-backoff",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(move |_| Ok(r2.load(Ordering::SeqCst))),
+        );
+        let part = r.cache.part_path("track/1");
+        r.dl.prefetch(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 600) {
+            assert!(Instant::now() < until, "no partial file");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        room.store(MIN_FREE_BYTES + 100, Ordering::SeqCst);
+        r.srv.edit(|s| s.etag("vB").ignore_range());
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.srv.seen().len() < 6 {
+            assert!(Instant::now() < until, "no retries: {:?}", r.srv.seen());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let waits = r.dl.waits();
+        assert!(
+            waits.iter().any(|w| *w == fast().backoff_max),
+            "the refusals never backed off past the minimum: {waits:?}"
+        );
     }
 
     /// CR 4637705955: a retry whose free-space preflight is refused (the
