@@ -44,6 +44,9 @@ serve a lyric that was not sung as synced karaoke (V1468).
   search marked done, and is aligned in the same request. With no pick,
   or a lyric from beside the file or its tags, the lines are served
   without times.
+- On a song's first play its word times stream as they are timed,
+  before the text check has run, as every other song's do. Once the
+  aligner's verdict is a mismatch, the song is never served synced again.
 - `ALIGN_VERSION` is not bumped: that would align the whole library
   again. Songs are judged as they are next aligned.
 
@@ -55,6 +58,10 @@ serve a lyric that was not sung as synced karaoke (V1468).
   threshold, is not found, and the song is served without times.
 - One provider search per affected song, ever; the disk record's mark
   survives restarts, and a retag searches again.
+- The first play of a wrong lyric can show karaoke words that miss the
+  singing until the aligner's verdict arrives. Holding them for the check
+  would leave every song's first play without words for most of its
+  length, which is the worse trade.
 - A song the listener gave a wrong local lyric shows plain text rather
   than karaoke until the file is fixed. That is their file to change.
 - Signals: `pharos_aligner_text_recall`,
