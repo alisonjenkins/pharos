@@ -22,11 +22,12 @@ use super::platform::{
     video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    abr_ladder, check_master, engine_buffer_config, evict_range_s, forward_buffer_ms,
-    pick_audio_uri, plan_hls, playlist_retry_policy, ranges_to_ms, rung_label, segment_deadlines,
-    with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad, HlsFallbackCause, MediaRecovery,
-    MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment, PlannerNoteReport, PlaybackEngine,
-    SegmentFailureReport, SegmentRecovery, StallReport,
+    abr_ladder, check_master, engine_buffer_config, evict_range_s, forward_buffer_ms, part_layout,
+    part_offset_ms, pick_audio_uri, plan_hls, playlist_retry_policy, ranges_to_ms, rung_label,
+    segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
+    HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
+    PartLayout, PlannerNoteReport, PlaybackEngine, SegmentFailureReport, SegmentRecovery,
+    StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -40,6 +41,9 @@ const STALL_TICK_MS: i32 = 250;
 /// tried again, and how many refusals of one append are a media error.
 const QUOTA_RETRY_MS: u32 = 500;
 const QUOTA_MAX_TRIES: u32 = 4;
+
+/// Two timestamp offsets closer than this are the same part's.
+const OFFSET_EPSILON_S: f64 = 0.000_5;
 
 /// How often a download still arriving is checked against the abandon rule.
 const ABANDON_CHECK_MS: u64 = 500;
@@ -56,6 +60,9 @@ enum Op {
         load_ms: u64,
         ttfb_ms: u64,
         media_ms: u64,
+        /// Where a media segment's own timeline starts on the stream's: its
+        /// part's start. Each part of a split film restarts its timestamps.
+        offset_s: Option<f64>,
     },
     Remove {
         start_s: f64,
@@ -91,7 +98,8 @@ struct Prefetch {
 /// One rung the engine can switch the video track to.
 struct Rendition {
     entry_label: String,
-    init_uri: String,
+    /// One init per part, as [`PartLayout::inits`].
+    inits: Vec<String>,
     segments: Vec<Segment>,
 }
 
@@ -106,7 +114,10 @@ struct AbrState {
 }
 
 struct TrackRunner {
-    init_uri: String,
+    /// One init per part.
+    inits: Vec<String>,
+    /// Each part's first segment.
+    part_starts: Vec<usize>,
     segments: Vec<Segment>,
     source_buffer: web_sys::SourceBuffer,
     controller: Option<web_sys::AbortController>,
@@ -126,14 +137,15 @@ struct TrackRunner {
 
 impl TrackRunner {
     fn new(
-        init_uri: String,
+        parts: PartLayout,
         segments: Vec<Segment>,
         source_buffer: web_sys::SourceBuffer,
         policy: RetryPolicy,
         generation: u64,
     ) -> Self {
         Self {
-            init_uri,
+            inits: parts.inits,
+            part_starts: parts.starts,
             segments,
             source_buffer,
             controller: None,
@@ -514,12 +526,12 @@ async fn load(weak: Weak<RefCell<Session>>) {
     };
 
     // `plan_hls` already refused a playlist without EXT-X-MAP; this keeps the type honest.
-    let audio_init = audio_pl.as_ref().map(|a| a.init_uri.clone());
-    let (Some(video_init_uri), None | Some(Some(_))) = (video_pl.init_uri.clone(), &audio_init)
-    else {
+    let audio_parts = audio_pl.as_ref().map(part_layout);
+    let (Some(video_parts), None | Some(Some(_))) = (part_layout(&video_pl), &audio_parts) else {
         fallback(&weak, HlsFallbackCause::NotFmp4, "none").await;
         return;
     };
+    let audio_parts = audio_parts.flatten();
 
     let duration_ms = pharos_hls::timeline::duration_ms(&video_pl);
     if duration_ms > 0 && media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
@@ -546,10 +558,12 @@ async fn load(weak: Weak<RefCell<Session>>) {
     };
 
     let policy = RetryPolicy::with_deadlines(deadlines);
-    let audio_runner = match (audio_sb, audio_pl.as_ref(), audio_init.flatten()) {
-        (Some(sb), Some(apl), Some(init_uri)) => {
-            let mut runner =
-                TrackRunner::new(init_uri, apl.segments.clone(), sb, policy, generation);
+    let part_count = video_parts.starts.len();
+    let video_starts = video_parts.starts.clone();
+    let audio_starts = audio_parts.as_ref().map(|p| p.starts.clone());
+    let audio_runner = match (audio_sb, audio_pl.as_ref(), audio_parts) {
+        (Some(sb), Some(apl), Some(parts)) => {
+            let mut runner = TrackRunner::new(parts, apl.segments.clone(), sb, policy, generation);
             wire_source_buffer(&weak, Track::Audio, &mut runner);
             Some(runner)
         }
@@ -557,7 +571,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     };
 
     let mut video_runner = TrackRunner::new(
-        video_init_uri,
+        video_parts,
         video_pl.segments.clone(),
         video_sb,
         policy,
@@ -566,14 +580,22 @@ async fn load(weak: Weak<RefCell<Session>>) {
     wire_source_buffer(&weak, Track::Video, &mut video_runner);
 
     let seg_count = video_pl.segments.len();
-    let playing = (plan.video_uri.clone(), video_pl.segments.clone());
-    let planner = Planner::new(
+    let playing = (
+        plan.video_uri.clone(),
+        video_pl.segments.clone(),
+        video_starts.clone(),
+    );
+    let mut planner = Planner::new(
         video_pl.segments,
         true,
         audio_pl.map(|a| (a.segments, true)),
         buffer,
         start_ms,
     );
+    planner.set_parts(Track::Video, video_starts);
+    if let Some(starts) = audio_starts {
+        planner.set_parts(Track::Audio, starts);
+    }
 
     if start_ms > 0 {
         #[allow(clippy::cast_precision_loss)]
@@ -607,7 +629,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     let audio_label = plan.audio_mime.as_deref().unwrap_or("none");
     info(&format!(
-        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} forward_ms={} forward_ceiling_ms={} forward_bytes={} back_ms={} url={url}",
+        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} parts={part_count} device={device} first_byte_ms={} load_ms={} forward_ms={} forward_ceiling_ms={} forward_bytes={} back_ms={} url={url}",
         plan.video_mime,
         deadlines.first_byte_ms,
         deadlines.load_ms,
@@ -630,10 +652,10 @@ async fn load(weak: Weak<RefCell<Session>>) {
 async fn prepare_abr(
     weak: Weak<RefCell<Session>>,
     master: Master,
-    playing: (String, Vec<Segment>),
+    playing: (String, Vec<Segment>, Vec<usize>),
     epoch: u32,
 ) {
-    let (playing_uri, playing_segments) = playing;
+    let (playing_uri, playing_segments, playing_starts) = playing;
     let ladder = abr_ladder(&master);
     if ladder.len() < 2 {
         info(&format!("pharos: abr off rungs={}", ladder.len()));
@@ -663,24 +685,34 @@ async fn prepare_abr(
                 )),
             }
         };
-        let (init_uri, segments) = match playlist {
+        let (inits, segments) = match playlist {
             Ok(None) => {
-                let Some(init) = weak
+                let Some(inits) = weak
                     .upgrade()
-                    .and_then(|s| s.borrow().video_track.as_ref().map(|t| t.init_uri.clone()))
+                    .and_then(|s| s.borrow().video_track.as_ref().map(|t| t.inits.clone()))
                 else {
                     return;
                 };
-                (init, playing_segments.clone())
+                (inits, playing_segments.clone())
             }
             Ok(Some(pl)) => {
-                let Some(init) = pl.init_uri else {
+                let Some(parts) = part_layout(&pl) else {
                     warn(&format!(
                         "pharos: abr rung skipped rung={label} reason=no_init url={}",
                         entry.uri
                     ));
                     continue;
                 };
+                if parts.starts != playing_starts {
+                    warn(&format!(
+                        "pharos: abr rung skipped rung={label} reason=parts parts={} playing={} url={}",
+                        parts.starts.len(),
+                        playing_starts.len(),
+                        entry.uri
+                    ));
+                    continue;
+                }
+                let init = parts.inits;
                 if !same_grid(&pl.segments, &playing_segments) {
                     warn(&format!(
                         "pharos: abr rung skipped rung={label} reason=grid segments={} playing={} url={}",
@@ -703,7 +735,7 @@ async fn prepare_abr(
         rungs.push(entry.rung);
         renditions.push(Rendition {
             entry_label: label,
-            init_uri,
+            inits,
             segments,
         });
     }
@@ -735,11 +767,10 @@ async fn prepare_abr(
     if s.dead || s.recovery.epoch() != epoch {
         return;
     }
-    let on_rung = s.video_track.as_ref().is_some_and(|t| {
-        renditions
-            .get(current)
-            .is_some_and(|r| r.init_uri == t.init_uri)
-    });
+    let on_rung = s
+        .video_track
+        .as_ref()
+        .is_some_and(|t| renditions.get(current).is_some_and(|r| r.inits == t.inits));
     if !on_rung {
         drop(s);
         warn(&format!(
@@ -815,7 +846,7 @@ fn abr_step(session: &Rc<RefCell<Session>>, index: usize, load: FragmentLoad, tt
         };
         let applied = planner.reinit(Track::Video);
         if applied {
-            track.init_uri = to.init_uri.clone();
+            track.inits = to.inits.clone();
             track.segments = to.segments.clone();
         }
         AbrSwitchReport {
@@ -1377,23 +1408,36 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         }
     };
 
-    let (uri, media_ms, generation, old_controller, deadlines, signal, prefetched) = {
+    let (uri, media_ms, offset_s, generation, old_controller, deadlines, signal, prefetched) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
         }
         let deadlines = s.deadlines;
         let first_media = s.planner.as_ref().and_then(|p| p.first_media(track));
+        let init_part = s.planner.as_ref().map_or(0, |p| p.init_part(track));
         let Some(t) = s.track_mut(track) else {
             return;
         };
-        let (uri, media_ms) = match request {
-            SegRequest::Init => (t.init_uri.clone(), 0),
+        let (uri, media_ms, offset_s) = match request {
+            SegRequest::Init => {
+                let Some(init) = t.inits.get(init_part) else {
+                    warn(&format!(
+                        "pharos: playback engine=rust init missing track={} part={init_part} parts={}",
+                        track.label(),
+                        t.inits.len()
+                    ));
+                    return;
+                };
+                (init.clone(), 0, None)
+            }
             SegRequest::Media(idx) => {
                 let Some(seg) = t.segments.get(idx) else {
                     return;
                 };
-                (seg.uri.clone(), seg.duration_ms)
+                #[allow(clippy::cast_precision_loss)]
+                let offset_s = part_offset_ms(&t.part_starts, &t.segments, idx) as f64 / 1000.0;
+                (seg.uri.clone(), seg.duration_ms, Some(offset_s))
             }
         };
         let stale = t.prefetch.take();
@@ -1426,7 +1470,9 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         t.generation = t.generation.saturating_add(1);
         let gen = t.generation;
         let old = t.controller.replace(controller);
-        (uri, media_ms, gen, old, deadlines, signal, outcome)
+        (
+            uri, media_ms, offset_s, gen, old, deadlines, signal, outcome,
+        )
     };
 
     if let Some(old) = old_controller {
@@ -1475,6 +1521,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                         load_ms,
                         ttfb_ms,
                         media_ms,
+                        offset_s,
                     });
                     true
                 };
@@ -1676,7 +1723,7 @@ fn step_down_rung(
         return None;
     }
     let switch = st.abr.step_down(now_ms_u64())?;
-    t.init_uri = to.init_uri.clone();
+    t.inits = to.inits.clone();
     t.segments = to.segments.clone();
     Some(AbrSwitchReport {
         from: from.entry_label.clone(),
@@ -1833,6 +1880,7 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
                     load_ms,
                     ttfb_ms,
                     media_ms,
+                    ..
                 } => RunningOp::Append {
                     request: *request,
                     bytes: u64::from(bytes.byte_length()),
@@ -1853,7 +1901,33 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
     };
 
     match op {
-        Op::Append { ref bytes, .. } => {
+        Op::Append {
+            ref bytes,
+            offset_s,
+            ..
+        } => {
+            // Only a segment of another part moves the offset; one part never does.
+            let moved =
+                offset_s.filter(|&to| (sb.timestamp_offset() - to).abs() > OFFSET_EPSILON_S);
+            if let Some(to) = moved {
+                info(&format!(
+                    "pharos: playback engine=rust timestamp_offset track={} to_s={to:.3}",
+                    track.label()
+                ));
+                // Through Reflect: the typed setter cannot report the browser's refusal.
+                let set = js_sys::Reflect::set(&sb, &"timestampOffset".into(), &to.into());
+                if let Err(err) = set {
+                    if let Some(t) = session.borrow_mut().track_mut(track) {
+                        t.running = None;
+                    }
+                    fail_media(
+                        &Rc::downgrade(session),
+                        "bufferAppendError",
+                        &format!("timestampOffset {to:.3}: {}", js_message(&err)),
+                    );
+                    return;
+                }
+            }
             if let Err(err) = sb.append_buffer_with_array_buffer(bytes) {
                 on_append_error(session, track, &err, op);
             }
