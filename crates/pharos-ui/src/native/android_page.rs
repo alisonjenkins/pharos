@@ -30,7 +30,7 @@ use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::kept_video::{
-    loudness, playlist_base_verdict, request_class, request_key, request_line, url_path, Loudness,
+    key_under_base, loudness, request_class, request_key, request_line, url_path, Loudness,
     StoredFile, Verdict,
 };
 use super::kept_video_disk::{
@@ -3351,9 +3351,10 @@ fn token_for_run(owner: &str) -> Result<String, String> {
 /// The client the downloads use. Its redirect policy follows a redirect
 /// only to the same scheme, host and port as the request (the download
 /// sends the device token): a cross-host redirect or an https-to-http
-/// downgrade stops and is logged. A playlist is followed only within its
-/// folder ([`playlist_base_verdict`]). Not `https_only`: a plain-http server on
-/// the LAN must keep working. [`http`] is the proxy's and is unchanged.
+/// downgrade stops and is logged. A playlist followed to another key is
+/// stored with its references rebased onto it ([`key_under_base`],
+/// [`rebase_playlist`](super::kept_video::rebase_playlist)). Not
+/// `https_only`: a plain-http server on the LAN must keep working. [`http`] is the proxy's and is unchanged.
 fn download_http() -> &'static Result<reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
         std::sync::OnceLock::new();
@@ -3367,12 +3368,9 @@ fn download_http() -> &'static Result<reqwest::Client, String> {
             if attempt.previous().len() >= 10 {
                 return attempt.error("too many redirects");
             }
-            // Same origin, and a playlist stays in its folder: its relative
-            // references are planned against the key it was asked for.
-            let next = attempt.url().as_str();
-            match tv_page::redirect_verdict(&first, next)
-                .and_then(|()| playlist_base_verdict(&first, next))
-            {
+            // Same origin only. A playlist may move: the store rebases its
+            // references onto where it was answered from.
+            match tv_page::redirect_verdict(&first, attempt.url().as_str()) {
                 Ok(()) => attempt.follow(),
                 Err(reason) => {
                     log::warn!(
@@ -3399,7 +3397,8 @@ fn download_http() -> &'static Result<reqwest::Client, String> {
     })
 }
 
-struct ServerBody(reqwest::Response);
+/// A response, and the key it was answered from when a redirect moved it.
+struct ServerBody(reqwest::Response, Option<String>);
 
 fn no_answer(what: &str) -> FetchError {
     FetchError {
@@ -3420,6 +3419,10 @@ impl Body for ServerBody {
                 }),
             }
         })
+    }
+
+    fn final_key(&self) -> Option<String> {
+        self.1.clone()
     }
 }
 
@@ -3444,7 +3447,8 @@ impl Fetcher for ServerFetcher {
                 status: None,
                 message: why.clone(),
             })?;
-            let url = tv_page::server_url(&server(), key);
+            let base = server();
+            let url = tv_page::server_url(&base, key);
             let mut req = client.get(&url);
             if let Some(token) = allowed_token(&url, "video_download", token) {
                 req = req.header("X-Emby-Token", token);
@@ -3457,8 +3461,28 @@ impl Fetcher for ServerFetcher {
                     message: format!("send {}", tv_page::error_chain(&e.without_url())),
                 })?;
             let status = resp.status();
+            // Where a followed redirect left the request: a playlist's
+            // references resolve against it, so the store rebases them.
+            let moved = if resp.url().as_str() == url {
+                None
+            } else {
+                match key_under_base(&base, resp.url().as_str()) {
+                    Some(final_key) => (final_key != key).then_some(final_key),
+                    None => {
+                        log::warn!(
+                            "pharos: video download redirect refused reason=outside_base_path url_path={} final_path={}",
+                            url_path(key),
+                            url_path(resp.url().as_str())
+                        );
+                        return Err(OpenFailed::Fetch(FetchError {
+                            status: None,
+                            message: "redirected outside the server's base path".to_owned(),
+                        }));
+                    }
+                }
+            };
             if status.is_success() {
-                Ok(Box::new(ServerBody(resp)) as Box<dyn Body>)
+                Ok(Box::new(ServerBody(resp, moved)) as Box<dyn Body>)
             } else {
                 Err(OpenFailed::Fetch(FetchError {
                     status: Some(status.as_u16()),
