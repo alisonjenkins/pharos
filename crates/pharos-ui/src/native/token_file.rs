@@ -224,6 +224,20 @@ pub fn forget_token_with(
     verdict
 }
 
+/// A session end (or refused resume) that could not find the token file:
+/// every token at every path is fenced, as a sign-out that could not find
+/// it fences them ([`forget_token_with`]), and the end is `Unsafe`, for the
+/// caller to ask the media service to stay signed out.
+pub fn end_session_path_unknown(error: String) -> Ended {
+    fence_every_file("token_path_unknown");
+    log::warn!("pharos: token forget verdict=fenced reason=token_path_unknown error={error}");
+    Ended::Unsafe {
+        removal: error,
+        marker: "no token path".to_owned(),
+        target: None,
+    }
+}
+
 /// Ends a session's hold on the token (`pharos_content::token::end_session`):
 /// the token goes while it is `seen` (any with `None`), a replacement is
 /// kept, and one that will not go is marked revoked for `user`.
@@ -254,7 +268,7 @@ mod sign_out_tests {
         let path = d.path().join("device-token");
         store(&path, "tok").unwrap();
         assert_eq!(sign_out(&path), SignedOut::Saved);
-        assert_eq!(read(&path).unwrap(), None);
+        assert!(read(&path).unwrap().is_none());
         // A folder where the file should be: the unlink fails.
         std::fs::create_dir_all(path.join("held")).unwrap();
         assert!(
@@ -417,6 +431,35 @@ mod sign_out_tests {
         lib.reload_credentials()
             .expect("the reload tried the token the sign-out left");
         assert_eq!(lib.auth_state(), pharos_content::AuthState::SignedOut);
+    }
+
+    /// CR 4642574404: a refused session's end that could not find the
+    /// token file fences every token, as a sign-out that could not find it
+    /// does, so no reader loads the refused token meanwhile. The fence is
+    /// process-wide, so in a child.
+    #[test]
+    fn a_session_end_with_no_token_path_fences_every_token() {
+        if !in_child(
+            "a_session_end_with_no_token_path_fences_every_token",
+            "PHAROS_TEST_END_NO_PATH",
+        ) {
+            return;
+        }
+        let d = super::super::test_dir::TmpDir::new("end-no-path");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        assert_eq!(fence(&path), SignOutFence::Open);
+        let ended = end_session_path_unknown("no files dir".to_owned());
+        assert!(
+            matches!(ended, Ended::Unsafe { target: None, .. }),
+            "{ended:?}"
+        );
+        assert_eq!(
+            fence(&path),
+            SignOutFence::Every,
+            "the refused token stayed readable"
+        );
+        assert!(read(&path).unwrap().is_none());
     }
 
     /// CR 4638522305: a sign-out that could not read its token fences every

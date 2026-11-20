@@ -278,17 +278,15 @@ pub fn forget_token() -> token_file::SignedOut {
 /// (kept, for the caller to resume with), `Marked` when it would not go but
 /// is marked revoked for `user`, `Unsafe` when neither could be written.
 pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::Ended {
-    let ended = {
+    let ended = 'ended: {
         let mut cached = token_lock();
         let path = match token_path() {
             Ok(path) => path,
             Err(e) => {
+                // Fenced like a sign-out with no path; the notice below
+                // goes once the cache's lock is released.
                 *cached = Some(None);
-                return token_file::Ended::Unsafe {
-                    removal: e,
-                    marker: "no token path".to_owned(),
-                    target: None,
-                };
+                break 'ended token_file::end_session_path_unknown(e);
             }
         };
         let ended = token_file::end_session(&path, Some(refused), user);
