@@ -332,7 +332,6 @@ impl Library {
                     qc: None,
                     qc_gen: 0,
                     qc_approved: Arc::default(),
-                    session_token: None,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -905,11 +904,20 @@ impl Library {
     }
 }
 
-/// A live connection and its media token.
+/// A live connection, its media token, and the device token it was
+/// opened with: a refusal on it ends that token, never whichever one is on
+/// file by then. Every link is made with its token ([`Link::new`]).
 #[derive(Clone)]
 struct Link {
     cat: NativeCatalogue,
     media: MediaToken,
+    token: String,
+}
+
+impl Link {
+    fn new(cat: NativeCatalogue, media: MediaToken, token: String) -> Self {
+        Self { cat, media, token }
+    }
 }
 
 enum Event {
@@ -937,9 +945,6 @@ struct Worker {
     /// runs before the worker consumes it does not start a poller over it.
     qc_approved: Arc<AtomicBool>,
     limit: Duration,
-    /// The device token the open link was resumed with: a refusal ends
-    /// that token, never whichever one is on file by then.
-    session_token: Option<String>,
 }
 
 /// The fingerprint of a token this process signed out of but could neither
@@ -1107,7 +1112,7 @@ impl Worker {
                 let cat = NativeCatalogue::new(bootstrap, closed, &session);
                 match cat.media_token().await {
                     Ok(media) => {
-                        self.link = Some(Link { cat, media });
+                        self.link = Some(Link::new(cat, media, token));
                         self.shared.set_auth(AuthState::SignedIn);
                     }
                     Err(e) => {
@@ -1169,8 +1174,7 @@ impl Worker {
             match r {
                 Err(e) if e.is_revoked() => {
                     log::warn!("{}: device token revoked; starting QuickConnect", op.name());
-                    let seen = self.session_token.clone();
-                    return Err(self.revoked(events, seen));
+                    return Err(self.revoked(events, Some(link.token.clone())));
                 }
                 Err(e @ ContentError::Closed { .. }) => {
                     log::warn!("{} (attempt {}): {e}; reconnecting", op.name(), attempt + 1);
@@ -1199,6 +1203,7 @@ impl Worker {
                 self.link = None;
             } else {
                 if l.media.expires_at_ms <= now_ms().saturating_add(TOKEN_REFRESH_MARGIN_MS) {
+                    let seen = l.token.clone();
                     match l.cat.media_token().await {
                         Ok(m) => l.media = m,
                         Err(e) if e.is_revoked() => {
@@ -1206,8 +1211,7 @@ impl Worker {
                                 "media token refresh refused ({}); starting QuickConnect",
                                 e.redacted()
                             );
-                            let seen = self.session_token.clone();
-                            return Err(self.revoked(events, seen));
+                            return Err(self.revoked(events, Some(seen)));
                         }
                         Err(e) => return Err(e),
                     }
@@ -1246,9 +1250,8 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        let link = Link { cat, media };
+        let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
-        self.session_token = Some(device_token);
         self.shared.set_auth(AuthState::SignedIn);
         Ok(link)
     }
@@ -1324,7 +1327,6 @@ impl Worker {
     /// removed nor marked is fenced in this process, so nothing here
     /// resumes from it.
     fn end_session(&mut self, at: &str, seen: Option<&str>) -> Result<(), String> {
-        self.session_token = None;
         let held = token::load(&self.token_path).ok().flatten();
         let ended = token::end_session(&self.token_path, seen, None);
         if matches!(ended, token::Ended::Unsafe { .. }) {
@@ -1346,7 +1348,14 @@ impl Worker {
         seen: Option<String>,
     ) -> ContentError {
         self.link = None;
-        let _ = self.end_session("revoked", seen.as_deref());
+        match seen.as_deref() {
+            Some(seen) => {
+                let _ = self.end_session("revoked", Some(seen));
+            }
+            // No token named: whatever is on file may be a replacement, so
+            // nothing on disk is removed or marked.
+            None => log::warn!("token forget verdict=kept reason=revoked_session_token_unknown"),
+        }
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
         ContentError::NeedsSignIn
@@ -1989,7 +1998,6 @@ mod tests {
             qc: None,
             qc_gen: 0,
             qc_approved: Arc::default(),
-            session_token: None,
             limit: Duration::from_secs(5),
         };
         (w, shared, token_path)
@@ -2043,7 +2051,7 @@ mod tests {
                 if at == "sign_out" {
                     w.execute(&Op::SignOut, &events).await.unwrap();
                 } else {
-                    let _ = w.revoked(&events, None);
+                    let _ = w.revoked(&events, Some("tok".to_owned()));
                 }
             });
             crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
@@ -2207,6 +2215,80 @@ mod tests {
         assert_eq!(token::load(&token_path).unwrap(), None);
     }
 
+    /// A refusal that names no token leaves the token file alone: whatever
+    /// is on file may be a replacement.
+    #[test]
+    fn a_refusal_naming_no_token_removes_nothing() {
+        let root = test_root("revoked-none");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tokB").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, None);
+        });
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "a refusal naming no token ended the token on file"
+        );
+    }
+
+    /// A session QuickConnect approved ends its own token when the server
+    /// refuses it: a replacement token stored since is left as it is. Run
+    /// through the real approval path over an in-process session whose
+    /// media token is refused on the refresh.
+    #[test]
+    fn a_quickconnect_session_refused_leaves_a_replacement_token() {
+        struct Session(std::cell::Cell<u32>);
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                let r = results.get().init_result();
+                if n == 0 {
+                    // Expired at once: the next call refreshes it.
+                    let mut t = r.init_token();
+                    t.set_token("media");
+                    t.set_expires_at_ms(0);
+                } else {
+                    pharos_api::Denial::Revoked { reason: "revoked" }.write(r.init_error());
+                }
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("qc-revoked-own");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session(std::cell::Cell::new(0))),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        assert_eq!(token::load(&token_path).unwrap().as_deref(), Some("tokA"));
+        // Another sign-in stores B while A's link is still open.
+        token::store(&token_path, "tokB").unwrap();
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        assert!(matches!(out, Err(ContentError::NeedsSignIn)), "not refused");
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "the refusal of A's QuickConnect session removed B's token"
+        );
+    }
+
     /// A fence set before any library is connected (the app signed out and
     /// could neither remove nor mark its token) holds for a worker that
     /// connects afterwards; a different token is not fenced.
@@ -2253,7 +2335,7 @@ mod tests {
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
-            let e = w.revoked(&events, None);
+            let e = w.revoked(&events, Some("stale-token".to_owned()));
             assert!(matches!(e, ContentError::NeedsSignIn), "{e}");
             assert!(w.qc.is_some(), "QuickConnect started");
         });
