@@ -267,6 +267,13 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     # read-only, so copy the tree into a writable directory.
     mkdir -p "$TMP/media"
     cp -rL --no-preserve=mode "$MEDIA_SRC/." "$TMP/media/"
+    # Two generated clips for the play-to-the-end test (hls-eos.spec.ts): 90 s
+    # leaves a short sliver as the last HLS segment, 87 s ends on a whole one.
+    if [ -n "${PHAROS_HLS_EOS:-}" ]; then
+      for secs in 90 87; do
+        nix develop --command ffmpeg -loglevel error -f lavfi -i testsrc=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$secs" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 500k -g 50 -c:a libopus -b:a 64k "$TMP/media/eos-audit-$secs.webm"
+      done
+    fi
     # A movie library of more than one browse page (100), for the grid's
     # infinite scroll: 120 hard links to one small clip, under distinct names.
     # Each name starts with a letter A to Z in turn, so the letter rail has
