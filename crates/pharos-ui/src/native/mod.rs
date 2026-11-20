@@ -52,6 +52,7 @@ pub mod manage;
 pub mod mixes;
 pub mod music_bridge;
 pub mod my_devices;
+pub mod offline_device;
 pub mod offline_library;
 pub mod offline_names;
 pub mod offline_start;
