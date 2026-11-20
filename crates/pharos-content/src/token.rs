@@ -351,6 +351,10 @@ pub fn on_stored(hook: fn(&str, Option<&str>)) {
 pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let _held = hold();
     let token = token.trim();
+    if token.is_empty() {
+        log::warn!("token store verdict=refused reason=empty_token");
+        return Err(err(path, "an empty token"));
+    }
     // The token this one replaces, for the fence. A read that fails does
     // not matter here: store never touches another token's marker.
     #[cfg(test)]
@@ -1669,5 +1673,20 @@ pub(crate) mod tests {
             Some("tokA")
         );
         assert_eq!(load(&p).unwrap(), None);
+    }
+
+    /// CR 4640611314: a token that is only whitespace is refused before
+    /// anything changes: the token on file stays.
+    #[test]
+    fn an_empty_token_is_refused_and_the_old_one_stays() {
+        let d = dir("empty-token");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        for empty in ["", "  ", "\n"] {
+            assert!(store(&p, empty).is_err(), "{empty:?} was stored");
+            assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"), "{empty:?}");
+        }
+        store(&p, "  tokB \n").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
     }
 }
