@@ -92,10 +92,13 @@ rules, the log lines and their fields) are in V1464 in
   evict retained music parts no job holds and no pin wants, oldest first
   (`verdict=evicted kind=part`); the downloader then drops the state it
   kept to resume them, so the track starts again from zero.
-- A music pin whose part a whole body will replace passes the low-disk
-  preflight on the part's bytes, so its response is inspected; a pin
-  refused for low disk is parked with its part and a backoff, and the
-  downloader's one worker moves on.
+- A music job with a retained part, resumable or not, passes the low-disk
+  preflight on the part's bytes, so its response is inspected before any
+  byte is written: a 206 goes through the normal admission, a 200 through
+  the replacement one with the part counted as room. A pin refused for low
+  disk, at the preflight or at either admission, is parked with its part
+  and a backoff, and the downloader's one worker moves on; a reconnect
+  ends the backoff.
 - The cache can stay over its cap when all the music left is protected
   (pinned, queued or playing): nothing is evictable, and the cache logs
   `cache over cap ... nothing is evictable`.

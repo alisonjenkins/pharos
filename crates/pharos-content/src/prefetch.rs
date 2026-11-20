@@ -196,12 +196,6 @@ enum Outcome {
     Parked(Duration),
 }
 
-/// Whether a retained part can be resumed: only under a strong ETag, as
-/// `attempt` sends it. Any other part is replaced by a whole body.
-fn part_resumable(st: &JobState) -> bool {
-    st.etag.as_deref().is_some_and(|e| !e.starts_with("W/"))
-}
-
 impl Downloader {
     pub fn start(
         cache: Arc<Cache>,
@@ -681,11 +675,13 @@ impl Gate {
             id,
         };
         let outcome = loop {
-            // A part that cannot be resumed is replaced by a whole body,
-            // whose admission reclaims the part: the preflight counts its
-            // bytes as room so the request goes out and the response is
-            // inspected. A resumable part's 206 adds to it, so it does not.
-            let replacing = part_len() > 0 && !part_resumable(&st);
+            // A retained part always gets its response inspected: the
+            // preflight counts its bytes as room (a whole body's admission
+            // reclaims them) and authorizes no write. The headers decide:
+            // a 206 goes through the normal admission, a 200 through the
+            // replacement one, and no body byte is written before one of
+            // them passes.
+            let replacing = part_len() > 0;
             let preflight = if replacing {
                 self.cache.preflight_replacing_part(id)
             } else {
@@ -2649,15 +2645,30 @@ mod tests {
             assert!(Instant::now() < until, "the pin did not wait for room");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(r.srv.seen().len(), 1, "{:?}", r.srv.seen());
+        // CR 4640691884: each retry's response is inspected (a range under
+        // the part's validator), and its 206, refused for room, parks the
+        // pin again without a byte written.
+        let retries = r.srv.seen();
+        assert!(retries.len() >= 2, "{retries:?}");
+        assert!(
+            retries[1..]
+                .iter()
+                .all(|s| s.if_range.as_deref() == Some("\"vA\"") && s.status == 206),
+            "{retries:?}"
+        );
         assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        assert!(r.dl.has_deferred("track/1"), "the pin was not parked");
         starve.store(false, Ordering::SeqCst);
         assert!(
             r.dl.wait_idle(Duration::from_secs(10)),
             "the pin never resumed"
         );
         let seen = r.srv.seen();
-        assert_eq!(seen[1].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert_eq!(
+            seen.last().and_then(|s| s.if_range.as_deref()),
+            Some("\"vA\""),
+            "{seen:?}"
+        );
         assert!(r.cache.is_complete("track/1"));
     }
 
@@ -2704,7 +2715,11 @@ mod tests {
             r.dl.wait_idle(Duration::from_secs(10)),
             "the job never ended"
         );
-        assert_eq!(r.srv.seen().len(), 1, "{:?}", r.srv.seen());
+        // The retry's response is inspected: a 206 under the validator,
+        // refused for room before a byte is written.
+        let first = r.srv.seen();
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert_eq!(first[1].status, 206, "{first:?}");
         assert_eq!(
             std::fs::metadata(&part).map(|m| m.len()).ok(),
             Some(600),
@@ -2720,9 +2735,9 @@ mod tests {
             "the resume never ended"
         );
         let seen = r.srv.seen();
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[1].range.as_deref(), Some("bytes=600-"), "{seen:?}");
-        assert_eq!(seen[1].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[2].range.as_deref(), Some("bytes=600-"), "{seen:?}");
+        assert_eq!(seen[2].if_range.as_deref(), Some("\"vA\""), "{seen:?}");
         assert!(r.cache.is_complete("track/1"));
     }
 
@@ -2794,10 +2809,13 @@ mod tests {
             .into_iter()
             .filter(|s| s.path == "/audio/1")
             .collect();
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[1].range, None, "{seen:?}");
+        // The kept part's retry had its 206 inspected and refused for room
+        // (CR 4640691884); after the eviction a fresh whole body is asked.
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[1].status, 206, "{seen:?}");
+        assert_eq!(seen[2].range, None, "{seen:?}");
         assert_eq!(
-            seen[1].if_range, None,
+            seen[2].if_range, None,
             "the evicted part's state was kept: {seen:?}"
         );
         assert!(r.cache.is_complete("track/1"));
@@ -2923,8 +2941,15 @@ mod tests {
             .into_iter()
             .filter(|s| s.path == "/audio/1")
             .collect();
-        assert_eq!(one.len(), 2, "{one:?}");
-        assert_eq!(one[1].if_range.as_deref(), Some("\"vA\""), "{one:?}");
+        // The refused retry's 206 was inspected before the park (CR
+        // 4640691884), so the resume is the third request.
+        assert_eq!(one.len(), 3, "{one:?}");
+        assert!(
+            one[1..]
+                .iter()
+                .all(|s| s.if_range.as_deref() == Some("\"vA\"")),
+            "{one:?}"
+        );
         assert!(r.cache.is_complete("track/1"));
     }
 
@@ -3041,6 +3066,45 @@ mod tests {
             "the reconnect left the pin to its 30 s backoff"
         );
         assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// CR 4640691884: a part under a strong ETag still has its response
+    /// inspected while the disk is below the guard. The origin answers the
+    /// range request with a smaller whole body (its ETag changed), and the
+    /// replacement is admitted with the part counted as room.
+    #[test]
+    fn a_resumable_part_gets_its_response_inspected_through_low_disk() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = rig_with_free(
+            "inspect-resumable",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            starved_while_part(slot.clone(), starve, 600, MIN_FREE_BYTES - 100),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::metadata(&part).is_ok_and(|m| m.len() == 600) {
+            assert!(Instant::now() < until, "no part");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The new version: smaller, under another ETag.
+        r.srv.edit(|s| s.file("/audio/1", body(400, 2)).etag("vB"));
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the response was never inspected: {:?}",
+            r.srv.seen()
+        );
+        assert_eq!(read(&r.cache, "track/1"), body(400, 2));
     }
 
     /// A whole new body that replaces a partial file is admitted with the
