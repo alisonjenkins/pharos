@@ -749,6 +749,18 @@ impl Gate {
             match res {
                 Ok(()) => break Outcome::Ok,
                 Err(Fail::Cancelled) => break Outcome::Cancelled,
+                // A pin's resume (or any write over a kept part) refused for
+                // room parks, as at the preflight: the part and its state
+                // stay, and the worker moves on.
+                Err(Fail::LowDisk(free)) if part_len() > 0 && self.is_pin_work(id) => {
+                    log::info!(
+                        "cache download id={id} bytes={} ms={} outcome=kept_part reason=low_disk step=admission free_bytes={free} attempt={attempt} wait_ms={}",
+                        part_len(),
+                        started.elapsed().as_millis(),
+                        backoff.as_millis()
+                    );
+                    break Outcome::Parked(backoff);
+                }
                 Err(Fail::LowDisk(free)) => break Outcome::LowDisk(free),
                 // Read-ahead does not hold the worker for a replacement that
                 // cannot fit: it stops with the part and its validator kept,
@@ -2901,6 +2913,72 @@ mod tests {
             .collect();
         assert_eq!(one.len(), 2, "{one:?}");
         assert_eq!(one[1].if_range.as_deref(), Some("\"vA\""), "{one:?}");
+        assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// A probe that reads `free` while the part at `slot` holds at least
+    /// `at` bytes and `starve` is set, and is roomy otherwise.
+    fn starved_while_part(
+        slot: Arc<Mutex<Option<std::path::PathBuf>>>,
+        starve: Arc<AtomicBool>,
+        at: u64,
+        free: u64,
+    ) -> FreeProbe {
+        Box::new(move |_| {
+            let len = slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len());
+            Ok(if starve.load(Ordering::SeqCst) && len >= at {
+                free
+            } else {
+                MIN_FREE_BYTES + 5000
+            })
+        })
+    }
+
+    /// Outside-diff item on prefetch.rs:752: a pinned resume whose remaining
+    /// bytes do not fit is parked (its 206 refused before a byte is
+    /// written), not given up, and resumes once there is room. The disk is
+    /// 100 bytes above the guard: the preflight passes, the 400 bytes left
+    /// do not.
+    #[test]
+    fn a_pinned_resume_that_does_not_fit_is_parked() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = rig_with_free(
+            "park-resume",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            starved_while_part(slot.clone(), starve.clone(), 600, MIN_FREE_BYTES + 100),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.srv.seen().iter().filter(|s| s.status == 206).count() < 2 {
+            assert!(
+                Instant::now() < until,
+                "the pin was not retried: {:?}",
+                r.srv.seen()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(std::fs::metadata(&part).map(|m| m.len()).ok(), Some(600));
+        starve.store(false, Ordering::SeqCst);
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(10)),
+            "the pin never resumed"
+        );
         assert!(r.cache.is_complete("track/1"));
     }
 
