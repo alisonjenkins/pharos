@@ -398,6 +398,22 @@ impl Planner {
         }
     }
 
+    /// The media segment `track` fetches first once the init segment now in
+    /// flight is appended, when that is already certain: a start or a seek
+    /// with nothing buffered at the target. The adapter may request it
+    /// alongside the init.
+    pub fn first_media(&self, track: Track) -> Option<usize> {
+        let state = match track {
+            Track::Video => Some(&self.video),
+            Track::Audio => self.audio.as_ref(),
+        }?;
+        if state.in_flight != Some(Request::Init) {
+            return None;
+        }
+        let idx = clamped_segment_at(&state.segments, state.seek_target_ms?)?;
+        (!state.given_up.contains(&idx)).then_some(idx)
+    }
+
     /// The media segment in flight on `track` was `bytes` long. Called before
     /// [`Planner::appended`]; feeds the byte budget of the forward target.
     pub fn media_bytes(&mut self, track: Track, bytes: u64) {
@@ -1952,6 +1968,34 @@ mod tests {
             planner.media_bytes(Track::Video, segment_bytes);
             planner.appended(Track::Video);
             buf.video = vec![(0, segs[index].start_ms + segs[index].duration_ms)];
+        }
+    }
+
+    #[test]
+    fn the_first_media_segment_is_known_while_the_init_loads() {
+        let segs = make_segments(&[6_000; 10]);
+        for start_ms in [0, 5_999, 20_000, 1_000_000] {
+            let mut planner = Planner::new(
+                segs.clone(),
+                true,
+                Some((segs.clone(), true)),
+                Config::default(),
+                start_ms,
+            );
+            let buf = Buffered::default();
+            assert_eq!(planner.first_media(Track::Video), None);
+            planner.tick(0, &buf);
+            for track in [Track::Video, Track::Audio] {
+                let first = planner.first_media(track);
+                assert!(first.is_some(), "{track:?} at {start_ms}");
+                planner.appended(track);
+                assert_eq!(planner.first_media(track), None);
+                let fetched = planner.tick(0, &buf).into_iter().find_map(|a| match a {
+                    Action::Fetch { track: t, index } if t == track => Some(index),
+                    _ => None,
+                });
+                assert_eq!(fetched, first, "{track:?} at {start_ms}");
+            }
         }
     }
 
