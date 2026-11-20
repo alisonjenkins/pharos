@@ -70,8 +70,8 @@ pub struct Pick {
 
 /// The best of `candidates` for a song `duration_ms` long, judged against
 /// `heard`: within [`DURATION_WINDOW_MS`], not the text of the lyric that
-/// failed (`current`), one the aligner takes and so checks against the
-/// song in turn, the [`MAX_CANDIDATES`] closest in length, and only
+/// failed (`current`), one the aligner takes once fitted to the song and
+/// so checks against the song in turn, the [`MAX_CANDIDATES`] closest in length, and only
 /// one with word pairs for [`MIN_PAIRS_OF_HEARD`] of the words heard and
 /// recall reaching [`MIN_RECALL`]. The higher recall wins, and on a tie the
 /// record closer in length. A record is scored as one text, pairs running
@@ -86,7 +86,7 @@ pub fn choose(
         .into_iter()
         .filter(|c| c.duration_ms.abs_diff(duration_ms) <= DURATION_WINDOW_MS)
         .filter(|c| !same_text(&c.lyrics, current))
-        .filter(|c| align::alignable(&c.lyrics))
+        .filter(|c| align::alignable(&c.lyrics.clone().fit_to(Some(duration_ms))))
         .collect();
     near.sort_by_key(|c| c.duration_ms.abs_diff(duration_ms));
     near.truncate(MAX_CANDIDATES);
@@ -298,6 +298,21 @@ mod tests {
                 };
                 candidate(10 + i, SONG_MS + i * 100, refused)
             })
+            .collect();
+        all.push(candidate(99, SONG_MS + 1_500, sung()));
+        let got = choose(all, &wrong(), SONG_MS, HEARD);
+        assert_eq!(got.map(|p| p.candidate.id), Some(99));
+    }
+
+    #[test]
+    fn records_timed_past_the_song_take_no_slot() {
+        // Five records closer in length whose last line starts after the
+        // song ends: fitted to it they lose their times, so the aligner
+        // never checks them.
+        let mut overrun = sung();
+        overrun.lines.last_mut().unwrap().start_ms = Some(SONG_MS + 10_000);
+        let mut all: Vec<Candidate> = (0..MAX_CANDIDATES as u64)
+            .map(|i| candidate(10 + i, SONG_MS + i * 100, overrun.clone()))
             .collect();
         all.push(candidate(99, SONG_MS + 1_500, sung()));
         let got = choose(all, &wrong(), SONG_MS, HEARD);
