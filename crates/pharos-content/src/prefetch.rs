@@ -1039,12 +1039,48 @@ impl Gate {
             // the new reservation in one step. A refusal keeps them and
             // their validator.
             let replacing = !append && pos > 0;
-            let mut reserved_ahead = match self.reserve(id, left(start), 0, unknown_len, replacing)
-            {
-                Err(Fail::LowDisk(free)) if replacing => {
-                    return Err(Fail::ReplacementLowDisk(free))
+            // A replacement of unknown length whose speculative window does
+            // not fit is not refused for it: the first chunk is read, and
+            // admitted with the part counted as room; only then does the
+            // part go. One that does not fit even so is refused with the
+            // part kept.
+            let mut first_chunk = None;
+            let mut reserved_ahead = if replacing && unknown_len {
+                match self
+                    .cache
+                    .ensure_free_replacing_part(id, left(start), false)
+                {
+                    Ok(_) => left(start),
+                    Err(NoRoom::LowDisk(room)) => {
+                        let chunk = resp
+                            .next_chunk()
+                            .await
+                            .map_err(|e| Fail::Transient(e.redacted()))?
+                            .unwrap_or_default();
+                        let len = chunk.len() as u64;
+                        log::info!(
+                            "cache download id={id} reserve verdict=first_chunk reason=window_does_not_fit replacing=true window={} chunk={len} room={room}",
+                            left(start)
+                        );
+                        match self.cache.ensure_free_replacing_part(id, len, true) {
+                            Ok(_) => {}
+                            Err(NoRoom::LowDisk(free)) => {
+                                return Err(Fail::ReplacementLowDisk(free))
+                            }
+                            Err(no) => return Err(Fail::no_room(no)),
+                        }
+                        first_chunk = Some(chunk);
+                        len
+                    }
+                    Err(no) => return Err(Fail::no_room(no)),
                 }
-                other => other?,
+            } else {
+                match self.reserve(id, left(start), 0, unknown_len, replacing) {
+                    Err(Fail::LowDisk(free)) if replacing => {
+                        return Err(Fail::ReplacementLowDisk(free))
+                    }
+                    other => other?,
+                }
             };
             let mut written = start;
             let mut since_check = 0u64;
@@ -1069,11 +1105,20 @@ impl Gate {
             }
             st.total = total;
             st.etag = validator;
-            while let Some(chunk) = resp
-                .next_chunk()
-                .await
-                .map_err(|e| Fail::Transient(e.redacted()))?
-            {
+            loop {
+                // The first chunk, when its admission was taken above, is
+                // written first, within what it reserved.
+                let chunk = match first_chunk.take() {
+                    Some(c) => c,
+                    None => match resp
+                        .next_chunk()
+                        .await
+                        .map_err(|e| Fail::Transient(e.redacted()))?
+                    {
+                        Some(c) => c,
+                        None => break,
+                    },
+                };
                 let len = chunk.len() as u64;
                 if since_check.saturating_add(len) > reserved_ahead {
                     reserved_ahead =
@@ -3105,6 +3150,54 @@ mod tests {
             r.srv.seen()
         );
         assert_eq!(read(&r.cache, "track/1"), body(400, 2));
+    }
+
+    /// Outside-diff item on prefetch.rs:1141: a whole body of unknown
+    /// length over a part, whose speculative window does not fit, is not
+    /// refused: its first chunk is admitted with the part counted as room,
+    /// and only then is the part replaced. A first chunk that does not fit
+    /// even so is refused with the part kept.
+    #[test]
+    fn a_replacement_of_unknown_length_shrinks_its_window_to_the_first_chunk() {
+        for (under, fits) in [(100u64, true), (700, false)] {
+            let script = Script::default()
+                .file("/audio/1", body(400, 2))
+                .chunked()
+                .chunk_bytes(400)
+                .no_etag();
+            let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+            let r = rig_with_free(
+                &format!("replace-window-{under}"),
+                script,
+                1 << 20,
+                &["t"],
+                fast(),
+                starved_while_part(
+                    slot.clone(),
+                    Arc::new(AtomicBool::new(true)),
+                    600,
+                    MIN_FREE_BYTES - under,
+                ),
+            );
+            let part = r.cache.part_path("track/1");
+            *slot.lock().unwrap() = Some(part.clone());
+            std::fs::write(&part, body(600, 1)).unwrap();
+            r.dl.prefetch(&ids(&["track/1"]));
+            assert!(
+                r.dl.wait_idle(Duration::from_secs(10)),
+                "{under}: never ended"
+            );
+            if fits {
+                assert_eq!(read(&r.cache, "track/1"), body(400, 2), "{under}");
+            } else {
+                assert!(!r.cache.is_complete("track/1"), "{under}");
+                assert_eq!(
+                    std::fs::metadata(&part).map(|m| m.len()).ok(),
+                    Some(600),
+                    "{under}: a refused first chunk deleted the part"
+                );
+            }
+        }
     }
 
     /// A whole new body that replaces a partial file is admitted with the
