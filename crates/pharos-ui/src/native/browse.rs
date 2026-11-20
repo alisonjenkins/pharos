@@ -1872,7 +1872,7 @@ fn PagedGrid(
             if let Some(kept) = kept_index(&key) {
                 return Some(kept);
             }
-            let api = ctx.api.peek().clone()?;
+            let api = ctx.peek_library()?;
             match api.index(&call("browse", "index"), &listing).await {
                 Ok(index) => {
                     keep_index(key, index.clone());
@@ -3674,7 +3674,7 @@ fn AlbumPlay(
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
             let found = if tracks.is_empty() {
-                match ctx.and_then(|c| c.api.peek().clone()) {
+                match ctx.and_then(|c| c.peek_library()) {
                     Some(api) => list_all(
                         &api,
                         &call("queue", "album_shuffle"),
@@ -4003,7 +4003,7 @@ pub fn QueueButtons(
             let found = match (
                 tracks.is_empty(),
                 album,
-                ctx.and_then(|c| c.api.peek().clone()),
+                ctx.and_then(|c| c.peek_library()),
             ) {
                 (false, _, _) | (true, None, _) => Ok(tracks),
                 (true, Some(album), Some(api)) => {
@@ -4403,6 +4403,7 @@ mod tests {
             let marks = use_signal(|| 0);
             use_context_provider(|| Ctx {
                 api,
+                offline: Signal::new(None),
                 machine,
                 marks,
             });
@@ -5032,6 +5033,7 @@ mod tests {
             let marks = use_signal(|| 0);
             use_context_provider(|| Ctx {
                 api,
+                offline: Signal::new(None),
                 machine,
                 marks,
             });
@@ -5066,6 +5068,7 @@ mod tests {
             let marks = use_signal(|| 0);
             use_context_provider(|| Ctx {
                 api,
+                offline: Signal::new(None),
                 machine,
                 marks,
             });
@@ -5623,6 +5626,7 @@ mod tests {
                 let marks = use_signal(|| 0);
                 use_context_provider(|| Ctx {
                     api,
+                    offline: Signal::new(None),
                     machine,
                     marks,
                 });

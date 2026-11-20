@@ -123,6 +123,7 @@ pub mod seen;
 pub mod settings;
 pub mod shell;
 pub mod show_tracks;
+pub mod source;
 pub mod stage;
 pub mod stereo;
 pub mod style_picker;

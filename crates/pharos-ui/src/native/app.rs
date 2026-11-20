@@ -24,6 +24,8 @@ use super::appearance::{
 use super::approve_device;
 use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
+use super::offline_library::{device_verdict, OfflineLibrary, Standing, LOST_GRACE_MS};
+use super::source::Library;
 use super::damage;
 use super::diagnostics;
 use super::favourites::{self, Favourites, FavouritesView};
@@ -1804,10 +1806,32 @@ pub(super) struct AccountMe(pub(super) Resource<Option<pharos_client::api::Me>>)
 #[derive(Clone, Copy)]
 pub(super) struct Ctx {
     pub(super) api: Signal<Option<NativeApi>>,
+    /// What this device holds, while the server cannot be reached (spec
+    /// 049); `None` while online.
+    pub(super) offline: Signal<Option<Rc<OfflineLibrary>>>,
     pub(super) machine: Signal<Machine>,
     /// Counts stored watched marks; a screen that shows them reads it, so a
     /// mark reloads it.
     pub(super) marks: Signal<u32>,
+}
+
+impl Ctx {
+    /// The library the screens read (spec 049): the device's while offline,
+    /// else the server's. Reading it subscribes the caller to both.
+    pub(super) fn library(&self) -> Option<Library> {
+        if let Some(lib) = self.offline.read().clone() {
+            return Some(Library::Device(lib));
+        }
+        self.api.read().clone().map(Library::Server)
+    }
+
+    /// [`Self::library`] without subscribing, for a handler.
+    pub(super) fn peek_library(&self) -> Option<Library> {
+        if let Some(lib) = self.offline.peek().clone() {
+            return Some(Library::Device(lib));
+        }
+        self.api.peek().clone().map(Library::Server)
+    }
 }
 
 /// How long a [`Flash`] line stays up.
@@ -1937,10 +1961,85 @@ fn NativeApp(route: Route) -> Element {
         generation: use_signal(|| 0),
     };
     use_context_provider(|| flash);
+    let mut offline = use_signal(|| None::<Rc<OfflineLibrary>>);
     use_context_provider(|| Ctx {
         api,
+        offline,
         machine,
         marks,
+    });
+    // Spec 049: a dropped connection that lasts past the grace, so a blip
+    // does not swap the page for the device's library.
+    let mut lost_long = use_signal(|| false);
+    let mut lost_generation = use_signal(|| 0u32);
+    use_effect(move || {
+        let lost = connection_lost();
+        let generation = lost_generation.peek().wrapping_add(1);
+        lost_generation.set(generation);
+        if !lost {
+            if *lost_long.peek() {
+                lost_long.set(false);
+            }
+            return;
+        }
+        spawn(async move {
+            platform::sleep_ms(LOST_GRACE_MS).await;
+            if *lost_generation.peek() == generation && connection_lost() {
+                lost_long.set(true);
+            }
+        });
+    });
+    // Whether the screens read the device's library, decided on every
+    // change of connection; the "Back online" line shows for a moment after.
+    let mut back_online = use_signal(|| false);
+    let mut device_reason = use_signal(|| "connecting");
+    use_effect(move || {
+        let standing = {
+            let m = machine.read();
+            Standing {
+                connecting_or_ready: matches!(m.phase(), Phase::Connecting | Phase::Ready),
+                connected: matches!(m.phase(), Phase::Ready),
+                reconnecting: m.reconnecting(),
+                lost_long: lost_long(),
+                waiting: m.waiting().is_some(),
+                slow_connect: slow_connect(),
+                no_network: platform_offline(),
+            }
+        };
+        let (device, reason) = device_verdict(standing);
+        if *device_reason.peek() == reason {
+            return;
+        }
+        device_reason.set(reason);
+        let was_device = offline.peek().is_some();
+        if device {
+            match super::offline_device::device_library() {
+                Some(lib) => {
+                    platform::info(&format!(
+                        "pharos: offline library verdict=device reason={reason} items={}",
+                        lib.len()
+                    ));
+                    offline.set(Some(Rc::new(lib)));
+                }
+                None => platform::info(&format!(
+                    "pharos: offline library verdict=waiting reason={reason} items=0"
+                )),
+            }
+            return;
+        }
+        platform::info(&format!(
+            "pharos: offline library verdict=server reason={reason} was_device={was_device}"
+        ));
+        if was_device {
+            offline.set(None);
+            if reason == "connected" {
+                back_online.set(true);
+                spawn(async move {
+                    platform::sleep_ms(BACK_ONLINE_MS).await;
+                    back_online.set(false);
+                });
+            }
+        }
     });
     // One manage token per connection, reused each time Manage opens (B920).
     let mut held_manage = use_signal(|| None);
@@ -2162,7 +2261,7 @@ fn NativeApp(route: Route) -> Element {
     let mut libraries_failed = use_signal(|| false);
     use_effect(move || {
         let _ = library_rev();
-        let Some(api) = api.read().clone() else {
+        let Some(api) = read_library(offline, api) else {
             return;
         };
         spawn(async move {
@@ -2184,7 +2283,7 @@ fn NativeApp(route: Route) -> Element {
         _ => None,
     };
     let trail = use_resource(use_reactive!(|(shown,)| {
-        let api = api.read().clone();
+        let api = read_library(offline, api);
         async move {
             let (Some(api), Some(id)) = (api, shown) else {
                 return Vec::new();
@@ -2251,6 +2350,21 @@ fn NativeApp(route: Route) -> Element {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
                     offline_video::remember_user(&me.id);
+                    {
+                        let (api, user) = (api.clone(), me.id.clone());
+                        spawn(async move {
+                            let began = platform::now_ms();
+                            let filled = super::offline_device::fill_notes(
+                                &api,
+                                &user,
+                                platform::unix_ms(),
+                            )
+                            .await;
+                            if filled.kept > 0 {
+                                platform::info(&filled.log_line(platform::now_ms() - began));
+                            }
+                        });
+                    }
                     claim_queue(queue, held, &me.id);
                     Some(me)
                 }
@@ -2271,7 +2385,8 @@ fn NativeApp(route: Route) -> Element {
     if route == Route::Manage && matches!(machine.read().phase(), Phase::NotEnabled) {
         return rsx! { RootApp {} };
     }
-    if machine.read().shows_screens() {
+    let device_shown = offline.read().is_some();
+    if machine.read().shows_screens() || device_shown {
         let notice = {
             let m = machine.read();
             if m.reconnecting() {
@@ -2313,6 +2428,7 @@ fn NativeApp(route: Route) -> Element {
                                 if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
                                     forget_kept_books("sign-out").await;
                                     offline_video::forget_user();
+                                    super::offline_device::forget_catalogue();
                                 }
                             });
                         },
@@ -2337,8 +2453,16 @@ fn NativeApp(route: Route) -> Element {
                         }
                     }
                 }
-                if reconnecting {
+                if device_shown {
+                    OfflineNote { reconnecting: !matches!(machine.read().phase(), Phase::Ready) }
+                } else if reconnecting {
                     p { class: "pharos-error pharos-connection-shell", role: "alert", {CONNECTION_LOST} }
+                } else if back_online() {
+                    p { class: "pharos-offline-note pharos-offline-note--back", role: "status",
+                        span { class: "pharos-offline-dot" }
+                        strong { "Back online." }
+                        " Your full library is filling back in."
+                    }
                 }
                 if let Some(message) = notice {
                     ErrorNote { message }
@@ -2622,6 +2746,17 @@ fn on_this_device() -> Element {
     }
 }
 
+/// [`Ctx::library`] for the app root, which holds the two signals.
+fn read_library(
+    offline: Signal<Option<Rc<OfflineLibrary>>>,
+    api: Signal<Option<NativeApi>>,
+) -> Option<Library> {
+    if let Some(lib) = offline.read().clone() {
+        return Some(Library::Device(lib));
+    }
+    api.read().clone().map(Library::Server)
+}
+
 /// How long the first connection may take before kept books open without it.
 /// Short, because a phone in a tunnel reports itself online.
 const SLOW_CONNECT_MS: u32 = 3_000;
@@ -2859,7 +2994,7 @@ impl Search {
             if !self.find.peek().is_current(generation) {
                 return;
             }
-            let Some(api) = ctx.api.peek().clone() else {
+            let Some(api) = ctx.peek_library() else {
                 self.hits.set(Hits::Idle);
                 return;
             };
@@ -3004,7 +3139,7 @@ fn PaletteScreen() -> Element {
     let mut home = use_signal(Home::default);
     use_hook(move || {
         spawn(async move {
-            let Some(api) = ctx.api.peek().clone() else {
+            let Some(api) = ctx.peek_library() else {
                 return;
             };
             match settle(ctx.machine, api.home(&call("palette", "home")).await) {
@@ -4738,7 +4873,7 @@ fn HomeScreen() -> Element {
     let ctx = use_context::<Ctx>();
     let library = try_use_context::<super::live::LibraryRev>();
     let mut home = use_resource(move || {
-        let api = ctx.api.read().clone();
+        let api = ctx.library();
         // Continue Watching and Next Up follow watched marks; the rails
         // follow the library.
         let _ = (ctx.marks)();
@@ -4805,7 +4940,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
     // The screen stays mounted when a tile or season tab opens another
     // parent, so the load follows `id` instead of running once.
     let mut listing = use_resource(use_reactive!(|(id,)| {
-        let api = ctx.api.read().clone();
+        let api = ctx.library();
         let _ = (ctx.marks)();
         let _ = library.map(|l| (l.0)());
         async move {
@@ -5010,7 +5145,7 @@ fn TitleScreen(id: ItemRef) -> Element {
     // each result carries the id it was asked for and a stale one shows as
     // loading, never as the previous title's controls.
     let mut detail = use_resource(use_reactive!(|(id,)| {
-        let api = ctx.api.read().clone();
+        let api = ctx.library();
         let _ = (ctx.marks)();
         async move {
             let api = api?;
@@ -6312,6 +6447,26 @@ type LeaveInFlight =
 pub struct ConnectionLost(pub Memo<bool>);
 
 const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
+
+/// How long "Back online" stays up after the device's library gives way
+/// to the server's (spec 049).
+const BACK_ONLINE_MS: u32 = 4_000;
+
+/// The line over the screens while they show what is on this device (spec
+/// 049): it says so, and that the app keeps trying.
+#[component]
+fn OfflineNote(reconnecting: bool) -> Element {
+    rsx! {
+        p { class: "pharos-offline-note", role: "status",
+            span { class: "pharos-offline-dot" }
+            strong { "You're offline." }
+            " Showing what's on this device."
+            if reconnecting {
+                span { class: "pharos-offline-note-more", "Reconnecting…" }
+            }
+        }
+    }
+}
 
 /// How far past a note's deadline its redraw is timed, so the redraw finds it
 /// expired even when the browser fires the timer a little early.
@@ -9394,6 +9549,7 @@ mod tests {
         use_context_provider(|| themes);
         let ctx = Ctx {
             api: use_signal(|| None::<NativeApi>),
+            offline: use_signal(|| None),
             machine: use_signal(Machine::new),
             marks: use_signal(|| 0),
         };
@@ -9410,6 +9566,7 @@ mod tests {
             use_context_provider(|| crate::native::views::Nav(EventHandler::new(|_: Route| {})));
             use_context_provider(|| Ctx {
                 api: Signal::new(None::<NativeApi>),
+                offline: Signal::new(None),
                 machine: Signal::new(Machine::new()),
                 marks: Signal::new(0),
             });
