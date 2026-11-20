@@ -583,7 +583,19 @@ fn localize_ref<'a>(
         };
     }
     match final_key {
-        Some(base) => Ok(Cow::Owned(pharos_hls::uri::resolve(base, r))),
+        // Resolved against the URL the playlist was answered from, base path
+        // and all, so a reference that climbs out of the base path is seen
+        // to; the key is what is left under it.
+        Some(at) => {
+            let base_path = url_path(server).trim_end_matches('/');
+            let resolved = pharos_hls::uri::resolve(&format!("{base_path}{at}"), r);
+            let rest = resolved.strip_prefix(base_path).ok_or(())?;
+            if rest.starts_with('/') || rest.starts_with('?') {
+                Ok(Cow::Owned(request_key(rest)))
+            } else {
+                Err(())
+            }
+        }
         None => Ok(Cow::Borrowed(r)),
     }
 }
@@ -892,6 +904,25 @@ mod tests {
                 usize::MAX
             ),
             Localized::NotLocal(other.to_owned())
+        );
+    }
+
+    /// CR 4638660955: a relative reference resolves against the URL the
+    /// playlist was answered from, base path and all, before the key is
+    /// taken. One that climbs out of the base path is not local; a sibling
+    /// stays under it.
+    #[test]
+    fn a_relative_reference_resolves_against_the_upstream_url() {
+        let server = "https://s.example/jf";
+        let from = Some("/videos/main.m3u8");
+        assert_eq!(
+            localize_playlist("#EXTINF:6.0,\n0.m4s\n", from, server, usize::MAX),
+            Localized::Rewritten("#EXTINF:6.0,\n/videos/0.m4s\n".to_owned())
+        );
+        assert_eq!(
+            localize_playlist("#EXTINF:6.0,\n../../x/0.m4s\n", from, server, usize::MAX),
+            Localized::NotLocal("../../x/0.m4s".to_owned()),
+            "a reference outside the base path was kept"
         );
     }
 
