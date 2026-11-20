@@ -44,6 +44,8 @@ thread_local! {
     static PART_SCAN_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Part scans made on this thread.
     static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Listings of the parts an eviction may take, made on this thread.
+    static PART_VICTIM_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs in `set_cap` once the setting is saved, before the live cap is.
     static AFTER_CAP_SAVED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     /// Runs each time a `.part`'s length is read, with that length.
@@ -1005,7 +1007,8 @@ impl Cache {
         });
         let mut fresh = false;
         let mut evicted = Vec::new();
-        let mut stuck = HashSet::new();
+        // Listed once, when the finished tracks run out, not per victim.
+        let mut part_queue: Option<std::vec::IntoIter<(String, u64)>> = None;
         loop {
             let (_, music) = Self::totals(s);
             let outside = self.outside_bytes().held;
@@ -1021,11 +1024,12 @@ impl Cache {
             let Some((id, bytes)) = Self::victim(s, None) else {
                 // Finished tracks first; then a part no job holds, oldest
                 // first: its bytes leave the parts figure.
-                if let Some((id, bytes)) = self.part_victim(s, None, &stuck) {
+                let queue =
+                    part_queue.get_or_insert_with(|| self.part_victims(s, None).into_iter());
+                if let Some((id, bytes)) = queue.find(|(id, _)| !self.part_taken(id)) {
                     // One that will not go is passed over: the next oldest
                     // is tried, and its bytes are not credited.
                     if !self.remove_part_locked(&id, bytes, "over_cap") {
-                        stuck.insert(id);
                         continue;
                     }
                     parts = parts.saturating_sub(bytes);
@@ -1064,26 +1068,26 @@ impl Cache {
             .map(|(id, e)| (id.clone(), e.size))
     }
 
-    /// The oldest retained `.part` that may go, by when it was last
-    /// written: one no job holds (`active`), not pinned, queued, playing or
-    /// `keep`. Asked only once no finished track is left to evict. A part
-    /// whose name or metadata cannot be read is never a victim.
-    /// `skip` holds parts that would not go this pass: the next oldest is
-    /// tried instead.
-    fn part_victim(
-        &self,
-        s: &State,
-        keep: Option<&str>,
-        skip: &HashSet<String>,
-    ) -> Option<(String, u64)> {
+    /// The retained `.part` files that may go, oldest first by when each
+    /// was last written: ones no job holds (`active`), not pinned, queued,
+    /// playing or `keep`. Asked only once no finished track is left to
+    /// evict, and read once per trim or admission (it lists the folder),
+    /// not per victim: the caller asks [`Cache::part_taken`] again before
+    /// each removal, since a job may take one up meanwhile. A part whose
+    /// name or metadata cannot be read is never a victim.
+    fn part_victims(&self, s: &State, keep: Option<&str>) -> Vec<(String, u64)> {
+        #[cfg(test)]
+        PART_VICTIM_SCANS.with(|n| n.set(n.get() + 1));
         let active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
-        let read = std::fs::read_dir(&self.dir).ok()?;
-        read.filter_map(Result::ok)
+        let Ok(read) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<_> = read
+            .filter_map(Result::ok)
             .filter_map(|e| {
                 let name = e.file_name();
                 let id = unescape(name.to_str()?.strip_suffix(PART_EXT)?)?;
                 let held = keep == Some(id.as_str())
-                    || skip.contains(&id)
                     || active.contains(&id)
                     || s.entries.get(&id).is_some_and(|e| e.pinned)
                     || s.pins.values().any(|v| v.contains(&id))
@@ -1097,8 +1101,23 @@ impl Cache {
                 let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
                 Some((meta.modified().ok()?, id, meta.len()))
             })
-            .min_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
-            .map(|(_, id, len)| (id, len))
+            .collect();
+        found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        found.into_iter().map(|(_, id, len)| (id, len)).collect()
+    }
+
+    /// Whether a job took up `id`'s part since the victims were listed: it
+    /// is passed over, and its bytes are not credited.
+    fn part_taken(&self, id: &str) -> bool {
+        let taken = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id);
+        if taken {
+            log::info!("cache evict id={id} verdict=kept kind=part reason=taken_by_job");
+        }
+        taken
     }
 
     /// Delete the retained `.part` of `id` and name it for the downloader
@@ -1583,16 +1602,17 @@ impl Cache {
         // Finished tracks first; then parts no job holds, oldest first. One
         // that will not go is passed over for the next, its bytes not
         // credited.
-        let mut stuck = HashSet::new();
-        while now < want {
-            let Some((id, bytes)) = self.part_victim(&s, Some(downloading), &stuck) else {
-                break;
-            };
-            if !self.remove_part_locked(&id, bytes, "low_disk") {
-                stuck.insert(id);
-                continue;
+        if now < want {
+            let mut queue = self.part_victims(&s, Some(downloading)).into_iter();
+            while now < want {
+                let Some((id, bytes)) = queue.find(|(id, _)| !self.part_taken(id)) else {
+                    break;
+                };
+                if !self.remove_part_locked(&id, bytes, "low_disk") {
+                    continue;
+                }
+                now = now.saturating_add(bytes);
             }
-            now = now.saturating_add(bytes);
         }
         if evicted {
             self.persist_locked(&s);
@@ -1877,6 +1897,22 @@ pub(crate) mod tests {
             "scanned {scans} times for {} victims",
             evicted.len()
         );
+    }
+
+    /// CR 4644634478: a trim lists the parts it may evict once, not once
+    /// per part it takes.
+    #[test]
+    fn a_trim_lists_the_parts_it_may_evict_once() {
+        let d = tmp("trim-part-victims");
+        let c = Cache::open(&d, 10_000).unwrap();
+        for i in 0..6 {
+            std::fs::write(c.part_path(&format!("track/{i}")), vec![0u8; 100]).unwrap();
+        }
+        let before = PART_VICTIM_SCANS.with(std::cell::Cell::get);
+        c.set_cap(150).unwrap();
+        let listed = PART_VICTIM_SCANS.with(std::cell::Cell::get) - before;
+        assert_eq!(c.in_progress_bytes(), Some(100), "the trim did not fit");
+        assert_eq!(listed, 1, "listed the parts {listed} times for 5 victims");
     }
 
     #[test]
