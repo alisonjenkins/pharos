@@ -729,8 +729,9 @@ pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .
 
 /// What the remote's Back closes, with an Escape, before it goes back a page
 /// (FR-607): dialogs, menus, an open search list, the player's settings
-/// sheet and its queue.
-pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue"#;
+/// sheet and its queue, and the music queue while it holds the focus (B1508:
+/// its arrows stay inside it, so Back is the only way out).
+pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue, .pharos-queue:focus-within"#;
 
 pub fn bridge_script(template: &str) -> String {
     template
@@ -1904,6 +1905,19 @@ mod tests {
         assert_eq!(server_base(Some("http://media.example")), DEFAULT_SERVER);
         assert_eq!(server_base(Some("https://")), DEFAULT_SERVER);
         assert_eq!(server_base(None), DEFAULT_SERVER.trim_end_matches('/'));
+    }
+
+    /// B1508 / V1507: Back closes the music queue while the focus is in it,
+    /// since its arrows never leave it; one merely shown beside the player
+    /// stays, and Back goes on as usual.
+    #[test]
+    fn back_closes_the_music_queue_only_while_it_holds_the_focus() {
+        let overlays: Vec<&str> = OVERLAYS.split(", ").collect();
+        assert!(
+            overlays.contains(&".pharos-queue:focus-within"),
+            "{OVERLAYS}"
+        );
+        assert!(!overlays.contains(&".pharos-queue"), "{OVERLAYS}");
     }
 
     #[test]
