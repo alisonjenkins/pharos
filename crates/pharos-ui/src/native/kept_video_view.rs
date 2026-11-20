@@ -743,13 +743,12 @@ pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<S
 }
 
 /// The offline start's list of videos: the ready ones, which play with no
-/// server. Nothing when there are none.
+/// server. `ready` is the count the parent read, logged and chose this
+/// screen by; nothing when it is 0. Not read again here: a video removed
+/// in between would leave the screen the verdict named blank.
 #[component]
-pub fn OfflineVideos() -> Element {
-    // Subscribed: a store published later renders the list then.
-    let _store = shown_video_store();
-    let videos = offline_video::ready_for_last_user();
-    if videos.is_empty() {
+pub fn OfflineVideos(ready: usize) -> Element {
+    if ready == 0 {
         return rsx! {};
     }
     rsx! {
@@ -1093,6 +1092,27 @@ mod tests {
         );
         assert!(!html.contains("disabled"), "a retry is not offered: {html}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a second discard ran");
+    }
+
+    /// The offline start's video section renders from the count its parent
+    /// read and logged, not a later read: a video gone in between leaves
+    /// the section the verdict named, never a blank screen.
+    #[test]
+    fn the_offline_videos_render_from_the_parents_read() {
+        assert!(offline_video::ready_for_last_user().is_empty());
+        fn root() -> Element {
+            rsx! { OfflineVideos { ready: 1 } }
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Offline: videos on this device"), "{html}");
+        fn none() -> Element {
+            rsx! { OfflineVideos { ready: 0 } }
+        }
+        let mut dom = VirtualDom::new(none);
+        dom.rebuild_in_place();
+        assert_eq!(dioxus_ssr::render(&dom), "");
     }
 
     /// A poll refreshes the screen when only the unreadable count changed:

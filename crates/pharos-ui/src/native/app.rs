@@ -2874,13 +2874,16 @@ fn offline_start(route: &Route) -> Option<Element> {
         videos.len(),
         others.is_some()
     ));
+    // The video section renders from this read too, so a video removed
+    // after it never leaves the screen the verdict named blank.
+    let ready = videos.len();
     match (others, videos.is_empty()) {
         (others, true) => others,
         (Some(others), false) => Some(rsx! {
             {others}
-            super::kept_video_view::OfflineVideos {}
+            super::kept_video_view::OfflineVideos { ready }
         }),
-        (None, false) => Some(rsx! { super::kept_video_view::OfflineVideos {} }),
+        (None, false) => Some(rsx! { super::kept_video_view::OfflineVideos { ready } }),
     }
 }
 
