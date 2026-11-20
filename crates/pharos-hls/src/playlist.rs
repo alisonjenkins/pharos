@@ -46,7 +46,19 @@ pub struct MediaPlaylist {
     pub init_uri: Option<String>,
     pub start_offset_ms: Option<u64>,
     pub segments: Vec<Segment>,
+    /// The runs of segments between discontinuities, in order; one for a
+    /// playlist with segments and no discontinuity, none without segments.
+    pub parts: Vec<Part>,
     pub unsupported: Vec<Unsupported>,
+}
+
+/// A run of segments on one media timeline: the segments from
+/// `first_segment` up to the next part's, read with `init_uri` (the
+/// `EXT-X-MAP` in effect at its first segment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub first_segment: usize,
+    pub init_uri: Option<String>,
 }
 
 /// One media segment with millisecond timing accumulated from `#EXTINF`.
@@ -238,6 +250,8 @@ pub fn parse_media(text: &str, base_url: &str) -> Result<MediaPlaylist, ParseErr
     let mut unsupported: Vec<Unsupported> = Vec::new();
     let mut pending_extinf: Option<(f64, usize)> = None;
     let mut accum_secs: f64 = 0.0;
+    let mut parts: Vec<Part> = Vec::new();
+    let mut discontinuity = false;
 
     for (idx, raw_line) in text.lines().enumerate() {
         let line_num = idx.saturating_add(1);
@@ -260,6 +274,13 @@ pub fn parse_media(text: &str, base_url: &str) -> Result<MediaPlaylist, ParseErr
             accum_secs += dur_secs;
             let end_ms = (accum_secs * 1000.0).round() as u64;
             let duration_ms = end_ms.saturating_sub(start_ms);
+            if segments.is_empty() || discontinuity {
+                parts.push(Part {
+                    first_segment: segments.len(),
+                    init_uri: init_uri.clone(),
+                });
+            }
+            discontinuity = false;
             segments.push(Segment {
                 uri: uri::resolve(base_url, line),
                 start_ms,
@@ -360,6 +381,7 @@ pub fn parse_media(text: &str, base_url: &str) -> Result<MediaPlaylist, ParseErr
         } else if line == "#EXT-X-BYTERANGE" || line.starts_with("#EXT-X-BYTERANGE:") {
             push_unsupported(&mut unsupported, Unsupported::ByteRange);
         } else if line == "#EXT-X-DISCONTINUITY" {
+            discontinuity = true;
             push_unsupported(&mut unsupported, Unsupported::Discontinuity);
         } else if line == "#EXT-X-I-FRAMES-ONLY" {
             push_unsupported(&mut unsupported, Unsupported::IFramesOnly);
@@ -396,6 +418,7 @@ pub fn parse_media(text: &str, base_url: &str) -> Result<MediaPlaylist, ParseErr
         init_uri,
         start_offset_ms,
         segments,
+        parts,
         unsupported,
     })
 }
@@ -673,7 +696,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        parse_master, parse_media, Master, MediaPlaylist, ParseError, Rendition, Segment,
+        parse_master, parse_media, Master, MediaPlaylist, ParseError, Part, Rendition, Segment,
         Unsupported, Variant,
     };
 
@@ -789,6 +812,12 @@ mod tests {
                         duration_ms: 2_503,
                     },
                 ],
+                parts: vec![Part {
+                    first_segment: 0,
+                    init_uri: Some(format!(
+                        "http://pharos.local/videos/42/vp9/init.mp4?{qs}&e=3"
+                    )),
+                }],
                 unsupported: Vec::new(),
             }
         );
@@ -878,6 +907,55 @@ mod tests {
                 Unsupported::Live,
             ]
         );
+    }
+
+    #[test]
+    fn each_discontinuity_starts_a_part_with_the_map_in_effect() {
+        let body = "#EXTM3U\n\
+            #EXT-X-TARGETDURATION:6\n\
+            #EXT-X-PLAYLIST-TYPE:VOD\n\
+            #EXT-X-MAP:URI=\"init-a.mp4\"\n\
+            #EXTINF:6.000,\n\
+            a0.m4s\n\
+            #EXTINF:4.000,\n\
+            a1.m4s\n\
+            #EXT-X-DISCONTINUITY\n\
+            #EXT-X-MAP:URI=\"init-b.mp4\"\n\
+            #EXTINF:6.000,\n\
+            b0.m4s\n\
+            #EXT-X-DISCONTINUITY\n\
+            #EXTINF:6.000,\n\
+            c0.m4s\n\
+            #EXT-X-ENDLIST\n";
+        let media = parse_media(body, "http://pharos.local/v/main.m3u8").unwrap();
+        let init = |name: &str| Some(format!("http://pharos.local/v/{name}"));
+        assert_eq!(
+            media.parts,
+            vec![
+                Part {
+                    first_segment: 0,
+                    init_uri: init("init-a.mp4"),
+                },
+                Part {
+                    first_segment: 2,
+                    init_uri: init("init-b.mp4"),
+                },
+                // No map of its own: the one before stays in effect.
+                Part {
+                    first_segment: 3,
+                    init_uri: init("init-b.mp4"),
+                },
+            ]
+        );
+        // Segment times run on across the parts.
+        assert_eq!(media.segments[2].start_ms, 10_000);
+
+        let empty = parse_media(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-DISCONTINUITY\n#EXT-X-ENDLIST\n",
+            "http://pharos.local/v/main.m3u8",
+        )
+        .unwrap();
+        assert_eq!(empty.parts, Vec::new());
     }
 
     #[test]
