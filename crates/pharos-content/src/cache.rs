@@ -1526,7 +1526,6 @@ impl Cache {
     /// wants; a `.part` no job holds is counted until its download resumes,
     /// an eviction that has no finished track left takes it, or the next
     /// `open` removes it.
-    /// Read the reservation first (under the admission lock), then this.
     /// None when the folder could not be read whole: the host refuses new
     /// downloads until a scan succeeds, never counts it as 0.
     pub fn in_progress_bytes(&self) -> Option<u64> {
