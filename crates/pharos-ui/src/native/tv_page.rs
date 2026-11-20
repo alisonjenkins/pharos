@@ -369,6 +369,7 @@ pub async fn proxy_get<T: ProxyTransport>(
     } = get;
     // Checked here as well as by the caller: the core never sends the token
     // where it may not go, whatever it was handed.
+    let mut withheld = false;
     if token.is_some() {
         if let Err(reason) = token_allowed(&url, build_server) {
             log(
@@ -376,11 +377,22 @@ pub async fn proxy_get<T: ProxyTransport>(
                 format!("pharos: proxy token withheld reason={reason}"),
             );
             token = None;
+            withheld = true;
         }
     }
-    // Whether the request carried a token at all: a hop with none tells a
-    // token never sent from one an earlier hop dropped.
+    // Why a hop carries no token, when it carries none: the request never
+    // had one, it was withheld from plain http off the build's server, or
+    // an earlier hop dropped it. Stable label strings.
     let started_with_token = token.is_some();
+    let no_token_reason = || {
+        if started_with_token {
+            "token_dropped_earlier"
+        } else if withheld {
+            "token_withheld_insecure"
+        } else {
+            "no_token"
+        }
+    };
     let mut hops = 0usize;
     // Once a redirect leaves the original origin, the caller's headers
     // keep only those that may cross origins, for the rest of the request,
@@ -442,22 +454,23 @@ pub async fn proxy_get<T: ProxyTransport>(
                 Level::Debug,
                 format!(
                     "pharos: proxy redirect verdict=follow_without_token reason={} status={status}",
-                    if started_with_token {
-                        "token_dropped_earlier"
-                    } else {
-                        "no_token"
-                    }
+                    no_token_reason()
                 ),
             ),
+            // Every hop without the token says why, whether this hop
+            // dropped it or it was already gone.
             Hop::FollowWithoutToken => {
-                if token.take().is_some() {
-                    log(
-                        Level::Info,
-                        format!(
-                            "pharos: proxy redirect verdict=follow_without_token status={status}"
-                        ),
-                    );
-                }
+                let reason = if token.take().is_some() {
+                    "cross_origin"
+                } else {
+                    no_token_reason()
+                };
+                log(
+                    Level::Info,
+                    format!(
+                        "pharos: proxy redirect verdict=follow_without_token reason={reason} status={status}"
+                    ),
+                );
             }
             Hop::Refuse(reason) => {
                 log(
@@ -2078,6 +2091,45 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("verdict=dropped reason=cross_origin names=Authorization,Cookie")));
+    }
+
+    /// CR 4647753659: a same-origin redirect on a plain-http origin that is
+    /// not the build's server sends no token (it was withheld from the
+    /// first request) and still logs its verdict, with that reason.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_hop_on_plain_http_off_the_build_server_logs_the_withheld_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = proxy_client(|| Ok(Scripted::new(&["http://c.example.com/2"])));
+        let logged = std::sync::Mutex::new(Vec::new());
+        rt.block_on(proxy_get(
+            &client,
+            ProxyGet {
+                url: "http://c.example.com/1".to_owned(),
+                token: Some("t".to_owned()),
+                headers: &[],
+                build_server: "https://a.example.org",
+                passed_back: &[],
+                max_hops: 5,
+            },
+            &|_, line| logged.lock().unwrap().push(line),
+        ))
+        .unwrap();
+        let names = client.as_ref().unwrap().names.lock().unwrap().clone();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names.iter().flatten().all(|n| n != "X-Emby-Token"),
+            "a token was sent: {names:?}"
+        );
+        let lines = logged.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=follow_without_token reason=token_withheld_insecure")),
+            "{lines:?}"
+        );
     }
 
     /// CR 4647378697: a request that started with no token logs a
