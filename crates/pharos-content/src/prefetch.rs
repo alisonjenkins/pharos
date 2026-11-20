@@ -157,6 +157,8 @@ impl Fail {
 struct Parked {
     until: Instant,
     backoff: Duration,
+    /// The network epoch it was parked in: a reconnect since makes it due.
+    epoch: u64,
 }
 
 #[derive(Default, Clone)]
@@ -477,7 +479,16 @@ impl Gate {
                         q.parked.remove(&id);
                         continue;
                     }
-                    if let Some(until) = q.parked.get(&id).map(|p| p.until) {
+                    // A reconnect since the park makes it due at once.
+                    let epoch = self.online_epoch.load(Ordering::SeqCst);
+                    let parked = q.parked.get(&id).map(|p| (p.until, p.epoch));
+                    if let Some((until, at)) = parked.filter(|&(u, at)| at != epoch && u > now) {
+                        log::info!(
+                            "cache download id={id} park verdict=ended reason=reconnect parked_epoch={at} epoch={epoch} left_ms={}",
+                            until.saturating_duration_since(now).as_millis()
+                        );
+                    }
+                    if let Some((until, _)) = parked.filter(|&(_, at)| at == epoch) {
                         if until > now {
                             earliest = Some(earliest.map_or(until, |e| e.min(until)));
                             q.pinned.push_back(id);
@@ -839,6 +850,7 @@ impl Gate {
                     Parked {
                         until: Instant::now() + wait,
                         backoff: next,
+                        epoch: self.online_epoch.load(Ordering::SeqCst),
                     },
                 );
                 log::info!(
@@ -2978,6 +2990,55 @@ mod tests {
         assert!(
             r.dl.wait_idle(Duration::from_secs(10)),
             "the pin never resumed"
+        );
+        assert!(r.cache.is_complete("track/1"));
+    }
+
+    /// Outside-diff item on prefetch.rs:480: a reconnect ends a parked pin's
+    /// backoff, as `set_online` says, rather than leaving it to its timer.
+    #[test]
+    fn a_reconnect_ends_a_parked_pins_backoff() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .etag("vA")
+            .drop_first_after(600);
+        let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = rig_with_free(
+            "park-reconnect",
+            script,
+            1 << 20,
+            &["t"],
+            Tuning {
+                backoff_min: Duration::from_secs(30),
+                backoff_max: Duration::from_secs(30),
+                ..fast()
+            },
+            starved_while_part(slot.clone(), starve.clone(), 600, MIN_FREE_BYTES + 100),
+        );
+        let part = r.cache.part_path("track/1");
+        *slot.lock().unwrap() = Some(part.clone());
+        r.cache.pin("album/a", &ids(&["track/1"]));
+        r.dl.enqueue(&ids(&["track/1"]));
+        let until = Instant::now() + Duration::from_secs(10);
+        while r.srv.seen().is_empty() {
+            assert!(Instant::now() < until, "the pin never started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The dropped first body's 30 s retry wait is cut by a reconnect
+        // too, so the retry runs and is parked for room.
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        while !r.dl.has_deferred("track/1") {
+            assert!(Instant::now() < until, "the pin was not parked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        starve.store(false, Ordering::SeqCst);
+        r.dl.set_online(false);
+        r.dl.set_online(true);
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(5)),
+            "the reconnect left the pin to its 30 s backoff"
         );
         assert!(r.cache.is_complete("track/1"));
     }
