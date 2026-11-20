@@ -358,13 +358,15 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // The token this one replaces, for the fence. A read that fails does
     // not matter here: store never touches another token's marker.
     #[cfg(test)]
-    let previous = if tests::FAIL_PREVIOUS_READ.with(std::cell::Cell::get) {
-        None
+    let read_previous = if tests::FAIL_PREVIOUS_READ.with(std::cell::Cell::get) {
+        Err(err(path, "previous token unreadable"))
     } else {
-        read_raw(path).ok().flatten()
+        read_raw(path)
     };
     #[cfg(not(test))]
-    let previous = read_raw(path).ok().flatten();
+    let read_previous = read_raw(path);
+    let previous_unknown = read_previous.is_err();
+    let previous = read_previous.ok().flatten();
     let replaced = previous.as_ref().map(|s| fingerprint(&s.token));
     // Markers are keyed by fingerprint and, for store, append-only: it
     // never removes or rewrites a marker naming any token but this one. One
@@ -375,6 +377,27 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // own marker is pending. A write that fails leaves the old file and
     // every other marker as they were.
     let new = fingerprint(token);
+    // A sign-in that yields the very token a marker revokes is refused
+    // before the marker is touched: removing it and then failing to write
+    // would leave that token on file with nothing refusing it. A token
+    // file that could not be read may hold it, so it is refused too.
+    let same = previous
+        .as_ref()
+        .map_or(previous_unknown, |s| s.token == token);
+    if same && !matches!(marker(path, &new), Marker::Absent) {
+        log::warn!(
+            "token store verdict=refused reason=same_token_revoked previous={}",
+            if previous_unknown {
+                "unreadable"
+            } else {
+                "same"
+            }
+        );
+        return Err(err(
+            path,
+            "a revocation marker refuses this token, and it is the one on file",
+        ));
+    }
     if let Err(e) = remove_marker(path, &new) {
         log::warn!(
             "token store verdict=refused reason=revocation_marker_blocks_token step=before_write error={e}"
@@ -1688,5 +1711,48 @@ pub(crate) mod tests {
         }
         store(&p, "  tokB \n").unwrap();
         assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+    }
+
+    /// CR 4640624120: a sign-in that yields the same token a marker
+    /// revokes is refused before the marker is touched, whatever the
+    /// write or the marker's sync would do: the token stays refused after
+    /// a restart, and the log says reason=same_token_revoked.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_in_with_the_same_revoked_token_stays_refused() {
+        type Arm = fn(bool);
+        let arms: [(&str, Arm); 3] = [
+            ("plain", |_| {}),
+            ("failed_write", |on| FAIL_WRITE.with(|f| f.set(on))),
+            ("failed_marker_sync", |on| {
+                FAIL_MARKER_SYNC.with(|f| f.set(on))
+            }),
+        ];
+        for (name, arm) in arms {
+            let d = dir(&format!("same-token-{name}"));
+            let p = d.join("device-token");
+            marked_a(&p);
+            crate::testlog::start();
+            arm(true);
+            let stored = store(&p, "tokA");
+            arm(false);
+            let lines = crate::testlog::lines();
+            assert!(stored.is_err(), "{name}: {stored:?}");
+            assert!(
+                revoked(&p, &fingerprint("tokA")).is_some(),
+                "{name}: the marker went"
+            );
+            assert_eq!(load(&p).unwrap(), None, "{name}: read in this process");
+            assert_eq!(after_restart(&p), None, "{name}: read after a restart");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("reason=same_token_revoked")),
+                "{name}: {lines:?}"
+            );
+            // Another token signs in as before.
+            store(&p, "tokB").unwrap();
+            assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"), "{name}");
+        }
     }
 }
