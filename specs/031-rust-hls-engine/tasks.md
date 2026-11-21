@@ -57,4 +57,5 @@ Notes from slice 2 (2026-11-08T00:40:00Z): with #949's `PHAROS_FIREFOX_LIBAV` on
 ## Slice 5 - Measure and flip
 
 - [ ] T031-17 Comparison harness in CI on the corpus streams, both engines. (2026-11-10: `.github/workflows/hls-bench.yml` runs both engines in Chromium and Firefox on the seeded `fixture-1.webm` and writes `tools/hls-bench-compare.cjs`'s table to the job summary, for batch PRs and main pushes touching the engine; the corpus streams wait on T031-01; open)
+- [x] T031-47 Streams in several parts (V1504): `#EXT-X-DISCONTINUITY` no longer hands the stream to hls.js; one init per part, each part appended at its start with `timestampOffset`. Open: a browser play of a split film.
 - [ ] T031-18 Device traces against the slice 0 baseline; a separate ADR or ADR-0071 acceptance to flip the default.
