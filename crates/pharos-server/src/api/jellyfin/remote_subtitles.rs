@@ -260,7 +260,7 @@ pub(crate) async fn save_download(
             "OpenSubtitles returned an empty file",
         ));
     }
-    let path = store::save(&os.root, &item.path, language, file_id, &downloaded.bytes)
+    let path = store::save(&os.root, &item.path, language, file_id, false, &downloaded.bytes)
         .await
         .map_err(|e| {
             tracing::error!(item = item.id, file_id, error = %e, "opensubtitles: could not store the download");

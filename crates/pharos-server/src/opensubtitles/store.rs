@@ -35,17 +35,19 @@ pub fn item_dir(root: &Path, media_path: &Path) -> PathBuf {
     root.join(format!("{:016x}", pharos_scanner::stable_id(media_path)))
 }
 
-/// File name for a download. The language comes last so
+/// File name for a download. The language comes before any `sdh` tag so
 /// `sidecar_language_from_name` reads it, and the file id keeps two results in
-/// one language apart.
-pub fn file_name(language: &str, file_id: u64) -> String {
+/// one language apart. `sdh` marks a hearing-impaired file the way a sidecar
+/// beside the media would be marked, so it is labelled SDH (V1510).
+pub fn file_name(language: &str, file_id: u64, sdh: bool) -> String {
     let lang: String = language
         .chars()
         .filter(|c| c.is_ascii_alphabetic() || *c == '-')
         .take(8)
         .collect();
     let lang = if lang.is_empty() { "und" } else { &lang };
-    format!("os{file_id}.{lang}.srt")
+    let tag = if sdh { ".sdh" } else { "" };
+    format!("os{file_id}.{lang}{tag}.srt")
 }
 
 /// Distinguishes temp names within one process; the pid distinguishes them
@@ -63,11 +65,12 @@ pub async fn save(
     media_path: &Path,
     language: &str,
     file_id: u64,
+    sdh: bool,
     bytes: &[u8],
 ) -> io::Result<PathBuf> {
     let dir = item_dir(root, media_path);
     tokio::fs::create_dir_all(&dir).await?;
-    let name = file_name(language, file_id);
+    let name = file_name(language, file_id, sdh);
     let final_path = dir.join(&name);
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.{}.{seq}.part", std::process::id()));
@@ -102,19 +105,25 @@ mod tests {
 
     #[test]
     fn file_name_ends_in_a_language_the_sidecar_reader_understands() {
-        let name = file_name("pt-BR", 4242);
+        let name = file_name("pt-BR", 4242, false);
         assert_eq!(name, "os4242.pt-BR.srt");
         assert_eq!(
             crate::api::jellyfin::subtitles::sidecar_language_from_name(&name).as_deref(),
             Some("pt-BR")
         );
+        let sdh = file_name("en", 7, true);
+        assert_eq!(sdh, "os7.en.sdh.srt");
+        assert_eq!(
+            crate::api::jellyfin::subtitles::sidecar_language_from_name(&sdh).as_deref(),
+            Some("en")
+        );
     }
 
     #[test]
     fn hostile_language_cannot_escape_the_directory() {
-        let name = file_name("../../etc/passwd", 1);
+        let name = file_name("../../etc/passwd", 1, false);
         assert!(!name.contains('/') && !name.contains(".."), "{name}");
-        assert_eq!(file_name("", 1), "os1.und.srt");
+        assert_eq!(file_name("", 1, false), "os1.und.srt");
     }
 
     /// Two saves of one file race; both succeed and the final file is one
@@ -129,8 +138,8 @@ mod tests {
         let b = vec![b'b'; 512 * 1024];
         for _ in 0..20 {
             let (ra, rb) = tokio::join!(
-                save(&root, &media, "en", 7, &a),
-                save(&root, &media, "en", 7, &b)
+                save(&root, &media, "en", 7, false, &a),
+                save(&root, &media, "en", 7, false, &b)
             );
             let final_path = ra.unwrap();
             rb.unwrap();
@@ -158,6 +167,7 @@ mod tests {
             &media,
             "en",
             7,
+            false,
             b"1\n00:00:01,000 --> 00:00:02,000\nhi\n",
         )
         .await

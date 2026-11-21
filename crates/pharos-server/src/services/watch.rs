@@ -10,7 +10,7 @@ use pharos_jellyfin_api::dto::{
 };
 
 use crate::api::jellyfin::subtitles::{
-    discover_sidecars, is_image_subtitle_codec, sidecar_language_from_name,
+    discover_sidecars, is_image_subtitle_codec, sidecar_language_from_name, sidecar_sdh_flags,
 };
 use crate::state::AppState;
 use crate::styled_track::styled_index;
@@ -188,6 +188,7 @@ pub async fn streams(item: &MediaItem) -> Vec<MediaStreamDto> {
                     .and_then(sidecar_language_from_name)
             })
             .collect(),
+        sidecar_sdh: sidecar_sdh_flags(&sidecars),
         ..SubtitleStreamCtx::new(item.id)
     };
     build_media_streams_with_subtitles(&item.probe, is_video(item), Some(&ctx))

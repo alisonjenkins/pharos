@@ -2488,6 +2488,30 @@ pub(crate) fn sidecar_language_from_name(name: &str) -> Option<String> {
     None
 }
 
+/// Whether a sidecar filename marks the file hearing-impaired: an `sdh` or
+/// `cc` token before the extension (V1510). `hi` is left out: it is also the
+/// code for Hindi.
+pub(crate) fn sidecar_is_sdh(name: &str) -> bool {
+    let Some((base, _)) = name.rsplit_once('.') else {
+        return false;
+    };
+    base.split('.')
+        .skip(1)
+        .any(|t| t.eq_ignore_ascii_case("sdh") || t.eq_ignore_ascii_case("cc"))
+}
+
+/// [`sidecar_is_sdh`] for each sidecar, in discovery order.
+pub(crate) fn sidecar_sdh_flags(sidecars: &[(std::path::PathBuf, SidecarKind)]) -> Vec<bool> {
+    sidecars
+        .iter()
+        .map(|(p, _)| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(sidecar_is_sdh)
+        })
+        .collect()
+}
+
 /// Heuristic: is `t` a language identifier? A 2-3 letter ISO-639 code, a
 /// locale like `pt-BR`, or a spelled-out English language name.
 fn is_language_token(t: &str) -> bool {
@@ -3167,6 +3191,16 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_sdh_reads_sdh_and_cc_but_not_hindi() {
+        assert!(sidecar_is_sdh("Movie.en.sdh.srt"));
+        assert!(sidecar_is_sdh("os7.en.SDH.srt"));
+        assert!(sidecar_is_sdh("Movie.eng.cc.srt"));
+        assert!(!sidecar_is_sdh("Movie.hi.srt"), "hi is Hindi");
+        assert!(!sidecar_is_sdh("sdh.srt"), "the stem is not a tag");
+        assert!(!sidecar_is_sdh("Movie.en.srt"));
+    }
+
+    #[test]
     fn sidecar_language_parsed_from_filename() {
         // The token before the extension is the language, unless it's a
         // disposition tag (forced/sdh/…). Missing → None.
@@ -3318,6 +3352,7 @@ mod tests {
             &media,
             "en",
             31,
+            false,
             b"1\n00:00:01,000 --> 00:00:02,000\nhi\n",
         )
         .await
