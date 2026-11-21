@@ -1552,14 +1552,19 @@ impl PlaybackEngine for HlsJs {
                     bytes,
                     load_ms,
                     media_ms,
-                    sn,
                     track,
                     ..
                 } => {
                     if track == tv_page::FragTrack::Audio {
                         return;
                     }
-                    budget.borrow_mut().fragment_loaded(sn);
+                    {
+                        let mut budget = budget.borrow_mut();
+                        budget.fragment_loaded();
+                        // Loads keep coming while playing: each one checks
+                        // whether the play head has passed the last rebuild.
+                        budget.play_head(position_ms(&id));
+                    }
                     // Every load ends a failure, even a cache hit with no
                     // timing; the watch decides what counts as a sample.
                     on_fragment(super::playback::FragmentEvent::Loaded(
@@ -1607,6 +1612,7 @@ impl PlaybackEngine for HlsJs {
                         on_fragment(event);
                     }
                     let mut budget = budget.borrow_mut();
+                    budget.play_head(position_ms(&id));
                     let action = super::playback::hls_refusal(&kind, status, fatal)
                         .unwrap_or_else(|| budget.on_fatal(&kind, &details));
                     log::warn!(
