@@ -2698,12 +2698,14 @@ async fn playback_info(
     let transcoding_url =
         playback::ensure_audio_index_param(transcoding_url, default_audio_stream_index);
 
+    let stand_ins = crate::opensubtitles::stand_in::for_item(&item).await;
     let default_subtitle_stream_index = playback::pick_subtitle(
         &audio_pick,
         &streams,
         probe,
         &profile.subtitle_profiles,
         explicit_subtitle_index,
+        &stand_ins,
     );
 
     // TranscodingSubProtocol only makes sense alongside a real TranscodingUrl.

@@ -17,6 +17,7 @@ use crate::api::jellyfin::dto::container_for;
 use crate::api::jellyfin::media_source;
 use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery};
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
+use crate::opensubtitles::stand_in::{self, StandIn};
 use crate::state::AppState;
 
 /// The named-config key holding one device's audio codec deny list (T130).
@@ -1322,6 +1323,7 @@ pub fn pick_subtitle(
     probe: &pharos_core::MediaProbe,
     subtitle_profiles: &[SubtitleProfileDto],
     explicit: Option<i64>,
+    stand_ins: &[StandIn],
 ) -> Option<u32> {
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
     //   0. What the CLIENT asked for on THIS request, if it asked at all.
@@ -1390,15 +1392,40 @@ pub fn pick_subtitle(
         // veto `resolve_selected_subtitle` applies to the container default,
         // so `DefaultSubtitleStreamIndex` never points at a track this
         // session will not actually burn.
-        None => crate::api::jellyfin::stream_select::default_subtitle_stream_index(
-            &crate::api::jellyfin::stream_select::subtitle_facts(streams),
-            &audio.prefs.subtitle_languages,
-            audio.prefs.subtitle_mode,
-            audio.language.as_deref(),
-        )
-        .and_then(|idx| probe.subtitle_tracks.iter().find(|t| t.stream_index == idx))
-        .and_then(|candidate| accept_or_decline_uninvited_burn(candidate, probe, subtitle_profiles))
-        .map(|t| t.stream_index),
+        //
+        // A fetched text track standing in for a picture track (V1509) ranks
+        // as that picture track and starts in its place.
+        None => {
+            let mut facts = crate::api::jellyfin::stream_select::subtitle_facts(streams);
+            stand_in::adjust_facts(&mut facts, stand_ins);
+            let chosen = crate::api::jellyfin::stream_select::default_subtitle_stream_index(
+                &facts,
+                &audio.prefs.subtitle_languages,
+                audio.prefs.subtitle_mode,
+                audio.language.as_deref(),
+            )?;
+            if let Some(text) = stand_in::replacement(chosen, stand_ins) {
+                metrics::counter!(
+                    "pharos_subtitle_autoselect_total",
+                    "outcome" => "stand_in",
+                )
+                .increment(1);
+                tracing::info!(
+                    subtitle.ranked = chosen,
+                    subtitle.chosen = text,
+                    "auto-selected the fetched text subtitle in place of the disc picture track"
+                );
+                return Some(text);
+            }
+            probe
+                .subtitle_tracks
+                .iter()
+                .find(|t| t.stream_index == chosen)
+                .and_then(|candidate| {
+                    accept_or_decline_uninvited_burn(candidate, probe, subtitle_profiles)
+                })
+                .map(|t| t.stream_index)
+        }
     }
 }
 
@@ -1703,12 +1730,14 @@ async fn pick_tracks(
     });
     let (requested_subtitle, styled_pick) =
         crate::styled_track::negotiation_choice(&state.stores, item, stated_subtitle).await;
+    let stand_ins = stand_in::for_item(item).await;
     let subtitle = pick_subtitle(
         &audio,
         streams,
         &item.probe,
         subtitle_profiles,
         requested_subtitle,
+        &stand_ins,
     );
     let styled_pick = match (styled_pick, stated_subtitle, subtitle) {
         (None, None, Some(source)) => {
