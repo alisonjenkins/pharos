@@ -9,6 +9,7 @@ pub mod hash;
 pub mod job;
 pub mod memo;
 pub mod quota;
+pub mod stand_in;
 pub mod store;
 pub mod telemetry;
 
