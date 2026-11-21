@@ -1552,20 +1552,23 @@ impl PlaybackEngine for HlsJs {
                     bytes,
                     load_ms,
                     media_ms,
+                    sn,
                     track,
                     ..
                 } => {
                     if track == tv_page::FragTrack::Audio {
                         return;
                     }
-                    budget.borrow_mut().progressed();
-                    if bytes > 0 && load_ms > 0 && media_ms > 0 {
-                        on_fragment(super::playback::FragmentLoad {
+                    budget.borrow_mut().fragment_loaded(sn);
+                    // Every load ends a failure, even a cache hit with no
+                    // timing; the watch decides what counts as a sample.
+                    on_fragment(super::playback::FragmentEvent::Loaded(
+                        super::playback::FragmentLoad {
                             bytes,
                             load_ms,
                             media_ms,
-                        });
-                    }
+                        },
+                    ));
                 }
                 tv_page::HlsEvent::Buffered {
                     bytes,
@@ -1582,19 +1585,32 @@ impl PlaybackEngine for HlsJs {
                     kind,
                     details,
                     fatal: false,
-                } => {
+                    status,
+                } if super::playback::hls_refusal(&kind, status, false).is_none() => {
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
+                    }
                     log::warn!(
-                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=false url={log_url}"
+                        "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal=false url={log_url}"
                     );
                 }
-                tv_page::HlsEvent::Error { kind, details, .. } => {
+                tv_page::HlsEvent::Error {
+                    kind,
+                    details,
+                    fatal,
+                    status,
+                } => {
                     // The stream is in trouble: show the player's own state,
                     // not the turn, as the browser does.
                     turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
+                    }
                     let mut budget = budget.borrow_mut();
-                    let action = budget.on_fatal(&kind, &details);
+                    let action = super::playback::hls_refusal(&kind, status, fatal)
+                        .unwrap_or_else(|| budget.on_fatal(&kind, &details));
                     log::warn!(
-                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={} url={log_url}",
+                        "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal={fatal} action={} attempt={} url={log_url}",
                         action.label(),
                         budget.attempts(&kind)
                     );
@@ -1609,7 +1625,9 @@ impl PlaybackEngine for HlsJs {
                         super::playback::Recovery::Fail => {
                             let reports = trace.borrow_mut().finish(Flush::Fatal, trace_now());
                             emit_trace(reports);
-                            on_fatal(Fatal::from_hls(&kind, &details));
+                            // A refusal hls.js has not given up on yet stops here.
+                            run(format!("const p = {p}; if (p) p.stopLoad();"));
+                            on_fatal(Fatal::from_hls_answer(&kind, &details, status));
                         }
                     }
                 }
@@ -1659,7 +1677,7 @@ const h = new Hls({{
 h.__pharosGen = {generation};
 window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
-h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
+h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal, status: (d.response && d.response.code) || 0 }}));
 const fragStats = (ev, d) => {{
   if (!d.frag || (d.frag.type !== "main" && d.frag.type !== "audio")) return null;
   const st = d.frag.stats || d.stats || {{}};
@@ -2525,24 +2543,7 @@ addEventListener("scroll", gridPlace, { passive: true });
 addEventListener("focusin", gridPlace);
 __GRID_VIEW__
 __MEASURE__
-// Back closes an open dialog or menu before it goes back a page (FR-607),
-// with the Escape each of them already closes on. One that is still open
-// at the next Back, with no key pressed between, does not close on Escape:
-// that Back goes on as usual.
-let backClosed = null;
-addEventListener("keydown", () => { backClosed = null; }, true);
-const closeOverlay = () => {
-  let el = null;
-  for (const o of document.querySelectorAll('__OVERLAYS__')) {
-    if (o.getClientRects().length > 0) { el = o; break; }
-  }
-  if (!el || el === backClosed) return null;
-  const at = document.activeElement;
-  const target = at && el.contains(at) ? at : el;
-  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-  backClosed = el;
-  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
-};
+__BACK_CLOSE__
 addEventListener("popstate", (e) => {
   const closed = closeOverlay();
   if (e.state === "pharos-guard") {

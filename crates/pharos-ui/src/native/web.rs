@@ -19,8 +19,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind,
-    Fatal, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
-    PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
+    Fatal, FragmentEvent, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment,
+    OverlayEffect, PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
 
 const SESSION: &str = "/pharos/session";
@@ -3537,6 +3537,8 @@ extern "C" {
     fn destroy(this: &HlsPlayer);
     #[wasm_bindgen(method, js_class = "Hls", js_name = startLoad)]
     fn start_load(this: &HlsPlayer);
+    #[wasm_bindgen(method, js_class = "Hls", js_name = stopLoad)]
+    fn stop_load(this: &HlsPlayer);
     #[wasm_bindgen(method, js_class = "Hls", js_name = recoverMediaError)]
     fn recover_media_error(this: &HlsPlayer);
 }
@@ -3905,6 +3907,7 @@ impl PlaybackEngine for HlsJs {
         self.ceiling = Rc::new(RefCell::new(super::playback::BufferCeiling::default()));
         let on_error = {
             let (player, budget, url) = (player.clone(), Rc::clone(&budget), url.to_owned());
+            let on_fragment = Rc::clone(&on_fragment);
             let ceiling = Rc::clone(&self.ceiling);
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_event, data: JsValue| {
                 check_ceiling(&player, &ceiling);
@@ -3915,9 +3918,15 @@ impl PlaybackEngine for HlsJs {
                         .unwrap_or_default()
                 };
                 let (kind, details, fatal) = (field("type"), field("details"), field("fatal"));
-                if fatal != "true" {
+                let fatal = fatal == "true";
+                let status = js_number(&data, &["response", "code"]) as u16;
+                let refusal = super::playback::hls_refusal(&kind, status, fatal);
+                if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                    on_fragment(event);
+                }
+                if !fatal && refusal.is_none() {
                     warn(&format!(
-                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=false url={url}"
+                        "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal=false url={url}"
                     ));
                     report_event(hls_event(ClientLevel::Warn, &kind, &details, "none", 0));
                     return;
@@ -3925,10 +3934,10 @@ impl PlaybackEngine for HlsJs {
                 // The stream is in trouble: show the player's own state, not the turn.
                 super::turn_web::turn_cancel_current("engine-fatal");
                 let mut budget = budget.borrow_mut();
-                let action = budget.on_fatal(&kind, &details);
+                let action = refusal.unwrap_or_else(|| budget.on_fatal(&kind, &details));
                 let attempt = budget.attempts(&kind);
                 warn(&format!(
-                    "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={attempt} url={url}",
+                    "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal={fatal} action={} attempt={attempt} url={url}",
                     action.label(),
                 ));
                 report_event(hls_event(
@@ -3941,7 +3950,11 @@ impl PlaybackEngine for HlsJs {
                 match action {
                     Recovery::StartLoad => player.start_load(),
                     Recovery::RecoverMedia => player.recover_media_error(),
-                    Recovery::Fail => on_fatal(Fatal::from_hls(&kind, &details)),
+                    Recovery::Fail => {
+                        // A refusal hls.js has not given up on yet stops here.
+                        player.stop_load();
+                        on_fatal(Fatal::from_hls_answer(&kind, &details, status));
+                    }
                 }
             })
         };
@@ -3949,10 +3962,12 @@ impl PlaybackEngine for HlsJs {
             let budget = Rc::clone(&budget);
             let (player, ceiling) = (player.clone(), Rc::clone(&self.ceiling));
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
-                budget.borrow_mut().progressed();
+                if let Some(sn) = main_fragment_sn(&data) {
+                    budget.borrow_mut().fragment_loaded(sn);
+                }
                 check_ceiling(&player, &ceiling);
                 if let Some(load) = fragment_load(&data) {
-                    on_fragment(load);
+                    on_fragment(FragmentEvent::Loaded(load));
                 }
             })
         };
@@ -3992,8 +4007,22 @@ fn js_number(from: &JsValue, path: &[&str]) -> f64 {
     at.as_f64().unwrap_or(0.0)
 }
 
+/// The sequence number of a loaded main fragment; `None` for audio or subtitles.
+fn main_fragment_sn(data: &JsValue) -> Option<u64> {
+    let frag = js_sys::Reflect::get(data, &"frag".into()).ok()?;
+    let kind = js_sys::Reflect::get(&frag, &"type".into())
+        .ok()?
+        .as_string();
+    if kind.as_deref() != Some("main") {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(js_number(data, &["frag", "sn"]).max(0.0) as u64)
+}
+
 /// The download an `hlsFragLoaded` event reports; `None` for audio and
-/// subtitle fragments and for ones with no usable timing.
+/// subtitle fragments. A load with no usable timing still ends a failure,
+/// so it is kept; the watch decides what counts as a sample.
 fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
     let kind = js_sys::Reflect::get(data, &"frag".into())
         .ok()
@@ -4012,12 +4041,11 @@ fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
     };
     let seconds = js_number(data, &["frag", "duration"]);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let load = FragmentLoad {
+    Some(FragmentLoad {
         bytes: bytes.max(0.0) as u64,
         load_ms: (end - start).max(0.0) as u64,
         media_ms: (seconds * 1000.0).max(0.0) as u64,
-    };
-    (load.bytes > 0 && load.load_ms > 0 && load.media_ms > 0).then_some(load)
+    })
 }
 
 impl Drop for HlsJs {

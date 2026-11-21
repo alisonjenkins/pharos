@@ -12,16 +12,37 @@
 /// always one the server has seen.
 pub const RUNGS: [u64; 4] = [8_000_000, 4_000_000, 2_000_000, 1_000_000];
 
-/// Where the last cap auto quality settled on is kept, in bits per second;
-/// absent or `0` is none. It is where the next video starts.
+/// Where the last cap auto quality settled on is kept, as `<bps>@<unix ms>`
+/// (see [`format_rung`]); absent or `0` is none. It is where the next video
+/// starts, until [`AUTO_RUNG_TTL_MS`] has passed.
 pub const AUTO_RUNG_KEY: &str = "pharos.player.auto_rung";
 
-/// The cap a stored [`AUTO_RUNG_KEY`] value holds; anything that is not
-/// one of the [`RUNGS`] is none.
-pub fn parse_rung(stored: &str) -> u64 {
-    stored
-        .trim()
-        .parse::<u64>()
+/// How long a remembered cap holds: about one sitting on the same network.
+/// A cap older than that says nothing about the connection now, and one
+/// bad minute must not hold every later video down (B1487).
+pub const AUTO_RUNG_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The [`AUTO_RUNG_KEY`] value for `bps`, set at `set_at_ms`.
+pub fn format_rung(bps: u64, set_at_ms: u64) -> String {
+    format!("{bps}@{set_at_ms}")
+}
+
+/// The cap a stored [`AUTO_RUNG_KEY`] value holds at `now_ms`: none once it
+/// is older than [`AUTO_RUNG_TTL_MS`], stamped after now, unstamped (from
+/// before caps carried a time) or not one of the [`RUNGS`].
+pub fn parse_rung(stored: &str, now_ms: u64) -> u64 {
+    let Some((bps, set_at)) = stored.trim().split_once('@') else {
+        return 0;
+    };
+    let Ok(set_at) = set_at.parse::<u64>() else {
+        return 0;
+    };
+    // A stamp after now came from a clock since corrected: it says nothing
+    // about how long ago the cap was set.
+    if set_at > now_ms || now_ms - set_at > AUTO_RUNG_TTL_MS {
+        return 0;
+    }
+    bps.parse::<u64>()
         .ok()
         .filter(|bps| RUNGS.contains(bps))
         .unwrap_or(0)
@@ -34,6 +55,17 @@ pub fn effective_cap(manual: u64, auto: u64) -> u64 {
         (0, auto) => auto,
         (manual, 0) => manual,
         (manual, auto) => manual.min(auto),
+    }
+}
+
+/// The automatic cap in force: none where the HLS engine picks its own
+/// quality, since the cap auto quality settled on under hls.js is then not
+/// negotiated (B1485).
+pub fn auto_in_force(auto: u64, engine_adapts: bool) -> u64 {
+    if engine_adapts {
+        0
+    } else {
+        auto
     }
 }
 
@@ -281,6 +313,11 @@ pub struct Watch {
     quiet_until: u64,
     headroom_since: Option<u64>,
     seeking_since: Option<u64>,
+    /// The newest stall when the last fragment loaded: stalls after it are
+    /// dropped if a load then fails.
+    stall_at_load: Option<u64>,
+    /// A fragment failed to load and none has loaded since (B1489).
+    failing: bool,
 }
 
 impl Watch {
@@ -303,6 +340,8 @@ impl Watch {
             quiet_until: now.saturating_add(SETTLE_MS),
             headroom_since: None,
             seeking_since: None,
+            stall_at_load: None,
+            failing: false,
         }
     }
 
@@ -332,6 +371,8 @@ impl Watch {
     /// A fragment of `bytes` took `load_ms` to download and holds
     /// `media_ms` of video.
     pub fn fragment(&mut self, bytes: u64, load_ms: u64, media_ms: u64) {
+        self.failing = false;
+        self.stall_at_load = self.stalls.last().copied();
         // A cache hit answers in a millisecond; that says nothing of the link.
         if bytes < MIN_SAMPLE_BYTES || load_ms < MIN_LOAD_MS || media_ms == 0 {
             return;
@@ -353,9 +394,26 @@ impl Watch {
         }
     }
 
+    /// A fragment's fetch failed. The video runs out of data because it got
+    /// no answer, not a slow one: stalls since the last load, and any until
+    /// the next, are not the link's (B1489).
+    pub fn load_failed(&mut self) {
+        self.failing = true;
+        self.headroom_since = None;
+        let kept = self.stall_at_load;
+        self.stalls
+            .retain(|&at| kept.is_some_and(|kept| at <= kept));
+    }
+
+    /// A fragment's fetch timed out: the link answers, too slowly, so the
+    /// stalls from here are its again, as after a load.
+    pub fn load_timed_out(&mut self) {
+        self.failing = false;
+    }
+
     /// The video ran out of data at `now`.
     pub fn stalled(&mut self, now: u64) {
-        if self.seeking_since.is_some() {
+        if self.seeking_since.is_some() || self.failing {
             return;
         }
         let merged = self
@@ -396,7 +454,10 @@ impl Watch {
             (_, None) => None,
         };
         let estimate = self.estimate_bps.filter(|_| self.samples >= MIN_SAMPLES);
+        // A link that is failing fetches has no headroom, however fast its
+        // last answers were.
         let headroom = !settling
+            && !self.failing
             && up_target(self.cap, self.ceiling, self.source_bps).is_some_and(|(_, to)| {
                 estimate.is_some_and(|e| e.saturating_mul(10) >= to.saturating_mul(UP_ABOVE_TENTHS))
             });
@@ -719,6 +780,90 @@ mod tests {
         assert_eq!(w.cap(), 4_000_000);
     }
 
+    /// V1480: a wait on a fetch that failed is not a slow link.
+    #[test]
+    fn stalls_around_a_failed_load_do_not_step_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        // The buffer runs dry before the engine reports the fetch failing.
+        w.stalled(20 * MS);
+        w.load_failed();
+        w.stalled(25 * MS);
+        assert_eq!(w.evaluate(26 * MS), None);
+        // Loads again: a stall now is the link's once more.
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.stalled(30 * MS);
+        assert_eq!(w.evaluate(31 * MS), None);
+        w.stalled(35 * MS);
+        assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    /// V1480: on a link too slow for the stream, fragment fetches time out
+    /// after healthy loads. A timeout is not a failed load, so its stalls
+    /// still step down.
+    /// Disarm check: with `fragLoadTimeOut` counted as a failure, no step.
+    #[test]
+    fn a_timeout_streak_after_healthy_loads_steps_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        for at in [20, 25] {
+            hls_error(&mut w, "fragLoadTimeOut");
+            w.stalled(at * MS);
+        }
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    /// V1480: a timeout after a failed load ends the failure, so the slow
+    /// link's stalls that follow still step down.
+    /// Disarm check: with `load_timed_out` leaving `failing` set, no step.
+    #[test]
+    fn timeouts_after_a_failed_load_still_step_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        hls_error(&mut w, "fragLoadError");
+        for at in [20, 25] {
+            hls_error(&mut w, "fragLoadTimeOut");
+            w.stalled(at * MS);
+        }
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    /// Hands the watch what an hls.js `networkError` of `details` says, as
+    /// the engines and the app do.
+    fn hls_error(w: &mut Watch, details: &str) {
+        use super::super::playback::{fragment_load_event, FragmentEvent};
+        match fragment_load_event("networkError", details) {
+            Some(FragmentEvent::Failed) => w.load_failed(),
+            Some(FragmentEvent::TimedOut) => w.load_timed_out(),
+            Some(FragmentEvent::Loaded(_)) | None => {}
+        }
+    }
+
+    /// V1480: a load with no usable timing, such as a cache hit, still
+    /// ends a failure, so the engines hand every load to the watch.
+    #[test]
+    fn an_untimed_load_ends_a_failure() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.load_failed();
+        w.fragment(4_700_000, 0, 6_000);
+        w.stalled(30 * MS);
+        w.stalled(35 * MS);
+        assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    #[test]
+    fn a_stall_before_the_last_load_survives_a_failure() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.stalled(20 * MS);
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.load_failed();
+        downloads(&mut w, 4_700_000, 20_000_000, 1);
+        w.stalled(25 * MS);
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
     #[test]
     fn stalls_while_settling_are_ignored() {
         let mut w = watch();
@@ -856,6 +1001,23 @@ mod tests {
         assert!(w.evaluate(141 * MS).is_some());
     }
 
+    /// V1480: a failing fetch is no headroom, and a failure restarts the
+    /// headroom clock.
+    #[test]
+    fn a_failed_load_restarts_the_headroom_clock() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 1_200_000, 3);
+        assert!(w.evaluate(20 * MS).is_some());
+        downloads(&mut w, 1_000_000, 12_000_000, 8);
+        assert_eq!(w.evaluate(40 * MS), None);
+        w.load_failed();
+        assert_eq!(w.evaluate(101 * MS), None, "no step up while failing");
+        downloads(&mut w, 1_000_000, 12_000_000, 1);
+        assert_eq!(w.evaluate(110 * MS), None);
+        assert_eq!(w.evaluate(169 * MS), None, "the clock restarted");
+        assert!(w.evaluate(171 * MS).is_some());
+    }
+
     #[test]
     fn a_restarted_player_settles_before_stalls_count() {
         let mut w = watch();
@@ -879,13 +1041,44 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_that_adapts_has_no_auto_cap_in_force() {
+        // V1476: the menu shows the cap negotiation sends, not the stored rung.
+        assert_eq!(auto_in_force(2_000_000, true), 0);
+        assert_eq!(auto_in_force(2_000_000, false), 2_000_000);
+        let shown = QualityView {
+            manual: 0,
+            auto: auto_in_force(2_000_000, true),
+            method: String::new(),
+        };
+        assert_eq!(shown.title(), "Quality: Auto, no limit");
+        assert!(shown
+            .options(0)
+            .iter()
+            .all(|(value, _)| value != RESET_AUTO));
+    }
+
+    #[test]
     fn a_stored_rung_is_read_only_when_it_is_one() {
-        assert_eq!(parse_rung("2000000"), 2_000_000);
-        assert_eq!(parse_rung(" 1000000 "), 1_000_000);
-        assert_eq!(parse_rung("0"), 0);
-        assert_eq!(parse_rung("3000000"), 0);
-        assert_eq!(parse_rung("fast"), 0);
-        assert_eq!(parse_rung(""), 0);
+        let now = 10 * AUTO_RUNG_TTL_MS;
+        assert_eq!(parse_rung(&format_rung(2_000_000, now), now), 2_000_000);
+        assert_eq!(parse_rung(" 1000000@1000 ", 1_000), 1_000_000);
+        assert_eq!(parse_rung(&format_rung(0, now), now), 0);
+        assert_eq!(parse_rung(&format_rung(3_000_000, now), now), 0);
+        assert_eq!(parse_rung("fast@1000", 1_000), 0);
+        assert_eq!(parse_rung("2000000@soon", 1_000), 0);
+        assert_eq!(parse_rung("", now), 0);
+    }
+
+    /// A remembered cap holds for one sitting, not for good: it lapses after
+    /// the TTL, and one stored before caps carried a time is not read (B1487).
+    #[test]
+    fn a_remembered_cap_lapses() {
+        let set = 5 * AUTO_RUNG_TTL_MS;
+        let stored = format_rung(1_000_000, set);
+        assert_eq!(parse_rung(&stored, set + AUTO_RUNG_TTL_MS), 1_000_000);
+        assert_eq!(parse_rung(&stored, set + AUTO_RUNG_TTL_MS + 1), 0);
+        assert_eq!(parse_rung(&stored, set - 1), 0, "stamped after now");
+        assert_eq!(parse_rung("1000000", set), 0, "unstamped");
     }
 
     #[test]

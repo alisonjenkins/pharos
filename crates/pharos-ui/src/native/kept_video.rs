@@ -278,6 +278,12 @@ pub fn is_retryable(status: Option<u16>) -> bool {
     }
 }
 
+/// Whether a fetch's last answer was the server's own failure (5xx), the only
+/// answer that lets a download go without a short tail (B1484).
+pub fn is_server_failure(status: Option<u16>) -> bool {
+    status.is_some_and(|s| (500..600).contains(&s))
+}
+
 /// `files` that `cached` does not hold yet, in order: what a restarted
 /// download still has to fetch.
 pub fn missing_files(files: &[String], cached: &std::collections::HashSet<String>) -> Vec<String> {
@@ -482,6 +488,14 @@ mod tests {
         assert_eq!(retry_delay_secs(0), None);
         assert!(is_retryable(None) && is_retryable(Some(404)) && is_retryable(Some(500)));
         assert!(!is_retryable(Some(403)) && !is_retryable(Some(401)));
+    }
+
+    #[test]
+    fn only_the_servers_own_failure_lets_a_short_tail_go() {
+        // V1475: an ended session (401) or a lost network keeps the tail owed.
+        assert!(is_server_failure(Some(500)) && is_server_failure(Some(503)));
+        assert!(!is_server_failure(Some(401)) && !is_server_failure(Some(404)));
+        assert!(!is_server_failure(None));
     }
 
     #[test]

@@ -114,6 +114,17 @@ impl Fatal {
         self.kind == FailureKind::Damaged
     }
 
+    /// [`Self::from_hls`] for an error whose fetch got `status` (0 when it got
+    /// none): an HTTP failure is the server's, as the Rust engine reports it.
+    pub fn from_hls_answer(kind: &str, details: &str, status: u16) -> Self {
+        if (400..600).contains(&status) {
+            let reason = format!("the stream failed ({kind}: {details}, HTTP {status})");
+            Self::of(FailureKind::of_status(status), reason)
+        } else {
+            Self::from_hls(kind, details)
+        }
+    }
+
     /// hls.js reports media it could not parse or append as a `mediaError`
     /// with these details; a stall, a full buffer or a codec the browser
     /// lacks is a `mediaError` too, but not damage. A codec the browser
@@ -138,6 +149,20 @@ impl Fatal {
     }
 }
 
+/// What to do about an hls.js error that carried an HTTP status, before the
+/// recovery budget is asked: `Some(Fail)` where no retry can change the
+/// answer, `None` to go on as the error's kind says (B1488).
+///
+/// A 401 or 403 fails at its first sight, fatal or not: hls.js would try the
+/// other renditions and `startLoad` would ask again, each refused the same
+/// way, while an ended session's mark waits to renegotiate. Any other 4xx
+/// hls.js gave up on fails too, since `startLoad` would only repeat it.
+pub fn hls_refusal(kind: &str, status: u16, fatal: bool) -> Option<Recovery> {
+    let refused = kind == "networkError" && (400..500).contains(&status);
+    let denied = matches!(status, 401 | 403);
+    (refused && (fatal || denied)).then_some(Recovery::Fail)
+}
+
 /// One video fragment the engine downloaded, for measuring the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentLoad {
@@ -149,9 +174,33 @@ pub struct FragmentLoad {
     pub media_ms: u64,
 }
 
-/// Told of each video fragment downloaded; engines that cannot see
-/// downloads (the browser's own player) never call it.
-pub type OnFragment = std::rc::Rc<dyn Fn(FragmentLoad)>;
+/// What an engine saw of one video fragment's download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentEvent {
+    Loaded(FragmentLoad),
+    /// The fetch was answered with an error. The wait that follows says
+    /// nothing of the link's speed (B1489).
+    Failed,
+    /// The fetch got no answer in time: the link is too slow for the stream,
+    /// so the waits that follow are its, even after an earlier failure.
+    TimedOut,
+}
+
+/// Told of each video fragment downloaded, or that failed to; engines that
+/// cannot see downloads (the browser's own player) never call it.
+pub type OnFragment = std::rc::Rc<dyn Fn(FragmentEvent)>;
+
+/// What an hls.js error says of a video fragment's fetch, if anything. A
+/// timeout (`fragLoadTimeOut`) is not a failure: it is the link too slow for
+/// the stream, and the stalls it leaves must still step auto quality down,
+/// including after an earlier failure.
+pub fn fragment_load_event(kind: &str, details: &str) -> Option<FragmentEvent> {
+    match (kind, details) {
+        ("networkError", "fragLoadError") => Some(FragmentEvent::Failed),
+        ("networkError", "fragLoadTimeOut") => Some(FragmentEvent::TimedOut),
+        _ => None,
+    }
+}
 
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,6 +773,22 @@ impl AbrSwitchReport {
                 ("applied", self.applied.to_string()),
             ],
         }
+    }
+}
+
+/// Retries of a playlist fetch after its first failure, as hls.js
+/// `playlistLoadPolicy.errorRetry.maxNumRetry`: without them one blip on the
+/// master or a media playlist fails the start (B1491).
+pub const PLAYLIST_RETRIES: u32 = 2;
+
+/// The backoff for the Rust engine's playlist fetches: the segment backoff,
+/// fewer times. A refusal (4xx other than 408 and 429) is not retried.
+pub fn playlist_retry_policy(
+    deadlines: pharos_hls::retry::Deadlines,
+) -> pharos_hls::retry::RetryPolicy {
+    pharos_hls::retry::RetryPolicy {
+        max_retries: PLAYLIST_RETRIES,
+        ..pharos_hls::retry::RetryPolicy::with_deadlines(deadlines)
     }
 }
 
@@ -2312,15 +2377,26 @@ impl Recovery {
 }
 
 /// Recoveries of one kind before a fatal error is shown. A fragment that
-/// loads refills the budget, so a long film survives scattered blips but a
-/// stream that keeps failing gives up within a few seconds.
+/// loads refills the network budget, and one [`MEDIA_REFILL_FRAGMENTS`] past
+/// the last media rebuild refills the media budget, so a long film survives
+/// scattered blips but a stream that keeps failing gives up within a few
+/// seconds.
 pub const MAX_RECOVERIES: u32 = 3;
+
+/// How many fragments past the one loaded before a media rebuild must load
+/// before the media budget refills. A segment that fails to decode loads fine
+/// each time it is refetched, so its own load proves nothing (V1474).
+pub const MEDIA_REFILL_FRAGMENTS: u64 = 2;
 
 /// Chooses the recovery for each fatal hls.js error.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryBudget {
     network: u32,
     media: u32,
+    /// The sequence number of the last main media fragment that loaded.
+    last_sn: u64,
+    /// `last_sn` when the last media rebuild started, until playback passes it.
+    rebuilt_after_sn: Option<u64>,
 }
 
 impl RecoveryBudget {
@@ -2342,6 +2418,9 @@ impl RecoveryBudget {
             return Recovery::Fail;
         }
         *used += 1;
+        if recovery == Recovery::RecoverMedia {
+            self.rebuilt_after_sn = Some(self.last_sn);
+        }
         recovery
     }
 
@@ -2354,8 +2433,27 @@ impl RecoveryBudget {
         }
     }
 
-    /// A fragment loaded: playback is moving again.
-    pub fn progressed(&mut self) {
+    /// Main fragment `sn` loaded: the network is answering again, and once
+    /// it is [`MEDIA_REFILL_FRAGMENTS`] past the last rebuild's, so is the media.
+    /// An `sn` of 0 is an init segment or an unnumbered report, which says
+    /// nothing about where playback is.
+    pub fn fragment_loaded(&mut self, sn: u64) {
+        self.network = 0;
+        if sn == 0 {
+            return;
+        }
+        self.last_sn = sn;
+        if self
+            .rebuilt_after_sn
+            .is_some_and(|from| sn >= from.saturating_add(MEDIA_REFILL_FRAGMENTS))
+        {
+            self.media = 0;
+            self.rebuilt_after_sn = None;
+        }
+    }
+
+    /// Playback is moving again: both budgets refill.
+    pub fn refill(&mut self) {
         *self = Self::default();
     }
 }
@@ -2462,7 +2560,7 @@ impl MediaRecovery {
             return None;
         }
         let attempt = self.budget.attempts("mediaError");
-        self.budget.progressed();
+        self.budget.refill();
         self.rebuilt = None;
         Some(MediaResumed {
             attempt,
@@ -3352,6 +3450,34 @@ mod tests {
         ] {
             assert_eq!(FailureKind::of_media_error(details), want, "{details}");
         }
+    }
+
+    /// V1479: an hls.js fetch the server refused fails as the server's
+    /// failure at once, and a 401 does not wait for hls.js to give up.
+    #[test]
+    fn an_hlsjs_refusal_fails_at_once_as_the_servers() {
+        assert_eq!(
+            hls_refusal("networkError", 401, false),
+            Some(Recovery::Fail)
+        );
+        assert_eq!(
+            hls_refusal("networkError", 403, false),
+            Some(Recovery::Fail)
+        );
+        assert_eq!(hls_refusal("networkError", 404, true), Some(Recovery::Fail));
+        // A level gone while others play: hls.js may switch away from it.
+        assert_eq!(hls_refusal("networkError", 404, false), None);
+        // The server's own failure and a lost network keep their retries.
+        assert_eq!(hls_refusal("networkError", 503, true), None);
+        assert_eq!(hls_refusal("networkError", 0, true), None);
+        assert_eq!(hls_refusal("mediaError", 401, true), None);
+        let refused = Fatal::from_hls_answer("networkError", "fragLoadError", 401);
+        assert_eq!(refused.kind, FailureKind::Server);
+        assert!(refused.reason.contains("HTTP 401"), "{}", refused.reason);
+        assert_eq!(
+            Fatal::from_hls_answer("networkError", "fragLoadError", 0),
+            Fatal::from_hls("networkError", "fragLoadError")
+        );
     }
 
     /// 038 FR-403: a codec the browser lacks is the browser's limit, a
@@ -5639,12 +5765,46 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_fragment_refills_the_budget() {
+    fn a_loaded_fragment_refills_the_network_budget() {
         let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            budget.on_fatal("networkError", "fragLoadError");
+        }
+        budget.fragment_loaded(4);
+        assert_eq!(
+            budget.on_fatal("networkError", "fragLoadError"),
+            Recovery::StartLoad
+        );
+    }
+
+    #[test]
+    fn a_segment_that_never_decodes_runs_out_the_media_budget() {
+        // V1474: the failing segment loads again after every rebuild.
+        let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            budget.fragment_loaded(7);
+            assert_eq!(
+                budget.on_fatal("mediaError", "bufferAppendError"),
+                Recovery::RecoverMedia
+            );
+        }
+        // The init segment the rebuild refetches is no progress either.
+        budget.fragment_loaded(0);
+        budget.fragment_loaded(8);
+        assert_eq!(
+            budget.on_fatal("mediaError", "bufferAppendError"),
+            Recovery::Fail
+        );
+    }
+
+    #[test]
+    fn playback_past_a_rebuild_refills_the_media_budget() {
+        let mut budget = RecoveryBudget::new();
+        budget.fragment_loaded(7);
         for _ in 0..MAX_RECOVERIES {
             budget.on_fatal("mediaError", "bufferAppendError");
         }
-        budget.progressed();
+        budget.fragment_loaded(7 + MEDIA_REFILL_FRAGMENTS);
         assert_eq!(
             budget.on_fatal("mediaError", "bufferAppendError"),
             Recovery::RecoverMedia
@@ -5999,5 +6159,43 @@ mod tests {
         for bad in ["tv@", "tv@soon", "ultra@1000000000000", "@5", ""] {
             assert_eq!(parse_tier_drop(bad, set), None, "{bad:?}");
         }
+    }
+
+    /// A playlist fetch that fails on the network or a 5xx is tried again,
+    /// twice; a refusal fails at once (B1491).
+    #[test]
+    fn a_playlist_blip_is_retried_and_a_refusal_is_not() {
+        use pharos_hls::retry::{Cause, GiveUp, Retries, Verdict};
+        let policy = playlist_retry_policy(segment_deadlines(DeviceClass::Desktop));
+        let mut blips = Retries::new(policy);
+        assert!(matches!(
+            blips.on_failure((), Cause::Http(503)),
+            Verdict::Retry {
+                attempt: 1,
+                after_ms: 1_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Retry {
+                attempt: 2,
+                after_ms: 2_000
+            }
+        ));
+        assert!(matches!(
+            blips.on_failure((), Cause::Network),
+            Verdict::Fail {
+                why: GiveUp::Exhausted,
+                ..
+            }
+        ));
+        let mut refused = Retries::new(policy);
+        assert!(matches!(
+            refused.on_failure((), Cause::Http(401)),
+            Verdict::Fail {
+                why: GiveUp::NotRetryable,
+                ..
+            }
+        ));
     }
 }
