@@ -267,11 +267,17 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     # read-only, so copy the tree into a writable directory.
     mkdir -p "$TMP/media"
     cp -rL --no-preserve=mode "$MEDIA_SRC/." "$TMP/media/"
-    # Two generated clips for the play-to-the-end test (hls-eos.spec.ts): 90 s
+    # Generated clips for the play-to-the-end tests. hls-eos.spec.ts: 90 s
     # leaves a short sliver as the last HLS segment, 87 s ends on a whole one.
     if [ -n "${PHAROS_HLS_EOS:-}" ]; then
       for secs in 90 87; do
         nix develop --command ffmpeg -loglevel error -f lavfi -i testsrc=size=640x360:rate=25 -f lavfi -i sine=frequency=440:sample_rate=48000 -t "$secs" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 500k -g 50 -c:a libopus -b:a 64k "$TMP/media/eos-audit-$secs.webm"
+      done
+      # One film in two files for the split-film test (hls-eos-split.spec.ts).
+      mkdir -p "$TMP/media/Split Audit"
+      for part in "1 40 440" "2 35 660"; do
+        set -- $part
+        nix develop --command ffmpeg -loglevel error -f lavfi -i testsrc=size=640x360:rate=25 -f lavfi -i sine=frequency="$3":sample_rate=48000 -t "$2" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 500k -g 50 -c:a libopus -b:a 64k "$TMP/media/Split Audit/split-audit cd$1.webm"
       done
     fi
     # A movie library of more than one browse page (100), for the grid's
