@@ -313,7 +313,9 @@ pub async fn run_pass(
                         record_job(JobOutcome::Error);
                         continue;
                     }
-                    match store::save(&os.root, &item.path, language, hit.file_id, &d.bytes).await {
+                    match store::save(&os.root, &item.path, language, hit.file_id, false, &d.bytes)
+                        .await
+                    {
                         Ok(path) => {
                             sum.downloaded += 1;
                             record_job(JobOutcome::Downloaded);

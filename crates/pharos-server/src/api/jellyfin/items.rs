@@ -2645,6 +2645,7 @@ async fn playback_info(
         item_id: item.id,
         sidecar_count: sidecars.len() as u32,
         sidecar_langs,
+        sidecar_sdh: crate::api::jellyfin::subtitles::sidecar_sdh_flags(&sidecars),
         burn_text_indices: burn_text_indices.clone(),
         media_source_id: item.edition.as_ref().map(|_| source_id.clone()),
     };
