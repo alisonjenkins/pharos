@@ -1559,13 +1559,15 @@ impl PlaybackEngine for HlsJs {
                         return;
                     }
                     budget.borrow_mut().progressed();
-                    if bytes > 0 && load_ms > 0 && media_ms > 0 {
-                        on_fragment(super::playback::FragmentLoad {
+                    // Every load ends a failure, even a cache hit with no
+                    // timing; the watch decides what counts as a sample.
+                    on_fragment(super::playback::FragmentEvent::Loaded(
+                        super::playback::FragmentLoad {
                             bytes,
                             load_ms,
                             media_ms,
-                        });
-                    }
+                        },
+                    ));
                 }
                 tv_page::HlsEvent::Buffered {
                     bytes,
@@ -1584,6 +1586,9 @@ impl PlaybackEngine for HlsJs {
                     fatal: false,
                     status,
                 } if super::playback::hls_refusal(&kind, status, false).is_none() => {
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
+                    }
                     log::warn!(
                         "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal=false url={log_url}"
                     );
@@ -1597,6 +1602,9 @@ impl PlaybackEngine for HlsJs {
                     // The stream is in trouble: show the player's own state,
                     // not the turn, as the browser does.
                     turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
+                    }
                     let mut budget = budget.borrow_mut();
                     let action = super::playback::hls_refusal(&kind, status, fatal)
                         .unwrap_or_else(|| budget.on_fatal(&kind, &details));
