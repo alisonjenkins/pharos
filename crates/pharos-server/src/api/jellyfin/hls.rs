@@ -8156,6 +8156,7 @@ mod prewarm_edition_tests {
                 client_is_remote: false,
                 version: "",
                 device: None,
+                resumes: "",
             },
         )
         .await

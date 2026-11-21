@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 48;
+const schemaVersion :UInt32 = 49;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -485,8 +485,13 @@ struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
 struct StartTracks { audio @0 :OptU32; subtitle @1 :OptU32; }
 struct StartTracksResult { union { tracks @0 :StartTracks; error @1 :Error; } }
 interface Playback {
-  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice, version :Text) -> (result :NegotiateResult);
+  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice, version :Text, resumes :PlaySessionId) -> (result :NegotiateResult);
   # `version`: a Version.id from ItemDetail.versions; empty plays the primary.
+  # `resumes`: the play session of the stream the player is still pulling, named
+  # by a renewal after a reconnect; absent on a first negotiate. When no released
+  # grant is adopted, the grant keeps that session if this user holds it for this
+  # version and the stream negotiated is the same one, and no live grant has it
+  # (B1490, ADR-0150). Since schemaVersion 49.
   # An id the item does not have is notFound; an edition the server cannot
   # serve yet (no stored probe) is unavailable.
   # What a title page shows in its track pickers before playback; opens no session.

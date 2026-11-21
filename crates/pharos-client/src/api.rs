@@ -713,6 +713,21 @@ pub trait PharosApi {
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
+    /// [`PharosApi::play`] again for a stream that is still running on the
+    /// play session `resumes`, so the server can keep that session rather
+    /// than open a second one (B1490). An API that cannot say so plays.
+    async fn renew(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        version: &str,
+        caps: &Capabilities,
+        picks: TrackPicks,
+        resumes: &str,
+    ) -> Result<(Decision, Self::Playing), ClientError> {
+        let _ = resumes;
+        self.play(call, id, version, caps, picks).await
+    }
     /// The tracks [`PharosApi::play`] with default picks would start `id`
     /// on: the user's last choice for it, else their preferences.
     async fn start_tracks(
@@ -1500,6 +1515,68 @@ impl NativeApi {
     }
 }
 
+impl NativeApi {
+    /// One `negotiate` call; `resumes` names the play session a renewal's
+    /// stream already uses (empty: none).
+    async fn negotiate(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        version: &str,
+        caps: &Capabilities,
+        picks: TrackPicks,
+        resumes: &str,
+    ) -> Result<(Decision, NativeGrant), ClientError> {
+        let mut req = self.playback.negotiate_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            set_caps(p.reborrow().init_caps(), caps);
+            set_choice(p.reborrow().init_audio(), picks.audio);
+            set_choice(p.reborrow().init_subtitle(), picks.subtitle);
+            p.set_version(version);
+            if !resumes.is_empty() {
+                p.init_resumes().set_value(resumes);
+            }
+        }
+        let reply = req.send().promise.await?;
+        let grant = match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            negotiate_result::Grant(grant) => grant?,
+            negotiate_result::Error(e) => return Err(ClientError::from_api(e?)),
+        };
+        let mut req = grant.decision_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        let decision = match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            decision_result::Decision(d) => {
+                let d = d?;
+                Decision {
+                    method: text(d.get_method())?,
+                    direct_play_block: text(d.get_direct_play_block())?,
+                    downgrade: text(d.get_downgrade())?,
+                    stream_url: text(d.get_stream_url())?,
+                    play_session: text(d.get_play_session()?.get_value())?,
+                    audio: read_opt_u32(d.get_audio()?)?,
+                    subtitle: read_opt_u32(d.get_subtitle()?)?,
+                }
+            }
+            decision_result::Error(e) => return Err(ClientError::from_api(e?)),
+        };
+        Ok((decision, NativeGrant(grant)))
+    }
+}
+
 impl PharosApi for NativeApi {
     type Playing = NativeGrant;
 
@@ -1881,50 +1958,20 @@ impl PharosApi for NativeApi {
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, NativeGrant), ClientError> {
-        let mut req = self.playback.negotiate_request();
-        {
-            let mut p = req.get();
-            call.write(p.reborrow().init_ctx());
-            set_item_ref(p.reborrow().init_id(), id);
-            set_caps(p.reborrow().init_caps(), caps);
-            set_choice(p.reborrow().init_audio(), picks.audio);
-            set_choice(p.reborrow().init_subtitle(), picks.subtitle);
-            p.set_version(version);
-        }
-        let reply = req.send().promise.await?;
-        let grant = match reply
-            .get()?
-            .get_result()?
-            .which()
-            .map_err(capnp::Error::from)?
-        {
-            negotiate_result::Grant(grant) => grant?,
-            negotiate_result::Error(e) => return Err(ClientError::from_api(e?)),
-        };
-        let mut req = grant.decision_request();
-        call.write(req.get().init_ctx());
-        let reply = req.send().promise.await?;
-        let decision = match reply
-            .get()?
-            .get_result()?
-            .which()
-            .map_err(capnp::Error::from)?
-        {
-            decision_result::Decision(d) => {
-                let d = d?;
-                Decision {
-                    method: text(d.get_method())?,
-                    direct_play_block: text(d.get_direct_play_block())?,
-                    downgrade: text(d.get_downgrade())?,
-                    stream_url: text(d.get_stream_url())?,
-                    play_session: text(d.get_play_session()?.get_value())?,
-                    audio: read_opt_u32(d.get_audio()?)?,
-                    subtitle: read_opt_u32(d.get_subtitle()?)?,
-                }
-            }
-            decision_result::Error(e) => return Err(ClientError::from_api(e?)),
-        };
-        Ok((decision, NativeGrant(grant)))
+        self.negotiate(call, id, version, caps, picks, "").await
+    }
+
+    async fn renew(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        version: &str,
+        caps: &Capabilities,
+        picks: TrackPicks,
+        resumes: &str,
+    ) -> Result<(Decision, NativeGrant), ClientError> {
+        self.negotiate(call, id, version, caps, picks, resumes)
+            .await
     }
 
     async fn start_tracks(

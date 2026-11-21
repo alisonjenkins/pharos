@@ -333,6 +333,8 @@ pub struct AppState {
     /// Native grants released without a stop, waiting for their player to
     /// negotiate again (B1397).
     pub pending_releases: Arc<crate::pending_release::PendingReleases>,
+    /// The play sessions this replica's live grants hold (B1490).
+    pub play_holds: Arc<crate::services::playback::PlayHolds>,
     /// Track preferences a newly created user starts with (`[user_defaults]`).
     /// Stock by default, in which case creation writes no preferences row.
     pub user_defaults: crate::config::UserDefaultsConfig,
@@ -832,6 +834,7 @@ impl AppState {
             pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
                 crate::pending_release::DEFAULT_RELEASE_GRACE,
             )),
+            play_holds: Arc::default(),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
@@ -981,6 +984,7 @@ impl AppState {
             pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
                 crate::pending_release::DEFAULT_RELEASE_GRACE,
             )),
+            play_holds: Arc::default(),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,

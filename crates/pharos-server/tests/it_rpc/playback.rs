@@ -165,6 +165,49 @@ async fn negotiate_version(
     subtitle: Choice,
     version: &str,
 ) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate_full(
+        schema_version,
+        session,
+        id,
+        caps,
+        audio,
+        subtitle,
+        version,
+        None,
+    )
+    .await
+}
+
+/// A renewal of `MOVIE` that names the play session its stream is on.
+async fn renew_naming(
+    session: &session::Client,
+    caps: &Capabilities,
+    resumes: &str,
+) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate_full(
+        pharos_api::pharos_capnp::SCHEMA_VERSION,
+        session,
+        WireId::Real(MOVIE),
+        caps,
+        Choice::Default,
+        Choice::Default,
+        "",
+        Some(resumes),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn negotiate_full(
+    schema_version: u32,
+    session: &session::Client,
+    id: WireId,
+    caps: &Capabilities,
+    audio: Choice,
+    subtitle: Choice,
+    version: &str,
+    resumes: Option<&str>,
+) -> Result<(playback_grant::Client, Decided), String> {
     let playback = session.playback_request().send().pipeline.get_playback();
     let mut req = playback.negotiate_request();
     let mut p = req.get();
@@ -180,6 +223,9 @@ async fn negotiate_version(
     set_choice(p.reborrow().init_audio(), audio);
     set_choice(p.reborrow().init_subtitle(), subtitle);
     p.set_version(version);
+    if let Some(resumes) = resumes {
+        p.reborrow().init_resumes().set_value(resumes);
+    }
     let reply = req.send().promise.await.expect("negotiate");
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         negotiate_result::Grant(grant) => {
@@ -2129,4 +2175,240 @@ async fn an_adopting_reconnect_reports_the_subtitle_it_named() {
     .unwrap();
     assert_eq!(again.psid, first.psid, "the control: it was adopted");
     assert_eq!(again.subtitle, Some(3), "{again:?}");
+}
+
+/// B1490: a renewal from another of the user's device tokens keeps the
+/// session and becomes its holder: the old token's revocation leaves the
+/// stream open and the renewing token's ends it.
+/// Disarm check: with the holder left as stored, revoking the old token
+/// closes the stream and revoking the new one does not.
+#[actix_web::test]
+async fn a_renewal_from_another_token_holds_the_stream() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let old = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let new_token = fx.state.stores.issue(fx.user_id, "test").await.unwrap();
+    let new_token = new_token.0.expose().to_string();
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let new = crate::revocation::signed_in(&client2, &new_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = play_on(&old, &direct).await.unwrap();
+    as_after_a_rollout(&fx, grant, &first.psid).await;
+    let (_grant, renewed) = renew_naming(&new, &direct, &first.psid).await.unwrap();
+    assert_eq!(renewed.psid, first.psid, "the control: it was kept");
+
+    let status = || async {
+        test::call_service(&app, test::TestRequest::get().uri(&first.url).to_request())
+            .await
+            .status()
+    };
+    let unauthorized = actix_web::http::StatusCode::UNAUTHORIZED;
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the control: the stream is open"
+    );
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    assert_ne!(
+        status().await,
+        unauthorized,
+        "the old token's revocation leaves the kept stream open"
+    );
+    fx.state.stores.revoke(&new_token).await.unwrap();
+    assert_eq!(
+        status().await,
+        unauthorized,
+        "the renewing token's revocation ends it"
+    );
+}
+
+/// B1490: two renewals naming one session at once keep it for one of them
+/// only; the other gets its own, so no two grants share a stream. The RPC
+/// may run them one after the other; the hold's exclusion itself is pinned
+/// by `a_held_session_is_not_claimed_until_every_hold_drops`.
+#[actix_web::test]
+async fn concurrent_renewals_keep_a_session_for_one_only() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let one = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let two = crate::revocation::signed_in(&client2, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, first) = play_on(&one, &direct).await.unwrap();
+    as_after_a_rollout(&fx, grant, &first.psid).await;
+    let (a, b) = tokio::join!(
+        renew_naming(&one, &direct, &first.psid),
+        renew_naming(&two, &direct, &first.psid),
+    );
+    let (_ga, a) = a.unwrap();
+    let (_gb, b) = b.unwrap();
+    let kept = [&a, &b].iter().filter(|d| d.psid == first.psid).count();
+    assert_eq!(kept, 1, "one keeps it, one does not: {a:?} {b:?}");
+}
+
+/// B1490: a start on the device replaces a playback's `/Sessions` entry while
+/// its grant lives on, so the listing no longer says the session is held. A
+/// renewal naming it gets its own session, and the live grant's stream runs.
+/// Disarm check: with `claim_free` ignoring the holds, the renewal keeps the
+/// live grant's id and two grants share one stream.
+#[actix_web::test]
+async fn a_renewal_cannot_take_a_session_a_live_grant_holds() {
+    let live_before = resume_count("live");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (_a, first) = play_on(&session, &direct).await.unwrap();
+    let (_b, second) = play_on(&session, &direct).await.unwrap();
+    let listed = fx.state.sessions.snapshot().await.unwrap();
+    assert!(
+        !listed.iter().any(|s| s.id == first.psid),
+        "the control: the second start replaced the first's entry"
+    );
+
+    let (_c, renewed) = renew_naming(&session, &direct, &first.psid).await.unwrap();
+
+    assert_ne!(renewed.psid, first.psid, "the live grant keeps its session");
+    assert_ne!(renewed.psid, second.psid);
+    assert!(stream_is_live(&fx, &first.psid).await, "its stream runs on");
+    assert!(resume_count("live") > live_before, "counted as live");
+}
+
+/// What `pharos_play_session_resume_total{outcome}` has counted so far.
+fn resume_count(outcome: &str) -> u64 {
+    let _ = pharos_server::obs::init("info", None);
+    pharos_server::obs::render()
+        .lines()
+        .filter(|l| {
+            l.starts_with("pharos_play_session_resume_total{")
+                && l.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// The server as a rollout leaves it for a playback: its grant and its
+/// `/Sessions` entry are gone with the old process, while its stored
+/// transcode session still serves the stream. The grant is leaked rather than
+/// dropped, since a dropped one would be held as a release, and its hold on
+/// the session is forgotten as the old process's would be.
+async fn as_after_a_rollout(fx: &Fixture, grant: playback_grant::Client, psid: &str) {
+    std::mem::forget(grant);
+    fx.state.play_holds.forget(psid);
+    fx.state
+        .sessions
+        .apply(pharos_server::sessions::SessionEvent::Stopped {
+            session_id: pharos_core::PlaySessionId::from(psid),
+        })
+        .await
+        .unwrap();
+}
+
+/// B1490, V1481: after a rollout no release is held, so a renewal used to mint
+/// a second session while the player kept pulling the first. A renewal that
+/// names its stream's session keeps it, listed once.
+/// Disarm check: with `resume_named` returning `None`, the renewal gets a new
+/// id and the old stream is left running beside it.
+#[actix_web::test]
+async fn after_a_rollout_a_renewal_keeps_its_streams_session() {
+    let resumed_before = resume_count("resumed");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let sessions_listed = || async {
+        let req = test::TestRequest::get()
+            .uri("/Sessions")
+            .insert_header(("X-Emby-Token", fx.admin_token.as_str()))
+            .to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        body.as_array().unwrap().len()
+    };
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, first) = play_on(&session, &direct).await.unwrap();
+    as_after_a_rollout(&fx, grant, &first.psid).await;
+    assert_eq!(sessions_listed().await, 0, "the control: nothing listed");
+
+    let (grant, renewed) = renew_naming(&session, &direct, &first.psid).await.unwrap();
+
+    assert_eq!(
+        renewed.psid, first.psid,
+        "the playback keeps its session id"
+    );
+    assert_eq!(sessions_listed().await, 1, "and is listed again, once");
+    assert!(resume_count("resumed") > resumed_before, "counted");
+    stop(&grant, 45_000).await.unwrap();
+    assert!(
+        settles_gone(&fx, &first.psid).await,
+        "its stop ends the stream"
+    );
+}
+
+/// B1490: a named session is kept only when it is provably the stream asked
+/// for. A session a live grant holds, another user's, another stream's, or
+/// one that does not exist is not taken: the renewal gets its own, and the
+/// named one is left as it was.
+/// Disarm check: with each guard in `resume_named` removed in turn, that
+/// case keeps the named id.
+#[actix_web::test]
+async fn a_renewal_keeps_only_a_session_that_is_its_own_stream() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let (client2, _closed2) = crate::revocation::connect(&server).await;
+    let admin = crate::revocation::signed_in(&client2, &fx.admin_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let transcode = caps(&["vp9"], &["opus"], &["webm"]);
+
+    // A live grant still holds it.
+    let live_before = resume_count("live");
+    let (live, held) = play_on(&session, &direct).await.unwrap();
+    let (_g, renewed) = renew_naming(&session, &direct, &held.psid).await.unwrap();
+    assert_ne!(renewed.psid, held.psid, "a live grant's session");
+    assert!(resume_count("live") > live_before);
+    assert!(stream_is_live(&fx, &held.psid).await, "left as it was");
+
+    as_after_a_rollout(&fx, live, &held.psid).await;
+
+    // Another user names it.
+    let not_held_before = resume_count("not_held");
+    let (_g, theirs) = renew_naming(&admin, &direct, &held.psid).await.unwrap();
+    assert_ne!(theirs.psid, held.psid, "another user's session");
+    assert!(resume_count("not_held") > not_held_before);
+
+    // The renewal negotiated another stream.
+    let other_before = resume_count("other_stream");
+    let (_g, other) = renew_naming(&session, &transcode, &held.psid)
+        .await
+        .unwrap();
+    assert_ne!(other.method, held.method, "the control: another stream");
+    assert_ne!(other.psid, held.psid, "another stream's session");
+    assert!(resume_count("other_stream") > other_before);
+
+    // No such session.
+    let gone_before = resume_count("gone");
+    let (_g, unknown) = renew_naming(&session, &direct, "0123456789abcdef0123456789abcdef")
+        .await
+        .unwrap();
+    assert_ne!(unknown.psid, "0123456789abcdef0123456789abcdef");
+    assert!(resume_count("gone") > gone_before);
+
+    assert!(
+        stream_is_live(&fx, &held.psid).await,
+        "a refused name ends nothing"
+    );
+    let (_g, kept) = renew_naming(&session, &direct, &held.psid).await.unwrap();
+    assert_eq!(
+        kept.psid, held.psid,
+        "the control: its own renewal keeps it"
+    );
 }
