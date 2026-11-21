@@ -3908,6 +3908,7 @@ impl PlaybackEngine for HlsJs {
         let on_error = {
             let (player, budget, url) = (player.clone(), Rc::clone(&budget), url.to_owned());
             let on_fragment = Rc::clone(&on_fragment);
+            let video = video.clone();
             let ceiling = Rc::clone(&self.ceiling);
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_event, data: JsValue| {
                 check_ceiling(&player, &ceiling);
@@ -3934,6 +3935,7 @@ impl PlaybackEngine for HlsJs {
                 // The stream is in trouble: show the player's own state, not the turn.
                 super::turn_web::turn_cancel_current("engine-fatal");
                 let mut budget = budget.borrow_mut();
+                budget.play_head(seconds_to_ms(video.current_time()));
                 let action = refusal.unwrap_or_else(|| budget.on_fatal(&kind, &details));
                 let attempt = budget.attempts(&kind);
                 warn(&format!(
@@ -3961,9 +3963,14 @@ impl PlaybackEngine for HlsJs {
         let on_loaded = {
             let budget = Rc::clone(&budget);
             let (player, ceiling) = (player.clone(), Rc::clone(&self.ceiling));
+            let video = video.clone();
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
-                if let Some(sn) = main_fragment_sn(&data) {
-                    budget.borrow_mut().fragment_loaded(sn);
+                if main_fragment_sn(&data).is_some() {
+                    let mut budget = budget.borrow_mut();
+                    budget.fragment_loaded();
+                    // Loads keep coming while playing: each one checks
+                    // whether the play head has passed the last rebuild.
+                    budget.play_head(seconds_to_ms(video.current_time()));
                 }
                 check_ceiling(&player, &ceiling);
                 if let Some(load) = fragment_load(&data) {
