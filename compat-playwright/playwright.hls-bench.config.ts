@@ -10,7 +10,7 @@ import dioxus from "./playwright.dioxus.config";
 
 export default defineConfig({
   ...dioxus,
-  testMatch: /\/hls-(bench|eos)\.spec\.ts$/,
+  testMatch: /\/hls-(bench|eos|eos-split)\.spec\.ts$/,
   retries: 0,
   projects: [
     {
