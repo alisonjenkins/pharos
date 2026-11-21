@@ -17,6 +17,7 @@ use crate::api::jellyfin::dto::container_for;
 use crate::api::jellyfin::media_source;
 use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery};
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
+use crate::opensubtitles::stand_in::{self, StandIn};
 use crate::state::AppState;
 
 /// The named-config key holding one device's audio codec deny list (T130).
@@ -1322,6 +1323,7 @@ pub fn pick_subtitle(
     probe: &pharos_core::MediaProbe,
     subtitle_profiles: &[SubtitleProfileDto],
     explicit: Option<i64>,
+    stand_ins: &[StandIn],
 ) -> Option<u32> {
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
     //   0. What the CLIENT asked for on THIS request, if it asked at all.
@@ -1390,15 +1392,53 @@ pub fn pick_subtitle(
         // veto `resolve_selected_subtitle` applies to the container default,
         // so `DefaultSubtitleStreamIndex` never points at a track this
         // session will not actually burn.
-        None => crate::api::jellyfin::stream_select::default_subtitle_stream_index(
-            &crate::api::jellyfin::stream_select::subtitle_facts(streams),
-            &audio.prefs.subtitle_languages,
-            audio.prefs.subtitle_mode,
-            audio.language.as_deref(),
-        )
-        .and_then(|idx| probe.subtitle_tracks.iter().find(|t| t.stream_index == idx))
-        .and_then(|candidate| accept_or_decline_uninvited_burn(candidate, probe, subtitle_profiles))
-        .map(|t| t.stream_index),
+        //
+        // A fetched text track standing in for a picture track (V1509) ranks
+        // as that picture track and starts in its place.
+        None => {
+            // Only stand-ins whose text track is advertised: the sidecars are
+            // read again for the stand-ins, so a file saved in between must
+            // not become a default index the client was never sent.
+            let stand_ins: Vec<StandIn> = stand_ins
+                .iter()
+                .filter(|s| {
+                    streams
+                        .iter()
+                        .any(|st| st.kind == "Subtitle" && st.index == s.text_index)
+                })
+                .copied()
+                .collect();
+            let stand_ins = stand_ins.as_slice();
+            let mut facts = crate::api::jellyfin::stream_select::subtitle_facts(streams);
+            stand_in::adjust_facts(&mut facts, stand_ins);
+            let chosen = crate::api::jellyfin::stream_select::default_subtitle_stream_index(
+                &facts,
+                &audio.prefs.subtitle_languages,
+                audio.prefs.subtitle_mode,
+                audio.language.as_deref(),
+            )?;
+            if let Some(text) = stand_in::replacement(chosen, stand_ins) {
+                metrics::counter!(
+                    "pharos_subtitle_autoselect_total",
+                    "outcome" => "stand_in",
+                )
+                .increment(1);
+                tracing::info!(
+                    subtitle.ranked = chosen,
+                    subtitle.chosen = text,
+                    "auto-selected the fetched text subtitle in place of the disc picture track"
+                );
+                return Some(text);
+            }
+            probe
+                .subtitle_tracks
+                .iter()
+                .find(|t| t.stream_index == chosen)
+                .and_then(|candidate| {
+                    accept_or_decline_uninvited_burn(candidate, probe, subtitle_profiles)
+                })
+                .map(|t| t.stream_index)
+        }
     }
 }
 
@@ -1681,11 +1721,15 @@ pub struct TrackPick {
 /// the user's remembered pick for this item, else their language rules.
 /// `None` names the default. Shared by `grant` and `start_tracks`, so the
 /// tracks a title page shows are the ones the playback starts on.
+// `streams` and `stand_ins` come from one sidecar scan, so they travel
+// separately rather than being rebuilt here.
+#[allow(clippy::too_many_arguments)]
 async fn pick_tracks(
     state: &AppState,
     user: &pharos_core::User,
     item: &MediaItem,
     streams: &[pharos_jellyfin_api::dto::MediaStreamDto],
+    stand_ins: &[StandIn],
     subtitle_profiles: &[SubtitleProfileDto],
     audio_explicit: Option<u32>,
     subtitle_explicit: Option<i64>,
@@ -1709,6 +1753,7 @@ async fn pick_tracks(
         &item.probe,
         subtitle_profiles,
         requested_subtitle,
+        stand_ins,
     );
     let styled_pick = match (styled_pick, stated_subtitle, subtitle) {
         (None, None, Some(source)) => {
@@ -1734,12 +1779,13 @@ pub async fn start_tracks(
 ) -> Result<(Option<u32>, Option<u32>), GrantError> {
     let (item, _) = playable_item(state, user, id).await?;
     let profile = capabilities.profile(crate::services::watch::extracts_image_subtitles(state));
-    let streams = crate::services::watch::streams(&item).await;
+    let (streams, stand_ins) = crate::services::watch::streams_with_stand_ins(&item).await;
     let picked = pick_tracks(
         state,
         user,
         &item,
         &streams,
+        &stand_ins,
         &profile.subtitle_profiles,
         None,
         None,
@@ -1772,7 +1818,7 @@ pub async fn grant(
         .capabilities
         .profile(crate::services::watch::extracts_image_subtitles(state));
     profile.denied_audio_codecs = denied_audio_codecs_for_token(state, r.token).await;
-    let streams = crate::services::watch::streams(&item).await;
+    let (streams, stand_ins) = crate::services::watch::streams_with_stand_ins(&item).await;
     let release_key = r.device.map(|device| crate::pending_release::ReleaseKey {
         user: user.id,
         device: device.clone(),
@@ -1796,6 +1842,7 @@ pub async fn grant(
         user,
         &item,
         &streams,
+        &stand_ins,
         &profile.subtitle_profiles,
         r.audio_stream_index.or(held.and_then(|(audio, _)| audio)),
         r.subtitle_stream_index

@@ -268,3 +268,54 @@ async fn non_admin_cannot_download() {
     assert_eq!(status, 403);
     assert_eq!(fake.downloads.load(Ordering::SeqCst), 0);
 }
+
+/// V1509, V1510: a fetched text SDH track stands in for the disc's default
+/// picture track. PlaybackInfo starts on the text track, labels it SDH, and
+/// still lists the picture track as the fallback.
+#[actix_web::test]
+async fn a_fetched_text_track_starts_in_place_of_the_picture_track() {
+    let f = fixture_with(Arc::new(Fake::default())).await;
+    let (_dir, video) = put_movie(&f, 604).await;
+    let mut item = f.state.stores.get(604).await.unwrap();
+    item.probe.video_codec = Some("h264".into());
+    item.probe.subtitle_tracks.push(pharos_core::SubtitleTrack {
+        stream_index: 2,
+        language: Some("eng".into()),
+        codec: Some("hdmv_pgs_subtitle".into()),
+        is_default: true,
+        is_hearing_impaired: true,
+        ..Default::default()
+    });
+    f.state.stores.put(item).await.unwrap();
+    pharos_server::opensubtitles::store::save(&store_root(), &video, "en", 77, true, SRT)
+        .await
+        .unwrap();
+
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::post()
+        .uri("/Items/604/PlaybackInfo")
+        .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+        .set_json(serde_json::json!({}))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let source = &body["MediaSources"][0];
+    let subs: Vec<&Value> = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["Type"] == "Subtitle")
+        .collect();
+    let text = subs
+        .iter()
+        .find(|s| s["IsExternal"] == true)
+        .unwrap_or_else(|| panic!("no fetched track: {body}"));
+    assert!(
+        subs.iter().any(|s| s["Index"] == 2),
+        "the picture track stays listed: {body}"
+    );
+    assert_eq!(
+        source["DefaultSubtitleStreamIndex"], text["Index"],
+        "{body}"
+    );
+    assert_eq!(text["IsHearingImpaired"], true, "{text}");
+}

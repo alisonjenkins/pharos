@@ -177,7 +177,19 @@ pub(crate) fn is_video(item: &MediaItem) -> bool {
 /// The item's streams as PlaybackInfo lists them, sidecar subtitles included,
 /// for the track pickers in `services::playback` to choose from.
 pub async fn streams(item: &MediaItem) -> Vec<MediaStreamDto> {
+    streams_with_stand_ins(item).await.0
+}
+
+/// [`streams`] and the fetched text stand-ins (V1509), from one sidecar scan
+/// so a stand-in's index is the stream listed under it.
+pub async fn streams_with_stand_ins(
+    item: &MediaItem,
+) -> (
+    Vec<MediaStreamDto>,
+    Vec<crate::opensubtitles::stand_in::StandIn>,
+) {
     let sidecars = discover_sidecars(&item.path).await;
+    let stand_ins = crate::opensubtitles::stand_in::from_sidecars(&item.probe, &sidecars);
     let ctx = SubtitleStreamCtx {
         sidecar_count: u32::try_from(sidecars.len()).unwrap_or(u32::MAX),
         sidecar_langs: sidecars
@@ -191,7 +203,10 @@ pub async fn streams(item: &MediaItem) -> Vec<MediaStreamDto> {
         sidecar_sdh: sidecar_sdh_flags(&sidecars),
         ..SubtitleStreamCtx::new(item.id)
     };
-    build_media_streams_with_subtitles(&item.probe, is_video(item), Some(&ctx))
+    (
+        build_media_streams_with_subtitles(&item.probe, is_video(item), Some(&ctx)),
+        stand_ins,
+    )
 }
 
 fn track(s: MediaStreamDto, drawn: Option<Drawn>) -> Track {
