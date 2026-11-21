@@ -373,6 +373,12 @@ impl Watch {
             .retain(|&at| kept.is_some_and(|kept| at <= kept));
     }
 
+    /// A fragment's fetch timed out: the link answers, too slowly, so the
+    /// stalls from here are its again, as after a load.
+    pub fn load_timed_out(&mut self) {
+        self.failing = false;
+    }
+
     /// The video ran out of data at `now`.
     pub fn stalled(&mut self, now: u64) {
         if self.seeking_since.is_some() || self.failing {
@@ -766,17 +772,39 @@ mod tests {
     /// Disarm check: with `fragLoadTimeOut` counted as a failure, no step.
     #[test]
     fn a_timeout_streak_after_healthy_loads_steps_down() {
-        use super::super::playback::is_fragment_load_failure;
         let mut w = watch();
         downloads(&mut w, 4_700_000, 20_000_000, 3);
         for at in [20, 25] {
-            if is_fragment_load_failure("networkError", "fragLoadTimeOut") {
-                w.load_failed();
-            }
+            hls_error(&mut w, "fragLoadTimeOut");
             w.stalled(at * MS);
         }
         assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
-        assert!(is_fragment_load_failure("networkError", "fragLoadError"));
+    }
+
+    /// V1480: a timeout after a failed load ends the failure, so the slow
+    /// link's stalls that follow still step down.
+    /// Disarm check: with `load_timed_out` leaving `failing` set, no step.
+    #[test]
+    fn timeouts_after_a_failed_load_still_step_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        hls_error(&mut w, "fragLoadError");
+        for at in [20, 25] {
+            hls_error(&mut w, "fragLoadTimeOut");
+            w.stalled(at * MS);
+        }
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
+    }
+
+    /// Hands the watch what an hls.js `networkError` of `details` says, as
+    /// the engines and the app do.
+    fn hls_error(w: &mut Watch, details: &str) {
+        use super::super::playback::{fragment_load_event, FragmentEvent};
+        match fragment_load_event("networkError", details) {
+            Some(FragmentEvent::Failed) => w.load_failed(),
+            Some(FragmentEvent::TimedOut) => w.load_timed_out(),
+            Some(FragmentEvent::Loaded(_)) | None => {}
+        }
     }
 
     /// V1480: a load with no usable timing, such as a cache hit, still

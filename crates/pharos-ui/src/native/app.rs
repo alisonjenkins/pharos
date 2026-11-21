@@ -7354,6 +7354,7 @@ fn Player(
                                 );
                             }
                             FragmentEvent::Failed => watch.0.borrow_mut().load_failed(),
+                            FragmentEvent::TimedOut => watch.0.borrow_mut().load_timed_out(),
                         }
                         assess();
                     })

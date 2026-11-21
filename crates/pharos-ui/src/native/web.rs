@@ -3921,8 +3921,8 @@ impl PlaybackEngine for HlsJs {
                 let fatal = fatal == "true";
                 let status = js_number(&data, &["response", "code"]) as u16;
                 let refusal = super::playback::hls_refusal(&kind, status, fatal);
-                if super::playback::is_fragment_load_failure(&kind, &details) {
-                    on_fragment(FragmentEvent::Failed);
+                if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                    on_fragment(event);
                 }
                 if !fatal && refusal.is_none() {
                     warn(&format!(

@@ -1586,8 +1586,8 @@ impl PlaybackEngine for HlsJs {
                     fatal: false,
                     status,
                 } if super::playback::hls_refusal(&kind, status, false).is_none() => {
-                    if super::playback::is_fragment_load_failure(&kind, &details) {
-                        on_fragment(super::playback::FragmentEvent::Failed);
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
                     }
                     log::warn!(
                         "pharos: playback error engine=hlsjs type={kind} details={details} status={status} fatal=false url={log_url}"
@@ -1602,8 +1602,8 @@ impl PlaybackEngine for HlsJs {
                     // The stream is in trouble: show the player's own state,
                     // not the turn, as the browser does.
                     turn_call(tv_turn::Call::CancelCurrent("engine-fatal"));
-                    if super::playback::is_fragment_load_failure(&kind, &details) {
-                        on_fragment(super::playback::FragmentEvent::Failed);
+                    if let Some(event) = super::playback::fragment_load_event(&kind, &details) {
+                        on_fragment(event);
                     }
                     let mut budget = budget.borrow_mut();
                     let action = super::playback::hls_refusal(&kind, status, fatal)
