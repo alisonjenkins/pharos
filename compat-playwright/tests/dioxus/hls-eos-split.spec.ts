@@ -20,8 +20,25 @@ interface Probe {
 
 test("rust engine plays a film split across two files", async ({ browser, request }) => {
   test.skip(!process.env.PHAROS_HLS_EOS, "set PHAROS_HLS_EOS=1 to run the split-film test");
-  test.setTimeout(240_000);
-  const { nativeId } = await seededMovie(request, FIRST_PART);
+  test.setTimeout(360_000);
+  const { api, movie, nativeId } = await seededMovie(request, FIRST_PART);
+  // The first scan indexes the two files apart; the scan after both are
+  // probed makes them one film. Ask for scans until the film runs for both.
+  let asked = 0;
+  await expect
+    .poll(
+      async () => {
+        if (Date.now() - asked > 10_000) {
+          asked = Date.now();
+          await request.post(`${PHAROS_URL}/Library/Refresh`, { headers: api });
+        }
+        const got = await request.get(`${PHAROS_URL}/Items/${movie.Id}`, { headers: api });
+        if (!got.ok()) return -got.status();
+        return ((await got.json()).RunTimeTicks ?? 0) / 10_000_000;
+      },
+      { message: "the two files became one film", timeout: 120_000, intervals: [2_000] },
+    )
+    .toBeGreaterThan(WHOLE_S - 5);
   const { context, page, lines } = await signIn(browser, "rust");
   await context.addInitScript(() => {
     // Force HLS: without this the browser plays the WebM directly.
