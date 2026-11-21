@@ -760,6 +760,25 @@ mod tests {
         assert_eq!(w.evaluate(35 * MS).map(|c| c.reason), Some(Reason::Stalls));
     }
 
+    /// V1480: on a link too slow for the stream, fragment fetches time out
+    /// after healthy loads. A timeout is not a failed load, so its stalls
+    /// still step down.
+    /// Disarm check: with `fragLoadTimeOut` counted as a failure, no step.
+    #[test]
+    fn a_timeout_streak_after_healthy_loads_steps_down() {
+        use super::super::playback::is_fragment_load_failure;
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        for at in [20, 25] {
+            if is_fragment_load_failure("networkError", "fragLoadTimeOut") {
+                w.load_failed();
+            }
+            w.stalled(at * MS);
+        }
+        assert_eq!(w.evaluate(25 * MS).map(|c| c.reason), Some(Reason::Stalls));
+        assert!(is_fragment_load_failure("networkError", "fragLoadError"));
+    }
+
     /// V1480: a load with no usable timing, such as a cache hit, still
     /// ends a failure, so the engines hand every load to the watch.
     #[test]
