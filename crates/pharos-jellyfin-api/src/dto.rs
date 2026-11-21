@@ -2491,6 +2491,9 @@ pub struct SubtitleStreamCtx {
     /// caller. `None` where the filename carried no language token. Labels each
     /// external track with its language instead of a bare "External N".
     pub sidecar_langs: Vec<Option<String>>,
+    /// Per-sidecar hearing-impaired flag (index = offset), from an `sdh` tag
+    /// in the filename. Missing entries are `false`.
+    pub sidecar_sdh: Vec<bool>,
     /// Absolute ffprobe stream indices of TEXT subs the client will BURN
     /// (its SubtitleProfile lacks external support for that format). Such a
     /// track is advertised Encode/no-DeliveryUrl so the client requests the
@@ -2508,6 +2511,7 @@ impl SubtitleStreamCtx {
             media_source_id: None,
             sidecar_count: 0,
             sidecar_langs: Vec::new(),
+            sidecar_sdh: Vec::new(),
             burn_text_indices: std::collections::BTreeSet::new(),
         }
     }
@@ -2779,7 +2783,11 @@ pub fn build_media_streams_with_subtitles(
                     title,
                     is_external: true,
                     is_forced: false,
-                    is_hearing_impaired: false,
+                    is_hearing_impaired: ctx
+                        .sidecar_sdh
+                        .get(offset as usize)
+                        .copied()
+                        .unwrap_or(false),
                     is_interlaced: false,
                     is_original: false,
                     delivery_url: Some(format!(
@@ -3342,6 +3350,7 @@ mod tests {
             item_id: 0x2a,
             sidecar_count: 3,
             sidecar_langs: vec![Some("eng".into()), Some("spa".into()), None],
+            sidecar_sdh: vec![false, true],
             burn_text_indices: Default::default(),
             media_source_id: None,
         };
@@ -3352,6 +3361,13 @@ mod tests {
             .map(|s| s.index)
             .collect();
         assert_eq!(subs, vec![2, 3, 4], "contiguous after the real streams");
+        // V1510: the SDH flag rides through; a missing entry is not SDH.
+        let sdh: Vec<bool> = streams
+            .iter()
+            .filter(|s| s.kind == "Subtitle")
+            .map(|s| s.is_hearing_impaired)
+            .collect();
+        assert_eq!(sdh, vec![false, true, false]);
         assert!(
             streams.iter().all(|s| s.index < 1000),
             "no stream carries the old 1_000_000 sentinel index"
