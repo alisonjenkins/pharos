@@ -17,3 +17,8 @@
 - [x] T030-08 `opensubtitles/memo.rs`: miss memo beside the cache, keyed by item id and language, signature `(mtime, size)` plus a 7-day expiry and a schema version.
 - [x] T030-09 `opensubtitles/job.rs`: after-scan pass over items with no subtitle in the configured languages. One at a time, `max_downloads_per_day`, 1 s spacing, `bg_io` permit, stops for the day on a quota error. Tests with a fake provider and clock.
 - [x] T030-10 Spawn the job from `main.rs` behind the key, and add the `pharos_opensubtitles_total` outcomes for the job with a disarm check.
+
+## Slice 3 - Text stand-ins for picture-only languages (V1508-V1510, B1510)
+
+- [x] T030-11 The job fetches a text subtitle for a language whose only tracks are disc pictures, SDH when the picture track is, tagged `sdh` in the store; `pharos_opensubtitles_wanted_total{reason}`.
+- [x] T030-12 `opensubtitles/stand_in.rs`: the fetched track stands in for the picture track in the automatic pick; sidecars carry `IsHearingImpaired` from their name.
