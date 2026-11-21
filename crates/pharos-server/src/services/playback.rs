@@ -1573,38 +1573,86 @@ pub struct Grant {
     /// Whether the tracks this playback reports may be remembered for the
     /// item: only the primary file's, whose stream indexes they name.
     pub remembers_tracks: bool,
-    /// Held while a renewal that kept its named session is made live; drop
-    /// it once the grant is in `/Sessions`.
-    pub resume_claim: Option<ResumeClaim>,
+    /// This grant's hold on its play session, kept for as long as the grant
+    /// lives, its release grace included. A grant dropped at once, as a REST
+    /// negotiate's is, holds nothing past it.
+    pub hold: SessionHold,
 }
 
-/// The play sessions a renewal on this replica is taking over right now. A
-/// second renewal naming one of them is answered as if a live grant held it:
-/// between the live-grant check and `/Sessions` there is no other guard, and
-/// two takeovers would leave two grants on one stream.
-static RESUMING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(Default::default);
+/// How many live grants on this replica hold each play session. A renewal
+/// keeps the session it names only when none does: its `/Sessions` entry can
+/// go while its grant lives (another start on the device replaces it), so the
+/// listing alone does not say the stream is free (B1490).
+#[derive(Debug, Default)]
+pub struct PlayHolds(std::sync::Mutex<std::collections::HashMap<String, usize>>);
 
-/// One renewal's hold on the session it names, released on drop.
-#[derive(Debug)]
-pub struct ResumeClaim(String);
-
-impl ResumeClaim {
-    fn take(play_session_id: &str) -> Option<Self> {
-        let mut held = RESUMING
+impl PlayHolds {
+    fn held(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, usize>> {
+        self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.insert(play_session_id.to_owned())
-            .then(|| Self(play_session_id.to_owned()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A hold on `play_session_id` beside any others: a minted session, or
+    /// one adopted while its release is still being decided.
+    pub fn acquire(self: &std::sync::Arc<Self>, play_session_id: &str) -> SessionHold {
+        *self.held().entry(play_session_id.to_owned()).or_default() += 1;
+        SessionHold {
+            holds: std::sync::Arc::clone(self),
+            play_session_id: play_session_id.to_owned(),
+        }
+    }
+
+    /// The first hold on `play_session_id`, or `None` when a live grant
+    /// already holds it.
+    pub fn claim_free(self: &std::sync::Arc<Self>, play_session_id: &str) -> Option<SessionHold> {
+        let mut held = self.held();
+        if held.get(play_session_id).is_some_and(|n| *n > 0) {
+            return None;
+        }
+        held.insert(play_session_id.to_owned(), 1);
+        drop(held);
+        Some(SessionHold {
+            holds: std::sync::Arc::clone(self),
+            play_session_id: play_session_id.to_owned(),
+        })
+    }
+
+    /// Whether a live grant on this replica holds `play_session_id`.
+    pub fn is_held(&self, play_session_id: &str) -> bool {
+        self.held().get(play_session_id).is_some_and(|n| *n > 0)
+    }
+
+    /// Forgets every hold on `play_session_id`, as a restart does: the grants
+    /// that held it are gone with the old process. Tests stand in for a
+    /// rollout with it while their grant objects stay alive.
+    pub fn forget(&self, play_session_id: &str) {
+        self.held().remove(play_session_id);
     }
 }
 
-impl Drop for ResumeClaim {
+/// One grant's hold on its play session, released on drop.
+#[derive(Debug)]
+pub struct SessionHold {
+    holds: std::sync::Arc<PlayHolds>,
+    play_session_id: String,
+}
+
+impl SessionHold {
+    pub fn play_session_id(&self) -> &str {
+        &self.play_session_id
+    }
+}
+
+impl Drop for SessionHold {
     fn drop(&mut self) {
-        RESUMING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+        let mut held = self.holds.held();
+        if let Some(n) = held.get_mut(&self.play_session_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.play_session_id);
+            }
+        }
     }
 }
 
@@ -1848,6 +1896,7 @@ pub async fn grant(
         Some(key) => adopt_released(state, user, id, r, key, &shape).await,
         None => None,
     } {
+        let hold = state.play_holds.acquire(&adopted.play_session_id);
         return Ok(Grant {
             play_session_id: adopted.play_session_id,
             item_wire_id: adopted.item_wire_id,
@@ -1863,7 +1912,7 @@ pub async fn grant(
                 adopted.subtitle
             },
             remembers_tracks: adopted.remembers_tracks,
-            resume_claim: None,
+            hold,
             item_id: id,
             version: r.version.to_owned(),
             shape,
@@ -1872,10 +1921,13 @@ pub async fn grant(
         });
     }
     let resumed = resume_named(state, user, id, r, &item.probe, &negotiated).await;
-    let play_session_id = resumed
-        .as_ref()
-        .map(|c| c.0.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let is_resumed = resumed.is_some();
+    let hold = resumed.unwrap_or_else(|| {
+        state
+            .play_holds
+            .acquire(&uuid::Uuid::new_v4().simple().to_string())
+    });
+    let play_session_id = hold.play_session_id().to_owned();
     let resume_ticks = if user_data.played {
         0
     } else {
@@ -1922,7 +1974,7 @@ pub async fn grant(
     };
     // A resumed session already has its transcode session and its opening
     // segments: the player is part way through them.
-    if resumed.is_none() {
+    if !is_resumed {
         let holder = pharos_core::SessionHolder {
             user_id: user.id,
             token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
@@ -1982,7 +2034,7 @@ pub async fn grant(
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
         edition = item.edition.as_deref().unwrap_or("primary"),
         stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
-        resumed = resumed.is_some(),
+        resumed = is_resumed,
         "native playback negotiated"
     );
     Ok(Grant {
@@ -1998,7 +2050,7 @@ pub async fn grant(
         shape,
         adopted: false,
         reported_ms: None,
-        resume_claim: resumed,
+        hold,
     })
 }
 
@@ -2120,7 +2172,8 @@ impl ResumeOutcome {
 /// Keeps the play session a renewal names when no released grant was adopted:
 /// after a rollout the table of releases is gone, while the transcode session
 /// the player still pulls from is stored and outlives it (B1490). Kept only
-/// when no live grant holds it, this user holds it for this item, and it is
+/// when no grant on this replica holds it and `/Sessions` does not list it
+/// (another replica's grant), this user holds it for this item, and it is
 /// the stream just negotiated: the same file, decision and burned subtitles.
 /// Anything else mints a session, as before; the named one is left to run.
 async fn resume_named(
@@ -2130,15 +2183,15 @@ async fn resume_named(
     r: &GrantRequest<'_>,
     probe: &pharos_core::MediaProbe,
     negotiated: &Negotiated,
-) -> Option<ResumeClaim> {
+) -> Option<SessionHold> {
     let named = r.resumes;
     if named.is_empty() {
         return None;
     }
     let psid = pharos_core::PlaySessionId::from(named);
-    let Some(claim) = ResumeClaim::take(named) else {
+    let Some(claim) = state.play_holds.claim_free(named) else {
         let outcome = ResumeOutcome::Live;
-        outcome.record(named, "another renewal is resuming it");
+        outcome.record(named, "a live grant on this replica holds it");
         return None;
     };
     let (outcome, reason) = match state.sessions.snapshot().await {
@@ -2258,26 +2311,46 @@ fn server_codec_support(caps: &pharos_transcode::ServerEncodeCapabilities) -> Se
 }
 
 #[cfg(test)]
-mod resume_claim_tests {
+mod play_hold_tests {
     #![allow(clippy::expect_used)]
 
-    use super::ResumeClaim;
+    use super::PlayHolds;
 
-    /// B1490: while one renewal holds a session's claim a second gets none,
-    /// so only one of two concurrent renewals takes the stream over; the
-    /// claim frees on drop.
-    /// Disarm check: with `take` always answering `Some`, the second holds.
+    /// B1490: a session any live grant holds cannot be claimed by a renewal,
+    /// whether that grant minted it, adopted it, or resumed it; it frees once
+    /// the last hold drops.
+    /// Disarm check: with `claim_free` ignoring the count, the claims hold.
     #[test]
-    fn a_claimed_session_is_not_claimed_twice_until_released() {
-        let id = "resume-claim-test-session";
-        let first = ResumeClaim::take(id).expect("the first renewal claims it");
-        assert!(ResumeClaim::take(id).is_none(), "a second is refused");
+    fn a_held_session_is_not_claimed_until_every_hold_drops() {
+        let holds = std::sync::Arc::new(PlayHolds::default());
+        let id = "play-hold-test-session";
+        let minted = holds.acquire(id);
+        assert!(holds.claim_free(id).is_none(), "the minting grant holds it");
+        let adopted = holds.acquire(id);
+        drop(minted);
         assert!(
-            ResumeClaim::take("another-session").is_some(),
+            holds.claim_free(id).is_none(),
+            "the adopting grant holds it"
+        );
+        assert!(
+            holds.claim_free("another-session").is_some(),
             "others are free"
         );
-        drop(first);
-        assert!(ResumeClaim::take(id).is_some(), "free again once released");
+        drop(adopted);
+        let resumed = holds.claim_free(id).expect("free once no grant holds it");
+        assert!(
+            holds.claim_free(id).is_none(),
+            "a second renewal is refused"
+        );
+        drop(resumed);
+        let again = holds.acquire(id);
+        holds.forget(id);
+        assert!(!holds.is_held(id), "a restart forgets it");
+        drop(again);
+        assert!(
+            holds.claim_free(id).is_some(),
+            "and a late drop leaves it free"
+        );
     }
 }
 

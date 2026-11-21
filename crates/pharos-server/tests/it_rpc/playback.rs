@@ -2227,8 +2227,8 @@ async fn a_renewal_from_another_token_holds_the_stream() {
 
 /// B1490: two renewals naming one session at once keep it for one of them
 /// only; the other gets its own, so no two grants share a stream. The RPC
-/// may run them one after the other; the claim's exclusion itself is pinned
-/// by `a_claimed_session_is_not_claimed_twice_until_released`.
+/// may run them one after the other; the hold's exclusion itself is pinned
+/// by `a_held_session_is_not_claimed_until_every_hold_drops`.
 #[actix_web::test]
 async fn concurrent_renewals_keep_a_session_for_one_only() {
     let (server, fx) = crate::revocation::start().await;
@@ -2251,6 +2251,36 @@ async fn concurrent_renewals_keep_a_session_for_one_only() {
     assert_eq!(kept, 1, "one keeps it, one does not: {a:?} {b:?}");
 }
 
+/// B1490: a start on the device replaces a playback's `/Sessions` entry while
+/// its grant lives on, so the listing no longer says the session is held. A
+/// renewal naming it gets its own session, and the live grant's stream runs.
+/// Disarm check: with `claim_free` ignoring the holds, the renewal keeps the
+/// live grant's id and two grants share one stream.
+#[actix_web::test]
+async fn a_renewal_cannot_take_a_session_a_live_grant_holds() {
+    let live_before = resume_count("live");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (_a, first) = play_on(&session, &direct).await.unwrap();
+    let (_b, second) = play_on(&session, &direct).await.unwrap();
+    let listed = fx.state.sessions.snapshot().await.unwrap();
+    assert!(
+        !listed.iter().any(|s| s.id == first.psid),
+        "the control: the second start replaced the first's entry"
+    );
+
+    let (_c, renewed) = renew_naming(&session, &direct, &first.psid).await.unwrap();
+
+    assert_ne!(renewed.psid, first.psid, "the live grant keeps its session");
+    assert_ne!(renewed.psid, second.psid);
+    assert!(stream_is_live(&fx, &first.psid).await, "its stream runs on");
+    assert!(resume_count("live") > live_before, "counted as live");
+}
+
 /// What `pharos_play_session_resume_total{outcome}` has counted so far.
 fn resume_count(outcome: &str) -> u64 {
     let _ = pharos_server::obs::init("info", None);
@@ -2267,9 +2297,11 @@ fn resume_count(outcome: &str) -> u64 {
 /// The server as a rollout leaves it for a playback: its grant and its
 /// `/Sessions` entry are gone with the old process, while its stored
 /// transcode session still serves the stream. The grant is leaked rather than
-/// dropped, since a dropped one would be held as a release.
+/// dropped, since a dropped one would be held as a release, and its hold on
+/// the session is forgotten as the old process's would be.
 async fn as_after_a_rollout(fx: &Fixture, grant: playback_grant::Client, psid: &str) {
     std::mem::forget(grant);
+    fx.state.play_holds.forget(psid);
     fx.state
         .sessions
         .apply(pharos_server::sessions::SessionEvent::Stopped {

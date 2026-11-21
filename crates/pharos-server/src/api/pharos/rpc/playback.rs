@@ -93,14 +93,14 @@ impl server::playback::Handler for Playback {
                     resumes: &resumes,
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
-                    Ok(mut grant) => {
+                    Ok(grant) => {
                         // An adopted grant's entry in `/Sessions` never left.
+                        // An unlisted grant still plays, and its hold, not
+                        // the listing, keeps a renewal off its session.
                         if !grant.adopted {
                             start_session(session, &user, &grant, device.clone(), client_version)
                                 .await;
                         }
-                        // Listed now: a later renewal naming it sees it live.
-                        drop(grant.resume_claim.take());
                         Ok(grant)
                     }
                     Err(GrantError::Item(e)) => Err(item_denial(id, &e, "negotiate")),
@@ -128,6 +128,7 @@ impl server::playback::Handler for Playback {
                     remembers_tracks: grant.remembers_tracks,
                     reported_ms: Cell::new(grant.reported_ms),
                     stopped: Cell::new(false),
+                    hold: std::cell::RefCell::new(Some(grant.hold)),
                     item_id: grant.item_id,
                     version,
                     device,
@@ -255,6 +256,9 @@ struct Grant {
     reported_ms: Cell<Option<u64>>,
     /// Set by `stop`: the playback has ended and a release has nothing to do.
     stopped: Cell<bool>,
+    /// The grant's hold on its play session, until `stop` or the end of its
+    /// release grace.
+    hold: std::cell::RefCell<Option<playback::SessionHold>>,
     /// What a released grant is matched on when its player negotiates again:
     /// the item and version named, the device, and the stream's shape.
     item_id: u64,
@@ -350,6 +354,9 @@ impl server::playback_grant::Handler for Grant {
         };
         // A stop that failed leaves the release to try again.
         self.stopped.set(stopped.is_ok());
+        if stopped.is_ok() {
+            drop(self.hold.borrow_mut().take());
+        }
         write_done(results.get().init_result(), stopped);
         Ok(())
     }
@@ -420,6 +427,9 @@ impl Drop for Grant {
         if self.stopped.get() {
             return;
         }
+        // Kept until the release is decided: a renewal naming the session in
+        // its grace must not take a stream this release may yet end.
+        let hold = self.hold.get_mut().take();
         if crate::state::is_shutting_down() {
             tracing::info!(
                 play_session_id = %pharos_core::secret_prefix(&self.play_session_id),
@@ -454,6 +464,7 @@ impl Drop for Grant {
             end_at_once(
                 session,
                 released,
+                hold,
                 ReleaseOutcome::EndedNoDevice,
                 "the session names no device, so no negotiate can adopt it".into(),
             );
@@ -469,6 +480,7 @@ impl Drop for Grant {
                 end_at_once(
                     session,
                     released,
+                    hold,
                     ReleaseOutcome::EndedOverflow,
                     format!(
                         "{MAX_PENDING_RELEASES} released grants are already held, so this one ends now"
@@ -504,13 +516,21 @@ impl Drop for Grant {
             if let Some(Verdict::Ended { outcome, reason }) = verdict {
                 end_released(&session, &released, outcome, &reason).await;
             }
+            drop(hold);
         });
     }
 }
 
-fn end_at_once(session: Rc<Session>, released: Released, outcome: ReleaseOutcome, reason: String) {
+fn end_at_once(
+    session: Rc<Session>,
+    released: Released,
+    hold: Option<playback::SessionHold>,
+    outcome: ReleaseOutcome,
+    reason: String,
+) {
     actix_web::rt::spawn(async move {
         end_released(&session, &released, outcome, &reason).await;
+        drop(hold);
     });
 }
 
