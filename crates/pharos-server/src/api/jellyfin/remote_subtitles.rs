@@ -21,15 +21,25 @@ use pharos_jellyfin_api::dto::RemoteSubtitleInfoDto;
 const PROVIDER_NAME: &str = "OpenSubtitles";
 
 /// `Id` handed to the client: the OpenSubtitles file id and the language the
-/// search asked for (the POST carries nothing else), as `<file id>-<language>`.
+/// search asked for (the POST carries nothing else), as `<file id>-<language>`,
+/// with `-sdh` after it for a hearing-impaired file so the download keeps the
+/// tag (V1510).
 fn subtitle_id(hit: &SubtitleHit, language: &str) -> String {
-    format!("{}-{}", hit.file_id, language)
+    let sdh = if hit.hearing_impaired { "-sdh" } else { "" };
+    format!("{}-{}{sdh}", hit.file_id, language)
 }
 
-fn parse_subtitle_id(raw: &str) -> Option<(u64, String)> {
-    let (file_id, language) = raw.split_once('-')?;
+/// The file id, language and SDH flag in an id from [`subtitle_id`]. An id
+/// without the `-sdh` suffix (one handed out before it existed) reads as not
+/// SDH.
+fn parse_subtitle_id(raw: &str) -> Option<(u64, String, bool)> {
+    let (file_id, rest) = raw.split_once('-')?;
+    let (language, sdh) = match rest.strip_suffix("-sdh") {
+        Some(language) => (language, true),
+        None => (rest, false),
+    };
     let language = provider_language(language)?;
-    Some((file_id.parse().ok()?, language))
+    Some((file_id.parse().ok()?, language, sdh))
 }
 
 /// The numeric part of an IMDb id (`tt0111161` is `111161`).
@@ -238,9 +248,9 @@ pub async fn download_inner(
         return Err(error::ErrorBadRequest("OpenSubtitles is not configured"));
     };
     let item = item_by_id(state, raw_id).await?;
-    let (file_id, language) = parse_subtitle_id(raw_subtitle_id)
+    let (file_id, language, sdh) = parse_subtitle_id(raw_subtitle_id)
         .ok_or_else(|| error::ErrorBadRequest("invalid subtitle id"))?;
-    save_download(os, &item, file_id, &language).await
+    save_download(os, &item, file_id, &language, sdh).await
 }
 
 pub(crate) async fn save_download(
@@ -248,6 +258,7 @@ pub(crate) async fn save_download(
     item: &MediaItem,
     file_id: u64,
     language: &str,
+    sdh: bool,
 ) -> Result<(), actix_web::Error> {
     let result = os.provider.download(file_id).await;
     record_download(&result);
@@ -260,7 +271,7 @@ pub(crate) async fn save_download(
             "OpenSubtitles returned an empty file",
         ));
     }
-    let path = store::save(&os.root, &item.path, language, file_id, false, &downloaded.bytes)
+    let path = store::save(&os.root, &item.path, language, file_id, sdh, &downloaded.bytes)
         .await
         .map_err(|e| {
             tracing::error!(item = item.id, file_id, error = %e, "opensubtitles: could not store the download");
@@ -326,6 +337,39 @@ mod tests {
         let q = build_query(&stores, &item, "fr".into(), None).await;
         assert_eq!(q.moviehash, None);
         assert_eq!(q.language, "fr");
+    }
+
+    /// V1510: a hearing-impaired result's id carries `-sdh` so the download
+    /// stores the tag; an id without it still parses, as not SDH.
+    #[test]
+    fn the_subtitle_id_carries_the_sdh_flag() {
+        let mut hit = SubtitleHit {
+            file_id: 42,
+            subtitle_id: "7".into(),
+            language: "pt-PT".into(),
+            release: String::new(),
+            download_count: 0,
+            ratings: 0.0,
+            from_trusted: false,
+            hearing_impaired: false,
+            ai_translated: false,
+            machine_translated: false,
+            foreign_parts_only: false,
+            fps: None,
+            uploader: None,
+            upload_date: None,
+            hash_match: false,
+        };
+        assert_eq!(subtitle_id(&hit, "pt-pt"), "42-pt-pt");
+        hit.hearing_impaired = true;
+        let id = subtitle_id(&hit, "pt-pt");
+        assert_eq!(id, "42-pt-pt-sdh");
+        assert_eq!(parse_subtitle_id(&id), Some((42, "pt-pt".into(), true)));
+        assert_eq!(parse_subtitle_id("42-en"), Some((42, "en".into(), false)));
+        assert_eq!(
+            parse_subtitle_id("42-eng-sdh"),
+            Some((42, "en".into(), true))
+        );
     }
 
     #[tokio::test]

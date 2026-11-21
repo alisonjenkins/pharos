@@ -2466,19 +2466,33 @@ async fn scan_stem_matched(
 /// None. Scans the dot-separated tokens before the extension right-to-left,
 /// skipping disposition tags (forced/sdh/…) to reach the language; a token
 /// that's neither a disposition nor a recognisable language ends the search
-/// (it's the title/stem).
+/// (it's the title/stem). `hi` is both a disposition (hearing impaired) and
+/// Hindi: it is skipped only when a language token follows it, so
+/// `Movie.en.hi.srt` is `en` while `os5.hi.srt` and `os5.hi.sdh.srt` are `hi`.
 pub(crate) fn sidecar_language_from_name(name: &str) -> Option<String> {
     const DISPOSITIONS: &[&str] = &[
-        "forced", "sdh", "hi", "cc", "default", "foreign", "full", "normal",
+        "forced", "sdh", "cc", "default", "foreign", "full", "normal",
     ];
     let base = name.rsplit_once('.').map(|(b, _)| b)?; // drop extension
-    for tok in base.split('.').rev() {
-        let t = tok.trim();
-        if t.is_empty() {
-            continue;
-        }
+    let toks: Vec<&str> = base
+        .split('.')
+        .rev()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (at, t) in toks.iter().copied().enumerate() {
         if DISPOSITIONS.contains(&t.to_ascii_lowercase().as_str()) {
             continue;
+        }
+        if t.eq_ignore_ascii_case("hi") {
+            let language_follows = toks[at + 1..]
+                .iter()
+                .find(|n| !DISPOSITIONS.contains(&n.to_ascii_lowercase().as_str()))
+                .is_some_and(|n| is_language_token(n));
+            if language_follows {
+                continue;
+            }
+            return Some(t.to_string());
         }
         if is_language_token(t) {
             return Some(t.to_string());
@@ -2486,6 +2500,17 @@ pub(crate) fn sidecar_language_from_name(name: &str) -> Option<String> {
         break; // title/stem token — no language present
     }
     None
+}
+
+/// Whether a sidecar filename marks the file forced (foreign parts only): a
+/// `forced` token before the extension.
+pub(crate) fn sidecar_is_forced(name: &str) -> bool {
+    let Some((base, _)) = name.rsplit_once('.') else {
+        return false;
+    };
+    base.split('.')
+        .skip(1)
+        .any(|t| t.eq_ignore_ascii_case("forced"))
 }
 
 /// Whether a sidecar filename marks the file hearing-impaired: an `sdh` or
@@ -3233,6 +3258,19 @@ mod tests {
         // No language token.
         assert_eq!(sidecar_language_from_name("Movie.srt"), None);
         assert_eq!(sidecar_language_from_name("Movie.forced.srt"), None);
+        // `hi` is hearing impaired after a language, Hindi otherwise.
+        assert_eq!(
+            sidecar_language_from_name("Movie.en.hi.srt").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            sidecar_language_from_name("os5.hi.srt").as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            sidecar_language_from_name("os5.hi.sdh.srt").as_deref(),
+            Some("hi")
+        );
     }
 
     #[test]

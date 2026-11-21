@@ -68,6 +68,31 @@ pub fn record_job(outcome: JobOutcome) {
     count(Op::Job, outcome.label());
 }
 
+/// Why the background job looked for a subtitle (V1508):
+/// `pharos_opensubtitles_wanted_total{reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WantReason {
+    /// No subtitle in the language at all.
+    Missing,
+    /// Only disc-image tracks in the language.
+    PictureOnly,
+}
+
+impl WantReason {
+    pub const ALL: [WantReason; 2] = [WantReason::Missing, WantReason::PictureOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WantReason::Missing => "missing",
+            WantReason::PictureOnly => "picture_only",
+        }
+    }
+}
+
+pub fn record_wanted(reason: WantReason) {
+    metrics::counter!("pharos_opensubtitles_wanted_total", "reason" => reason.label()).increment(1);
+}
+
 impl ProviderError {
     pub const LABELS: [&'static str; 6] = [
         "quota",
@@ -182,6 +207,9 @@ mod tests {
         for reserved in ["ok", "empty"] {
             assert!(!ProviderError::LABELS.contains(&reserved));
         }
+        let wants: std::collections::HashSet<_> =
+            WantReason::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(wants.len(), WantReason::ALL.len());
     }
 
     #[test]
