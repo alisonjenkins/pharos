@@ -1,8 +1,9 @@
 //! Background job: fetch missing subtitles from OpenSubtitles (spec 030
 //! slice 2, V567-V569, V571).
 //!
-//! For each video item with no subtitle (embedded or already downloaded) in a
-//! configured language, ask for the best result and keep it. Bounded on every
+//! For each video item with no text subtitle (embedded or already downloaded)
+//! in a configured language, ask for the best result and keep it. A language
+//! whose only tracks are disc pictures counts as missing (V1508). Bounded on every
 //! side: one item at a time, at most [`JobConfig::max_downloads_per_day`]
 //! downloads a UTC day, a pause between searches, the hash read behind the
 //! background-I/O gate, a persisted memo so a miss is not asked again for a
@@ -11,10 +12,15 @@
 
 use super::memo::MissMemo;
 use super::quota::QuotaGate;
-use super::telemetry::{provider_language, record_download, record_job, record_search, JobOutcome};
+use super::telemetry::{
+    provider_language, record_download, record_job, record_search, record_wanted, JobOutcome,
+    WantReason,
+};
 use super::{store, OpenSubtitles, ProviderError, SubtitleHit};
 use crate::api::jellyfin::remote_subtitles::{build_query, item_moviehash, rank};
-use crate::api::jellyfin::subtitles::{discover_sidecars, sidecar_language_from_name};
+use crate::api::jellyfin::subtitles::{
+    discover_sidecars, is_image_subtitle_codec, sidecar_is_forced, sidecar_language_from_name,
+};
 use crate::bg_io::BgPermit;
 use crate::state::Stores;
 use pharos_core::{MediaItem, MediaKind, MediaStore};
@@ -149,6 +155,8 @@ pub enum StopReason {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PassSummary {
     pub wanted: usize,
+    /// Of `wanted`: languages with only picture tracks.
+    pub picture_only: usize,
     pub downloaded: usize,
     pub misses: usize,
     pub skipped_memo: usize,
@@ -161,26 +169,73 @@ fn base_language(code: &str) -> String {
     mapped.split('-').next().unwrap_or_default().to_string()
 }
 
-fn same_language(have: &str, want: &str) -> bool {
+pub(crate) fn same_language(have: &str, want: &str) -> bool {
     base_language(have) == base_language(want)
 }
 
-/// Whether the item already has a (non-forced) subtitle in `language`:
-/// embedded, beside the media, or downloaded earlier.
-async fn has_subtitle(item: &MediaItem, language: &str) -> bool {
-    if item.probe.subtitle_tracks.iter().any(|t| {
-        !t.is_forced
-            && t.language
-                .as_deref()
-                .is_some_and(|l| same_language(l, language))
-    }) {
-        return true;
+/// Why the job wants a subtitle for an item and language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    /// No subtitle in the language at all.
+    Missing,
+    /// Only disc-image (PGS, VobSub, DVB) tracks, which the player's text
+    /// engine cannot draw (V1508). `sdh` when one of them is hearing-impaired,
+    /// so the text stand-in should be too.
+    PictureOnly { sdh: bool },
+}
+
+impl Want {
+    pub fn reason(self) -> WantReason {
+        match self {
+            Want::Missing => WantReason::Missing,
+            Want::PictureOnly { .. } => WantReason::PictureOnly,
+        }
     }
-    discover_sidecars(&item.path).await.iter().any(|(p, _)| {
+
+    fn prefers_sdh(self) -> bool {
+        matches!(self, Want::PictureOnly { sdh: true })
+    }
+}
+
+/// What the item needs in `language`: `None` when it already has a
+/// (non-forced) text subtitle embedded, beside the media, or downloaded
+/// earlier. A forced track never counts; a picture track counts only as
+/// [`Want::PictureOnly`].
+async fn wants_subtitle(item: &MediaItem, language: &str) -> Option<Want> {
+    let tracks: Vec<_> = item
+        .probe
+        .subtitle_tracks
+        .iter()
+        .filter(|t| {
+            !t.is_forced
+                && t.language
+                    .as_deref()
+                    .is_some_and(|l| same_language(l, language))
+        })
+        .collect();
+    let is_picture =
+        |t: &&pharos_core::SubtitleTrack| t.codec.as_deref().is_some_and(is_image_subtitle_codec);
+    if !tracks.iter().all(is_picture) {
+        return None;
+    }
+    // A forced sidecar carries only foreign parts, so like a forced track it
+    // does not count as a full text subtitle.
+    let has_sidecar = discover_sidecars(&item.path).await.iter().any(|(p, _)| {
         p.file_name()
             .and_then(|n| n.to_str())
+            .filter(|n| !sidecar_is_forced(n))
             .and_then(sidecar_language_from_name)
             .is_some_and(|l| same_language(&l, language))
+    });
+    if has_sidecar {
+        return None;
+    }
+    Some(if tracks.is_empty() {
+        Want::Missing
+    } else {
+        Want::PictureOnly {
+            sdh: tracks.iter().any(|t| t.is_hearing_impaired),
+        }
     })
 }
 
@@ -196,11 +251,26 @@ async fn file_sig(path: &Path) -> Option<(i64, u64)> {
 }
 
 /// The hit worth keeping unattended: a hash match or a trusted uploader, never
-/// a machine translation or a foreign-parts-only track.
-fn pick(mut hits: Vec<SubtitleHit>) -> Option<SubtitleHit> {
-    hits.retain(|h| !h.ai_translated && !h.machine_translated && !h.foreign_parts_only);
+/// a machine translation or a foreign-parts-only track. With `prefer_sdh`, a
+/// hearing-impaired file wins within the best tier (a hash match beats an SDH
+/// file that was not timed to this release).
+fn pick(mut hits: Vec<SubtitleHit>, prefer_sdh: bool) -> Option<SubtitleHit> {
+    hits.retain(|h| {
+        !h.ai_translated
+            && !h.machine_translated
+            && !h.foreign_parts_only
+            && (h.hash_match || h.from_trusted)
+    });
     rank(&mut hits);
-    hits.into_iter().find(|h| h.hash_match || h.from_trusted)
+    let best_tier = hits.first()?.hash_match;
+    let at = prefer_sdh
+        .then(|| {
+            hits.iter()
+                .position(|h| h.hash_match == best_tier && h.hearing_impaired)
+        })
+        .flatten()
+        .unwrap_or(0);
+    (at < hits.len()).then(|| hits.swap_remove(at))
 }
 
 fn now_unix() -> i64 {
@@ -231,10 +301,14 @@ pub async fn run_pass(
         // the first language that reaches the search, and shared by the rest.
         let mut moviehash: Option<Option<String>> = None;
         for language in &cfg.languages {
-            if has_subtitle(item, language).await {
+            let Some(want) = wants_subtitle(item, language).await else {
                 continue;
-            }
+            };
             sum.wanted += 1;
+            if want != Want::Missing {
+                sum.picture_only += 1;
+            }
+            record_wanted(want.reason());
             let Some(sig) = file_sig(&item.path).await else {
                 continue;
             };
@@ -287,11 +361,16 @@ pub async fn run_pass(
                     continue;
                 }
             };
-            let Some(hit) = pick(hits) else {
+            let Some(hit) = pick(hits, want.prefers_sdh()) else {
                 memo.record_miss(item.id, language, sig, now_unix);
                 sum.misses += 1;
                 record_job(JobOutcome::Miss);
-                tracing::info!(item = item.id, language = %language, "opensubtitles job: nothing good enough; remembered");
+                tracing::info!(
+                    item = item.id,
+                    language = %language,
+                    reason = want.reason().label(),
+                    "opensubtitles job: nothing good enough; remembered"
+                );
                 continue;
             };
             let downloaded = os.provider.download(hit.file_id).await;
@@ -313,8 +392,15 @@ pub async fn run_pass(
                         record_job(JobOutcome::Error);
                         continue;
                     }
-                    match store::save(&os.root, &item.path, language, hit.file_id, false, &d.bytes)
-                        .await
+                    match store::save(
+                        &os.root,
+                        &item.path,
+                        language,
+                        hit.file_id,
+                        hit.hearing_impaired,
+                        &d.bytes,
+                    )
+                    .await
                     {
                         Ok(path) => {
                             sum.downloaded += 1;
@@ -324,6 +410,9 @@ pub async fn run_pass(
                                 language = %language,
                                 file_id = hit.file_id,
                                 hash_match = hit.hash_match,
+                                reason = want.reason().label(),
+                                wanted_sdh = want.prefers_sdh(),
+                                sdh = hit.hearing_impaired,
                                 remaining = d.remaining,
                                 path = %path.display(),
                                 "opensubtitles job: downloaded"
@@ -356,6 +445,7 @@ pub async fn run_pass(
     budget.persist(&os.gate);
     tracing::info!(
         wanted = sum.wanted,
+        picture_only = sum.picture_only,
         downloaded = sum.downloaded,
         misses = sum.misses,
         skipped_memo = sum.skipped_memo,
@@ -736,8 +826,139 @@ mod tests {
         let plain = hit(2, false);
         let mut trusted = hit(3, false);
         trusted.from_trusted = true;
-        assert_eq!(pick(vec![machine, plain.clone()]).map(|h| h.file_id), None);
-        assert_eq!(pick(vec![plain, trusted]).map(|h| h.file_id), Some(3));
+        assert_eq!(
+            pick(vec![machine, plain.clone()], false).map(|h| h.file_id),
+            None
+        );
+        assert_eq!(
+            pick(vec![plain, trusted], false).map(|h| h.file_id),
+            Some(3)
+        );
+    }
+
+    fn sdh(mut h: SubtitleHit) -> SubtitleHit {
+        h.hearing_impaired = true;
+        h
+    }
+
+    /// V1508: an SDH file wins when the disc track was SDH, but only within
+    /// the best tier, so timing to this release still comes first.
+    #[test]
+    fn sdh_is_preferred_within_the_best_tier_only() {
+        let mut trusted_sdh = sdh(hit(1, false));
+        trusted_sdh.from_trusted = true;
+        let mut popular = hit(2, true);
+        popular.download_count = 99;
+        let matched_sdh = sdh(hit(3, true));
+        let all = vec![trusted_sdh.clone(), popular.clone(), matched_sdh];
+        assert_eq!(pick(all.clone(), true).map(|h| h.file_id), Some(3));
+        assert_eq!(pick(all, false).map(|h| h.file_id), Some(2));
+        assert_eq!(
+            pick(vec![trusted_sdh, popular], true).map(|h| h.file_id),
+            Some(2),
+            "a hash match beats an SDH file timed to another release"
+        );
+    }
+
+    fn picture_track(index: u32, sdh: bool) -> pharos_core::SubtitleTrack {
+        pharos_core::SubtitleTrack {
+            stream_index: index,
+            language: Some("eng".into()),
+            codec: Some("hdmv_pgs_subtitle".into()),
+            is_hearing_impaired: sdh,
+            ..Default::default()
+        }
+    }
+
+    /// V1508: a language whose only tracks are pictures is fetched as text,
+    /// SDH when the picture track is, stored with an `sdh` tag, and a text
+    /// track in the language still means nothing is wanted.
+    #[tokio::test]
+    async fn a_picture_only_language_fetches_a_text_sdh_stand_in() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut r = rig(2, Fake::default()).await;
+        r.fake
+            .hits
+            .lock()
+            .unwrap()
+            .extend([hit(5, true), sdh(hit(6, true))]);
+        r.items[0]
+            .probe
+            .subtitle_tracks
+            .push(picture_track(2, true));
+        r.items[1]
+            .probe
+            .subtitle_tracks
+            .push(picture_track(2, false));
+        r.items[1]
+            .probe
+            .subtitle_tracks
+            .push(pharos_core::SubtitleTrack {
+                stream_index: 3,
+                language: Some("eng".into()),
+                codec: Some("subrip".into()),
+                ..Default::default()
+            });
+        let mut budget = DailyBudget::default();
+        let sum = pass(&r, &mut budget, &cfg(20), 1_000).await;
+        assert_eq!(
+            (sum.wanted, sum.picture_only, sum.downloaded),
+            (1, 1, 1),
+            "{sum:?}"
+        );
+        assert!(store::item_dir(&r.os.root, &r.items[0].path)
+            .join("os6.en.sdh.srt")
+            .exists());
+        let reasons: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_opensubtitles_wanted_total")
+            .flat_map(|(k, ..)| {
+                k.key()
+                    .labels()
+                    .filter(|l| l.key() == "reason")
+                    .map(|l| l.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(reasons, ["picture_only"]);
+        let sum = pass(&r, &mut budget, &cfg(20), 1_001).await;
+        assert_eq!(sum.wanted, 0, "the stand-in counts as text: {sum:?}");
+    }
+
+    /// A forced sidecar holds only foreign parts, so it does not stop the job
+    /// fetching full text for a picture-only language; a full one does.
+    #[tokio::test]
+    async fn a_forced_sidecar_does_not_count_as_text() {
+        // One folder each: the sidecar scan is cached per folder by its mtime
+        // in whole seconds, so a file added to the same folder within the
+        // second would not be seen.
+        async fn wants_with(sidecars: &[&str]) -> Option<Want> {
+            let dir = tempfile::tempdir().unwrap();
+            let media = dir.path().join("film.mkv");
+            std::fs::write(&media, b"x").unwrap();
+            for name in sidecars {
+                std::fs::write(dir.path().join(name), b"1").unwrap();
+            }
+            let mut item = MediaItem {
+                id: 1,
+                path: media,
+                kind: MediaKind::Movie,
+                ..MediaItem::default()
+            };
+            item.probe.subtitle_tracks.push(picture_track(2, false));
+            wants_subtitle(&item, "en").await
+        }
+        assert!(matches!(
+            wants_with(&["film.en.forced.srt"]).await,
+            Some(Want::PictureOnly { sdh: false })
+        ));
+        assert!(wants_with(&["film.en.forced.srt", "film.en.srt"])
+            .await
+            .is_none());
     }
 
     #[test]
