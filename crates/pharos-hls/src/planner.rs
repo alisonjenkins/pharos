@@ -179,6 +179,8 @@ struct TrackState {
     part_starts: Vec<usize>,
     /// The part whose init was last asked for.
     init_part: usize,
+    /// Whether that init was appended; a failed one is asked for again.
+    init_appended: bool,
     in_flight: Option<Request>,
     seek_target_ms: Option<u64>,
     /// The seek target's segment was fetched again because the target itself
@@ -209,6 +211,7 @@ impl TrackState {
             needs_init: has_init,
             part_starts: vec![0],
             init_part: 0,
+            init_appended: false,
             in_flight: None,
             seek_target_ms: Some(start_ms),
             seek_refetched: false,
@@ -429,6 +432,7 @@ impl Planner {
         match state.in_flight.take() {
             Some(Request::Init) => {
                 state.needs_init = false;
+                state.init_appended = true;
                 if state.segments.is_empty() {
                     state.last_appended = true;
                 }
@@ -694,6 +698,15 @@ fn plan_track(
         &state.segments,
         eviction_anchor(state, play_ms).saturating_sub(back_ms),
     );
+    // The record only stands while the buffer still starts where it did: once
+    // the remove took effect (or a seek refilled from elsewhere), the same
+    // range may be asked for again after it is refilled.
+    if state
+        .last_evict
+        .is_some_and(|(start, _)| track_buffered.first().map(|r| r.0) != Some(start))
+    {
+        state.last_evict = None;
+    }
     if let Some(&(range_start, range_end)) = track_buffered.first() {
         let range = (range_start, cutoff_ms);
         if range_start < range_end && range_start < cutoff_ms && state.last_evict != Some(range) {
@@ -714,6 +727,7 @@ fn plan_track(
         let at_ms = state.seek_target_ms.unwrap_or(play_ms);
         state.init_part = clamped_segment_at(&state.segments, at_ms)
             .map_or(0, |idx| part_of(&state.part_starts, idx));
+        state.init_appended = false;
         state.in_flight = Some(Request::Init);
         actions.push(Action::FetchInit { track });
         return;
@@ -744,7 +758,7 @@ fn plan_track(
             break;
         };
         if idx == start_idx && refetch_target {
-            found = Some((idx, seg.clone()));
+            found = Some((idx, seg.clone(), None));
             break;
         }
         let hole = hole_ahead(state, idx, track_buffered, anchor_ms);
@@ -761,20 +775,12 @@ fn plan_track(
                 });
             }
             _ => {
-                if let Some((start_ms, end_ms)) = hole {
-                    notes.push(Note::Refill {
-                        track,
-                        index: idx,
-                        start_ms,
-                        end_ms,
-                    });
-                }
-                found = Some((idx, seg.clone()));
+                found = Some((idx, seg.clone(), hole));
                 break;
             }
         }
     }
-    let Some((candidate_idx, candidate_seg)) = found else {
+    let Some((candidate_idx, candidate_seg, hole)) = found else {
         return;
     };
 
@@ -801,10 +807,12 @@ fn plan_track(
     }
     state.held = false;
 
-    // A segment of another part needs that part's init first.
+    // A segment of another part needs that part's init first, and a part
+    // whose init failed asks for it again before any of its segments.
     let part = part_of(&state.part_starts, candidate_idx);
-    if state.has_init && part != state.init_part {
+    if state.has_init && (part != state.init_part || !state.init_appended) {
         state.init_part = part;
+        state.init_appended = false;
         state.in_flight = Some(Request::Init);
         actions.push(Action::FetchInit { track });
         return;
@@ -812,6 +820,16 @@ fn plan_track(
 
     if candidate_idx == start_idx && refetch_target {
         state.seek_refetched = true;
+    }
+    // Noted only once the refill is asked for: a hole beyond the forward
+    // window, or behind the other track's lead, is not fetched yet.
+    if let Some((start_ms, end_ms)) = hole {
+        notes.push(Note::Refill {
+            track,
+            index: candidate_idx,
+            start_ms,
+            end_ms,
+        });
     }
     state.in_flight = Some(Request::Media(candidate_idx));
     actions.push(Action::Fetch {
@@ -855,12 +873,22 @@ fn hole_ahead(
         }
         at = at.max(end);
     }
-    // A short tail only strands the play head once the next segment is in.
+    // A short tail only strands the play head once the next segment is in,
+    // and the gap is measured to where data starts again, past this segment's
+    // end: two short sides of one boundary are one gap too wide to jump.
     let next_buffered = state
         .segments
         .get(idx.saturating_add(1))
         .is_some_and(|next| is_segment_covered(next, buffered));
-    (next_buffered && seg_end > at.saturating_add(REFILL_HOLE_MS)).then_some((at, seg_end))
+    let resumes_ms = buffered
+        .iter()
+        .map(|&(start, _)| start)
+        .filter(|&start| start > at)
+        .min()
+        .unwrap_or(seg_end)
+        .max(seg_end);
+    (next_buffered && seg_end > at && resumes_ms > at.saturating_add(REFILL_HOLE_MS))
+        .then_some((at, seg_end))
 }
 
 /// The start of the segment holding `at_ms`, so eviction removes whole
@@ -2240,6 +2268,148 @@ mod tests {
                 to_ms: 14_000 + SKIP_PADDING_MS
             }]
         );
+    }
+
+    /// Two short sides of one segment boundary are one gap the watchdog
+    /// cannot jump: the segment before it is fetched again.
+    /// Disarm check: measuring only to the segment's own end fetches nothing.
+    #[test]
+    fn a_gap_across_a_segment_boundary_is_measured_whole() {
+        let segs = make_segments(&[6_000; 2]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let holed = Buffered {
+            video: vec![(0, 5_100), (6_900, 12_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(
+            planner.tick(1_000, &holed),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 0
+            }]
+        );
+        assert_eq!(
+            planner.take_notes(),
+            vec![Note::Refill {
+                track: Track::Video,
+                index: 0,
+                start_ms: 5_100,
+                end_ms: 6_000,
+            }]
+        );
+        // A gap the watchdog can jump is left alone.
+        planner.appended(Track::Video);
+        let jumpable = Buffered {
+            video: vec![(0, 5_600), (6_400, 12_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(planner.tick(1_000, &jumpable), vec![Action::EndOfStream]);
+    }
+
+    /// A hole beyond the forward window is noted only when it is fetched.
+    /// Disarm check: noting it where it is found notes it on every tick.
+    #[test]
+    fn a_refill_outside_the_window_is_not_noted() {
+        let segs = make_segments(&[6_000; 40]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let holed = Buffered {
+            video: vec![(0, 120_070), (122_000, 240_000)],
+            audio: Vec::new(),
+        };
+        let fetches = planner
+            .tick(1_000, &holed)
+            .into_iter()
+            .filter(|a| matches!(a, Action::Fetch { .. }))
+            .count();
+        assert_eq!(fetches, 0);
+        assert!(
+            !planner
+                .take_notes()
+                .iter()
+                .any(|n| matches!(n, Note::Refill { .. })),
+            "nothing was asked for"
+        );
+    }
+
+    /// An init that fails at a part boundary is asked for again before any
+    /// segment of that part.
+    /// Disarm check: recording the part when the init is asked for fetches
+    /// the part's first segment without its init.
+    #[test]
+    fn a_failed_part_init_is_asked_for_again() {
+        let segs = make_segments(&[6_000; 4]);
+        let mut planner = Planner::new(segs, true, None, Config::default(), 0);
+        planner.set_parts(Track::Video, vec![0, 2]);
+        let mut buf = Buffered::default();
+        for index in 0..2u64 {
+            loop {
+                match planner.tick(0, &buf).first() {
+                    Some(Action::FetchInit { .. }) => planner.appended(Track::Video),
+                    Some(Action::Fetch { .. }) => {
+                        planner.appended(Track::Video);
+                        buf.video = vec![(0, (index + 1) * 6_000)];
+                        break;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            planner.tick(0, &buf),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        assert_eq!(planner.init_part(Track::Video), 1);
+        planner.failed(Track::Video);
+        assert_eq!(
+            planner.tick(0, &buf),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        assert_eq!(planner.init_part(Track::Video), 1);
+        planner.appended(Track::Video);
+        assert_eq!(
+            planner.tick(0, &buf),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 2
+            }]
+        );
+    }
+
+    /// Once a remove took effect, the same range may be evicted again after
+    /// a seek back refills it.
+    /// Disarm check: keeping the record forever leaves the refilled range.
+    #[test]
+    fn an_evicted_range_refilled_is_evicted_again() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 50_000);
+        let evicts = |actions: Vec<Action>| {
+            actions
+                .into_iter()
+                .filter(|a| matches!(a, Action::Evict { .. }))
+                .collect::<Vec<_>>()
+        };
+        let full = Buffered {
+            video: vec![(0, 120_000)],
+            audio: Vec::new(),
+        };
+        let asked = vec![Action::Evict {
+            track: Track::Video,
+            start_ms: 0,
+            end_ms: 30_000,
+        }];
+        assert_eq!(evicts(planner.tick(50_000, &full)), asked);
+        // The remove took effect.
+        let trimmed = Buffered {
+            video: vec![(30_000, 120_000)],
+            audio: Vec::new(),
+        };
+        assert_eq!(evicts(planner.tick(50_000, &trimmed)), Vec::new());
+        // A seek back refilled from 0, and the play head is back at 50 s.
+        assert_eq!(evicts(planner.tick(50_000, &full)), asked);
     }
 
     #[test]
