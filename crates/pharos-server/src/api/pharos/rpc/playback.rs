@@ -127,7 +127,10 @@ impl server::playback::Handler for Playback {
                     subtitle: grant.subtitle_stream_index,
                     remembers_tracks: grant.remembers_tracks,
                     reported_ms: Cell::new(grant.reported_ms),
+                    stop_ms: Cell::new(None),
                     stopped: Cell::new(false),
+                    epoch: grant.hold.epoch(),
+                    ended: std::sync::atomic::AtomicBool::new(false),
                     hold: std::cell::RefCell::new(Some(grant.hold)),
                     item_id: grant.item_id,
                     version,
@@ -254,11 +257,24 @@ struct Grant {
     remembers_tracks: bool,
     /// The position of the last report, which a stop on release saves.
     reported_ms: Cell<Option<u64>>,
+    /// The position of a stop that did not complete, which its release
+    /// retries ahead of any report: a report already on its way when the
+    /// stop ended the session can still land after it (B1490), and must not
+    /// put the saved position back behind the stop's.
+    stop_ms: Cell<Option<u64>>,
     /// Set by `stop`: the playback has ended and a release has nothing to do.
     stopped: Cell<bool>,
     /// The grant's hold on its play session, until `stop` or the end of its
     /// release grace.
     hold: std::cell::RefCell<Option<playback::SessionHold>>,
+    /// The grant epoch this grant's stop is fenced to (B1490), fixed when it
+    /// was negotiated: kept apart from the hold, which the first stop drops,
+    /// so a repeated stop after a takeover is fenced too.
+    epoch: Option<i64>,
+    /// Set once one of this grant's stops removed its session's row, so a
+    /// retry after its position write failed may still store the position
+    /// (`play_state::Fence`).
+    ended: std::sync::atomic::AtomicBool,
     /// What a released grant is matched on when its player negotiates again:
     /// the item and version named, the device, and the stream's shape.
     item_id: u64,
@@ -302,6 +318,66 @@ fn reported(choice: stream_choice::Reader<'_>) -> Result<Option<i32>, capnp::Err
     })
 }
 
+impl Grant {
+    /// Whether a renewal has taken this grant's session over (B1490): the
+    /// session's grant epoch is no longer the one this grant holds. Its
+    /// reports then store nothing; the grant that plays the stream now
+    /// reports for it. A grant that took no lease is never superseded, so it
+    /// reports as before. A row removed at this grant's epoch (the store
+    /// remembers the removal) is still this grant's. When the row is gone
+    /// otherwise, or reading it failed, the store cannot say, and the report
+    /// stores nothing: this
+    /// replica's lease snapshot cannot rule out a takeover elsewhere (see
+    /// `PlayHolds::holds_lease`), and the next report the store can answer
+    /// for stores the position.
+    async fn superseded(&self, what: &'static str) -> bool {
+        let Some(epoch) = self.epoch else {
+            return false;
+        };
+        let psid = pharos_core::PlaySessionId::from(self.play_session_id.as_str());
+        let registry = &self.session.state.transcode_sessions;
+        let unread = match registry.grant(&psid).await {
+            Ok(Some(g)) => Ok(g.epoch),
+            // Removed while it was still this grant's (the session cap, or
+            // its own stop): the store says so, and the report is this
+            // grant's to store.
+            Ok(None) => match registry.ended_at(&psid).await {
+                Ok(Some(at)) if at == epoch => Ok(epoch),
+                Ok(_) => Err("the session's row is gone".to_owned()),
+                Err(e) => Err(format!("reading how the session ended failed: {e}")),
+            },
+            Err(e) => Err(format!("reading the session's grant epoch failed: {e}")),
+        };
+        let now = match unread {
+            Ok(now) => now,
+            Err(why) => {
+                metrics::counter!("pharos_play_grant_superseded_total", "what" => what)
+                    .increment(1);
+                tracing::warn!(
+                    play_session_id = %pharos_core::secret_prefix(&self.play_session_id),
+                    held_epoch = epoch,
+                    %why,
+                    what,
+                    "playback: the store could not say whose the session is, so this grant's report stores nothing"
+                );
+                return true;
+            }
+        };
+        if now <= epoch {
+            return false;
+        }
+        metrics::counter!("pharos_play_grant_superseded_total", "what" => what).increment(1);
+        tracing::info!(
+            play_session_id = %pharos_core::secret_prefix(&self.play_session_id),
+            what,
+            held_epoch = epoch,
+            session_epoch = now,
+            "playback: a renewal took this grant's session over, so its report stores nothing"
+        );
+        true
+    }
+}
+
 impl server::playback_grant::Handler for Grant {
     async fn decision(
         self: Rc<Self>,
@@ -327,12 +403,22 @@ impl server::playback_grant::Handler for Grant {
             subtitle: reported(params.get_subtitle()?)?,
         };
         let report = self.at(params.get_position_ms(), params.get_paused(), playing);
-        let reported = match self.session.current_user().await {
-            Ok(user) => play_state::report(&self.session.state, &user, report)
-                .await
-                .map_err(report_denial),
-            Err(denial) => Err(denial),
+        // The caller is checked first, so a revoked token is denied whether
+        // or not the grant was superseded.
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                write_done(results.get().init_result(), Err(denial));
+                return Ok(());
+            }
         };
+        if self.superseded("report").await {
+            write_done(results.get().init_result(), Ok(()));
+            return Ok(());
+        }
+        let reported = play_state::report(&self.session.state, &user, report)
+            .await
+            .map_err(report_denial);
         if reported.is_ok() {
             self.reported_ms.set(Some(params.get_position_ms()));
         }
@@ -345,19 +431,38 @@ impl server::playback_grant::Handler for Grant {
         params: grant_wire::StopParams,
         results: &mut grant_wire::StopResults,
     ) -> Result<(), capnp::Error> {
-        let report = self.at(params.get()?.get_position_ms(), false, Playing::default());
+        let position_ms = params.get()?.get_position_ms();
+        let report = self.at(position_ms, false, Playing::default());
+        // B1490: fenced to the grant epoch this grant holds its session at,
+        // so it cannot stop a stream a renewal has taken over.
+        let fence = self.epoch.map(|epoch| play_state::Fence {
+            epoch,
+            ended: &self.ended,
+        });
         let stopped = match self.session.current_user().await {
-            Ok(user) => play_state::stop(&self.session.state, &user, report)
+            Ok(user) => play_state::stop_at(&self.session.state, &user, report, fence)
                 .await
                 .map_err(report_denial),
             Err(denial) => Err(denial),
         };
-        // A stop that failed leaves the release to try again.
-        self.stopped.set(stopped.is_ok());
-        if stopped.is_ok() {
+        // Only a stop that ended the playback and stored its position lets
+        // the hold go. One that failed, or found the session gone without
+        // the store's word that this grant ended it (an overlapping stop
+        // may have, and may yet fail to store), leaves the release to try
+        // again, unless an earlier stop already succeeded: that one let the
+        // hold go, so a release now would be one with no hold, which a
+        // negotiate could adopt onto a session a renewal took over.
+        if matches!(stopped, Ok(true)) {
+            self.stopped.set(true);
             drop(self.hold.borrow_mut().take());
+        } else if !self.stopped.get() {
+            // The release that retries it saves this stop's position, not
+            // the last report's, even if a report lands after it; it is
+            // fenced as the stop was, so a grant a renewal took over still
+            // stores nothing.
+            self.stop_ms.set(Some(position_ms));
         }
-        write_done(results.get().init_result(), stopped);
+        write_done(results.get().init_result(), stopped.map(|_| ()));
         Ok(())
     }
 
@@ -430,6 +535,11 @@ impl Drop for Grant {
         // Kept until the release is decided: a renewal naming the session in
         // its grace must not take a stream this release may yet end.
         let hold = self.hold.get_mut().take();
+        // The grant's own epoch, fixed when it was granted, not the hold's,
+        // and whether one of its stops already ended the session.
+        let fence = self
+            .epoch
+            .map(|epoch| (epoch, self.ended.load(std::sync::atomic::Ordering::Acquire)));
         if crate::state::is_shutting_down() {
             tracing::info!(
                 play_session_id = %pharos_core::secret_prefix(&self.play_session_id),
@@ -450,7 +560,7 @@ impl Drop for Grant {
             stream_url: std::mem::take(&mut self.stream_url),
             remembers_tracks: self.remembers_tracks,
             shape: self.shape.clone(),
-            reported_ms: self.reported_ms.get(),
+            reported_ms: self.stop_ms.get().or(self.reported_ms.get()),
             audio: self.audio,
             subtitle: self.subtitle,
         };
@@ -465,6 +575,7 @@ impl Drop for Grant {
                 session,
                 released,
                 hold,
+                fence,
                 ReleaseOutcome::EndedNoDevice,
                 "the session names no device, so no negotiate can adopt it".into(),
             );
@@ -481,6 +592,7 @@ impl Drop for Grant {
                     session,
                     released,
                     hold,
+                    fence,
                     ReleaseOutcome::EndedOverflow,
                     format!(
                         "{MAX_PENDING_RELEASES} released grants are already held, so this one ends now"
@@ -514,7 +626,7 @@ impl Drop for Grant {
                 }
             };
             if let Some(Verdict::Ended { outcome, reason }) = verdict {
-                end_released(&session, &released, outcome, &reason).await;
+                end_released(&session, &released, fence, outcome, &reason).await;
             }
             drop(hold);
         });
@@ -525,22 +637,32 @@ fn end_at_once(
     session: Rc<Session>,
     released: Released,
     hold: Option<playback::SessionHold>,
+    fence: Option<(i64, bool)>,
     outcome: ReleaseOutcome,
     reason: String,
 ) {
     actix_web::rt::spawn(async move {
-        end_released(&session, &released, outcome, &reason).await;
+        end_released(&session, &released, fence, outcome, &reason).await;
         drop(hold);
     });
 }
 
 /// Ends the playback of a released grant nobody adopted, as `stop` would.
+///
+/// Fenced, as `stop` is, to the grant's own epoch and whether one of its
+/// stops already ended the session (`fence`, B1490).
 async fn end_released(
     session: &Session,
     released: &Released,
+    fence: Option<(i64, bool)>,
     outcome: ReleaseOutcome,
     reason: &str,
 ) {
+    let ended = std::sync::atomic::AtomicBool::new(fence.is_some_and(|(_, ended)| ended));
+    let fence = fence.map(|(epoch, _)| play_state::Fence {
+        epoch,
+        ended: &ended,
+    });
     let play_session_id = pharos_core::secret_prefix(&released.play_session_id);
     if crate::state::is_shutting_down() {
         tracing::info!(%play_session_id, "playback: released grant left as it is, the server is shutting down");
@@ -558,33 +680,41 @@ async fn end_released(
         subtitle_stream_index: None,
     };
     // A revoked session saves no position but still ends the
-    // stream and the now-playing it owns.
+    // stream and the now-playing it owns. `ended` is false when a renewal
+    // took the session over, so this release ended and stored nothing.
     let (ended, saved) = match session.current_user().await {
-        Ok(user) => match play_state::stop(&session.state, &user, report).await {
+        Ok(user) => match play_state::stop_at(&session.state, &user, report, fence).await {
             // The item was hidden from the user since the last
             // report: `stop` wrote nothing and ended nothing, so
             // end the playback without saving a position.
             Err(play_state::ReportError::Withheld(hidden)) => {
                 tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
-                (play_state::end(&session.state, user.id, &psid).await, false)
+                (
+                    play_state::end_at(&session.state, user.id, &psid, fence).await,
+                    false,
+                )
             }
             // The playback ended; only its position was lost.
             Err(e @ play_state::ReportError::Store { .. }) => {
                 tracing::warn!(%play_session_id, error = %e, "playback: released grant's position not stored");
-                (Ok(()), false)
+                (Ok(true), false)
             }
-            other => (other, reported_ms.is_some()),
+            Ok(ended) => (Ok(ended), ended && reported_ms.is_some()),
+            Err(e) => (Err(e), false),
         },
         Err(_) => (
-            play_state::end(&session.state, session.owner(), &psid).await,
+            play_state::end_at(&session.state, session.owner(), &psid, fence).await,
             false,
         ),
     };
     let ended = ended.map_err(|e| e.to_string());
     outcome.record();
     match ended {
-        Ok(()) => {
+        Ok(true) => {
             tracing::info!(%play_session_id, saved, outcome = outcome.label(), %reason, "playback: grant released without a stop, playback ended")
+        }
+        Ok(false) => {
+            tracing::info!(%play_session_id, outcome = outcome.label(), %reason, "playback: grant released without a stop, but a renewal took its session over, so it ended and stored nothing")
         }
         Err(error) => {
             tracing::warn!(%play_session_id, %error, outcome = outcome.label(), %reason, "playback: grant released without a stop, ending it failed")
@@ -649,6 +779,12 @@ fn report_denial(e: play_state::ReportError) -> Denial {
             tracing::warn!(error = %e, "native playback report: session registry unavailable");
             Denial::Unavailable {
                 dependency: "session registry",
+            }
+        }
+        play_state::ReportError::SessionEnd(_) => {
+            tracing::warn!(error = %e, "native playback stop: play session not ended");
+            Denial::Unavailable {
+                dependency: "transcode session store",
             }
         }
     }

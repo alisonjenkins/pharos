@@ -4878,6 +4878,18 @@ pub struct SessionHolder {
     pub token_id: String,
 }
 
+/// Who owns a play session's lease (B1490, migration 0082), read when a
+/// takeover is refused, to say why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGrant {
+    /// 0 = never leased.
+    pub epoch: i64,
+    /// `None` once let go.
+    pub lease_until_unix_secs: Option<i64>,
+    /// The file the first lease was taken playing.
+    pub source: Option<String>,
+}
+
 /// Cross-replica store for [`PersistedTranscodeSession`]s keyed on
 /// PlaySessionId. The in-memory `TranscodeSessionRegistry` is the hot cache;
 /// this is the shared source of truth a failed-over replica falls back to.
@@ -4899,11 +4911,17 @@ pub trait TranscodeSessionStore: Send + Sync {
     /// when the row exists: `false` = no such row, and none is created. A
     /// session another replica stopped must not come back through a stale
     /// local cache (B256), which an upsert would allow.
+    ///
+    /// With `epoch`, only while the session's grant epoch has not moved past
+    /// it ([`Self::lease_transcode_session`]): a grant the session has moved
+    /// on from changes nothing. Not past rather than equal, so a grant unsure
+    /// whether its first lease committed (epoch 1, or still 0) is fenced as 1.
     fn update_transcode_session_holder(
         &self,
         play_session_id: &str,
         holder: &SessionHolder,
         now_unix_secs: i64,
+        epoch: Option<i64>,
     ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
 
     /// Fetch a session by PlaySessionId. `None` = no such row, or one last
@@ -4940,6 +4958,80 @@ pub trait TranscodeSessionStore: Send + Sync {
         keep: usize,
         updated_since_unix_secs: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send;
+
+    /// The first native grant's lease on a session it just negotiated
+    /// (B1490): its grant epoch goes from 0 to 1, it plays `source`, and its
+    /// grant has it until `lease_until_unix_secs`. `None` when the session
+    /// is gone or was claimed already. Answers the epoch the grant holds.
+    fn lease_transcode_session(
+        &self,
+        play_session_id: &str,
+        source: &str,
+        lease_until_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Option<i64>>> + Send;
+
+    /// A renewal's takeover of a claimed session no grant holds (B1490), in
+    /// one statement, so two renewals on two replicas cannot both win: only
+    /// when the session was claimed before, plays `source`, is `holder`'s
+    /// user's, was written at or after `updated_since_unix_secs`, and its
+    /// lease has lapsed (`< now_unix_secs`) or been let go. It then answers
+    /// to `holder`, its epoch moves on (so the grants before it are fenced
+    /// out) and its new grant has it until `lease_until_unix_secs`. Answers
+    /// the new epoch, or `None` when any of that does not hold.
+    fn take_over_transcode_session(
+        &self,
+        play_session_id: &str,
+        source: &str,
+        holder: &SessionHolder,
+        now_unix_secs: i64,
+        updated_since_unix_secs: i64,
+        lease_until_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Option<i64>>> + Send;
+
+    /// Extends the lease of the grant at `epoch` to `lease_until_unix_secs`.
+    /// `false` when the session is gone, was let go, or another grant owns
+    /// it now.
+    fn renew_transcode_session_lease(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+        lease_until_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
+    /// Lets the session go while it is still at `epoch`, so a renewal may
+    /// take it over at once. `false` when another grant owns it now, or it
+    /// is gone.
+    fn release_transcode_session_lease(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
+    /// The session's lease as it stands; `None` when there is no row.
+    fn transcode_session_grant(
+        &self,
+        play_session_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SessionGrant>>> + Send;
+
+    /// A grant's stop: removes the session only while its epoch has not
+    /// moved past `epoch` (as for the holder update), so a stop from a grant
+    /// it has moved on from cannot end the stream its new grant plays.
+    /// `false` when nothing was removed.
+    fn remove_transcode_session_at(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
+    /// The grant epoch a claimed session was at when its row was removed
+    /// (B1490), by any end: a grant's stop, the session cap, a REST stop.
+    /// Every removal of a row with a grant epoch above 0 records it, in the
+    /// same transaction, and the prune forgets it with the sessions. `None`
+    /// when no such removal is remembered.
+    fn transcode_session_end(
+        &self,
+        play_session_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<i64>>> + Send;
 }
 
 /// Persisted SyncPlay group snapshot (Phase B4 — zero-downtime deploys).

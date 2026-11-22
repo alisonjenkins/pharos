@@ -89,10 +89,17 @@ pub enum StopOutcome {
     /// The position was under the minimum resume point (FR-107): nothing
     /// stored, so an earlier resume point or played mark stands.
     BelowMinimum(BelowMinimum),
+    /// A grant's stop after its play session moved on to the grant a renewal
+    /// took it over with (B1490): that grant plays it and reports for it, so
+    /// this one ends and stores nothing.
+    Superseded,
+    /// A native grant's fenced stop could not reach the transcode-session
+    /// store: nothing was ended or stored (B1490).
+    SessionEndFailed,
 }
 
 impl StopOutcome {
-    pub const ALL: [StopOutcome; 9] = [
+    pub const ALL: [StopOutcome; 11] = [
         StopOutcome::Saved,
         StopOutcome::Finished,
         StopOutcome::NoItem,
@@ -102,6 +109,8 @@ impl StopOutcome {
         StopOutcome::UserDataWriteFailed,
         StopOutcome::BelowMinimum(BelowMinimum::Video),
         StopOutcome::BelowMinimum(BelowMinimum::Song),
+        StopOutcome::Superseded,
+        StopOutcome::SessionEndFailed,
     ];
 
     /// `(outcome, reason)` as the metric labels them.
@@ -115,6 +124,8 @@ impl StopOutcome {
             StopOutcome::UserDataReadFailed => ("store_error", "user_data_read"),
             StopOutcome::UserDataWriteFailed => ("store_error", "user_data_write"),
             StopOutcome::BelowMinimum(which) => ("below_minimum", which.label()),
+            StopOutcome::Superseded => ("skipped", "superseded"),
+            StopOutcome::SessionEndFailed => ("store_error", "session_end"),
         }
     }
 
@@ -148,6 +159,11 @@ pub enum ReportError {
     /// be recorded.
     #[error("session registry: {0}")]
     RegistryDown(String),
+    /// A native grant's fenced stop could not reach the transcode-session
+    /// store, so whether a renewal took the session over is unknown: nothing
+    /// was ended or stored, and a retry can (B1490).
+    #[error("ending the play session: {0}")]
+    SessionEnd(String),
     /// A play-state read or write on the stop failed (spec 038 FR-108). The
     /// playback has ended; the position was not stored, so a retry can.
     #[error("play state {step}: {source}")]
@@ -334,10 +350,80 @@ pub async fn end(
     owner: UserId,
     session_id: &pharos_core::PlaySessionId,
 ) -> Result<(), ReportError> {
+    end_at(state, owner, session_id, None).await.map(|_| ())
+}
+
+/// What fences a native grant's end to its own session (B1490): the grant
+/// epoch it holds the session at, and whether one of its own ends already
+/// removed the session's row (a stop whose position write then failed).
+#[derive(Debug, Clone, Copy)]
+pub struct Fence<'a> {
+    pub epoch: i64,
+    pub ended: &'a std::sync::atomic::AtomicBool,
+}
+
+/// [`end`] for a native grant fenced by `fence` (B1490): once a renewal has
+/// taken the session over, the old grant's end leaves it, and its
+/// now-playing entry, to the grant that plays it now. It goes on to the
+/// position only with the store's evidence the session was this grant's:
+/// its end removed the row, now or in an earlier call, or the store
+/// remembers the row was removed at this grant's epoch (this grant's own
+/// stop whose answer was lost, or the session cap). A row gone otherwise
+/// (the grant playing it now may have ended it; a local lease snapshot
+/// cannot rule that out) or held by another user ends and stores nothing. Answers
+/// whether it ended (`false`: superseded). `None` ends it whoever holds it,
+/// as a REST stop does.
+pub async fn end_at(
+    state: &AppState,
+    owner: UserId,
+    session_id: &pharos_core::PlaySessionId,
+    fence: Option<Fence<'_>>,
+) -> Result<bool, ReportError> {
+    use crate::transcode_sessions::GrantEnd;
+    use std::sync::atomic::Ordering;
     // B256: the PlaySessionId authorizes streams on its own, so the
     // stop that ends the playback ends the capability too.
-    if let Err(e) = state.transcode_sessions.end_held(session_id, owner).await {
-        tracing::warn!(error = %e, "playback stop: transcode session end failed");
+    match fence {
+        None => {
+            if let Err(e) = state.transcode_sessions.end_held(session_id, owner).await {
+                tracing::warn!(error = %e, "playback stop: transcode session end failed");
+            }
+        }
+        Some(Fence { epoch, ended }) => match state
+            .transcode_sessions
+            .end_granted(session_id, owner, epoch)
+            .await
+        {
+            Ok(GrantEnd::Ended | GrantEnd::EndedAt) => ended.store(true, Ordering::Release),
+            Ok(GrantEnd::Gone) if ended.load(Ordering::Acquire) => {}
+            Ok(verdict) => {
+                let why = match verdict {
+                    GrantEnd::Superseded => "a renewal took the session over",
+                    GrantEnd::NotHeld => "another user holds the session",
+                    _ => "the session is gone, and nothing shows this grant ended it",
+                };
+                tracing::info!(
+                    play_session_id = %pharos_core::secret_prefix(session_id.as_str()),
+                    epoch,
+                    verdict = ?verdict,
+                    %why,
+                    "playback stop: this grant's stop leaves the session, and stores nothing"
+                );
+                return Ok(false);
+            }
+            // Whether a renewal took the session over is unknown, so
+            // nothing a stop does may follow: no stop event, no position.
+            Err(e) => {
+                tracing::warn!(
+                    play_session_id = %pharos_core::secret_prefix(session_id.as_str()),
+                    error = %e,
+                    epoch,
+                    "playback stop: transcode session end failed, so the stop ended and stored nothing"
+                );
+                StopOutcome::SessionEndFailed.record();
+                return Err(ReportError::SessionEnd(e.to_string()));
+            }
+        },
     }
     state
         .sessions
@@ -345,13 +431,26 @@ pub async fn end(
             session_id: session_id.clone(),
         })
         .await
-        .map_err(|e| ReportError::RegistryDown(e.to_string()))
+        .map_err(|e| ReportError::RegistryDown(e.to_string()))?;
+    Ok(true)
 }
 
 /// Records the end of a playback: ends its session and its stream
 /// capability, then stores the final position, or marks the item played
 /// when the player stopped near its end.
 pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), ReportError> {
+    stop_at(state, user, r, None).await.map(|_| ())
+}
+
+/// [`stop`] from a native grant fenced by `fence` ([`end_at`]): a grant the session has moved on from stores nothing.
+/// Answers `false` for that superseded stop, `true` for one that ended the
+/// playback.
+pub async fn stop_at(
+    state: &AppState,
+    user: &User,
+    r: Report<'_>,
+    fence: Option<Fence<'_>>,
+) -> Result<bool, ReportError> {
     if let Some(id) = r
         .item_wire_id
         .and_then(pharos_jellyfin_api::dto::parse_item_id)
@@ -361,12 +460,17 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
             .map_err(ReportError::Withheld)?;
     }
     if let Some(session_id) = r.play_session_id {
-        end(
+        let ended = end_at(
             state,
             user.id,
             &pharos_core::PlaySessionId::from(session_id),
+            fence,
         )
         .await?;
+        if !ended {
+            StopOutcome::Superseded.record();
+            return Ok(false);
+        }
     }
 
     // Persist final UserData. If the client stopped within the last
@@ -383,7 +487,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         .and_then(pharos_jellyfin_api::dto::parse_item_id)
     else {
         StopOutcome::NoItem.record();
-        return Ok(());
+        return Ok(true);
     };
     let position = r.position_ticks;
     let progress_key = ProgressKey::new(user.id, item_id, r.play_session_id);
@@ -397,7 +501,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         Err(pharos_core::DomainError::NotFound(_)) => {
             StopOutcome::ItemMissing.record();
             state.progress_writes.forget(&progress_key);
-            return Ok(());
+            return Ok(true);
         }
         Err(error) => {
             StopOutcome::ItemReadFailed.record();
@@ -434,7 +538,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         );
         // The stop is final: a report held for this session must not store it either.
         state.progress_writes.forget(&progress_key);
-        return Ok(());
+        return Ok(true);
     }
     let mut data = match state.stores.get_user_data(user.id, item_id).await {
         Ok(data) => data,
@@ -487,7 +591,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
             });
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The most an audiobook's track may have left to play and count as

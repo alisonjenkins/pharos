@@ -74,7 +74,12 @@ fn shallow_of(mut item: MediaItem) -> MediaItem {
     item
 }
 
-async fn run_conformance<S>(store: S)
+/// Raw SQL against the backend under test, for a row state no store method
+/// writes on its own (B1490: a claimable source on a never-claimed row).
+type RawExec =
+    Box<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
+
+async fn run_conformance<S>(store: S, exec: RawExec)
 where
     S: pharos_core::MediaStore
         + pharos_core::UserStore
@@ -1802,7 +1807,7 @@ where
         token_id: "rebound-token-id".into(),
     };
     assert!(
-        !TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 500)
+        !TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 500, None)
             .await
             .unwrap(),
         "no row: the update reports false"
@@ -1818,7 +1823,7 @@ where
         .await
         .unwrap();
     assert!(
-        TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 700)
+        TranscodeSessionStore::update_transcode_session_holder(&store, psid, &rebound, 700, None)
             .await
             .unwrap(),
         "existing row: the update reports true"
@@ -1832,6 +1837,343 @@ where
     TranscodeSessionStore::remove_transcode_session(&store, psid)
         .await
         .unwrap();
+
+    // -----------------------------------------------------------------
+    // 10a. Play-session leases (B1490, migration 0082). A renewal takes a
+    // session over only after its grant let it go or its lease lapsed, and
+    // a grant the session moved on from can no longer renew, rebind, let go
+    // or stop it. Fresh ids per run: postgres persists across runs.
+    // -----------------------------------------------------------------
+    let lease_psid = format!("lease-{}", UserId::new().0.simple());
+    let lease_psid = lease_psid.as_str();
+    let lease_holder = sess.holder.clone().expect("conformance row has a holder");
+    let renewing = pharos_core::SessionHolder {
+        user_id: lease_holder.user_id,
+        token_id: "renewing-token-id".into(),
+    };
+    let stranger = pharos_core::SessionHolder {
+        user_id: UserId::new(),
+        token_id: "stranger-token-id".into(),
+    };
+    assert_eq!(
+        TranscodeSessionStore::lease_transcode_session(&store, lease_psid, "", 1_030)
+            .await
+            .unwrap(),
+        None,
+        "no row: nothing to lease"
+    );
+    TranscodeSessionStore::upsert_transcode_session(&store, lease_psid, &sess, 1_000)
+        .await
+        .unwrap();
+    // `since`: the oldest `updated_at` a takeover accepts as still live.
+    let take_over_since =
+        |holder: &pharos_core::SessionHolder, source: &'static str, now: i64, since: i64| {
+            let holder = holder.clone();
+            let store = &store;
+            async move {
+                TranscodeSessionStore::take_over_transcode_session(
+                    store,
+                    lease_psid,
+                    source,
+                    &holder,
+                    now,
+                    since,
+                    now + 30,
+                )
+                .await
+                .unwrap()
+            }
+        };
+    let take_over = |holder: &pharos_core::SessionHolder, source: &'static str, now: i64| {
+        take_over_since(holder, source, now, 900)
+    };
+    // The source the takeover asks for, on a row no grant ever claimed, so
+    // only the `grant_epoch > 0` guard can refuse it.
+    exec(format!(
+        "UPDATE transcode_sessions SET grant_source = '' WHERE play_session_id = '{lease_psid}'"
+    ))
+    .await;
+    assert_eq!(
+        take_over(&renewing, "", 1_001).await,
+        None,
+        "a session no grant ever claimed is never taken over"
+    );
+    let first = TranscodeSessionStore::lease_transcode_session(&store, lease_psid, "", 1_030)
+        .await
+        .unwrap()
+        .expect("the first claim");
+    assert_eq!(first, 1);
+    assert_eq!(
+        TranscodeSessionStore::lease_transcode_session(&store, lease_psid, "", 1_030)
+            .await
+            .unwrap(),
+        None,
+        "a claimed session is not claimed again"
+    );
+    assert_eq!(
+        take_over(&renewing, "", 1_010).await,
+        None,
+        "refused while the lease runs"
+    );
+    assert!(
+        TranscodeSessionStore::renew_transcode_session_lease(&store, lease_psid, first, 1_060)
+            .await
+            .unwrap(),
+        "its grant renews it"
+    );
+    assert_eq!(
+        take_over(&renewing, "", 1_040).await,
+        None,
+        "refused while the renewed lease runs"
+    );
+    assert_eq!(
+        take_over(&renewing, "an-edition", 1_061).await,
+        None,
+        "another file's renewal is refused"
+    );
+    assert_eq!(
+        take_over(&stranger, "", 1_061).await,
+        None,
+        "another user's renewal is refused"
+    );
+    assert_eq!(
+        take_over(&renewing, "", 1_060).await,
+        None,
+        "refused at the lease's last second: it lapses only after it"
+    );
+    assert_eq!(
+        take_over_since(&renewing, "", 1_061, 1_001).await,
+        None,
+        "refused once the row is older than the takeover's cutoff, lapsed or not"
+    );
+    let second = take_over_since(&renewing, "", 1_061, 1_000)
+        .await
+        .expect("a lapsed lease on a row as fresh as the cutoff is taken over");
+    assert!(second > first);
+    let got = TranscodeSessionStore::get_transcode_session(&store, lease_psid, 1_061)
+        .await
+        .unwrap()
+        .expect("the taken-over row");
+    assert_eq!(
+        got.holder,
+        Some(renewing.clone()),
+        "it answers to the renewal"
+    );
+    assert_eq!(
+        take_over(&renewing, "", 1_062).await,
+        None,
+        "a second renewal is refused while the new lease runs"
+    );
+    // The grant it moved on from is fenced out of every write.
+    assert!(
+        !TranscodeSessionStore::renew_transcode_session_lease(&store, lease_psid, first, 2_000)
+            .await
+            .unwrap(),
+        "an old grant cannot renew"
+    );
+    assert!(
+        !TranscodeSessionStore::update_transcode_session_holder(
+            &store,
+            lease_psid,
+            &lease_holder,
+            1_063,
+            Some(first)
+        )
+        .await
+        .unwrap(),
+        "an old grant cannot rebind"
+    );
+    assert!(
+        !TranscodeSessionStore::release_transcode_session_lease(&store, lease_psid, first)
+            .await
+            .unwrap(),
+        "an old grant cannot let it go"
+    );
+    assert!(
+        !TranscodeSessionStore::remove_transcode_session_at(&store, lease_psid, first)
+            .await
+            .unwrap(),
+        "an old grant cannot stop it"
+    );
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, lease_psid, 0)
+            .await
+            .unwrap()
+            .is_some(),
+        "the fenced writes left the session running"
+    );
+    // A grant that lets it go hands it over at once, and cannot renew after.
+    assert!(
+        TranscodeSessionStore::release_transcode_session_lease(&store, lease_psid, second)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !TranscodeSessionStore::renew_transcode_session_lease(&store, lease_psid, second, 2_000)
+            .await
+            .unwrap(),
+        "a lease let go is not renewed"
+    );
+    let third = take_over(&renewing, "", 1_063)
+        .await
+        .expect("a lease let go is taken over before it would lapse");
+    assert!(third > second);
+    assert!(
+        TranscodeSessionStore::update_transcode_session_holder(
+            &store,
+            lease_psid,
+            &renewing,
+            1_064,
+            Some(third)
+        )
+        .await
+        .unwrap(),
+        "the current grant rebinds"
+    );
+    assert!(
+        TranscodeSessionStore::remove_transcode_session_at(&store, lease_psid, third)
+            .await
+            .unwrap(),
+        "the current grant stops it"
+    );
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, lease_psid, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The removal remembers the epoch it ended the session at, so a stop
+    // whose answer was lost, retried by the same grant, can tell it ended it.
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, lease_psid)
+            .await
+            .unwrap(),
+        Some(third),
+        "the stop remembers the epoch it ended the session at"
+    );
+    // Every removal of a claimed row remembers it: the session cap's
+    // eviction (a plain removal) and its trim, at the epoch the row was at.
+    let capped = format!("capped-{}", UserId::new().0.simple());
+    TranscodeSessionStore::upsert_transcode_session(&store, &capped, &sess, 1_100)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::lease_transcode_session(&store, &capped, "", 1_130)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    TranscodeSessionStore::remove_transcode_session(&store, &capped)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, &capped)
+            .await
+            .unwrap(),
+        Some(1),
+        "an eviction remembers the claimed row's epoch"
+    );
+    let trim_owner = UserId::new();
+    let trimmed_row = PersistedTranscodeSession {
+        holder: Some(pharos_core::SessionHolder {
+            user_id: trim_owner,
+            token_id: "trimmed-token-id".into(),
+        }),
+        ..sess.clone()
+    };
+    let (trimmed, kept) = (
+        format!("trimmed-{}", trim_owner.0.simple()),
+        format!("kept-{}", trim_owner.0.simple()),
+    );
+    TranscodeSessionStore::upsert_transcode_session(&store, &trimmed, &trimmed_row, 1_200)
+        .await
+        .unwrap();
+    TranscodeSessionStore::lease_transcode_session(&store, &trimmed, "", 1_230)
+        .await
+        .unwrap();
+    TranscodeSessionStore::upsert_transcode_session(&store, &kept, &trimmed_row, 1_201)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::trim_transcode_sessions_for_holder(&store, trim_owner, &kept, 1, 0)
+            .await
+            .unwrap(),
+        vec![trimmed.clone()]
+    );
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, &trimmed)
+            .await
+            .unwrap(),
+        Some(1),
+        "a trim remembers the claimed row's epoch"
+    );
+    // A row no grant ever claimed is removed with nothing remembered.
+    let unclaimed = format!("unclaimed-{}", UserId::new().0.simple());
+    TranscodeSessionStore::upsert_transcode_session(&store, &unclaimed, &sess, 1_300)
+        .await
+        .unwrap();
+    TranscodeSessionStore::remove_transcode_session(&store, &unclaimed)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, &unclaimed)
+            .await
+            .unwrap(),
+        None,
+        "an unclaimed row leaves nothing to remember"
+    );
+    // A grant whose first lease errored is fenced at epoch 1 while its row
+    // is still at 0: its stop records the grant's epoch, not the row's.
+    let never_leased = format!("never-leased-{}", UserId::new().0.simple());
+    TranscodeSessionStore::upsert_transcode_session(&store, &never_leased, &sess, 1_300)
+        .await
+        .unwrap();
+    assert!(
+        TranscodeSessionStore::remove_transcode_session_at(&store, &never_leased, 1)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, &never_leased)
+            .await
+            .unwrap(),
+        Some(1),
+        "a fenced stop remembers the stopping grant's epoch"
+    );
+    // The retention prune remembers a claimed row it removes, as any
+    // removal does.
+    let aged = format!("aged-{}", UserId::new().0.simple());
+    TranscodeSessionStore::upsert_transcode_session(&store, &aged, &sess, 1_300)
+        .await
+        .unwrap();
+    let aged_epoch = TranscodeSessionStore::lease_transcode_session(&store, &aged, "", 1_330)
+        .await
+        .unwrap()
+        .expect("leased");
+    assert!(
+        TranscodeSessionStore::prune_transcode_sessions(&store, 1_301)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, &aged)
+            .await
+            .unwrap(),
+        Some(aged_epoch),
+        "the prune remembers the claimed row's epoch"
+    );
+    // The prune forgets the removals with the sessions.
+    TranscodeSessionStore::prune_transcode_sessions(&store, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        TranscodeSessionStore::transcode_session_end(&store, lease_psid)
+            .await
+            .unwrap(),
+        None,
+        "the prune forgets what it remembered"
+    );
 
     // -----------------------------------------------------------------
     // 10b. TranscodeSessionStore::trim_transcode_sessions_for_holder (B279)
@@ -4156,7 +4498,20 @@ async fn sqlite_conformance() {
     let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
-    run_conformance(s).await;
+    let pool = s.pool().clone();
+    run_conformance(
+        s,
+        Box::new(move |sql| {
+            let pool = pool.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        }),
+    )
+    .await;
 }
 
 #[cfg(feature = "postgres")]
@@ -4182,7 +4537,20 @@ async fn postgres_conformance() {
         p.pool().options().get_acquire_timeout(),
         std::time::Duration::from_secs(7)
     );
-    run_conformance(p).await;
+    let pool = p.pool().clone();
+    run_conformance(
+        p,
+        Box::new(move |sql| {
+            let pool = pool.clone();
+            Box::pin(async move {
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        }),
+    )
+    .await;
 }
 
 /// V1140 — the stale-art sweep's store reads and writes: keyset paging over the

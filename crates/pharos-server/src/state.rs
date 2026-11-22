@@ -780,6 +780,7 @@ impl AppState {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
         let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
+        let play_holds = Arc::new(crate::services::playback::PlayHolds::new(stores.clone()));
         let (bus, _) = broadcast::channel(256);
         Self {
             stores,
@@ -834,7 +835,7 @@ impl AppState {
             pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
                 crate::pending_release::DEFAULT_RELEASE_GRACE,
             )),
-            play_holds: Arc::default(),
+            play_holds,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
@@ -930,6 +931,7 @@ impl AppState {
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
         let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
+        let play_holds = Arc::new(crate::services::playback::PlayHolds::new(stores.clone()));
         let (bus, _) = broadcast::channel(256);
         Ok(Self {
             stores,
@@ -984,7 +986,7 @@ impl AppState {
             pending_releases: Arc::new(crate::pending_release::PendingReleases::new(
                 crate::pending_release::DEFAULT_RELEASE_GRACE,
             )),
-            play_holds: Arc::default(),
+            play_holds,
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,

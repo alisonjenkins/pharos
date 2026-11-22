@@ -709,6 +709,8 @@ async fn seed_raw(store: &SqliteStore) {
         "INSERT INTO transcode_sessions (play_session_id, media_id, decision_json, \
          source_probe_json, updated_at, burn_subtitle_indices_json, holder_user_id, \
          holder_token_id) VALUES ('ps1', 1, '{}', '{}', 1700000008, '[3]', 'u1', 't1')",
+        "INSERT INTO transcode_session_ends (play_session_id, grant_epoch, ended_at) \
+         VALUES ('ps0', 4, 1700000012)",
         "UPDATE media_items SET track_number = 3, disc_number = 1, release_year = 1979, \
          production_locations_json = '[\"UK\"]', trailers_json = '[]', synopsis = 'Long.', \
          content_rating = 'R', network = 'BBC', release_date = 300000000, has_primary_art = 1, \

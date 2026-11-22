@@ -73,6 +73,7 @@ pub const COPIED_TABLES: &[&str] = &[
     "subtitle_signals",
     "subtitle_check",
     "transcode_sessions",
+    "transcode_session_ends",
 ];
 
 /// SQLite tables the migration leaves behind on purpose, with the reason.

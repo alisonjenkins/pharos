@@ -1622,14 +1622,15 @@ impl TranscodeSessionStore for AnyStore {
         play_session_id: &str,
         holder: &pharos_core::SessionHolder,
         now_unix_secs: i64,
+        epoch: Option<i64>,
     ) -> DomainResult<bool> {
         match self {
             AnyStore::Sqlite(s) => {
-                s.update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                s.update_transcode_session_holder(play_session_id, holder, now_unix_secs, epoch)
                     .await
             }
             AnyStore::Postgres(p) => {
-                p.update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                p.update_transcode_session_holder(play_session_id, holder, now_unix_secs, epoch)
                     .await
             }
         }
@@ -1692,6 +1693,122 @@ impl TranscodeSessionStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.prune_transcode_sessions(cutoff_unix_secs).await,
             AnyStore::Postgres(p) => p.prune_transcode_sessions(cutoff_unix_secs).await,
+        }
+    }
+
+    async fn lease_transcode_session(
+        &self,
+        play_session_id: &str,
+        source: &str,
+        lease_until_unix_secs: i64,
+    ) -> DomainResult<Option<i64>> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.lease_transcode_session(play_session_id, source, lease_until_unix_secs)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.lease_transcode_session(play_session_id, source, lease_until_unix_secs)
+                    .await
+            }
+        }
+    }
+
+    async fn take_over_transcode_session(
+        &self,
+        play_session_id: &str,
+        source: &str,
+        holder: &pharos_core::SessionHolder,
+        now_unix_secs: i64,
+        updated_since_unix_secs: i64,
+        lease_until_unix_secs: i64,
+    ) -> DomainResult<Option<i64>> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.take_over_transcode_session(
+                    play_session_id,
+                    source,
+                    holder,
+                    now_unix_secs,
+                    updated_since_unix_secs,
+                    lease_until_unix_secs,
+                )
+                .await
+            }
+            AnyStore::Postgres(p) => {
+                p.take_over_transcode_session(
+                    play_session_id,
+                    source,
+                    holder,
+                    now_unix_secs,
+                    updated_since_unix_secs,
+                    lease_until_unix_secs,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn renew_transcode_session_lease(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+        lease_until_unix_secs: i64,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.renew_transcode_session_lease(play_session_id, epoch, lease_until_unix_secs)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.renew_transcode_session_lease(play_session_id, epoch, lease_until_unix_secs)
+                    .await
+            }
+        }
+    }
+
+    async fn release_transcode_session_lease(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.release_transcode_session_lease(play_session_id, epoch)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.release_transcode_session_lease(play_session_id, epoch)
+                    .await
+            }
+        }
+    }
+
+    async fn transcode_session_grant(
+        &self,
+        play_session_id: &str,
+    ) -> DomainResult<Option<pharos_core::SessionGrant>> {
+        match self {
+            AnyStore::Sqlite(s) => s.transcode_session_grant(play_session_id).await,
+            AnyStore::Postgres(p) => p.transcode_session_grant(play_session_id).await,
+        }
+    }
+
+    async fn remove_transcode_session_at(
+        &self,
+        play_session_id: &str,
+        epoch: i64,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.remove_transcode_session_at(play_session_id, epoch).await,
+            AnyStore::Postgres(p) => p.remove_transcode_session_at(play_session_id, epoch).await,
+        }
+    }
+
+    async fn transcode_session_end(&self, play_session_id: &str) -> DomainResult<Option<i64>> {
+        match self {
+            AnyStore::Sqlite(s) => s.transcode_session_end(play_session_id).await,
+            AnyStore::Postgres(p) => p.transcode_session_end(play_session_id).await,
         }
     }
 }

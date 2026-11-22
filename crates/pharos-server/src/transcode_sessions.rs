@@ -137,6 +137,26 @@ async fn delete_durable_row<S: TranscodeSessionStore>(store: &S, session_id: &Pl
     }
 }
 
+/// What a native grant's stop did ([`TranscodeSessionRegistry::end_granted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantEnd {
+    Ended,
+    /// The session is at another grant epoch (a renewal took it over), or
+    /// it ended between the check and the delete with no removal at this
+    /// grant's epoch remembered. Left as it is.
+    Superseded,
+    /// Another user holds it.
+    NotHeld,
+    /// The row is gone, and the store remembers it was removed at this
+    /// grant's epoch: by this grant's own stop (whose answer may have been
+    /// lost), or by the session cap while it was still this grant's, also
+    /// when the cap removed it between this stop's read and its delete.
+    EndedAt,
+    /// The row is gone with no removal at this grant's epoch remembered: it
+    /// was pruned, or it ended after a renewal took it over.
+    Gone,
+}
+
 struct Entry {
     session: TranscodeSession,
     last_used: Instant,
@@ -383,23 +403,39 @@ where
     /// Local cache first; on a miss fall back to the store (the failover /
     /// cold-replica path) and re-cache. A store error or an undecodable row
     /// resolves to `None` (the caller 410s, exactly as before), with the
-    /// underlying cause logged.
+    /// underlying cause logged. A cache that cannot answer (its actor has
+    /// stopped) is a miss too, so a session another replica's grant moved
+    /// here is still served from its row (B1490).
     pub async fn get(
         &self,
         session_id: PlaySessionId,
     ) -> Result<Option<TranscodeSession>, TranscodeSessionError> {
         let (tx, rx) = oneshot::channel();
-        self.tx
+        let session_id = match self
+            .tx
             .send(Msg::Get {
                 session_id,
                 reply: tx,
             })
             .await
-            .map_err(|_| TranscodeSessionError::ActorDown)?;
-        let (session_id, local) = rx.await.map_err(|_| TranscodeSessionError::ReplyDropped)?;
-        if local.is_some() {
-            return Ok(local);
-        }
+        {
+            Ok(()) => {
+                let (session_id, local) =
+                    rx.await.map_err(|_| TranscodeSessionError::ReplyDropped)?;
+                if local.is_some() {
+                    return Ok(local);
+                }
+                session_id
+            }
+            Err(mpsc::error::SendError(Msg::Get { session_id, .. })) => {
+                tracing::warn!(
+                    psid = %pharos_core::secret_prefix(session_id.as_str()),
+                    "transcode session cache is down; reading the store"
+                );
+                session_id
+            }
+            Err(_) => return Err(TranscodeSessionError::ActorDown),
+        };
 
         match self
             .store
@@ -511,17 +547,22 @@ where
     /// another replica stopped is not brought back by this replica's stale
     /// cache (B256); a store failure is returned, never swallowed, so the old
     /// token is not silently left as holder. `false` when the session is gone.
+    ///
+    /// With `epoch`, only while the session is still at that grant epoch
+    /// (B1490): a grant a renewal took the session over from changes nothing,
+    /// and reads as `false`, gone, like a stopped one.
     pub async fn rebind_holder(
         &self,
         session_id: &PlaySessionId,
         holder: SessionHolder,
+        epoch: Option<i64>,
     ) -> Result<bool, TranscodeSessionError> {
         let Some(mut session) = self.get(session_id.clone()).await? else {
             return Ok(false);
         };
         let updated = self
             .store
-            .update_transcode_session_holder(session_id.as_str(), &holder, now_unix_secs())
+            .update_transcode_session_holder(session_id.as_str(), &holder, now_unix_secs(), epoch)
             .await
             .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
         if !updated {
@@ -535,14 +576,182 @@ where
             return Ok(false);
         }
         session.holder = holder;
-        self.tx
+        // The rebind committed; a cache that cannot take the copy does not
+        // undo it, and `get` reads the store while the cache is down.
+        if self
+            .tx
             .send(Msg::Recache(Box::new(InsertPayload {
                 session_id: session_id.clone(),
                 session,
             })))
             .await
-            .map_err(|_| TranscodeSessionError::ActorDown)?;
+            .is_err()
+        {
+            tracing::warn!(
+                psid = %pharos_core::secret_prefix(session_id.as_str()),
+                "transcode session holder rebound, but caching it here failed"
+            );
+        }
         Ok(true)
+    }
+
+    /// The grant epoch `session_id` was at when its row was removed, as the
+    /// store remembers it (B1490); `None` when it remembers no such removal.
+    pub async fn ended_at(
+        &self,
+        session_id: &PlaySessionId,
+    ) -> Result<Option<i64>, TranscodeSessionError> {
+        self.store
+            .transcode_session_end(session_id.as_str())
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))
+    }
+
+    /// A renewal's takeover of `session` (B1490): in the store, one statement
+    /// that refuses while any grant's lease on it runs and otherwise moves
+    /// its epoch on and makes `holder` its holder; then, as
+    /// [`Self::rebind_holder`] does, in memory. `Some(epoch)` = taken over,
+    /// at that grant epoch; `None` = refused, and nothing changed.
+    pub async fn take_over(
+        &self,
+        session_id: &PlaySessionId,
+        mut session: TranscodeSession,
+        source: &str,
+        holder: SessionHolder,
+        lease_until_unix_secs: i64,
+    ) -> Result<Option<i64>, TranscodeSessionError> {
+        let now = now_unix_secs();
+        let Some(epoch) = self
+            .store
+            .take_over_transcode_session(
+                session_id.as_str(),
+                source,
+                &holder,
+                now,
+                now - DB_RETENTION_SECS,
+                lease_until_unix_secs,
+            )
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        session.holder = holder;
+        // The takeover committed: its epoch and lease are the grant's even
+        // if the copy here cannot be updated, so the hold attaches to them
+        // (and lets the lease go when it drops). A cache that cannot take
+        // the copy cannot answer for it either, so `get` reads the row from
+        // the store.
+        if self
+            .tx
+            .send(Msg::Recache(Box::new(InsertPayload {
+                session_id: session_id.clone(),
+                session,
+            })))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                psid = %pharos_core::secret_prefix(session_id.as_str()),
+                epoch,
+                "transcode session takeover committed, but caching it here failed"
+            );
+        }
+        Ok(Some(epoch))
+    }
+
+    /// `session_id`'s lease as the store has it, to say why a takeover was
+    /// refused.
+    pub async fn grant(
+        &self,
+        session_id: &PlaySessionId,
+    ) -> Result<Option<pharos_core::SessionGrant>, TranscodeSessionError> {
+        self.store
+            .transcode_session_grant(session_id.as_str())
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))
+    }
+
+    /// A native grant's stop of `session_id`, which it holds at grant
+    /// `epoch`: [`Self::end_held`], except that the row is removed only while
+    /// it is still at that epoch, in the delete itself, so a stop from a
+    /// grant a renewal took the session over from cannot end the stream the
+    /// new grant plays (B1490).
+    pub async fn end_granted(
+        &self,
+        session_id: &PlaySessionId,
+        user: pharos_core::UserId,
+        epoch: i64,
+    ) -> Result<GrantEnd, TranscodeSessionError> {
+        // Read from the store, keeping its errors: the cache, or a read that
+        // failed taken as no row, would let a stop act on a session it
+        // cannot show is its own. No retention cutoff: a lease's renewals
+        // do not touch `updated_at`, so a grant playing for longer than the
+        // retention still owns a row the cutoff would hide.
+        let row = self
+            .store
+            .get_transcode_session(session_id.as_str(), i64::MIN)
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
+        match row {
+            // Gone: whether it ended while it was still this grant's (its own
+            // stop whose answer was lost, or the session cap) is what the
+            // store remembers of the removal, never this replica's view.
+            None => {
+                let at = self
+                    .store
+                    .transcode_session_end(session_id.as_str())
+                    .await
+                    .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
+                return Ok(if at == Some(epoch) {
+                    GrantEnd::EndedAt
+                } else {
+                    GrantEnd::Gone
+                });
+            }
+            Some(row) if row.holder.as_ref().is_some_and(|h| h.user_id == user) => {}
+            Some(_) => return Ok(GrantEnd::NotHeld),
+        }
+        let removed = self
+            .store
+            .remove_transcode_session_at(session_id.as_str(), epoch)
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
+        // Either way the copy here goes: the session ended, or it answers to
+        // another grant now, which the next use reloads from the store. The
+        // delete decided the verdict; a cache that cannot take the removal
+        // does not change it, and `get` reads the store when it is down.
+        if self
+            .tx
+            .send(Msg::Remove {
+                session_id: session_id.clone(),
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                psid = %pharos_core::secret_prefix(session_id.as_str()),
+                epoch,
+                removed,
+                "transcode session stop: the store answered, but the cache here is down"
+            );
+        }
+        if removed {
+            return Ok(GrantEnd::Ended);
+        }
+        // Nothing removed: a renewal took the session over, or the row went
+        // between the read above and the delete (the session cap). Only the
+        // store's record of the removal tells the two apart.
+        let at = self
+            .store
+            .transcode_session_end(session_id.as_str())
+            .await
+            .map_err(|e| TranscodeSessionError::Store(e.to_string()))?;
+        Ok(if at == Some(epoch) {
+            GrantEnd::EndedAt
+        } else {
+            GrantEnd::Superseded
+        })
     }
 
     /// Drop durable rows idle past `DB_RETENTION_SECS`. Idempotent + cheap;
@@ -737,6 +946,261 @@ mod tests {
         assert!(replica_b.get("gone".into()).await.unwrap().is_none());
     }
 
+    /// B1490: a takeover committed on a replica whose cache actor has
+    /// stopped is still served: `get` reads the row when the cache cannot
+    /// answer, so a renewal that answered `Resumed` is not followed by a 500
+    /// on every segment. Disarm check: with `get` failing `ActorDown` when
+    /// the cache send fails, the lookup errs.
+    #[tokio::test]
+    async fn a_takeover_is_served_with_the_cache_down() {
+        let store = store().await;
+        let alice = pharos_core::UserId::new();
+        let up = TranscodeSessionRegistry::spawn(store.clone());
+        up.insert("moved".into(), session_for(alice)).await.unwrap();
+        // Leased elsewhere, and lapsed: free to take over.
+        assert!(store
+            .lease_transcode_session("moved", "file", 0)
+            .await
+            .unwrap()
+            .is_some());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let down = TranscodeSessionRegistry {
+            tx,
+            store: store.clone(),
+        };
+        let session = session_for(alice);
+        let holder = session.holder.clone();
+        let epoch = down
+            .take_over(
+                &"moved".into(),
+                session,
+                "file",
+                holder,
+                now_unix_secs() + 30,
+            )
+            .await
+            .unwrap();
+        assert!(epoch.is_some(), "the takeover commits");
+        let got = down.get("moved".into()).await.unwrap();
+        assert!(
+            got.is_some_and(|s| s.holder.user_id == alice),
+            "the moved session is served from its row"
+        );
+        // Its grant's stop ends it, and says so, though the cache cannot
+        // take the removal.
+        let ended = down
+            .end_granted(&"moved".into(), alice, epoch.unwrap_or_default())
+            .await
+            .unwrap();
+        assert_eq!(ended, GrantEnd::Ended, "the stop's verdict stands");
+    }
+
+    /// B1490: a stop whose delete committed but whose answer was lost is
+    /// known, when the same grant retries it, to have ended the session at
+    /// its epoch; a stop from a grant a renewal took the session over from,
+    /// after the newer grant ended it, is not. Disarm check: with
+    /// `end_granted` answering `Gone` for every gone row, the retry reads
+    /// `Gone`.
+    /// B1490: the session cap removing the row between a grant's read of it
+    /// and its fenced delete still leaves the stop known ended at its epoch,
+    /// so its final position is kept. Disarm check: with the no-removal arm
+    /// answering `Superseded` without reading the store's record, this reads
+    /// `Superseded`.
+    #[tokio::test]
+    async fn a_stop_the_cap_races_is_known_ended_at_its_epoch() {
+        let gated = GatedStore {
+            inner: store().await,
+            armed: Default::default(),
+            never: Default::default(),
+            fail_holder: Default::default(),
+            lose_remove_reply: Default::default(),
+            cap_before_remove: Default::default(),
+        };
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(gated.clone());
+        r.insert("raced".into(), session_for(alice)).await.unwrap();
+        let epoch = gated
+            .inner
+            .lease_transcode_session("raced", "file", now_unix_secs() + 30)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(epoch > 0, "the control: the row is leased");
+        gated
+            .cap_before_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            r.end_granted(&"raced".into(), alice, epoch).await.unwrap(),
+            GrantEnd::EndedAt,
+        );
+    }
+
+    /// B1490: a grant whose first lease errored is fenced at epoch 1 while
+    /// its row may still be at epoch 0; its stop ends that row and records
+    /// the end at the grant's own epoch, so a retry after a lost reply still
+    /// knows it ended the session. Disarm check: with the end recorded at the
+    /// row's epoch (0, so none), the retry reads `Gone`.
+    #[tokio::test]
+    async fn a_stop_of_a_never_leased_row_is_known_ended_on_retry() {
+        let gated = GatedStore {
+            inner: store().await,
+            armed: Default::default(),
+            never: Default::default(),
+            fail_holder: Default::default(),
+            lose_remove_reply: Default::default(),
+            cap_before_remove: Default::default(),
+        };
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(gated.clone());
+        r.insert("first-lease-failed".into(), session_for(alice))
+            .await
+            .unwrap();
+        gated
+            .lose_remove_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            r.end_granted(&"first-lease-failed".into(), alice, 1)
+                .await
+                .is_err(),
+            "the control: the stop's answer is lost"
+        );
+        gated
+            .lose_remove_reply
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            r.end_granted(&"first-lease-failed".into(), alice, 1)
+                .await
+                .unwrap(),
+            GrantEnd::EndedAt,
+        );
+        assert_eq!(
+            r.end_granted(&"first-lease-failed".into(), alice, 2)
+                .await
+                .unwrap(),
+            GrantEnd::Gone,
+            "another epoch's stop is not this one's"
+        );
+    }
+
+    /// B1490: a grant that has played for longer than the retention window
+    /// still owns its row (its lease renewals do not touch `updated_at`), so
+    /// its stop ends it. Disarm check: with the stop's read cut off at the
+    /// retention, it reads `Gone` and the row stays.
+    #[tokio::test]
+    async fn a_stop_after_the_retention_window_still_ends_its_session() {
+        let inner = store().await;
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(inner.clone());
+        r.insert("long-film".into(), session_for(alice))
+            .await
+            .unwrap();
+        let epoch = inner
+            .lease_transcode_session("long-film", "file", now_unix_secs() + 30)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        sqlx::query("UPDATE transcode_sessions SET updated_at = 0")
+            .execute(inner.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.end_granted(&"long-film".into(), alice, epoch)
+                .await
+                .unwrap(),
+            GrantEnd::Ended,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_whose_answer_was_lost_is_known_ended_on_retry() {
+        let gated = GatedStore {
+            inner: store().await,
+            armed: Default::default(),
+            never: Default::default(),
+            fail_holder: Default::default(),
+            lose_remove_reply: Default::default(),
+            cap_before_remove: Default::default(),
+        };
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(gated.clone());
+        let until = now_unix_secs() + 30;
+
+        r.insert("lost-reply".into(), session_for(alice))
+            .await
+            .unwrap();
+        let epoch = gated
+            .inner
+            .lease_transcode_session("lost-reply", "file", until)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        gated
+            .lose_remove_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            r.end_granted(&"lost-reply".into(), alice, epoch)
+                .await
+                .is_err(),
+            "the control: the stop's answer is lost"
+        );
+        gated
+            .lose_remove_reply
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            r.end_granted(&"lost-reply".into(), alice, epoch)
+                .await
+                .unwrap(),
+            GrantEnd::EndedAt,
+            "the retry knows it ended the session"
+        );
+
+        r.insert("moved-on".into(), session_for(alice))
+            .await
+            .unwrap();
+        let first = gated
+            .inner
+            .lease_transcode_session("moved-on", "file", until)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(gated
+            .inner
+            .release_transcode_session_lease("moved-on", first)
+            .await
+            .unwrap());
+        let renewing = pharos_core::SessionHolder {
+            user_id: alice,
+            token_id: "renewing".into(),
+        };
+        let second = r
+            .take_over(
+                &"moved-on".into(),
+                session_for(alice),
+                "file",
+                renewing,
+                until,
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(second > first, "the control: it was taken over");
+        assert_eq!(
+            r.end_granted(&"moved-on".into(), alice, second)
+                .await
+                .unwrap(),
+            GrantEnd::Ended,
+            "the newer grant ends it"
+        );
+        assert_eq!(
+            r.end_granted(&"moved-on".into(), alice, first)
+                .await
+                .unwrap(),
+            GrantEnd::Gone,
+            "the older grant's stop is not its end"
+        );
+    }
+
     fn session_for(user: pharos_core::UserId) -> TranscodeSession {
         let mut s = sample_session();
         s.holder.user_id = user;
@@ -856,7 +1320,10 @@ mod tests {
         let r = TranscodeSessionRegistry::spawn(store.clone());
         r.insert("s".into(), session_for(alice)).await.unwrap();
         let new = holder_of("new-token", alice);
-        assert!(r.rebind_holder(&"s".into(), new.clone()).await.unwrap());
+        assert!(r
+            .rebind_holder(&"s".into(), new.clone(), None)
+            .await
+            .unwrap());
         assert_eq!(r.get("s".into()).await.unwrap().unwrap().holder, new);
         let row = store.get_transcode_session("s", 0).await.unwrap().unwrap();
         assert_eq!(row.holder, Some(new));
@@ -875,7 +1342,7 @@ mod tests {
         // Another replica stops it: the row goes, this cache keeps its copy.
         store.remove_transcode_session("s").await.unwrap();
         let rebound = r
-            .rebind_holder(&"s".into(), holder_of("new-token", alice))
+            .rebind_holder(&"s".into(), holder_of("new-token", alice), None)
             .await
             .unwrap();
         assert!(!rebound, "a stopped session is gone, not rebound");
@@ -896,6 +1363,8 @@ mod tests {
             armed: Default::default(),
             never: Default::default(),
             fail_holder: Default::default(),
+            lose_remove_reply: Default::default(),
+            cap_before_remove: Default::default(),
         };
         let alice = pharos_core::UserId::new();
         let r = TranscodeSessionRegistry::spawn(gated.clone());
@@ -906,7 +1375,7 @@ mod tests {
             .fail_holder
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let out = r
-            .rebind_holder(&"s".into(), holder_of("new-token", alice))
+            .rebind_holder(&"s".into(), holder_of("new-token", alice), None)
             .await;
         assert!(
             matches!(out, Err(TranscodeSessionError::Store(_))),
@@ -923,6 +1392,11 @@ mod tests {
         armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
         never: std::sync::Arc<tokio::sync::Notify>,
         fail_holder: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// A grant's stop commits, and its answer is lost.
+        lose_remove_reply: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// The session cap removes the row between a stop's read of it and
+        /// its fenced delete.
+        cap_before_remove: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl GatedStore {
@@ -949,6 +1423,7 @@ mod tests {
             play_session_id: &str,
             holder: &SessionHolder,
             now_unix_secs: i64,
+            epoch: Option<i64>,
         ) -> pharos_core::DomainResult<bool> {
             if self.fail_holder.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(pharos_core::DomainError::Backend(
@@ -956,8 +1431,93 @@ mod tests {
                 ));
             }
             self.inner
-                .update_transcode_session_holder(play_session_id, holder, now_unix_secs)
+                .update_transcode_session_holder(play_session_id, holder, now_unix_secs, epoch)
                 .await
+        }
+        async fn lease_transcode_session(
+            &self,
+            play_session_id: &str,
+            source: &str,
+            lease_until_unix_secs: i64,
+        ) -> pharos_core::DomainResult<Option<i64>> {
+            self.inner
+                .lease_transcode_session(play_session_id, source, lease_until_unix_secs)
+                .await
+        }
+        async fn take_over_transcode_session(
+            &self,
+            play_session_id: &str,
+            source: &str,
+            holder: &SessionHolder,
+            now_unix_secs: i64,
+            updated_since_unix_secs: i64,
+            lease_until_unix_secs: i64,
+        ) -> pharos_core::DomainResult<Option<i64>> {
+            self.inner
+                .take_over_transcode_session(
+                    play_session_id,
+                    source,
+                    holder,
+                    now_unix_secs,
+                    updated_since_unix_secs,
+                    lease_until_unix_secs,
+                )
+                .await
+        }
+        async fn renew_transcode_session_lease(
+            &self,
+            play_session_id: &str,
+            epoch: i64,
+            lease_until_unix_secs: i64,
+        ) -> pharos_core::DomainResult<bool> {
+            self.inner
+                .renew_transcode_session_lease(play_session_id, epoch, lease_until_unix_secs)
+                .await
+        }
+        async fn release_transcode_session_lease(
+            &self,
+            play_session_id: &str,
+            epoch: i64,
+        ) -> pharos_core::DomainResult<bool> {
+            self.inner
+                .release_transcode_session_lease(play_session_id, epoch)
+                .await
+        }
+        async fn transcode_session_grant(
+            &self,
+            play_session_id: &str,
+        ) -> pharos_core::DomainResult<Option<pharos_core::SessionGrant>> {
+            self.inner.transcode_session_grant(play_session_id).await
+        }
+        async fn remove_transcode_session_at(
+            &self,
+            play_session_id: &str,
+            epoch: i64,
+        ) -> pharos_core::DomainResult<bool> {
+            self.park().await;
+            if self
+                .cap_before_remove
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.inner.remove_transcode_session(play_session_id).await?;
+            }
+            let removed = self
+                .inner
+                .remove_transcode_session_at(play_session_id, epoch)
+                .await;
+            if self
+                .lose_remove_reply
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(pharos_core::DomainError::Backend("connection reset".into()));
+            }
+            removed
+        }
+        async fn transcode_session_end(
+            &self,
+            play_session_id: &str,
+        ) -> pharos_core::DomainResult<Option<i64>> {
+            self.inner.transcode_session_end(play_session_id).await
         }
         async fn get_transcode_session(
             &self,
@@ -1009,6 +1569,8 @@ mod tests {
             armed: Default::default(),
             never: Default::default(),
             fail_holder: Default::default(),
+            lose_remove_reply: Default::default(),
+            cap_before_remove: Default::default(),
         };
         let r = TranscodeSessionRegistry::spawn(gated.clone());
         let alice = pharos_core::UserId::new();
