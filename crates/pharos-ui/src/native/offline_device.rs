@@ -55,11 +55,37 @@ pub fn art_of(catalogue: &Catalogue) -> Vec<String> {
 }
 
 /// Brings the browser's posters in line with the notes; nothing elsewhere.
-pub async fn sync_art(user: &str) {
+/// Returns whether every poster is stored (always, where none are kept), so
+/// a poster that failed is asked again by a later pass.
+pub async fn sync_art(user: &str) -> bool {
+    let fence = notes_fence();
+    if fence_moved(fence) {
+        return true;
+    }
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
-    super::offline_art_web::keep_art(user, &art_of(&load_catalogue(user))).await;
+    {
+        super::offline_art_web::keep_art(user, &art_of(&load_catalogue(user)), move || {
+            !fence_moved(fence)
+        })
+        .await
+    }
     #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-    let _ = user;
+    {
+        let _ = user;
+        true
+    }
+}
+
+/// Bumped as the account signs out, before its notes and posters are
+/// forgotten, so a pass still running for it stores nothing after.
+static NOTES_FENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn notes_fence() -> u32 {
+    NOTES_FENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn fence_moved(fence: u32) -> bool {
+    notes_fence() != fence
 }
 
 /// Forgets the browser's posters, as signing out forgets what is kept.
@@ -91,8 +117,10 @@ fn save_catalogue(catalogue: &Catalogue) {
     }
 }
 
-/// Forgets every note, as signing out forgets what is kept.
+/// Forgets every note, as signing out forgets what is kept. A notes or
+/// poster pass still in flight then stores nothing.
 pub fn forget_catalogue() {
+    NOTES_FENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     save_catalogue(&Catalogue::default());
 }
 
@@ -187,21 +215,29 @@ pub struct Filled {
     pub kept: usize,
     pub noted: usize,
     pub failed: usize,
+    /// Noted, but a parent above could not be read: asked again next pass.
+    pub partial: usize,
     pub pruned: usize,
     pub refreshed: bool,
+    /// The account signed out during the pass, so nothing was saved.
+    pub signed_out: bool,
 }
 
 impl Filled {
     pub fn log_line(&self, ms: f64) -> String {
         format!(
-            "pharos: offline notes kept={} noted={} failed={} pruned={} refreshed={} ms={ms:.0}",
-            self.kept, self.noted, self.failed, self.pruned, self.refreshed
+            "pharos: offline notes kept={} noted={} failed={} partial={} pruned={} refreshed={} signed_out={} ms={ms:.0}",
+            self.kept, self.noted, self.failed, self.partial, self.pruned, self.refreshed, self.signed_out
         )
     }
 }
 
 /// Notes `id` and the parents above it the catalogue lacks. Returns false
 /// when `id` itself could not be read.
+///
+/// A parent that could not be read leaves `id` marked partial: what was
+/// read is kept, and the next pass asks again, walking past the parents
+/// already noted until it reaches the one that was missing.
 pub async fn note_one<A: PharosApi>(
     api: &A,
     info: &CallInfo,
@@ -211,23 +247,36 @@ pub async fn note_one<A: PharosApi>(
     let Ok(detail) = api.detail(info, id).await else {
         return false;
     };
+    let key = id.to_string();
+    let retry = catalogue.partial.contains(&key);
     let mut trail = vec![detail.item.clone()];
+    let mut whole = true;
     while trail.len() < MAX_STEPS {
         let last = &trail[trail.len() - 1];
         let Some(parent) = last.parent.filter(|_| last.kind != ItemKind::Library) else {
             break;
         };
-        if trail.iter().any(|i| i.id == parent) || catalogue.snaps.contains_key(&parent.to_string())
-        {
+        if trail.iter().any(|i| i.id == parent) {
+            break;
+        }
+        if !retry && catalogue.snaps.contains_key(&parent.to_string()) {
             break;
         }
         match api.detail(info, parent).await {
             Ok(up) => trail.push(up.item),
-            Err(_) => break,
+            Err(_) => {
+                whole = false;
+                break;
+            }
         }
     }
     trail.reverse();
     catalogue.note(&trail, Some(&detail));
+    if whole {
+        catalogue.partial.remove(&key);
+    } else {
+        catalogue.partial.insert(key);
+    }
     true
 }
 
@@ -240,6 +289,7 @@ pub async fn fill_notes<A: PharosApi>(api: &A, user: &str, now_ms: i64) -> Fille
     if owner != user {
         return Filled::default();
     }
+    let fence = notes_fence();
     let ids: Vec<ItemRef> = kept.iter().map(OnDevice::id).collect();
     let mut catalogue = load_catalogue(user);
     let refreshed = !ids.is_empty() && catalogue.due(now_ms);
@@ -262,8 +312,17 @@ pub async fn fill_notes<A: PharosApi>(api: &A, user: &str, now_ms: i64) -> Fille
         }
     }
     filled.pruned = catalogue.prune(&ids);
+    filled.partial = catalogue.partial.len();
+    // A partial trail is asked again on every pass (`Catalogue::missing`),
+    // so it need not hold the daily refresh back.
     if refreshed && filled.failed == 0 {
         catalogue.refreshed_ms = now_ms;
+    }
+    // Signed out while the calls ran: the notes were forgotten, and are not
+    // written back.
+    if fence_moved(fence) {
+        filled.signed_out = true;
+        return filled;
     }
     if filled.noted > 0 || filled.pruned > 0 || refreshed {
         save_catalogue(&catalogue);
@@ -341,6 +400,49 @@ mod tests {
         assert!(!run(note_one(&server, &info, &mut c, ItemRef::Real(999))));
     }
 
+    /// A parent that could not be read leaves the item partial: the next
+    /// pass asks for it again and walks past the season already noted to
+    /// the missing series; a whole trail is no longer partial.
+    #[test]
+    fn a_trail_with_a_missing_parent_is_asked_again() {
+        // The "server" lost its series: the season's parent cannot be read.
+        let mut cut = Catalogue::new("u");
+        for (id, kind, name, parent) in [
+            ("1", "library", "TV", None),
+            ("s11", "season", "Season 1", Some("s10")),
+            ("101", "episode", "One", Some("s11")),
+        ] {
+            cut.snaps.insert(
+                id.into(),
+                Snap {
+                    id: id.into(),
+                    kind: kind.into(),
+                    name: name.into(),
+                    parent: parent.map(Into::into),
+                    ..Snap::default()
+                },
+            );
+        }
+        let kept = [OnDevice::Video {
+            id: ItemRef::Real(101),
+            title: String::new(),
+            kind: ItemKind::Episode,
+            runtime_ms: 0,
+            position_ms: 0,
+        }];
+        let broken = OfflineLibrary::new(&cut, &kept);
+        let info = CallInfo::default();
+        let mut c = Catalogue::new("u");
+        assert!(run(note_one(&broken, &info, &mut c, ItemRef::Real(101))));
+        assert!(c.snaps.contains_key("s11"));
+        assert!(!c.snaps.contains_key("s10"));
+        assert_eq!(c.missing(&[ItemRef::Real(101)]), vec![ItemRef::Real(101)]);
+        // The series reads again: the retry walks past the noted season.
+        assert!(run(note_one(&server(), &info, &mut c, ItemRef::Real(101))));
+        assert!(c.snaps.contains_key("s10"), "{:?}", c.snaps.keys());
+        assert!(c.missing(&[ItemRef::Real(101)]).is_empty());
+    }
+
     /// Every card width and format finds the one stored poster (V1487).
     #[test]
     fn the_art_key_drops_only_the_width_and_format() {
@@ -363,12 +465,14 @@ mod tests {
             kept: 4,
             noted: 2,
             failed: 1,
+            partial: 1,
             pruned: 3,
             refreshed: true,
+            signed_out: false,
         };
         assert_eq!(
             filled.log_line(12.4),
-            "pharos: offline notes kept=4 noted=2 failed=1 pruned=3 refreshed=true ms=12"
+            "pharos: offline notes kept=4 noted=2 failed=1 partial=1 pruned=3 refreshed=true signed_out=false ms=12"
         );
     }
 }

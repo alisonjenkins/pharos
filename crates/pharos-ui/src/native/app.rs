@@ -2019,6 +2019,7 @@ fn NativeApp(route: Route) -> Element {
     // item noted makes no call.
     use_hook(move || {
         spawn_forever(async move {
+            let mut art_settled = false;
             loop {
                 platform::sleep_ms(NOTES_EVERY_MS).await;
                 let up = {
@@ -2031,13 +2032,24 @@ fn NativeApp(route: Route) -> Element {
                     continue;
                 };
                 let began = platform::now_ms();
-                let filled =
-                    super::offline_device::fill_notes(&api, &user, platform::unix_ms()).await;
-                if filled.noted > 0 || filled.failed > 0 {
+                // A call on a socket that closed under it can hang rather
+                // than fail; a pass that outlasts its deadline is dropped,
+                // saving nothing, so the next tick runs.
+                let pass = super::offline_device::fill_notes(&api, &user, platform::unix_ms());
+                let Some(filled) = within(pass, NOTES_PASS_MS).await else {
+                    platform::warn(&format!(
+                        "pharos: offline notes timed_out=true ms={:.0}",
+                        platform::now_ms() - began
+                    ));
+                    continue;
+                };
+                if filled.noted > 0 || filled.failed > 0 || filled.partial > 0 {
                     platform::info(&filled.log_line(platform::now_ms() - began));
                 }
-                if filled.noted > 0 || filled.pruned > 0 {
-                    super::offline_device::sync_art(&user).await;
+                // Posters a pass could not store (a 503) are asked again
+                // on a later pass, even with no note changed.
+                if !filled.signed_out && (filled.noted > 0 || filled.pruned > 0 || !art_settled) {
+                    art_settled = super::offline_device::sync_art(&user).await;
                 }
             }
         })
@@ -2413,7 +2425,9 @@ fn NativeApp(route: Route) -> Element {
                             if filled.kept > 0 {
                                 platform::info(&filled.log_line(platform::now_ms() - began));
                             }
-                            super::offline_device::sync_art(&user).await;
+                            if !filled.signed_out {
+                                super::offline_device::sync_art(&user).await;
+                            }
                         });
                     }
                     claim_queue(queue, held, &me.id);
@@ -6527,6 +6541,21 @@ const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
 
 /// How often, while online, what was kept since gets its notes (spec 049).
 const NOTES_EVERY_MS: u32 = 5 * 60 * 1000;
+
+/// The longest one notes pass may take: a few detail calls, each well
+/// under a second on a working connection.
+const NOTES_PASS_MS: u32 = 60 * 1000;
+
+/// `fut`'s output, or `None` once `ms` pass first.
+async fn within<F: std::future::Future>(fut: F, ms: u32) -> Option<F::Output> {
+    let timer = platform::sleep_ms(ms);
+    futures_util::pin_mut!(fut);
+    futures_util::pin_mut!(timer);
+    match futures_util::future::select(fut, timer).await {
+        futures_util::future::Either::Left((out, _)) => Some(out),
+        futures_util::future::Either::Right(_) => None,
+    }
+}
 
 /// How long "Back online" stays up after the device's library gives way
 /// to the server's (spec 049).

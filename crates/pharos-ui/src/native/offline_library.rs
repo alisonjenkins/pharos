@@ -277,6 +277,10 @@ pub struct Catalogue {
     /// unix ms on this device's clock; 0 when never.
     #[serde(default)]
     pub refreshed_ms: i64,
+    /// Kept items whose trail stopped at a parent that could not be read;
+    /// each is asked again on the next pass.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub partial: BTreeSet<String>,
 }
 
 impl Catalogue {
@@ -285,6 +289,7 @@ impl Catalogue {
             user: user.to_owned(),
             snaps: BTreeMap::new(),
             refreshed_ms: 0,
+            partial: BTreeSet::new(),
         }
     }
 
@@ -359,10 +364,14 @@ impl Catalogue {
         changed
     }
 
-    /// Of `kept`, the ids with no note yet: what a reconnect fills in.
+    /// Of `kept`, the ids with no note yet, or whose parents were only
+    /// partly read: what a reconnect fills in.
     pub fn missing(&self, kept: &[ItemRef]) -> Vec<ItemRef> {
         kept.iter()
-            .filter(|id| !self.snaps.contains_key(&id.to_string()))
+            .filter(|id| {
+                let key = id.to_string();
+                !self.snaps.contains_key(&key) || self.partial.contains(&key)
+            })
             .copied()
             .collect()
     }
@@ -390,6 +399,8 @@ impl Catalogue {
         }
         let before = self.snaps.len();
         self.snaps.retain(|key, _| wanted.contains(key));
+        let kept: BTreeSet<String> = kept.iter().map(ToString::to_string).collect();
+        self.partial.retain(|key| kept.contains(key));
         before - self.snaps.len()
     }
 }
