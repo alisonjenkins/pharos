@@ -54,6 +54,9 @@ pub struct MediaPlan {
     /// stream then ends a frame early. A URI another segment needs is never
     /// one, so its failed fetch is never excused.
     pub short_tail: Option<String>,
+    /// The init segments among `files`: compared byte for byte when a
+    /// download carries on under a renewed play session (ADR 0148).
+    pub inits: Vec<String>,
 }
 
 /// A last segment shorter than this is a short tail (see [`MediaPlan`]).
@@ -94,13 +97,15 @@ pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
     }
     inits.dedup();
     let files = inits
-        .into_iter()
+        .iter()
+        .cloned()
         .chain(media.segments.into_iter().map(|s| s.uri))
         .collect();
     Ok(MediaPlan {
         files,
         duration_ms,
         short_tail,
+        inits,
     })
 }
 
@@ -168,6 +173,39 @@ fn swap_session(url: &str, with: impl Fn(&str) -> String) -> String {
     match fragment {
         Some(f) => format!("{head}?{query}#{f}"),
         None => format!("{head}?{query}"),
+    }
+}
+
+/// Whether a playlist fetched under the renewed session `live` says what
+/// the one stored under `kept` says, once its session ids are put back:
+/// the same segments, durations and inits. `Err` names the first line that
+/// differs (1-based), with the session hidden.
+pub fn same_playlist(
+    stored: &str,
+    renewed: &str,
+    kept: &str,
+    live: &str,
+) -> Result<(), PlanMismatch> {
+    let renewed = if live.is_empty() {
+        renewed.to_owned()
+    } else {
+        renewed.replace(live, kept)
+    };
+    let (mut a, mut b) = (stored.lines(), renewed.lines());
+    let mut at = 0;
+    loop {
+        at += 1;
+        match (a.next(), b.next()) {
+            (None, None) => return Ok(()),
+            (x, y) if x == y => {}
+            (x, y) => {
+                return Err(PlanMismatch {
+                    at,
+                    kept: x.map(redact_session).unwrap_or_default(),
+                    renewed: y.map(redact_session).unwrap_or_default(),
+                })
+            }
+        }
     }
 }
 
@@ -258,6 +296,10 @@ mod tests {
         );
         assert_eq!(plan.duration_ms, 10_500);
         assert_eq!(plan.short_tail, None);
+        assert_eq!(
+            plan.inits,
+            ["https://h/videos/9/h264cmaf/init.mp4?PlaySessionId=p"]
+        );
     }
 
     /// A multi-part film's playlist gives each part its own init after a
@@ -316,6 +358,22 @@ mod tests {
     #[test]
     fn an_hour_at_two_megabits_is_about_900_mb() {
         assert_eq!(estimate_bytes(2_000_000, 3_600_000), 900_000_000);
+    }
+
+    #[test]
+    fn a_renewed_playlist_matches_once_its_session_is_put_back() {
+        let kept = MEDIA;
+        let renewed = MEDIA.replace("PlaySessionId=p", "PlaySessionId=q");
+        assert_eq!(same_playlist(kept, &renewed, "p", "q"), Ok(()));
+        let regridded = renewed.replace("#EXTINF:4.5,", "#EXTINF:4.0,");
+        let err = same_playlist(kept, &regridded, "p", "q").unwrap_err();
+        assert_eq!(err.at, 8);
+        assert_eq!(
+            (err.kept.as_str(), err.renewed.as_str()),
+            ("#EXTINF:4.5,", "#EXTINF:4.0,")
+        );
+        let longer = format!("{renewed}#EXTINF:1.0,\n2.m4s?PlaySessionId=q\n");
+        assert!(same_playlist(kept, &longer, "p", "q").is_err());
     }
 
     #[test]
