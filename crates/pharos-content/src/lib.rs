@@ -25,10 +25,12 @@ mod prefetch;
 pub mod ranged;
 mod resume;
 #[cfg(test)]
+mod testdir;
+#[cfg(test)]
 mod testlog;
 #[cfg(test)]
 mod testserver;
-mod token;
+pub mod token;
 mod tree;
 
 pub use cache::{Download, DownloadTrack, OfflineSummary, DEFAULT_CAP_BYTES, MIN_FREE_BYTES};
