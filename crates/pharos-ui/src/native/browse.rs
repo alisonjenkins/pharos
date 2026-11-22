@@ -1048,11 +1048,11 @@ pub fn GridView(
                 // The top bar swaps libraries without leaving this view, and
                 // the grid's filters and listing belong to the one it opened
                 // on, so a new library mounts a new grid (B490).
-                Some(base) if library => remount_on(
+                Some(base) if library => on_source(
                     &base.parent.to_string(),
                     rsx! { LibraryGrid { first: page, base, sets } },
                 ),
-                Some(source) => remount_on(
+                Some(source) => on_source(
                     &source.parent.to_string(),
                     rsx! { PagedGrid { first: page, source, rail: None } },
                 ),
@@ -1068,7 +1068,7 @@ pub fn MixedView(title: String, page: Page, chain: Chain) -> Element {
     rsx! {
         section { class: "pharos-browse",
             h2 { "{title}" }
-            {remount_on(
+            {on_source(
                 &chain.head.parent.to_string(),
                 rsx! { PagedGrid { first: page, source: chain.head.clone(), rail: None, chain: Some(chain) } },
             )}
@@ -1192,7 +1192,7 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
-            Some(Ok((place, listing, page))) => remount_on(
+            Some(Ok((place, listing, page))) => on_source(
                 &format!("{listing:?}"),
                 rsx! {
                     PagedGrid {
@@ -1869,7 +1869,11 @@ fn PagedGrid(
         // A watched mark can change what a watched filter's listing holds.
         // The device's library and the server's index the same listing
         // differently; a switch between them fetches the index afresh.
-        let device = ctx.offline.read().is_some();
+        let device = ctx
+            .offline
+            .read()
+            .is_some()
+            .then(super::offline_device::library_generation);
         let key = index_key(
             &listing,
             revision.map_or(0, |r| (r.0)()),
@@ -2326,17 +2330,28 @@ const KEPT_INDEXES: usize = 8;
 /// Each listing's index as last fetched, most recent last.
 static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::new(Vec::new());
 
+/// [`remount_on`] keyed also to which library the screens read: a switch
+/// between the server's and the device's (or a new snapshot of the device)
+/// mounts a new grid, so no pager keeps the other library's pages or
+/// offsets, and the old one's replies land on nothing.
+fn on_source(key: &str, body: Element) -> Element {
+    remount_on(
+        &format!("{} {key}", super::offline_device::library_generation()),
+        body,
+    )
+}
+
 /// Bumped as the account signs out, so an index fetched for one account,
 /// even one still in flight, is never kept for the next.
 static INDEX_ACCOUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The key a listing's index is kept under: the account, the library
 /// revision and the watched marks it was fetched at, which library answered
-/// (the device's or the server's), and the listing, so a change to any
-/// fetches it again.
-fn index_key(listing: &Listing, revision: u32, marks: u32, device: bool) -> String {
+/// (the server's, or the device's snapshot by its generation), and the
+/// listing, so a change to any fetches it again.
+fn index_key(listing: &Listing, revision: u32, marks: u32, device: Option<u32>) -> String {
     let account = INDEX_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed);
-    let from = if device { "device" } else { "server" };
+    let from = device.map_or_else(|| "server".to_owned(), |g| format!("device{g}"));
     format!("{account} {from} {revision} {marks} {listing:?}")
 }
 
@@ -2665,7 +2680,7 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                     h3 { class: "pharos-section-title", "{show.seasons[0].name}" }
                 }
                 InThisGroup { rows: in_group }
-                {remount_on(
+                {on_source(
                     &show.selected.map_or_else(String::new, |s| s.to_string()),
                     rsx! { EpisodeList { page: show.episodes.clone(), seen, source: episode_source(&show) } },
                 )}
@@ -3138,7 +3153,7 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
             // Each tab pages through its own listing (B821); switching tabs
             // mounts the other grid, which starts from the page loaded.
             match tab() {
-                MusicTab::Artists => remount_on(
+                MusicTab::Artists => on_source(
                     "artists",
                     rsx! {
                         PagedGrid {
@@ -3150,7 +3165,7 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
                     },
                 ),
                 MusicTab::Playlists => rsx! { mixes::MixShelf {} },
-                MusicTab::Albums => remount_on(
+                MusicTab::Albums => on_source(
                     "albums",
                     rsx! { MusicAlbums { library, first: albums.clone(), order } },
                 ),
@@ -3393,7 +3408,7 @@ fn BooksTabs(
                 }
             }
             match current {
-                BooksTab::Books => remount_on(
+                BooksTab::Books => on_source(
                     &format!("books {library}"),
                     rsx! {
                         LibraryGrid {
@@ -3403,7 +3418,7 @@ fn BooksTabs(
                         }
                     },
                 ),
-                BooksTab::Courses => remount_on(
+                BooksTab::Courses => on_source(
                     &format!("courses {library}"),
                     rsx! {
                         PagedGrid {
@@ -3413,7 +3428,7 @@ fn BooksTabs(
                         }
                     },
                 ),
-                BooksTab::Audiobooks => remount_on(
+                BooksTab::Audiobooks => on_source(
                     &format!("audiobooks {library}"),
                     rsx! {
                         PagedGrid {
@@ -3472,7 +3487,7 @@ fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element 
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load the albums: {e}" } },
-            Some(Ok((listing, page))) => remount_on(
+            Some(Ok((listing, page))) => on_source(
                 &format!("{listing:?}"),
                 rsx! {
                     PagedGrid {
@@ -3504,7 +3519,7 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
                 square: true,
                 favourite: true,
             }
-            {remount_on(
+            {on_source(
                 &detail.item.id.to_string(),
                 rsx! {
                     PagedGrid {
@@ -5165,28 +5180,28 @@ mod tests {
 
         let listing = Listing::of(ItemRef::Real(7), None, "SortName");
         assert_ne!(
-            index_key(&listing, 1, 0, false),
-            index_key(&listing, 2, 0, false)
+            index_key(&listing, 1, 0, None),
+            index_key(&listing, 2, 0, None)
         );
         assert_ne!(
-            index_key(&listing, 1, 0, false),
-            index_key(&listing, 1, 1, false)
+            index_key(&listing, 1, 0, None),
+            index_key(&listing, 1, 1, None)
         );
         // The device's index is never the server's.
         assert_ne!(
-            index_key(&listing, 1, 0, false),
-            index_key(&listing, 1, 0, true)
+            index_key(&listing, 1, 0, None),
+            index_key(&listing, 1, 0, Some(1))
         );
-        let key = index_key(&listing, 1, 0, false);
+        let key = index_key(&listing, 1, 0, None);
         keep_index(key.clone(), ListIndex::default());
         assert_eq!(kept_index(&key), Some(ListIndex::default()));
-        assert_eq!(kept_index(&index_key(&listing, 2, 0, false)), None);
-        assert_eq!(kept_index(&index_key(&listing, 1, 0, true)), None);
+        assert_eq!(kept_index(&index_key(&listing, 2, 0, None)), None);
+        assert_eq!(kept_index(&index_key(&listing, 1, 0, Some(1))), None);
         // Signing out drops them, and one fetched before it is never found.
         forget_indexes();
         assert_eq!(kept_index(&key), None);
         keep_index(key.clone(), ListIndex::default());
-        assert_eq!(kept_index(&index_key(&listing, 1, 0, false)), None);
+        assert_eq!(kept_index(&index_key(&listing, 1, 0, None)), None);
     }
 
     #[test]

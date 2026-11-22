@@ -95,6 +95,19 @@ pub fn device_verdict(s: Standing) -> (bool, &'static str) {
     (false, "connecting")
 }
 
+/// Whether an item of `kind` sitting straight under a library stands in a
+/// listing grouped by `group`: an episode or season under a TV page's
+/// series, a song or album under a Music page's artists, a song under its
+/// albums.
+fn bare_member_of(group: ItemKind, kind: ItemKind) -> bool {
+    matches!(
+        (group, kind),
+        (ItemKind::Series, ItemKind::Episode | ItemKind::Season)
+            | (ItemKind::Artist, ItemKind::Audio | ItemKind::Album)
+            | (ItemKind::Album, ItemKind::Audio)
+    )
+}
+
 /// The answer to a call that needs the server.
 pub fn offline_error(what: &str) -> ClientError {
     ClientError::Api {
@@ -374,6 +387,23 @@ impl Catalogue {
             })
             .copied()
             .collect()
+    }
+
+    /// Whether the note under `key` leads all the way up: to a library, or
+    /// to an item with no parent. A parent missing on the way means a read
+    /// failed somewhere along the trail.
+    pub fn reaches_top(&self, key: &str) -> bool {
+        let mut at = key.to_owned();
+        for _ in 0..=MAX_DEPTH {
+            let Some(snap) = self.snaps.get(&at) else {
+                return false;
+            };
+            match (&snap.parent, snap.kind.as_str()) {
+                (_, "library") | (None, _) => return true,
+                (Some(parent), _) => at = parent.clone(),
+            }
+        }
+        false
     }
 
     /// Whether every kept item's note is due to be read again: once a day,
@@ -786,9 +816,11 @@ impl OfflineLibrary {
         let ids = match listing.group {
             // A grouped listing (a library's series or albums) lists every
             // item of that kind under the parent, however deep.
-            // A kept item with no note sits straight under its library
-            // (a bare episode or song); it is listed too, unless something
-            // of the grouped kind under it is listed already.
+            // A kept episode or song with no note sits straight under its
+            // library; a TV or Music page's grouped listing lists it too,
+            // unless something of the grouped kind under it is listed
+            // already. Other kinds (a book in a Books page's Courses or
+            // Audiobooks) keep strictly to the group.
             Some(group) => {
                 let of_group = |id: &ItemRef| self.items.get(id).is_some_and(|i| i.kind == group);
                 let mut ids: Vec<ItemRef> = self
@@ -797,7 +829,11 @@ impl OfflineLibrary {
                     .filter(of_group)
                     .collect();
                 for child in self.children.get(&listing.parent).into_iter().flatten() {
-                    if !of_group(child) && !self.descendants(*child).iter().any(of_group) {
+                    let stands_in = self
+                        .items
+                        .get(child)
+                        .is_some_and(|i| bare_member_of(group, i.kind));
+                    if stands_in && !self.descendants(*child).iter().any(of_group) {
                         ids.push(*child);
                     }
                 }
@@ -1574,6 +1610,25 @@ mod tests {
         assert!(ids.contains(&SHOW), "{ids:?}");
         assert!(ids.contains(&unnoted), "{ids:?}");
         assert_eq!(ids.len(), 2, "{ids:?}");
+
+        // A book under a Books library is no course or audiobook.
+        let book = ItemRef::Real(996);
+        let lib = OfflineLibrary::new(
+            &Catalogue::new("u"),
+            &[OnDevice::Book {
+                id: book,
+                title: "kept book".into(),
+                format: BookFormat::Epub,
+                fraction: 0.0,
+            }],
+        );
+        let views = run(lib.views(&info())).unwrap();
+        let books = views.items[0].id;
+        for group in [ItemKind::Series, ItemKind::Album] {
+            let page = run(lib.query(&info(), &Listing::of(books, Some(group), "SortName"), 0, 50))
+                .unwrap();
+            assert!(page.items.is_empty(), "{group:?}: {page:?}");
+        }
     }
 
     #[test]

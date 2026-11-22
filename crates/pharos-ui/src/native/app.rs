@@ -2087,6 +2087,7 @@ fn NativeApp(route: Route) -> Element {
                         "pharos: offline library verdict=device reason={reason} items={}",
                         lib.len()
                     ));
+                    super::offline_device::library_switched();
                     offline.set(Some(Rc::new(lib)));
                 }
                 None => platform::info(&format!(
@@ -2099,6 +2100,7 @@ fn NativeApp(route: Route) -> Element {
             "pharos: offline library verdict=server reason={reason} was_device={was_device}"
         ));
         if was_device {
+            super::offline_device::library_switched();
             offline.set(None);
             if reason == "connected" {
                 back_online.set(true);
@@ -2126,6 +2128,7 @@ fn NativeApp(route: Route) -> Element {
                 "pharos: offline library verdict=device reason=device_changed items={}",
                 lib.len()
             ));
+            super::offline_device::library_switched();
             offline.set(Some(Rc::new(lib)));
         }
     }));
@@ -5947,7 +5950,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             .map(|me| me.id);
         // With no connection the downloaded copy is all there is, so a
         // preferred version that is another file does not hide it.
-        let wanted = wanted.filter(|_| api.is_some());
+        // The device's library shown (the session lost, though its API is
+        // kept for the reconnect) counts as no connection too.
+        let reachable = api.is_some() && ctx.offline.peek().is_none();
+        let wanted = wanted.filter(|_| reachable);
         let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
         let offline_key = Rc::clone(&offline_key);
         async move {
