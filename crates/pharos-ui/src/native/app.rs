@@ -2106,6 +2106,27 @@ fn NativeApp(route: Route) -> Element {
             }
         }
     });
+    // While the device's library is shown, each page change reads the
+    // device again: a position saved by the player, or a download that
+    // finished, shows on the next page without waiting for the connection
+    // to change.
+    let shown_at = route.clone();
+    use_effect(use_reactive!(|(shown_at,)| {
+        let _ = shown_at;
+        let Some(old) = offline.peek().clone() else {
+            return;
+        };
+        match super::offline_device::device_library() {
+            Some(lib) if *old != lib => {
+                platform::info(&format!(
+                    "pharos: offline library verdict=device reason=device_changed items={}",
+                    lib.len()
+                ));
+                offline.set(Some(Rc::new(lib)));
+            }
+            _ => {}
+        }
+    }));
     // One manage token per connection, reused each time Manage opens (B920).
     let mut held_manage = use_signal(|| None);
     use_context_provider(|| super::manage::HeldManageToken(held_manage));
@@ -2231,6 +2252,28 @@ fn NativeApp(route: Route) -> Element {
         hits: use_signal(|| Hits::Idle),
     };
     use_context_provider(|| search);
+    // A switch between the server's library and the device's asks the term
+    // again, and outdates a search in flight: the last answer listed what
+    // the other library holds.
+    let mut searched_in = use_signal(|| None::<Option<usize>>);
+    use_effect(move || {
+        let source = offline.read().as_ref().map(|lib| Rc::as_ptr(lib) as usize);
+        let was = *searched_in.peek();
+        searched_in.set(Some(source));
+        if was.is_none() || was == Some(source) {
+            return;
+        }
+        let text = search.text.peek().clone();
+        if !text.trim().is_empty() {
+            let ctx = Ctx {
+                api,
+                offline,
+                machine,
+                marks,
+            };
+            search.edit(ctx, text);
+        }
+    });
     let mut palette = Palette(use_signal(|| false));
     use_context_provider(|| palette);
     let mut report_open = ReportOpen(use_signal(|| false));
@@ -2324,14 +2367,23 @@ fn NativeApp(route: Route) -> Element {
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
     let mut libraries_failed = use_signal(|| false);
+    let mut libraries_asked = use_signal(|| 0u32);
     use_effect(move || {
         let _ = library_rev();
         let Some(api) = read_library(offline, api) else {
             return;
         };
+        // Only the answer for the library still shown is kept: a server
+        // reply that fails after the device's library took over is not
+        // a failure of the list shown.
+        let asked_at = libraries_asked.peek().wrapping_add(1);
+        libraries_asked.set(asked_at);
         spawn(async move {
             let info = call("shell", "libraries");
             let asked = retry_once("libraries", || api.views(&info)).await;
+            if *libraries_asked.peek() != asked_at {
+                return;
+            }
             match asked {
                 Ok(page) => {
                     libraries.set(page.items);
@@ -3141,17 +3193,29 @@ fn PaletteScreen() -> Element {
     let mut palette = use_context::<Palette>();
     let mut active = use_signal(|| Some(0_usize));
     let mut home = use_signal(Home::default);
-    use_hook(move || {
+    // Read again when the library changes (the server's or the device's):
+    // the last one's rows could open what this one cannot, so they go at
+    // once.
+    let mut home_asked = use_signal(|| 0u32);
+    use_effect(move || {
+        let library = ctx.library();
+        let asked_at = home_asked.peek().wrapping_add(1);
+        home_asked.set(asked_at);
+        home.set(Home::default());
+        let Some(api) = library else {
+            return;
+        };
         spawn(async move {
-            let Some(api) = ctx.peek_library() else {
+            let reply = settle(ctx.machine, api.home(&call("palette", "home")).await);
+            if *home_asked.peek() != asked_at {
                 return;
-            };
-            match settle(ctx.machine, api.home(&call("palette", "home")).await) {
+            }
+            match reply {
                 Ok(reply) => home.set(reply),
                 // Places and search still work without it.
                 Err(message) => platform::warn(&format!("palette: home failed: {message}")),
             }
-        })
+        });
     });
     // Selected, so typing replaces a term the palette opens on.
     use_effect(|| platform::select_field(PALETTE_INPUT));
