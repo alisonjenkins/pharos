@@ -403,10 +403,12 @@ pub enum OnDevice {
         runtime_ms: u64,
         position_ms: u64,
     },
-    /// A kept book, and how far through it was read on the device.
+    /// A kept book, its format, and how far through it was read on the
+    /// device.
     Book {
         id: ItemRef,
         title: String,
+        format: BookFormat,
         fraction: f32,
     },
     /// A cached song, and the album it was kept with.
@@ -503,6 +505,8 @@ pub struct OfflineLibrary {
     reading: Vec<ItemRef>,
     /// Where each book was left on the device.
     places: HashMap<ItemRef, f32>,
+    /// Each kept book's format, for a book with no note.
+    formats: HashMap<ItemRef, BookFormat>,
 }
 
 /// The name of a library made up for kept items with no note.
@@ -579,7 +583,10 @@ impl OfflineLibrary {
                         }
                     }
                 }
-                OnDevice::Book { fraction, .. } => {
+                OnDevice::Book {
+                    fraction, format, ..
+                } => {
+                    lib.formats.insert(id, *format);
                     lib.places.insert(id, *fraction);
                     if *fraction > 0.0 && *fraction < 1.0 {
                         lib.reading.push(id);
@@ -792,13 +799,21 @@ impl OfflineLibrary {
     fn detail_of(&self, id: ItemRef) -> Option<Detail> {
         let item = self.item(id)?;
         let snap = self.text.get(&id);
-        let book = snap.and_then(|s| {
-            s.book_format.as_deref().map(|f| Book {
-                format: format_from_label(f),
-                author: s.author.clone(),
-                page_count: 0,
+        let book = snap
+            .and_then(|s| {
+                s.book_format.as_deref().map(|f| Book {
+                    format: format_from_label(f),
+                    author: s.author.clone(),
+                    page_count: 0,
+                })
             })
-        });
+            .or_else(|| {
+                self.formats.get(&id).map(|format| Book {
+                    format: *format,
+                    author: String::new(),
+                    page_count: 0,
+                })
+            });
         let read_position = self.places.get(&id).filter(|f| **f > 0.0).map(|f| ReadPosition {
             locator: String::new(),
             fraction: *f,
@@ -1064,6 +1079,7 @@ mod tests {
         let kept = [OnDevice::Book {
             id: item.id,
             title: item.name.clone(),
+            format: BookFormat::Epub,
             fraction: 0.0,
         }];
         let mut d = OfflineLibrary::new(&c, &kept).detail_of(item.id).unwrap();
@@ -1113,6 +1129,7 @@ mod tests {
             OnDevice::Book {
                 id: BOOK,
                 title: "A Book".into(),
+                format: BookFormat::Epub,
                 fraction: 0.3,
             },
         ]
@@ -1252,6 +1269,21 @@ mod tests {
         assert_eq!(home.resume[0].name, "kept 999");
         let found = run(lib.search(&info(), "KEPT", 0)).unwrap();
         assert_eq!(found.total, 1);
+
+        // An unnoted book still opens: its page knows its format, so it
+        // offers Read.
+        let book = ItemRef::Real(998);
+        let lib = OfflineLibrary::new(
+            &Catalogue::new("u"),
+            &[OnDevice::Book {
+                id: book,
+                title: "kept book".into(),
+                format: BookFormat::Pdf,
+                fraction: 0.0,
+            }],
+        );
+        let detail = run(lib.detail(&info(), book)).unwrap();
+        assert_eq!(detail.book.map(|b| b.format), Some(BookFormat::Pdf));
 
         // With a noted Movies library, it joins that one: one Movies tab.
         let mut device = device();
