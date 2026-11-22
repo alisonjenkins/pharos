@@ -8576,3 +8576,44 @@ body:has(.pharos-reader) {
   align-items: center;
   gap: 0.5rem 0.75rem;
 }
+
+/* ADR 0148: the download queue. A row's state line and bar say what it is
+   doing: accent while downloading, warning while it waits to carry on by
+   itself, muted while queued or paused, danger once a try cannot mend it. */
+.pharos-queue-place {
+  min-width: 1.5rem;
+  color: var(--px-color-fg-muted);
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.pharos-queue-state {
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-queue-state[data-state="downloading"] {
+  color: var(--px-color-accent);
+}
+.pharos-queue-state[data-state="waiting"] {
+  color: var(--px-color-warning);
+}
+.pharos-queue-state[data-state="failed"] {
+  color: var(--px-color-danger);
+}
+.pharos-queue-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--px-color-surface-raised);
+  overflow: hidden;
+}
+.pharos-queue-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--px-color-accent);
+}
+.pharos-queue-bar[data-state="waiting"] > i {
+  background: var(--px-color-warning);
+}
+.pharos-queue-bar[data-state="paused"] > i {
+  background: var(--px-color-fg-muted);
+}
