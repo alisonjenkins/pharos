@@ -98,14 +98,23 @@ pub fn device_verdict(s: Standing) -> (bool, &'static str) {
 /// Whether an item of `kind` sitting straight under a library stands in a
 /// listing grouped by `group`: an episode or season under a TV page's
 /// series, a song or album under a Music page's artists, a song under its
-/// albums.
-fn bare_member_of(group: ItemKind, kind: ItemKind) -> bool {
-    matches!(
-        (group, kind),
-        (ItemKind::Series, ItemKind::Episode | ItemKind::Season)
-            | (ItemKind::Artist, ItemKind::Audio | ItemKind::Album)
-            | (ItemKind::Album, ItemKind::Audio)
-    )
+/// albums. Only on pages of that kind (or mixed, or not a library): a
+/// Books page's Courses and Audiobooks keep strictly to their group.
+fn bare_member_of(library: Option<LibraryKind>, group: ItemKind, kind: ItemKind) -> bool {
+    let tv = matches!(
+        library,
+        None | Some(LibraryKind::TvShows | LibraryKind::Mixed)
+    );
+    let music = matches!(
+        library,
+        None | Some(LibraryKind::Music | LibraryKind::Mixed)
+    );
+    match (group, kind) {
+        (ItemKind::Series, ItemKind::Episode | ItemKind::Season) => tv,
+        (ItemKind::Artist, ItemKind::Audio | ItemKind::Album)
+        | (ItemKind::Album, ItemKind::Audio) => music,
+        _ => false,
+    }
 }
 
 /// The answer to a call that needs the server.
@@ -828,11 +837,12 @@ impl OfflineLibrary {
                     .into_iter()
                     .filter(of_group)
                     .collect();
+                let page = self.items.get(&listing.parent).and_then(|i| i.library_kind);
                 for child in self.children.get(&listing.parent).into_iter().flatten() {
                     let stands_in = self
                         .items
                         .get(child)
-                        .is_some_and(|i| bare_member_of(group, i.kind));
+                        .is_some_and(|i| bare_member_of(page, group, i.kind));
                     if stands_in && !self.descendants(*child).iter().any(of_group) {
                         ids.push(*child);
                     }
@@ -1628,6 +1638,35 @@ mod tests {
             let page = run(lib.query(&info(), &Listing::of(books, Some(group), "SortName"), 0, 50))
                 .unwrap();
             assert!(page.items.is_empty(), "{group:?}: {page:?}");
+        }
+
+        // Nor is a song noted straight under a Books library an audiobook,
+        // while the same song under a Music library is one of its albums'.
+        let song = ItemRef::Real(995);
+        for (kind, listed) in [(LibraryKind::Books, false), (LibraryKind::Music, true)] {
+            let mut c = Catalogue::new("u");
+            let shelf = library(BOOKS, kind, "Shelf");
+            c.note(
+                &[shelf, under(song, ItemKind::Audio, "kept song", BOOKS)],
+                None,
+            );
+            let lib = OfflineLibrary::new(
+                &c,
+                &[OnDevice::Song {
+                    id: song,
+                    title: "kept song".into(),
+                    album: None,
+                }],
+            );
+            let page = run(lib.query(
+                &info(),
+                &Listing::of(BOOKS, Some(ItemKind::Album), "SortName"),
+                0,
+                50,
+            ))
+            .unwrap();
+            let ids: Vec<_> = page.items.iter().map(|i| i.id).collect();
+            assert_eq!(ids.contains(&song), listed, "{kind:?}: {ids:?}");
         }
     }
 

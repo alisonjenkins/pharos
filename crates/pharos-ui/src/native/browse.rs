@@ -5194,6 +5194,11 @@ mod tests {
             index_key(&listing, 1, 0, None),
             index_key(&listing, 1, 0, Some(1))
         );
+        // Nor is a new device snapshot's index the last one's.
+        assert_ne!(
+            index_key(&listing, 1, 0, Some(1)),
+            index_key(&listing, 1, 0, Some(2))
+        );
         let key = index_key(&listing, 1, 0, None);
         keep_index(key.clone(), ListIndex::default());
         assert_eq!(kept_index(&key), Some(ListIndex::default()));
