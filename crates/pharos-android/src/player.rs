@@ -206,6 +206,22 @@ fn cached_item(queue: &[Item], id: &str, lookup: impl FnOnce() -> Option<Item>) 
 
 const FALLBACK_TITLE: &str = "Downloaded track";
 
+/// `Library::prefetch_from`, unless the video accounting is not installed:
+/// music would then spend room an admitted video needs. Refused with a log
+/// line, as nothing queued.
+fn prefetch_ahead(lib: &content::Library, id: &str) -> usize {
+    // A video store that could not open at connect is tried again here, the
+    // service-only process's only later chance: in the background, since
+    // the open walks the video folder and the track must not wait for it.
+    // Until it is done the accounting is not installed and this refuses.
+    crate::service::retry_init_in_background("prefetch");
+    if let Some(why) = prefetch_refusal(accounting_installed()) {
+        log(&format!("prefetch refused id={id} reason={why}"));
+        return 0;
+    }
+    lib.prefetch_from(id)
+}
+
 /// Asks the library for `id`'s fresh stream URL (blocking) and plays it.
 pub(crate) fn play_library(env: &mut Env, id: &str, queue: Vec<Item>, gen: u64) -> R<()> {
     let queue_ids: Vec<String> = queue.iter().map(|i| i.id.clone()).collect();
@@ -222,7 +238,7 @@ pub(crate) fn play_library(env: &mut Env, id: &str, queue: Vec<Item>, gen: u64) 
                     None
                 }
             });
-            let ahead = lib.prefetch_from(id);
+            let ahead = prefetch_ahead(lib, id);
             log(&format!(
                 "play id={id} verdict=cache-hit prefetch_queued={ahead}"
             ));
@@ -240,7 +256,7 @@ pub(crate) fn play_library(env: &mut Env, id: &str, queue: Vec<Item>, gen: u64) 
             .stream_url
             .clone()
             .ok_or_else(|| format!("node {id} has no stream"))?;
-        let ahead = lib.prefetch_from(id);
+        let ahead = prefetch_ahead(lib, id);
         log(&format!(
             "play id={id} verdict=stream prefetch_queued={ahead}"
         ));
