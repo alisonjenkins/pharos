@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use pharos_android::snapshot::{self, PlayState as HostState, Snapshot};
 use pharos_android::{content, Player};
+use pharos_ui::native::kept_video_disk::Budget;
 use pharos_ui::native::ports::{
     self, ContainerKind, ContainerRef, Download, NativeAudio, OfflineError, OfflineStore,
     PlayState, PlayerSnapshot, TrackDownload, TrackState, VisFrame,
@@ -225,6 +226,147 @@ fn container_id(c: &ContainerRef) -> Option<String> {
             .position(|m| m.name == c.id)
             .map(|n| format!("mix/{n}")),
     }
+}
+
+/// Downloaded video shares the music cache's budget: one cap for what the
+/// phone keeps, set where the music cache's is, with the music's bytes
+/// counted against it. Before the media service has started there is no
+/// cache to ask, so the default cap stands and the music counts as nothing.
+struct PhoneBudget {
+    dir: std::path::PathBuf,
+}
+
+/// The library as the music side of the budget, once the service has
+/// connected it.
+fn music() -> Option<&'static dyn pharos_ui::native::ports::MusicSide> {
+    pharos_android::library().map(|l| l as &dyn pharos_ui::native::ports::MusicSide)
+}
+
+impl Budget for PhoneBudget {
+    // The figures come from `pharos_ui::native::ports`, the code the tests run.
+    fn cap_bytes(&self) -> u64 {
+        pharos_ui::native::ports::music_cap(music())
+    }
+
+    fn other_used_bytes(&self) -> u64 {
+        pharos_ui::native::ports::music_used(music())
+    }
+
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        pharos_ui::native::ports::set_music_cap(music(), bytes)
+    }
+
+    fn accounting_ready(&self) -> bool {
+        pharos_ui::native::ports::music_ready(music())
+    }
+
+    fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+        pharos_ui::native::ports::music_pending(music())
+    }
+
+    fn admission_guard(&self) -> Box<dyn std::any::Any> {
+        // The lock the music cache holds while it adds a track and trims,
+        // so neither kind admits against a figure the other is changing.
+        Box::new(content::admission_guard())
+    }
+
+    fn free_bytes(&self) -> u64 {
+        match content::statvfs_free(&self.dir) {
+            Ok(free) => free,
+            Err(e) => {
+                // Unknown room is no room: a download is refused, not risked.
+                log::warn!(
+                    "pharos: video free space unreadable dir={} error={e}",
+                    self.dir.display()
+                );
+                0
+            }
+        }
+    }
+}
+
+/// Opens the video store under the app's files directory and registers it.
+/// Run on the first render of the root component: the files directory comes
+/// from the activity, which is there by then, and the first screen then
+/// sees the store.
+pub fn register_video() {
+    match crate::activity::files_dir() {
+        Ok(dir) => {
+            register_video_at(dir.join("video"));
+        }
+        Err(e) => log::warn!(
+            "pharos: port video_store verdict=not_registered reason=no_files_dir error={e}"
+        ),
+    }
+}
+
+/// What the media service runs when it connects the library, so a process
+/// the car started with no activity (where `register_video` never runs)
+/// still counts the video's bytes before music prefetches. `false` while
+/// the store could not be opened: the service runs it again on its next
+/// connect or prefetch, and music stays refused until then.
+fn accounting_init(files: &str) -> bool {
+    register_video_at(std::path::Path::new(files).join("video"))
+}
+
+/// Installs `accounting_init` in `pharos_android` as this library loads: a
+/// service-only process runs none of the app's own start-up.
+#[used]
+#[link_section = ".init_array"]
+static INSTALL_ACCOUNTING_INIT: extern "C" fn() = {
+    extern "C" fn install() {
+        pharos_android::set_init_hook(accounting_init);
+    }
+    install
+};
+
+/// Claimed by the first `register_video_at`, before it touches the folder.
+static OPENED: pharos_ui::native::ports::OpenOnce = pharos_ui::native::ports::OpenOnce::new();
+
+/// Whether a store is published, so the service's init is done; `false`
+/// while none is (a later caller tries again).
+fn register_video_at(root: std::path::PathBuf) -> bool {
+    use pharos_ui::native::ports::{register_video_root, Registration};
+    let outcome = register_video_root(
+        &root,
+        &OPENED,
+        || pharos_android::set_outside_used(pharos_ui::native::ports::outside_bytes_hook()),
+        || {
+            let budget = Arc::new(PhoneBudget { dir: root.clone() });
+            pharos_ui::native::register_phone_video_store(root.clone(), budget)
+        },
+    );
+    // Done only once a store is published: one still being opened by
+    // another caller may fail before it opens and give the claim back.
+    let settled = pharos_ui::native::ports::registration_done(
+        &outcome,
+        pharos_ui::native::ports::video_store().is_some(),
+    );
+    match outcome {
+        // The first caller may still be opening the store: the UI's readers
+        // re-render once it is published (`use_video_store_watch`).
+        Registration::AlreadyOpened => log::info!(
+            "pharos: port video_store verdict=already_opened published={} dir={}",
+            pharos_ui::native::ports::video_store().is_some(),
+            root.display()
+        ),
+        Registration::NoFolder(e) => log::warn!(
+            "pharos: port video_store verdict=not_registered reason=no_folder retry=next_caller dir={} error={e}",
+            root.display()
+        ),
+        Registration::Registered => log::info!(
+            "pharos: port video_store verdict=registered dir={}",
+            root.display()
+        ),
+        Registration::NotRegistered(e) => {
+            log::info!("pharos: port video_store verdict=already_registered reason={e}");
+        }
+        Registration::NotOpened(e) => log::warn!(
+            "pharos: port video_store verdict=not_registered reason=not_opened retry=next_caller dir={} error={e}",
+            root.display()
+        ),
+    }
+    settled
 }
 
 /// The UI's container for a library id; `None` for anything but an album or
