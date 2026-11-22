@@ -35,10 +35,13 @@ fn origin() -> String {
 
 /// Stores the picture behind each of `images` (same-origin paths, as
 /// `Item.image`) not stored yet, and drops the stored ones not listed.
-pub async fn keep_art(user: &str, images: &[String]) {
+/// Returns whether every wanted poster is now stored; `false` asks a later
+/// pass to try the missing ones again. `current` says whether the user is
+/// still signed in: once it is false nothing more is stored.
+pub async fn keep_art(user: &str, images: &[String], current: impl Fn() -> bool) -> bool {
     let began = super::platform::now_ms();
     let Ok(storage) = caches() else {
-        return;
+        return true;
     };
     let name = format!("{ART_PREFIX}{user}");
     if images.is_empty() {
@@ -52,16 +55,16 @@ pub async fn keep_art(user: &str, images: &[String]) {
             let _ = JsFuture::from(storage.delete(&name)).await;
             notify_worker();
         }
-        return;
+        return true;
     }
     let cache: web_sys::Cache = match JsFuture::from(storage.open(&name)).await {
         Ok(c) => match c.dyn_into() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => return false,
         },
         Err(e) => {
             warn(&format!("pharos: offline art cache error={}", describe(&e)));
-            return;
+            return false;
         }
     };
     let base = origin();
@@ -86,8 +89,9 @@ pub async fn keep_art(user: &str, images: &[String]) {
         }
     }
     let Some(window) = web_sys::window() else {
-        return;
+        return false;
     };
+    let mut signed_out = false;
     for key in wanted.difference(&stored) {
         let sep = if key.contains('?') { '&' } else { '?' };
         let url = format!("{key}{sep}fillWidth={ART_WIDTH}");
@@ -95,6 +99,11 @@ pub async fn keep_art(user: &str, images: &[String]) {
             Ok(r) => r.dyn_into::<web_sys::Response>().ok(),
             Err(_) => None,
         };
+        // Signed out while this fetched: the poster is not stored.
+        if !current() {
+            signed_out = true;
+            break;
+        }
         match response.filter(web_sys::Response::ok) {
             Some(r) => match JsFuture::from(cache.put_with_str(key, &r)).await {
                 Ok(_) => fetched += 1,
@@ -108,11 +117,12 @@ pub async fn keep_art(user: &str, images: &[String]) {
     }
     if fetched > 0 || failed > 0 || dropped > 0 {
         info(&format!(
-            "pharos: offline art wanted={} fetched={fetched} failed={failed} dropped={dropped} ms={:.0}",
+            "pharos: offline art wanted={} fetched={fetched} failed={failed} dropped={dropped} signed_out={signed_out} ms={:.0}",
             wanted.len(),
             super::platform::now_ms() - began
         ));
     }
+    failed == 0 && !signed_out
 }
 
 /// Deletes every stored poster, as signing out forgets what is kept.
