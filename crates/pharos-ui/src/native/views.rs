@@ -64,6 +64,18 @@ fn played_badge(kind: ItemKind) -> &'static str {
     }
 }
 
+/// Whether the screens show the device's library with no server (spec
+/// 049): provided by the app root. Controls that need the server leave
+/// themselves out while it is true.
+#[derive(Clone, Copy)]
+pub struct OfflineShown(pub Memo<bool>);
+
+/// Whether the device's library is shown; false where no app root
+/// provides it (a test, the older app).
+pub fn offline_shown() -> bool {
+    try_use_context::<OfflineShown>().is_some_and(|o| (o.0)())
+}
+
 #[component]
 pub fn FavoriteToggle(
     id: ItemRef,
@@ -75,6 +87,9 @@ pub fn FavoriteToggle(
     icon: bool,
 ) -> Element {
     let mark = use_context::<MarkFavorite>();
+    if offline_shown() {
+        return rsx! {};
+    }
     let star = if favorite { "\u{2605}" } else { "\u{2606}" };
     let class = match (favorite, icon) {
         (true, false) => "pharos-button pharos-button-secondary pharos-favorite on",
@@ -128,6 +143,9 @@ pub fn WatchedToggle(
     icon: bool,
 ) -> Element {
     let mark = use_context::<MarkPlayed>();
+    if offline_shown() {
+        return rsx! {};
+    }
     let state = match (listen, played) {
         (true, true) => "unplayed",
         (true, false) => "played",
@@ -284,6 +302,8 @@ pub fn Shell(
         .first()
         .filter(|item| item.kind == ItemKind::Library)
         .map(|library| library.id);
+    // Favourites and Together need the server (spec 049).
+    let offline = offline_shown();
     rsx! {
         div { class: "pharos-app", "data-keys": "page",
             header { class: "pharos-banner pharos-shell",
@@ -291,20 +311,24 @@ pub fn Shell(
                     Link { to: Route::Home, class: "pharos-brand", Brand {} }
                     nav { class: "pharos-shell-nav",
                         {search}
-                        Link { to: Route::Favourites, "Favourites" }
+                        if !offline {
+                            Link { to: Route::Favourites, "Favourites" }
+                        }
                         if offline_store().is_some() || video_store().is_some() {
                             Link { to: Route::Downloads, "Downloads" }
                         }
-                        if in_group {
-                            Link {
-                                to: Route::Together,
-                                class: "pharos-together-link is-in-group",
-                                "Together"
-                                span { class: "pharos-in-group-dot", aria_hidden: "true" }
-                                span { class: "pharos-visually-hidden", " (you're in a group)" }
+                        if !offline {
+                            if in_group {
+                                Link {
+                                    to: Route::Together,
+                                    class: "pharos-together-link is-in-group",
+                                    "Together"
+                                    span { class: "pharos-in-group-dot", aria_hidden: "true" }
+                                    span { class: "pharos-visually-hidden", " (you're in a group)" }
+                                }
+                            } else {
+                                Link { to: Route::Together, "Together" }
                             }
-                        } else {
-                            Link { to: Route::Together, "Together" }
                         }
                         {account}
                     }
@@ -3672,6 +3696,25 @@ mod tests {
             "pharos-favorite",
             r#"aria-label="Version""#,
         ] {
+            assert!(!html.contains(gone), "{gone} offered offline: {html}");
+        }
+    }
+
+    /// Spec 049 (V1486): with the device's library shown, the watched and
+    /// favourite marks leave themselves out wherever they are drawn (a
+    /// series page, a track row), not only on a title page. Disarm check:
+    /// drop the `offline_shown()` return from either toggle and its class
+    /// shows up here.
+    #[test]
+    fn offline_the_marks_leave_themselves_out_everywhere() {
+        let detail = two_copies(ItemKind::Movie);
+        let html = with_video_queue(move || {
+            let shown = use_memo(|| true);
+            use_context_provider(|| OfflineShown(shown));
+            rsx! { TitleView { detail: detail.clone() } }
+        });
+        assert!(html.contains(">Play<"), "{html}");
+        for gone in ["pharos-watched", "pharos-favorite"] {
             assert!(!html.contains(gone), "{gone} offered offline: {html}");
         }
     }

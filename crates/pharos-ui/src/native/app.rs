@@ -1984,6 +1984,8 @@ fn NativeApp(route: Route) -> Element {
     };
     use_context_provider(|| flash);
     let mut offline = use_signal(|| None::<Rc<OfflineLibrary>>);
+    let offline_shown = use_memo(move || offline.read().is_some());
+    use_context_provider(|| super::views::OfflineShown(offline_shown));
     use_context_provider(|| Ctx {
         api,
         offline,
