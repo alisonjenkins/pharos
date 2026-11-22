@@ -1292,6 +1292,11 @@ pub fn engine_client_event(
     })
 }
 
+/// What plays HLS in the Android apps when the Playback setting is unset:
+/// still hls.js, until the Pharos engine has been watched on a TV and a phone
+/// (ADR-0151, T031-49).
+pub const DEFAULT_MSE_ENGINE: super::playback::MseEngine = super::playback::MseEngine::HlsJs;
+
 /// Which engine the Android app really plays for a pick, and why, when it is
 /// another one. The Rust engine runs in the page; the WebView does not play
 /// HLS itself, so hls.js stands in for that (B1366, V1336).
@@ -2911,5 +2916,11 @@ process.stdout.write(JSON.stringify(out));
             "{script}"
         );
         assert!(script.contains("e.gen === 7"), "{script}");
+    }
+
+    /// V1505: Android stays on hls.js until the engine is watched on a device.
+    #[test]
+    fn android_keeps_hlsjs_as_its_default() {
+        assert_eq!(DEFAULT_MSE_ENGINE, super::super::playback::MseEngine::HlsJs);
     }
 }

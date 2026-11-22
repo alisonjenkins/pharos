@@ -435,6 +435,11 @@ pub fn has_mse() -> bool {
     true
 }
 
+/// See [`tv_page::DEFAULT_MSE_ENGINE`].
+pub fn default_mse_engine() -> super::playback::MseEngine {
+    tv_page::DEFAULT_MSE_ENGINE
+}
+
 /// The Rust engine plays in the page when asked for; hls.js stands in for
 /// the WebView's own HLS (B1366, V1336).
 pub fn hls_engine_used(picked: Engine) -> Option<(Engine, &'static str)> {
