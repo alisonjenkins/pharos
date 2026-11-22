@@ -432,7 +432,7 @@ pub fn rows(
                     bytes: progress.1,
                 },
                 _ if e.paused => RowState::Paused {
-                    percent: record.map_or(0, |r| stored_percent(r)),
+                    percent: record.map_or(0, stored_percent),
                     bytes: progress.1,
                 },
                 Some((KeptState::Failed { reason }, None)) => RowState::Failed {
