@@ -1768,8 +1768,9 @@ test.describe("pharos Dioxus UI", () => {
 
     // The page is told it has neither WebM nor native HLS, as Firefox on a
     // WebM-less build would be, so the server remuxes the VP9 fixture to HLS
-    // and the page plays it through the vendored hls.js. MediaSource answers
-    // are left alone: hls.js asks them itself.
+    // and the page plays it through the vendored hls.js, picked in this
+    // device's Playback setting. MediaSource answers are left alone: hls.js
+    // asks them itself.
     test("an HLS title plays through hls.js and moves the resume point", async ({
       page,
       request,
@@ -1822,6 +1823,11 @@ test.describe("pharos Dioxus UI", () => {
       page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
       page.on("console", (m) => {
         if (m.text().includes("Refused to")) problems.push(`csp: ${m.text()}`);
+      });
+      // V1505: the page's own engine is the default, so hls.js plays only
+      // where this device's Playback setting asks for it.
+      await page.addInitScript(() => {
+        localStorage.setItem("pharos.player.engine", "hlsjs");
       });
       const hlsjs: string[] = [];
       page.on("request", (r) => {
@@ -3201,8 +3207,8 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
-    // A playlist that never loads is fatal to hls.js with nothing to restart
-    // from, so the page must say so rather than show a black box.
+    // A playlist that never loads is fatal to either engine with nothing to
+    // restart from, so the page must say so rather than show a black box.
     test("an HLS stream that cannot load shows why", async ({ page, request }) => {
       test.setTimeout(60_000);
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
@@ -3262,7 +3268,7 @@ test.describe("pharos Dioxus UI", () => {
       });
       await expect(page.getByText(/the stream failed/).first()).toBeVisible();
       expect(
-        errors.some((e) => /engine=hlsjs .*fatal=true action=fail/.test(e)),
+        errors.some((e) => /engine=\w+ .*fatal=true action=fail/.test(e)),
         errors.join("\n"),
       ).toBe(true);
     });

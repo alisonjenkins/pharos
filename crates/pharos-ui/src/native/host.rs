@@ -142,6 +142,11 @@ pub fn has_mse() -> bool {
     false
 }
 
+/// As the browser.
+pub fn default_mse_engine() -> super::playback::MseEngine {
+    super::playback::MseEngine::Rust
+}
+
 /// The engine this platform plays `picked` with when it is not `picked`
 /// itself, and why (B1366): none here.
 pub fn hls_engine_used(_picked: Engine) -> Option<(Engine, &'static str)> {

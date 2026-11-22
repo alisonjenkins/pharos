@@ -274,7 +274,7 @@ pub fn PlaybackView(
                     div { class: "pharos-setting-text",
                         p { class: "pharos-setting-name", id: "engine-label", "Streaming engine" }
                         p { id: "engine-help", class: "pharos-setting-help",
-                            "What plays streamed video in this browser. hls.js is the default; the Pharos engine is experimental and still hands playback to hls.js where it cannot play a stream. Kept on this device."
+                            "What plays streamed video on this device. Pharos is the app's own player; hls.js is the older one it replaces, kept as a way back. Kept on this device."
                         }
                     }
                     Choices {
@@ -543,22 +543,22 @@ mod tests {
     }
 
     #[test]
-    fn engine_defaults_to_hlsjs_and_offers_the_rust_engine() {
+    fn engine_defaults_to_pharos_and_offers_hlsjs_as_the_way_back() {
         let html = page(0, SubtitleSize::default(), 0);
         assert_eq!(pressed(&html, "engine").len(), 1, "{html}");
         assert!(
-            button(&html, "engine-hlsjs").contains("aria-pressed=\"true\""),
+            button(&html, "engine-rust").contains("aria-pressed=\"true\""),
             "{html}"
         );
-        assert!(html.contains("Pharos (experimental)"), "{html}");
+        assert!(html.contains("hls.js (older)"), "{html}");
     }
 
     #[test]
     fn engine_presses_only_the_stored_choice() {
-        let html = page_with_engine(0, SubtitleSize::default(), 0, MseEngine::Rust);
+        let html = page_with_engine(0, SubtitleSize::default(), 0, MseEngine::HlsJs);
         assert_eq!(pressed(&html, "engine").len(), 1, "{html}");
         assert!(
-            button(&html, "engine-rust").contains("aria-pressed=\"true\""),
+            button(&html, "engine-hlsjs").contains("aria-pressed=\"true\""),
             "{html}"
         );
     }
