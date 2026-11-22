@@ -27,14 +27,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use futures_util::stream::{self, StreamExt as _};
-use pharos_hls::offline::{estimate_bytes, plan_master, plan_media};
+use pharos_hls::offline::{
+    estimate_bytes, plan_master, plan_media, play_session, rebind, same_playlist,
+};
 use tokio::io::AsyncWriteExt as _;
 
+use super::download_queue::{halt_for_status, Halt};
 use super::kept_video::{
     check_not_kept, content_type_for, find, fits, insert_front, interrupted, is_retryable,
-    localize_playlist, missing_files, new_record, progress_due, request_key, retry_delay_secs,
-    take, url_path, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, Localized,
-    StoredFile, VideoStore,
+    localize_playlist, missing_files, new_record, progress_due, renewal, renewed_record,
+    request_key, retry_delay_secs, take, url_path, KeepVideoRefusal, KeepVideoRequest, KeptState,
+    KeptVideo, Localized, StoredFile, VideoStore,
 };
 use super::platform;
 
@@ -196,6 +199,10 @@ enum Stop {
     /// The credentials are not the owner's (another user signed in): the
     /// record and its files stay as they are, to resume for its owner.
     Parked(String),
+    /// Stopped by something a later try can mend (ADR 0148): failed as
+    /// `Failed` is, files kept, and the record carries the halt so the
+    /// queue tries again by itself.
+    Halted(Halt, String),
 }
 
 /// A user's request key to the whole files on disk that answer it, one per
@@ -384,6 +391,10 @@ struct State {
     /// The store's root, to tell a record's folder from a tombstone's.
     root: PathBuf,
     last_saved: Option<Instant>,
+    /// The play session each renewed download fetches its stored keys
+    /// under, by user and item (ADR 0148). Set by a renewing start, gone
+    /// when its run ends.
+    live: HashMap<(String, String), String>,
 }
 
 struct Inner {
@@ -2392,10 +2403,11 @@ async fn fetch_file(
         match (is_retryable(failure.status), retry_delay_secs(attempt)) {
             (true, Some(secs)) => (inner.env.sleep)(secs).await,
             _ => {
-                return Err(Stop::Failed(format!(
-                    "{} answered {failure}",
-                    url_path(key)
-                )))
+                let reason = format!("{} answered {failure}", url_path(key));
+                return Err(match halt_for_status(failure.status) {
+                    Some(halt) => Stop::Halted(halt, reason),
+                    None => Stop::Failed(reason),
+                });
             }
         }
     }
@@ -2519,6 +2531,176 @@ fn shown_name(path: &Path) -> String {
 /// while `run` still owns the download: the check and the rename happen
 /// under the state lock, so a removed or restarted run cannot put its bytes
 /// in place.
+/// The request key a stored `key` is fetched under: itself, or itself
+/// under the download's renewed play session (ADR 0148).
+fn live_key(inner: &Inner, user: &str, item: &str, key: &str) -> String {
+    match lock(&inner.state)
+        .live
+        .get(&(user.to_owned(), item.to_owned()))
+    {
+        Some(live) => rebind(key, live),
+        None => key.to_owned(),
+    }
+}
+
+/// The whole body of `key` fetched under the live session, not stored, at
+/// most `limit` bytes: a renewal's comparison. One try; a failure is a
+/// halt when a later try can mend it.
+async fn fetch_compare(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    key: &str,
+    limit: u64,
+) -> Result<Vec<u8>, Stop> {
+    let url = live_key(inner, user, item, key);
+    let failed = |e: FetchError| {
+        let reason = format!("{} answered {e}", url_path(key));
+        match halt_for_status(e.status) {
+            Some(halt) => Stop::Halted(halt, reason),
+            None => Stop::Failed(reason),
+        }
+    };
+    let mut body = inner
+        .env
+        .fetcher
+        .open(user, &url)
+        .await
+        .map_err(|e| match e {
+            OpenFailed::Fetch(e) => failed(e),
+            OpenFailed::NotOwner(why) => Stop::Parked(why),
+            OpenFailed::Refused(why) => {
+                Stop::Failed(format!("{} could not be fetched: {why}", url_path(key)))
+            }
+        })?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next_chunk().await.map_err(failed)? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 >= limit {
+            // Past what a comparison needs: the caller sees it differ.
+            bytes.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            break;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Checks the renewed session hands out the stored stream (ADR 0148): every
+/// playlist is on disk and says the same as the renewed one once the
+/// session ids are put back, and every stored init segment is the same
+/// bytes. Anything else is [`Halt::StreamChanged`], naming the first
+/// difference; the queue then starts the download afresh.
+async fn verify_renewal(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    record: &KeptVideo,
+    kept: &str,
+    live: &str,
+) -> Result<(), Stop> {
+    let changed = |what: String| {
+        emit(
+            true,
+            format!("pharos: video keep renewed item={item} verdict=stream_changed {what}"),
+        );
+        Stop::Halted(Halt::StreamChanged, format!("the stream changed: {what}"))
+    };
+    let stored_text = |key: &str| -> Result<String, Stop> {
+        let path = inner.file_path(user, item, key);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => std::fs::read(&path)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or_else(|| changed(format!("url_path={} unreadable", url_path(key)))),
+            _ => Err(changed(format!("url_path={} never_stored", url_path(key)))),
+        }
+    };
+    let master = request_key(&record.master_url);
+    let text = stored_text(&master)?;
+    let plan = plan_master(&format!("{PLAN_ORIGIN}{master}"), &text)
+        .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
+    let mut texts = vec![(master, text)];
+    let mut inits = Vec::new();
+    for url in &plan.media_playlists {
+        let key = request_key(url);
+        let text = stored_text(&key)?;
+        let media = plan_media(url, &text)
+            .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(&key))))?;
+        // A segment stored without its init came from the ended session's
+        // encoder, and nothing stored is left to check the renewed init
+        // against: it cannot be spliced.
+        let is_stored = |key: &str| {
+            std::fs::symlink_metadata(inner.file_path(user, item, key)).is_ok_and(|m| m.is_file())
+        };
+        for init in media.inits.iter().map(|i| request_key(i)) {
+            if is_stored(&init) {
+                continue;
+            }
+            let segments = media
+                .files
+                .iter()
+                .filter(|f| !media.inits.contains(f))
+                .filter(|f| is_stored(&request_key(f)))
+                .count();
+            if segments > 0 {
+                return Err(changed(format!(
+                    "url_path={} init_never_stored segments_stored={segments}",
+                    url_path(&init)
+                )));
+            }
+        }
+        inits.extend(media.inits.iter().map(|i| request_key(i)));
+        texts.push((key, text));
+    }
+    for (key, text) in &texts {
+        let renewed = fetch_compare(inner, user, item, key, PLAYLIST_MAX_BYTES).await?;
+        let renewed = String::from_utf8_lossy(&renewed);
+        // Stored copies are localized as they are written: the renewed text
+        // is put the same way before it is compared.
+        let server = inner.env.fetcher.server_base();
+        let cap = usize::try_from(PLAYLIST_MAX_BYTES).unwrap_or(usize::MAX);
+        let renewed = match localize_playlist(&renewed, key, false, &server, cap) {
+            Localized::Unchanged => renewed.into_owned(),
+            Localized::Rewritten(t) => t,
+            Localized::TooLarge | Localized::NotLocal(_) => {
+                return Err(changed(format!(
+                    "url_path={} renewed_not_localizable",
+                    url_path(key)
+                )))
+            }
+        };
+        if let Err(m) = same_playlist(text, &renewed, kept, live) {
+            return Err(changed(format!("url_path={} {m}", url_path(key))));
+        }
+    }
+    let mut compared = 0usize;
+    for key in &inits {
+        let Ok(stored) = std::fs::read(inner.file_path(user, item, key)) else {
+            continue;
+        };
+        // One byte past the stored length is enough to tell them apart.
+        let limit = (stored.len() as u64).saturating_add(1);
+        let renewed = fetch_compare(inner, user, item, key, limit).await?;
+        if renewed != stored {
+            return Err(changed(format!(
+                "url_path={} init_bytes kept={} renewed={}",
+                url_path(key),
+                stored.len(),
+                renewed.len()
+            )));
+        }
+        compared += 1;
+    }
+    emit(
+        false,
+        format!(
+            "pharos: video keep renewed item={item} verdict=same_stream playlists={} inits={compared}",
+            texts.len()
+        ),
+    );
+    Ok(())
+}
+
 async fn fetch_once(
     inner: &Inner,
     user: &str,
@@ -2535,10 +2717,11 @@ async fn fetch_once(
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         ))
     };
+    let url = live_key(inner, user, item, key);
     let mut body = inner
         .env
         .fetcher
-        .open(user, key)
+        .open(user, &url)
         .await
         .map_err(|e| match e {
             OpenFailed::Fetch(e) => FetchOnce::Fetch(e),
@@ -3490,7 +3673,9 @@ async fn fetch_planned(
         Ok(len) => Ok((key, Some(len))),
         // B1476: the sliver of a last segment can fail to encode; the
         // copy plays without it, ending a frame early.
-        Err(Stop::Failed(reason)) if short_tails.contains(&key) => {
+        Err(Stop::Failed(reason) | Stop::Halted(Halt::Unreachable, reason))
+            if short_tails.contains(&key) =>
+        {
             emit(
                 true,
                 format!(
@@ -3907,6 +4092,15 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         .cloned()
         .ok_or(Stop::Gone)?;
     let resume = !record.files.is_empty();
+    let renewing = lock(&inner.state)
+        .live
+        .get(&(user.to_owned(), item.to_owned()))
+        .cloned()
+        .zip(play_session(&record.master_url).map(str::to_owned))
+        .filter(|(live, kept)| live != kept);
+    if let Some((live, kept)) = &renewing {
+        verify_renewal(inner, user, item, &record, kept, live).await?;
+    }
     wait_for_revoked_writers(inner, user, item, run).await?;
     wait_for_accounting(inner, user, item, run).await?;
     // A folder whose adoption walk fell short blocks admission, and no
@@ -4001,6 +4195,19 @@ struct Finished {
 async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     let started = Instant::now();
     let outcome = download(&inner, &user, &item, run).await;
+    // ADR 0148: a stop a later try can mend fails as any other, and the
+    // record carries why, for the queue.
+    let (outcome, halt) = match outcome {
+        Err(Stop::Halted(halt, reason)) => (Err(Stop::Failed(reason)), Some(halt)),
+        other => (other, None),
+    };
+    {
+        let mut st = lock(&inner.state);
+        let key = (user.clone(), item.clone());
+        if st.runs.get(&key) == Some(&run) {
+            st.live.remove(&key);
+        }
+    }
     let ms = started.elapsed().as_millis();
     let superseded = |what: &str| {
         emit(
@@ -4101,6 +4308,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                         v.files.retain(|k| !skipped.contains(k));
                         let completed = v.bytes();
                         v.state = KeptState::Ready;
+                        v.halt = None;
                         // What the folder holds, a file a failed prune could not
                         // delete included: the record reports all storage used.
                         v.estimated_bytes = figure(v, completed);
@@ -4150,7 +4358,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 format!("pharos: video keep parked item={item} run={run} reason={why} ms={ms}"),
             );
         }
-        Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
+        Err(Stop::Refused(reason) | Stop::Failed(reason) | Stop::Halted(_, reason)) => {
             // The fetches cancelled with the failure leave their staging
             // files, which the figure below does not count: they go first,
             // and one that will not leaves the folder unknown before the
@@ -4188,6 +4396,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 v.state = KeptState::Failed {
                     reason: reason.clone(),
                 };
+                v.halt = halt;
             });
             #[cfg(test)]
             tests::after_failed_save();
@@ -4195,7 +4404,8 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 emit(
                     true,
                     format!(
-                        "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
+                        "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms} halt={}",
+                        halt.map_or("none", Halt::label)
                     ),
                 );
             } else {
@@ -5425,6 +5635,48 @@ impl VideoStore for DiskVideoStore {
         }
     }
 
+    fn pause(&self, user: &str, item: &str) -> Result<(), String> {
+        // The run is revoked as a session end parks one (`park_runs`): it
+        // stops at its next check, and its staging file goes with it. The
+        // record turns Failed with the pause as its halt in the same hold,
+        // so no poll sees it running without a run.
+        let key = (user.to_owned(), item.to_owned());
+        let run = {
+            let mut st = lock(&self.inner.state);
+            if st.pending_starts.contains_key(&key) {
+                return Err(format!("{item} is still starting; pause it in a moment"));
+            }
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Err(format!("{item} is not on this device"));
+            };
+            if !matches!(v.state, KeptState::Downloading { .. }) {
+                return Err(format!("{item} is not downloading"));
+            }
+            let held = v.bytes();
+            v.estimated_bytes = v.estimated_bytes.max(held);
+            v.state = KeptState::Failed {
+                reason: "paused".to_owned(),
+            };
+            v.halt = Some(Halt::Paused);
+            st.live.remove(&key);
+            st.runs.remove(&key)
+        };
+        let saved = self.inner.save_record(user, item);
+        emit(
+            saved.is_err(),
+            format!(
+                "pharos: video keep paused item={item} run={} saved={}",
+                run.map_or_else(|| "none".to_owned(), |r| r.to_string()),
+                saved.is_ok()
+            ),
+        );
+        saved.map_err(|e| format!("paused, but the record could not be saved: {e}"))
+    }
+
     fn videos(&self, user: &str) -> Vec<KeptVideo> {
         // The page that lists the downloads reads the held folders again, so
         // one whose record became readable is not stranded.
@@ -5533,12 +5785,32 @@ impl VideoStore for DiskVideoStore {
                 .and_then(|()| {
                     check_not_kept(&st.list, &user, &item)?;
                     replaced = find(&st.list, &user, &item).cloned();
-                    let mut record = new_record(&request, (self.inner.env.now)());
+                    let now = (self.inner.env.now)();
+                    // ADR 0148: the same stream under a new play session
+                    // keeps its stored keys, fetched under the new session.
+                    let live = replaced.as_ref().and_then(|old| renewal(old, &request));
+                    let mut record = match (&replaced, &live) {
+                        (Some(old), Some(_)) => renewed_record(old, &request, now),
+                        _ => new_record(&request, now),
+                    };
                     // A failed attempt's files stay on disk until a plan prunes
                     // them; the replacement keeps counting them meanwhile.
                     if let Some(old) = find(&st.list, &user, &item) {
                         record.estimated_bytes = old.estimated_bytes;
                     }
+                    let key = (user.clone(), item.clone());
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep renewal item={item} verdict={} files_kept={}",
+                            if live.is_some() { "renewing" } else { "fresh" },
+                            if live.is_some() { record.files.len() } else { 0 }
+                        ),
+                    );
+                    match live {
+                        Some(session) => st.live.insert(key, session),
+                        None => st.live.remove(&key),
+                    };
                     // So do the bytes of a removed download's folder that would
                     // not delete: the record takes the folder over whole. Its
                     // reservation floor becomes the tombstone's figure (a
@@ -5593,6 +5865,7 @@ impl VideoStore for DiskVideoStore {
                 let ours = st.pending_starts.get(&key) == Some(&run_id);
                 if ours {
                     st.pending_starts.remove(&key);
+                    st.live.remove(&key);
                     // The record goes: a sign-in that waited for it has
                     // nothing to resume.
                     st.resume_after_save.remove(&key);
@@ -8572,13 +8845,155 @@ pub(crate) mod tests {
         assert!(names.iter().all(|n| !n.ends_with(".part")), "{names:?}");
     }
 
-    /// A retry whose plan is new (a fresh play session names every file
-    /// anew) removes the files of the plan it replaces.
+    /// Waits until `key` is stored, so a failure gated behind it lands after.
+    async fn wait_indexed(store: &DiskVideoStore, key: &str) {
+        let mut waited = 0;
+        while store.indexed_file("u1", key).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "{key} was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The server's files, every key and playlist moved from session `p`
+    /// to `to`, as a renewed play session names them.
+    fn renew_server(rig: &Rig, to: &str) -> impl Fn(&str) -> String {
+        let to = format!("PlaySessionId={to}");
+        let renamed = move |t: &str| t.replace("PlaySessionId=p", &to);
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        renamed
+    }
+
+    /// B1486/V1477: a download whose play session ended (401) carries on
+    /// under a new session, keeping every stored file under its key and
+    /// fetching only the missing ones. Disarm check: building the record
+    /// with `new_record` in place of `renewed_record` fails "the stored
+    /// keys stay" (verified 2026-11-20).
+    #[tokio::test]
+    async fn a_new_play_session_of_the_same_stream_keeps_what_is_stored() {
+        let rig = Rig::new("renew");
+        let gate = rig.server.slow_first_open(SEG1);
+        rig.server.fail(SEG1, &[401]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        wait_indexed(&store, INIT).await;
+        gate.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let failed = only(&store);
+        assert!(matches!(failed.state, KeptState::Failed { .. }));
+        assert_eq!(failed.halt, Some(Halt::SessionEnded), "{failed:?}");
+        assert!(store.indexed_file("u1", INIT).is_some());
+
+        let renamed = renew_server(&rig, "q");
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert_eq!(v.master_url, MASTER_KEY, "the stored keys stay");
+        assert!(store.stored_file("u1", INIT).is_some());
+        assert!(store.stored_file("u1", SEG1).is_some());
+        assert_eq!(v.files.len(), 5);
+        assert!(lines("pharos: video keep pruned").is_empty());
+        let renewed = lines("pharos: video keep renewed");
+        assert!(
+            renewed.iter().any(|l| l.contains("verdict=same_stream")),
+            "{renewed:?}"
+        );
+        // The missing segment was fetched under the new session.
+        let asked = rig.server.asked();
+        assert!(asked.iter().any(|k| k == &renamed(SEG1)), "{asked:?}");
+    }
+
+    /// A renewed session whose stream is not the stored one (another init
+    /// segment) is stopped as StreamChanged, its first difference named,
+    /// and nothing stored is reused.
+    #[tokio::test]
+    async fn a_renewed_stream_that_changed_is_not_spliced() {
+        let rig = Rig::new("renew-changed");
+        let gate = rig.server.slow_first_open(SEG1);
+        rig.server.fail(SEG1, &[410]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        wait_indexed(&store, INIT).await;
+        gate.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let renamed = renew_server(&rig, "q");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(renamed(INIT), b"another encoder".to_vec());
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.halt, Some(Halt::StreamChanged), "{v:?}");
+        let changed: Vec<String> = lines("pharos: video keep renewed")
+            .into_iter()
+            .filter(|l| l.contains("verdict=stream_changed"))
+            .collect();
+        assert!(
+            changed.iter().any(|l| l.contains("init_bytes")),
+            "{changed:?}"
+        );
+        assert!(
+            !changed.iter().any(|l| l.contains("PlaySessionId=q")),
+            "session hidden"
+        );
+    }
+
+    /// ADR 0148: segments stored without their init cannot be checked
+    /// against the renewed init, so the download starts afresh rather than
+    /// splice them onto another encoder's init.
+    #[tokio::test]
+    async fn segments_stored_without_their_init_are_not_spliced() {
+        let rig = Rig::new("renew-orphans");
+        let gate = rig.server.slow_first_open(INIT);
+        rig.server.fail(INIT, &[401]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        wait_indexed(&store, SEG0).await;
+        gate.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(store.indexed_file("u1", INIT).is_none());
+        let renamed = renew_server(&rig, "q");
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.halt, Some(Halt::StreamChanged), "{v:?}");
+        let changed: Vec<String> = lines("pharos: video keep renewed")
+            .into_iter()
+            .filter(|l| l.contains("init_never_stored"))
+            .collect();
+        assert!(!changed.is_empty(), "no stream_changed line names the init");
+        assert!(
+            changed.iter().all(|l| !l.contains("PlaySessionId=")),
+            "{changed:?}"
+        );
+    }
+    /// A retry under another stream (another bitrate) starts afresh and
+    /// removes the files of the plan it replaces.
     #[tokio::test]
     async fn a_retry_with_a_new_plan_removes_the_old_plans_files() {
         let rig = Rig::new("new-plan");
         let _never = rig.server.hold_mid_body(SEG0);
-        rig.server.fail(SEG1, &[403]);
+        rig.server.fail(SEG1, &[400]);
         let store = rig.open();
         store.start(request("1")).unwrap();
         store.settled().await;
@@ -8588,8 +9003,8 @@ pub(crate) mod tests {
             "the old plan left files"
         );
 
-        // The next attempt negotiates a new session: every key changes.
-        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        // The next attempt is another stream: every key changes.
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q&VideoBitrate=1");
         {
             let mut f = rig.server.files.lock().unwrap();
             let old: Vec<(String, Vec<u8>)> = f.drain().collect();
@@ -8617,6 +9032,31 @@ pub(crate) mod tests {
         assert_eq!(on_disk, v.files.len(), "only the new plan's files remain");
         assert_eq!(v.files.len(), 5);
         assert_eq!(lines("pharos: video keep pruned").len(), 1);
+    }
+
+    /// Pause stops the run where it is and keeps the record and its files
+    /// as a paused failure; a start carries on.
+    #[tokio::test]
+    async fn a_paused_download_keeps_its_files_and_carries_on() {
+        let rig = Rig::new("pause");
+        let release = rig.server.hold_mid_body(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG1).await;
+        store.pause("u1", "1").unwrap();
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.halt, Some(Halt::Paused), "{v:?}");
+        assert!(matches!(v.state, KeptState::Failed { .. }));
+        assert!(store.indexed_file("u1", INIT).is_some());
+        assert!(store.pause("u1", "1").is_err(), "not downloading now");
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(lines("pharos: video keep paused")
+            .iter()
+            .any(|l| l.contains("saved=true")));
     }
 
     /// A failed attempt leaves files on disk; they stay counted through the
@@ -14209,7 +14649,8 @@ pub(crate) mod tests {
             .lock()
             .unwrap()
             .insert(MEDIA_KEY.into(), media.into_bytes());
-        rig.server.fail(SEG1, &[403]);
+        // The encoder failing the sliver: a busy answer every retry.
+        rig.server.fail(SEG1, &[500; 8]);
         let store = rig.open();
         store.start(request("1")).unwrap();
         store.settled().await;
