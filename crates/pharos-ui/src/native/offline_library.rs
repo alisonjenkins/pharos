@@ -1227,6 +1227,13 @@ mod tests {
         CallInfo::default()
     }
 
+    /// FR-005: a dropped session switches 5 s after the loss, no sooner;
+    /// the e2e test checks nothing switched just before.
+    #[test]
+    fn the_lost_connection_grace_is_five_seconds() {
+        assert_eq!(LOST_GRACE_MS, 5_000);
+    }
+
     #[test]
     fn the_device_stands_in_only_once_the_server_is_out_of_reach() {
         let base = Standing {
