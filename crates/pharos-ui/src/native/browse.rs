@@ -2333,7 +2333,9 @@ static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::n
 /// [`remount_on`] keyed also to which library the screens read: a switch
 /// between the server's and the device's (or a new snapshot of the device)
 /// mounts a new grid, so no pager keeps the other library's pages or
-/// offsets, and the old one's replies land on nothing.
+/// offsets, and the old one's replies land on nothing. The browse screen
+/// also remounts its whole listing when a load from the other library lands,
+/// so a grid mounted from the old listing during the switch is replaced too.
 fn on_source(key: &str, body: Element) -> Element {
     remount_on(
         &format!("{} {key}", super::offline_device::library_generation()),
