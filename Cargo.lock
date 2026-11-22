@@ -8312,6 +8312,7 @@ name = "pharos-content"
 version = "0.0.0"
 dependencies = [
  "capnp",
+ "capnp-rpc",
  "futures",
  "httparse",
  "libc",

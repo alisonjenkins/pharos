@@ -16,7 +16,7 @@ use pharos_api::pharos_capnp::{bootstrap, session};
 use pharos_client::api::{ItemRef, MediaToken};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-use super::cache::{self, Cache, Download, OfflineSummary, MIN_FREE_BYTES};
+use super::cache::{self, Cache, Download, MusicPending, OfflineSummary, MIN_FREE_BYTES};
 use super::error::ContentError;
 use super::id::NodeId;
 use super::net::{self, Closed, NativeCatalogue};
@@ -124,6 +124,10 @@ enum Op {
     Search(String),
     SignOut,
     Reload,
+    /// Another part of the process signed out but could neither remove nor
+    /// mark the token with this fingerprint ([`token::fingerprint`]): stay
+    /// signed out, and refuse that token until a different one is stored.
+    StaySignedOut,
 }
 
 impl Op {
@@ -136,6 +140,7 @@ impl Op {
             Op::Search(q) => format!("search {q:?}"),
             Op::SignOut => "sign out".into(),
             Op::Reload => "reload credentials".into(),
+            Op::StaySignedOut => "stay signed out".into(),
         }
     }
 }
@@ -171,6 +176,13 @@ pub struct Library {
     network_known: AtomicBool,
     /// Restored pins were queued (once, after the state is known).
     pins_resumed: AtomicBool,
+    /// The cache has been told what other downloads hold (or there is no
+    /// hook to tell it): until then restored pins must not queue, or they
+    /// would write before the cap counts the video.
+    outside_ready: AtomicBool,
+    /// What other downloads hold of the cache's cap; applied to the cache
+    /// when it is enabled, or at once if it already is.
+    outside_used: Mutex<Option<cache::OutsideUsed>>,
 }
 
 /// The audio cache and the thread that fills it.
@@ -340,6 +352,8 @@ impl Library {
             network_up: AtomicBool::new(true),
             network_known: AtomicBool::new(false),
             pins_resumed: AtomicBool::new(false),
+            outside_ready: AtomicBool::new(false),
+            outside_used: Mutex::new(None),
         })
     }
 
@@ -493,6 +507,15 @@ impl Library {
         self.call(Op::Reload).map(|_| ())
     }
 
+    /// The app signed out but its token could be neither removed nor
+    /// marked revoked: the service drops its link and stays signed out. The
+    /// sign-out fenced that token already, in the operation that left it
+    /// ([`token::end_session`]), so every read here refuses it until a
+    /// sign-in stores another.
+    pub fn stay_signed_out(&self) -> Result<(), ContentError> {
+        self.call(Op::StaySignedOut).map(|_| ())
+    }
+
     /// Keep the listing for offline browse and remember the play order.
     fn note_listing(&self, media_id: &str, id: NodeId, nodes: &[Node]) {
         let signed_out = nodes.iter().any(|n| n.id == NodeId::SignIn.to_string());
@@ -531,16 +554,21 @@ impl Library {
     /// (see [`super::cache::DEFAULT_CAP_BYTES`]). Call once after
     /// [`Library::connect`]; calling again is a no-op.
     pub fn enable_cache(&self, dir: &Path, default_cap: u64) -> Result<(), ContentError> {
-        self.enable_cache_with(dir, default_cap, || {})
+        self.enable_cache_with(dir, default_cap, || {}, || {}, || {})
     }
 
-    /// [`Library::enable_cache`] with a hook that runs just before the
-    /// downloader is published, so a test can land a network change there.
+    /// [`Library::enable_cache`] with seams for tests: `before_publish` runs
+    /// just before the downloader is published (a network change lands
+    /// there), `between_read_and_apply` between reading the outside hook and
+    /// applying it, and `after_publish` once the downloader is reachable but
+    /// before the enable is finished.
     fn enable_cache_with(
         &self,
         dir: &Path,
         default_cap: u64,
         before_publish: impl FnOnce(),
+        between_read_and_apply: impl FnOnce(),
+        after_publish: impl FnOnce(),
     ) -> Result<(), ContentError> {
         if self.offline.get().is_some() {
             return Ok(());
@@ -563,8 +591,31 @@ impl Library {
             }
         }
         downloader.set_online(self.online.load(Ordering::SeqCst));
-        before_publish();
-        let _ = self.offline.set(Offline { cache, downloader });
+        // The pending hook is applied before the downloader is published: a
+        // `prefetch` that reaches it at once must already see what video
+        // holds, never the empty default. The lock is held from the read
+        // through the publish, as `set_outside_used` holds it from its store
+        // through its apply: a hook set meanwhile waits, then finds the cache
+        // published and applies itself, so the older one read here can never
+        // land over it.
+        {
+            let outside = cache::lock_noting(&self.outside_used);
+            between_read_and_apply();
+            let hook = if let Some(outside) = outside.clone() {
+                cache.set_outside_used(outside);
+                "pending"
+            } else {
+                "none"
+            };
+            before_publish();
+            let _ = self.offline.set(Offline {
+                cache: cache.clone(),
+                downloader,
+            });
+            log::info!("cache enabled outside_hook={hook} applied=before_publish");
+            after_publish();
+            self.outside_ready.store(true, Ordering::SeqCst);
+        }
         // A `set_online` that landed before the downloader was published
         // could not reach it. Re-apply the state now it can, before pins run.
         self.apply_online();
@@ -582,6 +633,56 @@ impl Library {
             });
         };
         o.cache.set_cap(cap_bytes).map(|_| ())
+    }
+
+    /// Count what `used` reports against the cache's cap: bytes that other
+    /// downloads (the phone's offline video) hold of the one shared budget.
+    /// They are never evicted from here; only music goes, so music cannot
+    /// push the total past the cap. Applied when the cache is enabled, or
+    /// now if it is. `used` runs under the cache's lock and must not call
+    /// back into the library.
+    pub fn set_outside_used(&self, used: cache::OutsideUsed) {
+        // Stored and applied under one hold, so two callers (or this and
+        // `enable_cache`) cannot leave the cache with the older of two hooks.
+        let mut slot = cache::lock_noting(&self.outside_used);
+        *slot = Some(used.clone());
+        if let Some(o) = self.offline.get() {
+            o.cache.set_outside_used(used);
+        }
+    }
+
+    /// What music writes the cache has approved still have to add to the
+    /// disk, for a host admitting its own downloads against the same free
+    /// space; 0 with no cache. Read under [`admission_guard`].
+    pub fn music_outstanding_bytes(&self) -> u64 {
+        self.offline.get().map_or(0, |o| o.cache.reserved_bytes())
+    }
+
+    /// Bytes music's in-flight downloads have written to `.part` files:
+    /// part of the cap, not of the free-space check (free space already
+    /// lacks them). Read after [`music_outstanding_bytes`], under
+    /// [`admission_guard`]; 0 with no cache, None when the parts could not
+    /// all be read (a host refuses new downloads until they can).
+    pub fn music_in_progress_bytes(&self) -> Option<u64> {
+        self.offline
+            .get()
+            .map_or(Some(0), |o| o.cache.in_progress_bytes())
+    }
+
+    /// What music's approved writes still owe and what its in-flight
+    /// downloads have written, from one read of each `.part`
+    /// ([`crate::cache::Cache::pending`]). Read under [`admission_guard`],
+    /// before any free-space probe; nothing in flight with no cache.
+    pub fn music_pending(&self) -> MusicPending {
+        self.offline
+            .get()
+            .map_or(MusicPending::NONE, |o| o.cache.pending())
+    }
+
+    /// Whether the music cache is enabled: it is what the cap, the free
+    /// space guard and the music's bytes are read from.
+    pub fn cache_enabled(&self) -> bool {
+        self.offline.get().is_some()
     }
 
     /// The cap in force, when the cache is enabled.
@@ -731,6 +832,7 @@ impl Library {
             return;
         };
         if self.network_known.load(Ordering::SeqCst)
+            && self.outside_ready.load(Ordering::SeqCst)
             && !self.pins_resumed.swap(true, Ordering::SeqCst)
         {
             o.downloader.resume_pins();
@@ -796,11 +898,20 @@ impl Library {
     }
 }
 
-/// A live connection and its media token.
+/// A live connection, its media token, and the device token it was
+/// opened with: a refusal on it ends that token, never whichever one is on
+/// file by then. Every link is made with its token ([`Link::new`]).
 #[derive(Clone)]
 struct Link {
     cat: NativeCatalogue,
     media: MediaToken,
+    token: String,
+}
+
+impl Link {
+    fn new(cat: NativeCatalogue, media: MediaToken, token: String) -> Self {
+        Self { cat, media, token }
+    }
 }
 
 enum Event {
@@ -828,6 +939,37 @@ struct Worker {
     /// runs before the worker consumes it does not start a poller over it.
     qc_approved: Arc<AtomicBool>,
     limit: Duration,
+}
+
+/// Reports what a sign-out (`at`: the user's, or the server's refusal)
+/// left on disk. The worker has signed out in memory either way; a removal
+/// the folder could not make durable may come back after a crash, so it is
+/// said, with the same verdict the phone uses.
+/// Logs what ending the session did to the token file. Err only when
+/// nothing on disk keeps the token from resuming after a restart.
+fn note_forgotten(at: &str, ended: token::Ended) -> Result<(), String> {
+    match ended {
+        token::Ended::Forgotten(token::Forgotten::Durable) | token::Ended::Changed => {
+            log::info!("pharos: token forget verdict=signed_out at={at}");
+        }
+        token::Ended::Forgotten(token::Forgotten::NotDurable(why)) => {
+            log::warn!("pharos: token forget verdict=signed_out_not_durable at={at} reason={why}")
+        }
+        token::Ended::Marked(why) => log::warn!(
+            "pharos: token forget verdict=marked_revoked at={at} reason=token_not_removed error={why}"
+        ),
+        token::Ended::Unsafe {
+            removal, marker, ..
+        } => {
+            log::warn!(
+                "pharos: token forget verdict=restart_unsafe at={at} removal_error={removal} marker_error={marker}"
+            );
+            return Err(format!(
+                "signed out, but the token could not be removed ({removal}) or marked revoked ({marker})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -912,16 +1054,34 @@ impl Worker {
             } => {
                 self.qc = None;
                 self.qc_approved.store(false, Ordering::SeqCst);
-                if let Err(e) = token::store(&self.token_path, &token) {
-                    log::warn!(
+                match token::store(&self.token_path, &token) {
+                    Ok(()) => {}
+                    // The file may hold the token, but this process has not
+                    // taken it up (fence, hooks): the sign-in stops here.
+                    Err(e) if token::is_store_incomplete(&e) => {
+                        log::warn!(
+                            "quickconnect sign-in verdict=stopped reason=token_store_incomplete auth=signed_out error={}",
+                            e.redacted()
+                        );
+                        // The approved code is consumed: a Pending row
+                        // left showing it would offer a code no poller
+                        // serves. The next browse waits for a new one.
+                        self.shared.set_auth(AuthState::SignedOut);
+                        self.shared.set_error(e.redacted());
+                        return;
+                    }
+                    Err(e) => log::warn!(
                         "device token not kept, signing in again next start: {}",
                         e.redacted()
-                    );
+                    ),
                 }
                 let cat = NativeCatalogue::new(bootstrap, closed, &session);
                 match cat.media_token().await {
+                    // A sign-out may have fenced the token while the media
+                    // token was out: the link is not published.
+                    Ok(_) if self.fenced_after(&token, "quickconnect") => {}
                     Ok(media) => {
-                        self.link = Some(Link { cat, media });
+                        self.link = Some(Link::new(cat, media, token));
                         self.shared.set_auth(AuthState::SignedIn);
                     }
                     Err(e) => {
@@ -942,12 +1102,73 @@ impl Worker {
         if matches!(op, Op::SignOut) {
             self.link = None;
             self.stop_sign_in();
-            token::forget(&self.token_path)?;
+            let ended = self.end_session("sign_out", None);
             self.shared.set_auth(AuthState::SignedOut);
-            return Ok(Out::Done);
+            return ended
+                .map(|()| Out::Done)
+                .map_err(|why| ContentError::TokenFile {
+                    path: self.token_path.clone(),
+                    why,
+                });
         }
         if matches!(op, Op::Reload) {
             return self.reload(events).await;
+        }
+        if matches!(op, Op::StaySignedOut) {
+            // Queued behind other work: a sign-in may have stored a newer
+            // token since the sign-out asked. Its store replaced the fence,
+            // so its token is not refused: that session and its sign-in
+            // stay. Only the token the sign-out fenced is dropped.
+            let fence = token::fence(&self.token_path);
+            let newer = match &self.link {
+                Some(l) => !fence.refuses(&l.token),
+                None => self.load_token().ok().flatten().is_some(),
+            };
+            if newer {
+                log::info!(
+                    "credentials stay signed out: verdict=kept reason=newer_sign_in linked={}",
+                    self.link.is_some()
+                );
+                return Ok(Out::Done);
+            }
+            let dropped = self.link.take().is_some();
+            // The fenced link is gone. A token on file the fence does not
+            // refuse (a sign-in that stored one since) resumes, as a reload
+            // would: the service is not signed out over a usable token.
+            // A lookup that fails leaves no link and no token to resume:
+            // the service is signed out, said so, and the error returned.
+            let stored = if dropped {
+                match self.load_token() {
+                    Ok(t) => t.is_some(),
+                    Err(e) => {
+                        let polling = self.stop_sign_in();
+                        self.shared.set_auth(AuthState::SignedOut);
+                        log::warn!(
+                            "credentials stay signed out: verdict=signed_out reason=token_lookup_failed quickconnect_stopped={polling} error={e}"
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                false
+            };
+            if stored {
+                let result = self.link(events).await.map(|_| Out::Done);
+                log::info!(
+                    "credentials stay signed out: verdict=resumed_stored reason=fenced_link_dropped outcome={}",
+                    match &result {
+                        Ok(_) => "signed_in",
+                        Err(e) => e.label(),
+                    }
+                );
+                return result;
+            }
+            let polling = self.stop_sign_in();
+            self.shared.set_auth(AuthState::SignedOut);
+            log::warn!(
+                "credentials stay signed out: verdict=fenced reason=token_neither_removed_nor_marked quickconnect_stopped={polling}"
+            );
+            return Ok(Out::Done);
         }
         let mut last = None;
         for attempt in 0..2 {
@@ -963,12 +1184,12 @@ impl Worker {
                 Op::Search(q) => tree::search(&link.cat, &urls, q)
                     .await
                     .map(|(n, r)| Out::Ranked(n, r)),
-                Op::SignOut | Op::Reload => Ok(Out::Done),
+                Op::SignOut | Op::Reload | Op::StaySignedOut => Ok(Out::Done),
             };
             match r {
                 Err(e) if e.is_revoked() => {
                     log::warn!("{}: device token revoked; starting QuickConnect", op.name());
-                    return Err(self.revoked(events));
+                    return Err(self.revoked(events, Some(link.token.clone())));
                 }
                 Err(e @ ContentError::Closed { .. }) => {
                     log::warn!("{} (attempt {}): {e}; reconnecting", op.name(), attempt + 1);
@@ -991,12 +1212,21 @@ impl Worker {
                 why: super::fault::WHY.into(),
             });
         }
+        // An open link whose token has been fenced since is not reused: the
+        // fence holds for every call, not just for the next token read. It
+        // is dropped, and the stored token is looked up as for no link: a
+        // usable replacement resumes, and none starts QuickConnect.
+        let open = self.link.as_ref().map(|l| l.token.clone());
+        if open.is_some_and(|t| self.fenced_after(&t, "open_link")) {
+            log::info!("token link verdict=dropped reason=fenced next=stored_token");
+        }
         if let Some(l) = self.link.as_mut() {
             if l.cat.is_closed() {
                 log::info!("connection closed; reconnecting");
                 self.link = None;
             } else {
                 if l.media.expires_at_ms <= now_ms().saturating_add(TOKEN_REFRESH_MARGIN_MS) {
+                    let seen = l.token.clone();
                     match l.cat.media_token().await {
                         Ok(m) => l.media = m,
                         Err(e) if e.is_revoked() => {
@@ -1004,18 +1234,47 @@ impl Worker {
                                 "media token refresh refused ({}); starting QuickConnect",
                                 e.redacted()
                             );
-                            return Err(self.revoked(events));
+                            return Err(self.revoked(events, Some(seen)));
                         }
                         Err(e) => return Err(e),
                     }
                 }
-                return Ok(l.clone());
+                // A sign-out may have fenced the token while a refresh was
+                // out: the link is not handed on. As at the entry check, the
+                // stored token is looked up instead: a usable replacement
+                // resumes, and none starts QuickConnect.
+                let link = l.clone();
+                if !self.fenced_after(&link.token, "refresh") {
+                    return Ok(link);
+                }
             }
         }
-        let Some(device_token) = token::load(&self.token_path)? else {
-            self.start_sign_in(events);
-            return Err(ContentError::NeedsSignIn);
-        };
+        // At most twice: a fence that lands while the resume is out sends
+        // it back to the token file once, where the fenced token reads as
+        // none.
+        for _ in 0..2 {
+            let Some(device_token) = self.load_token()? else {
+                self.start_sign_in(events);
+                return Err(ContentError::NeedsSignIn);
+            };
+            if let Some(link) = self.resume_link(events, device_token).await? {
+                return Ok(link);
+            }
+        }
+        log::warn!("token link verdict=needs_sign_in reason=fenced_twice");
+        self.start_sign_in(events);
+        Err(ContentError::NeedsSignIn)
+    }
+
+    /// Resumes a session from `device_token` and opens a link on it.
+    /// `None` when a sign-out fenced the token while the resume was out.
+    async fn resume_link(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+        device_token: String,
+    ) -> Result<Option<Link>, ContentError> {
+        #[cfg(test)]
+        tests::RESUMED_WITH.with(|r| r.borrow_mut().push(device_token.clone()));
         let (bootstrap, closed) = net::open(&self.base).await?;
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
@@ -1024,7 +1283,7 @@ impl Worker {
                     "stored device token refused ({}); starting QuickConnect",
                     e.redacted()
                 );
-                return Err(self.revoked(events));
+                return Err(self.revoked(events, Some(device_token)));
             }
             Err(e) => {
                 self.shared.set_error(e.redacted());
@@ -1039,14 +1298,19 @@ impl Worker {
                     "media token refused ({}); starting QuickConnect",
                     e.redacted()
                 );
-                return Err(self.revoked(events));
+                return Err(self.revoked(events, Some(device_token)));
             }
             Err(e) => return Err(e),
         };
-        let link = Link { cat, media };
+        // A sign-out may have fenced the token while the resume was out:
+        // no link opens with it.
+        if self.fenced_after(&device_token, "resume") {
+            return Ok(None);
+        }
+        let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
         self.shared.set_auth(AuthState::SignedIn);
-        Ok(link)
+        Ok(Some(link))
     }
 
     /// Drop the connection and any QuickConnect, then resume from the token
@@ -1057,7 +1321,7 @@ impl Worker {
     ) -> Result<Out, ContentError> {
         self.link = None;
         let polling = self.stop_sign_in();
-        let token = token::load(&self.token_path)?.is_some();
+        let token = self.load_token()?.is_some();
         let (verdict, result) = if token {
             match self.link(events).await {
                 Ok(_) => ("signed_in", Ok(Out::Done)),
@@ -1086,12 +1350,69 @@ impl Worker {
         self.qc.take().inspect(|h| h.abort()).is_some()
     }
 
+    /// The device token on file, behind the in-process fence
+    /// ([`token::Fence`]): the fenced token reads as none. A read never
+    /// lifts the fence; only a store of another token replaces it, in the
+    /// same hold of the file's lock ([`token::store`]).
+    fn load_token(&mut self) -> Result<Option<String>, ContentError> {
+        token::load(&self.token_path)
+    }
+
+    /// Whether `token` is fenced now, checked again after a network await
+    /// (`at`): a fenced one drops the link and signs the service out.
+    fn fenced_after(&mut self, token: &str, at: &str) -> bool {
+        let fence = token::fence(&self.token_path);
+        if !fence.refuses(token) {
+            return false;
+        }
+        log::warn!(
+            "token read verdict=refused reason=service_fence at={at} fence={}",
+            fence.label()
+        );
+        self.link = None;
+        self.shared.set_auth(AuthState::SignedOut);
+        true
+    }
+
+    /// Ends the session's token on file (`at`: the user's sign-out or the
+    /// server's refusal): only while it is still `seen` when one is named
+    /// (a refusal ends the token it was sent with; a replacement stays),
+    /// any token with `None` (a sign-out). One that could be neither
+    /// removed nor marked is fenced in this process, so nothing here
+    /// resumes from it.
+    fn end_session(&mut self, at: &str, seen: Option<&str>) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_END_SESSION.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        // An `Unsafe` end fences the token it targeted (every token, when
+        // it could not name one) inside `end_session`, under the file's
+        // lock: no store lands between the operation and its fence.
+        let ended = token::end_session(&self.token_path, seen, None);
+        if let token::Ended::Unsafe { target, .. } = &ended {
+            log::warn!(
+                "token fence verdict={} reason=token_neither_removed_nor_marked at={at}",
+                token::Fence::for_target(target.as_deref()).label()
+            );
+        }
+        note_forgotten(at, ended)
+    }
+
     /// The server refused our credentials: forget them, drop the link and
     /// start QuickConnect.
-    fn revoked(&mut self, events: &UnboundedSender<(u64, Event)>) -> ContentError {
+    fn revoked(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+        seen: Option<String>,
+    ) -> ContentError {
         self.link = None;
-        if let Err(e) = token::forget(&self.token_path) {
-            log::warn!("{}", e.redacted());
+        match seen.as_deref() {
+            Some(seen) => {
+                let _ = self.end_session("revoked", Some(seen));
+            }
+            // No token named: whatever is on file may be a replacement, so
+            // nothing on disk is removed or marked.
+            None => log::warn!("token forget verdict=kept reason=revoked_session_token_unknown"),
         }
         self.shared.set_auth(AuthState::SignedOut);
         self.start_sign_in(events);
@@ -1208,6 +1529,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::testdir::TmpDir;
+
+    thread_local! {
+        /// Runs once in `end_session` before the token file is ended.
+        pub(super) static BEFORE_END_SESSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+        /// The device token each resume was sent with, in order.
+        pub(super) static RESUMED_WITH: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     fn dead_server() -> String {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1236,21 +1567,18 @@ mod tests {
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
     }
 
-    fn cache_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "pharos-auto-libcache-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    /// A test's own folder, removed when the guard drops: bind it first in
+    /// the test, so it outlives the library and its workers.
+    fn test_root(name: &str) -> TmpDir {
+        TmpDir::new(&format!("lib-{name}"))
     }
 
-    fn offline_lib(name: &str) -> (Library, PathBuf) {
+    /// A library with its token and its cache under `root`; the cache's
+    /// folder comes back with it.
+    fn offline_lib(root: &Path) -> (Library, PathBuf) {
         let base = dead_server();
-        let tok =
-            std::env::temp_dir().join(format!("pharos-auto-lib-{name}-{}", std::process::id()));
-        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
-        let dir = cache_dir(name);
+        let lib = Library::connect_with(&base, &root.join("token"), quick()).unwrap();
+        let dir = root.join("cache");
         lib.enable_cache(&dir, 1 << 20).unwrap();
         (lib, dir)
     }
@@ -1258,17 +1586,25 @@ mod tests {
     #[test]
     fn a_network_loss_while_the_cache_starts_still_reaches_the_downloader() {
         let base = dead_server();
-        let tok = std::env::temp_dir().join(format!("pharos-auto-lib-race-{}", std::process::id()));
+        let root = test_root("race");
+        let tok = root.join("token");
         let lib = Library::connect_with(&base, &tok, quick()).unwrap();
-        lib.enable_cache_with(&cache_dir("race"), 1 << 20, || lib.set_online(false))
-            .unwrap();
+        lib.enable_cache_with(
+            &root.join("cache"),
+            1 << 20,
+            || lib.set_online(false),
+            || {},
+            || {},
+        )
+        .unwrap();
         assert!(!lib.is_online());
         assert!(!lib.offline.get().unwrap().downloader.is_online());
     }
 
     #[test]
     fn a_set_cache_cap_survives_a_restart() {
-        let (lib, dir) = offline_lib("cap");
+        let root = test_root("cap");
+        let (lib, dir) = offline_lib(&root);
         assert_eq!(
             lib.cache_cap(),
             Some(1 << 20),
@@ -1287,9 +1623,163 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_for_other_downloads_reaches_the_cache_whenever_it_is_set() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = |calls: &Arc<std::sync::atomic::AtomicUsize>| -> cache::OutsideUsed {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                cache::OutsideBytes::default()
+            })
+        };
+        // Set before the cache is enabled: applied when it is.
+        let base = dead_server();
+        let root = test_root("outside-before");
+        let tok = root.join("token");
+        let lib = Library::connect_with(&base, &tok, quick()).unwrap();
+        lib.set_outside_used(hook(&calls));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no cache to tell yet");
+        lib.enable_cache(&root.join("cache"), 1 << 20).unwrap();
+        let after_enable = calls.load(Ordering::SeqCst);
+        assert!(after_enable > 0, "the cache was told when it came up");
+        // Set after: applied at once.
+        lib.set_outside_used(hook(&calls));
+        assert!(calls.load(Ordering::SeqCst) > after_enable);
+    }
+
+    /// A hook set while the cache is being enabled must be the one the cache
+    /// keeps: the older hook, read before it, must not be applied over it.
+    #[test]
+    fn a_newer_outside_hook_is_not_overwritten_by_an_older_one_while_enabling() {
+        let hook = |held: u64| -> cache::OutsideUsed {
+            Arc::new(move || cache::OutsideBytes {
+                held,
+                ..cache::OutsideBytes::default()
+            })
+        };
+        let root = test_root("outside-race");
+        let tok = root.join("token");
+        let lib = Arc::new(Library::connect_with(&dead_server(), &tok, quick()).unwrap());
+        lib.set_outside_used(hook(1));
+        let mut handle = None;
+        lib.enable_cache_with(
+            &root.join("cache"),
+            1 << 20,
+            || {},
+            || {
+                // The older hook is read; a newer one is set now. The test
+                // goes on only once the setter is blocked at the outside
+                // hook lock the enable holds (`lock_noting`), never on a
+                // timer: without that hold the setter is applied at once,
+                // and the enable then puts the older hook over it.
+                let l = lib.clone();
+                let setter = std::thread::spawn(move || l.set_outside_used(hook(2)));
+                cache::tests::wait_until_blocked(setter.thread().id());
+                handle = Some(setter);
+            },
+            || {},
+        )
+        .unwrap();
+        handle.unwrap().join().unwrap();
+        let held = lib.offline.get().unwrap().cache.outside_for_test().held;
+        assert_eq!(held, 2, "the cache kept the older hook");
+    }
+
+    /// Restored pins do not queue between the cache being published and the
+    /// outside-bytes hook being applied.
+    #[test]
+    fn restored_pins_wait_for_the_outside_hook() {
+        let root = test_root("pins-wait");
+        let tok = root.join("token");
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        lib.set_outside_used(Arc::new(cache::OutsideBytes::default));
+        let mid = std::cell::Cell::new(None);
+        lib.enable_cache_with(
+            &root.join("cache"),
+            1 << 20,
+            || {},
+            || {},
+            || {
+                // The cache is published, the enable not yet finished.
+                lib.set_online(true);
+                mid.set(Some(lib.pins_resumed.load(Ordering::SeqCst)));
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mid.get(),
+            Some(false),
+            "pins queued before the hook applied"
+        );
+        assert!(
+            lib.pins_resumed.load(Ordering::SeqCst),
+            "pins never resumed after"
+        );
+    }
+
+    /// A `prefetch` that reaches the downloader the moment it is published
+    /// is admitted against the pending outside hook, not the empty default:
+    /// with a video folder of unknown size, its first admission asks the
+    /// hook and is refused.
+    #[test]
+    fn a_prefetch_as_the_cache_comes_up_sees_the_pending_outside_hook() {
+        let root = test_root("prefetch-gap");
+        let tok = root.join("token");
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        lib.set_outside_used(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            cache::OutsideBytes {
+                unknown: true,
+                ..cache::OutsideBytes::default()
+            }
+        }));
+        let asked = std::cell::Cell::new(false);
+        lib.enable_cache_with(
+            &root.join("cache"),
+            1 << 20,
+            || {},
+            || {},
+            || {
+                let before = calls.load(Ordering::SeqCst);
+                assert_eq!(lib.prefetch(&["track/x".into()]), 1);
+                let start = std::time::Instant::now();
+                while calls.load(Ordering::SeqCst) == before
+                    && start.elapsed() < Duration::from_secs(2)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                asked.set(calls.load(Ordering::SeqCst) > before);
+            },
+        )
+        .unwrap();
+        assert!(
+            asked.get(),
+            "the prefetch was admitted without the pending hook"
+        );
+    }
+
+    #[test]
+    fn the_cache_is_enabled_only_once_it_is_up() {
+        let root = test_root("enabled");
+        let tok = root.join("token");
+        let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
+        assert!(!lib.cache_enabled());
+        // A cache directory that cannot be made leaves it disabled.
+        let file = root.join("notadir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(lib.enable_cache(&file.join("sub"), 1 << 20).is_err());
+        assert!(!lib.cache_enabled());
+        lib.enable_cache(&root.join("cache"), 1 << 20).unwrap();
+        assert!(lib.cache_enabled());
+    }
+
+    #[test]
     fn enabling_the_cache_logs_where_its_cap_came_from() {
         crate::testlog::start();
-        let (lib, dir) = offline_lib("cap-source");
+        let root = test_root("cap-source");
+        let (lib, dir) = offline_lib(&root);
         let has = |want: &str| crate::testlog::lines().iter().any(|l| l == want);
         assert!(
             has("cache cap bytes=1048576 source=default"),
@@ -1310,7 +1800,8 @@ mod tests {
 
     #[test]
     fn reloading_with_no_token_file_signs_out_quietly() {
-        let tok = cache_dir("reload-none").join("device-token");
+        let root = test_root("reload-none");
+        let tok = root.join("device-token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         lib.reload_credentials().unwrap();
         assert_eq!(lib.auth_state(), AuthState::SignedOut);
@@ -1318,7 +1809,8 @@ mod tests {
 
     #[test]
     fn reloading_a_new_token_file_resumes_from_it_and_keeps_it() {
-        let tok = cache_dir("reload-token").join("device-token");
+        let root = test_root("reload-token");
+        let tok = root.join("device-token");
         let lib = Library::connect_with(&dead_server(), &tok, quick()).unwrap();
         token::store(&tok, "from-the-phone").unwrap();
         let e = lib.reload_credentials().unwrap_err();
@@ -1332,8 +1824,8 @@ mod tests {
 
     #[test]
     fn a_cap_needs_the_cache() {
-        let lib =
-            Library::connect_with(&dead_server(), &cache_dir("nocap").join("t"), quick()).unwrap();
+        let root = test_root("nocap");
+        let lib = Library::connect_with(&dead_server(), &root.join("t"), quick()).unwrap();
         assert!(lib.set_cache_cap(1).is_err());
         assert_eq!(lib.cache_cap(), None);
         assert_eq!(lib.offline_summary(), None);
@@ -1342,7 +1834,8 @@ mod tests {
 
     #[test]
     fn the_offline_summary_reports_cap_use_and_the_guard() {
-        let (lib, _dir) = offline_lib("summary");
+        let root = test_root("summary");
+        let (lib, _dir) = offline_lib(&root);
         lib.set_cache_cap(4096).unwrap();
         let s = lib.offline_summary().unwrap();
         assert_eq!((s.cap_bytes, s.used_bytes), (4096, 0));
@@ -1376,7 +1869,8 @@ mod tests {
 
     #[test]
     fn play_queue_is_the_rest_of_the_album_in_order() {
-        let (lib, _) = offline_lib("queue");
+        let root = test_root("queue");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
         assert_eq!(lib.play_queue("track/1"), ["track/2", "track/3"]);
@@ -1390,7 +1884,8 @@ mod tests {
 
     #[test]
     fn local_path_is_only_for_whole_cached_files() {
-        let (lib, _) = offline_lib("local");
+        let root = test_root("local");
+        let (lib, _) = offline_lib(&root);
         assert_eq!(lib.local_path("track/1"), None);
         keep(&lib, "track/1");
         let p = lib.local_path("track/1").unwrap();
@@ -1414,7 +1909,8 @@ mod tests {
     /// phone, and those rows carry no URL (and so no token).
     #[test]
     fn an_unreachable_server_still_lists_the_cached_tracks_of_an_album() {
-        let (lib, _) = offline_lib("browse");
+        let root = test_root("browse");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2), track(3)]);
         keep(&lib, "track/2");
@@ -1436,7 +1932,8 @@ mod tests {
 
     #[test]
     fn set_offline_answers_from_the_snapshot_without_waiting_for_the_network() {
-        let (lib, _) = offline_lib("flag");
+        let root = test_root("flag");
+        let (lib, _) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1)]);
         keep(&lib, "track/1");
@@ -1449,7 +1946,8 @@ mod tests {
 
     #[test]
     fn a_book_offline_plays_its_parts_on_the_phone_from_the_first() {
-        let (lib, _) = offline_lib("book");
+        let root = test_root("book");
+        let (lib, _) = offline_lib(&root);
         let book = NodeId::parse("album/7").unwrap();
         let mut resume = track(9);
         resume.id = "album/7".into();
@@ -1477,7 +1975,8 @@ mod tests {
 
     #[test]
     fn progress_offline_is_dropped_and_says_so() {
-        let (lib, _) = offline_lib("progress");
+        let root = test_root("progress");
+        let (lib, _) = offline_lib(&root);
         lib.set_online(false);
         crate::testlog::start();
         lib.progress("track/2", 61_000, tree::Progress::Paused)
@@ -1497,17 +1996,13 @@ mod tests {
 
     #[test]
     fn the_play_order_and_snapshots_survive_a_restart() {
-        let (lib, dir) = offline_lib("restart");
+        let root = test_root("restart");
+        let (lib, dir) = offline_lib(&root);
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2)]);
         keep(&lib, "track/1");
         drop(lib);
-        let lib2 = Library::connect_with(
-            &dead_server(),
-            &std::env::temp_dir().join("pharos-auto-lib-restart2"),
-            quick(),
-        )
-        .unwrap();
+        let lib2 = Library::connect_with(&dead_server(), &root.join("token2"), quick()).unwrap();
         lib2.enable_cache(&dir, 1 << 20).unwrap();
         assert_eq!(lib2.play_queue("track/1"), ["track/2"]);
         assert!(lib2.local_path("track/1").is_some());
@@ -1515,7 +2010,8 @@ mod tests {
 
     #[test]
     fn only_albums_and_mixes_pin_and_a_pin_survives_for_the_tracks_it_names() {
-        let (lib, dir) = offline_lib("pin");
+        let root = test_root("pin");
+        let (lib, dir) = offline_lib(&root);
         assert!(lib.pin("music/albums").is_err());
         let album = NodeId::parse("album/7").unwrap();
         lib.note_listing("album/7", album, &[track(1), track(2)]);
@@ -1544,10 +2040,9 @@ mod tests {
         );
     }
 
-    fn worker(name: &str) -> (Worker, Arc<Shared>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("pharos-lib-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A worker whose token lives under `dir` (a test's `test_root`, bound
+    /// before the worker so it outlives it).
+    fn worker(dir: &Path) -> (Worker, Arc<Shared>, PathBuf) {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 auth: AuthState::SignedOut,
@@ -1581,7 +2076,8 @@ mod tests {
 
     #[test]
     fn a_sign_out_disowns_the_pending_quickconnect_poller() {
-        let (mut w, shared, _) = worker("signout-qc");
+        let root = test_root("signout-qc");
+        let (mut w, shared, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
@@ -1597,9 +2093,718 @@ mod tests {
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
     }
 
+    /// A sign-out whose removal the folder could not make durable still
+    /// signs out in memory, says it is not durable, and marks the token
+    /// revoked (both the user's sign-out and the server's refusal).
+    #[test]
+    fn a_sign_out_that_is_not_durable_is_reported_and_still_signs_out() {
+        use std::io::ErrorKind::Other;
+        let root = test_root("signout-not-durable");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        for at in ["sign_out", "revoked"] {
+            // Each case starts signed in, so the sign-out is what moves it.
+            shared.set_auth(AuthState::SignedIn);
+            assert_eq!(shared.lock().auth, AuthState::SignedIn, "{at}");
+            token::store(&token_path, "tok").unwrap();
+            crate::testlog::start();
+            crate::token::tests::DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+            local.block_on(&rt, async {
+                if at == "sign_out" {
+                    w.execute(&Op::SignOut, &events).await.unwrap();
+                } else {
+                    let _ = w.revoked(&events, Some("tok".to_owned()));
+                }
+            });
+            crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+            assert_eq!(shared.lock().auth, AuthState::SignedOut, "{at}");
+            assert!(token::load(&token_path).unwrap().is_none(), "{at}");
+            let lines = crate::testlog::lines();
+            // Not durable is said, and the token is marked as well, so a
+            // crash that brings it back resumes nothing.
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("verdict=signed_out_not_durable")),
+                "{at}: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains(&format!(
+                    "pharos: token forget verdict=marked_revoked at={at} reason=token_not_removed error=removal not durable"
+                ))),
+                "{at}: {lines:?}"
+            );
+        }
+    }
+
+    /// A sign-out whose token is readable but cannot be removed leaves the
+    /// service signed out: the token is marked revoked, and the reload the
+    /// credentials change asks for finds no token.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_out_whose_token_will_not_go_leaves_the_service_signed_out() {
+        let root = test_root("signout-kept");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        crate::testlog::start();
+        token::faults::REMOVE.with(|f| f.set(true));
+        local.block_on(&rt, async {
+            w.execute(&Op::SignOut, &events).await.unwrap();
+        });
+        token::faults::REMOVE.with(|f| f.set(false));
+        assert!(
+            std::fs::metadata(&token_path).is_ok(),
+            "the fault removed it"
+        );
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=marked_revoked at=sign_out")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "{lines:?}"
+        );
+    }
+
+    /// A sign-out whose token can be neither removed nor marked keeps the
+    /// service signed out all the same: the reload the credentials change
+    /// asks for refuses that token. A different token lifts the fence.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_out_whose_token_neither_goes_nor_is_marked_leaves_the_service_signed_out() {
+        let root = test_root("signout-unsafe");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        token::faults::REMOVE.with(|f| f.set(true));
+        token::faults::MARKER.with(|f| f.set(true));
+        local.block_on(&rt, async {
+            let _ = w.execute(&Op::SignOut, &events).await;
+        });
+        token::faults::REMOVE.with(|f| f.set(false));
+        token::faults::MARKER.with(|f| f.set(false));
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tok")),
+            "the sign-out did not fence the token it left"
+        );
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("token read verdict=refused reason=sign_out_fence")),
+            "the reload read the signed-out token: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "{lines:?}"
+        );
+        // A new sign-in's token is not the fenced one.
+        token::store(&token_path, "tok2").unwrap();
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+        assert!(!token::fence(&token_path).refuses("tok2"));
+    }
+
+    /// The app's sign-out could neither remove nor mark the token: told to
+    /// stay signed out, the service refuses that token on its next reload.
+    #[test]
+    fn a_service_told_to_stay_signed_out_refuses_that_token() {
+        let root = test_root("stay-signed-out");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        // The app's sign-out fenced the token it could not end.
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
+        local.block_on(&rt, async {
+            w.execute(&Op::StaySignedOut, &events).await.unwrap();
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("credentials stay signed out: verdict=fenced")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
+            ),
+            "the reload resumed the fenced token: {lines:?}"
+        );
+    }
+
+    /// CR 4642574319: a stay-signed-out notice that reaches the worker
+    /// after a newer sign-in stored its token keeps that session: only the
+    /// fenced token is refused. The control is the test above.
+    #[test]
+    fn a_late_stay_signed_out_keeps_a_newer_sign_in() {
+        let root = test_root("stay-signed-out-late");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
+        // A newer sign-in, before the notice is handled.
+        token::store(&token_path, "tok2").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        crate::testlog::start();
+        local.block_on(&rt, async {
+            w.execute(&Op::StaySignedOut, &events).await.unwrap();
+        });
+        assert_eq!(
+            shared.lock().auth,
+            AuthState::SignedIn,
+            "the newer sign-in was dropped"
+        );
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    .contains("credentials stay signed out: verdict=kept reason=newer_sign_in")),
+            "{lines:?}"
+        );
+    }
+
+    /// A refusal ends the token its request was sent with: a replacement a
+    /// sign-in stored since is kept, and the refused token, still on file,
+    /// goes.
+    #[test]
+    fn a_revoked_session_ends_its_own_token_not_a_replacement() {
+        let root = test_root("revoked-own");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tokB").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, Some("tokA".to_owned()));
+        });
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "the refusal of A's session removed B's token"
+        );
+        token::store(&token_path, "tokA").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, Some("tokA".to_owned()));
+        });
+        assert_eq!(token::load(&token_path).unwrap(), None);
+    }
+
+    /// A refusal that names no token leaves the token file alone: whatever
+    /// is on file may be a replacement.
+    #[test]
+    fn a_refusal_naming_no_token_removes_nothing() {
+        let root = test_root("revoked-none");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tokB").unwrap();
+        local.block_on(&rt, async {
+            let _ = w.revoked(&events, None);
+        });
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "a refusal naming no token ended the token on file"
+        );
+    }
+
+    /// A session QuickConnect approved ends its own token when the server
+    /// refuses it: a replacement token stored since is left as it is. Run
+    /// through the real approval path over an in-process session whose
+    /// media token is refused on the refresh.
+    #[test]
+    fn a_quickconnect_session_refused_leaves_a_replacement_token() {
+        struct Session(std::cell::Cell<u32>);
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                let r = results.get().init_result();
+                if n == 0 {
+                    // Expired at once: the next call refreshes it.
+                    let mut t = r.init_token();
+                    t.set_token("media");
+                    t.set_expires_at_ms(0);
+                } else {
+                    pharos_api::Denial::Revoked { reason: "revoked" }.write(r.init_error());
+                }
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("qc-revoked-own");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session(std::cell::Cell::new(0))),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        assert_eq!(token::load(&token_path).unwrap().as_deref(), Some("tokA"));
+        // Another sign-in stores B while A's link is still open.
+        token::store(&token_path, "tokB").unwrap();
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        assert!(matches!(out, Err(ContentError::NeedsSignIn)), "not refused");
+        assert_eq!(
+            token::load(&token_path).unwrap().as_deref(),
+            Some("tokB"),
+            "the refusal of A's QuickConnect session removed B's token"
+        );
+    }
+
+    /// CR 4638660894: a read that finds B on file while A is fenced
+    /// returns B and leaves A's fence standing. Only a store replaces a
+    /// fence; a read from before a sign-out's fence never clears it.
+    #[test]
+    fn a_read_of_another_token_does_not_lift_the_fence() {
+        let root = test_root("fence-not-lifted");
+        let (mut w, _shared, token_path) = worker(&root);
+        token::store(&token_path, "tokB").unwrap();
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tokB"));
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tokA")),
+            "a read lifted the fence"
+        );
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokB")), "test");
+        assert_eq!(
+            w.load_token().unwrap(),
+            None,
+            "B was read through its fence"
+        );
+    }
+
+    /// CR 4637783594: a link opened with a token fenced since is not
+    /// reused: the next call drops it and asks for a sign-in, sending
+    /// nothing with the fenced token.
+    #[test]
+    fn a_fenced_token_is_not_used_through_an_open_link() {
+        struct Session;
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                let mut t = results.get().init_result().init_token();
+                t.set_token("media");
+                t.set_expires_at_ms(u64::MAX);
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("fence-open-link");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        assert!(
+            matches!(&out, Err(ContentError::NeedsSignIn)),
+            "{:?}",
+            out.err()
+        );
+        assert!(w.link.is_none(), "the fenced link was kept");
+    }
+
+    /// CR 4638660884: a sign-out that fences the token while a media
+    /// token refresh is out is honored when the refresh returns: the link
+    /// is dropped and nothing is sent with the fenced token.
+    #[test]
+    fn a_fence_set_during_a_refresh_is_honored_after_it() {
+        thread_local! {
+            /// The token file to fence from inside the refresh, once armed.
+            static FENCE_AT: std::cell::RefCell<Option<PathBuf>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        struct Session;
+        impl session::Server for Session {
+            fn media_token(
+                self: capnp::capability::Rc<Self>,
+                _: session::MediaTokenParams,
+                mut results: session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                if let Some(path) = FENCE_AT.with(|f| f.borrow_mut().take()) {
+                    token::add_fence(&path, &token::Fence::for_token(Some("tokA")), "test");
+                }
+                let mut t = results.get().init_result().init_token();
+                t.set_token("media");
+                // Always due: every call refreshes.
+                t.set_expires_at_ms(0);
+                std::future::ready(Ok(()))
+            }
+        }
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("fence-during-refresh");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(Session),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        FENCE_AT.with(|f| *f.borrow_mut() = Some(token_path.clone()));
+        crate::testlog::start();
+        let out = local.block_on(&rt, w.execute(&Op::Children(NodeId::Root), &events));
+        assert!(
+            matches!(&out, Err(ContentError::NeedsSignIn)),
+            "{:?}",
+            out.err()
+        );
+        assert!(w.link.is_none(), "the fenced link was kept");
+        // CR 4642574342: as at the entry check, the token file is looked
+        // up: the fenced token reads as none, so QuickConnect starts.
+        assert!(w.qc.is_some(), "no sign-in started after the fence");
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("token read verdict=refused reason=service_fence at=refresh")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR reply 4644229275: the service holds a link on A, fenced, when the
+    /// phone has stored B. StaySignedOut drops A's link and resumes with B,
+    /// as a reload would: SignedOut is not reported and QuickConnect is not
+    /// stopped over a usable token.
+    #[test]
+    fn a_stay_signed_out_over_a_fenced_link_resumes_the_stored_token() {
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("stay-signed-out-resumes");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(|| {})),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        token::store(&token_path, "tokB").unwrap();
+        RESUMED_WITH.with(|r| r.borrow_mut().clear());
+        crate::testlog::start();
+        let _ = local.block_on(&rt, w.execute(&Op::StaySignedOut, &events));
+        let lines = crate::testlog::lines();
+        assert_eq!(
+            RESUMED_WITH.with(|r| r.borrow().clone()),
+            ["tokB".to_owned()],
+            "B was not used"
+        );
+        assert_ne!(
+            shared.lock().auth,
+            AuthState::SignedOut,
+            "SignedOut was reported"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "credentials stay signed out: verdict=resumed_stored reason=fenced_link_dropped"
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("verdict=fenced reason=token_neither")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4646280193: StaySignedOut drops a fenced link, and the lookup
+    /// for a token to resume fails. The service is signed out (no link is
+    /// left), says so, and returns the error.
+    #[test]
+    fn a_stay_signed_out_whose_token_lookup_fails_signs_out() {
+        struct Boot;
+        impl bootstrap::Server for Boot {}
+        let root = test_root("stay-signed-out-lookup-fails");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(Boot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(|| {})),
+                token: "tokA".to_owned(),
+            })
+            .await;
+        });
+        assert!(w.link.is_some(), "the approval opened no link");
+        assert_ne!(shared.lock().auth, AuthState::SignedOut);
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        // A token file that cannot be read.
+        let _ = std::fs::remove_file(&token_path);
+        std::fs::create_dir_all(&token_path).unwrap();
+        crate::testlog::start();
+        let result = local.block_on(&rt, w.execute(&Op::StaySignedOut, &events));
+        let lines = crate::testlog::lines();
+        assert!(result.is_err(), "the lookup error was not returned");
+        assert!(w.link.is_none());
+        assert_eq!(shared.lock().auth, AuthState::SignedOut, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(
+                "credentials stay signed out: verdict=signed_out reason=token_lookup_failed"
+            )),
+            "{lines:?}"
+        );
+    }
+
+    /// A session whose media token call runs `on_call` first.
+    struct HookSession(fn());
+    impl session::Server for HookSession {
+        fn media_token(
+            self: capnp::capability::Rc<Self>,
+            _: session::MediaTokenParams,
+            mut results: session::MediaTokenResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            (self.0)();
+            let mut t = results.get().init_result().init_token();
+            t.set_token("media");
+            t.set_expires_at_ms(u64::MAX);
+            std::future::ready(Ok(()))
+        }
+    }
+    struct HookBoot;
+    impl bootstrap::Server for HookBoot {}
+
+    thread_local! {
+        /// The token file a hook session fences, once armed.
+        static HOOK_PATH: std::cell::RefCell<Option<PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn approve(
+        w: &mut Worker,
+        rt: &tokio::runtime::Runtime,
+        local: &tokio::task::LocalSet,
+        on_call: fn(),
+        token: &str,
+    ) {
+        local.block_on(rt, async {
+            w.on_event(Event::Approved {
+                bootstrap: capnp_rpc::new_client(HookBoot),
+                closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+                session: capnp_rpc::new_client(HookSession(on_call)),
+                token: token.to_owned(),
+            })
+            .await;
+        });
+    }
+
+    /// CR 4640611270: a sign-out that fences the approved token while the
+    /// QuickConnect media token call is out is honored when it returns:
+    /// no link is published and the worker does not sign in.
+    #[test]
+    fn a_fence_set_during_a_quickconnect_approval_is_honored() {
+        let root = test_root("fence-during-qc");
+        let (mut w, shared, token_path) = worker(&root);
+        HOOK_PATH.with(|p| *p.borrow_mut() = Some(token_path.clone()));
+        let (rt, local) = local_rt();
+        crate::testlog::start();
+        approve(
+            &mut w,
+            &rt,
+            &local,
+            || {
+                if let Some(path) = HOOK_PATH.with(|p| p.borrow_mut().take()) {
+                    token::add_fence(&path, &token::Fence::for_token(Some("tokA")), "test");
+                }
+            },
+            "tokA",
+        );
+        let lines = crate::testlog::lines();
+        assert!(w.link.is_none(), "a fenced approval opened a link");
+        assert_ne!(shared.lock().auth, AuthState::SignedIn);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=service_fence at=quickconnect")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4640611326: an approval whose token store cannot be confirmed
+    /// does not sign in.
+    #[test]
+    fn a_quickconnect_approval_whose_store_is_incomplete_stops() {
+        let root = test_root("qc-store-incomplete");
+        let (mut w, shared, _) = worker(&root);
+        let (rt, local) = local_rt();
+        token::tests::FAIL_READ_BACK.with(|f| f.set(true));
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        token::tests::FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(w.link.is_none(), "an unconfirmed store signed in");
+        assert_ne!(shared.lock().auth, AuthState::SignedIn);
+    }
+
+    /// CR 4644634491: an approval whose store is incomplete, reached while
+    /// its code shows (Pending), leaves the service signed out, not Pending
+    /// with the consumed code: the next browse waits for a new code.
+    #[test]
+    fn an_incomplete_store_clears_the_consumed_code() {
+        let root = test_root("qc-store-incomplete-pending");
+        let (mut w, shared, _) = worker(&root);
+        let (rt, local) = local_rt();
+        shared.set_auth(AuthState::Pending {
+            code: "123456".to_owned(),
+        });
+        token::tests::FAIL_READ_BACK.with(|f| f.set(true));
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        token::tests::FAIL_READ_BACK.with(|f| f.set(false));
+        assert_eq!(
+            shared.lock().auth,
+            AuthState::SignedOut,
+            "the consumed code is still shown"
+        );
+    }
+
+    /// CR 4640611278: an open link whose token is fenced is dropped, and the
+    /// stored token is looked up as for no link: a usable replacement is
+    /// resumed (here the server is unreachable, so the resume is what
+    /// fails), not a bare NeedsSignIn.
+    #[test]
+    fn a_fenced_link_falls_through_to_the_stored_token() {
+        let root = test_root("fenced-link-falls-through");
+        let (mut w, _shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        approve(&mut w, &rt, &local, || {}, "tokA");
+        assert!(w.link.is_some());
+        token::store(&token_path, "tokB").unwrap();
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tokA")), "test");
+        let out = local.block_on(&rt, w.link(&events));
+        assert!(
+            matches!(&out, Err(ContentError::Connect { .. })),
+            "the replacement was not resumed: {:?}",
+            out.err()
+        );
+        token::clear_fence(&token_path);
+    }
+
+    /// CR 4637783547: a sign-out fences the token `end_session` targeted
+    /// under the file lock, not one read before it. A replaces nothing
+    /// here: B is stored in between, cannot be removed or marked, and B is
+    /// what the fence names.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_out_fences_the_token_it_targeted() {
+        let root = test_root("fence-targeted");
+        let (mut w, _shared, token_path) = worker(&root);
+        token::store(&token_path, "tokA").unwrap();
+        let swap = token_path.clone();
+        BEFORE_END_SESSION.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                token::store(&swap, "tokB").unwrap();
+                token::faults::REMOVE.with(|f| f.set(true));
+                token::faults::MARKER.with(|f| f.set(true));
+            }));
+        });
+        let out = w.end_session("sign_out", None);
+        token::faults::REMOVE.with(|f| f.set(false));
+        token::faults::MARKER.with(|f| f.set(false));
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(
+            token::fence(&token_path),
+            token::Fence::for_token(Some("tokB"))
+        );
+    }
+
+    /// A fence set before any library is connected (the app signed out and
+    /// could neither remove nor mark its token) holds for a worker that
+    /// connects afterwards; a different token is not fenced.
+    #[test]
+    fn a_fence_set_before_the_service_connects_holds_for_its_worker() {
+        let root = test_root("fence-before-connect");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        token::add_fence(&token_path, &token::Fence::for_token(Some("tok")), "test");
+        local.block_on(&rt, async {
+            w.execute(&Op::Reload, &events).await.unwrap();
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
+        assert_eq!(
+            w.load_token().unwrap(),
+            None,
+            "the new worker read the fenced token"
+        );
+        token::store(&token_path, "tok2").unwrap();
+        assert_eq!(w.load_token().unwrap().as_deref(), Some("tok2"));
+    }
+
     #[test]
     fn a_reload_disowns_the_pending_quickconnect_poller() {
-        let (mut w, _, _) = worker("reload-qc");
+        let root = test_root("reload-qc");
+        let (mut w, _, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
@@ -1612,17 +2817,249 @@ mod tests {
 
     #[test]
     fn a_revoked_session_forgets_the_token_and_starts_quickconnect() {
-        let (mut w, shared, token_path) = worker("revoked");
+        let root = test_root("revoked");
+        let (mut w, shared, token_path) = worker(&root);
         token::store(&token_path, "stale-token").unwrap();
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
-            let e = w.revoked(&events);
+            let e = w.revoked(&events, Some("stale-token".to_owned()));
             assert!(matches!(e, ContentError::NeedsSignIn), "{e}");
             assert!(w.qc.is_some(), "QuickConnect started");
         });
         assert!(token::load(&token_path).unwrap().is_none());
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
+    }
+
+    /// A chunked download of unknown length, held in the middle of its
+    /// window, is on the library's outstanding figure (what a host that
+    /// shares the disk reads), and gone when the job ends. The downloader
+    /// is the real one over the real cache, resolving to a local server
+    /// (the library's own resolver needs the server's node protocol).
+    #[test]
+    fn a_download_held_mid_window_is_outstanding_until_the_job_ends() {
+        use crate::prefetch::{Downloader, Resolver, Tuning, FREE_CHECK_BYTES};
+        use crate::testserver::{Script, TestServer};
+        // Declared before the library and downloader, the folder drops
+        // after them, even when an assertion fails.
+        let dir = TmpDir::new("lib-window");
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .chunked()
+            .hold_after(64 * 1024);
+        let srv = Arc::new(TestServer::start(script));
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        // A fixed, ample free space: the temp filesystem's own is not the
+        // subject, and under the guard it would refuse every reservation.
+        let cache = Arc::new(
+            Cache::open_with_probe(&dir.join("cache"), 100 << 30, Box::new(|_| Ok(u64::MAX)))
+                .unwrap(),
+        );
+        let s2 = srv.clone();
+        let resolve: Resolver = Arc::new(move |_| Ok(s2.url_with_token("/audio/1", "t")));
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
+        downloader.set_online(true);
+        assert!(lib
+            .offline
+            .set(Offline {
+                cache: cache.clone(),
+                downloader,
+            })
+            .is_ok());
+        assert_eq!(lib.music_outstanding_bytes(), 0);
+        lib.prefetch(&["track/1".to_owned()]);
+        // The server has stopped mid-body: the download is in its window.
+        let mut waited = 0;
+        while !reached.load(Ordering::SeqCst) {
+            waited += 1;
+            assert!(waited < 10_000, "the server never reached the hold");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The server's hold is set once its bytes reach the socket, not the
+        // disk: wait for the downloader to land them all in the `.part`.
+        let hold = 64 * 1024;
+        let part = cache.part_path("track/1");
+        let landed = || std::fs::metadata(&part).map_or(0, |m| m.len());
+        let mut waited = 0;
+        while landed() < hold || lib.music_in_progress_bytes().unwrap_or(0) < hold {
+            waited += 1;
+            assert!(
+                waited < 10_000,
+                "the .part never reached the hold: {} on disk, {:?} in progress",
+                landed(),
+                lib.music_in_progress_bytes()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The window is claimed whole: what has landed of it in the `.part`,
+        // and what is still owed of it (never the landed bytes again), from
+        // one read, as a host reads them.
+        let pending = lib.music_pending();
+        let written = pending.written.unwrap_or(0);
+        let outstanding = pending.owed;
+        assert_eq!(
+            written + outstanding,
+            FREE_CHECK_BYTES,
+            "the window is not claimed whole: {written} written, {outstanding} owed"
+        );
+        assert_eq!(
+            outstanding,
+            FREE_CHECK_BYTES - written,
+            "the bytes already written are still counted as owed"
+        );
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        assert_eq!(lib.music_outstanding_bytes(), 0, "kept after the job ended");
+    }
+
+    /// A library over the real cache and downloader, resolving `track/N` to
+    /// `/audio/N` on a local server (the library's own resolver needs the
+    /// server's node protocol), with a fixed, ample free space.
+    struct HeldRig {
+        lib: Library,
+        _srv: Arc<crate::testserver::TestServer>,
+        // Fields drop in declaration order: last, so the folder goes only
+        // after the library's downloader has shut down.
+        _cleanup: TmpDir,
+    }
+
+    fn held_rig(tag: &str, script: crate::testserver::Script) -> HeldRig {
+        use crate::prefetch::{Downloader, Resolver, Tuning};
+        let dir = TmpDir::new(&format!("lib-{tag}"));
+        let srv = Arc::new(crate::testserver::TestServer::start(script));
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        let cache = Arc::new(
+            Cache::open_with_probe(&dir.join("cache"), 100 << 30, Box::new(|_| Ok(u64::MAX)))
+                .unwrap(),
+        );
+        let s2 = srv.clone();
+        let resolve: Resolver = Arc::new(move |id| {
+            let n = id.rsplit('/').next().unwrap_or("1");
+            Ok(s2.url_with_token(&format!("/audio/{n}"), "t"))
+        });
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
+        downloader.set_online(true);
+        assert!(lib.offline.set(Offline { cache, downloader }).is_ok());
+        HeldRig {
+            lib,
+            _srv: srv,
+            _cleanup: dir,
+        }
+    }
+
+    fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+        let mut waited = 0;
+        while !ok() {
+            waited += 1;
+            assert!(waited < 10_000, "never: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// What a video admission against the shared cap reads from the music
+    /// cache, as the phone's budget sums it: finished bytes, bytes still to
+    /// come and bytes already written to a `.part`. A video of `video` bytes
+    /// fits under `cap` only when that sum leaves it room.
+    fn video_fits(lib: &Library, cap: u64, video: u64) -> bool {
+        let used = lib.offline_summary().map_or(0, |s| s.used_bytes);
+        let claimed = used
+            .saturating_add(lib.music_outstanding_bytes())
+            .saturating_add(lib.music_in_progress_bytes().unwrap_or(u64::MAX));
+        claimed.saturating_add(video) <= cap
+    }
+
+    /// A known-length download paused after its reservation was refreshed to
+    /// what is left: the bytes already written are in the cap figure, so a
+    /// video that fits only without them is refused.
+    #[test]
+    fn a_video_is_refused_after_a_music_reservation_refresh() {
+        use crate::prefetch::FREE_CHECK_BYTES;
+        use crate::testserver::Script;
+        let size = usize::try_from(FREE_CHECK_BYTES * 3).unwrap();
+        let hold_at = usize::try_from(FREE_CHECK_BYTES + (1 << 20)).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .hold_after(hold_at);
+        let rig = held_rig("refresh", script);
+        let lib = &rig.lib;
+        lib.prefetch(&["track/1".to_owned()]);
+        wait_until("the server holding", || reached.load(Ordering::SeqCst));
+        // The refresh has moved the reservation's baseline past the bytes
+        // written before it (the outstanding figure alone would also fall
+        // as bytes land against the first reservation).
+        let total = u64::try_from(size).unwrap();
+        let cache = &lib.offline.get().unwrap().cache;
+        wait_until("the reservation refreshed", || {
+            cache
+                .reservation("track/1")
+                .is_some_and(|(_, at_len)| at_len >= FREE_CHECK_BYTES)
+        });
+        let r = lib.music_outstanding_bytes();
+        assert!(r > 0 && r <= total - FREE_CHECK_BYTES, "outstanding {r}");
+        let written = lib.music_in_progress_bytes().unwrap();
+        assert!(
+            written >= FREE_CHECK_BYTES,
+            "written bytes not counted: {written}"
+        );
+        // A video that fits beside the remainder alone, not beside the
+        // written bytes too.
+        let video = 1 << 20;
+        let cap = lib.music_outstanding_bytes() + video + 1;
+        assert!(
+            lib.music_outstanding_bytes() + video <= cap,
+            "the scenario does not fit without the written bytes"
+        );
+        assert!(
+            !video_fits(lib, cap, video),
+            "admitted over the written bytes"
+        );
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        // Landed: the bytes are the finished track's, once.
+        assert_eq!(lib.music_in_progress_bytes(), Some(0));
+        assert_eq!(lib.offline_summary().unwrap().used_bytes, total);
+    }
+
+    /// A download cancelled mid-body keeps its `.part` and drops its
+    /// reservation: the kept bytes still count against the cap.
+    #[test]
+    fn a_video_is_refused_after_a_music_download_is_cancelled_with_its_part_kept() {
+        use crate::prefetch::FREE_CHECK_BYTES;
+        use crate::testserver::Script;
+        let size = usize::try_from(FREE_CHECK_BYTES * 2).unwrap();
+        let hold_at = usize::try_from(FREE_CHECK_BYTES / 2).unwrap();
+        let (script, release, reached) = Script::default()
+            .file("/audio/1", vec![7u8; size])
+            .file("/audio/2", vec![1u8; 1000])
+            .hold_after(hold_at);
+        let rig = held_rig("cancelled", script);
+        let lib = &rig.lib;
+        lib.prefetch(&["track/1".to_owned()]);
+        wait_until("the server holding", || reached.load(Ordering::SeqCst));
+        wait_until("bytes written", || lib.music_in_progress_bytes() > Some(0));
+        // Another wish replaces it: track/1 is cancelled at its next chunk.
+        lib.prefetch(&["track/2".to_owned()]);
+        release.store(true, Ordering::SeqCst);
+        let o = lib.offline.get().unwrap();
+        assert!(o.downloader.wait_idle(Duration::from_secs(20)));
+        assert_eq!(
+            lib.music_outstanding_bytes(),
+            0,
+            "a reservation outlived its job"
+        );
+        let kept = lib.music_in_progress_bytes().unwrap();
+        assert!(kept > 0, "the cancelled download's part is not counted");
+        let used = lib.offline_summary().unwrap().used_bytes;
+        // Room for a video beside the finished tracks only, not the part.
+        let video = 1 << 20;
+        let cap = used + video + 1;
+        assert!(
+            !video_fits(lib, cap, video),
+            "admitted over a kept part of {kept}"
+        );
     }
 
     #[test]
@@ -1646,7 +3083,8 @@ mod tests {
 
     #[test]
     fn a_poller_that_queued_its_approval_is_not_replaced_before_it_is_consumed() {
-        let (mut w, _, _) = worker("approved-pending");
+        let root = test_root("approved-pending");
+        let (mut w, _, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
