@@ -256,6 +256,18 @@ pub fn OfflineSong(id: String, ids: Vec<String>, at: usize) -> Element {
             "pharos: offline song verdict=none item={id} reason=no_player"
         )),
     });
+    // The stage closed: the song ends, as the player's would. A song the
+    // stage replaced with another (it then holds an item) keeps playing.
+    let stage = try_use_context::<super::stage::StageCtx>();
+    use_drop(move || {
+        let closed = stage.map_or(true, |s| s.0.try_peek().map_or(true, |s| s.item.is_none()));
+        if closed {
+            if let Some(audio) = native_audio() {
+                platform::info("pharos: offline song stopped reason=stage_closed");
+                audio.stop();
+            }
+        }
+    });
     rsx! { OfflineStart {} }
 }
 

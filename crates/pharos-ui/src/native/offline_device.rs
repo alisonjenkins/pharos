@@ -81,6 +81,19 @@ pub async fn sync_art(user: &str) -> bool {
     settled
 }
 
+/// Bumped each time the screens switch library (server or device) or take a
+/// new device snapshot, so what was kept for the last one (a grid's pages,
+/// a listing's index) is not reused for this one.
+static LIBRARY_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn library_switched() {
+    LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn library_generation() -> u32 {
+    LIBRARY_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the last poster pass stored every poster; false until one has
 /// run, so the first periodic pass checks.
 static ART_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -256,9 +269,11 @@ impl Filled {
 /// Notes `id` and the parents above it the catalogue lacks. Returns false
 /// when `id` itself could not be read.
 ///
-/// A parent that could not be read leaves `id` marked partial: what was
-/// read is kept, and the next pass asks again, walking past the parents
-/// already noted until it reaches the one that was missing.
+/// A trail that does not reach its top (a parent that could not be read,
+/// here or when a sibling sharing a parent was noted) leaves `id` marked
+/// partial: what was read is kept, and the next pass asks again, walking
+/// past the parents already noted until it reaches the one that was
+/// missing.
 pub async fn note_one<A: PharosApi>(
     api: &A,
     info: &CallInfo,
@@ -271,7 +286,6 @@ pub async fn note_one<A: PharosApi>(
     let key = id.to_string();
     let retry = catalogue.partial.contains(&key);
     let mut trail = vec![detail.item.clone()];
-    let mut whole = true;
     while trail.len() < MAX_STEPS {
         let last = &trail[trail.len() - 1];
         let Some(parent) = last.parent.filter(|_| last.kind != ItemKind::Library) else {
@@ -285,15 +299,12 @@ pub async fn note_one<A: PharosApi>(
         }
         match api.detail(info, parent).await {
             Ok(up) => trail.push(up.item),
-            Err(_) => {
-                whole = false;
-                break;
-            }
+            Err(_) => break,
         }
     }
     trail.reverse();
     catalogue.note(&trail, Some(&detail));
-    if whole {
+    if catalogue.reaches_top(&key) {
         catalogue.partial.remove(&key);
     } else {
         catalogue.partial.insert(key);
@@ -474,6 +485,48 @@ mod tests {
         assert!(emptied.is_empty());
         assert_eq!(refreshed(&emptied, None), None);
         assert_eq!(refreshed(&emptied, Some(lib.clone())), Some(lib));
+    }
+
+    /// Two kept episodes share a season whose series could not be read: both
+    /// stay partial, so with the first one gone the next pass still reads
+    /// the series for the other.
+    #[test]
+    fn a_sibling_stopping_at_a_cut_off_parent_is_partial_too() {
+        let mut cut = Catalogue::new("u");
+        for (id, kind, name, parent) in [
+            ("s11", "season", "Season 1", Some("s10")),
+            ("101", "episode", "One", Some("s11")),
+            ("102", "episode", "Two", Some("s11")),
+        ] {
+            cut.snaps.insert(
+                id.into(),
+                Snap {
+                    id: id.into(),
+                    kind: kind.into(),
+                    name: name.into(),
+                    parent: parent.map(Into::into),
+                    ..Snap::default()
+                },
+            );
+        }
+        let kept = [ItemRef::Real(101), ItemRef::Real(102)].map(|id| OnDevice::Video {
+            id,
+            title: String::new(),
+            kind: ItemKind::Episode,
+            runtime_ms: 0,
+            position_ms: 0,
+        });
+        let broken = OfflineLibrary::new(&cut, &kept);
+        let info = CallInfo::default();
+        let mut c = Catalogue::new("u");
+        assert!(run(note_one(&broken, &info, &mut c, ItemRef::Real(101))));
+        assert!(run(note_one(&broken, &info, &mut c, ItemRef::Real(102))));
+        // The first episode is removed; the second still needs the series.
+        c.prune(&[ItemRef::Real(102)]);
+        assert_eq!(c.missing(&[ItemRef::Real(102)]), vec![ItemRef::Real(102)]);
+        assert!(run(note_one(&server(), &info, &mut c, ItemRef::Real(102))));
+        assert!(c.snaps.contains_key("s10"), "{:?}", c.snaps.keys());
+        assert!(c.missing(&[ItemRef::Real(102)]).is_empty());
     }
 
     /// Every card width and format finds the one stored poster (V1487).
