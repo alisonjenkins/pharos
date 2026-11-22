@@ -24,7 +24,9 @@ web = [
 
 # 025: the Android TV app (`nix run .#android-apk`, or `dx build --platform
 # android --package pharos-ui --bin pharos-tv --features mobile`).
-mobile = ["dioxus/mobile", "dioxus/launch", "dioxus/document"]
+# `dep:pharos-content`: the phone hands the music cache the video store's
+# bytes (`native::ports::outside_bytes_hook`).
+mobile = ["dioxus/mobile", "dioxus/launch", "dioxus/document", "dep:pharos-content"]
 
 [[bin]]
 name = "pharos-tv"
@@ -54,6 +56,8 @@ required-features = ["web"]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
 futures-util = "0.3"
+# The TV page compares origins with the parser reqwest sends with (tv_page.rs).
+url = "2.5"
 gloo-net = { workspace = true, optional = true }
 # Pulled in by the `web` feature so PlayerView's wasm path can read
 # `<video>.currentTime` from the underlying `web_sys::HtmlMediaElement`.
@@ -172,9 +176,20 @@ thiserror.workspace = true
 # listed under [final-excludes] in .config/hakari.toml so CI's hakari-check
 # does not try to re-add the dependency.
 
+# Only the phone build (feature `mobile`) uses it; the dependency is declared
+# for every target so the feature resolves wherever it is enabled.
+pharos-content = { path = "../pharos-content", optional = true }
+
+# The disk video store (native/kept_video_disk.rs) runs its downloads on tokio;
+# the browser build has its own store and none of this.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
+
 # 025: the Android TV app's native link to the server (native/android.rs).
 [target.'cfg(target_os = "android")'.dependencies]
 pharos-api = { path = "../pharos-api", features = ["rustls-client"] }
+# The device token file belongs to pharos-content (native/token_file.rs).
+pharos-content = { path = "../pharos-content" }
 capnp = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
@@ -190,6 +205,9 @@ log = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# The video store's refusal reaching the real music cache (V1464), in a test.
+pharos-content = { path = "../pharos-content" }
+log = "0.4"
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside
 # `#[test]`s so we can assert structural landmarks (input #ids,
 # button text, expected error branches) without a browser. Lives at
