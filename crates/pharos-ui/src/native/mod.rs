@@ -37,6 +37,8 @@ pub mod hls_trace;
 mod hls_web;
 pub mod kept;
 pub mod kept_video;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod kept_video_disk;
 pub mod kept_video_view;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod kept_video_web;
