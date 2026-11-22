@@ -78,6 +78,9 @@ mod platform;
 #[cfg(all(feature = "mobile", target_os = "android"))]
 #[path = "android_page.rs"]
 mod platform;
+/// Opens and registers the phone's store of downloaded video (ADR 0145).
+#[cfg(all(feature = "mobile", target_os = "android"))]
+pub use platform::register_video_store as register_phone_video_store;
 #[cfg(all(feature = "mobile", target_os = "android"))]
 pub use platform::use_server_proxy;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
@@ -138,6 +141,13 @@ mod subs_web;
 pub mod subtitles;
 pub mod together;
 pub mod together_view;
+// The device token and its user in one file (android.rs keeps it; builds on
+// the host so the sign-in sequences can be tested).
+#[cfg(any(target_os = "android", test))]
+pub mod token_file;
+// A scope-owned temporary folder for the native tests.
+#[cfg(test)]
+pub(crate) mod test_dir;
 pub mod track_follow;
 pub mod trail;
 pub mod turn;
@@ -157,10 +167,3 @@ pub mod views;
 pub mod visualiser;
 pub mod watch_view;
 pub mod whats_new;
-// The device token and its user in one file (android.rs keeps it; builds on
-// the host so the sign-in sequences can be tested).
-#[cfg(any(target_os = "android", test))]
-pub mod token_file;
-// A scope-owned temporary folder for the native tests.
-#[cfg(test)]
-pub(crate) mod test_dir;

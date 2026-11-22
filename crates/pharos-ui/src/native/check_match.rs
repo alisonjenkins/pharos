@@ -101,7 +101,7 @@ pub fn RematchEpisode(id: ItemRef) -> Element {
     let held = try_use_context::<HeldManageToken>();
     let mut status = use_signal(|| None::<String>);
     let mut busy = use_signal(|| false);
-    let admin = me.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+    let admin = me.is_some_and(|me| me.me().is_some_and(|m| m.is_admin));
     let (ItemRef::Real(media_id), Some(ctx), Some(held), true) = (id, ctx, held, admin) else {
         return rsx! {};
     };
@@ -159,8 +159,7 @@ pub fn CheckMatchBadge(series: ItemRef) -> Element {
     let tab = try_use_context::<ManageTab>();
     let focus = try_use_context::<ManageFocus>();
     let nav = try_use_context::<Nav>();
-    let is_admin =
-        move || me.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+    let is_admin = move || me.is_some_and(|me| me.me().is_some_and(|m| m.is_admin));
     use_effect(move || {
         let (Some(ctx), Some(flagged), Some(held)) = (ctx, flagged, held) else {
             return;

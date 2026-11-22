@@ -35,7 +35,7 @@ use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::music_bridge::{self, Follow, MediaIo, Step};
 use super::offline_library::{device_verdict, OfflineLibrary, Standing, LOST_GRACE_MS};
-use super::offline_video;
+use super::offline_video::{self, Session};
 use super::palette::{self, Row};
 use super::person::PersonView;
 use super::platform::{self, OpenError};
@@ -1819,9 +1819,90 @@ fn release_track_skips(skips: &TrackSkipCtx, owner: u64) {
 struct StartOver(Signal<Option<ItemRef>>);
 
 /// Who is signed in, as the account menu shows them; a screen that changes
-/// the avatar restarts it.
-#[derive(Clone, Copy)]
-pub(super) struct AccountMe(pub(super) Resource<Option<pharos_client::api::Me>>);
+/// the avatar restarts it. Read through its methods, which show an answer
+/// only while the session it was asked on is still the published one.
+pub(super) type AccountMe = ScopedMe<NativeApi, pharos_client::api::Me>;
+
+/// A `me` resource read against the published session: the screens' only
+/// way to its answer ([`current_answer`]).
+pub(crate) struct ScopedMe<A: 'static, M: 'static>(
+    Resource<Stamped<M>>,
+    Signal<Option<Session<A>>>,
+);
+
+impl<A, M> Clone for ScopedMe<A, M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A, M> Copy for ScopedMe<A, M> {}
+
+impl<A, M: Clone> ScopedMe<A, M> {
+    /// The answer of `me` (from [`use_me`]), scoped to `session`.
+    pub(crate) fn new(me: Resource<Stamped<M>>, session: Signal<Option<Session<A>>>) -> Self {
+        Self(me, session)
+    }
+
+    /// `None` while no answer is current (none yet, or the one held was
+    /// asked on a session since replaced); `Some(None)` when it failed.
+    /// Subscribes to the answer and the session.
+    pub(crate) fn answer(&self) -> Option<Option<M>> {
+        current_answer(
+            self.0.read().as_ref(),
+            self.1.read().as_ref().map(Session::id),
+        )
+    }
+
+    /// The signed-in user, when a current answer names one.
+    pub(crate) fn me(&self) -> Option<M> {
+        self.answer().flatten()
+    }
+
+    /// [`Self::me`] without subscribing.
+    pub(crate) fn peek_me(&self) -> Option<M> {
+        current_answer(
+            self.0.peek().as_ref(),
+            self.1.peek().as_ref().map(Session::id),
+        )
+        .flatten()
+    }
+
+    /// Asks again.
+    pub(crate) fn restart(&mut self) {
+        self.0.restart();
+    }
+}
+
+/// A `me` answer with the session it was asked on (`None`: nothing was
+/// asked, as with no ready session). `me` is `None` when the ask failed or
+/// its answer was stale.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Stamped<M> {
+    pub(crate) session: Option<u64>,
+    pub(crate) me: Option<M>,
+}
+
+/// The answer the screens may use. Dioxus keeps a finished value through a
+/// restart, so after a reconnect the answer held can be the previous
+/// session's: it is hidden once another session is published, and kept
+/// while none is (an outage keeps the last name) or while its own session
+/// is. `None` while nothing current is held.
+pub(crate) fn current_answer<M: Clone>(
+    held: Option<&Stamped<M>>,
+    published: Option<u64>,
+) -> Option<Option<M>> {
+    let held = held?;
+    match (held.session, published) {
+        (Some(asked), Some(now)) if asked != now => {
+            platform::info(&format!(
+                "pharos: account me verdict=hidden reason=session_replaced asked_on={asked} published={now}"
+            ));
+            None
+        }
+        _ => Some(held.me.clone()),
+    }
+}
 
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
@@ -1909,12 +1990,47 @@ fn mark_handler(
     api: Signal<Option<NativeApi>>,
     machine: Signal<Machine>,
     flash: Flash,
+    marks: Signal<u32>,
+    stored: Signal<Option<(ItemRef, bool)>>,
+) -> EventHandler<(ItemRef, bool, String)> {
+    let send: SendMark = Rc::new(move |mark, id, on| {
+        let api = api.peek().clone()?;
+        Some(Box::pin(async move {
+            let call = call("mark", mark.label());
+            match mark {
+                Mark::Played => api.set_played(&call, id, on).await,
+                Mark::Favorite => api.set_favorite(&call, id, on).await,
+            }
+        }))
+    });
+    mark_handler_with(mark, send, machine, flash, marks, stored)
+}
+
+/// What a mark handler sends for a mark on an item: the call's future,
+/// or None with no API to send it on.
+type SendMark = Rc<
+    dyn Fn(
+        Mark,
+        ItemRef,
+        bool,
+    ) -> Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, ClientError>>>>,
+    >,
+>;
+
+/// [`mark_handler`] with the call it sends given, so a test drives the
+/// real handler with a call it completes when it chooses.
+fn mark_handler_with(
+    mark: Mark,
+    send: SendMark,
+    machine: Signal<Machine>,
+    flash: Flash,
     mut marks: Signal<u32>,
     mut stored: Signal<Option<(ItemRef, bool)>>,
 ) -> EventHandler<(ItemRef, bool, String)> {
     let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
     EventHandler::new(move |(id, on, name): (ItemRef, bool, String)| {
-        let Some(api) = api.peek().clone() else {
+        let Some(sent) = send(mark, id, on) else {
             return;
         };
         let what = mark.label();
@@ -1925,15 +2041,18 @@ fn mark_handler(
             return;
         }
         let marking = Rc::clone(&marking);
+        // The session the mark is sent in: a refusal ends only that one,
+        // never a session signed in while the call was out.
+        let session = machine.peek().session();
         spawn(async move {
-            let call = call("mark", what);
-            let result = match mark {
-                Mark::Played => api.set_played(&call, id, on).await,
-                Mark::Favorite => api.set_favorite(&call, id, on).await,
-            };
-            match settle(machine, result) {
+            let result = sent.await;
+            match settle_session(machine, session, result) {
                 Ok(now) => {
-                    if matches!(mark, Mark::Played) {
+                    // Kept only for the session that sent it: a mark that
+                    // lands after a sign-out or another sign-in is not this
+                    // session's to show.
+                    if matches!(mark, Mark::Played) && mark_is_current(&machine.peek(), session, id)
+                    {
                         stored.set(Some((id, now)));
                     }
                 }
@@ -1952,14 +2071,108 @@ fn mark_handler(
     })
 }
 
+/// The app's session machine. Whenever a session ends, whoever caused it,
+/// the previous user's offline identity goes with it (the machine runs the
+/// hook). The one place it is built, so a test of the hook tests the app's.
+fn app_machine() -> Machine {
+    Machine::new().with_session_end(offline_video::session_ended)
+}
+
+/// Applies a sign-out's answer to the machine: true when it signed out.
+/// The machine's session-end hook has then parked the user's downloads and
+/// forgotten them; nothing here runs it again (a second run, with no user
+/// left, would park every user's downloads). `sent_at` is
+/// [`Machine::sign_ins`] when the sign-out was sent: a reply a newer
+/// sign-in overtook is ignored before it changes the phase, runs the hook
+/// or lets the caller delete kept books.
+fn sign_out_answered(
+    machine: &mut Machine,
+    reply: super::machine::SignOutReply,
+    sent_at: u32,
+) -> bool {
+    if !machine.sign_out_reply_is_current(sent_at) {
+        platform::info(&format!(
+            "pharos: sign-out reply verdict=ignored reason=newer_sign_in sent_at={sent_at} sign_ins={} reply={reply:?}",
+            machine.sign_ins()
+        ));
+        return false;
+    }
+    platform::info(&format!(
+        "pharos: sign-out reply verdict=applied sent_at={sent_at} reply={reply:?}"
+    ));
+    machine.apply(Event::SignOutAnswered(reply));
+    matches!(machine.phase(), Phase::SignIn { .. })
+}
+
+/// What a `me` fetch returns, built by the caller (the app's retried call,
+/// or a test's hand-completed one).
+pub(crate) type MeFetch<A, M> =
+    Rc<dyn Fn(A) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<M>>>>>;
+
+/// The signed-in user's `me`, as the app asks it: again whenever the
+/// screens come up or go (a session ending clears the name; a reconnect
+/// keeps the screens, and the name, until the new session resumes), through
+/// [`offline_video::me_request`], and remembered only under the identity
+/// generation it was asked at, paired only with the token of the session it
+/// was sent on. `fetch` sends the request, `id` names the answer's user and
+/// `on_me` runs with each answer.
+pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
+    machine: Signal<Machine>,
+    session: Signal<Option<Session<A>>>,
+    fetch: MeFetch<A, M>,
+    id: fn(&M) -> &str,
+    on_me: Rc<dyn Fn(&M)>,
+) -> Resource<Stamped<M>> {
+    // A memo, so other machine changes do not ask again.
+    let screens = use_memo(move || machine.read().shows_screens());
+    use_resource(move || {
+        let _ = screens();
+        // The session (its API and its token, one value) and the identity
+        // generation are taken together, here, before the request's future
+        // is built: a session that ends after this point signs the user
+        // out, and the answer must not undo that. Sent only to a ready
+        // session's API.
+        let ready = matches!(machine.peek().phase(), Phase::Ready);
+        let ask = offline_video::me_request(ready, session.read().clone());
+        let (fetch, on_me) = (fetch.clone(), on_me.clone());
+        async move {
+            let Some(ask) = ask else {
+                return Stamped {
+                    session: None,
+                    me: None,
+                };
+            };
+            let session = Some(ask.session);
+            let Some(me) = fetch(ask.api.clone()).await else {
+                return Stamped { session, me: None };
+            };
+            // A stale answer (its session ended after it was asked) names a
+            // user who is no longer current: nothing runs for it.
+            if !ask.answered(id(&me)) {
+                platform::info("pharos: video user me verdict=stale_answer_dropped");
+                return Stamped { session, me: None };
+            }
+            on_me(&me);
+            Stamped {
+                session,
+                me: Some(me),
+            }
+        }
+    })
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
-    let mut machine = use_signal(Machine::new);
+    super::kept_video_view::use_video_store_watch();
+    let mut machine = use_signal(app_machine);
     // The player shows a lost connection itself; the shell under it is out
     // of sight (spec 038 FR-503).
     let connection_lost = use_memo(move || machine.read().reconnecting());
     use_context_provider(|| ConnectionLost(connection_lost));
     let mut api = use_signal(|| None::<NativeApi>);
+    // The session `api` came from, with the token it was resumed with: set
+    // and cleared with `api`, read only by `use_me`.
+    let mut session = use_signal(|| None::<Session<NativeApi>>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
     // A connection attempt that has not answered in a while (a tunnel, where
@@ -2425,21 +2638,15 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
-                if kept_any() || !offline_video::ready_for_last_user().is_empty() {
-                    spawn(async move {
-                        platform::sleep_ms(SLOW_CONNECT_MS).await;
-                        let m = machine.peek();
-                        if m.epoch() == epoch && *m.phase() == Phase::Connecting {
-                            slow_connect.set(true);
-                        }
-                    });
-                }
+                start_attempt_timer(machine, epoch, slow_connect);
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
                 // A reconnect keeps the old API until the new one resumes,
                 // so the screens keep what they loaded.
-                task.set(Some(spawn(connect(machine, api, outdated, epoch, delay))));
+                task.set(Some(spawn(connect(
+                    machine, api, session, outdated, epoch, delay,
+                ))));
             }
             Phase::Connecting => {}
             Phase::Ready => {
@@ -2450,6 +2657,9 @@ fn NativeApp(route: Route) -> Element {
             _ => {
                 if let Some(old) = task.write().take() {
                     old.cancel();
+                }
+                if session.peek().is_some() {
+                    session.set(None);
                 }
                 if api.peek().is_some() {
                     api.set(None);
@@ -2463,16 +2673,17 @@ fn NativeApp(route: Route) -> Element {
 
     // Who is signed in, for the account menu; asked again on each resume.
     // A failed ask leaves the menu without a name rather than blocking it.
-    let me = use_resource(move || {
-        let api = api.read().clone();
-        async move {
-            let api = api?;
-            let info = call("shell", "me");
-            match retry_once("me", || api.me(&info)).await {
-                Ok(me) => {
-                    reconcile_kept_books(&me.id);
-                    offline_video::remember_user(&me.id);
-                    {
+    // Asked again when the screens come up or go (a session ending clears
+    // the name); a reconnect keeps the screens, and the name, until the new
+    // API resumes. A memo, so other machine changes do not ask again.
+    let me = use_me(
+        machine,
+        session,
+        Rc::new(|api| {
+            Box::pin(async move {
+                let info = call("shell", "me");
+                match retry_once("me", || api.me(&info)).await {
+                    Ok(me) => {
                         let (api, user) = (api.clone(), me.id.clone());
                         spawn(async move {
                             let began = platform::now_ms();
@@ -2486,19 +2697,24 @@ fn NativeApp(route: Route) -> Element {
                                 super::offline_device::sync_art(&user).await;
                             }
                         });
+                        Some(me)
                     }
-                    claim_queue(queue, held, &me.id);
-                    Some(me)
+                    Err(e) => {
+                        platform::warn(&format!("account: me failed: {e}"));
+                        None
+                    }
                 }
-                Err(e) => {
-                    platform::warn(&format!("account: me failed: {e}"));
-                    None
-                }
-            }
-        }
-    });
+            })
+        }),
+        |me| me.id.as_str(),
+        Rc::new(move |me| {
+            reconcile_kept_books(&me.id);
+            claim_queue(queue, held, &me.id);
+        }),
+    );
 
-    use_context_provider(|| AccountMe(me));
+    let account = AccountMe::new(me, session);
+    use_context_provider(|| account);
 
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
@@ -2518,7 +2734,7 @@ fn NativeApp(route: Route) -> Element {
             }
         };
         let reconnecting = machine.read().reconnecting();
-        let me = me.read().clone().flatten();
+        let me = account.me();
         // The update notice waits while the full player is up: it sat over
         // the picture for the whole film, and nothing in it is urgent there.
         let on_player = {
@@ -2540,14 +2756,15 @@ fn NativeApp(route: Route) -> Element {
                             if machine.peek().signing_out() {
                                 return;
                             }
+                            let sent_at = machine.peek().sign_ins();
                             machine.write().apply(Event::SignOutSubmitted);
                             report::forget();
                             spawn(async move {
                                 let reply = platform::sign_out().await;
-                                machine.write().apply(Event::SignOutAnswered(reply));
+                                let out = sign_out_answered(&mut machine.write(), reply, sent_at);
                                 // Signed out: no kept book stays on the device.
                                 // The queue is emptied by the sign-in effect.
-                                if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
+                                if out {
                                     forget_kept_books("sign-out").await;
                                     offline_video::forget_user();
                                     super::offline_device::forget_catalogue();
@@ -2695,11 +2912,24 @@ fn QuickConnectSignIn(on_signed_in: EventHandler<SignInReply>) -> Element {
     }
 }
 
+/// Applies attempt `epoch`'s resume when the machine still accepts it, and
+/// says whether it did and the server's schema when that is newer than this
+/// build's. A superseded attempt notes nothing.
+fn accept_resume(m: &mut Machine, epoch: u32, schema: Option<u32>) -> (bool, Option<u32>) {
+    let accepted = m.accepts_resume(epoch);
+    if accepted {
+        m.apply(Event::Resumed { epoch });
+    }
+    let newer = schema.filter(|&v| accepted && pharos_client::is_outdated_by(v));
+    (accepted, newer)
+}
+
 /// One connection attempt: wait out the backoff, open and resume, then
 /// report the socket's close.
 async fn connect(
     mut machine: Signal<Machine>,
     mut api: Signal<Option<NativeApi>>,
+    mut session: Signal<Option<Session<NativeApi>>>,
     mut outdated: Signal<Option<u32>>,
     epoch: u32,
     delay_ms: u32,
@@ -2707,27 +2937,83 @@ async fn connect(
     platform::sleep_ms(delay_ms).await;
     let event = match platform::open(&call("connect", "resume")).await {
         Ok(mut open) => {
-            if let Some(server) = open
-                .server_schema
-                .filter(|&v| pharos_client::is_outdated_by(v))
-            {
+            // Published only while the machine still accepts this attempt:
+            // a sign-out (or any screen) that won while it was in flight
+            // keeps it, and its session, out. Decided and applied in one
+            // step, before any other event can land.
+            let (accepted, newer) = accept_resume(&mut machine.write(), epoch, open.server_schema);
+            if let Some(server) = newer {
                 platform::warn(&format!(
                     "pharos: server schema {server} is newer than this page's {}",
                     pharos_client::SCHEMA_VERSION
                 ));
                 outdated.set(Some(server));
             }
-            api.set(Some(open.api.clone()));
-            platform::install_telemetry(&open.api);
-            machine.write().apply(Event::Resumed { epoch });
+            if !accepted {
+                let m = machine.peek();
+                platform::info(&format!(
+                    "pharos: resume publish verdict=dropped reason=attempt_no_longer_accepted epoch={epoch} current={} phase={:?}",
+                    m.epoch(),
+                    m.phase()
+                ));
+                return;
+            }
+            // The session this replaces has ended: a `me` asked on it must
+            // not install its user once this one is up.
+            offline_video::session_replaced(&open.session);
+            api.set(Some(open.session.api().clone()));
+            session.set(Some(open.session.clone()));
+            platform::install_telemetry(open.session.api());
             let reason = platform::closed(&mut open.conn).await;
             Event::Closed { epoch, reason }
         }
         Err(OpenError::NotOpened(probe)) => Event::NotOpened { epoch, probe },
-        Err(OpenError::NotSignedIn) => Event::ResumeRefused { epoch },
+        Err(OpenError::NotSignedIn) => {
+            let _cleaned = forget_user_on_refused_resume(&machine.peek(), epoch);
+            Event::ResumeRefused { epoch }
+        }
+        // Signed out here all the same; the sign-in screen warns that the
+        // account may come back after a restart.
+        Err(OpenError::NotSignedInTokenKept) => {
+            let _cleaned = forget_user_on_refused_resume(&machine.peek(), epoch);
+            Event::ResumeRefusedTokenKept { epoch }
+        }
         Err(OpenError::Resume(error)) => Event::ResumeFailed { epoch, error },
     };
     machine.write().apply(event);
+}
+
+/// The server knows no session for this device: nobody is signed in from
+/// here on, so the proxy and the kept-video list stop serving the previous
+/// user. An answer for an attempt that has since been replaced, or ended by
+/// a sign-out while it was out, says nothing about the current state and is
+/// left alone. A refusal of a session that was
+/// Ready ends it through the machine's session-end hook, which does this
+/// same cleanup with the user still known: doing it here as well would run
+/// the hook with nobody signed in, and park every user's downloads.
+/// Returns whether it cleaned up.
+fn forget_user_on_refused_resume(machine: &Machine, epoch: u32) -> bool {
+    let (verdict, reason) = if machine.epoch() != epoch {
+        ("skipped", "stale_attempt")
+    } else if *machine.phase() != Phase::Connecting {
+        // A sign-out (or any screen) ended the attempt while it was out:
+        // nobody is signed in from it, and that sign-out cleaned up.
+        ("skipped", "attempt_ended")
+    } else if machine.had_session() {
+        ("skipped", "session_end_hook_cleans_up")
+    } else {
+        ("cleaned", "first_resume_refused")
+    };
+    platform::info(&format!(
+        "pharos: resume refused cleanup verdict={verdict} reason={reason} epoch={epoch} current={} phase={:?}",
+        machine.epoch(),
+        machine.phase()
+    ));
+    let clean = verdict == "cleaned";
+    if clean {
+        offline_video::forget_user();
+    }
+    clean
 }
 
 pub(super) fn call(route: &str, action: &str) -> CallInfo {
@@ -2753,6 +3039,46 @@ fn settle_start<T>(
             machine.write().apply(Event::NeedsSignIn);
         }
         StartFailure::from_client(&e)
+    })
+}
+
+/// Whether a mark sent in session `sent_in` still belongs to a session
+/// signed in now: one is (`had_session`, which a sign-out clears and an
+/// outage keeps), and it is the one the mark was sent in. Logs the skip
+/// when it does not.
+fn mark_is_current(machine: &Machine, sent_in: u32, id: ItemRef) -> bool {
+    let current = machine.session();
+    let reason = if !machine.had_session() {
+        "no_session"
+    } else if current != sent_in {
+        "stale_session"
+    } else {
+        return true;
+    };
+    platform::info(&format!(
+        "pharos: mark {id} stored verdict=skipped reason={reason} sent_in={sent_in} current={current}"
+    ));
+    false
+}
+
+/// As [`settle`], for a call sent in `session`: a refusal ends only that
+/// session ([`Event::SessionNeedsSignIn`]), and says so when it is stale.
+fn settle_session<T>(
+    mut machine: Signal<Machine>,
+    session: u32,
+    result: Result<T, ClientError>,
+) -> Result<T, String> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            let now = machine.peek().session();
+            if now != session {
+                platform::info(&format!(
+                    "pharos: sign-in refusal verdict=ignored reason=stale_session sent_in={session} current={now}"
+                ));
+            }
+            machine.write().apply(Event::SessionNeedsSignIn { session });
+        }
+        e.to_string()
     })
 }
 
@@ -2805,7 +3131,10 @@ fn Screen(route: Route) -> Element {
             rsx! { SettingsLayout { current: Section::OfflineMusic, super::offline_view::OfflineMusicSettings {} } }
         }
         Route::OfflineMusic => rsx! { NotFoundView { path: Route::OfflineMusic.path() } },
-        Route::Downloads if offline_store().is_some() || super::ports::video_store().is_some() => {
+        Route::Downloads
+            if offline_store().is_some()
+                || super::kept_video_view::shown_video_store().is_some() =>
+        {
             rsx! {
                 super::offline_view::DownloadsScreen {}
                 super::kept_video_view::VideoDownloads {}
@@ -2880,6 +3209,51 @@ fn read_library(
 /// How long the first connection may take before kept books open without it.
 /// Short, because a phone in a tunnel reports itself online.
 const SLOW_CONNECT_MS: u32 = 3_000;
+
+/// Starts attempt `epoch`'s slow-connect timer: it fires only while that
+/// attempt is still connecting.
+fn start_attempt_timer(machine: Signal<Machine>, epoch: u32, slow_connect: Signal<bool>) {
+    start_slow_connect(
+        SLOW_CONNECT_MS,
+        move || {
+            let m = machine.peek();
+            m.epoch() == epoch && *m.phase() == Phase::Connecting
+        },
+        || kept_any() || !offline_video::ready_for_last_user().is_empty(),
+        slow_connect,
+    );
+}
+
+/// Starts one connection attempt's slow-connect timer. Nothing is decided
+/// when the attempt starts: a store published after that (the phone
+/// registers its video store from two places) still counts. When the timer
+/// fires on an attempt still connecting, the screen is cut off, and the
+/// render decides what shows: `offline_start` reads the stores, subscribed
+/// to a later publish, so the offline list appears whenever there is one.
+/// `kept` is read then only for the log.
+fn start_slow_connect(
+    ms: u32,
+    still_connecting: impl Fn() -> bool + 'static,
+    kept: impl Fn() -> bool + 'static,
+    mut slow: Signal<bool>,
+) {
+    spawn(async move {
+        platform::sleep_ms(ms).await;
+        if !still_connecting() {
+            return;
+        }
+        let kept = kept();
+        platform::info(&format!(
+            "pharos: connect slow verdict={} kept={kept} after_ms={ms}",
+            if kept {
+                "offline_lists"
+            } else {
+                "lists_on_publish"
+            }
+        ));
+        slow.set(true);
+    });
+}
 
 /// Whether anything is kept on this device (a browser's book, a phone's
 /// download): one read, made only when a connection attempt starts.
@@ -3247,8 +3621,7 @@ fn PaletteScreen() -> Element {
         }
     };
     let account = try_use_context::<AccountMe>();
-    let admin =
-        move || account.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+    let admin = move || account.is_some_and(|me| me.me().is_some_and(|m| m.is_admin));
     let rows = use_memo(move || {
         let home = home.read();
         let libraries: Vec<_> = home.rails.iter().map(|rail| rail.library.clone()).collect();
@@ -3680,7 +4053,7 @@ fn AccountScreen() -> Element {
     // Saves run one at a time, so quick picks can't land out of order.
     let mut description_language_saves = use_signal(|| None::<account_settings::SerialPref>);
     let mut description_language_failed = use_signal(|| None::<String>);
-    let me = account.0.read().clone().flatten();
+    let me = account.me();
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
             let mut machine = ctx.machine;
@@ -3761,7 +4134,7 @@ fn AccountScreen() -> Element {
                     };
                     let result = api.set_avatar(&call("account", "set_avatar"), &picture).await;
                     match &result {
-                        Ok(_) => account.0.restart(),
+                        Ok(_) => account.restart(),
                         Err(e) => report(e, "set avatar"),
                     }
                     avatar_outcome.set(Some(
@@ -3782,7 +4155,7 @@ fn AccountScreen() -> Element {
                 spawn(async move {
                     let result = api.remove_avatar(&call("account", "remove_avatar")).await;
                     match &result {
-                        Ok(()) => account.0.restart(),
+                        Ok(()) => account.restart(),
                         Err(e) => report(e, "remove avatar"),
                     }
                     avatar_outcome.set(result.err().map(|e| Err(account_settings::avatar_refusal_message(&e))));
@@ -4007,7 +4380,7 @@ fn ReaderPasswordsScreen() -> Element {
     let mut problem = use_signal(|| None::<String>);
     let mut opds_path = use_signal(|| "/opds/".to_owned());
     let mut connection = use_signal(|| 0u64);
-    let username = account.0.read().clone().flatten().map(|me| me.name);
+    let username = account.me().map(|me| me.name);
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
             let mut machine = ctx.machine;
@@ -5193,7 +5566,7 @@ fn SeenTitle(
 /// video store is registered, else a readable book's Keep offline.
 fn keep_control(detail: &Detail, version: &str) -> Option<Element> {
     let video = matches!(detail.item.kind, ItemKind::Movie | ItemKind::Episode);
-    if video && super::ports::video_store().is_some() {
+    if video && super::kept_video_view::shown_video_store().is_some() {
         return Some(rsx! {
             super::kept_video_view::VideoKeep { detail: detail.clone(), version: version.to_owned() }
         });
@@ -5523,9 +5896,12 @@ fn downloaded_copy(
     std::sync::Arc<dyn super::kept_video::VideoStore>,
 )> {
     let store = super::ports::video_store()?;
-    let Some(user) = signed_in.or_else(offline_video::last_user) else {
+    // Only the authorized offline owner selects a copy: an account result
+    // still held from a replaced session (fenced) decides nothing.
+    let Some(user) = offline_video::last_user() else {
         platform::info(&format!(
-            "pharos: playback copy item={id} downloaded=false reason=no_user"
+            "pharos: playback copy item={id} downloaded=false reason=no_authorized_user account={}",
+            signed_in.is_some()
         ));
         return None;
     };
@@ -5537,6 +5913,86 @@ fn downloaded_copy(
         videos.len()
     ));
     copy.map(|c| (c, user, store))
+}
+
+/// Whether a mounted downloaded copy, played for `owner`, must stop once a
+/// session is replaced: its owner is not the authorized offline user any
+/// more (`authorized`, [`offline_video::last_user`]).
+fn offline_owner_lost(owner: &str, authorized: Option<&str>) -> bool {
+    authorized != Some(owner)
+}
+
+/// A reconnect's verdict on a mounted downloaded copy played for `owner`:
+/// true when the player must go ([`offline_owner_lost`]). The position it
+/// carried (`last_ms`) is the old owner's then, and is dropped, so the
+/// start decided again for whoever is authorized resumes from their own
+/// saved position. A same-owner reconnect keeps it.
+fn offline_reconnect_stops(
+    id: ItemRef,
+    owner: &str,
+    authorized: Option<&str>,
+    last_ms: &Cell<u64>,
+) -> bool {
+    if !offline_owner_lost(owner, authorized) {
+        platform::info(&format!(
+            "pharos: playback offline item={id} verdict=kept reason=same_owner_authorized"
+        ));
+        return false;
+    }
+    let carried = last_ms.replace(0);
+    platform::info(&format!(
+        "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={} carried_ms={carried} carried=dropped",
+        authorized.is_some()
+    ));
+    true
+}
+
+/// What the watch screen may show of a negotiation's `state`: a downloaded
+/// copy only while the owner it was negotiated for is still the authorized
+/// offline user; otherwise nothing, the pending state. A restarted
+/// negotiation keeps its last value until the new one completes, so without
+/// this A's player would stay mounted while B's start is pending. `seen`
+/// keeps the last verdict, which is logged when it changes.
+fn shown_playback<'a>(
+    id: ItemRef,
+    state: Option<&'a Result<PlayingRef, StartFailure>>,
+    seen: &Cell<Option<bool>>,
+) -> Option<&'a Result<PlayingRef, StartFailure>> {
+    let Some(Ok(p)) = state else {
+        return state;
+    };
+    let Some(save) = &p.0.offline else {
+        return state;
+    };
+    let authorized = offline_video::last_user();
+    let lost = offline_owner_lost(&save.user, authorized.as_deref());
+    if seen.replace(Some(lost)) != Some(lost) {
+        if lost {
+            platform::info(&format!(
+                "pharos: playback offline render item={id} verdict=hidden reason=owner_not_authorized authorized_user={}",
+                authorized.is_some()
+            ));
+        } else {
+            platform::info(&format!(
+                "pharos: playback offline render item={id} verdict=shown reason=owner_authorized"
+            ));
+        }
+    }
+    state.filter(|_| !lost)
+}
+
+/// The watch screen's negotiation as it may be shown: [`shown_playback`]
+/// over `playing`, for the caller to render the player from. It subscribes
+/// to the resource's state as well as its value: a restart keeps the value,
+/// so only the state re-renders the screen for the gate while it is held.
+fn use_gated_playback(
+    id: ItemRef,
+    playing: Resource<Option<Result<PlayingRef, StartFailure>>>,
+) -> Option<Result<PlayingRef, StartFailure>> {
+    let seen = use_hook(|| Rc::new(Cell::new(None::<bool>)));
+    let _ = playing.state().cloned();
+    let state = playing.read();
+    shown_playback(id, state.as_ref().and_then(Option::as_ref), &seen).cloned()
 }
 
 /// A playback of a downloaded copy: the stored master playlist as it was
@@ -5974,9 +6430,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // A downloaded copy plays whatever the connection is: a weak signal
         // never breaks it. `peek`: the account loading must not restart it.
         let wanted = picked_here.clone().or_else(|| stored_version(id));
-        let signed_in = account
-            .and_then(|a| a.0.peek().clone().flatten())
-            .map(|me| me.id);
+        let signed_in = account.and_then(|a| a.peek_me()).map(|me| me.id);
         // With no connection the downloaded copy is all there is, so a
         // preferred version that is another file does not hide it.
         // The device's library shown (the session lost, though its API is
@@ -6227,6 +6681,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // network failure renegotiates instead of failing (B1482). The renewal
     // names the stream's session so a server that lost its grant in a
     // rollout keeps it rather than listing a second one (B1490).
+    let owner_last_ms = Rc::clone(&last_ms);
     use_effect(move || {
         let gen = api_gen();
         let current = playing.read().clone();
@@ -6243,7 +6698,19 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             }
             Some(None) => return,
         };
-        if p.0.grant_gen.replace(gen) == gen || p.0.offline.is_some() {
+        if p.0.grant_gen.replace(gen) == gen {
+            return;
+        }
+        // A downloaded copy has no grant to renew, but the reconnect may
+        // have replaced its owner's session: it plays on only while its
+        // owner is still the authorized offline user (`session_replaced`
+        // ran before the new API was set). Otherwise the player goes, and
+        // the start is decided again for whoever is authorized now.
+        if let Some(save) = &p.0.offline {
+            let authorized = offline_video::last_user();
+            if offline_reconnect_stops(id, &save.user, authorized.as_deref(), &owner_last_ms) {
+                playing.restart();
+            }
             return;
         }
         let Some(api) = ctx.api.peek().clone() else {
@@ -6334,22 +6801,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         }
     });
     use_drop(move || platform::turn_cancel(&id.to_string(), "left"));
-    let state = playing.read();
+    // The owner gate reads an identity no signal carries: a new API
+    // re-renders it, as a restart does through the gate's own subscription.
+    api_gen();
+    let gated = use_gated_playback(id, playing);
+    let shown = gated.as_ref();
     // The song handing over is not the page's.
-    let name = state
-        .as_ref()
-        .and_then(Option::as_ref)
+    let name = shown
         .and_then(|r| r.as_ref().ok())
         .filter(|_| matches!(slot, Slot::Current { .. }))
         .map(|p| super::views::page_name(&p.0.detail.item));
     use_page_name(id, name);
     // The stage bar, and its Close, comes with a loaded player; a compact
     // window still loading or failed needs a way out of its own.
-    let stranded = ctx_stage.read().view != View::Full
-        && !matches!(state.as_ref().and_then(Option::as_ref), Some(Ok(_)));
+    let stranded = ctx_stage.read().view != View::Full && !matches!(shown, Some(Ok(_)));
     // A negotiation that failed in the full view has no player and no shell
     // to leave by, so it gets the failure panel (B806).
-    let start_failure = match state.as_ref().and_then(Option::as_ref) {
+    let start_failure = match shown {
         Some(Err(reason)) if ctx_stage.read().view == View::Full => Some(reason.clone()),
         _ => None,
     };
@@ -6366,8 +6834,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The full view's first load has no player chrome yet, so it carries its
     // own way out (038 FR-408, V1220).
-    let first_load =
-        ctx_stage.read().view == View::Full && state.as_ref().and_then(Option::as_ref).is_none();
+    let first_load = ctx_stage.read().view == View::Full && shown.is_none();
     let body = match start_failure {
         None if first_load => rsx! {
             FirstLoad { on_back: move |()| leave_player(nav) }
@@ -6380,7 +6847,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 on_report: move |()| report_failure(&PlayFailure::start(reason.clone())),
             }
         },
-        None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+        None => loaded(shown, |p: &PlayingRef| {
             remount_on(
                 &p.0.mount_key(),
                 rsx! {
@@ -8890,12 +9357,7 @@ fn Player(
         let skips = skips.clone();
         move || release_track_skips(&skips, skip_owner)
     });
-    let me = account.and_then(|a| {
-        a.0.read()
-            .as_ref()
-            .and_then(Option::as_ref)
-            .map(|m| (m.id.clone(), m.name.clone()))
-    });
+    let me = account.and_then(|a| a.me().map(|m| (m.id, m.name)));
     let members_waiting: Vec<String> = match me {
         Some((id, name)) if group.drives(playing_id) => group
             .members
@@ -9421,7 +9883,808 @@ fn Player(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// CR 4640611420: A's revoked socket shows sign-in before A's sign-out
+    /// reply lands. If B has started signing in since, or is Ready, A's
+    /// late reply is ignored: it neither changes the phase nor runs the
+    /// session-end hook, and reports no sign-out (so no kept book is
+    /// deleted). With no newer sign-in, the reply is taken as before.
+    #[test]
+    fn a_sign_out_reply_overtaken_by_a_newer_sign_in_is_ignored() {
+        use super::super::machine::{SignInReply, SignOutReply};
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() -> Option<String> {
+            ENDED.with(|n| n.set(n.get() + 1));
+            None
+        }
+        let ended = || ENDED.with(std::cell::Cell::get);
+        let a_signed_out = || {
+            let mut m = Machine::new().with_session_end(hook);
+            m.apply(Event::Resumed { epoch: 0 });
+            let sent_at = m.sign_ins();
+            m.apply(Event::SignOutSubmitted);
+            m.apply(Event::Closed {
+                epoch: 0,
+                reason: "revoked".into(),
+            });
+            (m, sent_at)
+        };
+        // B is Ready before A's reply.
+        let (mut m, sent_at) = a_signed_out();
+        let after_a = ended();
+        m.apply(Event::SignInSubmitted);
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 204,
+            retry_after: None,
+        }));
+        let epoch = m.epoch();
+        m.apply(Event::Resumed { epoch });
+        assert_eq!(m.phase(), &Phase::Ready);
+        assert!(
+            !sign_out_answered(&mut m, SignOutReply::Status(204), sent_at),
+            "A's late reply signed B out"
+        );
+        assert_eq!(m.phase(), &Phase::Ready, "A's late reply ended B's session");
+        assert_eq!(ended(), after_a, "the session-end hook ran for B");
+        // B is still signing in: A's reply reports no sign-out either.
+        let (mut m, sent_at) = a_signed_out();
+        m.apply(Event::SignInSubmitted);
+        assert!(!sign_out_answered(
+            &mut m,
+            SignOutReply::Status(204),
+            sent_at
+        ));
+        // The control: nobody signed in since, so A's reply is taken.
+        let (mut m, sent_at) = a_signed_out();
+        assert!(sign_out_answered(
+            &mut m,
+            SignOutReply::Status(204),
+            sent_at
+        ));
+    }
+
+    /// A sign-out from Ready parks the signed-out user's downloads once,
+    /// through the machine's session-end hook, and never every user's.
+    #[test]
+    fn a_sign_out_from_ready_parks_only_its_users_downloads() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, KeptVideo, VideoStore};
+        use super::super::machine::SignOutReply;
+        use super::super::ports::{use_test_video_slot, Slot};
+        #[derive(Default)]
+        struct Parks(std::sync::Mutex<Vec<String>>);
+        impl VideoStore for Parks {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn park_runs(&self, owner: Option<&str>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("park {}", owner.unwrap_or("all")));
+            }
+        }
+        let slot: &'static Slot<dyn VideoStore> = Box::leak(Box::new(Slot::new()));
+        let parks = std::sync::Arc::new(Parks::default());
+        let _ = slot.set(parks.clone());
+        use_test_video_slot(Some(slot));
+        offline_video::remember_user("A");
+        let mut m = app_machine();
+        m.apply(Event::Resumed { epoch: 0 });
+        let sent_at = m.sign_ins();
+        m.apply(Event::SignOutSubmitted);
+        let out = sign_out_answered(&mut m, SignOutReply::Status(204), sent_at);
+        use_test_video_slot(None);
+        assert!(out);
+        assert_eq!(*parks.0.lock().unwrap(), ["park A"], "parked more than A's");
+    }
+
+    /// A replaced session's account result still naming A selects none of
+    /// A's downloads while the identity is fenced: only the authorized
+    /// offline owner picks a copy to play.
+    #[test]
+    fn a_fenced_users_account_result_selects_no_downloaded_copy() {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        use super::super::ports::{use_test_video_slot, Slot};
+        static SLOT: Slot<dyn VideoStore> = Slot::new();
+        struct AsOnly;
+        impl VideoStore for AsOnly {
+            fn videos(&self, user: &str) -> Vec<KeptVideo> {
+                if user != "A" {
+                    return Vec::new();
+                }
+                let mut v = offline_video::tests::video("7", "", KeptState::Ready);
+                v.user = user.into();
+                vec![v]
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let _ = SLOT.set(std::sync::Arc::new(AsOnly));
+        use_test_video_slot(Some(&SLOT));
+        let id: ItemRef = "7".parse().unwrap();
+        offline_video::remember_user("A");
+        assert!(downloaded_copy(id, None, Some("A".into())).is_some());
+        // CR 4640611367: a player mounted for A plays on while A is the
+        // authorized owner, and stops once the replacement fences A.
+        let lost = || offline_owner_lost("A", offline_video::last_user().as_deref());
+        assert!(!lost(), "A's own player was stopped");
+        offline_video::session_replaced(&offline_video::Session::opened(
+            (),
+            Some("tokB".to_owned()),
+        ));
+        assert!(lost(), "A's mounted player outlived the replacement");
+        let copy = downloaded_copy(id, None, Some("A".into()));
+        use_test_video_slot(None);
+        assert!(copy.is_none(), "a fenced user's copy was selected");
+    }
+
+    /// CR 4644634578: a reconnect that stops a downloaded copy because its
+    /// owner is not authorized drops the position it carried, so the new
+    /// owner's start resumes from their own saved one. A same-owner
+    /// reconnect keeps it.
+    #[test]
+    fn an_owner_change_drops_the_carried_position() {
+        let id: ItemRef = "7".parse().unwrap();
+        let carried = std::cell::Cell::new(90_000u64);
+        assert!(!offline_reconnect_stops(id, "A", Some("A"), &carried));
+        assert_eq!(
+            carried.get(),
+            90_000,
+            "a same-owner reconnect lost its place"
+        );
+        assert!(offline_reconnect_stops(id, "A", Some("B"), &carried));
+        assert_eq!(carried.get(), 0, "B's start carried on from A's position");
+        carried.set(5);
+        assert!(offline_reconnect_stops(id, "A", None, &carried));
+        assert_eq!(carried.get(), 0, "a signed-out start carried A's position");
+    }
+
+    /// A downloaded copy's player as [`offline_playing`] builds it for
+    /// `user`, whatever engine the host has.
+    fn offline_player_for(user: &str) -> PlayingRef {
+        use super::super::kept_video::{
+            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
+        };
+        struct NoStore;
+        impl VideoStore for NoStore {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let mut copy = offline_video::tests::video("7", "", KeptState::Ready);
+        copy.user = user.into();
+        let detail = offline_video::offline_detail(&copy).unwrap();
+        let tracks = (&detail.audio_tracks[..], &detail.subtitle_tracks[..]);
+        let track_map = track_follow::TrackMap::new(tracks, tracks);
+        PlayingRef(Rc::new(Playing {
+            title: copy.title.clone(),
+            kind: detail.item.kind,
+            image: None,
+            url: copy.master_url.clone(),
+            start_ms: 0,
+            from_start: false,
+            engine: Engine::HlsJs,
+            session: format!("{}-0", offline_video::OFFLINE_SESSION),
+            grant: RefCell::new(None),
+            grant_gen: Cell::new(1),
+            track_map,
+            audio: copy.audio,
+            subtitle: None,
+            asked_audio: None,
+            method: offline_video::OFFLINE_METHOD.to_owned(),
+            asked_subtitle: TrackChoice::default(),
+            version: String::new(),
+            offline: Some(OfflineSave {
+                store: std::sync::Arc::new(NoStore),
+                user: user.into(),
+            }),
+            renegotiation: 0,
+            session_suspect: Cell::new(false),
+            detail,
+        }))
+    }
+
+    /// Mounts A's downloaded copy behind a negotiation as the watch screen
+    /// holds it, then reconnects: `replaced` runs (the session swap), and
+    /// the negotiation restarts and stays pending, as a slow server start
+    /// for the new owner does. The screen's [`use_gated_playback`] decides
+    /// what shows. Returns what renders while it is pending.
+    fn render_during_a_pending_renegotiation(replaced: impl FnOnce()) -> String {
+        type Negotiated = Option<Result<PlayingRef, StartFailure>>;
+        thread_local! {
+            static RUNS: Cell<u32> = const { Cell::new(0) };
+            static HANDLE: RefCell<Option<Resource<Negotiated>>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let playing = use_resource(|| {
+                let run = RUNS.with(|r| r.replace(r.get() + 1));
+                async move {
+                    if run == 0 {
+                        Some(Ok(offline_player_for("A")))
+                    } else {
+                        std::future::pending::<Negotiated>().await
+                    }
+                }
+            });
+            HANDLE.with(|h| h.replace(Some(playing)));
+            let id: ItemRef = "7".parse().unwrap();
+            // The screen's own gate; the player is this marker.
+            match use_gated_playback(id, playing) {
+                Some(Ok(p)) => rsx! { div { "player {p.0.session}" } },
+                Some(Err(_)) => rsx! { div { "failed" } },
+                None => rsx! { div { "pending" } },
+            }
+        }
+        RUNS.with(|r| r.set(0));
+        offline_video::remember_user("A");
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let settle = |dom: &mut VirtualDom, want: &'static str| {
+                let html = dioxus_ssr::render(dom);
+                (html.contains(want), html)
+            };
+            let start = std::time::Instant::now();
+            loop {
+                let (done, html) = settle(&mut dom, "player");
+                if done {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(3),
+                    "A's player never mounted: {html}"
+                );
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            platform::take_info_lines();
+            replaced();
+            let mut playing = HANDLE.with(|h| h.borrow().unwrap());
+            dom.in_runtime(|| playing.restart());
+            for _ in 0..5 {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+            assert!(RUNS.with(Cell::get) >= 2, "the negotiation did not restart");
+            dioxus_ssr::render(&dom)
+        })
+    }
+
+    /// CR 4640611367: a reconnect that fences A restarts the negotiation,
+    /// whose last value (A's player) stays until the new one completes.
+    /// While B's start is pending, A's player is not rendered.
+    #[test]
+    fn a_fenced_owners_player_unmounts_while_the_next_start_is_pending() {
+        let html = render_during_a_pending_renegotiation(|| {
+            offline_video::session_replaced(&offline_video::Session::opened(
+                (),
+                Some("tokB".to_owned()),
+            ));
+        });
+        let lines = platform::take_info_lines();
+        offline_video::forget_user();
+        assert!(
+            !html.contains("player"),
+            "A's player stayed mounted: {html}"
+        );
+        assert!(html.contains("pending"), "{html}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(
+                "pharos: playback offline render item=7 verdict=hidden reason=owner_not_authorized"
+            )),
+            "{lines:?}"
+        );
+    }
+
+    /// A reconnect that keeps A authorized leaves A's player mounted while
+    /// the restarted negotiation is pending.
+    #[test]
+    fn a_same_owner_reconnect_keeps_the_player_mounted() {
+        offline_video::tests::use_pref_seam();
+        let html = render_during_a_pending_renegotiation(|| {
+            // The new session's token is the one A is paired with.
+            offline_video::session_replaced(&offline_video::tests::seam_session());
+            assert_eq!(offline_video::last_user().as_deref(), Some("A"));
+        });
+        let lines = platform::take_info_lines();
+        offline_video::forget_user();
+        assert!(html.contains("player offline-0"), "A's player went: {html}");
+        assert!(
+            !lines.iter().any(|l| l.contains("verdict=hidden")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4642574422: Dioxus keeps A's finished `me` through the restart a
+    /// reconnect causes. Once B's session is published, A's answer is not
+    /// shown (no name, no admin links) while B's `me` is pending; B's
+    /// answer shows when it comes.
+    #[test]
+    fn a_replaced_sessions_me_is_not_shown_while_the_next_is_pending() {
+        use super::super::machine::{Event, Machine};
+        use offline_video::Session;
+        type Answers = Vec<tokio::sync::oneshot::Receiver<String>>;
+        thread_local! {
+            static ANSWERS: RefCell<Answers> = const { RefCell::new(Vec::new()) };
+            static SESSION: RefCell<Option<Signal<Option<Session<()>>>>> =
+                const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let machine = use_signal(|| {
+                let mut m = Machine::new();
+                m.apply(Event::Resumed { epoch: 0 });
+                m
+            });
+            let session = use_signal(|| Some(offline_video::tests::seam_session()));
+            SESSION.with(|s| s.replace(Some(session)));
+            let me = use_me(
+                machine,
+                session,
+                Rc::new(|()| {
+                    Box::pin(async {
+                        let rx = ANSWERS.with(|a| {
+                            let mut a = a.borrow_mut();
+                            (!a.is_empty()).then(|| a.remove(0))
+                        })?;
+                        rx.await.ok()
+                    })
+                }),
+                String::as_str,
+                Rc::new(|_: &String| {}),
+            );
+            match ScopedMe::new(me, session).me() {
+                Some(user) => rsx! { div { "me {user}" } },
+                None => rsx! { div { "no me" } },
+            }
+        }
+        /// Renders until `want` shows or `ms` pass. Each check follows a
+        /// render, so a change made before the call is on screen.
+        async fn drive(dom: &mut VirtualDom, want: &str, ms: u64) -> String {
+            let start = std::time::Instant::now();
+            loop {
+                dom.render_immediate_to_vec();
+                let html = dioxus_ssr::render(dom);
+                if html.contains(want) || start.elapsed() > std::time::Duration::from_millis(ms) {
+                    return html;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work())
+                        .await;
+                dom.render_immediate_to_vec();
+            }
+        }
+        offline_video::tests::use_pref_seam();
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<String>();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel::<String>();
+        ANSWERS.with(|a| a.replace(vec![rx_a, rx_b]));
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (during, after, lines) = rt.block_on(async {
+            tx_a.send("A".to_owned()).unwrap();
+            let html = drive(&mut dom, "me A", 2000).await;
+            assert!(html.contains("me A"), "A's answer never showed: {html}");
+            platform::take_info_lines();
+            let mut session = SESSION.with(|s| s.borrow().unwrap());
+            dom.in_runtime(|| session.set(Some(offline_video::tests::seam_session())));
+            dom.mark_dirty(ScopeId::APP);
+            // A's name, if it shows, shows at once.
+            let during = drive(&mut dom, "me A", 300).await;
+            let lines = platform::take_info_lines();
+            tx_b.send("B".to_owned()).unwrap();
+            let after = drive(&mut dom, "me B", 2000).await;
+            (during, after, lines)
+        });
+        offline_video::forget_user();
+        assert!(
+            during.contains("no me"),
+            "A's answer showed for B's session: {during}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                .starts_with("pharos: account me verdict=hidden reason=session_replaced")),
+            "{lines:?}"
+        );
+        assert!(after.contains("me B"), "B's answer never showed: {after}");
+    }
+
+    /// The slow-connect timer decides when it fires, not when the attempt
+    /// starts: downloads that appear in between (a store published after
+    /// the attempt began) still cut the screen off to the offline lists.
+    #[test]
+    fn a_store_published_after_the_attempt_started_still_gets_the_slow_connect() {
+        thread_local! {
+            static KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            static SLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            /// Every answer the timer's `kept` read got.
+            static SEEN: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        KEPT.with(|k| k.set(false));
+        SLOW.with(|s| s.set(false));
+        SEEN.with(|s| s.borrow_mut().clear());
+        fn root() -> Element {
+            let slow = use_signal(|| false);
+            use_hook(|| {
+                start_slow_connect(
+                    10,
+                    // Runs once the sleep is over (the host's sleep is
+                    // instant): the store lands while the timer waited.
+                    || {
+                        KEPT.with(|k| k.set(true));
+                        true
+                    },
+                    || {
+                        let kept = KEPT.with(std::cell::Cell::get);
+                        SEEN.with(|s| s.borrow_mut().push(kept));
+                        kept
+                    },
+                    slow,
+                )
+            });
+            SLOW.with(|s| s.set(slow()));
+            rsx! {}
+        }
+        let mut dom = VirtualDom::new(root);
+        dom.rebuild_in_place();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..5 {
+                if SLOW.with(std::cell::Cell::get) {
+                    break;
+                }
+                let woke =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), dom.wait_for_work())
+                        .await;
+                assert!(woke.is_ok(), "no timer ran for the attempt");
+                dom.render_immediate_to_vec();
+            }
+        });
+        assert!(
+            SLOW.with(std::cell::Cell::get),
+            "the slow connect never came"
+        );
+        assert_eq!(
+            SEEN.with(|s| s.borrow().clone()),
+            vec![true],
+            "kept was not read when the timer fired"
+        );
+    }
+
     use super::*;
+
+    /// A refused resume ends the cached user, so a later sign-in as someone
+    /// else is never served the first user's downloads; a refusal for a
+    /// replaced attempt changes nothing.
+    #[test]
+    fn a_refused_resume_forgets_the_user_but_a_stale_one_does_not() {
+        offline_video::remember_user("alice");
+        let mut m = Machine::new();
+        m.apply(Event::Retry);
+        let stale = m.epoch().wrapping_sub(1);
+        forget_user_on_refused_resume(&m, stale);
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+        forget_user_on_refused_resume(&m, m.epoch());
+        assert_eq!(offline_video::last_user(), None, "the previous user stayed");
+        offline_video::remember_user("bob");
+        assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
+    }
+
+    /// A refused reconnect of a session that was Ready cleans up once,
+    /// through the session-end hook, while its user is still known: the
+    /// connect's own cleanup is skipped, so the hook never runs with nobody
+    /// signed in (which parks every user's downloads).
+    #[test]
+    fn a_refused_reconnect_after_ready_cleans_up_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        fn count_end() -> Option<String> {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        offline_video::remember_user("alice");
+        let mut m = Machine::new().with_session_end(count_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        let epoch = m.epoch();
+        let before = ENDED.load(Ordering::SeqCst);
+        assert!(
+            !forget_user_on_refused_resume(&m, epoch),
+            "the connect cleaned up a session the hook ends"
+        );
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(ENDED.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// A sign-out that ended a pending reconnect ends its attempt: the
+    /// attempt's refusal then runs no cleanup (nobody is signed in to clean
+    /// up for) and leaves the sign-in screen's warning in place.
+    #[test]
+    fn a_refusal_after_a_sign_out_ended_the_reconnect_changes_nothing() {
+        let sign_in_error = |m: &Machine| match m.phase() {
+            Phase::SignIn { error, .. } => error.clone(),
+            other => panic!("not on sign-in: {other:?}"),
+        };
+        offline_video::remember_user("alice");
+        let mut m = Machine::new();
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        let epoch = m.epoch();
+        m.apply(Event::SignOutAnswered(
+            super::super::machine::SignOutReply::NotSaved("disk full".into()),
+        ));
+        let warning = sign_in_error(&m);
+        assert!(warning.is_some());
+        offline_video::remember_user("bob");
+        assert!(
+            !forget_user_on_refused_resume(&m, epoch),
+            "an ended attempt's refusal cleaned up"
+        );
+        assert_eq!(offline_video::last_user().as_deref(), Some("bob"));
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(
+            sign_in_error(&m),
+            warning,
+            "the refusal cleared the warning"
+        );
+    }
+
+    /// However a session ends, through the machine, the previous user is
+    /// forgotten: a rejected request (as every load and play reports it), a
+    /// revoked socket; one that finds no ready session changes nothing.
+    #[test]
+    fn a_session_that_ends_forgets_the_user_whoever_ended_it() {
+        let machine = app_machine;
+        let ready = |mut m: Machine| {
+            m.apply(Event::Resumed { epoch: 0 });
+            m
+        };
+        for end in [
+            Event::NeedsSignIn,
+            Event::Closed {
+                epoch: 0,
+                reason: "revoked".into(),
+            },
+        ] {
+            offline_video::remember_user("alice");
+            let mut m = ready(machine());
+            m.apply(end.clone());
+            assert!(matches!(m.phase(), Phase::SignIn { .. }), "{end:?}");
+            assert_eq!(offline_video::last_user(), None, "{end:?} kept the user");
+            assert!(offline_video::ready_for_last_user().is_empty());
+        }
+        // No ready session: the event changes nothing, the user stays.
+        offline_video::remember_user("alice");
+        let mut m = machine();
+        m.apply(Event::NeedsSignIn);
+        assert_eq!(offline_video::last_user().as_deref(), Some("alice"));
+    }
+
+    /// CR 4638660937: a played mark that lands after the session it was
+    /// sent in ended is not stored for the session signed in now.
+    #[test]
+    fn a_mark_from_an_ended_session_is_not_stored() {
+        let id: ItemRef = "1".parse().unwrap();
+        let mut m = app_machine();
+        m.apply(Event::Resumed { epoch: 0 });
+        let sent_in = m.session();
+        assert!(mark_is_current(&m, sent_in, id));
+        assert!(
+            !mark_is_current(&m, sent_in.wrapping_sub(1), id),
+            "a stale mark was stored"
+        );
+        // CR 4644634657: a sign-out keeps the session counter; the mark
+        // sent before it is not stored once no session is signed in.
+        m.apply(Event::NeedsSignIn);
+        assert_eq!(m.session(), sent_in);
+        platform::take_info_lines();
+        assert!(
+            !mark_is_current(&m, sent_in, id),
+            "a mark was stored after its session ended"
+        );
+        assert!(platform::take_info_lines()
+            .iter()
+            .any(|l| l.contains("verdict=skipped reason=no_session")));
+        offline_video::forget_user();
+    }
+
+    /// CR 4646041689: a played mark whose call completes after a sign-out,
+    /// through the real mark handler, stores nothing.
+    #[test]
+    fn a_mark_completed_after_sign_out_is_not_stored_by_the_handler() {
+        assert_eq!(mark_through_the_handler(true), None);
+    }
+
+    /// CR 4646041689: the control. One that completes while its session is
+    /// signed in is stored.
+    #[test]
+    fn a_mark_completed_in_its_session_is_stored_by_the_handler() {
+        let id: ItemRef = "1".parse().unwrap();
+        assert_eq!(mark_through_the_handler(false), Some((id, true)));
+    }
+
+    /// Drives the real mark handler for a played mark on item 1, its call
+    /// completed by the test once the session is signed out (or not), and
+    /// returns what it stored.
+    fn mark_through_the_handler(signed_out: bool) -> Option<(ItemRef, bool)> {
+        type Stored = Signal<Option<(ItemRef, bool)>>;
+        type Parts = (
+            EventHandler<(ItemRef, bool, String)>,
+            Signal<Machine>,
+            Stored,
+            Signal<u32>,
+        );
+        thread_local! {
+            static ANSWER: RefCell<Option<tokio::sync::oneshot::Receiver<bool>>> = const { RefCell::new(None) };
+            static PARTS: RefCell<Option<Parts>> = const { RefCell::new(None) };
+        }
+        fn root() -> Element {
+            let machine = use_signal(|| {
+                let mut m = app_machine();
+                m.apply(Event::Resumed { epoch: 0 });
+                m
+            });
+            let stored: Stored = use_signal(|| None);
+            let marks = use_signal(|| 0u32);
+            let flash = Flash {
+                line: use_signal(|| None),
+                generation: use_signal(|| 0),
+            };
+            let handler = use_hook(|| {
+                let send: SendMark = Rc::new(|_, _, _| {
+                    let answer = ANSWER.with(|a| a.borrow_mut().take())?;
+                    Some(Box::pin(async move { Ok(answer.await.unwrap_or(false)) }))
+                });
+                mark_handler_with(Mark::Played, send, machine, flash, marks, stored)
+            });
+            PARTS.with(|p| p.replace(Some((handler, machine, stored, marks))));
+            rsx! { div {} }
+        }
+        let id: ItemRef = "1".parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            offline_video::remember_user("alice");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ANSWER.with(|a| a.replace(Some(rx)));
+            let mut dom = VirtualDom::new(root);
+            dom.rebuild_in_place();
+            let (handler, mut machine, stored, marks) =
+                PARTS.with(|p| p.borrow_mut().take()).unwrap();
+            let sent_in = dom.in_runtime(|| machine.peek().session());
+            dom.in_runtime(|| handler.call((id, true, "Item".to_owned())));
+            if signed_out {
+                // The user's sign-out, as the app applies it.
+                dom.in_runtime(|| {
+                    let mut m = machine.write();
+                    m.apply(Event::SignOutSubmitted);
+                    m.apply(Event::SignOutAnswered(
+                        super::super::machine::SignOutReply::Status(204),
+                    ));
+                });
+                let m = dom.in_runtime(|| machine.peek().clone());
+                assert!(matches!(m.phase(), Phase::SignIn { .. }), "not signed out");
+                assert_eq!(m.session(), sent_in, "the sign-out moved the session");
+            }
+            tx.send(true).unwrap();
+            // The handler has run to its end once `marks` moves: only then
+            // does `stored` say what it did.
+            rt.block_on(async {
+                for _ in 0..200 {
+                    if dom.in_runtime(|| *marks.peek()) > 0 {
+                        break;
+                    }
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        dom.wait_for_work(),
+                    )
+                    .await;
+                    dom.render_immediate_to_vec();
+                }
+            });
+            assert_eq!(
+                dom.in_runtime(|| *marks.peek()),
+                1,
+                "the mark never completed"
+            );
+            let now = dom.in_runtime(|| *stored.peek());
+            offline_video::forget_user();
+            now
+        }
+    }
+
+    /// CR 4638660942: only an accepted resume notes a newer server's
+    /// schema. An attempt a sign-out superseded leaves the notice alone.
+    #[test]
+    fn only_an_accepted_resume_notes_a_newer_schema() {
+        let newer = pharos_client::SCHEMA_VERSION + 1;
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        m.apply(Event::SignInSubmitted);
+        m.apply(Event::ResumeRefused { epoch });
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(newer)),
+            (false, None),
+            "a rejected attempt set the notice"
+        );
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(newer)),
+            (true, Some(newer))
+        );
+        let mut m = Machine::new();
+        let epoch = m.epoch();
+        assert_eq!(
+            accept_resume(&mut m, epoch, Some(pharos_client::SCHEMA_VERSION)),
+            (true, None)
+        );
+    }
 
     #[test]
     fn the_apps_outdated_notice_names_both_versions_and_the_update() {
