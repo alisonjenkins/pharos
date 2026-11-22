@@ -579,7 +579,22 @@ pub fn warn(message: &str) {
     eprintln!("{message}");
 }
 
-pub fn info(_message: &str) {}
+#[cfg(test)]
+thread_local! {
+    /// Every `info` line on this thread, for tests to read.
+    static INFO_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn info(_message: &str) {
+    #[cfg(test)]
+    INFO_LINES.with(|l| l.borrow_mut().push(_message.to_owned()));
+}
+
+/// The `info` lines logged on this thread since the last take.
+#[cfg(test)]
+pub fn take_info_lines() -> Vec<String> {
+    INFO_LINES.with(|l| std::mem::take(&mut *l.borrow_mut()))
+}
 
 /// No server to submit to on the host: client events are dropped.
 pub fn install_telemetry(_api: &NativeApi) {}
