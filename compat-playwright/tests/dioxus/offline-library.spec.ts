@@ -135,12 +135,19 @@ test.describe("the library offline (spec 049)", () => {
     await page.goto("/ui/");
     await expect(main(page)).toContainText("Reader Second", { timeout: 20_000 });
 
-    // Cut: the page waits out the grace before it switches.
+    // Cut: the page waits out the 5 s grace before it switches, timed
+    // from the moment the app shows it saw the loss.
     cut = true;
-    const lostAt = Date.now();
     for (const ws of open.splice(0)) await ws.close();
-    await expect(page.locator(".pharos-offline-note")).toBeVisible({ timeout: 20_000 });
-    expect(Date.now() - lostAt).toBeGreaterThanOrEqual(4_000);
+    await expect(page.locator(".pharos-connection-shell")).toBeVisible({ timeout: 20_000 });
+    const lostAt = Date.now();
+    const note = page.locator(".pharos-offline-note");
+    // Well inside the grace: still the server's screens.
+    await page.waitForTimeout(4_000);
+    await expect(note).toHaveCount(0);
+    await expect(note).toBeVisible({ timeout: 20_000 });
+    // The loss is seen up to one poll late, so allow that much under 5 s.
+    expect(Date.now() - lostAt).toBeGreaterThanOrEqual(4_800);
     await expect(main(page)).toContainText("Reader Fixture");
     await expect(main(page)).not.toContainText("Reader Second", { timeout: 10_000 });
     expect(logs.some((l) => /^pharos: offline library verdict=device reason=connection_lost /.test(l))).toBe(true);
