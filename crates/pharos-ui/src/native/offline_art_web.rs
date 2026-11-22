@@ -93,6 +93,11 @@ pub async fn keep_art(user: &str, images: &[String], current: impl Fn() -> bool)
     };
     let mut signed_out = false;
     for key in wanted.difference(&stored) {
+        // Signed out before this poster was asked for: nothing more is.
+        if !current() {
+            signed_out = true;
+            break;
+        }
         let sep = if key.contains('?') { '&' } else { '?' };
         let url = format!("{key}{sep}fillWidth={ART_WIDTH}");
         let response = match JsFuture::from(window.fetch_with_str(&url)).await {

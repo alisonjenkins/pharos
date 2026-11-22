@@ -57,23 +57,44 @@ pub fn art_of(catalogue: &Catalogue) -> Vec<String> {
 /// Brings the browser's posters in line with the notes; nothing elsewhere.
 /// Returns whether every poster is stored (always, where none are kept), so
 /// a poster that failed is asked again by a later pass.
+///
+/// Every pass (the one after sign-in or a reconnect, and the periodic one)
+/// records its result in one place, [`art_settled`], so a poster that
+/// failed in any of them is asked again by the next periodic pass.
 pub async fn sync_art(user: &str) -> bool {
     let fence = notes_fence();
     if fence_moved(fence) {
         return true;
     }
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
-    {
+    let settled =
         super::offline_art_web::keep_art(user, &art_of(&load_catalogue(user)), move || {
             !fence_moved(fence)
         })
-        .await
-    }
+        .await;
     #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-    {
+    let settled = {
         let _ = user;
         true
-    }
+    };
+    ART_SETTLED.store(settled, std::sync::atomic::Ordering::Relaxed);
+    settled
+}
+
+/// Whether the last poster pass stored every poster; false until one has
+/// run, so the first periodic pass checks.
+static ART_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn art_settled() -> bool {
+    ART_SETTLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The device's library to show in place of `old`, when it changed: the new
+/// one, or an empty one once nothing is left on the device (so a removed
+/// item does not stay listed). `None` when nothing changed.
+pub fn refreshed(old: &OfflineLibrary, now: Option<OfflineLibrary>) -> Option<OfflineLibrary> {
+    let now = now.unwrap_or_default();
+    (*old != now).then_some(now)
 }
 
 /// Bumped as the account signs out, before its notes and posters are
@@ -441,6 +462,18 @@ mod tests {
         assert!(run(note_one(&server(), &info, &mut c, ItemRef::Real(101))));
         assert!(c.snaps.contains_key("s10"), "{:?}", c.snaps.keys());
         assert!(c.missing(&[ItemRef::Real(101)]).is_empty());
+    }
+
+    /// The shown device library follows what is on the device: a change
+    /// replaces it, the last item removed empties it, no change keeps it.
+    #[test]
+    fn the_shown_device_library_follows_the_device() {
+        let lib = server();
+        assert_eq!(refreshed(&lib, Some(lib.clone())), None);
+        let emptied = refreshed(&lib, None).expect("the removed items go");
+        assert!(emptied.is_empty());
+        assert_eq!(refreshed(&emptied, None), None);
+        assert_eq!(refreshed(&emptied, Some(lib.clone())), Some(lib));
     }
 
     /// Every card width and format finds the one stored poster (V1487).

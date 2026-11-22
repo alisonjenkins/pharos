@@ -2019,7 +2019,6 @@ fn NativeApp(route: Route) -> Element {
     // item noted makes no call.
     use_hook(move || {
         spawn_forever(async move {
-            let mut art_settled = false;
             loop {
                 platform::sleep_ms(NOTES_EVERY_MS).await;
                 let up = {
@@ -2048,8 +2047,12 @@ fn NativeApp(route: Route) -> Element {
                 }
                 // Posters a pass could not store (a 503) are asked again
                 // on a later pass, even with no note changed.
-                if !filled.signed_out && (filled.noted > 0 || filled.pruned > 0 || !art_settled) {
-                    art_settled = super::offline_device::sync_art(&user).await;
+                if !filled.signed_out
+                    && (filled.noted > 0
+                        || filled.pruned > 0
+                        || !super::offline_device::art_settled())
+                {
+                    super::offline_device::sync_art(&user).await;
                 }
             }
         })
@@ -2116,15 +2119,14 @@ fn NativeApp(route: Route) -> Element {
         let Some(old) = offline.peek().clone() else {
             return;
         };
-        match super::offline_device::device_library() {
-            Some(lib) if *old != lib => {
-                platform::info(&format!(
-                    "pharos: offline library verdict=device reason=device_changed items={}",
-                    lib.len()
-                ));
-                offline.set(Some(Rc::new(lib)));
-            }
-            _ => {}
+        if let Some(lib) =
+            super::offline_device::refreshed(&old, super::offline_device::device_library())
+        {
+            platform::info(&format!(
+                "pharos: offline library verdict=device reason=device_changed items={}",
+                lib.len()
+            ));
+            offline.set(Some(Rc::new(lib)));
         }
     }));
     // One manage token per connection, reused each time Manage opens (B920).
