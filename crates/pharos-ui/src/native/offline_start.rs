@@ -230,14 +230,44 @@ pub fn song_queue(items: &[OfflineItem], id: &str) -> Option<(Vec<String>, usize
     })
 }
 
+/// [`song_queue`], unless the app's queue is shuffled and goes on with
+/// songs of the same download: then the song and those, in the shuffled
+/// order. A queued song not on the phone is skipped, as nothing could
+/// fetch it. The `bool` says whether the shuffled order was kept.
+pub fn song_queue_after(
+    items: &[OfflineItem],
+    id: &str,
+    shuffled: bool,
+    upcoming: &[String],
+) -> Option<(Vec<String>, usize, bool)> {
+    let (ids, at) = song_queue(items, id)?;
+    let next: Vec<String> = upcoming
+        .iter()
+        .filter(|u| shuffled && u.as_str() != id && ids.contains(u))
+        .cloned()
+        .collect();
+    if next.is_empty() {
+        return Some((ids, at, false));
+    }
+    let mut order = vec![id.to_owned()];
+    order.extend(next);
+    Some((order, 0, true))
+}
+
 /// A cached song asked for with no server (spec 049): the queue it starts
 /// on the phone's own player, or `None` when it is not cached or there is
-/// no player.
-pub fn cached_song(id: &str) -> Option<(Vec<String>, usize)> {
+/// no player. `shuffled` and `upcoming` are the app's queue.
+pub fn cached_song(id: &str, shuffled: bool, upcoming: &[String]) -> Option<(Vec<String>, usize)> {
     let store = offline_store()?;
     native_audio()?;
     let (_, items) = current_items(&*store);
-    song_queue(&items, id)
+    let (ids, at, kept) = song_queue_after(&items, id, shuffled, upcoming)?;
+    platform::info(&format!(
+        "pharos: offline song queue item={id} order={} tracks={}",
+        if kept { "shuffled" } else { "download" },
+        ids.len()
+    ));
+    Some((ids, at))
 }
 
 /// Plays a cached song on the phone's own player, once, and shows what is
@@ -763,7 +793,29 @@ mod tests {
         );
         assert_eq!(song_queue(&items, "8-1"), None);
         // No ports registered in a test: nothing to play on.
-        assert_eq!(cached_song("7-1"), None);
+        assert_eq!(cached_song("7-1", false, &[]), None);
+    }
+
+    /// An offline album Shuffle keeps its order on the phone's player: the
+    /// chosen song, then the queue's songs that are cached; a song not on
+    /// the phone is skipped. An unshuffled queue keeps the download order.
+    #[test]
+    fn a_shuffled_queue_keeps_its_order_for_a_cached_song() {
+        let store = kept_store();
+        let items = build_items(&store.downloads(), |_| None);
+        let upcoming = vec!["9-9".to_owned(), "7-1".to_owned()];
+        assert_eq!(
+            song_queue_after(&items, "7-2", true, &upcoming),
+            Some((vec!["7-2".to_owned(), "7-1".to_owned()], 0, true))
+        );
+        assert_eq!(
+            song_queue_after(&items, "7-2", false, &upcoming),
+            Some((vec!["7-1".to_owned(), "7-2".to_owned()], 1, false))
+        );
+        assert_eq!(
+            song_queue_after(&items, "7-2", true, &["9-9".to_owned()]),
+            Some((vec!["7-1".to_owned(), "7-2".to_owned()], 1, false))
+        );
     }
 
     #[test]
