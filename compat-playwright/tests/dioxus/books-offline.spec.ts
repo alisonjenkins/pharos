@@ -216,14 +216,22 @@ test.describe("books kept on the device (spec 036)", () => {
     await expect(row).toContainText("kept by hand");
     await expect(page.locator("#pharos-kept-total")).toHaveText(/^1 book · /);
 
-    // No connection: the shell starts from the worker, the list from the record.
+    // No connection: the shell starts from the worker and keeps the usual
+    // screens, showing only what is on the device (spec 049). The book is on
+    // Home's Books rail; its page offers Read.
     await page.context().setOffline(true);
-    await page.reload();
-    await expect(page.getByRole("heading", { name: "Offline: showing books on this device" })).toBeVisible({
+    await page.goto("/ui/");
+    await expect(page.locator(".pharos-offline-note")).toContainText("You're offline.", {
       timeout: 30_000,
     });
-    await page.getByRole("link", { name: "Reader Fixture" }).click();
-    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+    // Read earlier in this test, so Home may offer it under Continue reading,
+    // whose card opens the reader directly; a Books card opens its page.
+    await page.locator(".pharos-main").getByRole("link", { name: /Reader Fixture/ }).first().click();
+    const reader = page.locator(".pharos-reader");
+    const action = page.locator("#pharos-main-action");
+    await expect(reader.or(action).first()).toBeVisible({ timeout: 20_000 });
+    if (!(await reader.isVisible())) await action.click();
+    await expect(reader).toBeVisible({ timeout: 20_000 });
     await expect
       .poll(
         () =>
@@ -432,9 +440,7 @@ test.describe("books kept on the device (spec 036)", () => {
     // Offline, a reload starts from the kept list and the book opens from the cache.
     await page.context().setOffline(true);
     await page.goto("/ui/settings/offline");
-    await expect(page.getByRole("heading", { name: "Offline: showing books on this device" })).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(page.locator(".pharos-offline-note")).toBeVisible({ timeout: 30_000 });
     await expect(page.locator(".pharos-kept-row")).toContainText("reading now");
     await page.getByRole("link", { name: "Reader Fixture" }).click();
     await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
