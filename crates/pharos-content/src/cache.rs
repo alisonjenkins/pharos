@@ -38,6 +38,33 @@ const INDEX_VERSION: u32 = 1;
 const AUDIO_EXT: &str = ".audio";
 const PART_EXT: &str = ".audio.part";
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the part scan fail: 1 the folder, 2 an entry, 3 a length.
+    static PART_SCAN_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Part scans made on this thread.
+    static PART_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Listings of the parts an eviction may take, made on this thread.
+    static PART_VICTIM_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs in `set_cap` once the setting is saved, before the live cap is.
+    static AFTER_CAP_SAVED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs each time a `.part`'s length is read, with that length.
+    static AFTER_PART_LEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs in a trim once its first part scan is read.
+    static AFTER_TRIM_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs in an eviction of a retained part, with the cache's lock held,
+    /// before the part goes.
+    static BEFORE_PART_EVICT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Makes `truncate_part` fail.
+    static TRUNCATE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the emptying of an opened part (`set_len`) fail.
+    static SET_LEN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Parts whose `truncate_part` fails, from any thread (the downloader's).
+#[cfg(test)]
+pub(crate) static TRUNCATE_REFUSED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
@@ -213,11 +240,173 @@ struct State {
     clock: u64,
 }
 
+/// The one lock for admission against the shared cap. The music cache holds
+/// it while it adds a track and trims; a host that admits other downloads
+/// against the same cap (the phone's video) holds it while it reads the
+/// music's bytes and reserves its own. Taken first, always: before the
+/// cache's own lock here, and before the host's own state lock there.
+static ADMISSION: Mutex<()> = Mutex::new(());
+
+/// Holds the shared admission lock until dropped. Never call this while
+/// holding the cache's lock or a host's state lock.
+pub fn admission_guard() -> MutexGuard<'static, ()> {
+    lock_noting(&ADMISSION)
+}
+
+/// Locks `m`. In tests, a thread that finds it held is listed as waiting
+/// on a lock until it gets it, so a test can see that a thread really is
+/// blocked at the lock ([`tests::wait_until_blocked`]), not merely about
+/// to reach it.
+pub(crate) fn lock_noting<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(test)]
+    {
+        match m.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let me = std::thread::current().id();
+        tests::WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(me);
+        let g = m.lock().unwrap_or_else(PoisonError::into_inner);
+        tests::WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|t| *t != me);
+        g
+    }
+    #[cfg(not(test))]
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Bytes that other kinds of download hold against the same cap (the
+/// phone's offline video). Called while the cache's lock is held, so it
+/// must not call back into the cache.
+pub type OutsideUsed = std::sync::Arc<dyn Fn() -> OutsideBytes + Send + Sync>;
+
+/// What other downloads hold of the shared budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutsideBytes {
+    /// Bytes they hold or have reserved, counted against the cap.
+    pub held: u64,
+    /// Bytes they are admitted for but have yet to write: the free space
+    /// does not lack these yet, but it will.
+    pub outstanding: u64,
+    /// Whether the size of what they hold is not known (a folder that could
+    /// not be read): the cap cannot be checked, so nothing is admitted.
+    pub unknown: bool,
+}
+
+/// Why [`Cache::ensure_free`] refused a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRoom {
+    /// Even eviction cannot leave the guard free; carries the room there is.
+    LowDisk(u64),
+    /// Other downloads on the same cap could not say what they hold (a
+    /// folder that could not be read), so the cap cannot be checked yet.
+    /// Retryable: it clears once their size can be read again.
+    AccountingUnknown,
+    /// A replacement's old `.part` could not be emptied: approving it would
+    /// count the old part and the whole new body. Retryable: the part and
+    /// its validator stay.
+    PartNotTruncated,
+}
+
+/// What a retained `.part` gives back to an admission.
+#[derive(Debug, Clone, Copy)]
+enum Reclaim {
+    /// No part is replaced.
+    Nothing,
+    /// A preflight: the part's bytes count as room; nothing is emptied.
+    Counted(u64),
+    /// A whole body replaces the part: its bytes count as room, and it is
+    /// emptied once the room is found, before any track is evicted for it.
+    Emptied(u64),
+}
+
+impl Reclaim {
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Nothing => 0,
+            Self::Counted(b) | Self::Emptied(b) => b,
+        }
+    }
+}
+
 pub struct Cache {
     dir: PathBuf,
     cap: AtomicU64,
     state: Mutex<State>,
     free: FreeProbe,
+    /// What the host says other downloads hold of the cap. They count
+    /// against it but are never evicted from here.
+    outside: Mutex<Option<OutsideUsed>>,
+    /// Bytes of music writes `ensure_free` has approved that have not landed
+    /// (or failed) yet, by track id: free space does not lack them yet, but
+    /// it will. A host admitting its own downloads against the same free
+    /// space takes them off it (`reserved_bytes`). Written only under the
+    /// shared admission lock. Each reservation keeps what its `.part` held
+    /// when it was made: the bytes written since come off what is still
+    /// owed, so a host never counts them both on disk and as owed.
+    reserved: Mutex<std::collections::HashMap<String, Reservation>>,
+    /// Tracks a download job is running for: their `.part` is never
+    /// evicted. A leaf lock, taken under the cache's lock or alone.
+    active: Mutex<HashSet<String>>,
+    /// Tracks whose retained `.part` an eviction removed since the
+    /// downloader last asked: it drops the state it kept to resume them.
+    /// A leaf lock, as `active`.
+    evicted_parts: Mutex<HashSet<String>>,
+}
+
+impl Reservation {
+    /// What is still owed when the `.part` is `len` long. An unknown
+    /// baseline or length counts nothing as written: the whole reservation
+    /// stays owed, never less.
+    fn owed(&self, len: Option<u64>) -> u64 {
+        let written = match (self.at_len, len) {
+            (Some(at), Some(now)) => now.saturating_sub(at),
+            _ => 0,
+        };
+        self.bytes.saturating_sub(written)
+    }
+}
+
+/// Music's in-flight bytes, from one observation: see [`Cache::pending`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MusicPending {
+    /// What approved writes have yet to add: free space lacks it still.
+    pub owed: u64,
+    /// What `.part` files hold already: in the cap, not in free space.
+    /// None when they could not all be read.
+    pub written: Option<u64>,
+}
+
+/// See [`Cache::part_figures`].
+struct PartFigures {
+    owed: u64,
+    written: u64,
+    whole: bool,
+}
+
+impl MusicPending {
+    /// Nothing in flight: no cache, so no music.
+    pub const NONE: Self = Self {
+        owed: 0,
+        written: Some(0),
+    };
+}
+
+/// What one approved music write still had to add, and from where.
+#[derive(Debug, Clone, Copy)]
+struct Reservation {
+    bytes: u64,
+    /// The `.part`'s length when the reservation was made; `None` when it
+    /// could not be read (not absent: unreadable). Nothing is then counted
+    /// as written against it, so the whole reservation stays owed until a
+    /// later refresh reads a baseline.
+    at_len: Option<u64>,
 }
 
 /// Space available to an unprivileged writer, as `df` reports it.
@@ -409,6 +598,10 @@ impl Cache {
                 ..State::default()
             }),
             free,
+            outside: Mutex::new(None),
+            reserved: Mutex::default(),
+            active: Mutex::default(),
+            evicted_parts: Mutex::default(),
         };
         {
             let mut s = cache.lock();
@@ -433,7 +626,19 @@ impl Cache {
         let path = self.dir.join(SETTINGS_FILE);
         let bytes = serde_json::to_vec(&Settings { cap_bytes })
             .map_err(|e| err("encode settings", &path, e))?;
+        // The cap is part of what a host's admission reads: saved, changed
+        // and trimmed to as one step against it (shared lock, then the
+        // cache's), so two changes land on disk in the order they apply and
+        // a restart restores the cap admission saw. No caller holds the
+        // shared lock here. A failed save leaves the live cap as it was.
+        let _admission = admission_guard();
         write_atomic(&path, &bytes).map_err(|e| err("save settings", &path, e))?;
+        #[cfg(test)]
+        AFTER_CAP_SAVED.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
         let mut s = self.lock();
         self.cap.store(cap_bytes, Ordering::SeqCst);
         let evicted = self.evict_locked(&mut s);
@@ -446,8 +651,41 @@ impl Cache {
         Ok(evicted)
     }
 
+    /// Count what `used` reports (bytes other kinds of download hold) against
+    /// the cap from now on, and evict music at once if that puts the cache
+    /// over. Those bytes are never candidates for eviction here; only music
+    /// that is not pinned goes, so pinned music can keep the total over the
+    /// cap (a pin is never evicted).
+    /// Returns the evicted ids.
+    pub fn set_outside_used(&self, used: OutsideUsed) -> Vec<String> {
+        *self.outside.lock().unwrap_or_else(PoisonError::into_inner) = Some(used);
+        let _admission = admission_guard();
+        let mut s = self.lock();
+        let evicted = self.evict_locked(&mut s);
+        if !evicted.is_empty() {
+            self.persist_locked(&s);
+        }
+        evicted
+    }
+
+    /// What the host says other downloads hold and have yet to write.
+    fn outside_bytes(&self) -> OutsideBytes {
+        let hook = self
+            .outside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        hook.map_or_else(OutsideBytes::default, |f| f())
+    }
+
+    /// What the hook in force reports, for a test to tell which hook that is.
+    #[cfg(test)]
+    pub(crate) fn outside_for_test(&self) -> OutsideBytes {
+        self.outside_bytes()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock_noting(&self.state)
     }
 
     fn totals(s: &State) -> (usize, u64) {
@@ -547,7 +785,14 @@ impl Cache {
             .and_then(|f| f.sync_all())
             .map_err(|e| err("sync part", &part, e))?;
         let fin = self.final_path(id);
+        // The `.part` leaves the in-progress figure and the track joins the
+        // shared cap as one step against a host's admission, which reads
+        // both: taken before the rename, so no admission sees the track in
+        // neither.
+        let _admission = admission_guard();
         std::fs::rename(&part, &fin).map_err(|e| err("rename part", &fin, e))?;
+        // The bytes are in the entry from here: no longer to come.
+        self.unreserve(id);
         let mut s = self.lock();
         let t = Self::tick(&mut s);
         let pinned = s.pins.values().any(|v| v.iter().any(|p| p == id));
@@ -575,14 +820,32 @@ impl Cache {
         self.lock().failed.remove(id);
     }
 
-    /// Remove the in-progress file for `id`.
+    /// Remove the in-progress file for `id`, under the cache's lock: a trim
+    /// reads the parts once under that lock and decides on them, so a part
+    /// it counted cannot go while it decides (a trim never counts bytes a
+    /// discard took off). Lock order: shared admission, then the cache's.
     pub fn discard_part(&self, id: &str) {
         let p = self.part_path(id);
+        let _s = self.lock();
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::warn!("cache id={id}: cannot remove part: {e}"),
         }
+    }
+
+    /// Opens `id`'s `.part` for writing: appended to, or truncated to start
+    /// a whole new body. The truncation is under the cache's lock for the
+    /// same reason as [`Cache::discard_part`]'s removal.
+    pub fn open_part(&self, id: &str, append: bool) -> std::io::Result<std::fs::File> {
+        let p = self.part_path(id);
+        let _s = self.lock();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(&p)
     }
 
     /// The ids the player is about to need; they are exempt from eviction
@@ -746,17 +1009,73 @@ impl Cache {
     }
 
     /// Delete least-recently-played unpinned finished tracks until the cache
-    /// fits; skip the current and protected ones.
+    /// fits, then retained parts no job holds; skip the current and
+    /// protected ones.
     fn evict_locked(&self, s: &mut State) -> Vec<String> {
+        // Parts count against the cap (a cancelled download keeps its one).
+        // Finished tracks go first; only then a part no job holds, oldest
+        // first, so an active or pinned download's file is safe. They are read once, not per victim (this runs under
+        // the shared admission lock), and once more before the cache is
+        // declared within the cap, since a download may have written since:
+        // that recheck runs on the first fit too, not only after an evict.
+        // An incomplete scan counts what it did read, a lower bound: the
+        // cache trims for at least that much and never deletes on a guess.
+        // What approved writes still owe counts too, as the shared cap
+        // does: read with the parts, from the same scan.
+        let parts_now = || {
+            let f = self.part_figures();
+            if !f.whole {
+                log::warn!(
+                    "cache trim with parts unknown parts_known={} owed={} reason=part_scan_incomplete",
+                    f.written,
+                    f.owed
+                );
+            }
+            (f.written, f.owed)
+        };
+        let (mut parts, mut owed) = parts_now();
+        #[cfg(test)]
+        AFTER_TRIM_SCAN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+        let mut fresh = false;
         let mut evicted = Vec::new();
+        // Listed once, when the finished tracks run out, not per victim.
+        let mut part_queue: Option<std::vec::IntoIter<(String, u64)>> = None;
         loop {
-            let (_, used) = Self::totals(s);
+            let (_, music) = Self::totals(s);
+            let outside = self.outside_bytes().held;
+            let used = music
+                .saturating_add(outside)
+                .saturating_add(parts)
+                .saturating_add(owed);
             if used <= self.cap() {
-                break;
+                if fresh {
+                    break;
+                }
+                (parts, owed) = parts_now();
+                fresh = true;
+                continue;
             }
             let Some((id, bytes)) = Self::victim(s, None) else {
+                // Finished tracks first; then a part no job holds, oldest
+                // first: its bytes leave the parts figure.
+                let queue =
+                    part_queue.get_or_insert_with(|| self.part_victims(s, None).into_iter());
+                if let Some((id, bytes)) = queue.find(|(id, _)| !self.part_taken(id)) {
+                    // One that will not go is passed over: the next oldest
+                    // is tried, and its bytes are not credited.
+                    if !self.remove_part_locked(&id, bytes, "over_cap") {
+                        continue;
+                    }
+                    parts = parts.saturating_sub(bytes);
+                    fresh = false;
+                    continue;
+                }
                 log::warn!(
-                    "cache over cap used={used} cap={} and nothing is evictable (pinned, queued or playing)",
+                    "cache over cap used={used} music={music} outside={outside} parts={parts} owed={owed} cap={} and nothing is evictable (pinned, queued or playing)",
                     self.cap()
                 );
                 break;
@@ -764,8 +1083,11 @@ impl Cache {
             if !self.remove_locked(s, &id) {
                 break;
             }
-            log::info!("cache evict id={id} bytes={bytes} reason=over_cap");
+            log::info!(
+                "cache evict id={id} bytes={bytes} reason=over_cap outside={outside} owed={owed}"
+            );
             evicted.push(id);
+            fresh = false;
         }
         evicted
     }
@@ -775,15 +1097,103 @@ impl Cache {
     fn victim(s: &State, keep: Option<&str>) -> Option<(String, u64)> {
         s.entries
             .iter()
-            .filter(|(id, e)| {
-                e.complete
-                    && !e.pinned
-                    && !s.protected.contains(*id)
-                    && s.current.as_deref() != Some(id.as_str())
-                    && keep != Some(id.as_str())
-            })
+            .filter(|(id, e)| Self::may_evict(s, id, e, keep))
             .min_by(|a, b| (a.1.last_played_ms, a.0).cmp(&(b.1.last_played_ms, b.0)))
             .map(|(id, e)| (id.clone(), e.size))
+    }
+
+    /// Whether the finished track `id` may go (see [`Cache::victim`]).
+    fn may_evict(s: &State, id: &str, e: &Entry, keep: Option<&str>) -> bool {
+        e.complete
+            && !e.pinned
+            && !s.protected.contains(id)
+            && s.current.as_deref() != Some(id)
+            && keep != Some(id)
+    }
+
+    /// The bytes of every finished track [`Cache::victim`] could name.
+    fn evictable_track_bytes(s: &State, keep: Option<&str>) -> u64 {
+        s.entries
+            .iter()
+            .filter(|(id, e)| Self::may_evict(s, id, e, keep))
+            .fold(0u64, |n, (_, e)| n.saturating_add(e.size))
+    }
+
+    /// The retained `.part` files that may go, oldest first by when each
+    /// was last written: ones no job holds (`active`), not pinned, queued,
+    /// playing or `keep`. Asked only once no finished track is left to
+    /// evict, and read once per trim or admission (it lists the folder),
+    /// not per victim: the caller asks [`Cache::part_taken`] again before
+    /// each removal, since a job may take one up meanwhile. A part whose
+    /// name or metadata cannot be read is never a victim.
+    fn part_victims(&self, s: &State, keep: Option<&str>) -> Vec<(String, u64)> {
+        #[cfg(test)]
+        PART_VICTIM_SCANS.with(|n| n.set(n.get() + 1));
+        let active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(read) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<_> = read
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name();
+                let id = unescape(name.to_str()?.strip_suffix(PART_EXT)?)?;
+                let held = keep == Some(id.as_str())
+                    || active.contains(&id)
+                    || s.entries.get(&id).is_some_and(|e| e.pinned)
+                    || s.pins.values().any(|v| v.contains(&id))
+                    || s.protected.contains(&id)
+                    || s.current.as_deref() == Some(id.as_str());
+                if held {
+                    return None;
+                }
+                // Only a regular file can go: a folder or a link would not,
+                // and its failed removal would end the eviction there.
+                let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
+                Some((meta.modified().ok()?, id, meta.len()))
+            })
+            .collect();
+        found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        found.into_iter().map(|(_, id, len)| (id, len)).collect()
+    }
+
+    /// Whether a job took up `id`'s part since the victims were listed: it
+    /// is passed over, and its bytes are not credited.
+    fn part_taken(&self, id: &str) -> bool {
+        let taken = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id);
+        if taken {
+            log::info!("cache evict id={id} verdict=kept kind=part reason=taken_by_job");
+        }
+        taken
+    }
+
+    /// Delete the retained `.part` of `id` and name it for the downloader
+    /// to drop the state it kept to resume it. False when it would not go.
+    fn remove_part_locked(&self, id: &str, bytes: u64, why: &str) -> bool {
+        #[cfg(test)]
+        if let Some(f) = BEFORE_PART_EVICT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+        match std::fs::remove_file(self.part_path(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!(
+                    "cache evict id={id} bytes={bytes} verdict=kept kind=part reason=remove_failed error={e}"
+                );
+                return false;
+            }
+        }
+        self.evicted_parts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned());
+        log::info!("cache evict id={id} bytes={bytes} verdict=evicted kind=part reason={why}");
+        true
     }
 
     /// Delete `id`'s file and forget it. False when the file would not go.
@@ -804,42 +1214,669 @@ impl Cache {
     /// [`MIN_FREE_BYTES`] free, evicting least recently played tracks first.
     /// `Ok(free)` when there is room, `Err(free)` when even eviction cannot
     /// make it. An unreadable free-space figure does not block a download.
-    pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, u64> {
-        let free = match (self.free)(&self.dir) {
+    ///
+    /// Other downloads admitted against the same disk (the phone's video)
+    /// still have bytes to write that the free figure does not yet lack;
+    /// those are taken off it first, so music cannot spend room an admitted
+    /// video needs. Read under the shared admission lock, taken before the
+    /// cache's lock.
+    ///
+    /// What it approves is reserved for `downloading` (the bytes the write
+    /// has yet to add) until `commit` or `release_reservation` clears it, so a host
+    /// admitting against the same free figure sees them as spoken for.
+    pub fn ensure_free(&self, downloading: &str, need: u64) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, true, false)
+    }
+
+    /// As [`Cache::ensure_free`] (or, with `evict` false, its no-eviction
+    /// form) for a whole new body about to replace `downloading`'s `.part`:
+    /// the part's bytes, read under the admission lock, come back when it is
+    /// truncated, so they count as room. A refusal leaves the part as it is.
+    pub fn ensure_free_replacing_part(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+    ) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, evict, true)
+    }
+
+    /// A preflight for a job with a retained `.part`, resumable or not: as
+    /// [`Cache::ensure_free`] with no bytes to write, but the part's bytes,
+    /// read under the admission lock, count as room, since a whole body's
+    /// own admission ([`Cache::ensure_free_replacing_part`]) reclaims them.
+    /// It authorizes no write: it reserves nothing and truncates nothing.
+    /// The response decides which admission the write needs: a 206 the
+    /// normal one, a 200 the replacement one.
+    pub fn preflight_replacing_part(&self, downloading: &str) -> Result<u64, NoRoom> {
+        let _admission = admission_guard();
+        // An unreadable part reclaims nothing: never room on a guess.
+        let reclaim = self.part_held(downloading).unwrap_or(0);
+        let verdict = self.check_free(downloading, 0, true, Reclaim::Counted(reclaim));
+        log::info!(
+            "cache admission id={downloading} need=0 reclaim={reclaim} verdict={} reason=preflight_part_retained",
+            if verdict.is_ok() { "approved" } else { "refused" }
+        );
+        self.unreserve(downloading);
+        verdict
+    }
+
+    /// As [`Cache::ensure_free`], but never evicts: for room a write may
+    /// not need (a speculative window), which must not cost a cached track.
+    /// A refusal reserves nothing.
+    pub fn ensure_free_without_eviction(
+        &self,
+        downloading: &str,
+        need: u64,
+    ) -> Result<u64, NoRoom> {
+        self.approve(downloading, need, false, false)
+    }
+
+    fn approve(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+        replacing: bool,
+    ) -> Result<u64, NoRoom> {
+        let _admission = admission_guard();
+        // An unreadable part reclaims nothing: never room on a guess.
+        let reclaim = if replacing {
+            Reclaim::Emptied(self.part_held(downloading).unwrap_or(0))
+        } else {
+            Reclaim::Nothing
+        };
+        // An approved replacement has emptied the old part (see
+        // `check_free`): the new body's reservation is published in the same
+        // step under the admission lock, so no other admission sees both.
+        // Owed is counted from the empty file.
+        let verdict = self.check_free(downloading, need, evict, reclaim);
+        if replacing {
+            log::info!(
+                "cache admission id={downloading} need={need} reclaim={} verdict={} reason=whole_body_replaces_part",
+                reclaim.bytes(),
+                if verdict.is_ok() { "approved" } else { "refused" }
+            );
+        }
+        match verdict {
+            Ok(_) if replacing => self.reserve_from(downloading, need, Some(0)),
+            Ok(_) => self.reserve(downloading, need),
+            Err(_) => self.unreserve(downloading),
+        }
+        verdict
+    }
+
+    /// Empties `id`'s `.part`, under the cache's lock as
+    /// [`Cache::open_part`]'s truncation is.
+    fn truncate_part(&self, id: &str) -> std::io::Result<()> {
+        let _s = self.lock();
+        self.truncate_part_locked(id)
+    }
+
+    /// [`Cache::truncate_part`] with the cache's lock already held.
+    fn truncate_part_locked(&self, id: &str) -> std::io::Result<()> {
+        match self.open_for_truncate(id)? {
+            Some(f) => empty_opened(&f),
+            None => Ok(()),
+        }
+    }
+
+    /// `id`'s `.part` opened for writing, to be emptied (None when there is
+    /// none): the step a truncation fails at, taken before a replacement
+    /// evicts anything for it.
+    fn open_for_truncate(&self, id: &str) -> std::io::Result<Option<std::fs::File>> {
+        let p = self.part_path(id);
+        #[cfg(test)]
+        if TRUNCATE_FAULT.with(std::cell::Cell::get)
+            || TRUNCATE_REFUSED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&p)
+        {
+            return Err(std::io::Error::other("truncate refused for the test"));
+        }
+        match std::fs::OpenOptions::new().write(true).open(&p) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn reserve_from(&self, id: &str, bytes: u64, at_len: Option<u64>) {
+        let mut r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes == 0 {
+            r.remove(id);
+        } else {
+            r.insert(id.to_owned(), Reservation { bytes, at_len });
+        }
+    }
+
+    fn reserve(&self, id: &str, bytes: u64) {
+        let at_len = self.part_len(id);
+        self.reserve_from(id, bytes, at_len);
+    }
+
+    /// `id`'s `.part` was truncated to start a whole new body: what its
+    /// reservation owes is counted from an empty file now, not from the
+    /// length it had when the room was approved (that file is gone).
+    pub fn restart_reservation(&self, id: &str) {
+        let _admission = admission_guard();
+        if let Some(r) = self
+            .reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(id)
+        {
+            r.at_len = Some(0);
+        }
+    }
+
+    /// `id`'s reservation and the `.part` length it was made at (tests).
+    #[cfg(test)]
+    pub(crate) fn reservation(&self, id: &str) -> Option<(u64, u64)> {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|r| (r.bytes, r.at_len.unwrap_or(0)))
+    }
+
+    /// The length of `id`'s `.part`: 0 when there is none, `None` when its
+    /// metadata cannot be read (unknown, never taken as empty).
+    /// What emptying `id`'s `.part` gives back: the blocks it holds, never
+    /// more than its length. A sparse part holds less than its length, so
+    /// its length is no credit. 0 when there is none, `None` when unknown.
+    fn part_held(&self, id: &str) -> Option<u64> {
+        let len = self.part_len(id)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(self.part_path(id)) {
+                Ok(m) => {
+                    let held = m.blocks().saturating_mul(512).min(len);
+                    if held < len {
+                        log::info!(
+                            "cache part credit id={id} verdict=held_blocks reason=sparse_part len={len} held={held}"
+                        );
+                    }
+                    Some(held)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        Some(len)
+    }
+
+    fn part_len(&self, id: &str) -> Option<u64> {
+        let meta = std::fs::metadata(self.part_path(id));
+        #[cfg(test)]
+        AFTER_PART_LEN.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+        match meta {
+            Ok(m) => Some(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(e) => {
+                log::warn!(
+                    "cache part length unknown id={id} reason=metadata_unreadable error={e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// A download job for `id` is running: its `.part` is not evicted
+    /// until [`Cache::job_ended`].
+    pub fn job_started(&self, id: &str) {
+        // Under the cache's lock, which an eviction of a part holds from
+        // choosing it to naming it: the eviction sees this job, or its
+        // notice is out before the job reads the state it kept.
+        let _s = self.lock();
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned());
+    }
+
+    /// Whether a job holds `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_active(&self, id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id)
+    }
+
+    /// The job for `id` is over: a `.part` it left may be evicted.
+    pub fn job_ended(&self, id: &str) {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// The tracks whose retained `.part` was evicted since the last call,
+    /// sorted. Each is named once.
+    pub fn take_evicted_parts(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::mem::take(
+            &mut *self
+                .evicted_parts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+        .into_iter()
+        .collect();
+        v.sort();
+        v
+    }
+
+    /// Drops what was reserved for `id`: its write landed, failed or was
+    /// cancelled.
+    pub fn release_reservation(&self, id: &str) {
+        let _admission = admission_guard();
+        self.unreserve(id);
+    }
+
+    fn unreserve(&self, id: &str) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// What approved music writes have yet to add to the disk. Read under
+    /// the shared admission lock by a host that admits against free space.
+    ///
+    /// Each reservation counts only what its write has yet to add: the bytes
+    /// its `.part` has gained since the reservation are on disk, where
+    /// [`Cache::in_progress_bytes`] counts them (and free space lacks them),
+    /// so they come off here. Written and owed are then read from the same
+    /// point, and their sum is the reservation's whole claim, once.
+    pub fn reserved_bytes(&self) -> u64 {
+        let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        r.iter().fold(0u64, |sum, (id, v)| {
+            sum.saturating_add(v.owed(self.part_len(id)))
+        })
+    }
+
+    /// What music's approved writes still owe and what its `.part` files
+    /// hold, from one read of each part's length, so a write that lands
+    /// mid-read is counted as owed or as written, never as both or neither.
+    /// Read under the shared admission lock, before any free-space probe.
+    pub fn pending(&self) -> MusicPending {
+        let f = self.part_figures();
+        MusicPending {
+            owed: f.owed,
+            written: f.whole.then_some(f.written),
+        }
+    }
+
+    /// What [`Cache::pending`] reads: the reservations first, then one
+    /// read of each part's length. `written` is a lower bound when the
+    /// scan is not `whole`.
+    fn part_figures(&self) -> PartFigures {
+        let r = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+        let (lens, whole) = self.scan_part_lens();
+        let written = lens
+            .values()
+            .fold(0u64, |sum, len| sum.saturating_add(*len));
+        let owed = r.iter().fold(0u64, |sum, (id, v)| {
+            let name = escape(id) + PART_EXT;
+            // Not found by a whole scan: absent. By a partial one: unknown,
+            // so the whole reservation stays owed.
+            let len = match lens.get(std::ffi::OsStr::new(&name)) {
+                Some(len) => Some(*len),
+                None => whole.then_some(0),
+            };
+            sum.saturating_add(v.owed(len))
+        });
+        PartFigures {
+            owed,
+            written,
+            whole,
+        }
+    }
+
+    /// Bytes in every `.part` file in the cache folder, reserved or not: a
+    /// measurement on its own. A shared-cap check reads [`Cache::pending`]
+    /// instead, which takes what running downloads owe and what their parts
+    /// hold from one read of each part's length; this and `reserved_bytes`
+    /// read apart could count a write that lands between them twice, or
+    /// not at all. A download
+    /// that was cancelled or yielded keeps its `.part` to resume from but
+    /// drops its reservation, so this reads the folder, not the reserved ids.
+    /// Free space already lacks these bytes, so the free-space check never
+    /// adds them. Eviction never touches a `.part` a job holds or a pin
+    /// wants; a `.part` no job holds is counted until its download resumes,
+    /// an eviction that has no finished track left takes it, or the next
+    /// `open` removes it.
+    /// None when the folder could not be read whole: the host refuses new
+    /// downloads until a scan succeeds, never counts it as 0.
+    pub fn in_progress_bytes(&self) -> Option<u64> {
+        let (bytes, whole) = self.scan_parts();
+        whole.then_some(bytes)
+    }
+
+    /// The `.part` bytes read and whether every entry was read: a scan that
+    /// fails, or an entry or a length that cannot be read, is not a 0. A
+    /// file that vanished mid-scan (renamed by a commit) is nothing to read.
+    fn scan_parts(&self) -> (u64, bool) {
+        let (lens, whole) = self.scan_part_lens();
+        let total = lens
+            .values()
+            .fold(0u64, |sum, len| sum.saturating_add(*len));
+        (total, whole)
+    }
+
+    /// Each `.part`'s length, by file name, read once, and whether every
+    /// entry was read (see [`Cache::scan_parts`]).
+    fn scan_part_lens(&self) -> (std::collections::HashMap<std::ffi::OsString, u64>, bool) {
+        let mut lens = std::collections::HashMap::new();
+        #[cfg(test)]
+        PART_SCANS.with(|n| n.set(n.get() + 1));
+        #[cfg(test)]
+        if PART_SCAN_FAULT.with(std::cell::Cell::get) == 1 {
+            return (lens, false);
+        }
+        let read = match std::fs::read_dir(&self.dir) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (lens, true),
+            Err(e) => {
+                log::warn!("cache part scan failed dir={}: {e}", self.dir.display());
+                return (lens, false);
+            }
+        };
+        let mut whole = true;
+        for entry in read {
+            #[cfg(test)]
+            let entry = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                entry
+            };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("cache part scan entry unreadable: {e}");
+                    whole = false;
+                    continue;
+                }
+            };
+            if !entry.file_name().to_string_lossy().ends_with(PART_EXT) {
+                continue;
+            }
+            let meta = entry.metadata();
+            #[cfg(test)]
+            AFTER_PART_LEN.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f();
+                }
+            });
+            #[cfg(test)]
+            let meta = if PART_SCAN_FAULT.with(std::cell::Cell::get) == 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                meta
+            };
+            match meta {
+                Ok(m) => {
+                    lens.insert(entry.file_name(), m.len());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::warn!("cache part length unreadable {:?}: {e}", entry.file_name());
+                    whole = false;
+                }
+            }
+        }
+        (lens, whole)
+    }
+
+    /// A replacement's old part ([`Reclaim::Emptied`]) is emptied only once
+    /// the room is found, and before any track is evicted for it: a part
+    /// that will not empty refuses the replacement with nothing evicted
+    /// (its room was counted as reclaimed, and approving would count the
+    /// old part and the whole new body), and a replacement eviction could
+    /// not make room for evicts nothing and keeps the part. Either way the
+    /// part and its validator stay for a retry.
+    fn check_free(
+        &self,
+        downloading: &str,
+        need: u64,
+        evict: bool,
+        reclaim: Reclaim,
+    ) -> Result<u64, NoRoom> {
+        // Outstanding first, then the probe: a write that lands between the
+        // two lowers free and the stale (higher) outstanding keeps the figure
+        // conservative. The other order counts those bytes twice as spent
+        // room, or not at all.
+        let outside = self.outside_bytes();
+        if outside.unknown {
+            // Video's verdict too: with a folder of unknown size on the
+            // device neither cap nor free space can be trusted.
+            log::warn!(
+                "cache admission refused id={downloading} reason=outside_size_unknown held={} outstanding={}",
+                outside.held,
+                outside.outstanding
+            );
+            return Err(NoRoom::AccountingUnknown);
+        }
+        let outstanding = outside.outstanding;
+        // What a truncation is about to free is room for the write: the
+        // blocks the part holds (`part_held`), not its length.
+        let measured = match (self.free)(&self.dir) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("cache free space unknown ({e}); not guarding id={downloading}");
+                self.empty_replaced(downloading, reclaim, None)?;
                 return Ok(u64::MAX);
             }
         };
-        let want = MIN_FREE_BYTES.saturating_add(need);
-        if free >= want {
-            return Ok(free);
+        let raw = measured.saturating_add(reclaim.bytes());
+        // The raw probe is held against the whole requirement, what admitted
+        // video still has to write included: taking the outstanding bytes
+        // off the probe first clamps a deficit at zero and eviction would
+        // never have to make it up. The figure returned is room beyond them.
+        let want = MIN_FREE_BYTES
+            .saturating_add(need)
+            .saturating_add(outstanding);
+        if raw >= want {
+            // The part's credit is the blocks it holds, read before it is
+            // touched: what emptying it frees.
+            self.empty_replaced(downloading, reclaim, None)?;
+            return Ok(raw.saturating_sub(outstanding));
+        }
+        if !evict {
+            return Err(NoRoom::LowDisk(raw.saturating_sub(outstanding)));
         }
         let mut s = self.lock();
-        let mut now = free;
+        let mut now = raw;
         let mut evicted = false;
+        let mut parts = None;
+        // A replacement's part is touched last: opened for emptying before
+        // anything goes (where a truncation fails), emptied only once the
+        // evictions and its credit cover the need.
+        let mut part_file = None;
+        let replacing = matches!(reclaim, Reclaim::Emptied(_));
+        let mut evicted_n = 0usize;
+        if replacing {
+            // Nothing is evicted for a replacement that cannot proceed:
+            // what eviction could give is added up first.
+            let listed = self.part_victims(&s, Some(downloading));
+            let evictable = Self::evictable_track_bytes(&s, Some(downloading))
+                .saturating_add(listed.iter().fold(0u64, |n, (_, b)| n.saturating_add(*b)));
+            if raw.saturating_add(evictable) < want {
+                log::info!(
+                    "cache admission id={downloading} verdict=refused reason=eviction_cannot_fit free_bytes={raw} evictable={evictable} want={want} part=kept evicted=0"
+                );
+                return Err(NoRoom::LowDisk(raw.saturating_sub(outstanding)));
+            }
+            part_file = match self.open_for_truncate(downloading) {
+                Ok(f) => f,
+                Err(e) => return Err(truncate_refused(downloading, &e, 0, "open")),
+            };
+            parts = Some(listed);
+        }
+        let mut stopped = false;
+        let mut parts_evicted = false;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
             };
             if !self.remove_locked(&mut s, &id) {
+                stopped = true;
                 break;
             }
             now = now.saturating_add(bytes);
             evicted = true;
+            evicted_n += 1;
             log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
+        }
+        // Finished tracks first; then parts no job holds, oldest first. One
+        // that will not go is passed over for the next, its bytes not
+        // credited.
+        // A replacement stops at the first victim that will not go: the
+        // shortfall is known, and nothing more is evicted for it.
+        if now < want && !(replacing && stopped) {
+            let mut queue = parts
+                .unwrap_or_else(|| self.part_victims(&s, Some(downloading)))
+                .into_iter();
+            while now < want {
+                let Some((id, bytes)) = queue.find(|(id, _)| !self.part_taken(id)) else {
+                    break;
+                };
+                if !self.remove_part_locked(&id, bytes, "low_disk") {
+                    if replacing {
+                        break;
+                    }
+                    continue;
+                }
+                now = now.saturating_add(bytes);
+                evicted_n += 1;
+                parts_evicted = true;
+            }
         }
         if evicted {
             self.persist_locked(&s);
         }
-        if now >= want {
-            Ok(now)
+        let room = now.saturating_sub(outstanding);
+        if now < want {
+            if replacing {
+                // Counted as enough, but a victim would not go. Evicted
+                // tracks are gone; the part is kept as it was.
+                log::warn!(
+                    "cache admission id={downloading} verdict=refused reason=eviction_short free_bytes={now} want={want} evicted={evicted_n} part=kept"
+                );
+            }
+            return Err(NoRoom::LowDisk(room));
+        }
+        // An evicted part's length is no measure of what it freed (it may
+        // be sparse): the room is measured, before a replacement's own part
+        // is touched, with that part's held blocks still to come. A
+        // shortfall refuses with the part as it was.
+        let room = if parts_evicted {
+            self.confirm(
+                downloading,
+                want,
+                outstanding,
+                now,
+                reclaim.bytes(),
+                "part_evicted",
+            )?
         } else {
-            Err(now)
+            room
+        };
+        if let Some(f) = part_file {
+            if let Err(e) = empty_opened(&f) {
+                // The evictions made for it cannot be undone; the part is
+                // as it was, and the refusal says how many went.
+                return Err(truncate_refused(downloading, &e, evicted_n, "set_len"));
+            }
+        }
+        Ok(room)
+    }
+
+    /// The room an admission approved on parts' lengths, measured once
+    /// they are gone: approved only when the free space now (plus a
+    /// preflight's `pending` credit, for a part not emptied yet) meets
+    /// `want`. `estimated` is the figure the lengths gave.
+    fn confirm(
+        &self,
+        downloading: &str,
+        want: u64,
+        outstanding: u64,
+        estimated: u64,
+        pending: u64,
+        after: &str,
+    ) -> Result<u64, NoRoom> {
+        match (self.free)(&self.dir) {
+            Ok(f) => {
+                let now = f.saturating_add(pending);
+                if now >= want {
+                    log::info!(
+                        "cache admission id={downloading} verdict=approved reason=measured_after_reclaim after={after} free_bytes={f} estimated={estimated} want={want}"
+                    );
+                    Ok(now.saturating_sub(outstanding))
+                } else {
+                    log::warn!(
+                        "cache admission id={downloading} verdict=refused reason=reclaim_short after={after} free_bytes={f} estimated={estimated} want={want}"
+                    );
+                    Err(NoRoom::LowDisk(now.saturating_sub(outstanding)))
+                }
+            }
+            // Never room on a guess: the lengths are no measure.
+            Err(e) => {
+                log::warn!(
+                    "cache admission id={downloading} verdict=refused reason=free_unknown_after_reclaim after={after} estimated={estimated} error={e}"
+                );
+                Err(NoRoom::LowDisk(0))
+            }
         }
     }
 
+    /// Empties a replacement's old part (see [`Cache::check_free`]); other
+    /// admissions touch nothing. `locked` is the cache's lock when the
+    /// caller holds it.
+    fn empty_replaced(
+        &self,
+        downloading: &str,
+        reclaim: Reclaim,
+        locked: Option<&State>,
+    ) -> Result<(), NoRoom> {
+        let Reclaim::Emptied(_) = reclaim else {
+            return Ok(());
+        };
+        let emptied = match locked {
+            Some(_) => self.truncate_part_locked(downloading),
+            None => self.truncate_part(downloading),
+        };
+        emptied.map_err(|e| truncate_refused(downloading, &e, 0, "truncate"))
+    }
+}
+
+/// The refusal of a replacement whose part would not empty, after
+/// `evicted` evictions made for it.
+fn truncate_refused(downloading: &str, e: &std::io::Error, evicted: usize, step: &str) -> NoRoom {
+    log::warn!(
+        "cache admission id={downloading} verdict=refused reason=truncate_failed step={step} error={e} evicted={evicted} part=kept"
+    );
+    NoRoom::PartNotTruncated
+}
+
+/// Empties an opened part.
+fn empty_opened(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if SET_LEN_FAULT.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("set_len refused for the test"));
+    }
+    f.set_len(0)
+}
+
+impl Cache {
     fn persist_locked(&self, s: &State) {
         let index = IndexFile {
             version: INDEX_VERSION,
@@ -901,19 +1938,37 @@ impl Cache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
-    pub(crate) fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "pharos-auto-cache-{name}-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    /// Threads blocked in [`lock_noting`] right now.
+    pub(crate) static WAITING: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+
+    /// Waits until `thread` is blocked on a lock taken through
+    /// [`lock_noting`]: listed only after its attempt found the lock held,
+    /// so no signal sent before the attempt can pass this. Panics after
+    /// 10 s.
+    pub(crate) fn wait_until_blocked(thread: std::thread::ThreadId) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !WAITING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&thread)
+        {
+            assert!(
+                std::time::Instant::now() < until,
+                "the thread never blocked on the lock"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A test's own cache folder, removed when the guard drops: bind it
+    /// before the cache, so it outlives the cache and its workers.
+    pub(crate) fn tmp(name: &str) -> crate::testdir::TmpDir {
+        crate::testdir::TmpDir::new(&format!("cache-{name}"))
     }
 
     /// A finished track of `n` bytes, as the downloader would leave it.
@@ -962,6 +2017,178 @@ mod tests {
     }
 
     #[test]
+    fn bytes_other_downloads_hold_count_against_the_cap_and_only_music_goes() {
+        let d = tmp("outside");
+        let c = Cache::open(&d, 1000).unwrap();
+        let video = std::sync::Arc::new(AtomicU64::new(700));
+        let v = video.clone();
+        assert!(c
+            .set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+                held: v.load(Ordering::SeqCst),
+                outstanding: 0,
+                ..OutsideBytes::default()
+            }))
+            .is_empty());
+        put(&c, "track/a", 100);
+        put(&c, "track/b", 100);
+        put(&c, "track/c", 100);
+        c.protect(&[]);
+        assert_eq!(c.used_bytes(), 300, "music and video exactly fill the cap");
+        // One more track would make 1100: the oldest music goes, not video.
+        put(&c, "track/d", 100);
+        assert!(!c.is_complete("track/a"));
+        assert_eq!(c.used_bytes(), 300);
+        assert_eq!(video.load(Ordering::SeqCst), 700, "video is never touched");
+        // When video grows, a new hook reading evicts music at once.
+        video.store(850, Ordering::SeqCst);
+        let v = video.clone();
+        let evicted = c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            held: v.load(Ordering::SeqCst),
+            outstanding: 0,
+            ..OutsideBytes::default()
+        }));
+        assert_eq!(evicted, ids(&["track/b", "track/c"]));
+        assert_eq!(
+            c.used_bytes(),
+            100,
+            "850 of video leaves room for one track"
+        );
+    }
+
+    /// Adding a track and trimming is one step against a host's admission:
+    /// it waits for whoever holds the shared lock.
+    #[test]
+    fn a_commit_waits_for_the_shared_admission_lock() {
+        let d = tmp("admission");
+        let c = std::sync::Arc::new(Cache::open(&d, 1000).unwrap());
+        std::fs::write(c.part_path("track/a"), vec![7u8; 10]).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = admission_guard();
+        let worker = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                c.commit("track/a", Some(10)).unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        wait_until_blocked(worker.thread().id());
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the commit went ahead of the admission lock"
+        );
+        drop(guard);
+        worker.join().unwrap();
+        assert!(c.is_complete("track/a"));
+    }
+
+    /// A cap change is one step against a host's admission: it waits for
+    /// whoever holds the shared lock, so no admission reads the old cap
+    /// beside the new one's trim.
+    #[test]
+    fn a_cap_change_waits_for_the_shared_admission_lock() {
+        let d = tmp("cap-admission");
+        let c = std::sync::Arc::new(Cache::open(&d, 1000).unwrap());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = admission_guard();
+        let worker = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                c.set_cap(500).unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        wait_until_blocked(worker.thread().id());
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the cap changed ahead of the admission lock"
+        );
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(c.cap(), 500);
+    }
+
+    /// The cap is saved under the shared admission lock, in the same hold
+    /// that applies it: two changes cannot save in one order and apply in
+    /// the other, leaving a restart a cap admission never saw.
+    #[test]
+    fn a_cap_is_saved_in_the_same_hold_that_applies_it() {
+        let d = tmp("cap-save-hold");
+        let c = Cache::open(&d, 1000).unwrap();
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        let h2 = held.clone();
+        AFTER_CAP_SAVED.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                h2.set(Some(ADMISSION.try_lock().is_err()))
+            }));
+        });
+        c.set_cap(500).unwrap();
+        AFTER_CAP_SAVED.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            held.get(),
+            Some(true),
+            "the cap was saved outside the admission lock"
+        );
+    }
+
+    /// A trim reads the parts folder once, and once more before it calls
+    /// the cache within the cap, not once per track it evicts.
+    #[test]
+    fn a_trim_scans_the_parts_once_not_per_victim() {
+        let d = tmp("trim-scans");
+        let c = Cache::open(&d, 10_000).unwrap();
+        for i in 0..6 {
+            put(&c, &format!("track/{i}"), 100);
+        }
+        c.protect(&[]);
+        let before = PART_SCANS.with(std::cell::Cell::get);
+        let evicted = c.set_cap(150).unwrap();
+        let scans = PART_SCANS.with(std::cell::Cell::get) - before;
+        assert_eq!(evicted.len(), 5);
+        assert!(
+            scans <= 2,
+            "scanned {scans} times for {} victims",
+            evicted.len()
+        );
+    }
+
+    /// CR 4644634437: a trim counts what approved writes still owe, as the
+    /// shared cap does, and evicts a finished track to fit it.
+    #[test]
+    fn a_trim_counts_what_approved_writes_still_owe() {
+        let d = tmp("trim-owed");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(1 << 40)).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        assert!(c.ensure_free("track/w", 100).is_ok());
+        crate::testlog::start();
+        // 100 finished fits 150; with the 100 the write owes it does not.
+        c.set_cap(150).unwrap();
+        assert_eq!(c.used_bytes(), 0, "the trim left owed bytes over the cap");
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache evict id=track/a bytes=100 reason=over_cap")
+                && l.contains("owed=100")),
+            "the eviction did not name what was owed"
+        );
+    }
+
+    /// CR 4644634478: a trim lists the parts it may evict once, not once
+    /// per part it takes.
+    #[test]
+    fn a_trim_lists_the_parts_it_may_evict_once() {
+        let d = tmp("trim-part-victims");
+        let c = Cache::open(&d, 10_000).unwrap();
+        for i in 0..6 {
+            std::fs::write(c.part_path(&format!("track/{i}")), vec![0u8; 100]).unwrap();
+        }
+        let before = PART_VICTIM_SCANS.with(std::cell::Cell::get);
+        c.set_cap(150).unwrap();
+        let listed = PART_VICTIM_SCANS.with(std::cell::Cell::get) - before;
+        assert_eq!(c.in_progress_bytes(), Some(100), "the trim did not fit");
+        assert_eq!(listed, 1, "listed the parts {listed} times for 5 victims");
+    }
+
+    #[test]
     fn a_cap_change_logs_the_new_cap_and_what_it_evicted() {
         let d = tmp("cap-log");
         let c = Cache::open(&d, 1000).unwrap();
@@ -979,8 +2206,612 @@ mod tests {
         );
     }
 
+    /// CR 4637783537: an approved replacement truncates the old part and
+    /// publishes the new reservation in the same step as the approval, so
+    /// no other admission counts the old part and the whole new body at
+    /// once. A refused one leaves the old part as it was.
+    #[test]
+    fn an_approved_replacement_counts_the_old_part_once() {
+        let d = tmp("replace-once");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        // 500 free and 600 reclaimed: 2000 does not fit, and nothing moves.
+        assert!(c.ensure_free_replacing_part("track/x", 2000, true).is_err());
+        assert_eq!(
+            c.in_progress_bytes(),
+            Some(600),
+            "a refusal touched the part"
+        );
+        assert!(c.ensure_free_replacing_part("track/x", 1000, true).is_ok());
+        assert_eq!(
+            (c.in_progress_bytes(), c.reserved_bytes()),
+            (Some(0), 1000),
+            "the old part and the new body were both counted"
+        );
+    }
+
+    /// CR 4644634482: a replacement that needs a track evicted, but whose
+    /// old part will not truncate, evicts nothing: it is refused with the
+    /// track and the part as they were.
+    #[test]
+    fn a_replacement_whose_part_will_not_truncate_evicts_nothing() {
+        let d = tmp("replace-truncate-evicts");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free and 600 reclaimed: 1300 fits only with track/a gone.
+        TRUNCATE_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        TRUNCATE_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes()),
+            (400, Some(600)),
+            "a refused replacement evicted a track or touched its part"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "cache admission id=track/x verdict=refused reason=truncate_failed step=open error=truncate refused for the test evicted=0"
+            )),
+            "the refusal did not say nothing was evicted"
+        );
+        // The control: with the part emptied, the same replacement evicts
+        // the track and proceeds.
+        assert!(c.ensure_free_replacing_part("track/x", 1300, true).is_ok());
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
+            (0, Some(0), 1300)
+        );
+    }
+
+    /// CR 4647361477: a replacement whose part opens, but whose emptying
+    /// (`set_len`) fails after a track was evicted for it, is refused with
+    /// the part as it was. The eviction cannot be undone: the refusal names
+    /// the step and how many went.
+    #[test]
+    fn a_replacement_whose_emptying_fails_after_an_eviction_keeps_its_part() {
+        let d = tmp("replace-set-len-fails");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free and 600 reclaimed: 1300 fits only with track/a gone.
+        SET_LEN_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        SET_LEN_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            std::fs::read(c.part_path("track/x")).unwrap(),
+            vec![1u8; 600],
+            "the part was touched"
+        );
+        assert_eq!((c.used_bytes(), c.reserved_bytes()), (0, 0));
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "verdict=refused reason=truncate_failed step=set_len error=set_len refused for the test evicted=1 part=kept"
+            )),
+            "{:?}",
+            crate::testlog::lines()
+        );
+    }
+
+    /// CR 4646035938: a replacement's part is touched last. A track that
+    /// will not go after the estimate said eviction would fit stops the
+    /// eviction there: the refusal is LowDisk, the part is as it was, and
+    /// no track after the failing one is evicted.
+    #[test]
+    fn a_replacement_whose_victim_will_not_go_keeps_its_part() {
+        let d = tmp("replace-victim-stuck");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        put(&c, "track/a", 400);
+        put(&c, "track/b", 400);
+        c.protect(&[]);
+        // The oldest track's file will not unlink: a folder in its place.
+        let stuck = c.final_path("track/a");
+        std::fs::remove_file(&stuck).unwrap();
+        std::fs::create_dir_all(stuck.join("held")).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free, 600 reclaimed: 1300 needs one track; both count as
+        // evictable, so the estimate says it fits.
+        let verdict = c.ensure_free_replacing_part("track/x", 1300, true);
+        assert!(matches!(verdict, Err(NoRoom::LowDisk(_))), "{verdict:?}");
+        assert_eq!(c.in_progress_bytes(), Some(600), "the part was touched");
+        assert_eq!(c.reserved_bytes(), 0);
+        assert!(
+            c.final_path("track/b").exists(),
+            "a track was evicted after the failing unlink"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache admission id=track/x verdict=refused reason=eviction_short")
+                && l.contains("evicted=0 part=kept")),
+            "the refusal did not say the part was kept"
+        );
+        std::fs::remove_dir_all(&stuck).unwrap();
+    }
+
+    /// CR 4646280185: a part's length is no measure of what it frees. A
+    /// sparse part is credited the blocks it holds, so the replacement is
+    /// refused with the part as it was (CR 4647361477: LowDisk never
+    /// empties it). The control: a part that holds its length is approved.
+    #[test]
+    fn a_sparse_part_is_not_counted_as_the_room_it_frees() {
+        for sparse in [true, false] {
+            let d = tmp(if sparse {
+                "replace-sparse"
+            } else {
+                "replace-dense"
+            });
+            let len = 1u64 << 20;
+            let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 500 + len))
+                .unwrap();
+            let part = std::fs::File::create(c.part_path("track/x")).unwrap();
+            if sparse {
+                part.set_len(len).unwrap();
+            } else {
+                std::io::Write::write_all(&mut &part, &vec![1u8; 1 << 20]).unwrap();
+            }
+            drop(part);
+            crate::testlog::start();
+            // A dense part leaves 500 free and gives back its length; a
+            // sparse one leaves its length free already and gives nothing
+            // back. Each need fits only with the part's length credited.
+            let need = if sparse { len + 1000 } else { len };
+            let verdict = c.ensure_free_replacing_part("track/x", need, true);
+            let lines = crate::testlog::lines();
+            if sparse {
+                assert!(
+                    matches!(verdict, Err(NoRoom::LowDisk(_))),
+                    "{verdict:?} {lines:?}"
+                );
+                assert_eq!(c.reserved_bytes(), 0);
+                assert_eq!(
+                    c.part_len("track/x"),
+                    Some(len),
+                    "a refusal emptied the part"
+                );
+                assert!(
+                    lines.iter().any(|l| l.contains(
+                        "cache part credit id=track/x verdict=held_blocks reason=sparse_part"
+                    )),
+                    "{lines:?}"
+                );
+            } else {
+                assert!(verdict.is_ok(), "{verdict:?} {lines:?}");
+            }
+        }
+    }
+
+    /// CR 4647361477: a replacement that evicts a sparse retained part
+    /// counted at its length measures the room before its own part is
+    /// touched. The measure falls short: LowDisk, with its part as it was.
+    #[test]
+    fn a_replacement_short_after_evicting_a_sparse_part_keeps_its_part() {
+        let d = tmp("replace-evict-sparse");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        // A retained part no job holds, 1000 long and holding nothing.
+        std::fs::File::create(c.part_path("track/y"))
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        crate::testlog::start();
+        // 500 free, 600 held by the part: 1500 fits only on y's length.
+        let verdict = c.ensure_free_replacing_part("track/x", 1500, true);
+        let lines = crate::testlog::lines();
+        assert!(
+            matches!(verdict, Err(NoRoom::LowDisk(_))),
+            "{verdict:?} {lines:?}"
+        );
+        assert_eq!(
+            std::fs::read(c.part_path("track/x")).unwrap(),
+            vec![1u8; 600],
+            "LowDisk emptied the part"
+        );
+        assert_eq!(c.reserved_bytes(), 0);
+        assert!(
+            lines.iter().any(|l| {
+                l.contains(
+                "cache admission id=track/x verdict=refused reason=reclaim_short after=part_evicted"
+            )
+            }),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4644634482: a replacement that eviction could not make room for
+    /// evicts nothing and keeps its old part.
+    #[test]
+    fn a_replacement_eviction_cannot_fit_keeps_the_tracks_and_part() {
+        let d = tmp("replace-evict-short");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        // 500 free, 600 reclaimed and 400 evictable: 5000 cannot fit.
+        let verdict = c.ensure_free_replacing_part("track/x", 5000, true);
+        assert!(matches!(verdict, Err(NoRoom::LowDisk(_))), "{verdict:?}");
+        assert_eq!(
+            (c.used_bytes(), c.in_progress_bytes(), c.reserved_bytes()),
+            (400, Some(600), 0),
+            "a replacement that could not fit evicted a track or emptied its part"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l
+                .contains("cache admission id=track/x verdict=refused reason=eviction_cannot_fit")
+                && l.contains("evictable=400")
+                && l.contains("part=kept evicted=0")),
+            "the refusal did not name what eviction could give"
+        );
+    }
+
+    /// CR 4638524306: a replacement whose old part will not truncate is
+    /// refused. The old part stays, counted once, and nothing is reserved
+    /// for the new body.
+    #[test]
+    fn a_replacement_whose_part_will_not_truncate_is_refused() {
+        let d = tmp("replace-truncate-fails");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 1100)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![0u8; 600]).unwrap();
+        crate::testlog::start();
+        TRUNCATE_FAULT.with(|f| f.set(true));
+        let verdict = c.ensure_free_replacing_part("track/x", 1000, true);
+        TRUNCATE_FAULT.with(|f| f.set(false));
+        assert_eq!(verdict, Err(NoRoom::PartNotTruncated));
+        assert_eq!(
+            (c.in_progress_bytes(), c.reserved_bytes()),
+            (Some(600), 0),
+            "the old part and the new body were both counted"
+        );
+        assert!(
+            crate::testlog::lines().iter().any(|l| l.contains(
+                "cache admission id=track/x verdict=refused reason=truncate_failed step=truncate error=truncate refused for the test"
+            )),
+            "{:?}",
+            crate::testlog::lines()
+        );
+        // With the truncation back, the same replacement is approved.
+        assert!(c.ensure_free_replacing_part("track/x", 1000, true).is_ok());
+        assert_eq!((c.in_progress_bytes(), c.reserved_bytes()), (Some(0), 1000));
+    }
+
+    /// A host's cap needs the whole claim of an in-flight download: what its
+    /// `.part` holds (which `used_bytes` skips) plus the reservation, which
+    /// a refresh lowers to what is left. Free space needs only the second. A
+    /// `.part` nothing reserves any more (a cancelled job's) still counts.
+    #[test]
+    fn an_in_flight_download_claims_its_written_and_its_remaining_bytes() {
+        let d = tmp("in-progress");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert_eq!(c.in_progress_bytes(), Some(0));
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        assert_eq!(c.in_progress_bytes(), Some(0), "nothing written yet");
+        // 60 bytes land, then the refresh reserves what is left.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 60]).unwrap();
+        assert!(c.ensure_free("track/x", 40).is_ok());
+        assert_eq!(c.reserved_bytes(), 40, "free space needs the rest only");
+        assert_eq!(c.in_progress_bytes(), Some(60));
+        assert_eq!(c.used_bytes(), 0, "a part is not a finished track");
+        assert_eq!(
+            c.reserved_bytes() + c.in_progress_bytes().unwrap() + c.used_bytes(),
+            100,
+            "the claim is the whole track, counted once"
+        );
+        // All of it written, nothing left to reserve: still claimed.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 100]).unwrap();
+        assert!(c.ensure_free("track/x", 0).is_ok());
+        assert_eq!(c.reserved_bytes(), 0);
+        assert_eq!(
+            c.in_progress_bytes(),
+            Some(100),
+            "dropped at the last refresh"
+        );
+        // A cancelled job drops its reservation and keeps its part.
+        c.release_reservation("track/x");
+        assert_eq!(c.reserved_bytes(), 0);
+        assert_eq!(
+            c.in_progress_bytes(),
+            Some(100),
+            "a part nothing reserves must still count"
+        );
+        assert!(c.ensure_free("track/x", 0).is_ok());
+        // Landing moves it to the finished bytes, once.
+        c.commit("track/x", Some(100)).unwrap();
+        assert_eq!(c.in_progress_bytes(), Some(0));
+        assert_eq!(c.used_bytes(), 100);
+        // A job that ends keeps its part, which counts until it is discarded.
+        std::fs::write(c.part_path("track/y"), vec![0u8; 30]).unwrap();
+        assert!(c.ensure_free("track/y", 5).is_ok());
+        assert_eq!(c.in_progress_bytes(), Some(30));
+        c.release_reservation("track/y");
+        assert_eq!(c.in_progress_bytes(), Some(30));
+        c.discard_part("track/y");
+        assert_eq!(c.in_progress_bytes(), Some(0));
+    }
+
+    /// A part a trim counted stays on disk while the trim decides on it: a
+    /// discard racing the trim waits for the cache's lock, so no track is
+    /// evicted for bytes a discard already took off.
+    #[test]
+    fn a_part_a_trim_counted_is_not_discarded_while_it_decides() {
+        let d = tmp("trim-discard");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/p"), vec![0u8; 100]).unwrap();
+        let part = c.part_path("track/p");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let cache = &c;
+            // Bounded: a trim that never reaches its scan (a failed save)
+            // leaves the worker to give up rather than hang the scope.
+            let (id_tx, id_rx) = std::sync::mpsc::channel();
+            let discarder = scope.spawn(move || {
+                if rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
+                    cache.discard_part("track/p");
+                }
+            });
+            id_tx.send(discarder.thread().id()).unwrap();
+            /// Clears the hook however the trim ends, an unwind included,
+            /// which drops `tx` and frees the worker.
+            struct ClearHook;
+            impl Drop for ClearHook {
+                fn drop(&mut self) {
+                    AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
+                }
+            }
+            let _clear = ClearHook;
+            let seen2 = seen.clone();
+            let part2 = part.clone();
+            AFTER_TRIM_SCAN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let _ = tx.send(());
+                    // The discard is at the cache's lock, which the trim
+                    // holds: the part must still be there.
+                    wait_until_blocked(id_rx.recv().unwrap());
+                    seen2.store(part2.exists(), std::sync::atomic::Ordering::SeqCst);
+                }));
+            });
+            c.set_cap(150).unwrap();
+        });
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "a discard took the counted part off mid-trim"
+        );
+        assert!(!part.exists(), "the discard ran once the trim was done");
+    }
+
+    /// A trim that fits on its first part scan reads the parts once more
+    /// before it declares the cache within the cap: a download that wrote
+    /// after the scan is counted, and a track goes for it.
+    #[test]
+    fn a_part_that_grows_after_the_first_scan_is_counted_before_a_fit() {
+        let d = tmp("trim-grow");
+        let c = Cache::open(&d, 1000).unwrap();
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        let part = c.part_path("track/p");
+        std::fs::write(&part, vec![0u8; 20]).unwrap();
+        let grown = part.clone();
+        AFTER_TRIM_SCAN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = std::fs::write(&grown, vec![0u8; 100]);
+            }));
+        });
+        // 100 finished + 20 part fits 150 on the first scan; the part is
+        // 100 by the time the trim decides, so the track must go.
+        c.set_cap(150).unwrap();
+        AFTER_TRIM_SCAN.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            c.used_bytes(),
+            0,
+            "the trim declared a fit on a stale part scan"
+        );
+    }
+
+    /// A reservation made while its `.part`'s length could not be read
+    /// keeps its whole claim owed: the bytes found on file later were there
+    /// already, not written against it. A refresh that reads a baseline
+    /// then counts from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reservation_over_an_unreadable_part_owes_its_whole_claim() {
+        let d = tmp("unreadable-baseline");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let part = c.part_path("track/x");
+        // A link to itself: its metadata fails, and not as absent.
+        std::os::unix::fs::symlink(&part, &part).unwrap();
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::remove_file(&part).unwrap();
+        std::fs::write(&part, vec![0u8; 60]).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            100,
+            "bytes already on file were taken as written against the claim"
+        );
+        // A refresh reads the baseline; writes from it count.
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(&part, vec![0u8; 90]).unwrap();
+        assert_eq!(c.reserved_bytes(), 70);
+    }
+
+    /// Owed and written come from one read of each part: a write that lands
+    /// between two reads is counted once, so the pair never claims more
+    /// than the reservation's whole claim.
+    #[test]
+    fn pending_reads_each_part_once_for_owed_and_written() {
+        let d = tmp("pending-once");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        let part = c.part_path("track/x");
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(&part, vec![0u8; 60]).unwrap();
+        let grown = part.clone();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let r2 = reads.clone();
+        AFTER_PART_LEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                r2.set(r2.get() + 1);
+                if r2.get() == 1 {
+                    let _ = std::fs::write(&grown, vec![0u8; 100]);
+                }
+            }));
+        });
+        let p = c.pending();
+        AFTER_PART_LEN.with(|h| *h.borrow_mut() = None);
+        assert_eq!(reads.get(), 1, "a part's length was read more than once");
+        assert_eq!(
+            p.owed + p.written.unwrap(),
+            100,
+            "owed {} and written {:?} come from different reads",
+            p.owed,
+            p.written
+        );
+    }
+
+    /// A part scan that fails, or whose entry or length cannot be read, is
+    /// unknown, never 0; once it can be read, the figure is back.
+    #[test]
+    fn a_part_scan_that_cannot_read_everything_is_unknown_not_zero() {
+        let d = tmp("part-scan");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 40]).unwrap();
+        assert_eq!(c.in_progress_bytes(), Some(40));
+        for (fault, what) in [(1, "folder"), (2, "entry"), (3, "length")] {
+            PART_SCAN_FAULT.with(|f| f.set(fault));
+            let figure = c.in_progress_bytes();
+            PART_SCAN_FAULT.with(|f| f.set(0));
+            assert_eq!(figure, None, "a failed {what} read as a figure");
+        }
+        assert_eq!(c.in_progress_bytes(), Some(40));
+    }
+
+    /// Trimming with the part scan unknown does not guess a figure and never
+    /// deletes a part.
+    #[test]
+    fn eviction_with_an_unknown_part_scan_deletes_no_part() {
+        let d = tmp("evict-part-unknown");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 400]).unwrap();
+        c.commit("track/a", Some(400)).unwrap();
+        std::fs::write(c.part_path("track/y"), vec![0u8; 500]).unwrap();
+        std::fs::write(c.part_path("track/b"), vec![0u8; 300]).unwrap();
+        PART_SCAN_FAULT.with(|f| f.set(3));
+        let evicted = c.commit("track/b", Some(300)).unwrap();
+        PART_SCAN_FAULT.with(|f| f.set(0));
+        assert!(evicted.is_empty(), "evicted on a figure it did not have");
+        assert!(c.part_path("track/y").exists());
+        assert_eq!(c.in_progress_bytes(), Some(500));
+    }
+
+    /// A cancelled download's kept `.part` counts against the cap when the
+    /// cache trims: finished tracks go to make room for it, and the part is
+    /// not touched.
+    #[test]
+    fn eviction_counts_a_kept_part_and_never_deletes_it() {
+        let d = tmp("evict-part");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 400]).unwrap();
+        c.commit("track/a", Some(400)).unwrap();
+        // A cancelled download: its part stays, its reservation is gone.
+        std::fs::write(c.part_path("track/y"), vec![0u8; 500]).unwrap();
+        std::fs::write(c.part_path("track/b"), vec![0u8; 300]).unwrap();
+        let evicted = c.commit("track/b", Some(300)).unwrap();
+        assert_eq!(evicted, ["track/a"], "700 + a 500 part is over 1000");
+        assert!(
+            c.part_path("track/y").exists(),
+            "an active part was deleted"
+        );
+        assert!(c.is_complete("track/b"));
+        assert_eq!(c.in_progress_bytes(), Some(500));
+    }
+
+    /// Bytes a reserved write has put on disk since its reservation are not
+    /// owed any more: the reservation and the `.part` together claim what
+    /// was approved, once, before the next refresh as after it.
+    #[test]
+    fn bytes_written_since_a_reservation_are_not_also_owed() {
+        let d = tmp("reserve-written");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert!(c.ensure_free("track/x", 100).is_ok());
+        std::fs::write(c.part_path("track/x"), vec![0u8; 6]).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            94,
+            "the written bytes are still counted as owed"
+        );
+        assert_eq!(
+            c.reserved_bytes() + c.in_progress_bytes().unwrap(),
+            100,
+            "the written bytes were counted twice"
+        );
+        // More than reserved landed: nothing is owed, never less than 0.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 150]).unwrap();
+        assert_eq!(c.reserved_bytes(), 0);
+    }
+
+    /// What `ensure_free` approves is reserved until the write lands or the
+    /// job ends, so a host admitting against the same free space sees it as
+    /// spoken for.
+    #[test]
+    fn an_approved_music_write_is_reserved_until_it_lands() {
+        let d = tmp("reserve");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES + 500)).unwrap();
+        assert_eq!(c.ensure_free("track/x", 300), Ok(MIN_FREE_BYTES + 500));
+        assert_eq!(c.reserved_bytes(), 300, "approved but not reserved");
+        // A refresh replaces the figure; it does not add to it.
+        assert_eq!(c.ensure_free("track/x", 200), Ok(MIN_FREE_BYTES + 500));
+        assert_eq!(c.reserved_bytes(), 200);
+        // A refusal reserves nothing.
+        assert!(c.ensure_free("track/y", 1 << 40).is_err());
+        assert_eq!(c.reserved_bytes(), 200);
+        // Landing clears it.
+        std::fs::write(c.part_path("track/x"), vec![0u8; 200]).unwrap();
+        c.commit("track/x", Some(200)).unwrap();
+        assert_eq!(
+            c.reserved_bytes(),
+            0,
+            "still reserved after the write landed"
+        );
+        // So does the job ending.
+        assert!(c.ensure_free("track/z", 100).is_ok());
+        assert_eq!(c.reserved_bytes(), 100);
+        c.release_reservation("track/z");
+        assert_eq!(c.reserved_bytes(), 0);
+    }
+
     fn fixed_free(bytes: u64) -> FreeProbe {
         Box::new(move |_| Ok(bytes))
+    }
+
+    /// A disk of `size` bytes under `dir`: free is what the cache's
+    /// tracks and parts leave of it, counted by the blocks they take, so a
+    /// sparse file frees only what it holds.
+    pub(crate) fn disk_of(dir: &Path, size: u64) -> FreeProbe {
+        fn held(dir: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::read_dir(dir).map_or(0, |rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| {
+                        let path = e.path();
+                        match e.metadata() {
+                            Ok(m) if m.is_dir() && e.file_name() != "listings" => held(&path),
+                            Ok(m) if m.is_file() && e.file_name() != "index.json" => {
+                                m.blocks().saturating_mul(512).min(m.len())
+                            }
+                            _ => 0,
+                        }
+                    })
+                    .sum()
+            })
+        }
+        let dir = dir.to_path_buf();
+        Box::new(move |_| Ok(size.saturating_sub(held(&dir))))
     }
 
     #[test]
@@ -1010,22 +2841,141 @@ mod tests {
         put(&c, "track/a", 100);
         put(&c, "track/x", 100);
         c.protect(&[]);
-        assert_eq!(c.ensure_free("track/x", 0), Err(MIN_FREE_BYTES - 1));
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES - 1))
+        );
         assert!(c.is_complete("track/a") && c.is_complete("track/x"));
+    }
+
+    /// An admitted video still has bytes to write; the music write may not
+    /// spend the room they need.
+    #[test]
+    fn room_leaves_what_an_admitted_video_still_has_to_write() {
+        let outstanding = std::sync::Arc::new(AtomicU64::new(0));
+        let hook = |o: &std::sync::Arc<AtomicU64>| -> OutsideUsed {
+            let o = o.clone();
+            std::sync::Arc::new(move || OutsideBytes {
+                held: 0,
+                outstanding: o.load(Ordering::SeqCst),
+                ..OutsideBytes::default()
+            })
+        };
+        let d = tmp("lowdisk-video");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 50)).unwrap();
+        c.set_outside_used(hook(&outstanding));
+        assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
+        // The video still has 100 to write: 50 free beyond the guard is
+        // really 50 short of it, and nothing is there to evict.
+        outstanding.store(100, Ordering::SeqCst);
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES - 50))
+        );
+        // Evicting music makes up the difference.
+        put(&c, "track/a", 100);
+        c.protect(&[]);
+        assert_eq!(c.ensure_free("track/x", 0), Ok(MIN_FREE_BYTES + 50));
+        assert!(!c.is_complete("track/a"));
+    }
+
+    /// A video write landing between the two reads must not be missed: the
+    /// outstanding figure is read before free space is probed.
+    #[test]
+    fn room_reads_what_a_video_owes_before_probing_free_space() {
+        let order = std::sync::Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let probe_order = order.clone();
+        let probe: FreeProbe = Box::new(move |_| {
+            probe_order.lock().unwrap().push("probe");
+            Ok(MIN_FREE_BYTES + 50)
+        });
+        let d = tmp("lowdisk-order");
+        let c = Cache::open_with_probe(&d, 1000, probe).unwrap();
+        let hook_order = order.clone();
+        c.set_outside_used(std::sync::Arc::new(move || {
+            hook_order.lock().unwrap().push("outstanding");
+            OutsideBytes::default()
+        }));
+        order.lock().unwrap().clear();
+        assert!(c.ensure_free("track/x", 0).is_ok());
+        assert_eq!(*order.lock().unwrap(), ["outstanding", "probe"]);
+    }
+
+    /// Video cannot say how big a folder is (it could not be read): the
+    /// cap and the free space cannot be trusted, so music is refused too,
+    /// as video is.
+    #[test]
+    fn music_is_refused_while_a_videos_size_is_unknown() {
+        let unknown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let u = unknown.clone();
+        let d = tmp("lowdisk-unknown-video");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 1_000_000)).unwrap();
+        c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            unknown: u.load(Ordering::SeqCst),
+            ..OutsideBytes::default()
+        }));
+        crate::testlog::start();
+        assert_eq!(
+            c.ensure_free("track/x", 10),
+            Err(NoRoom::AccountingUnknown),
+            "admitted"
+        );
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/x")),
+            "{lines:?}"
+        );
+        // Known again: admitted.
+        unknown.store(false, Ordering::SeqCst);
+        assert!(c.ensure_free("track/x", 10).is_ok());
+    }
+
+    /// Eviction must make up what admitted video still has to write, not
+    /// only the guard: with less free than video owes, the deficit counts.
+    #[test]
+    fn eviction_covers_the_deficit_when_video_owes_more_than_is_free() {
+        let outstanding = std::sync::Arc::new(AtomicU64::new(MIN_FREE_BYTES));
+        let o = outstanding.clone();
+        // Room for a sparse 2 GiB "track" and the cap to match.
+        let d = tmp("lowdisk-deficit");
+        let c = Cache::open_with_probe(&d, u64::MAX / 2, fixed_free(MIN_FREE_BYTES / 2)).unwrap();
+        c.set_outside_used(std::sync::Arc::new(move || OutsideBytes {
+            outstanding: o.load(Ordering::SeqCst),
+            ..OutsideBytes::default()
+        }));
+        let part = c.part_path("track/a");
+        std::fs::File::create(&part)
+            .unwrap()
+            .set_len(MIN_FREE_BYTES)
+            .unwrap();
+        c.commit("track/a", Some(MIN_FREE_BYTES)).unwrap();
+        c.protect(&[]);
+        // 1 GiB free, 2 GiB owed, 2 GiB of music: evicting it leaves 3 GiB
+        // against the 4 GiB the guard and the owed bytes need.
+        assert_eq!(
+            c.ensure_free("track/x", 0),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES / 2))
+        );
     }
 
     #[test]
     fn room_counts_the_bytes_still_to_write() {
-        let c = Cache::open_with_probe(&tmp("lowdisk-need"), 1000, fixed_free(MIN_FREE_BYTES + 10))
-            .unwrap();
+        let d = tmp("lowdisk-need");
+        let c = Cache::open_with_probe(&d, 1000, fixed_free(MIN_FREE_BYTES + 10)).unwrap();
         assert_eq!(c.ensure_free("track/x", 10), Ok(MIN_FREE_BYTES + 10));
-        assert_eq!(c.ensure_free("track/x", 11), Err(MIN_FREE_BYTES + 10));
+        assert_eq!(
+            c.ensure_free("track/x", 11),
+            Err(NoRoom::LowDisk(MIN_FREE_BYTES + 10))
+        );
     }
 
     #[test]
     fn an_unreadable_free_space_figure_does_not_block() {
         let probe: FreeProbe = Box::new(|_| Err(std::io::Error::other("no statvfs")));
-        let c = Cache::open_with_probe(&tmp("lowdisk-unknown"), 1000, probe).unwrap();
+        let d = tmp("lowdisk-unknown");
+        let c = Cache::open_with_probe(&d, 1000, probe).unwrap();
         assert!(c.ensure_free("track/x", 1 << 40).is_ok());
     }
 
@@ -1356,7 +3306,199 @@ mod tests {
         assert_eq!(c.used_bytes(), 150);
         assert_eq!(c.free_bytes().unwrap(), 12_345);
         let failing: FreeProbe = Box::new(|_| Err(std::io::Error::other("statvfs")));
-        let c = Cache::open_with_probe(&tmp("summary-err"), 1000, failing).unwrap();
+        let d = tmp("summary-err");
+        let c = Cache::open_with_probe(&d, 1000, failing).unwrap();
         assert!(c.free_bytes().is_err());
+    }
+
+    /// A part of `n` bytes no job holds, last written `age_s` seconds ago.
+    fn retained(c: &Cache, id: &str, n: usize, age_s: u64) {
+        let p = c.part_path(id);
+        std::fs::write(&p, vec![7u8; n]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// CR 4638660907: retained parts no job holds fill the disk and a new
+    /// admission needs room. With no finished track to evict, the oldest
+    /// inactive, unpinned part goes (and is named for its deferred state to
+    /// be dropped), and the admission is approved. A pinned part and an
+    /// active one, both older, stay.
+    #[test]
+    fn an_admission_evicts_the_oldest_part_no_job_holds() {
+        let d = tmp("evict-part-admission");
+        let dir = d.to_path_buf();
+        // A disk of fixed size: free is what the parts leave of it.
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 2200).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        c.pin("album/a", &ids(&["pinned"]));
+        retained(&c, "pinned", 600, 400);
+        retained(&c, "active", 600, 300);
+        retained(&c, "old", 600, 200);
+        retained(&c, "new", 600, 100);
+        c.job_started("active");
+        crate::testlog::start();
+        let verdict = c.ensure_free("x", 300);
+        let lines = crate::testlog::lines();
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(!c.part_path("old").exists(), "the oldest free part stayed");
+        for kept in ["pinned", "active", "new"] {
+            assert!(c.part_path(kept).exists(), "{kept} was evicted");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("id=old") && l.contains("verdict=evicted kind=part")),
+            "{lines:?}"
+        );
+        assert_eq!(c.take_evicted_parts(), vec!["old".to_owned()]);
+        assert!(c.take_evicted_parts().is_empty(), "taken twice");
+        c.job_ended("active");
+    }
+
+    /// CR 4638660907: over the cap with nothing finished to evict, a part
+    /// no job holds goes, oldest first; a part a job holds never does.
+    #[test]
+    fn a_trim_over_the_cap_evicts_the_oldest_part_no_job_holds() {
+        let d = tmp("evict-part-cap");
+        let c = Cache::open(&d, 1000).unwrap();
+        retained(&c, "active", 300, 300);
+        retained(&c, "old", 300, 200);
+        retained(&c, "new", 300, 100);
+        c.job_started("active");
+        c.protect(&ids(&["t"]));
+        put(&c, "t", 300);
+        assert!(c.is_complete("t"));
+        assert!(!c.part_path("old").exists(), "the oldest free part stayed");
+        assert!(c.part_path("new").exists());
+        assert!(c.part_path("active").exists(), "a held part was evicted");
+        c.job_ended("active");
+    }
+
+    /// CR 4640611246: a part-named entry that is not a regular file (a
+    /// folder) is never chosen: it would not go, and the eviction would
+    /// stop there. The newer regular part is evicted and the admission is
+    /// approved.
+    #[test]
+    fn an_admission_skips_a_part_named_folder() {
+        let d = tmp("evict-part-folder");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file()))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 700).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        let folder = c.part_path("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("x"), b"x").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(900);
+        std::fs::File::open(&folder)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        retained(&c, "file", 600, 100);
+        let verdict = c.ensure_free("x", 300);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(folder.exists());
+        assert!(!c.part_path("file").exists(), "the regular part stayed");
+    }
+
+    /// CR 4642574328: a part whose unlink fails is passed over for the
+    /// rest of the pass. The next oldest goes, the stuck one's bytes are
+    /// not credited, and the admission is approved.
+    #[test]
+    fn an_admission_tries_the_next_part_when_one_will_not_go() {
+        let d = tmp("evict-part-stuck");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .filter(|e| e.metadata().is_ok_and(|m| m.is_file()))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 1000).saturating_sub(parts))
+        });
+        let c = Cache::open_with_probe(&d, 1 << 20, free).unwrap();
+        retained(&c, "old", 600, 900);
+        retained(&c, "new", 900, 100);
+        // The oldest turns into a folder as its eviction starts: its unlink
+        // fails.
+        let stuck = c.part_path("old");
+        BEFORE_PART_EVICT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&stuck).unwrap();
+                std::fs::create_dir(&stuck).unwrap();
+                std::fs::write(stuck.join("x"), b"x").unwrap();
+            }));
+        });
+        crate::testlog::start();
+        let verdict = c.ensure_free("x", 300);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(c.part_path("old").is_dir());
+        assert!(!c.part_path("new").exists(), "the next part was not tried");
+        assert_eq!(c.take_evicted_parts(), vec!["new".to_owned()]);
+        let lines = crate::testlog::lines();
+        assert!(
+            lines.iter().any(|l| l.contains("id=old")
+                && l.contains("verdict=kept kind=part reason=remove_failed")),
+            "{lines:?}"
+        );
+    }
+
+    /// CR 4640611255: a job that starts while an eviction holds the cache's
+    /// lock waits for it, so the eviction's notice is published before the
+    /// job reads its resume state, or the eviction sees the job.
+    #[test]
+    fn a_job_start_waits_for_a_part_eviction_in_progress() {
+        let d = tmp("evict-part-job-start");
+        let dir = d.to_path_buf();
+        let free: FreeProbe = Box::new(move |_| {
+            let parts: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(PART_EXT))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .sum();
+            Ok((MIN_FREE_BYTES + 700).saturating_sub(parts))
+        });
+        let c = std::sync::Arc::new(Cache::open_with_probe(&d, 1 << 20, free).unwrap());
+        retained(&c, "old", 600, 100);
+        let c2 = c.clone();
+        BEFORE_PART_EVICT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let starter = std::thread::spawn(move || c2.job_started("old"));
+                wait_until_blocked(starter.thread().id());
+                std::mem::forget(starter);
+            }));
+        });
+        assert!(c.ensure_free("x", 300).is_ok());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !c.is_active("old") {
+            assert!(std::time::Instant::now() < until, "the job never started");
+            std::thread::yield_now();
+        }
+        assert_eq!(c.take_evicted_parts(), vec!["old".to_owned()]);
+        c.job_ended("old");
     }
 }
