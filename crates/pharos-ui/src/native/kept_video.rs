@@ -162,6 +162,12 @@ pub struct KeptVideo {
     /// has to clear it.
     #[serde(skip)]
     pub stale_on_disk: u64,
+    /// Why a Failed record stopped when a later try can mend it (ADR 0148):
+    /// the queue tries it again by itself, keeping its files. `None` on a
+    /// failure only the viewer can act on, and on every other state. A build
+    /// before the queue ignores it and shows a plain failure with Retry.
+    #[serde(default)]
+    pub halt: Option<super::download_queue::Halt>,
 }
 
 fn estimate_from_adoption_default() -> bool {
@@ -1081,6 +1087,7 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         saved_at,
         estimate_from_adoption: false,
         stale_on_disk: 0,
+        halt: None,
     }
 }
 
