@@ -5101,6 +5101,7 @@ fn SeenTitle(
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
     let detail_for_keep = detail.clone();
     let version_for_keep = version.clone();
+    let offline = use_context::<Ctx>().offline.read().is_some();
     rsx! {
         TitleView {
             detail,
@@ -5112,6 +5113,7 @@ fn SeenTitle(
             version,
             on_version,
             keep: keep_control(&detail_for_keep, &version_for_keep),
+            offline,
         }
     }
 }
