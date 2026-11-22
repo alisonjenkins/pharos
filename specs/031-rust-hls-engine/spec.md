@@ -63,7 +63,7 @@ Design rules:
 
 ## User story 1 - Choose the engine per device (Priority: P1)
 
-A tester opens Settings, Playback, and picks "Pharos engine (experimental)" on one device. Videos on that device play through the Rust engine; other devices keep hls.js.
+A viewer opens Settings, Playback, and picks the player for one device: "Pharos" (the Rust engine, the default on the web since ADR-0151) or "hls.js (older)". Videos on that device play through the pick; other devices keep theirs.
 
 **Acceptance**: the choice is stored per device (`localStorage`), `?engine=rust` and `?engine=hlsjs` override it for one page load, and the player logs `pharos: playback engine=<rust|hlsjs> reason=<setting|override|default|fallback>` and reports it as a client event (V630).
 
