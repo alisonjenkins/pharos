@@ -29,8 +29,17 @@ use dioxus::core::{spawn_forever, try_consume_context};
 use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
+use super::kept_video::{
+    landed, loudness, request_class, request_key, request_line, url_path, Landed, Loudness,
+    StoredFile, Verdict,
+};
+use super::kept_video_disk::{
+    iso_now, Body, BoxFut, Budget, DiskVideoStore, Env, FetchError, Fetcher, OpenFailed,
+};
+use super::offline_video::{self, ResumeError, Resumed, Session};
 use super::tv_page::{self, Bridge, Paths};
 use super::tv_turn;
+use pharos_api::pharos_capnp::bootstrap;
 
 use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
@@ -50,13 +59,17 @@ pub struct Connection {
 
 pub struct Open {
     pub conn: Connection,
-    pub api: NativeApi,
+    /// The API and the token it was resumed with, one value.
+    pub session: Session<NativeApi>,
     pub server_schema: Option<u32>,
 }
 
 pub enum OpenError {
     NotOpened(Probe),
     NotSignedIn,
+    /// The server refused the token, which could be neither removed nor
+    /// marked revoked: signed out here, but a restart may resume it.
+    NotSignedInTokenKept,
     Resume(String),
 }
 
@@ -110,7 +123,6 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     spawn_forever(system);
     // None of the three needs another's answer, so they share one wait: the
     // capability probe is a WebView round trip and the other two are RPCs.
-    let token = android::load_token();
     let probe = async {
         if lock(&CAPS).is_some() {
             return None;
@@ -125,16 +137,17 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             .ok();
         (schema, now_ms() - connected)
     };
-    let resume = async {
-        match &token {
-            Some(token) => {
-                let resumed = android::resume(&client, &closed, call, token).await;
-                Some((resumed, now_ms() - connected))
-            }
-            None => None,
-        }
+    let resumer = PhoneResumer {
+        client: &client,
+        closed: &closed,
+        call,
     };
-    let (probe_ms, (server_schema, server_info_ms), resumed) =
+    let resume = async {
+        let resumed = offline_video::resume_session(&resumer).await;
+        let ms = (!matches!(resumed, Resumed::NoToken)).then(|| now_ms() - connected);
+        (resumed, ms)
+    };
+    let (probe_ms, (server_schema, server_info_ms), (resumed, resume_ms)) =
         futures_util::join!(probe, info, resume);
     // A step that did not run says so instead of carrying a duration.
     let ms =
@@ -143,32 +156,83 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         "connect_ms={:.0} probe_ms={} server_info_ms={server_info_ms:.0} resume_ms={} total_ms={:.0}",
         connected - started,
         ms(probe_ms, "cached"),
-        ms(resumed.as_ref().map(|(_, d)| *d), "no_token"),
+        ms(resume_ms, "no_token"),
         now_ms() - started,
     );
-    let Some((resumed, _)) = resumed else {
-        log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
-        return Err(OpenError::NotSignedIn);
-    };
     match resumed {
-        Ok(session) => {
+        Resumed::NoToken => {
+            log::info!("pharos: open server={base} signed_in=false reason=no_token {timing}");
+            Err(OpenError::NotSignedIn)
+        }
+        Resumed::Opened(session) => {
             log::info!("pharos: open server={base} signed_in=true {timing}");
-            let api = NativeApi::new(&session);
-            spawn_forever(keep_media_token(api.clone()));
+            spawn_forever(keep_media_token(session.api().clone()));
             Ok(Open {
-                api,
+                session,
                 conn: Connection { closed },
                 server_schema,
             })
         }
-        Err(NetError::Client(e)) if e.needs_sign_in() => {
+        Resumed::Refused => {
             log::info!("pharos: open server={base} signed_in=false reason=token_refused {timing}");
-            android::forget_token();
             Err(OpenError::NotSignedIn)
         }
-        Err(e) => {
+        Resumed::RefusedNotForgotten => {
+            log::warn!(
+                "pharos: open server={base} signed_in=false reason=token_refused_not_forgotten {timing}"
+            );
+            Err(OpenError::NotSignedInTokenKept)
+        }
+        Resumed::Superseded => {
+            log::info!(
+                "pharos: open server={base} signed_in=unknown reason=token_replaced_during_resume {timing}"
+            );
+            Err(OpenError::Resume(
+                "the device token was replaced while it was resumed".to_owned(),
+            ))
+        }
+        Resumed::Failed(e) => {
             log::warn!("pharos: open resume failed server={base} error={e} {timing}");
-            Err(OpenError::Resume(e.to_string()))
+            Err(OpenError::Resume(e))
+        }
+    }
+}
+
+/// The phone's side of [`offline_video::resume_session`]: the token file
+/// and the server's resume over `open`'s socket.
+struct PhoneResumer<'a> {
+    client: &'a bootstrap::Client,
+    closed: &'a Closed,
+    call: &'a CallInfo,
+}
+
+impl offline_video::Resumer for PhoneResumer<'_> {
+    type Api = NativeApi;
+    type Error = String;
+
+    fn load_token(&self) -> Option<String> {
+        android::load_token()
+    }
+
+    fn resume<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> futures_util::future::LocalBoxFuture<'a, Result<NativeApi, ResumeError<String>>> {
+        Box::pin(async move {
+            match android::resume(self.client, self.closed, self.call, token).await {
+                Ok(session) => Ok(NativeApi::new(&session)),
+                Err(NetError::Client(e)) if e.needs_sign_in() => Err(ResumeError::Refused),
+                Err(e) => Err(ResumeError::Failed(e.to_string())),
+            }
+        })
+    }
+
+    fn forget_token(&self, refused: &str) -> offline_video::TokenDropped {
+        use super::token_file::Ended;
+        match android::forget_refused_token(refused, None) {
+            Ended::Changed => offline_video::TokenDropped::Replaced,
+            Ended::Unsafe { .. } => offline_video::TokenDropped::Unsafe,
+            Ended::Forgotten(_) | Ended::Marked(_) => offline_video::TokenDropped::Gone,
         }
     }
 }
@@ -242,8 +306,7 @@ pub async fn quick_connect(mut show_code: impl FnMut(String) + 'static) -> SignI
 /// Forget the device token. The server keeps the session until it lapses
 /// or is revoked from another device.
 pub async fn sign_out() -> SignOutReply {
-    android::forget_token();
-    SignOutReply::Status(204)
+    android::forget_token().reply()
 }
 
 /// GET a same-server path as text, with the device token in a header.
@@ -1851,7 +1914,7 @@ h.attachMedia(v);
 "#,
             id = js_str(&id),
             mark = js_str(super::resume::ENGINE_MARK),
-            url = js_str(&direct_url(&server(), url)),
+            url = js_str(&hls_source(url)),
             token = android::token().map_or_else(|| "null".to_owned(), |t| js_str(&t)),
             generation = self.generation,
             xhr_setup = super::playback::HLS_XHR_SETUP,
@@ -2036,6 +2099,29 @@ impl Drop for DirectMedia {
 /// server allows the app's origin): through the page proxy each segment
 /// held a WebView request thread, a JNI copy of the body and the 8 s proxy
 /// deadline.
+/// The URL hls.js loads `url` from, logged with its reason: a downloaded
+/// master through the page's own origin (the local handler answers it and
+/// everything under it from disk), anything else from the server
+/// (`direct_url`).
+fn hls_source(url: &str) -> String {
+    let local = super::offline_video::hls_local_source(super::ports::video_store().as_deref(), url);
+    let log_url = url.split('?').next().unwrap_or_default();
+    match local {
+        Some(path) => {
+            log::info!(
+                "pharos: playback hls source verdict=local reason=stored_master url={log_url}"
+            );
+            path
+        }
+        None => {
+            log::info!(
+                "pharos: playback hls source verdict=direct reason=not_stored url={log_url}"
+            );
+            direct_url(&server(), url)
+        }
+    }
+}
+
 fn direct_url(base: &str, url: &str) -> String {
     if url.starts_with('/') {
         tv_page::server_url(base, url)
@@ -2132,6 +2218,37 @@ pub fn apply_tokens(declarations: &[(String, String)]) -> Result<(), String> {
 
 pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
     android::store_pref(key, value)
+}
+
+/// The device token decides who is signed in at a cold start: no token (or
+/// one that cannot be read) is nobody, whatever a preference says.
+pub const TOKEN_DECIDES_SIGN_IN: bool = true;
+
+/// The user id kept with the device token; `None` when there is no readable
+/// token or none was stored with it.
+pub fn token_user() -> Result<Option<String>, String> {
+    android::load_token_user()
+}
+
+/// The user kept with the device token, only while that token is `seen`
+/// (the one a new session was resumed with).
+pub fn token_user_if(seen: &str) -> Result<Option<String>, String> {
+    android::load_token_user_if(seen)
+}
+
+/// Drops the device token an ended session was opened with, only while it
+/// is still the one on file (`token_file::forget_if`): a replacement a new
+/// sign-in stored is kept. False when it was kept.
+pub fn forget_token_if(seen: &str, user: Option<&str>) -> super::offline_video::TokenEnd {
+    android::forget_refused_token(seen, user).into()
+}
+
+/// Keeps `user` with the device token, at sign-in, only while the token on
+/// file is still `seen`, the one the request that named `user` was built
+/// with. Err `token_changed` (a new sign-in's token landed in between: it
+/// stays unpaired) or `no_token_seen`; either fails closed.
+pub fn note_token_user(user: &str, seen: Option<&str>) -> Result<(), String> {
+    android::pair_token_user(seen, user)
 }
 
 pub fn apply_subtitle_size(size: SubtitleSize) {
@@ -3272,69 +3389,378 @@ const PASSED_ON: [&str; 2] = ["accept", "if-none-match"];
 /// into a title in particular, can take the server longer than that. A 503
 /// instead is an ordinary load error that hls.js retries.
 const PROXY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// The most redirects one proxied request follows.
+const PROXY_REDIRECTS: usize = 5;
 /// The response headers passed back to the page.
 const PASSED_BACK: [&str; 4] = ["content-type", "cache-control", "etag", "last-modified"];
 
-fn http() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+/// The proxy's client, or why there is none: one that cannot be built is
+/// never replaced by a default one (no TLS config, the default redirect
+/// policy that would carry the token), so every proxied request is refused.
+fn http() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // reqwest 0.13's default verifier is rustls-platform-verifier, which
         // on Android needs JNI setup this app does not do. Use the shared
         // ring + webpki-roots config the server uses.
-        let builder = reqwest::Client::builder().user_agent(tv_page::USER_AGENT);
-        let builder = match pharos_api::tls::client_config() {
-            Ok(tls) => builder.tls_backend_preconfigured(tls),
-            Err(error) => {
-                // ring is installed above, so this still builds; the platform
-                // verifier it falls back to fails every handshake loudly.
-                log::error!("server proxy TLS config failed to build: {error}");
-                builder
-            }
-        };
-        builder.build().unwrap_or_default()
+        // Redirects are followed by hand in `fetch_server`, hop by hop, so
+        // the device token never rides one off its origin.
+        let builder = reqwest::Client::builder()
+            .user_agent(tv_page::USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none());
+        let built = tv_page::proxy_client(|| {
+            let tls = pharos_api::tls::client_config().map_err(|e| format!("tls config: {e}"))?;
+            builder
+                .tls_backend_preconfigured(tls)
+                .build()
+                .map_err(|e| e.to_string())
+        });
+        if let Err(why) = &built {
+            log::error!("pharos: proxy refused reason={why}");
+        }
+        built
     })
 }
 
-/// GET `path_and_query` from the server with the device token in a header.
-/// Returns the status, the passed-back headers and the body.
+/// The device token for a request to `url`, when it may go there
+/// ([`tv_page::token_allowed`]). One withheld is logged with the reason,
+/// at warn the first time and at debug after, since every request to a
+/// plain-http server would repeat it.
+fn token_for(url: &str, what: &str) -> Option<String> {
+    allowed_token(url, what, android::token()?)
+}
+
+/// `token` for a request to `url`, when it may go there; logged as
+/// [`token_for`] logs a withheld one.
+fn allowed_token(url: &str, what: &str, token: String) -> Option<String> {
+    match tv_page::token_allowed(url, tv_page::DEFAULT_SERVER) {
+        Ok(()) => Some(token),
+        Err(reason) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::debug!("pharos: device token withheld for={what} reason={reason}");
+            } else {
+                log::warn!("pharos: device token withheld for={what} reason={reason}");
+            }
+            None
+        }
+    }
+}
+
+/// The phone's transport for [`tv_page::proxy_get`]: one reqwest GET, no
+/// redirect followed (the client's policy is `none`).
+impl tv_page::ProxyTransport for reqwest::Client {
+    type Response = reqwest::Response;
+    async fn get(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<reqwest::Response, String> {
+        let mut req = reqwest::Client::get(self, url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        req.send()
+            .await
+            .map_err(|e| tv_page::error_chain(&e.without_url()))
+    }
+}
+
+impl tv_page::ProxyResponse for reqwest::Response {
+    fn status(&self) -> u16 {
+        reqwest::Response::status(self).as_u16()
+    }
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+    fn redirect(&self) -> Option<Result<String, String>> {
+        if !reqwest::Response::status(self).is_redirection() {
+            return None;
+        }
+        let location = self
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())?;
+        Some(
+            self.url()
+                .join(location)
+                .map(|u| u.to_string())
+                .map_err(|e| e.to_string()),
+        )
+    }
+    async fn body(self) -> Result<Vec<u8>, String> {
+        self.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| tv_page::error_chain(&e.without_url()))
+    }
+}
+
+/// GET `path_and_query` from the server with the device token in a header,
+/// through [`tv_page::proxy_get`]. Returns the status, the passed-back
+/// headers and the body.
 async fn fetch_server(
     path_and_query: &str,
     headers: &[(String, String)],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    let base = server();
-    let mut req = http().get(tv_page::server_url(&base, path_and_query));
-    if let Some(token) = android::token() {
-        req = req.header("X-Emby-Token", token);
+    let url = tv_page::server_url(&server(), path_and_query);
+    let token = token_for(&url, "proxy");
+    let log = |level: tv_page::Level, line: String| match level {
+        tv_page::Level::Debug => log::debug!("{line}"),
+        tv_page::Level::Info => log::info!("{line}"),
+        tv_page::Level::Warn => log::warn!("{line}"),
+    };
+    tv_page::proxy_get(
+        http(),
+        tv_page::ProxyGet {
+            url,
+            token,
+            headers,
+            build_server: tv_page::DEFAULT_SERVER,
+            passed_back: &PASSED_BACK,
+            max_hops: PROXY_REDIRECTS,
+        },
+        &log,
+    )
+    .await
+}
+
+/// How long a download's request or one chunk of its body may go without
+/// an answer before it counts as a failure (a retryable one: no signal).
+const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The phone's video downloads over the same client, token and server
+/// address as the proxy, the body streamed rather than held.
+struct ServerFetcher;
+
+/// The device token for a download run of `owner`'s
+/// ([`token_file::run_token`](super::token_file::run_token)). Err names the
+/// refusal; nothing is sent.
+fn token_for_run(owner: &str) -> Result<String, String> {
+    android::run_token(owner)
+}
+
+/// The client the downloads use. Its redirect policy follows a redirect
+/// only to the same scheme, host and port as the request (the download
+/// sends the device token): a cross-host redirect or an https-to-http
+/// downgrade stops and is logged. A playlist followed to another key is
+/// stored with its references rebased onto it ([`key_under_base`],
+/// [`localize_playlist`](super::kept_video::localize_playlist)). Not
+/// `https_only`: a plain-http server on the LAN must keep working. [`http`] is the proxy's and is unchanged.
+fn download_http() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            let first = attempt
+                .previous()
+                .first()
+                .map_or_else(String::new, |u| u.to_string());
+            if tv_page::redirects_exceeded(attempt.previous().len()) {
+                return attempt.error("too many redirects");
+            }
+            // Same origin only. A playlist may move: the store rebases its
+            // references onto where it was answered from.
+            match tv_page::redirect_verdict(&first, attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => {
+                    log::warn!(
+                        "pharos: video download redirect stopped reason={reason} status={}",
+                        attempt.status()
+                    );
+                    attempt.stop()
+                }
+            }
+        });
+        let built = tv_page::built_client(|| {
+            let tls = pharos_api::tls::client_config().map_err(|e| format!("tls config: {e}"))?;
+            reqwest::Client::builder()
+                .user_agent(tv_page::USER_AGENT)
+                .redirect(policy)
+                .tls_backend_preconfigured(tls)
+                .build()
+                .map_err(|e| e.to_string())
+        });
+        if let Err(why) = &built {
+            log::error!("pharos: video download refused reason={why}");
+        }
+        built
+    })
+}
+
+/// A response, and the key it was answered from when a redirect moved it.
+struct ServerBody(reqwest::Response, Option<String>);
+
+fn no_answer(what: &str) -> FetchError {
+    FetchError {
+        status: None,
+        message: format!("{what} timed out after {DOWNLOAD_STALL:?}"),
     }
-    for (name, value) in headers {
-        req = req.header(name, value);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("stage=send {}", tv_page::error_chain(&e.without_url())))?;
-    let status = resp.status().as_u16();
-    let back = PASSED_BACK
-        .iter()
-        .filter_map(|name| {
-            resp.headers()
-                .get(*name)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| ((*name).to_owned(), v.to_owned()))
+}
+
+impl Body for ServerBody {
+    fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>> {
+        Box::pin(async move {
+            match tokio::time::timeout(DOWNLOAD_STALL, self.0.chunk()).await {
+                Err(_) => Err(no_answer("body")),
+                Ok(Ok(chunk)) => Ok(chunk.map(|c| c.to_vec())),
+                Ok(Err(e)) => Err(FetchError {
+                    status: None,
+                    message: format!("body {}", tv_page::error_chain(&e.without_url())),
+                }),
+            }
         })
-        .collect();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            format!(
-                "stage=body status={status} {}",
-                tv_page::error_chain(&e.without_url())
-            )
-        })?
-        .to_vec();
-    Ok((status, back, body))
+    }
+
+    fn final_key(&self) -> Option<String> {
+        self.1.clone()
+    }
+}
+
+impl Fetcher for ServerFetcher {
+    fn check_owner(&self, owner: &str) -> Result<(), String> {
+        token_for_run(owner).map(|_| ())
+    }
+
+    fn server_base(&self) -> String {
+        server()
+    }
+
+    fn open<'a>(
+        &'a self,
+        owner: &'a str,
+        key: &'a str,
+    ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>> {
+        Box::pin(async move {
+            // Bound to the run's owner before anything is sent: another
+            // user's token never goes out for this run, and a refusal sends
+            // nothing at all (fail closed).
+            let token = token_for_run(owner).map_err(OpenFailed::NotOwner)?;
+            // No client, no download: never a default one without the
+            // redirect policy.
+            let client = download_http()
+                .as_ref()
+                .map_err(|why| OpenFailed::Refused(format!("no client: {why}")))?;
+            let base = server();
+            let url = tv_page::server_url(&base, key);
+            let mut req = client.get(&url);
+            if let Some(token) = allowed_token(&url, "video_download", token) {
+                req = req.header("X-Emby-Token", token);
+            }
+            let resp = tokio::time::timeout(DOWNLOAD_STALL, req.send())
+                .await
+                .map_err(|_| no_answer("request"))?
+                .map_err(|e| {
+                    // Too many redirects answers the same on every try.
+                    let redirect = e.is_redirect();
+                    let chain = tv_page::error_chain(&e.without_url());
+                    if redirect {
+                        OpenFailed::Refused(format!("send {chain}"))
+                    } else {
+                        OpenFailed::Fetch(FetchError {
+                            status: None,
+                            message: format!("send {chain}"),
+                        })
+                    }
+                })?;
+            let status = resp.status();
+            // Where a followed redirect left the request: a playlist's
+            // references resolve against it, so the store rebases them.
+            let moved = match landed(&base, &url, resp.url().as_str(), key) {
+                Landed::Asked => None,
+                Landed::Moved(final_key) => Some(final_key),
+                Landed::OutsideBase => {
+                    log::warn!(
+                        "pharos: video download redirect refused reason=outside_base_path url_path={} final_path={}",
+                        url_path(key),
+                        url_path(resp.url().as_str())
+                    );
+                    return Err(OpenFailed::Refused(
+                        "redirected outside the server's base path".to_owned(),
+                    ));
+                }
+            };
+            if status.is_success() {
+                Ok(Box::new(ServerBody(resp, moved)) as Box<dyn Body>)
+            } else {
+                Err(OpenFailed::Fetch(FetchError {
+                    status: Some(status.as_u16()),
+                    message: String::new(),
+                }))
+            }
+        })
+    }
+}
+
+/// Opens the phone's store of downloaded video under `root`, restarts the
+/// downloads a closed app left half done, and registers it as the app's
+/// [`VideoStore`](super::kept_video::VideoStore). The downloads run on a
+/// runtime of their own: one thread, because they wait on the network and
+/// the disk, and RAM is scarce. Call once, before launch.
+pub fn register_video_store(
+    root: std::path::PathBuf,
+    budget: Arc<dyn Budget>,
+) -> Result<(), super::ports::RegisterFailed> {
+    use super::ports::RegisterFailed;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RegisterFailed::BeforeOpen(format!("video runtime: {e}")))?;
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .name("pharos-video".into())
+        .spawn(move || runtime.block_on(std::future::pending::<()>()))
+        .map_err(|e| RegisterFailed::BeforeOpen(format!("video thread: {e}")))?;
+    let store = DiskVideoStore::open(
+        root,
+        Env {
+            fetcher: Arc::new(ServerFetcher),
+            budget,
+            sleep: Arc::new(|secs| {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_secs(secs)))
+            }),
+            now: iso_now,
+            runtime: handle,
+            remove_dir: |dir| std::fs::remove_dir_all(dir),
+        },
+    );
+    super::ports::register_video_store(store).map_err(|e| RegisterFailed::AfterOpen(e.to_string()))
+}
+
+/// Logs where a stream request was answered from: playlists at info,
+/// segments at debug, other requests not at all.
+fn log_video_request(key: &str, verdict: Verdict, bytes: u64) {
+    let line = request_line(key, verdict, bytes);
+    match loudness(request_class(key)) {
+        Some(Loudness::Info) => log::info!("{line}"),
+        Some(Loudness::Debug) => log::debug!("{line}"),
+        None => {}
+    }
+}
+
+/// The stored file's bytes, read whole: the WebView's response is a buffer,
+/// and a segment is a few MB at most. `None` when the file would not read
+/// (logged; the network answers instead). Which file answers, and for whom,
+/// is decided by `offline_video::offline_file_for`, off the device.
+async fn read_stored(file: &StoredFile, key: &str) -> Option<Vec<u8>> {
+    match tokio::fs::read(&file.path).await {
+        Ok(body) => Some(body),
+        Err(e) => {
+            log::warn!(
+                "pharos: video request class={} verdict=stored_unreadable url_path={} error={e}",
+                request_class(key).label(),
+                url_path(key)
+            );
+            None
+        }
+    }
 }
 
 /// Answer the page's requests to the server (`tv_page::proxied_segments`)
@@ -3358,8 +3784,38 @@ pub fn use_server_proxy() {
                 .iter()
                 .filter_map(|name| header(name).map(|v| ((*name).to_owned(), v)))
                 .collect();
+            // Decided now, on the caller's thread: the signed-in user this
+            // request belongs to (`None` after a sign-out) picks the stored
+            // file, if any.
+            let offline = super::offline_video::offline_file_for(
+                super::ports::video_store().as_deref(),
+                &path,
+            );
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
+                // A downloaded video's files answer from disk, online or
+                // not: no data used, and the same bytes the player was
+                // given when it was kept.
+                let key = request_key(&path);
+                let stored = match &offline {
+                    Some(file) => read_stored(file, &key).await.map(|body| (file, body)),
+                    None => None,
+                };
+                if let Some((file, body)) = stored {
+                    log_video_request(&key, Verdict::ServedOffline, file.len);
+                    let mut builder = dioxus::mobile::wry::http::Response::builder().status(200);
+                    for (name, value) in super::offline_video::offline_headers(file) {
+                        builder = builder.header(name, value);
+                    }
+                    let response = builder.body(body).unwrap_or_else(|e| {
+                        log::warn!("pharos: proxy response build failed error={e}");
+                        let mut fallback = dioxus::mobile::wry::http::Response::new(Vec::new());
+                        *fallback.status_mut() = dioxus::mobile::wry::http::StatusCode::BAD_GATEWAY;
+                        fallback
+                    });
+                    responder.respond(response);
+                    return;
+                }
                 let fetched = tokio::time::timeout(PROXY_DEADLINE, fetch_server(&path, &headers))
                     .await
                     .unwrap_or_else(|_| {
@@ -3374,6 +3830,7 @@ pub fn use_server_proxy() {
                             builder = builder.header(name, value);
                         }
                         let ms = started.elapsed().as_millis();
+                        log_video_request(&key, Verdict::Network, body.len() as u64);
                         if status >= 400 {
                             // The server's own refusal, passed on: no "proxy failed" line.
                             log::warn!(
