@@ -5,6 +5,7 @@
 //! does the sockets and files. Nothing here logs a token or a QuickConnect
 //! secret; the QuickConnect code is logged because the user must type it.
 
+use crate::native::token_file;
 use crate::native::tv_auth::{self, Action, Polled, QuickConnect};
 use futures_util::{SinkExt, StreamExt};
 use pharos_api::pharos_capnp::{bootstrap, login_result, quick_connect_result, session};
@@ -137,80 +138,184 @@ fn token_path() -> Result<PathBuf, String> {
         })
 }
 
+/// The user id stored with the token (one file: `token_file`). `None` with
+/// no readable token or no user id stored with it; the older layout's
+/// sidecar is never read, as nothing says it belongs to this token.
+pub fn load_token_user() -> Result<Option<String>, String> {
+    Ok(token_file::read(&token_path()?)?.and_then(|s| s.user))
+}
+
+/// The user stored with the token on file, from one read, only while that
+/// token is `seen`.
+pub fn load_token_user_if(seen: &str) -> Result<Option<String>, String> {
+    Ok(token_file::read(&token_path()?)?
+        .filter(|s| s.token == seen.trim())
+        .and_then(|s| s.user))
+}
+
+/// Keeps `user` with the token on file only while it is `seen`
+/// (`token_file::pair`).
+pub fn pair_token_user(seen: Option<&str>, user: &str) -> Result<(), String> {
+    token_file::pair(&token_path()?, seen, user)
+}
+
 /// The device token as last loaded, stored or forgotten, kept in memory for
-/// the server proxy, which sends it on every image request.
+/// the server proxy, which sends it on every image request. Its lock is
+/// held across each file operation and the cache update that follows it,
+/// so a sign-out that completes is never followed by publishing the token
+/// it removed.
 static TOKEN: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
-fn set_cached(token: Option<String>) {
-    if let Ok(mut t) = TOKEN.lock() {
-        *t = Some(token);
-    }
+fn token_lock() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
+    TOKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The sign-out fence is the token file's own ([`token_file::fence`]): set
+/// by the sign-out operation that left its token on file, under the file's
+/// lock, so that token is not loaded again here. Every token store replaces
+/// it in the same lock, the car's QuickConnect included.
+fn fence(path: &std::path::Path) -> token_file::SignOutFence {
+    token_file::fence(path)
 }
 
 /// `load_token`, read from disk only the first time. Never log the value.
 pub fn token() -> Option<String> {
-    if let Ok(t) = TOKEN.lock() {
-        if let Some(token) = &*t {
+    let mut cached = token_lock();
+    // A store since (the car's QuickConnect writes the file itself) may
+    // have put another token there: read it again.
+    if let Some(token) = &*cached {
+        if !token_file::take_stale() {
             return token.clone();
         }
     }
-    load_token()
+    load_locked(&mut cached)
 }
 
 /// The stored device token, if any. Never log the value.
 pub fn load_token() -> Option<String> {
-    let path = token_path().ok()?;
-    let token = std::fs::read_to_string(path)
-        .ok()
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty());
-    set_cached(token.clone());
+    load_locked(&mut token_lock())
+}
+
+/// Reads the token behind the fence and caches it, under the cache's lock.
+fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
+    let path = token_path().ok();
+    let fence = path.as_deref().map(fence).unwrap_or_default();
+    // The read goes through the fence itself (`token_file::read`).
+    let token = path
+        .and_then(|path| token_file::read(&path).ok().flatten())
+        .map(|s| s.token);
+    if token.is_none() && fence != token_file::SignOutFence::Open {
+        log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
+    }
+    *cached = Some(token.clone());
     token
 }
 
-/// Write the token to a temp file in the same directory, fsync it, and
-/// rename it over the target, so a crash never leaves a half-written token.
-pub fn store_token(token: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let path = token_path()?;
-    let dir = path.parent().ok_or("token path has no directory")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join("device-token.tmp");
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(token.as_bytes())?;
-        f.sync_all()?;
-        if f.metadata()?.permissions().mode() & 0o077 != 0 {
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &path)
-    };
-    write()
-        .inspect(|()| {
-            set_cached(Some(token.to_owned()));
-            note_credentials_changed("stored");
-        })
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
-        })
+/// The token for a download request of `owner`'s run, from one uncached
+/// read of the one file (`token_file::run_token`), behind the same
+/// sign-out fence as `load_token`. Never log the token.
+pub fn run_token(owner: &str) -> Result<String, String> {
+    let path = token_path().map_err(|e| format!("token_unreadable owner={owner} error={e}"))?;
+    // The fence is read with the token, under the file's lock.
+    let decided = token_file::run_token(&path, owner);
+    if decided
+        .as_ref()
+        .is_err_and(|e| e.starts_with("signed_out_token_not_removed"))
+    {
+        log::info!(
+            "pharos: run token verdict=refused reason=signed_out_token_not_removed owner={owner}"
+        );
+    }
+    decided
 }
 
-pub fn forget_token() {
-    set_cached(None);
-    let Ok(path) = token_path() else { return };
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("forget token: {e}"),
+/// Replaces the token file whole (`token_file::store`): the new token's user
+/// is unknown until `pair_token_user`, never the previous sign-in's.
+pub fn store_token(token: &str) -> Result<(), String> {
+    let path = token_path()?;
+    {
+        let mut cached = token_lock();
+        // The store replaces the fence, as every token store does.
+        token_file::store(&path, token)?;
+        *cached = Some(Some(token.to_owned()));
     }
-    note_credentials_changed("forgotten");
+    note_credentials_changed("stored");
+    Ok(())
+}
+
+/// Signs out on the device: the token and its pairing go. What
+/// the removal left is the verdict; a file that would not go is
+/// `NotSaved`, and this process stays signed out all the same: the token
+/// is not read again until a new sign-in stores one.
+///
+/// The sign-out operation fences the token it left on file itself, under
+/// the file's lock and from the token it targeted (every token when it
+/// could not name one): no store lands between it and its fence, and no
+/// earlier read names the wrong token. A `NotSaved` is never reported as
+/// forgotten: the media service stays signed out instead.
+///
+/// Every exit publishes a fence first, so no early return can skip it:
+/// every token at the token file's path, or at every path when the path
+/// cannot be found. The operation then narrows it to the token it left, or
+/// a store replaces it. A service that connects later reads it too.
+pub fn forget_token() -> token_file::SignedOut {
+    token_file::forget_token_with(
+        token_path,
+        |_| {
+            *token_lock() = Some(None);
+        },
+        |notice| match notice {
+            token_file::ServiceNotice::StaySignedOut => note_credentials_kept(),
+            token_file::ServiceNotice::Reload => note_credentials_changed("forgotten"),
+        },
+    )
+}
+
+/// Drops the token a session ended (or a resume was refused) with, only
+/// while it is still the one on file, and says what happened
+/// (`token_file::end_session`): `Changed` when a sign-in replaced it since
+/// (kept, for the caller to resume with), `Marked` when it would not go but
+/// is marked revoked for `user`, `Unsafe` when neither could be written.
+pub fn forget_refused_token(refused: &str, user: Option<&str>) -> token_file::Ended {
+    let ended = 'ended: {
+        let mut cached = token_lock();
+        let path = match token_path() {
+            Ok(path) => path,
+            Err(e) => {
+                // Fenced like a sign-out with no path; the notice below
+                // goes once the cache's lock is released.
+                *cached = Some(None);
+                break 'ended token_file::end_session_path_unknown(e);
+            }
+        };
+        let ended = token_file::end_session(&path, Some(refused), user);
+        if ended == token_file::Ended::Changed {
+            log::info!("pharos: token forget verdict=kept reason=token_changed_since_resume");
+            return ended;
+        }
+        *cached = Some(None);
+        // An `Unsafe` end fenced its target in the operation, the media
+        // service's reads included: it is asked to stay signed out below,
+        // not to reload.
+        ended
+    };
+    if matches!(ended, token_file::Ended::Unsafe { .. }) {
+        log::warn!("pharos: token forget verdict=fenced reason=token_neither_removed_nor_marked");
+        note_credentials_kept();
+    } else {
+        note_credentials_changed("forgotten");
+    }
+    ended
+}
+
+/// Tells the host app a sign-out left `token` on file, neither removed nor
+/// marked: the car's media service, in this same process, stays signed out
+/// and refuses that token (by fingerprint) instead of reloading it.
+fn note_credentials_kept() {
+    let hook = super::ports::credentials_kept();
+    log::warn!("pharos: credentials change=kept_unsafe action=stay_signed_out host_hook={hook}");
 }
 
 /// Tells the host app the token file changed, so the car's media service in
