@@ -2666,9 +2666,9 @@ pub async fn discover_sidecars(
 ///   both stem-matched files and a per-episode `Subs/<stem>/` subfolder;
 /// - a per-episode `<stem>/` folder next to the media.
 ///
-/// Returns `(sidecar_path, kind)` in ascending-path order so the numeric
-/// `stream_index` offsets stay consistent between PlaybackInfo and Stream.vtt
-/// fetches.
+/// Returns `(sidecar_path, kind)` in ascending-path order, then the
+/// downloads in the order they were published, so the numeric `stream_index` offsets
+/// stay consistent between PlaybackInfo and Stream.vtt fetches.
 async fn discover_sidecars_uncached(
     media_path: &std::path::Path,
 ) -> Vec<(std::path::PathBuf, SidecarKind)> {
@@ -2700,18 +2700,31 @@ async fn discover_sidecars_uncached(
         scan_all_subs(&epdir, &mut found).await;
     }
 
-    // (d) subtitles downloaded from OpenSubtitles, kept on the cache volume
-    // (spec 030).
-    if let Some(root) = crate::opensubtitles::store::installed_root() {
-        scan_all_subs(
-            &crate::opensubtitles::store::item_dir(root, media_path),
-            &mut found,
-        )
-        .await;
-    }
-
     found.sort_by(|a, b| a.0.cmp(&b.0));
     found.dedup_by(|a, b| a.0 == b.0);
+
+    // (d) subtitles downloaded from OpenSubtitles, kept on the cache volume
+    // (spec 030). They come after every file beside the media, in the order
+    // they were published (any saved before arrival numbers existed first),
+    // so a new download takes the next index and never moves a sidecar a
+    // client was already handed (V1509): delivery finds a sidecar by its
+    // index in a fresh scan.
+    if let Some(root) = crate::opensubtitles::store::installed_root() {
+        let mut downloads = Vec::new();
+        scan_all_subs(
+            &crate::opensubtitles::store::item_dir(root, media_path),
+            &mut downloads,
+        )
+        .await;
+        downloads.sort_by_cached_key(|(path, _)| {
+            let seq = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(crate::opensubtitles::store::arrival);
+            (seq.is_some(), seq, path.clone())
+        });
+        found.extend(downloads);
+    }
     found
 }
 
@@ -3410,6 +3423,46 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 1, "nothing was written beside the media");
+    }
+
+    /// A download takes the next index: it never moves a sidecar beside the
+    /// media, a download saved before arrival numbers existed, or an earlier
+    /// download, wherever its name sorts (V1509).
+    #[tokio::test]
+    async fn a_download_never_moves_a_sidecar_already_listed() {
+        let td = TempDir::new().unwrap();
+        let media = td.path().join("order-show.mkv");
+        tokio::fs::write(&media, b"x").await.unwrap();
+        let beside = td.path().join("order-show.en.srt");
+        tokio::fs::write(&beside, b"x").await.unwrap();
+        let root = crate::opensubtitles::store::shared_test_root();
+        let srt = b"1\n00:00:01,000 --> 00:00:02,000\nhi\n";
+        // Saved by an older build, with no arrival number: by path it sorts
+        // after every numbered download.
+        let dir = crate::opensubtitles::store::item_dir(&root, &media);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let legacy = dir.join("os5.yy.srt");
+        tokio::fs::write(&legacy, srt).await.unwrap();
+        let first = crate::opensubtitles::store::save(&root, &media, "zz", 90, false, srt)
+            .await
+            .unwrap();
+        let before = discover_sidecars(&media).await;
+        let second = crate::opensubtitles::store::save(&root, &media, "aa", 1, false, srt)
+            .await
+            .unwrap();
+        let again = crate::opensubtitles::store::save(&root, &media, "zz", 90, false, srt)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "a repeat save keeps the first copy");
+        let after = discover_sidecars(&media).await;
+        let paths = |v: &[(std::path::PathBuf, SidecarKind)]| {
+            v.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&before),
+            vec![beside.clone(), legacy.clone(), first.clone()]
+        );
+        assert_eq!(paths(&after), vec![beside, legacy, first, second]);
     }
 
     #[tokio::test]

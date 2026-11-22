@@ -211,8 +211,8 @@ async fn download_stores_on_the_cache_volume_and_playback_info_lists_it() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(before, after, "nothing is written beside the media");
-    let stored =
-        pharos_server::opensubtitles::store::item_dir(&store_root(), &video).join("os42.en.srt");
+    let stored = pharos_server::opensubtitles::store::item_dir(&store_root(), &video)
+        .join("00000000-os42.en.srt");
     assert_eq!(std::fs::read(&stored).unwrap(), SRT);
 
     let app = test::init_service(build_app(f.state.clone())).await;

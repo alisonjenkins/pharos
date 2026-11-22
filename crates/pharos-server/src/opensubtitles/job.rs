@@ -670,7 +670,7 @@ mod tests {
         );
         assert_eq!(r.fake.searches.load(Ordering::SeqCst), 1);
         assert!(store::item_dir(&r.os.root, &r.items[0].path)
-            .join("os5.en.srt")
+            .join("00000000-os5.en.srt")
             .exists());
         // A second pass sees the downloaded file and asks for nothing.
         let sum = pass(&r, &mut budget, &cfg(20), 1_001).await;
@@ -909,7 +909,7 @@ mod tests {
             "{sum:?}"
         );
         assert!(store::item_dir(&r.os.root, &r.items[0].path)
-            .join("os6.en.sdh.srt")
+            .join("00000000-os6.en.sdh.srt")
             .exists());
         let reasons: Vec<String> = snapshotter
             .snapshot()
