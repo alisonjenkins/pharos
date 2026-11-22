@@ -5033,7 +5033,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
                 result.is_ok(),
                 platform::now_ms() - asked
             ));
-            Some((id, source, settle_load(ctx.machine, result)))
+            Some((id, source, api, settle_load(ctx.machine, result)))
         }
     }));
     let state = listing.read();
@@ -5041,8 +5041,8 @@ fn BrowseScreen(id: ItemRef) -> Element {
     let name = state
         .as_ref()
         .and_then(Option::as_ref)
-        .filter(|(asked, _, _)| *asked == id)
-        .and_then(|(_, _, r)| r.as_ref().ok())
+        .filter(|(asked, ..)| *asked == id)
+        .and_then(|(.., r)| r.as_ref().ok())
         .map(|browse| browse.name(id));
     use_page_name(id, name);
     // The last parent's listing stays up while the next loads (so a tile
@@ -5050,7 +5050,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
     let busy = state
         .as_ref()
         .and_then(Option::as_ref)
-        .is_some_and(|(asked, _, _)| *asked != id);
+        .is_some_and(|(asked, ..)| *asked != id);
     // Keyed by what it shows (`Browse::mount_key`), so another parent's
     // listing mounts afresh once it lands, while a reload of this one or a
     // season tab keeps its place and the last one stays mounted under the
@@ -5058,18 +5058,31 @@ fn BrowseScreen(id: ItemRef) -> Element {
     let shown = state
         .as_ref()
         .and_then(Option::as_ref)
-        .map(|(asked, source, _)| (*asked, *source));
+        .map(|(asked, generation, library, _)| {
+            (
+                *asked,
+                browse::ShownLibrary {
+                    generation: *generation,
+                    library: library.clone(),
+                },
+            )
+        });
     rsx! {
         Busy { busy,
             {loaded_or_retry(
-                state.as_ref().and_then(Option::as_ref).map(|(_, _, result)| result),
+                state.as_ref().and_then(Option::as_ref).map(|(.., result)| result),
                 EventHandler::new(move |()| listing.restart()),
                 |browse: &browse::Browse| {
+                    let Some((asked, from)) = shown.as_ref() else {
+                        return rsx! { SeenBrowse { browse: browse.clone() } };
+                    };
                     remount_on(
-                        &shown
-                            .map(|(s, source)| format!("{source} {}", browse.mount_key(s)))
-                            .unwrap_or_default(),
-                        rsx! { SeenBrowse { browse: browse.clone() } },
+                        &format!("{} {}", from.generation, browse.mount_key(*asked)),
+                        rsx! {
+                            browse::ReadFrom { shown: from.clone(),
+                                SeenBrowse { browse: browse.clone() }
+                            }
+                        },
                     )
                 },
             )}

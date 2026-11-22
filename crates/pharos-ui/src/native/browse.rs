@@ -1121,6 +1121,7 @@ fn read_place(key: &str) -> Option<(u32, f64)> {
 #[component]
 fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     let ctx = use_context::<Ctx>();
+    let shown = try_use_context::<ShownLibrary>();
     // Whether the films are grouped into box sets; the first page was
     // fetched the way the device last chose (B1086).
     let opened_grouped = base.collapse;
@@ -1159,11 +1160,12 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
         let place = place_key(library, &narrow.read().to_query());
         let first = first.clone();
         let fresh = *narrow.read() != Narrow::default() || *grouped.read() != opened_grouped;
+        let shown = shown.clone();
         async move {
             if !fresh {
                 return Ok((place, listing, first));
             }
-            let Some(api) = ctx.peek_library() else {
+            let Some(api) = reads_from(shown.as_ref(), Some(&ctx)) else {
                 return Err("not signed in".to_owned());
             };
             fetch_more(
@@ -1750,6 +1752,8 @@ fn PagedGrid(
     #[props(default)] chain: Option<Chain>,
 ) -> Element {
     let ctx = use_context::<Ctx>();
+    let shown = try_use_context::<ShownLibrary>();
+    let indexed_from = shown.clone();
     let mut pager = use_signal(|| Pager::new(first.clone()));
     // The observer and the button fire outside any one render, so both send
     // here; `Pager::begin` is what keeps a second request out while one is
@@ -1759,6 +1763,7 @@ fn PagedGrid(
     let requests = use_coroutine(move |mut rx: UnboundedReceiver<Ask>| {
         let paged = paged.clone();
         let chained = chained.clone();
+        let shown = shown.clone();
         async move {
             while let Some(ask) = rx.next().await {
                 let claimed = match ask {
@@ -1770,7 +1775,7 @@ fn PagedGrid(
                 let Some((start, limit)) = claimed else {
                     continue;
                 };
-                let Some(api) = ctx.peek_library() else {
+                let Some(api) = reads_from(shown.as_ref(), Some(&ctx)) else {
                     pager.write().fail(NOT_SIGNED_IN);
                     continue;
                 };
@@ -1869,22 +1874,29 @@ fn PagedGrid(
         // A watched mark can change what a watched filter's listing holds.
         // The device's library and the server's index the same listing
         // differently; a switch between them fetches the index afresh.
-        let device = ctx
-            .offline
-            .read()
-            .is_some()
-            .then(super::offline_device::library_generation);
+        // Under a shown listing, its library's, which a switch does not
+        // change until the listing is replaced.
+        let device = match indexed_from.as_ref() {
+            Some(shown) => matches!(shown.library, super::source::Library::Device(_))
+                .then_some(shown.generation),
+            None => ctx
+                .offline
+                .read()
+                .is_some()
+                .then(super::offline_device::library_generation),
+        };
         let key = index_key(
             &listing,
             revision.map_or(0, |r| (r.0)()),
             (ctx.marks)(),
             device,
         );
+        let indexed_from = indexed_from.clone();
         async move {
             if let Some(kept) = kept_index(&key) {
                 return Some(kept);
             }
-            let api = ctx.peek_library()?;
+            let api = reads_from(indexed_from.as_ref(), Some(&ctx))?;
             match api.index(&call("browse", "index"), &listing).await {
                 Ok(index) => {
                     keep_index(key, index.clone());
@@ -2329,6 +2341,49 @@ const KEPT_INDEXES: usize = 8;
 
 /// Each listing's index as last fetched, most recent last.
 static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::new(Vec::new());
+
+/// The library the shown listing was read from, and the source switch it
+/// belongs to (spec 049). The browse screen provides it with each listing
+/// it shows and remounts it when a load from the other library lands; until
+/// then the grids under it page, index and play through it, so a page from
+/// one library is never followed by pages from the other.
+#[derive(Clone)]
+pub struct ShownLibrary {
+    pub generation: u32,
+    pub library: super::source::Library,
+}
+
+impl PartialEq for ShownLibrary {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+    }
+}
+
+/// Provides [`ShownLibrary`] to the listing under it.
+#[component]
+pub fn ReadFrom(shown: ShownLibrary, children: Element) -> Element {
+    use_context_provider(|| shown.clone());
+    children
+}
+
+/// Where a grid's later reads go: the shown listing's library while it is
+/// the device's; the server as it is now (its current sign-in) while the
+/// shown listing is the server's; the selected library outside a listing.
+fn reads_from(shown: Option<&ShownLibrary>, ctx: Option<&Ctx>) -> Option<super::source::Library> {
+    use super::source::Library;
+    let now = ctx.and_then(Ctx::peek_library);
+    match (shown.map(|s| &s.library), now) {
+        (None, now) => now,
+        (Some(Library::Device(device)), _) => Some(Library::Device(device.clone())),
+        (Some(Library::Server(_)), Some(now @ Library::Server(_))) => Some(now),
+        // Offline with the server's listing still up: its reads fail as
+        // offline, not as another library's pages.
+        (Some(Library::Server(old)), Some(Library::Device(_))) => {
+            Some(Library::Server(old.clone()))
+        }
+        (Some(Library::Server(_)), None) => None,
+    }
+}
 
 /// [`remount_on`] keyed also to which library the screens read: a switch
 /// between the server's and the device's (or a new snapshot of the device)
@@ -2791,6 +2846,7 @@ pub fn EpisodeList(
     #[props(default)] source: Option<Listing>,
 ) -> Element {
     let ctx = try_use_context::<Ctx>();
+    let shown = try_use_context::<ShownLibrary>();
     let mut pager = use_signal(|| Pager::new(page.clone()));
     // The fetch of a range of the listing, as `PagedGrid` makes it; `None`
     // when there is nothing to ask or no one to ask.
@@ -2798,7 +2854,7 @@ pub fn EpisodeList(
         let source = source.clone();
         move |start: u32, limit: u32| {
             let (ctx, source) = (ctx?, source.clone()?);
-            let api = ctx.peek_library()?;
+            let api = reads_from(shown.as_ref(), Some(&ctx))?;
             Some(async move {
                 let result = fetch_more(
                     &api,
@@ -3453,16 +3509,18 @@ fn BooksTabs(
 #[component]
 fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element {
     let ctx = use_context::<Ctx>();
+    let shown = try_use_context::<ShownLibrary>();
     let base = Listing::of(library, Some(ItemKind::Album), "SortName");
     let listed = use_resource(move || {
         let listing = order.read().apply(&base);
         let fresh = *order.read() != Narrow::default();
         let first = first.clone();
+        let shown = shown.clone();
         async move {
             if !fresh {
                 return Ok((listing, first));
             }
-            let Some(api) = ctx.peek_library() else {
+            let Some(api) = reads_from(shown.as_ref(), Some(&ctx)) else {
                 return Err("not signed in".to_owned());
             };
             fetch_more(
@@ -3675,6 +3733,7 @@ fn AlbumPlay(
     let mix = try_use_context::<MixCtx>();
     let nav = try_use_context::<Nav>();
     let ctx = try_use_context::<Ctx>();
+    let shown = try_use_context::<ShownLibrary>();
     // A group picks what plays, so no shuffling the queue under it.
     let in_group = try_use_context::<Together>()
         .as_ref()
@@ -3699,9 +3758,10 @@ fn AlbumPlay(
         pressed.set(ticket);
         let mix_at = mix_generation(mix);
         let (tracks, name) = (tracks.clone(), name.clone());
+        let shown = shown.clone();
         spawn(async move {
             let found = if tracks.is_empty() {
-                match ctx.and_then(|c| c.peek_library()) {
+                match reads_from(shown.as_ref(), ctx.as_ref()) {
                     Some(api) => list_all(
                         &api,
                         &call("queue", "album_shuffle"),
@@ -4005,6 +4065,7 @@ pub fn QueueButtons(
         try_use_context::<QueueCtx>().map(|q| q.0)
     };
     let ctx = try_use_context::<Ctx>();
+    let listed_from = try_use_context::<ShownLibrary>();
     // A song row can also start a mix like it, playing at once (spec 024).
     // No mix in a SyncPlay group, where the group picks the songs.
     let in_group = try_use_context::<Together>()
@@ -4026,8 +4087,13 @@ pub fn QueueButtons(
     let row_only = kind == QueueTarget::EpisodeRow;
     let put = move |place: Place| {
         let (tracks, name) = (tracks.clone(), name.clone());
+        let listed_from = listed_from.clone();
         spawn(async move {
-            let found = match (tracks.is_empty(), album, ctx.and_then(|c| c.peek_library())) {
+            let found = match (
+                tracks.is_empty(),
+                album,
+                reads_from(listed_from.as_ref(), ctx.as_ref()),
+            ) {
                 (false, _, _) | (true, None, _) => Ok(tracks),
                 (true, Some(album), Some(api)) => {
                     list_all(&api, &call("queue", "album"), album, None, INDEX_ORDER)
@@ -5160,6 +5226,32 @@ mod tests {
     /// FR-210: a failed paging step says why beside its retry.
     /// B1405, V1375: a TV's grid steps by whole rows of 4, 6, 8 or 12, and by
     /// fewer tiles than a browser's.
+    /// A grid under a listing read from the device keeps paging the device
+    /// while a switch to the server is still loading; outside a listing,
+    /// and once signed out under a server listing, there is none to read.
+    #[test]
+    fn a_shown_device_listing_keeps_reading_the_device() {
+        use super::super::source::Library;
+        let device = std::rc::Rc::new(super::super::offline_library::OfflineLibrary::default());
+        let shown = ShownLibrary {
+            generation: 3,
+            library: Library::Device(device.clone()),
+        };
+        assert!(matches!(
+            reads_from(Some(&shown), None),
+            Some(Library::Device(d)) if std::rc::Rc::ptr_eq(&d, &device)
+        ));
+        assert!(reads_from(None, None).is_none());
+        assert!(
+            shown
+                == ShownLibrary {
+                    generation: 3,
+                    library: Library::Device(std::rc::Rc::default()),
+                },
+            "a listing's source is told apart by its switch"
+        );
+    }
+
     #[test]
     fn a_kept_index_is_dropped_by_age_and_by_a_library_change() {
         let mut kept = Vec::new();
