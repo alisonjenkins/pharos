@@ -43,7 +43,12 @@ pub async fn keep_art(user: &str, images: &[String]) {
     let name = format!("{ART_PREFIX}{user}");
     if images.is_empty() {
         // No cache at all, so the worker leaves every picture alone.
-        if JsFuture::from(storage.has(&name)).await.ok().and_then(|v| v.as_bool()) == Some(true) {
+        if JsFuture::from(storage.has(&name))
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
             let _ = JsFuture::from(storage.delete(&name)).await;
             notify_worker();
         }
@@ -118,7 +123,10 @@ pub async fn forget_art() {
     let Ok(keys) = JsFuture::from(storage.keys()).await else {
         return;
     };
-    for name in js_sys::Array::from(&keys).iter().filter_map(|k| k.as_string()) {
+    for name in js_sys::Array::from(&keys)
+        .iter()
+        .filter_map(|k| k.as_string())
+    {
         if name.starts_with(ART_PREFIX) {
             let _ = JsFuture::from(storage.delete(&name)).await;
         }
@@ -145,6 +153,9 @@ fn notify_worker() {
     let _ = js_sys::Reflect::set(&message, &"kind".into(), &"pharos-sw".into());
     let _ = js_sys::Reflect::set(&message, &"event".into(), &"art-changed".into());
     if let Err(e) = worker.post_message(&message) {
-        warn(&format!("pharos: offline art worker note failed error={}", describe(&e)));
+        warn(&format!(
+            "pharos: offline art worker note failed error={}",
+            describe(&e)
+        ));
     }
 }

@@ -338,9 +338,10 @@ impl Catalogue {
         let mut changed = false;
         for item in items {
             let snap = Snap::of(item, None);
-            let keep_text = self.snaps.get(&snap.id).map(|old| {
-                (old.overview.clone(), old.genres.clone())
-            });
+            let keep_text = self
+                .snaps
+                .get(&snap.id)
+                .map(|old| (old.overview.clone(), old.genres.clone()));
             let snap = match keep_text {
                 Some((overview, genres)) => Snap {
                     overview,
@@ -613,7 +614,11 @@ impl OfflineLibrary {
                     lib.items.insert(parent, snap_item(snap, parent));
                     order.push(parent);
                 }
-                if lib.items.get(&child).is_some_and(|i| i.kind == ItemKind::Library) {
+                if lib
+                    .items
+                    .get(&child)
+                    .is_some_and(|i| i.kind == ItemKind::Library)
+                {
                     break;
                 }
                 child = parent;
@@ -645,13 +650,19 @@ impl OfflineLibrary {
                     _ => break,
                 }
             }
-            if lib.items.get(&top).is_some_and(|i| i.kind == ItemKind::Library) {
+            if lib
+                .items
+                .get(&top)
+                .is_some_and(|i| i.kind == ItemKind::Library)
+            {
                 continue;
             }
             let kind = kept.library_kind();
-            let library = match lib.libraries.iter().find(|l| {
-                lib.items.get(l).and_then(|i| i.library_kind) == Some(kind)
-            }) {
+            let library = match lib
+                .libraries
+                .iter()
+                .find(|l| lib.items.get(l).and_then(|i| i.library_kind) == Some(kind))
+            {
                 Some(found) => *found,
                 None => {
                     let id = ItemRef::Synth(u64::MAX - u64::from(library_rank(Some(kind))));
@@ -732,7 +743,11 @@ impl OfflineLibrary {
             let Some(last) = eps.iter().rposition(|e| e.played) else {
                 continue;
             };
-            if let Some(next) = eps.iter().skip(last + 1).find(|e| !e.played && e.position_ms == 0) {
+            if let Some(next) = eps
+                .iter()
+                .skip(last + 1)
+                .find(|e| !e.played && e.position_ms == 0)
+            {
                 out.push(next.clone());
             }
         }
@@ -764,7 +779,11 @@ impl OfflineLibrary {
                 .into_iter()
                 .filter(|id| self.items.get(id).is_some_and(|i| i.kind == group))
                 .collect(),
-            None => self.children.get(&listing.parent).cloned().unwrap_or_default(),
+            None => self
+                .children
+                .get(&listing.parent)
+                .cloned()
+                .unwrap_or_default(),
         };
         let mut items: Vec<Item> = ids
             .into_iter()
@@ -777,13 +796,13 @@ impl OfflineLibrary {
             })
             .filter(|i| match &listing.genre {
                 None => true,
-                Some(genre) => self.text.get(&i.id).is_some_and(|s| s.genres.contains(genre)),
-            })
-            .filter(|i| {
-                let unreadable = self
+                Some(genre) => self
                     .text
                     .get(&i.id)
-                    .and_then(|s| s.book_format.as_deref())
+                    .is_some_and(|s| s.genres.contains(genre)),
+            })
+            .filter(|i| {
+                let unreadable = self.text.get(&i.id).and_then(|s| s.book_format.as_deref())
                     == Some("unreadable");
                 match listing.unreadable {
                     Unreadable::Show => true,
@@ -814,11 +833,15 @@ impl OfflineLibrary {
                     page_count: 0,
                 })
             });
-        let read_position = self.places.get(&id).filter(|f| **f > 0.0).map(|f| ReadPosition {
-            locator: String::new(),
-            fraction: *f,
-            read_at_ms: 0,
-        });
+        let read_position = self
+            .places
+            .get(&id)
+            .filter(|f| **f > 0.0)
+            .map(|f| ReadPosition {
+                locator: String::new(),
+                fraction: *f,
+                read_at_ms: 0,
+            });
         Some(Detail {
             overview: snap.map(|s| s.overview.clone()).unwrap_or_default(),
             genres: snap.map(|s| s.genres.clone()).unwrap_or_default(),
@@ -852,7 +875,13 @@ fn sort_key_name(item: &Item) -> String {
 
 fn sort_items(items: &mut [Item], sort_by: &str, descending: bool) {
     if sort_by.contains("IndexNumber") {
-        items.sort_by_key(|i| (i.season.unwrap_or(0), i.episode.unwrap_or(0), sort_key_name(i)));
+        items.sort_by_key(|i| {
+            (
+                i.season.unwrap_or(0),
+                i.episode.unwrap_or(0),
+                sort_key_name(i),
+            )
+        });
     } else if sort_by.contains("ProductionYear") || sort_by.contains("PremiereDate") {
         items.sort_by_key(|i| (i.year.unwrap_or(0), sort_key_name(i)));
     } else {
@@ -865,7 +894,11 @@ fn sort_items(items: &mut [Item], sort_by: &str, descending: bool) {
 
 fn page(items: Vec<Item>, start: u32, limit: u32) -> Page {
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
-    let take = if limit == 0 { usize::MAX } else { limit as usize };
+    let take = if limit == 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
     Page {
         items: items.into_iter().skip(start as usize).take(take).collect(),
         total,
@@ -884,7 +917,13 @@ fn first_letter(item: &Item) -> String {
 pub struct NoGrant;
 
 impl PlaybackGrant for NoGrant {
-    async fn report(&self, _: &CallInfo, _: u64, _: bool, _: TrackPicks) -> Result<(), ClientError> {
+    async fn report(
+        &self,
+        _: &CallInfo,
+        _: u64,
+        _: bool,
+        _: TrackPicks,
+    ) -> Result<(), ClientError> {
         Err(offline_error("progress"))
     }
     async fn stop(&self, _: &CallInfo, _: u64) -> Result<(), ClientError> {
@@ -907,9 +946,18 @@ impl PharosApi for OfflineLibrary {
             .collect();
         Ok(Home {
             rails,
-            resume: self.resume.iter().rev().filter_map(|id| self.item(*id)).collect(),
+            resume: self
+                .resume
+                .iter()
+                .rev()
+                .filter_map(|id| self.item(*id))
+                .collect(),
             listening: Vec::new(),
-            reading: self.reading.iter().filter_map(|id| self.item(*id)).collect(),
+            reading: self
+                .reading
+                .iter()
+                .filter_map(|id| self.item(*id))
+                .collect(),
             next_up: self.next_up(),
         })
     }
@@ -968,13 +1016,22 @@ impl PharosApi for OfflineLibrary {
             .filter(|i| i.kind != ItemKind::Library)
             .filter(|i| {
                 i.name.to_lowercase().contains(&needle)
-                    || i.series_name.as_deref().is_some_and(|s| s.to_lowercase().contains(&needle))
-                    || i.artist.as_deref().is_some_and(|s| s.to_lowercase().contains(&needle))
+                    || i.series_name
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(&needle))
+                    || i.artist
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(&needle))
             })
             .cloned()
             .collect();
         // Names that start with the text first, then by name.
-        hits.sort_by_key(|i| (!i.name.to_lowercase().starts_with(&needle), sort_key_name(i)));
+        hits.sort_by_key(|i| {
+            (
+                !i.name.to_lowercase().starts_with(&needle),
+                sort_key_name(i),
+            )
+        });
         Ok(page(hits, 0, limit))
     }
 
@@ -1102,7 +1159,10 @@ mod tests {
             runtime_ms: 6_000_000,
             ..under(FILM, ItemKind::Movie, "The Film", FILMS)
         };
-        c.note(&[films.clone(), film.clone()], Some(&detail_with(&film, "A film.")));
+        c.note(
+            &[films.clone(), film.clone()],
+            Some(&detail_with(&film, "A film.")),
+        );
         let other = under(OTHER_FILM, ItemKind::Movie, "Another", FILMS);
         c.note(&[films, other], None);
         let books = library(BOOKS, LibraryKind::Books, "Books");
@@ -1146,14 +1206,65 @@ mod tests {
             ..Standing::default()
         };
         let cases = [
-            (Standing { connecting_or_ready: false, no_network: true, ..base }, (false, "not_signed_in")),
-            (Standing { connected: true, ..base }, (false, "connected")),
-            (Standing { connected: true, no_network: true, ..base }, (false, "connected")),
-            (Standing { no_network: true, ..base }, (true, "no_network")),
-            (Standing { reconnecting: true, ..base }, (false, "reconnecting")),
-            (Standing { reconnecting: true, lost_long: true, ..base }, (true, "connection_lost")),
-            (Standing { waiting: true, ..base }, (true, "server_unreachable")),
-            (Standing { slow_connect: true, ..base }, (true, "slow_connect")),
+            (
+                Standing {
+                    connecting_or_ready: false,
+                    no_network: true,
+                    ..base
+                },
+                (false, "not_signed_in"),
+            ),
+            (
+                Standing {
+                    connected: true,
+                    ..base
+                },
+                (false, "connected"),
+            ),
+            (
+                Standing {
+                    connected: true,
+                    no_network: true,
+                    ..base
+                },
+                (false, "connected"),
+            ),
+            (
+                Standing {
+                    no_network: true,
+                    ..base
+                },
+                (true, "no_network"),
+            ),
+            (
+                Standing {
+                    reconnecting: true,
+                    ..base
+                },
+                (false, "reconnecting"),
+            ),
+            (
+                Standing {
+                    reconnecting: true,
+                    lost_long: true,
+                    ..base
+                },
+                (true, "connection_lost"),
+            ),
+            (
+                Standing {
+                    waiting: true,
+                    ..base
+                },
+                (true, "server_unreachable"),
+            ),
+            (
+                Standing {
+                    slow_connect: true,
+                    ..base
+                },
+                (true, "slow_connect"),
+            ),
             (base, (false, "connecting")),
         ];
         for (standing, want) in cases {
@@ -1177,7 +1288,12 @@ mod tests {
         let rails: Vec<_> = home
             .rails
             .iter()
-            .map(|r| (r.library.name.as_str(), r.latest.iter().map(|i| i.name.clone()).collect::<Vec<_>>()))
+            .map(|r| {
+                (
+                    r.library.name.as_str(),
+                    r.latest.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+                )
+            })
             .collect();
         // The film not on the device is not listed though it is noted.
         assert_eq!(
@@ -1211,25 +1327,49 @@ mod tests {
     fn books_part_read_are_in_reading_with_their_place() {
         let lib = OfflineLibrary::new(&catalogue(), &device());
         let home = run(lib.home(&info())).unwrap();
-        assert_eq!(home.reading.iter().map(|i| i.id).collect::<Vec<_>>(), vec![BOOK]);
+        assert_eq!(
+            home.reading.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![BOOK]
+        );
         let detail = run(lib.detail(&info(), BOOK)).unwrap();
         assert_eq!(detail.read_position.map(|p| p.fraction), Some(0.3));
     }
 
     #[test]
     fn a_season_lists_only_its_downloaded_episodes_in_order() {
-        let device = vec![video(E3, ItemKind::Episode, 0), video(E1, ItemKind::Episode, 0)];
+        let device = vec![
+            video(E3, ItemKind::Episode, 0),
+            video(E1, ItemKind::Episode, 0),
+        ];
         let lib = OfflineLibrary::new(&catalogue(), &device);
-        let page = run(lib.query(&info(), &Listing::of(S1, None, "ParentIndexNumber,IndexNumber"), 0, 50)).unwrap();
-        assert_eq!(page.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![E1, E3]);
+        let page = run(lib.query(
+            &info(),
+            &Listing::of(S1, None, "ParentIndexNumber,IndexNumber"),
+            0,
+            50,
+        ))
+        .unwrap();
+        assert_eq!(
+            page.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![E1, E3]
+        );
         assert_eq!(page.total, 2);
     }
 
     #[test]
     fn a_grouped_listing_finds_series_under_a_library() {
         let lib = OfflineLibrary::new(&catalogue(), &device());
-        let page = run(lib.query(&info(), &Listing::of(TV, Some(ItemKind::Series), "SortName"), 0, 50)).unwrap();
-        assert_eq!(page.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![SHOW]);
+        let page = run(lib.query(
+            &info(),
+            &Listing::of(TV, Some(ItemKind::Series), "SortName"),
+            0,
+            50,
+        ))
+        .unwrap();
+        assert_eq!(
+            page.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![SHOW]
+        );
     }
 
     #[test]
@@ -1237,7 +1377,10 @@ mod tests {
         let device = vec![video(FILM, ItemKind::Movie, 0)];
         let lib = OfflineLibrary::new(&catalogue(), &device);
         let views = run(lib.views(&info())).unwrap();
-        assert_eq!(views.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![FILMS]);
+        assert_eq!(
+            views.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![FILMS]
+        );
     }
 
     #[test]
@@ -1252,7 +1395,16 @@ mod tests {
     fn an_item_not_on_the_device_is_not_found() {
         let lib = OfflineLibrary::new(&catalogue(), &device());
         let err = run(lib.detail(&info(), OTHER_FILM)).unwrap_err();
-        assert!(matches!(err, ClientError::Api { kind: "notFound", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ClientError::Api {
+                    kind: "notFound",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     /// Kept since the last notes pass: it shows by its kept title, in a
@@ -1300,7 +1452,10 @@ mod tests {
     fn search_matches_names_series_and_artists_on_the_device_only() {
         let lib = OfflineLibrary::new(&catalogue(), &device());
         let found = run(lib.search(&info(), "film", 0)).unwrap();
-        assert_eq!(found.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![FILM]);
+        assert_eq!(
+            found.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![FILM]
+        );
         let by_series = run(lib.search(&info(), "show", 0)).unwrap();
         assert!(by_series.items.iter().any(|i| i.id == E2), "{by_series:?}");
     }
@@ -1309,16 +1464,31 @@ mod tests {
     fn server_only_calls_answer_offline() {
         let lib = OfflineLibrary::new(&catalogue(), &device());
         let err = run(lib.person(&info(), FILM)).unwrap_err();
-        assert!(matches!(err, ClientError::Api { kind: OFFLINE_KIND, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                ClientError::Api {
+                    kind: OFFLINE_KIND,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn the_index_gives_each_letter_its_first_offset() {
-        let device = vec![video(FILM, ItemKind::Movie, 0), video(OTHER_FILM, ItemKind::Movie, 0)];
+        let device = vec![
+            video(FILM, ItemKind::Movie, 0),
+            video(OTHER_FILM, ItemKind::Movie, 0),
+        ];
         let lib = OfflineLibrary::new(&catalogue(), &device);
         let index = run(lib.index(&info(), &Listing::of(FILMS, None, "SortName"))).unwrap();
         // "The Film" sorts under F.
-        assert_eq!(index.letters, vec![("A".to_owned(), 0), ("F".to_owned(), 1)]);
+        assert_eq!(
+            index.letters,
+            vec![("A".to_owned(), 0), ("F".to_owned(), 1)]
+        );
     }
 
     #[test]
@@ -1334,7 +1504,10 @@ mod tests {
     #[test]
     fn missing_lists_kept_items_without_a_note() {
         let c = catalogue();
-        assert_eq!(c.missing(&[FILM, ItemRef::Real(999)]), vec![ItemRef::Real(999)]);
+        assert_eq!(
+            c.missing(&[FILM, ItemRef::Real(999)]),
+            vec![ItemRef::Real(999)]
+        );
     }
 
     #[test]
@@ -1352,11 +1525,20 @@ mod tests {
         let mut c = Catalogue::new("u");
         let films = library(FILMS, LibraryKind::Movies, "Movies");
         let film = under(FILM, ItemKind::Movie, "The Film", FILMS);
-        assert!(c.note(&[films.clone(), film.clone()], Some(&detail_with(&film, "A film."))));
-        assert!(!c.note(&[films.clone(), film.clone()], Some(&detail_with(&film, "A film."))));
+        assert!(c.note(
+            &[films.clone(), film.clone()],
+            Some(&detail_with(&film, "A film."))
+        ));
+        assert!(!c.note(
+            &[films.clone(), film.clone()],
+            Some(&detail_with(&film, "A film."))
+        ));
         // A later trail through the film (as an ancestor) does not wipe it.
         let extra = under(ItemRef::Real(999), ItemKind::Other, "Extra", FILM);
         c.note(&[films, film, extra], None);
-        assert_eq!(c.snaps.get("201").map(|s| s.overview.as_str()), Some("A film."));
+        assert_eq!(
+            c.snaps.get("201").map(|s| s.overview.as_str()),
+            Some("A film.")
+        );
     }
 }
