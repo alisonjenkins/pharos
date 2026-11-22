@@ -18,13 +18,17 @@ pub struct Connection;
 
 pub struct Open {
     pub conn: Connection,
-    pub api: NativeApi,
+    pub session: super::offline_video::Session<NativeApi>,
     pub server_schema: Option<u32>,
 }
 
 pub enum OpenError {
     NotOpened(Probe),
     NotSignedIn,
+    /// The phone's: a refused token that could not be dropped. Never made
+    /// here; the app's match is shared.
+    #[allow(dead_code)]
+    NotSignedInTokenKept,
     Resume(String),
 }
 
@@ -627,6 +631,30 @@ pub fn apply_tokens(_declarations: &[(String, String)]) -> Result<(), String> {
 }
 
 pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
+    Ok(())
+}
+
+/// Whether a device token, not the stored preference, decides who is signed
+/// in at a cold start. Only the phone and TV apps keep one.
+pub const TOKEN_DECIDES_SIGN_IN: bool = false;
+
+/// The user id kept with the device token; none where there is no token.
+pub fn token_user() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// The user kept with the device token `seen`; none where there is no token.
+pub fn token_user_if(_seen: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Drops an ended session's device token; there is none here.
+pub fn forget_token_if(_seen: &str, _user: Option<&str>) -> super::offline_video::TokenEnd {
+    super::offline_video::TokenEnd::Forgotten
+}
+
+/// Keeps `user` with the device token; nothing to do where there is none.
+pub fn note_token_user(_user: &str, _seen: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
