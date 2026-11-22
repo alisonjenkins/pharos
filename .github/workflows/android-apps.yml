@@ -144,7 +144,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: android-apks-${{ needs.version.outputs.name }}
           path: apks
