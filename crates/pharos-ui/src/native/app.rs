@@ -5737,10 +5737,19 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // With no server, a song cached on the phone plays on its own player
     // (spec 049): the device's library lists it, and no grant can be asked
     // for. Decided once, as the screen mounts per item.
+    // An album Shuffle's order is the app queue's, which goes on after it.
+    let song_queue = try_use_context::<QueueCtx>();
     let cached_song = use_hook(|| {
         let offline = ctx.offline.peek().is_some() || ctx.api.peek().is_none();
         offline
-            .then(|| super::offline_start::cached_song(&id.to_string()))
+            .then(|| {
+                let (shuffled, upcoming) = song_queue.map_or((false, Vec::new()), |q| {
+                    let q = q.0.peek();
+                    let upcoming = q.upcoming().iter().map(|e| e.id.to_string()).collect();
+                    (q.shuffled(), upcoming)
+                });
+                super::offline_start::cached_song(&id.to_string(), shuffled, &upcoming)
+            })
             .flatten()
     });
     if let Some((ids, at)) = cached_song {
